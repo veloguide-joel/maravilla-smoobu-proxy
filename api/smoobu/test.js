@@ -1,4 +1,12 @@
+import { applyCors, handleCorsPreflight } from "../_cors";
+
 export default async function handler(req, res) {
+  if (handleCorsPreflight(req, res)) {
+    return;
+  }
+
+  applyCors(req, res);
+
   try {
     const response = await fetch(
       `${process.env.SMOOBU_API_BASE}/apartments`,
