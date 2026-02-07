@@ -138,6 +138,7 @@ export default async function handler(req, res) {
     let allAvailableByFlag = true;
     let allPricesPresent = true;
     let totalPrice = 0;
+    let firstNightPrice = null;
 
     for (const night of nights) {
       const dayInfo = prices ? prices[night] : null;
@@ -150,17 +151,26 @@ export default async function handler(req, res) {
         price: priceValue
       });
 
-      if (availabilityValue == null) {
+      let nightOk = true;
+      if (!dayInfo) {
+        nightOk = false;
         missingAvailabilityDates.push(night);
-        allAvailableByFlag = false;
-      } else if (availabilityValue !== 1) {
-        allAvailableByFlag = false;
+      } else if (availabilityValue === 0) {
+        nightOk = false;
+      } else if (availabilityValue == null && priceValue == null) {
+        nightOk = false;
       }
+
+      allAvailableByFlag = allAvailableByFlag && nightOk;
 
       if (priceValue == null) {
         allPricesPresent = false;
       } else {
         totalPrice += Number(priceValue);
+      }
+
+      if (firstNightPrice == null && night === nights[0]) {
+        firstNightPrice = priceValue == null ? null : Number(priceValue);
       }
     }
 
@@ -170,6 +180,8 @@ export default async function handler(req, res) {
     if (available && allPricesPresent) {
       const average = nights.length ? totalPrice / nights.length : 0;
       nightlyPrice = Number(average.toFixed(2));
+    } else if (available && firstNightPrice != null) {
+      nightlyPrice = Number(firstNightPrice.toFixed(2));
     }
 
     const payload = { available, nightlyPrice };
