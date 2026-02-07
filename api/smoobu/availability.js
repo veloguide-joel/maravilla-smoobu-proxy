@@ -49,55 +49,81 @@ export default async function handler(req, res) {
   res.setHeader("Pragma", "no-cache");
   res.setHeader("Expires", "0");
 
-  if (req.method === "OPTIONS") {
-    applyCors(req, res);
-    res.status(204).end();
-    return;
-  }
-
-  if (req.method !== "GET") {
-    applyCors(req, res);
-    res.status(405).json({ error: "Method Not Allowed" });
-    return;
-  }
-
-  const { apartmentId, checkIn, checkOut, guests, debug } = req.query;
-  console.log("availability query", { apartmentId, checkIn, checkOut, guests });
-  if (!apartmentId || !checkIn || !checkOut) {
-    applyCors(req, res);
-    res.status(400).json({ error: "Missing required parameters" });
-    return;
-  }
-
-  const checkInDate = parseDate(checkIn);
-  const checkOutDate = parseDate(checkOut);
-  if (!checkInDate || !checkOutDate) {
-    applyCors(req, res);
-    res.status(400).json({ error: "Invalid date format" });
-    return;
-  }
-
-  if (checkOutDate <= checkInDate) {
-    applyCors(req, res);
-    res.status(400).json({ error: "checkOut must be after checkIn" });
-    return;
-  }
-
-  const apiKey = process.env.SMOOBU_API_KEY;
-  if (!apiKey) {
-    applyCors(req, res);
-    res.status(500).json({ error: "Missing SMOOBU_API_KEY" });
-    return;
-  }
-
-  const endDate = addDays(checkOutDate, -1);
-  const params = new URLSearchParams();
-  params.set("start_date", formatDate(checkInDate));
-  params.set("end_date", formatDate(endDate));
-  params.append("apartments[]", String(apartmentId));
-  const upstreamUrl = `https://login.smoobu.com/api/rates?${params.toString()}`;
-
   try {
+    if (req.method === "OPTIONS") {
+      applyCors(req, res);
+      res.status(204).end();
+      return;
+    }
+
+    if (req.method !== "GET") {
+      applyCors(req, res);
+      res.status(405).json({ error: "Method Not Allowed" });
+      return;
+    }
+
+    const { apartmentId, checkIn, checkOut, guests, debug } = req.query;
+    console.log("availability query", { apartmentId, checkIn, checkOut, guests });
+
+    if (!apartmentId || !checkIn || !checkOut || !guests) {
+      const payload = { available: false, nightlyPrice: null };
+      if (debug === "1") {
+        payload._debug = {
+          reason: "missing_params",
+          got: { apartmentId, checkIn, checkOut, guests }
+        };
+      }
+      applyCors(req, res);
+      res.status(200).json(payload);
+      return;
+    }
+
+    const checkInDate = parseDate(checkIn);
+    const checkOutDate = parseDate(checkOut);
+    if (!checkInDate || !checkOutDate) {
+      const payload = { available: false, nightlyPrice: null };
+      if (debug === "1") {
+        payload._debug = {
+          reason: "missing_params",
+          got: { apartmentId, checkIn, checkOut, guests }
+        };
+      }
+      applyCors(req, res);
+      res.status(200).json(payload);
+      return;
+    }
+
+    if (checkOutDate <= checkInDate) {
+      const payload = { available: false, nightlyPrice: null };
+      if (debug === "1") {
+        payload._debug = {
+          reason: "invalid_date_range",
+          got: { checkIn, checkOut }
+        };
+      }
+      applyCors(req, res);
+      res.status(200).json(payload);
+      return;
+    }
+
+    const apiKey = process.env.SMOOBU_API_KEY;
+    if (!apiKey) {
+      const payload = { available: false, nightlyPrice: null };
+      if (debug === "1") {
+        payload._debug = { reason: "missing_api_key" };
+      }
+      applyCors(req, res);
+      res.status(200).json(payload);
+      return;
+    }
+
+    const endDate = addDays(checkOutDate, -1);
+    const params = new URLSearchParams();
+    params.set("start_date", formatDate(checkInDate));
+    params.set("end_date", formatDate(endDate));
+    params.append("apartments[]", String(apartmentId));
+    const upstreamUrl = `https://login.smoobu.com/api/rates?${params.toString()}`;
+
     const response = await fetch(upstreamUrl, {
       headers: {
         "Api-Key": apiKey,
@@ -107,76 +133,101 @@ export default async function handler(req, res) {
 
     const upstreamStatus = response.status;
     const upstreamText = await response.text();
-
     if (!response.ok) {
+      const payload = { available: false, nightlyPrice: null };
+      if (debug === "1") {
+        payload._debug = {
+          upstreamUrl,
+          upstreamStatus,
+          nights: [],
+          failedNight: null,
+          failedReason: "upstream_error",
+          priceKeysSample: []
+        };
+      }
       applyCors(req, res);
-      res.status(upstreamStatus).json({
-        error: "Upstream Smoobu error",
-        upstreamStatus,
-        upstreamBody: upstreamText
-      });
+      res.status(200).json(payload);
       return;
     }
 
-    let data;
+    let upstreamJson = null;
     try {
-      data = upstreamText ? JSON.parse(upstreamText) : null;
+      upstreamJson = upstreamText ? JSON.parse(upstreamText) : null;
     } catch (parseError) {
+      const payload = { available: false, nightlyPrice: null };
+      if (debug === "1") {
+        payload._debug = {
+          upstreamUrl,
+          upstreamStatus,
+          nights: [],
+          failedNight: null,
+          failedReason: "upstream_parse_error",
+          priceKeysSample: []
+        };
+      }
       applyCors(req, res);
-      res.status(500).json({ error: "Failed to parse upstream response" });
+      res.status(200).json(payload);
+      return;
+    }
+
+    const prices =
+      (upstreamJson && upstreamJson.data && upstreamJson.data[String(apartmentId)]) ||
+      (upstreamJson && upstreamJson.data && upstreamJson.data[apartmentId]) ||
+      null;
+
+    if (!prices) {
+      const payload = { available: false, nightlyPrice: null };
+      if (debug === "1") {
+        payload._debug = {
+          upstreamUrl,
+          upstreamStatus,
+          nights: [],
+          failedNight: null,
+          failedReason: "missing_prices_object",
+          priceKeysSample: []
+        };
+      }
+      applyCors(req, res);
+      res.status(200).json(payload);
       return;
     }
 
     const nights = [];
-    for (let cursor = addDays(checkInDate, 1); cursor <= endDate; cursor = addDays(cursor, 1)) {
+    for (let cursor = checkInDate; cursor < checkOutDate; cursor = addDays(cursor, 1)) {
       nights.push(formatDate(cursor));
     }
 
-    const prices = data && data.prices ? data.prices : null;
-    let allAvailableByFlag = true;
-    let allPricesPresent = true;
-    let totalPrice = 0;
-    let firstNightPrice = null;
+    let available = true;
     let failedNight = null;
+    let failedReason = null;
+    let failedAvailable = null;
+
     for (const night of nights) {
-      const dayInfo = prices ? prices[night] : null;
-      const availabilityValue = dayInfo ? dayInfo.available : null;
-      const priceValue = dayInfo ? dayInfo.price : null;
-        price: dayInfo ? dayInfo.price : null
-
-      parsedNights.push({
-        date: night,
-      if (!dayInfo) {
-        price: priceValue
-      });
-
-      let nightOk = true;
-          failedReason = "missing_price_entry";
-        if (failedNight == null) {
-      } else if (availabilityValue !== 1) {
-          failedReason = isFirstNight
-            ? "missing_checkin_price"
-            : "missing_price_entry";
-        }
-      } else if (!isFirstNight && availabilityValue !== 1) {
-        nightOk = false;
-        if (failedNight == null) {
-          failedNight = night;
-          failedReason = "night_unavailable";
-      allPricesPresent = allPricesPresent && dayInfo != null;
-      if (priceValue == null) {
-        allPricesPresent = false;
-      } else {
-        totalPrice += Number(priceValue);
+      const entry = prices[night];
+      if (!entry) {
+        available = false;
+        failedNight = night;
+        failedReason = "missing_price_entry";
+        break;
       }
-
-      if (firstNightPrice == null && night === nights[0]) {
-        firstNightPrice = priceValue == null ? null : Number(priceValue);
+      if (entry.available !== 1) {
+        available = false;
+        failedNight = night;
+        failedReason = "night_unavailable";
+        failedAvailable = entry.available;
+        break;
+      }
+      if (!Number.isFinite(entry.price)) {
+        available = false;
+        failedNight = night;
+        failedReason = "missing_price_value";
+        break;
       }
     }
 
-    const available = allAvailableByFlag && missingAvailabilityDates.length === 0;
-    const nightlyPrice = null;
+    const nightlyPrice = available && nights.length > 0 && prices[nights[0]]
+      ? Number(prices[nights[0]].price)
+      : null;
 
     const payload = { available, nightlyPrice };
 
@@ -184,24 +235,24 @@ export default async function handler(req, res) {
       payload._debug = {
         upstreamUrl,
         upstreamStatus,
-        upstreamBody: data,
-        parsedFields: {
-          nights: parsedNights,
-          conflictsCount: null,
-          missingAvailabilityDates: missingAvailabilityDates.length
-            ? missingAvailabilityDates
-            : null,
-          allPricesPresent,
-          failedNight,
-          failedReason
-        }
+        nights,
+        failedNight,
+        failedReason,
+        failedAvailable,
+        priceKeysSample: Object.keys(prices).slice(0, 5)
       };
     }
 
     applyCors(req, res);
     res.status(200).json(payload);
   } catch (err) {
+    const payload = { available: false, nightlyPrice: null };
+    if (req.query && req.query.debug === "1") {
+      payload.error = err.message;
+      payload.stack = err.stack;
+      payload._debug = { reason: "exception" };
+    }
     applyCors(req, res);
-    res.status(500).json({ error: err.message });
+    res.status(200).json(payload);
   }
 }
