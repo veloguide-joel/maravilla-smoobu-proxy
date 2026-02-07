@@ -128,38 +128,32 @@ export default async function handler(req, res) {
     }
 
     const nights = [];
-    for (let cursor = checkInDate; cursor <= endDate; cursor = addDays(cursor, 1)) {
+    for (let cursor = addDays(checkInDate, 1); cursor <= endDate; cursor = addDays(cursor, 1)) {
       nights.push(formatDate(cursor));
     }
 
-    const parsedNights = [];
-    const missingAvailabilityDates = [];
     const prices = data && data.prices ? data.prices : null;
     let allAvailableByFlag = true;
     let allPricesPresent = true;
     let totalPrice = 0;
     let firstNightPrice = null;
     let failedNight = null;
-    let failedReason = null;
-
     for (const night of nights) {
       const dayInfo = prices ? prices[night] : null;
       const availabilityValue = dayInfo ? dayInfo.available : null;
       const priceValue = dayInfo ? dayInfo.price : null;
-      const isFirstNight = night === nights[0];
+        price: dayInfo ? dayInfo.price : null
 
       parsedNights.push({
         date: night,
-        available: availabilityValue,
+      if (!dayInfo) {
         price: priceValue
       });
 
       let nightOk = true;
-      if (!dayInfo || priceValue == null) {
-        nightOk = false;
-        missingAvailabilityDates.push(night);
+          failedReason = "missing_price_entry";
         if (failedNight == null) {
-          failedNight = night;
+      } else if (availabilityValue !== 1) {
           failedReason = isFirstNight
             ? "missing_checkin_price"
             : "missing_price_entry";
@@ -169,15 +163,7 @@ export default async function handler(req, res) {
         if (failedNight == null) {
           failedNight = night;
           failedReason = "night_unavailable";
-        }
-      }
-
-      allAvailableByFlag = allAvailableByFlag && nightOk;
-
-      if (!nightOk) {
-        break;
-      }
-
+      allPricesPresent = allPricesPresent && dayInfo != null;
       if (priceValue == null) {
         allPricesPresent = false;
       } else {
@@ -190,14 +176,7 @@ export default async function handler(req, res) {
     }
 
     const available = allAvailableByFlag && missingAvailabilityDates.length === 0;
-    let nightlyPrice = null;
-
-    if (available && allPricesPresent) {
-      const average = nights.length ? totalPrice / nights.length : 0;
-      nightlyPrice = Number(average.toFixed(2));
-    } else if (available && firstNightPrice != null) {
-      nightlyPrice = Number(firstNightPrice.toFixed(2));
-    }
+    const nightlyPrice = null;
 
     const payload = { available, nightlyPrice };
 
