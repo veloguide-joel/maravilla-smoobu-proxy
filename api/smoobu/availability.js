@@ -146,6 +146,7 @@ export default async function handler(req, res) {
       const dayInfo = prices ? prices[night] : null;
       const availabilityValue = dayInfo ? dayInfo.available : null;
       const priceValue = dayInfo ? dayInfo.price : null;
+      const isFirstNight = night === nights[0];
 
       parsedNights.push({
         date: night,
@@ -154,21 +155,21 @@ export default async function handler(req, res) {
       });
 
       let nightOk = true;
-      if (!dayInfo) {
+      if (!dayInfo || priceValue == null) {
         nightOk = false;
         missingAvailabilityDates.push(night);
         if (failedNight == null) {
           failedNight = night;
-          failedReason = "missing_price_entry";
+          failedReason = isFirstNight
+            ? "missing_checkin_price"
+            : "missing_price_entry";
         }
-      } else if (availabilityValue === 0) {
+      } else if (!isFirstNight && availabilityValue !== 1) {
         nightOk = false;
         if (failedNight == null) {
           failedNight = night;
-          failedReason = "explicitly_blocked";
+          failedReason = "night_unavailable";
         }
-      } else if (availabilityValue == null && priceValue == null) {
-        nightOk = false;
       }
 
       allAvailableByFlag = allAvailableByFlag && nightOk;
