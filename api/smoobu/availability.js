@@ -95,17 +95,15 @@ export default async function handler(req, res) {
   params.set("start_date", formatDate(checkInDate));
   params.set("end_date", formatDate(endDate));
   params.append("apartments[]", String(apartmentId));
+  const upstreamUrl = `https://login.smoobu.com/api/rates?${params.toString()}`;
 
   try {
-    const response = await fetch(
-      `https://login.smoobu.com/api/rates?${params.toString()}`,
-      {
-        headers: {
-          "Api-Key": apiKey,
-          "Accept": "application/json"
-        }
+    const response = await fetch(upstreamUrl, {
+      headers: {
+        "Api-Key": apiKey,
+        "Accept": "application/json"
       }
-    );
+    });
 
     const upstreamStatus = response.status;
     const upstreamText = await response.text();
@@ -134,26 +132,83 @@ export default async function handler(req, res) {
       nights.push(formatDate(cursor));
     }
 
+    const conflictsList = Array.isArray(data && data.conflicts)
+      ? data.conflicts
+      : Array.isArray(data && data.bookings)
+        ? data.bookings
+        : Array.isArray(data && data.reservations)
+          ? data.reservations
+          : null;
+
+    const parsedNights = [];
+    const missingAvailabilityDates = [];
+    let hasAvailabilityForAllNights = true;
+    let allAvailableByFlag = true;
+    let allPricesPresent = true;
     let totalPrice = 0;
+
     for (const night of nights) {
       const dayInfo = (data && data[night]) || (data && data.data && data.data[night]);
-      if (!dayInfo || dayInfo.available !== 1 || dayInfo.price == null) {
-        applyCors(req, res);
-        res.status(200).json({ available: false, nightlyPrice: null });
-        return;
+      const hasAvailability = dayInfo && dayInfo.available != null;
+      const availabilityValue = hasAvailability ? dayInfo.available : null;
+      const priceValue = dayInfo ? dayInfo.price : null;
+
+      parsedNights.push({
+        date: night,
+        available: availabilityValue,
+        price: priceValue
+      });
+
+      if (!hasAvailability) {
+        hasAvailabilityForAllNights = false;
+        missingAvailabilityDates.push(night);
+      } else if (!(availabilityValue === 1 || availabilityValue === true)) {
+        allAvailableByFlag = false;
       }
-      totalPrice += Number(dayInfo.price);
+
+      if (priceValue == null) {
+        allPricesPresent = false;
+      } else {
+        totalPrice += Number(priceValue);
+      }
     }
 
-    const average = nights.length ? totalPrice / nights.length : 0;
-    const payload = {
-      available: true,
-      nightlyPrice: Number(average.toFixed(2))
-    };
+    let available;
+    let nightlyPrice = null;
+    let ambiguousAvailability = false;
+
+    if (conflictsList) {
+      available = conflictsList.length === 0;
+    } else if (hasAvailabilityForAllNights) {
+      available = allAvailableByFlag;
+    } else {
+      available = true;
+      ambiguousAvailability = true;
+    }
+
+    if (!ambiguousAvailability && allPricesPresent) {
+      const average = nights.length ? totalPrice / nights.length : 0;
+      nightlyPrice = Number(average.toFixed(2));
+    }
+
+    const payload = { available, nightlyPrice };
 
     if (debug === "1") {
-      payload.upstreamStatus = upstreamStatus;
-      payload.upstreamBody = upstreamText.slice(0, 500);
+      payload._debug = {
+        upstreamUrl,
+        upstreamStatus,
+        upstreamBody: data,
+        parsedFields: {
+          nights: parsedNights,
+          conflictsCount: conflictsList ? conflictsList.length : null,
+          hasAvailabilityForAllNights,
+          missingAvailabilityDates: missingAvailabilityDates.length
+            ? missingAvailabilityDates
+            : null,
+          allPricesPresent,
+          ambiguousAvailability
+        }
+      };
     }
 
     applyCors(req, res);
