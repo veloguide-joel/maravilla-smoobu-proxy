@@ -132,25 +132,16 @@ export default async function handler(req, res) {
       nights.push(formatDate(cursor));
     }
 
-    const conflictsList = Array.isArray(data && data.conflicts)
-      ? data.conflicts
-      : Array.isArray(data && data.bookings)
-        ? data.bookings
-        : Array.isArray(data && data.reservations)
-          ? data.reservations
-          : null;
-
     const parsedNights = [];
     const missingAvailabilityDates = [];
-    let hasAvailabilityForAllNights = true;
+    const prices = data && data.prices ? data.prices : null;
     let allAvailableByFlag = true;
     let allPricesPresent = true;
     let totalPrice = 0;
 
     for (const night of nights) {
-      const dayInfo = (data && data[night]) || (data && data.data && data.data[night]);
-      const hasAvailability = dayInfo && dayInfo.available != null;
-      const availabilityValue = hasAvailability ? dayInfo.available : null;
+      const dayInfo = prices ? prices[night] : null;
+      const availabilityValue = dayInfo ? dayInfo.available : null;
       const priceValue = dayInfo ? dayInfo.price : null;
 
       parsedNights.push({
@@ -159,10 +150,10 @@ export default async function handler(req, res) {
         price: priceValue
       });
 
-      if (!hasAvailability) {
-        hasAvailabilityForAllNights = false;
+      if (availabilityValue == null) {
         missingAvailabilityDates.push(night);
-      } else if (!(availabilityValue === 1 || availabilityValue === true)) {
+        allAvailableByFlag = false;
+      } else if (availabilityValue !== 1) {
         allAvailableByFlag = false;
       }
 
@@ -173,20 +164,10 @@ export default async function handler(req, res) {
       }
     }
 
-    let available;
+    const available = allAvailableByFlag && missingAvailabilityDates.length === 0;
     let nightlyPrice = null;
-    let ambiguousAvailability = false;
 
-    if (conflictsList) {
-      available = conflictsList.length === 0;
-    } else if (hasAvailabilityForAllNights) {
-      available = allAvailableByFlag;
-    } else {
-      available = true;
-      ambiguousAvailability = true;
-    }
-
-    if (!ambiguousAvailability && allPricesPresent) {
+    if (available && allPricesPresent) {
       const average = nights.length ? totalPrice / nights.length : 0;
       nightlyPrice = Number(average.toFixed(2));
     }
@@ -200,13 +181,11 @@ export default async function handler(req, res) {
         upstreamBody: data,
         parsedFields: {
           nights: parsedNights,
-          conflictsCount: conflictsList ? conflictsList.length : null,
-          hasAvailabilityForAllNights,
+          conflictsCount: null,
           missingAvailabilityDates: missingAvailabilityDates.length
             ? missingAvailabilityDates
             : null,
-          allPricesPresent,
-          ambiguousAvailability
+          allPricesPresent
         }
       };
     }
