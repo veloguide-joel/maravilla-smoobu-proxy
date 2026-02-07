@@ -117,12 +117,9 @@ export default async function handler(req, res) {
       return;
     }
 
-    const endDate = addDays(checkOutDate, -1);
-    const params = new URLSearchParams();
-    params.set("start_date", formatDate(checkInDate));
-    params.set("end_date", formatDate(endDate));
-    params.append("apartments[]", String(apartmentId));
-    const upstreamUrl = `https://login.smoobu.com/api/rates?${params.toString()}`;
+    const startDate = formatDate(checkInDate);
+    const endDate = formatDate(addDays(checkOutDate, -1));
+    const upstreamUrl = `https://login.smoobu.com/api/rates?start_date=${encodeURIComponent(startDate)}&end_date=${encodeURIComponent(endDate)}&apartments%5B%5D=${encodeURIComponent(String(apartmentId))}`;
 
     const response = await fetch(upstreamUrl, {
       headers: {
@@ -235,6 +232,8 @@ export default async function handler(req, res) {
       payload._debug = {
         upstreamUrl,
         upstreamStatus,
+        requestedStartDate: startDate,
+        requestedEndDate: endDate,
         nights,
         failedNight,
         failedReason,
