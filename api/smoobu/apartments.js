@@ -23,11 +23,19 @@ export default async function handler(req, res) {
     }
 
     const data = await response.json();
-
-    res.status(200).json({
+    const apartments = Array.isArray(data.apartments) ? data.apartments : [];
+    const payload = {
       ok: true,
-      apartments: data.apartments || []
-    });
+      apartments
+    };
+
+    if (req.query && req.query.debug === "1") {
+      payload._debug = {
+        apartmentKeysSample: Object.keys(apartments[0] || {})
+      };
+    }
+
+    res.status(200).json(payload);
 
   } catch (err) {
     res.status(500).json({
