@@ -61,7 +61,8 @@ export default async function handler(req, res) {
     return;
   }
 
-  const { apartmentId, checkIn, checkOut } = req.query;
+  const { apartmentId, checkIn, checkOut, guests, debug } = req.query;
+  console.log("availability query", { apartmentId, checkIn, checkOut, guests });
   if (!apartmentId || !checkIn || !checkOut) {
     applyCors(req, res);
     res.status(400).json({ error: "Missing required parameters" });
@@ -106,18 +107,27 @@ export default async function handler(req, res) {
       }
     );
 
+    const upstreamStatus = response.status;
+    const upstreamText = await response.text();
+
     if (!response.ok) {
-      const detail = (await response.text()).slice(0, 500);
       applyCors(req, res);
-      res.status(response.status).json({
-        error: "Smoobu API error",
-        status: response.status,
-        detail
+      res.status(upstreamStatus).json({
+        error: "Upstream Smoobu error",
+        upstreamStatus,
+        upstreamBody: upstreamText
       });
       return;
     }
 
-    const data = await response.json();
+    let data;
+    try {
+      data = upstreamText ? JSON.parse(upstreamText) : null;
+    } catch (parseError) {
+      applyCors(req, res);
+      res.status(500).json({ error: "Failed to parse upstream response" });
+      return;
+    }
 
     const nights = [];
     for (let cursor = checkInDate; cursor <= endDate; cursor = addDays(cursor, 1)) {
@@ -136,11 +146,18 @@ export default async function handler(req, res) {
     }
 
     const average = nights.length ? totalPrice / nights.length : 0;
-    applyCors(req, res);
-    res.status(200).json({
+    const payload = {
       available: true,
       nightlyPrice: Number(average.toFixed(2))
-    });
+    };
+
+    if (debug === "1") {
+      payload.upstreamStatus = upstreamStatus;
+      payload.upstreamBody = upstreamText.slice(0, 500);
+    }
+
+    applyCors(req, res);
+    res.status(200).json(payload);
   } catch (err) {
     applyCors(req, res);
     res.status(500).json({ error: err.message });
