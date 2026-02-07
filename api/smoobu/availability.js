@@ -139,6 +139,8 @@ export default async function handler(req, res) {
     let allPricesPresent = true;
     let totalPrice = 0;
     let firstNightPrice = null;
+    let failedNight = null;
+    let failedReason = null;
 
     for (const night of nights) {
       const dayInfo = prices ? prices[night] : null;
@@ -155,13 +157,25 @@ export default async function handler(req, res) {
       if (!dayInfo) {
         nightOk = false;
         missingAvailabilityDates.push(night);
+        if (failedNight == null) {
+          failedNight = night;
+          failedReason = "missing_price_entry";
+        }
       } else if (availabilityValue === 0) {
         nightOk = false;
+        if (failedNight == null) {
+          failedNight = night;
+          failedReason = "explicitly_blocked";
+        }
       } else if (availabilityValue == null && priceValue == null) {
         nightOk = false;
       }
 
       allAvailableByFlag = allAvailableByFlag && nightOk;
+
+      if (!nightOk) {
+        break;
+      }
 
       if (priceValue == null) {
         allPricesPresent = false;
@@ -197,7 +211,9 @@ export default async function handler(req, res) {
           missingAvailabilityDates: missingAvailabilityDates.length
             ? missingAvailabilityDates
             : null,
-          allPricesPresent
+          allPricesPresent,
+          failedNight,
+          failedReason
         }
       };
     }
