@@ -2,11 +2,11 @@ import pg from "pg";
 
 const { Pool } = pg;
 
-let pool;
+let pool = null;
 
 function getPool() {
-  if (!process.env.DATABASE_URL) {
-    throw new Error("DATABASE_URL is required to query the database");
+  if (typeof process.env.DATABASE_URL !== "string" || process.env.DATABASE_URL.trim() === "") {
+    throw new Error("DATABASE_URL is not set");
   }
 
   if (!pool) {
