@@ -10,18 +10,16 @@ function getPool() {
   }
 
   if (!pool) {
-    pool = new Pool({ connectionString: process.env.DATABASE_URL });
+    pool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false }
+    });
   }
 
   return pool;
 }
 
 export async function query(text, params) {
-  try {
-    const db = getPool();
-    return await db.query(text, params);
-  } catch (err) {
-    console.error(err.message);
-    throw err;
-  }
+  const db = getPool();
+  return await db.query(text, params);
 }

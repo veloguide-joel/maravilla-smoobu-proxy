@@ -20,38 +20,38 @@ function parseDate(value) {
 }
 
 export default async function handler(req, res) {
-  if (handleCorsPreflight(req, res)) {
-    return;
-  }
-
-  applyCors(req, res);
-
-  if (req.method !== "GET") {
-    res.status(405).json({ error: "Method Not Allowed" });
-    return;
-  }
-
-  const { propertyId, from, to } = req.query;
-  const details = { propertyId, from, to };
-
-  if (typeof propertyId !== "string" || propertyId.trim() === "") {
-    res.status(400).json({ error: "Invalid propertyId", details });
-    return;
-  }
-
-  const fromDate = parseDate(from);
-  const toDate = parseDate(to);
-  if (!fromDate || !toDate) {
-    res.status(400).json({ error: "Invalid date format", details });
-    return;
-  }
-
-  if (toDate <= fromDate) {
-    res.status(400).json({ error: "Invalid date range", details });
-    return;
-  }
-
   try {
+    if (handleCorsPreflight(req, res)) {
+      return;
+    }
+
+    applyCors(req, res);
+
+    if (req.method !== "GET") {
+      res.status(405).json({ error: "Method Not Allowed" });
+      return;
+    }
+
+    const { propertyId, from, to } = req.query;
+    const details = { propertyId, from, to };
+
+    if (typeof propertyId !== "string" || propertyId.trim() === "") {
+      res.status(400).json({ error: "Invalid propertyId", details });
+      return;
+    }
+
+    const fromDate = parseDate(from);
+    const toDate = parseDate(to);
+    if (!fromDate || !toDate) {
+      res.status(400).json({ error: "Invalid date format", details });
+      return;
+    }
+
+    if (toDate <= fromDate) {
+      res.status(400).json({ error: "Invalid date range", details });
+      return;
+    }
+
     const result = await query(
       "SELECT id, property_id, check_in, check_out, hold_expires_at, status " +
         "FROM public.booking_intents " +
@@ -66,6 +66,10 @@ export default async function handler(req, res) {
 
     res.status(200).json({ holds: result.rows || [] });
   } catch (err) {
-    res.status(500).json({ error: "Database query failed" });
+    applyCors(req, res);
+    res.status(500).json({
+      error: "server_error",
+      message: err?.message || String(err)
+    });
   }
 }
