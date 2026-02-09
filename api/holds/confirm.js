@@ -1,6 +1,18 @@
 import { pool } from "../_db.js";
 
 export default async function handler(req, res) {
+  const adminToken = process.env.ADMIN_TOKEN;
+  if (!adminToken) {
+    res.status(500).json({ ok: false, error: "ADMIN_TOKEN_NOT_SET" });
+    return;
+  }
+
+  const providedToken = req.headers["x-admin-token"];
+  if (!providedToken || providedToken !== adminToken) {
+    res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
+    return;
+  }
+
   if (req.method !== "POST") {
     res.status(405).json({ ok: false, error: "METHOD_NOT_ALLOWED" });
     return;
