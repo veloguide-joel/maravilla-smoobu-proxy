@@ -16,7 +16,7 @@ export default async function handler(req, res) {
 
   try {
     const existingResult = await pool.query(
-      "SELECT * FROM holds WHERE id = $1",
+      "SELECT * FROM booking_intents WHERE id = $1",
       [holdId]
     );
 
@@ -37,7 +37,7 @@ export default async function handler(req, res) {
     }
 
     const updatedResult = await pool.query(
-      "UPDATE holds " +
+      "UPDATE booking_intents " +
         "SET status = 'confirmed', confirmed_at = now(), hold_expires_at = NULL " +
         "WHERE id = $1 " +
         "RETURNING *",
@@ -49,7 +49,8 @@ export default async function handler(req, res) {
     res.status(500).json({
       ok: false,
       error: "DB_UPDATE_FAILED",
-      detail: err?.message || String(err)
+      detail: err?.message || String(err),
+      table: "booking_intents"
     });
   }
 }
