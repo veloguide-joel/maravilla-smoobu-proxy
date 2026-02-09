@@ -36,13 +36,18 @@ export default async function handler(req, res) {
       return;
     }
 
-    const updatedResult = await pool.query(
-      "UPDATE booking_intents " +
-        "SET status = 'confirmed', confirmed_at = now(), hold_expires_at = NULL " +
-        "WHERE id = $1 " +
-        "RETURNING *",
-      [holdId]
+    const columnResult = await pool.query(
+      "SELECT 1 FROM information_schema.columns " +
+        "WHERE table_name = 'booking_intents' AND column_name = 'hold_expires_at' " +
+        "LIMIT 1"
     );
+
+    const setHoldExpires = columnResult.rows.length > 0;
+    const updateSql = setHoldExpires
+      ? "UPDATE booking_intents SET status = 'confirmed', hold_expires_at = NULL WHERE id = $1 RETURNING *"
+      : "UPDATE booking_intents SET status = 'confirmed' WHERE id = $1 RETURNING *";
+
+    const updatedResult = await pool.query(updateSql, [holdId]);
 
     res.status(200).json({ ok: true, confirmed: true, hold: updatedResult.rows[0] });
   } catch (err) {
