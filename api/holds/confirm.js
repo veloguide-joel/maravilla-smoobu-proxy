@@ -26,6 +26,12 @@ export default async function handler(req, res) {
     return;
   }
 
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (typeof holdId !== "string" || !uuidRegex.test(holdId)) {
+    res.status(400).json({ ok: false, error: "INVALID_HOLD_ID" });
+    return;
+  }
+
   try {
     const existingResult = await pool.query(
       "SELECT * FROM booking_intents WHERE id = $1",
