@@ -44,6 +44,16 @@ export default async function handler(req, res) {
       return;
     }
 
+    const hold = existing;
+    if (hold.status === "confirmed") {
+      return res.status(200).json({
+        ok: true,
+        confirmed: true,
+        alreadyConfirmed: true,
+        hold
+      });
+    }
+
     if (existing.status === "confirmed" || existing.status === "booked") {
       res.status(200).json({ ok: true, alreadyConfirmed: true, hold: existing });
       return;
