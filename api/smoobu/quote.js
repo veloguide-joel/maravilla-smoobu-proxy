@@ -119,6 +119,11 @@ export default async function handler(req, res) {
     const endDate = formatDate(addDays(departureDate, -1));
     const upstreamUrl = `https://login.smoobu.com/api/rates?start_date=${encodeURIComponent(startDate)}&end_date=${encodeURIComponent(endDate)}&apartments%5B%5D=${encodeURIComponent(String(apartmentId))}`;
     const safeUpstreamUrl = upstreamUrl;
+    const upstreamParams = {
+      start_date: startDate,
+      end_date: endDate,
+      apartments: [String(apartmentId)]
+    };
 
     let response = null;
     try {
@@ -145,6 +150,15 @@ export default async function handler(req, res) {
     }
 
     if (!response.ok) {
+      const debug = response.status === 422
+        ? {
+            smoobuRequest: {
+              url: safeUpstreamUrl,
+              params: upstreamParams
+            }
+          }
+        : null;
+
       res.status(502).json({
         ok: false,
         error: "SMOOBU_UPSTREAM_FAILED",
@@ -155,7 +169,8 @@ export default async function handler(req, res) {
         request: {
           url: safeUpstreamUrl,
           method: "GET"
-        }
+        },
+        ...(debug ? { debug } : {})
       });
       return;
     }
