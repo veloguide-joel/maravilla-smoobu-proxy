@@ -38,20 +38,9 @@ function dateMinusOneDay(date) {
   return formatDate(addDays(date, -1));
 }
 
-function parseCount(value, fallback) {
-  if (value === undefined || value === null || value === "") {
-    return fallback;
-  }
-  const parsed = Number.parseInt(String(value), 10);
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    return null;
-  }
-  return parsed;
-}
-
 function normalizeQuery(query) {
-  const arrival = query?.arrival ?? query?.start_date ?? null;
-  const departure = query?.departure ?? query?.end_date ?? null;
+  const arrival = query?.arrival ?? query?.start_date ?? query?.from ?? null;
+  const departure = query?.departure ?? query?.end_date ?? query?.to ?? null;
   const apartmentId = query?.apartmentId ?? null;
   const debug = query?.debug === "1";
 
@@ -92,14 +81,7 @@ function normalizeQuery(query) {
 
   const hasErrors = missing.length > 0 || Object.keys(invalid).length > 0;
   if (hasErrors) {
-    return {
-      ok: false,
-      errors: {
-        missing,
-        invalid
-      },
-      debug
-    };
+    return { ok: false, debug };
   }
 
   return {
@@ -116,44 +98,13 @@ function normalizeQuery(query) {
   };
 }
 
-function buildDebug({
-  arrival,
-  departure,
-  endDateForRates,
-  availabilityUrl,
-  availabilityStatus,
-  availabilityStatusText,
-  ratesUrl,
-  ratesStatus,
-  ratesStatusText,
-  nightsCount,
-  pricedNightsCount,
-  availableApartmentsCount
-}) {
-  return {
-    arrival: arrival || null,
-    departure: departure || null,
-    end_date_for_rates: endDateForRates || null,
-    availabilityUrl: availabilityUrl || null,
-    availabilityStatus: Number.isFinite(availabilityStatus) ? availabilityStatus : null,
-    availabilityStatusText: typeof availabilityStatusText === "string" ? availabilityStatusText : null,
-    ratesUrl: ratesUrl || null,
-    ratesStatus: Number.isFinite(ratesStatus) ? ratesStatus : null,
-    ratesStatusText: typeof ratesStatusText === "string" ? ratesStatusText : null,
-    nightsCount: Number.isFinite(nightsCount) ? nightsCount : null,
-    pricedNightsCount: Number.isFinite(pricedNightsCount) ? pricedNightsCount : null,
-    availableApartmentsCount: Number.isFinite(availableApartmentsCount)
-      ? availableApartmentsCount
-      : null
-  };
-}
-
-async function callSmoobuAvailability({ apiKey, arrival, departure, apartmentIdNumber }) {
+async function callSmoobuAvailability({ apiKey, arrival, departure, apartmentIdNumber, customerId }) {
   const url = "https://login.smoobu.com/booking/checkApartmentAvailability";
   const payload = {
     arrivalDate: arrival,
     departureDate: departure,
-    apartments: [apartmentIdNumber]
+    apartments: [apartmentIdNumber],
+    customerId
   };
 
   let response = null;
@@ -347,8 +298,7 @@ export default async function handler(req, res) {
     if (!normalized.ok) {
       res.status(400).json({
         ok: false,
-        error: "VALIDATION_ERROR",
-        details: normalized.errors
+        error: "VALIDATION_ERROR"
       });
       return;
     }
@@ -362,17 +312,6 @@ export default async function handler(req, res) {
       departureDate,
       debug
     } = normalized.values;
-
-    const adults = parseCount(req.query?.adults, 2);
-    const children = parseCount(req.query?.children, 0);
-    if (adults === null || children === null) {
-      res.status(400).json({
-        ok: false,
-        error: "VALIDATION_ERROR",
-        details: { invalid: { guests: "INVALID_GUESTS" } }
-      });
-      return;
-    }
 
     const conflictResult = await pool.query(
       "SELECT " +
@@ -407,41 +346,48 @@ export default async function handler(req, res) {
       return;
     }
 
+    const customerId = Number(process.env.SMOOBU_CUSTOMER_ID);
+    if (!Number.isFinite(customerId)) {
+      res.status(500).json({ ok: false, error: "SMOOBU_CUSTOMER_ID_MISSING" });
+      return;
+    }
+
     const availabilityResult = await callSmoobuAvailability({
       apiKey,
       arrival,
       departure,
-      apartmentIdNumber
+      apartmentIdNumber,
+      customerId
     });
 
     if (!availabilityResult.ok) {
       res.status(502).json({
         ok: false,
         error: "SMOOBU_UPSTREAM_FAILED",
-        upstream: availabilityResult.upstream,
-        request: availabilityResult.request
+        upstream: availabilityResult.upstream
       });
       return;
     }
 
     if (!availabilityResult.available) {
       const debugInfo = debug
-        ? buildDebug({
+        ? {
             arrival,
             departure,
-            availabilityUrl: availabilityResult.requestUrl,
-            availabilityStatus: availabilityResult.upstreamStatus,
-            availabilityStatusText: availabilityResult.upstreamStatusText,
-            availableApartmentsCount: availabilityResult.availableApartmentsCount
-          })
+            end_date_for_rates: dateMinusOneDay(departureDate),
+            customerId,
+            upstreamStatusAvailability: Number.isFinite(availabilityResult.upstreamStatus)
+              ? availabilityResult.upstreamStatus
+              : null,
+            upstreamStatusRates: null,
+            ratesCount: null
+          }
         : undefined;
 
       res.status(200).json({
         ok: true,
         source: "smoobu",
         available: false,
-        nightlyPrice: null,
-        reason: "SMOOBU_UNAVAILABLE",
         ...(debugInfo ? { debug: debugInfo } : {})
       });
       return;
@@ -452,48 +398,86 @@ export default async function handler(req, res) {
       apiKey,
       arrival,
       endDateForRates,
-      apartmentId
+      apartmentId: apartmentIdNumber
     });
 
     if (!ratesResult.ok) {
       res.status(502).json({
         ok: false,
         error: "SMOOBU_UPSTREAM_FAILED",
-        upstream: ratesResult.upstream,
-        request: ratesResult.request
+        upstream: ratesResult.upstream
       });
       return;
     }
 
     const nights = getNightDates(arrivalDate, departureDate);
-    const { nightlyPrice, totalPrice, pricedNightsCount } = computePrices(
-      ratesResult.prices,
-      nights
-    );
+    const ratesCount = ratesResult.prices && typeof ratesResult.prices === "object"
+      ? Object.keys(ratesResult.prices).length
+      : 0;
+
+    if (!ratesResult.prices || ratesCount === 0) {
+      const debugInfo = debug
+        ? {
+            arrival,
+            departure,
+            end_date_for_rates: endDateForRates,
+            customerId,
+            upstreamStatusAvailability: Number.isFinite(availabilityResult.upstreamStatus)
+              ? availabilityResult.upstreamStatus
+              : null,
+            upstreamStatusRates: Number.isFinite(ratesResult.upstreamStatus)
+              ? ratesResult.upstreamStatus
+              : null,
+            ratesCount
+          }
+        : undefined;
+
+      res.status(200).json({
+        ok: true,
+        source: "smoobu",
+        available: true,
+        priced: false,
+        message: "AVAILABLE_BUT_NO_RATES",
+        ...(debugInfo ? { debug: debugInfo } : {})
+      });
+      return;
+    }
+
+    const { totalPrice } = computePrices(ratesResult.prices, nights);
+    const subtotal = totalPrice ?? 0;
 
     const debugInfo = debug
-      ? buildDebug({
+      ? {
           arrival,
           departure,
-          endDateForRates,
-          availabilityUrl: availabilityResult.requestUrl,
-          availabilityStatus: availabilityResult.upstreamStatus,
-          availabilityStatusText: availabilityResult.upstreamStatusText,
-          ratesUrl: ratesResult.requestUrl,
-          ratesStatus: ratesResult.upstreamStatus,
-          ratesStatusText: ratesResult.upstreamStatusText,
-          nightsCount: nights.length,
-          pricedNightsCount,
-          availableApartmentsCount: availabilityResult.availableApartmentsCount
-        })
+          end_date_for_rates: endDateForRates,
+          customerId,
+          upstreamStatusAvailability: Number.isFinite(availabilityResult.upstreamStatus)
+            ? availabilityResult.upstreamStatus
+            : null,
+          upstreamStatusRates: Number.isFinite(ratesResult.upstreamStatus)
+            ? ratesResult.upstreamStatus
+            : null,
+          ratesCount
+        }
       : undefined;
 
     res.status(200).json({
       ok: true,
       source: "smoobu",
       available: true,
-      nightlyPrice,
-      totalPrice,
+      priced: true,
+      apartmentId,
+      arrival,
+      departure,
+      nights: nights.length,
+      currency: "MXN",
+      quote: {
+        subtotal,
+        taxes: null,
+        fees: null,
+        total: subtotal
+      },
       ...(debugInfo ? { debug: debugInfo } : {})
     });
   } catch (err) {
