@@ -16,39 +16,11 @@ function parseDate(value) {
   return date;
 }
 
-function addDays(date, days) {
-  const next = new Date(date.getTime());
-  next.setUTCDate(next.getUTCDate() + days);
-  return next;
-}
-
 function formatDate(date) {
   const year = date.getUTCFullYear();
   const month = String(date.getUTCMonth() + 1).padStart(2, "0");
   const day = String(date.getUTCDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
-}
-
-function buildDebug({
-  startDate,
-  endDate,
-  apartmentId,
-  upstreamUrl,
-  upstreamStatus,
-  upstreamStatusText,
-  rates
-}) {
-  const rateKeys = rates && typeof rates === "object" ? Object.keys(rates) : [];
-  return {
-    start_date: startDate || null,
-    end_date: endDate || null,
-    apartmentId: apartmentId ? String(apartmentId) : null,
-    upstreamUrl: upstreamUrl || null,
-    upstreamStatus: Number.isFinite(upstreamStatus) ? upstreamStatus : null,
-    upstreamStatusText: typeof upstreamStatusText === "string" ? upstreamStatusText : null,
-    ratesCount: rateKeys.length,
-    sampleKeys: rateKeys.slice(0, 5)
-  };
 }
 
 export default async function handler(req, res) {
@@ -124,20 +96,27 @@ export default async function handler(req, res) {
       return;
     }
 
-    const startDate = formatDate(checkInDate);
-    const endDate = formatDate(addDays(checkOutDate, -1));
-    const upstreamUrl = `https://login.smoobu.com/api/rates?start_date=${encodeURIComponent(startDate)}&end_date=${encodeURIComponent(endDate)}&apartments%5B%5D=${encodeURIComponent(String(apartmentId))}`;
+    const from = formatDate(checkInDate);
+    const to = formatDate(checkOutDate);
+    const upstreamUrl = "https://login.smoobu.com/booking/checkApartmentAvailability";
+    const apartmentIdNumber = Number(apartmentId);
 
     const response = await fetch(upstreamUrl, {
+      method: "POST",
       headers: {
         "Api-Key": apiKey,
-        "Accept": "application/json"
-      }
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        apartmentId: apartmentIdNumber,
+        from,
+        to
+      })
     });
 
     const upstreamStatus = response.status;
     const upstreamStatusText = response.statusText;
-    const upstreamText = await response.text();
     if (!response.ok) {
       res.status(502).json({
         ok: false,
@@ -145,175 +124,38 @@ export default async function handler(req, res) {
         upstream: {
           status: Number.isFinite(upstreamStatus) ? upstreamStatus : null,
           statusText: typeof upstreamStatusText === "string" ? upstreamStatusText : null
-        },
-        available: false,
-        nightlyPrice: null,
-        reason: "UPSTREAM_NON_2XX",
-        debug: buildDebug({
-          startDate,
-          endDate,
-          apartmentId,
-          upstreamUrl,
-          upstreamStatus,
-          upstreamStatusText
-        })
+        }
       });
       return;
     }
 
     let upstreamJson = null;
     try {
-      upstreamJson = upstreamText ? JSON.parse(upstreamText) : null;
+      upstreamJson = await response.json();
     } catch (parseError) {
       res.status(502).json({
         ok: false,
-        error: "SMOOBU_UPSTREAM_INVALID",
+        error: "SMOOBU_UPSTREAM_FAILED",
         upstream: {
           status: Number.isFinite(upstreamStatus) ? upstreamStatus : null,
           statusText: typeof upstreamStatusText === "string" ? upstreamStatusText : null
-        },
-        available: false,
-        nightlyPrice: null,
-        reason: "PARSE_ERROR",
-        debug: buildDebug({
-          startDate,
-          endDate,
-          apartmentId,
-          upstreamUrl,
-          upstreamStatus,
-          upstreamStatusText
-        })
+        }
       });
       return;
     }
 
-    const prices =
-      (upstreamJson && upstreamJson.data && upstreamJson.data[String(apartmentId)]) ||
-      (upstreamJson && upstreamJson.data && upstreamJson.data[apartmentId]) ||
-      null;
-
-    if (!prices) {
-      res.status(200).json({
-        ok: true,
-        source: "smoobu",
-        available: true,
-        nightlyPrice: null,
-        reason: "NO_RATES",
-        debug: buildDebug({
-          startDate,
-          endDate,
-          apartmentId,
-          upstreamUrl,
-          upstreamStatus,
-          upstreamStatusText
-        })
-      });
-      return;
-    }
-
-    const priceKeys = Object.keys(prices);
-    if (priceKeys.length === 0) {
-      res.status(200).json({
-        ok: true,
-        source: "smoobu",
-        available: true,
-        nightlyPrice: null,
-        reason: "RATES_EMPTY",
-        debug: buildDebug({
-          startDate,
-          endDate,
-          apartmentId,
-          upstreamUrl,
-          upstreamStatus,
-          upstreamStatusText,
-          rates: prices
-        })
-      });
-      return;
-    }
-
-    const nights = [];
-    for (let cursor = checkInDate; cursor < checkOutDate; cursor = addDays(cursor, 1)) {
-      nights.push(formatDate(cursor));
-    }
-
-    let blocked = false;
-    let partial = false;
-
-    for (const night of nights) {
-      const entry = prices[night];
-      if (!entry) {
-        partial = true;
-        continue;
-      }
-      if (entry.available === 0 || entry.available === false) {
-        blocked = true;
-        break;
-      }
-      if (!Number.isFinite(entry.price)) {
-        partial = true;
-      }
-    }
-
-    if (blocked) {
-      res.status(200).json({
-        ok: true,
-        source: "smoobu",
-        available: false,
-        nightlyPrice: null,
-        reason: "UNKNOWN",
-        debug: buildDebug({
-          startDate,
-          endDate,
-          apartmentId,
-          upstreamUrl,
-          upstreamStatus,
-          upstreamStatusText,
-          rates: prices
-        })
-      });
-      return;
-    }
-
-    if (partial) {
-      res.status(200).json({
-        ok: true,
-        source: "smoobu",
-        available: true,
-        nightlyPrice: null,
-        reason: "RATES_PARTIAL",
-        debug: buildDebug({
-          startDate,
-          endDate,
-          apartmentId,
-          upstreamUrl,
-          upstreamStatus,
-          upstreamStatusText,
-          rates: prices
-        })
-      });
-      return;
-    }
-
-    const nightlyPrice = nights.length > 0 && prices[nights[0]]
-      ? Number(prices[nights[0]].price)
-      : null;
+    const available = upstreamJson?.available === true;
 
     res.status(200).json({
       ok: true,
+      available,
       source: "smoobu",
-      available: true,
-      nightlyPrice,
-      reason: "UNKNOWN",
-      debug: buildDebug({
-        startDate,
-        endDate,
-        apartmentId,
-        upstreamUrl,
-        upstreamStatus,
-        upstreamStatusText,
-        rates: prices
-      })
+      debug: {
+        apartmentId: apartmentIdNumber,
+        from,
+        to,
+        upstreamStatus: Number.isFinite(upstreamStatus) ? upstreamStatus : null
+      }
     });
   } catch (err) {
     console.error("[smoobu] endpoint failed", {
