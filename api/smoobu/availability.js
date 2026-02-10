@@ -46,13 +46,21 @@ export default async function handler(req, res) {
     console.log("availability query", { apartmentId, checkIn, checkOut, guests });
 
     if (!apartmentId || !checkIn || !checkOut || !guests) {
+      const apartmentIdNumber = Number.isFinite(Number(apartmentId))
+        ? Number(apartmentId)
+        : null;
       res.status(200).json({
         ok: true,
         source: "smoobu",
         available: false,
         nightlyPrice: null,
         reason: "UNKNOWN",
-        debug: buildDebug({ apartmentId })
+        debug: {
+          apartmentId: apartmentIdNumber,
+          from: null,
+          to: null,
+          upstreamStatus: null
+        }
       });
       return;
     }
@@ -60,38 +68,62 @@ export default async function handler(req, res) {
     const checkInDate = parseDate(checkIn);
     const checkOutDate = parseDate(checkOut);
     if (!checkInDate || !checkOutDate) {
+      const apartmentIdNumber = Number.isFinite(Number(apartmentId))
+        ? Number(apartmentId)
+        : null;
       res.status(200).json({
         ok: true,
         source: "smoobu",
         available: false,
         nightlyPrice: null,
         reason: "UNKNOWN",
-        debug: buildDebug({ apartmentId })
+        debug: {
+          apartmentId: apartmentIdNumber,
+          from: null,
+          to: null,
+          upstreamStatus: null
+        }
       });
       return;
     }
 
     if (checkOutDate <= checkInDate) {
+      const apartmentIdNumber = Number.isFinite(Number(apartmentId))
+        ? Number(apartmentId)
+        : null;
       res.status(200).json({
         ok: true,
         source: "smoobu",
         available: false,
         nightlyPrice: null,
         reason: "UNKNOWN",
-        debug: buildDebug({ apartmentId })
+        debug: {
+          apartmentId: apartmentIdNumber,
+          from: null,
+          to: null,
+          upstreamStatus: null
+        }
       });
       return;
     }
 
     const apiKey = process.env.SMOOBU_API_KEY;
     if (!apiKey) {
+      const apartmentIdNumber = Number.isFinite(Number(apartmentId))
+        ? Number(apartmentId)
+        : null;
       res.status(200).json({
         ok: true,
         source: "smoobu",
         available: false,
         nightlyPrice: null,
         reason: "UNKNOWN",
-        debug: buildDebug({ apartmentId })
+        debug: {
+          apartmentId: apartmentIdNumber,
+          from: null,
+          to: null,
+          upstreamStatus: null
+        }
       });
       return;
     }
