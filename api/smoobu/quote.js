@@ -411,9 +411,19 @@ export default async function handler(req, res) {
     }
 
     const nights = getNightDates(arrivalDate, departureDate);
-    const ratesCount = ratesResult.prices && typeof ratesResult.prices === "object"
-      ? Object.keys(ratesResult.prices).length
-      : 0;
+    const ratesEntries = ratesResult.prices && typeof ratesResult.prices === "object"
+      ? Object.entries(ratesResult.prices)
+      : [];
+    const ratesCount = ratesEntries.length;
+    const sampleEntry = ratesEntries.length > 0 ? ratesEntries[0][1] : null;
+    const nightlyFieldCandidates = sampleEntry && typeof sampleEntry === "object"
+      ? Object.keys(sampleEntry)
+      : [];
+    const ratesSample = ratesEntries.slice(0, 2).map(([date, entry]) => ({
+      date,
+      price: Number.isFinite(entry?.price) ? Number(entry.price) : null,
+      available: entry?.available ?? null
+    }));
 
     if (!ratesResult.prices || ratesCount === 0) {
       const debugInfo = debug
@@ -428,7 +438,9 @@ export default async function handler(req, res) {
             upstreamStatusRates: Number.isFinite(ratesResult.upstreamStatus)
               ? ratesResult.upstreamStatus
               : null,
-            ratesCount
+            ratesCount,
+            ratesSample,
+            nightlyFieldCandidates
           }
         : undefined;
 
@@ -458,7 +470,9 @@ export default async function handler(req, res) {
           upstreamStatusRates: Number.isFinite(ratesResult.upstreamStatus)
             ? ratesResult.upstreamStatus
             : null,
-          ratesCount
+          ratesCount,
+          ratesSample,
+          nightlyFieldCandidates
         }
       : undefined;
 
