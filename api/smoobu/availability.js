@@ -42,88 +42,61 @@ export default async function handler(req, res) {
       return;
     }
 
-    const { apartmentId, checkIn, checkOut, guests } = req.query;
-    console.log("availability query", { apartmentId, checkIn, checkOut, guests });
+    const query = req.query || {};
+    const rawApartmentId =
+      query.apartmentId ??
+      query.apartment_id ??
+      (Array.isArray(query["apartments[]"]) ? query["apartments[]"][0] : query["apartments[]"]) ??
+      (Array.isArray(query.apartments) ? query.apartments[0] : query.apartments) ??
+      null;
+    const apartmentIdNumber = Number(rawApartmentId);
 
-    if (!apartmentId || !checkIn || !checkOut || !guests) {
-      const apartmentIdNumber = Number.isFinite(Number(apartmentId))
-        ? Number(apartmentId)
-        : null;
-      res.status(200).json({
-        ok: true,
-        source: "smoobu",
-        available: false,
-        nightlyPrice: null,
-        reason: "UNKNOWN",
-        debug: {
-          apartmentId: apartmentIdNumber,
-          from: null,
-          to: null,
-          upstreamStatus: null
-        }
+    if (!Number.isFinite(apartmentIdNumber)) {
+      res.status(400).json({
+        ok: false,
+        error: "VALIDATION_ERROR",
+        message: "Missing/invalid apartmentId"
       });
       return;
     }
 
-    const checkInDate = parseDate(checkIn);
-    const checkOutDate = parseDate(checkOut);
+    const arrivalRaw = query.arrival ?? query.from ?? query.start_date ?? null;
+    const departureRaw = query.departure ?? query.to ?? query.end_date ?? null;
+
+    if (!arrivalRaw || !departureRaw) {
+      res.status(400).json({
+        ok: false,
+        error: "VALIDATION_ERROR",
+        message: "Missing/invalid arrival/departure"
+      });
+      return;
+    }
+
+    const checkInDate = parseDate(String(arrivalRaw));
+    const checkOutDate = parseDate(String(departureRaw));
     if (!checkInDate || !checkOutDate) {
-      const apartmentIdNumber = Number.isFinite(Number(apartmentId))
-        ? Number(apartmentId)
-        : null;
-      res.status(200).json({
-        ok: true,
-        source: "smoobu",
-        available: false,
-        nightlyPrice: null,
-        reason: "UNKNOWN",
-        debug: {
-          apartmentId: apartmentIdNumber,
-          from: null,
-          to: null,
-          upstreamStatus: null
-        }
+      res.status(400).json({
+        ok: false,
+        error: "VALIDATION_ERROR",
+        message: "Missing/invalid arrival/departure"
       });
       return;
     }
 
     if (checkOutDate <= checkInDate) {
-      const apartmentIdNumber = Number.isFinite(Number(apartmentId))
-        ? Number(apartmentId)
-        : null;
-      res.status(200).json({
-        ok: true,
-        source: "smoobu",
-        available: false,
-        nightlyPrice: null,
-        reason: "UNKNOWN",
-        debug: {
-          apartmentId: apartmentIdNumber,
-          from: null,
-          to: null,
-          upstreamStatus: null
-        }
+      res.status(400).json({
+        ok: false,
+        error: "VALIDATION_ERROR",
+        message: "Missing/invalid arrival/departure"
       });
       return;
     }
 
     const apiKey = process.env.SMOOBU_API_KEY;
     if (!apiKey) {
-      const apartmentIdNumber = Number.isFinite(Number(apartmentId))
-        ? Number(apartmentId)
-        : null;
-      res.status(200).json({
-        ok: true,
-        source: "smoobu",
-        available: false,
-        nightlyPrice: null,
-        reason: "UNKNOWN",
-        debug: {
-          apartmentId: apartmentIdNumber,
-          from: null,
-          to: null,
-          upstreamStatus: null
-        }
+      res.status(500).json({
+        ok: false,
+        error: "SMOOBU_KEY_MISSING"
       });
       return;
     }
@@ -131,8 +104,6 @@ export default async function handler(req, res) {
     const from = formatDate(checkInDate);
     const to = formatDate(checkOutDate);
     const upstreamUrl = "https://login.smoobu.com/booking/checkApartmentAvailability";
-    const apartmentIdNumber = Number(apartmentId);
-
     const response = await fetch(upstreamUrl, {
       method: "POST",
       headers: {
