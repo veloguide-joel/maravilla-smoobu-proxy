@@ -66,8 +66,7 @@ export default async function handler(req, res) {
     if (!arrivalRaw || !departureRaw) {
       res.status(400).json({
         ok: false,
-        error: "VALIDATION_ERROR",
-        message: "Missing/invalid arrival/departure"
+        error: "VALIDATION_ERROR"
       });
       return;
     }
@@ -77,8 +76,7 @@ export default async function handler(req, res) {
     if (!checkInDate || !checkOutDate) {
       res.status(400).json({
         ok: false,
-        error: "VALIDATION_ERROR",
-        message: "Missing/invalid arrival/departure"
+        error: "VALIDATION_ERROR"
       });
       return;
     }
@@ -86,8 +84,7 @@ export default async function handler(req, res) {
     if (checkOutDate <= checkInDate) {
       res.status(400).json({
         ok: false,
-        error: "VALIDATION_ERROR",
-        message: "Missing/invalid arrival/departure"
+        error: "VALIDATION_ERROR"
       });
       return;
     }
@@ -101,10 +98,77 @@ export default async function handler(req, res) {
       return;
     }
 
-    const from = formatDate(checkInDate);
-    const to = formatDate(checkOutDate);
+    const arrivalDate = formatDate(checkInDate);
+    const departureDate = formatDate(checkOutDate);
     const upstreamUrl = "https://login.smoobu.com/booking/checkApartmentAvailability";
-    const response = await fetch(upstreamUrl, {
+    let customerId = Number(process.env.SMOOBU_CUSTOMER_ID);
+    if (!Number.isFinite(customerId)) {
+      let meResponse = null;
+      try {
+        meResponse = await fetch("https://login.smoobu.com/api/me", {
+          headers: {
+            "Api-Key": apiKey,
+            "Accept": "application/json"
+          }
+        });
+      } catch (fetchError) {
+        res.status(502).json({
+          ok: false,
+          error: "SMOOBU_UPSTREAM_FAILED",
+          upstream: {
+            status: null,
+            statusText: null
+          }
+        });
+        return;
+      }
+
+      const meStatus = meResponse.status;
+      const meStatusText = meResponse.statusText;
+      if (!meResponse.ok) {
+        res.status(502).json({
+          ok: false,
+          error: "SMOOBU_UPSTREAM_FAILED",
+          upstream: {
+            status: Number.isFinite(meStatus) ? meStatus : null,
+            statusText: typeof meStatusText === "string" ? meStatusText : null
+          }
+        });
+        return;
+      }
+
+      let meJson = null;
+      try {
+        meJson = await meResponse.json();
+      } catch (parseError) {
+        res.status(502).json({
+          ok: false,
+          error: "SMOOBU_UPSTREAM_FAILED",
+          upstream: {
+            status: Number.isFinite(meStatus) ? meStatus : null,
+            statusText: typeof meStatusText === "string" ? meStatusText : null
+          }
+        });
+        return;
+      }
+
+      customerId = Number(meJson?.id);
+      if (!Number.isFinite(customerId)) {
+        res.status(502).json({
+          ok: false,
+          error: "SMOOBU_UPSTREAM_FAILED",
+          upstream: {
+            status: Number.isFinite(meStatus) ? meStatus : null,
+            statusText: typeof meStatusText === "string" ? meStatusText : null
+          }
+        });
+        return;
+      }
+    }
+
+    let response = null;
+    try {
+      response = await fetch(upstreamUrl, {
       method: "POST",
       headers: {
         "Api-Key": apiKey,
@@ -112,11 +176,23 @@ export default async function handler(req, res) {
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        apartmentId: apartmentIdNumber,
-        from,
-        to
+        arrivalDate,
+        departureDate,
+        apartments: [apartmentIdNumber],
+        customerId
       })
-    });
+      });
+    } catch (fetchError) {
+      res.status(502).json({
+        ok: false,
+        error: "SMOOBU_UPSTREAM_FAILED",
+        upstream: {
+          status: null,
+          statusText: null
+        }
+      });
+      return;
+    }
 
     const upstreamStatus = response.status;
     const upstreamStatusText = response.statusText;
@@ -147,16 +223,41 @@ export default async function handler(req, res) {
       return;
     }
 
-    const available = upstreamJson?.available === true;
+    const availableApartments = Array.isArray(upstreamJson?.availableApartments)
+      ? upstreamJson.availableApartments
+      : [];
+    const available = availableApartments
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value))
+      .includes(apartmentIdNumber);
+
+    let reason = null;
+    if (!available && upstreamJson?.errorMessages) {
+      const errors = upstreamJson.errorMessages;
+      if (Array.isArray(errors)) {
+        const match = errors.find((item) => Number(item?.apartmentId) === apartmentIdNumber);
+        reason = match?.errorCode || match?.message || null;
+      } else if (typeof errors === "object") {
+        const entry = errors[String(apartmentIdNumber)] ?? errors[apartmentIdNumber];
+        if (entry && typeof entry === "object") {
+          reason = entry.errorCode || entry.message || null;
+        } else if (typeof entry === "string") {
+          reason = entry;
+        }
+      }
+    }
 
     res.status(200).json({
       ok: true,
       available,
       source: "smoobu",
+      nightlyPrice: null,
+      reason,
       debug: {
         apartmentId: apartmentIdNumber,
-        from,
-        to,
+        arrivalDate,
+        departureDate,
+        customerId,
         upstreamStatus: Number.isFinite(upstreamStatus) ? upstreamStatus : null
       }
     });
