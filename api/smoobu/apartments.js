@@ -65,7 +65,7 @@ export default async function handler(req, res) {
 
   } catch (err) {
     console.error("[smoobu] endpoint failed", {
-      endpoint: "apartments",
+      endpoint: "smoobu/apartments",
       message: err?.message,
       stack: err?.stack
     });
@@ -77,7 +77,7 @@ export default async function handler(req, res) {
     res.status(500).json({
       ok: false,
       error: "FUNCTION_FAILED",
-      endpoint: "apartments",
+      endpoint: "smoobu/apartments",
       message: err?.message || "Unknown error"
     });
   }
