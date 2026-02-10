@@ -1,18 +1,3 @@
-const ALLOWED_ORIGINS = new Set([
-  "http://127.0.0.1:5500",
-  "http://localhost:5500"
-]);
-
-function applyCors(req, res) {
-  const origin = req.headers.origin;
-  if (origin && ALLOWED_ORIGINS.has(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Vary", "Origin");
-  }
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-}
-
 function parseDate(value) {
   if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
     return null;
@@ -46,18 +31,19 @@ function formatDate(date) {
 
 export default async function handler(req, res) {
   try {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
     res.setHeader("Pragma", "no-cache");
     res.setHeader("Expires", "0");
 
     if (req.method === "OPTIONS") {
-      applyCors(req, res);
-      res.status(204).end();
+      res.status(200).end();
       return;
     }
 
     if (req.method !== "GET") {
-      applyCors(req, res);
       res.status(405).json({ error: "Method Not Allowed" });
       return;
     }
@@ -73,7 +59,6 @@ export default async function handler(req, res) {
           got: { apartmentId, checkIn, checkOut, guests }
         };
       }
-      applyCors(req, res);
       res.status(200).json(payload);
       return;
     }
@@ -88,7 +73,6 @@ export default async function handler(req, res) {
           got: { apartmentId, checkIn, checkOut, guests }
         };
       }
-      applyCors(req, res);
       res.status(200).json(payload);
       return;
     }
@@ -101,7 +85,6 @@ export default async function handler(req, res) {
           got: { checkIn, checkOut }
         };
       }
-      applyCors(req, res);
       res.status(200).json(payload);
       return;
     }
@@ -112,7 +95,6 @@ export default async function handler(req, res) {
       if (debug === "1") {
         payload._debug = { reason: "missing_api_key" };
       }
-      applyCors(req, res);
       res.status(200).json(payload);
       return;
     }
@@ -132,7 +114,6 @@ export default async function handler(req, res) {
     const upstreamStatusText = response.statusText;
     const upstreamText = await response.text();
     if (!response.ok) {
-      applyCors(req, res);
       res.status(502).json({
         ok: false,
         error: "SMOOBU_UPSTREAM_FAILED",
@@ -148,7 +129,6 @@ export default async function handler(req, res) {
     try {
       upstreamJson = upstreamText ? JSON.parse(upstreamText) : null;
     } catch (parseError) {
-      applyCors(req, res);
       res.status(502).json({
         ok: false,
         error: "SMOOBU_UPSTREAM_INVALID",
@@ -177,7 +157,6 @@ export default async function handler(req, res) {
           priceKeysSample: []
         };
       }
-      applyCors(req, res);
       res.status(200).json(payload);
       return;
     }
@@ -235,7 +214,6 @@ export default async function handler(req, res) {
       };
     }
 
-    applyCors(req, res);
     res.status(200).json(payload);
   } catch (err) {
     console.error("[smoobu] endpoint failed", {
@@ -243,11 +221,6 @@ export default async function handler(req, res) {
       message: err?.message,
       stack: err?.stack
     });
-    try {
-      applyCors(req, res);
-    } catch (corsError) {
-      // Ignore secondary failures when applying CORS headers.
-    }
     res.status(500).json({
       ok: false,
       error: "FUNCTION_FAILED",

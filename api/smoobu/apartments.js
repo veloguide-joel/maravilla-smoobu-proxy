@@ -1,12 +1,14 @@
-import { applyCors, handleCorsPreflight } from "../_cors";
-
 export default async function handler(req, res) {
-  try {
-    if (handleCorsPreflight(req, res)) {
-      return;
-    }
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
-    applyCors(req, res);
+  if (req.method === "OPTIONS") {
+    res.status(200).end();
+    return;
+  }
+
+  try {
 
     const response = await fetch(
       `${process.env.SMOOBU_API_BASE}/apartments`,
@@ -69,11 +71,6 @@ export default async function handler(req, res) {
       message: err?.message,
       stack: err?.stack
     });
-    try {
-      applyCors(req, res);
-    } catch (corsError) {
-      // Ignore secondary failures when applying CORS headers.
-    }
     res.status(500).json({
       ok: false,
       error: "FUNCTION_FAILED",

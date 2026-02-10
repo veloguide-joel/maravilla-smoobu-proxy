@@ -1,4 +1,3 @@
-import cors from "../_cors.js";
 import { pool } from "../_db.js";
 
 // Thunder Client example:
@@ -48,7 +47,12 @@ function parseCount(value, fallback) {
 
 export default async function handler(req, res) {
   try {
-    if (cors(req, res)) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+    if (req.method === "OPTIONS") {
+      res.status(200).end();
       return;
     }
 
@@ -239,11 +243,6 @@ export default async function handler(req, res) {
       message: err?.message,
       stack: err?.stack
     });
-    try {
-      cors(req, res);
-    } catch (corsError) {
-      // Ignore secondary failures when applying CORS headers.
-    }
     res.status(500).json({
       ok: false,
       error: "FUNCTION_FAILED",
