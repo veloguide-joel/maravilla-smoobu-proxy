@@ -118,16 +118,45 @@ export default async function handler(req, res) {
     const startDate = formatDate(arrivalDate);
     const endDate = formatDate(addDays(departureDate, -1));
     const upstreamUrl = `https://login.smoobu.com/api/rates?start_date=${encodeURIComponent(startDate)}&end_date=${encodeURIComponent(endDate)}&apartments%5B%5D=${encodeURIComponent(String(apartmentId))}`;
+    const safeUpstreamUrl = upstreamUrl;
 
-    const response = await fetch(upstreamUrl, {
-      headers: {
-        "Api-Key": apiKey,
-        "Accept": "application/json"
-      }
-    });
+    let response = null;
+    try {
+      response = await fetch(upstreamUrl, {
+        headers: {
+          "Api-Key": apiKey,
+          "Accept": "application/json"
+        }
+      });
+    } catch (fetchError) {
+      res.status(502).json({
+        ok: false,
+        error: "SMOOBU_UPSTREAM_FAILED",
+        upstream: {
+          status: null,
+          statusText: null
+        },
+        request: {
+          url: safeUpstreamUrl,
+          method: "GET"
+        }
+      });
+      return;
+    }
 
     if (!response.ok) {
-      res.status(502).json({ ok: false, error: "SMOOBU_UPSTREAM_FAILED" });
+      res.status(502).json({
+        ok: false,
+        error: "SMOOBU_UPSTREAM_FAILED",
+        upstream: {
+          status: Number.isFinite(response.status) ? response.status : null,
+          statusText: typeof response.statusText === "string" ? response.statusText : null
+        },
+        request: {
+          url: safeUpstreamUrl,
+          method: "GET"
+        }
+      });
       return;
     }
 
