@@ -29,6 +29,28 @@ function formatDate(date) {
   return `${year}-${month}-${day}`;
 }
 
+function buildDebug({
+  startDate,
+  endDate,
+  apartmentId,
+  upstreamUrl,
+  upstreamStatus,
+  upstreamStatusText,
+  rates
+}) {
+  const rateKeys = rates && typeof rates === "object" ? Object.keys(rates) : [];
+  return {
+    start_date: startDate || null,
+    end_date: endDate || null,
+    apartmentId: apartmentId ? String(apartmentId) : null,
+    upstreamUrl: upstreamUrl || null,
+    upstreamStatus: Number.isFinite(upstreamStatus) ? upstreamStatus : null,
+    upstreamStatusText: typeof upstreamStatusText === "string" ? upstreamStatusText : null,
+    ratesCount: rateKeys.length,
+    sampleKeys: rateKeys.slice(0, 5)
+  };
+}
+
 export default async function handler(req, res) {
   try {
     res.setHeader("Access-Control-Allow-Origin", "*");
@@ -48,54 +70,57 @@ export default async function handler(req, res) {
       return;
     }
 
-    const { apartmentId, checkIn, checkOut, guests, debug } = req.query;
+    const { apartmentId, checkIn, checkOut, guests } = req.query;
     console.log("availability query", { apartmentId, checkIn, checkOut, guests });
 
     if (!apartmentId || !checkIn || !checkOut || !guests) {
-      const payload = { available: false, nightlyPrice: null };
-      if (debug === "1") {
-        payload._debug = {
-          reason: "missing_params",
-          got: { apartmentId, checkIn, checkOut, guests }
-        };
-      }
-      res.status(200).json(payload);
+      res.status(200).json({
+        ok: true,
+        source: "smoobu",
+        available: false,
+        nightlyPrice: null,
+        reason: "UNKNOWN",
+        debug: buildDebug({ apartmentId })
+      });
       return;
     }
 
     const checkInDate = parseDate(checkIn);
     const checkOutDate = parseDate(checkOut);
     if (!checkInDate || !checkOutDate) {
-      const payload = { available: false, nightlyPrice: null };
-      if (debug === "1") {
-        payload._debug = {
-          reason: "missing_params",
-          got: { apartmentId, checkIn, checkOut, guests }
-        };
-      }
-      res.status(200).json(payload);
+      res.status(200).json({
+        ok: true,
+        source: "smoobu",
+        available: false,
+        nightlyPrice: null,
+        reason: "UNKNOWN",
+        debug: buildDebug({ apartmentId })
+      });
       return;
     }
 
     if (checkOutDate <= checkInDate) {
-      const payload = { available: false, nightlyPrice: null };
-      if (debug === "1") {
-        payload._debug = {
-          reason: "invalid_date_range",
-          got: { checkIn, checkOut }
-        };
-      }
-      res.status(200).json(payload);
+      res.status(200).json({
+        ok: true,
+        source: "smoobu",
+        available: false,
+        nightlyPrice: null,
+        reason: "UNKNOWN",
+        debug: buildDebug({ apartmentId })
+      });
       return;
     }
 
     const apiKey = process.env.SMOOBU_API_KEY;
     if (!apiKey) {
-      const payload = { available: false, nightlyPrice: null };
-      if (debug === "1") {
-        payload._debug = { reason: "missing_api_key" };
-      }
-      res.status(200).json(payload);
+      res.status(200).json({
+        ok: true,
+        source: "smoobu",
+        available: false,
+        nightlyPrice: null,
+        reason: "UNKNOWN",
+        debug: buildDebug({ apartmentId })
+      });
       return;
     }
 
@@ -120,7 +145,18 @@ export default async function handler(req, res) {
         upstream: {
           status: Number.isFinite(upstreamStatus) ? upstreamStatus : null,
           statusText: typeof upstreamStatusText === "string" ? upstreamStatusText : null
-        }
+        },
+        available: false,
+        nightlyPrice: null,
+        reason: "UPSTREAM_NON_2XX",
+        debug: buildDebug({
+          startDate,
+          endDate,
+          apartmentId,
+          upstreamUrl,
+          upstreamStatus,
+          upstreamStatusText
+        })
       });
       return;
     }
@@ -135,7 +171,18 @@ export default async function handler(req, res) {
         upstream: {
           status: Number.isFinite(upstreamStatus) ? upstreamStatus : null,
           statusText: typeof upstreamStatusText === "string" ? upstreamStatusText : null
-        }
+        },
+        available: false,
+        nightlyPrice: null,
+        reason: "PARSE_ERROR",
+        debug: buildDebug({
+          startDate,
+          endDate,
+          apartmentId,
+          upstreamUrl,
+          upstreamStatus,
+          upstreamStatusText
+        })
       });
       return;
     }
@@ -146,18 +193,42 @@ export default async function handler(req, res) {
       null;
 
     if (!prices) {
-      const payload = { available: false, nightlyPrice: null };
-      if (debug === "1") {
-        payload._debug = {
+      res.status(200).json({
+        ok: true,
+        source: "smoobu",
+        available: true,
+        nightlyPrice: null,
+        reason: "NO_RATES",
+        debug: buildDebug({
+          startDate,
+          endDate,
+          apartmentId,
           upstreamUrl,
           upstreamStatus,
-          nights: [],
-          failedNight: null,
-          failedReason: "missing_prices_object",
-          priceKeysSample: []
-        };
-      }
-      res.status(200).json(payload);
+          upstreamStatusText
+        })
+      });
+      return;
+    }
+
+    const priceKeys = Object.keys(prices);
+    if (priceKeys.length === 0) {
+      res.status(200).json({
+        ok: true,
+        source: "smoobu",
+        available: true,
+        nightlyPrice: null,
+        reason: "RATES_EMPTY",
+        debug: buildDebug({
+          startDate,
+          endDate,
+          apartmentId,
+          upstreamUrl,
+          upstreamStatus,
+          upstreamStatusText,
+          rates: prices
+        })
+      });
       return;
     }
 
@@ -166,55 +237,84 @@ export default async function handler(req, res) {
       nights.push(formatDate(cursor));
     }
 
-    let available = true;
-    let failedNight = null;
-    let failedReason = null;
-    let failedAvailable = null;
+    let blocked = false;
+    let partial = false;
 
     for (const night of nights) {
       const entry = prices[night];
       if (!entry) {
-        available = false;
-        failedNight = night;
-        failedReason = "missing_price_entry";
-        break;
+        partial = true;
+        continue;
       }
-      if (entry.available !== 1) {
-        available = false;
-        failedNight = night;
-        failedReason = "night_unavailable";
-        failedAvailable = entry.available;
+      if (entry.available === 0 || entry.available === false) {
+        blocked = true;
         break;
       }
       if (!Number.isFinite(entry.price)) {
-        available = false;
-        failedNight = night;
-        failedReason = "missing_price_value";
-        break;
+        partial = true;
       }
     }
 
-    const nightlyPrice = available && nights.length > 0 && prices[nights[0]]
+    if (blocked) {
+      res.status(200).json({
+        ok: true,
+        source: "smoobu",
+        available: false,
+        nightlyPrice: null,
+        reason: "UNKNOWN",
+        debug: buildDebug({
+          startDate,
+          endDate,
+          apartmentId,
+          upstreamUrl,
+          upstreamStatus,
+          upstreamStatusText,
+          rates: prices
+        })
+      });
+      return;
+    }
+
+    if (partial) {
+      res.status(200).json({
+        ok: true,
+        source: "smoobu",
+        available: true,
+        nightlyPrice: null,
+        reason: "RATES_PARTIAL",
+        debug: buildDebug({
+          startDate,
+          endDate,
+          apartmentId,
+          upstreamUrl,
+          upstreamStatus,
+          upstreamStatusText,
+          rates: prices
+        })
+      });
+      return;
+    }
+
+    const nightlyPrice = nights.length > 0 && prices[nights[0]]
       ? Number(prices[nights[0]].price)
       : null;
 
-    const payload = { available, nightlyPrice };
-
-    if (debug === "1") {
-      payload._debug = {
+    res.status(200).json({
+      ok: true,
+      source: "smoobu",
+      available: true,
+      nightlyPrice,
+      reason: "UNKNOWN",
+      debug: buildDebug({
+        startDate,
+        endDate,
+        apartmentId,
         upstreamUrl,
         upstreamStatus,
-        requestedStartDate: startDate,
-        requestedEndDate: endDate,
-        nights,
-        failedNight,
-        failedReason,
-        failedAvailable,
-        priceKeysSample: Object.keys(prices).slice(0, 5)
-      };
-    }
-
-    res.status(200).json(payload);
+        upstreamStatusText,
+        rates: prices
+      })
+    });
   } catch (err) {
     console.error("[smoobu] endpoint failed", {
       endpoint: "availability",
