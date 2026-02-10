@@ -252,30 +252,23 @@ function getNightDates(arrivalDate, departureDate) {
 
 function computePrices(prices, nights) {
   if (!prices || !Array.isArray(nights) || nights.length === 0) {
-    return { nightlyPrice: null, totalPrice: null, pricedNightsCount: 0 };
+    return { totalPrice: null, validNightCount: 0 };
   }
 
   let total = 0;
-  let count = 0;
+  let validNightCount = 0;
 
   for (const night of nights) {
     const entry = prices[night];
-    if (!entry || !Number.isFinite(entry.price)) {
+    const nightly = Number(entry?.price);
+    if (!Number.isFinite(nightly) || nightly <= 0) {
       continue;
     }
-    total += Number(entry.price);
-    count += 1;
+    total += nightly;
+    validNightCount += 1;
   }
 
-  if (count === 0) {
-    return { nightlyPrice: null, totalPrice: null, pricedNightsCount: 0 };
-  }
-
-  return {
-    nightlyPrice: total / count,
-    totalPrice: total,
-    pricedNightsCount: count
-  };
+  return { totalPrice: validNightCount > 0 ? total : null, validNightCount };
 }
 
 export default async function handler(req, res) {
@@ -440,7 +433,9 @@ export default async function handler(req, res) {
               : null,
             ratesCount,
             ratesSample,
-            nightlyFieldCandidates
+            nightlyFieldCandidates,
+            validNightCount: 0,
+            missingNightCount: nights.length
           }
         : undefined;
 
@@ -450,12 +445,96 @@ export default async function handler(req, res) {
         available: true,
         priced: false,
         message: "AVAILABLE_BUT_NO_RATES",
+        apartmentId,
+        arrival,
+        departure,
+        nights: nights.length,
+        currency: "MXN",
+        quote: null,
         ...(debugInfo ? { debug: debugInfo } : {})
       });
       return;
     }
 
-    const { totalPrice } = computePrices(ratesResult.prices, nights);
+    const { totalPrice, validNightCount } = computePrices(ratesResult.prices, nights);
+    const missingNightCount = nights.length - validNightCount;
+
+    if (validNightCount === 0) {
+      const debugInfo = debug
+        ? {
+            arrival,
+            departure,
+            end_date_for_rates: endDateForRates,
+            customerId,
+            upstreamStatusAvailability: Number.isFinite(availabilityResult.upstreamStatus)
+              ? availabilityResult.upstreamStatus
+              : null,
+            upstreamStatusRates: Number.isFinite(ratesResult.upstreamStatus)
+              ? ratesResult.upstreamStatus
+              : null,
+            ratesCount,
+            ratesSample,
+            nightlyFieldCandidates,
+            validNightCount,
+            missingNightCount
+          }
+        : undefined;
+
+      res.status(200).json({
+        ok: true,
+        source: "smoobu",
+        available: true,
+        priced: false,
+        message: "AVAILABLE_BUT_NO_RATES",
+        apartmentId,
+        arrival,
+        departure,
+        nights: nights.length,
+        currency: "MXN",
+        quote: null,
+        ...(debugInfo ? { debug: debugInfo } : {})
+      });
+      return;
+    }
+
+    if (validNightCount < nights.length) {
+      const debugInfo = debug
+        ? {
+            arrival,
+            departure,
+            end_date_for_rates: endDateForRates,
+            customerId,
+            upstreamStatusAvailability: Number.isFinite(availabilityResult.upstreamStatus)
+              ? availabilityResult.upstreamStatus
+              : null,
+            upstreamStatusRates: Number.isFinite(ratesResult.upstreamStatus)
+              ? ratesResult.upstreamStatus
+              : null,
+            ratesCount,
+            ratesSample,
+            nightlyFieldCandidates,
+            validNightCount,
+            missingNightCount
+          }
+        : undefined;
+
+      res.status(200).json({
+        ok: true,
+        source: "smoobu",
+        available: true,
+        priced: false,
+        message: "RATES_PARTIAL",
+        apartmentId,
+        arrival,
+        departure,
+        nights: nights.length,
+        currency: "MXN",
+        quote: null,
+        ...(debugInfo ? { debug: debugInfo } : {})
+      });
+      return;
+    }
+
     const subtotal = totalPrice ?? 0;
 
     const debugInfo = debug
@@ -472,7 +551,9 @@ export default async function handler(req, res) {
             : null,
           ratesCount,
           ratesSample,
-          nightlyFieldCandidates
+          nightlyFieldCandidates,
+          validNightCount,
+          missingNightCount
         }
       : undefined;
 
