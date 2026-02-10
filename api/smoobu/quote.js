@@ -234,10 +234,21 @@ export default async function handler(req, res) {
       }
     });
   } catch (err) {
+    console.error("[smoobu] endpoint failed", {
+      endpoint: "quote",
+      message: err?.message,
+      stack: err?.stack
+    });
+    try {
+      cors(req, res);
+    } catch (corsError) {
+      // Ignore secondary failures when applying CORS headers.
+    }
     res.status(500).json({
       ok: false,
-      error: "QUOTE_FAILED",
-      detail: err?.message || "Unknown error"
+      error: "FUNCTION_FAILED",
+      endpoint: "quote",
+      message: err?.message || "Unknown error"
     });
   }
 }

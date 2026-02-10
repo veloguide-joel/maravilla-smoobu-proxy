@@ -1,13 +1,13 @@
 import { applyCors, handleCorsPreflight } from "../_cors";
 
 export default async function handler(req, res) {
-  if (handleCorsPreflight(req, res)) {
-    return;
-  }
-
-  applyCors(req, res);
-
   try {
+    if (handleCorsPreflight(req, res)) {
+      return;
+    }
+
+    applyCors(req, res);
+
     const response = await fetch(
       `${process.env.SMOOBU_API_BASE}/apartments`,
       {
@@ -18,11 +18,37 @@ export default async function handler(req, res) {
       }
     );
 
+    const upstreamStatus = response.status;
+    const upstreamStatusText = response.statusText;
+    const upstreamText = await response.text();
+
     if (!response.ok) {
-      throw new Error(`Smoobu API error: ${response.status}`);
+      res.status(502).json({
+        ok: false,
+        error: "SMOOBU_UPSTREAM_FAILED",
+        upstream: {
+          status: Number.isFinite(upstreamStatus) ? upstreamStatus : null,
+          statusText: typeof upstreamStatusText === "string" ? upstreamStatusText : null
+        }
+      });
+      return;
     }
 
-    const data = await response.json();
+    let data = null;
+    try {
+      data = upstreamText ? JSON.parse(upstreamText) : null;
+    } catch (parseError) {
+      res.status(502).json({
+        ok: false,
+        error: "SMOOBU_UPSTREAM_INVALID",
+        upstream: {
+          status: Number.isFinite(upstreamStatus) ? upstreamStatus : null,
+          statusText: typeof upstreamStatusText === "string" ? upstreamStatusText : null
+        }
+      });
+      return;
+    }
+
     const apartments = Array.isArray(data.apartments) ? data.apartments : [];
     const payload = {
       ok: true,
@@ -38,9 +64,21 @@ export default async function handler(req, res) {
     res.status(200).json(payload);
 
   } catch (err) {
+    console.error("[smoobu] endpoint failed", {
+      endpoint: "apartments",
+      message: err?.message,
+      stack: err?.stack
+    });
+    try {
+      applyCors(req, res);
+    } catch (corsError) {
+      // Ignore secondary failures when applying CORS headers.
+    }
     res.status(500).json({
       ok: false,
-      error: err.message
+      error: "FUNCTION_FAILED",
+      endpoint: "apartments",
+      message: err?.message || "Unknown error"
     });
   }
 }

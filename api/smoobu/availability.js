@@ -45,11 +45,11 @@ function formatDate(date) {
 }
 
 export default async function handler(req, res) {
-  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
-  res.setHeader("Pragma", "no-cache");
-  res.setHeader("Expires", "0");
-
   try {
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+
     if (req.method === "OPTIONS") {
       applyCors(req, res);
       res.status(204).end();
@@ -129,21 +129,18 @@ export default async function handler(req, res) {
     });
 
     const upstreamStatus = response.status;
+    const upstreamStatusText = response.statusText;
     const upstreamText = await response.text();
     if (!response.ok) {
-      const payload = { available: false, nightlyPrice: null };
-      if (debug === "1") {
-        payload._debug = {
-          upstreamUrl,
-          upstreamStatus,
-          nights: [],
-          failedNight: null,
-          failedReason: "upstream_error",
-          priceKeysSample: []
-        };
-      }
       applyCors(req, res);
-      res.status(200).json(payload);
+      res.status(502).json({
+        ok: false,
+        error: "SMOOBU_UPSTREAM_FAILED",
+        upstream: {
+          status: Number.isFinite(upstreamStatus) ? upstreamStatus : null,
+          statusText: typeof upstreamStatusText === "string" ? upstreamStatusText : null
+        }
+      });
       return;
     }
 
@@ -151,19 +148,15 @@ export default async function handler(req, res) {
     try {
       upstreamJson = upstreamText ? JSON.parse(upstreamText) : null;
     } catch (parseError) {
-      const payload = { available: false, nightlyPrice: null };
-      if (debug === "1") {
-        payload._debug = {
-          upstreamUrl,
-          upstreamStatus,
-          nights: [],
-          failedNight: null,
-          failedReason: "upstream_parse_error",
-          priceKeysSample: []
-        };
-      }
       applyCors(req, res);
-      res.status(200).json(payload);
+      res.status(502).json({
+        ok: false,
+        error: "SMOOBU_UPSTREAM_INVALID",
+        upstream: {
+          status: Number.isFinite(upstreamStatus) ? upstreamStatus : null,
+          statusText: typeof upstreamStatusText === "string" ? upstreamStatusText : null
+        }
+      });
       return;
     }
 
@@ -245,13 +238,21 @@ export default async function handler(req, res) {
     applyCors(req, res);
     res.status(200).json(payload);
   } catch (err) {
-    const payload = { available: false, nightlyPrice: null };
-    if (req.query && req.query.debug === "1") {
-      payload.error = err.message;
-      payload.stack = err.stack;
-      payload._debug = { reason: "exception" };
+    console.error("[smoobu] endpoint failed", {
+      endpoint: "availability",
+      message: err?.message,
+      stack: err?.stack
+    });
+    try {
+      applyCors(req, res);
+    } catch (corsError) {
+      // Ignore secondary failures when applying CORS headers.
     }
-    applyCors(req, res);
-    res.status(200).json(payload);
+    res.status(500).json({
+      ok: false,
+      error: "FUNCTION_FAILED",
+      endpoint: "availability",
+      message: err?.message || "Unknown error"
+    });
   }
 }
