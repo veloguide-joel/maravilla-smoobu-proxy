@@ -1,11 +1,8 @@
-import { applyCors, handleCorsPreflight } from "./_cors";
-
 export default function handler(req, res) {
-  if (handleCorsPreflight(req, res)) {
+  if (req.method === "OPTIONS") {
+    res.status(200).end();
     return;
   }
 
-  applyCors(req, res);
-
-  res.status(200).json({ status: "ok" });
+  res.status(200).json({ ok: true, ts: new Date().toISOString() });
 }

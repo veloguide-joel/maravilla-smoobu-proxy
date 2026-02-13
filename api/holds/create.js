@@ -19,6 +19,15 @@ function parseDate(value) {
 }
 
 export default async function handler(req, res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+  if (req.method === "OPTIONS") {
+    res.status(200).end();
+    return;
+  }
+
   if (req.method !== "POST") {
     res.status(405).json({ ok: false, error: "METHOD_NOT_ALLOWED" });
     return;
@@ -44,6 +53,21 @@ export default async function handler(req, res) {
     res.status(400).json({ ok: false, error: "MISSING_FIELDS", missing });
     return;
   }
+
+  if (body.expiresInDays !== undefined && !Number.isInteger(body.expiresInDays)) {
+    res.status(400).json({ ok: false, error: "INVALID_EXPIRES_IN_DAYS" });
+    return;
+  }
+
+  const expiresInDays = body.expiresInDays ?? 1;
+  if (expiresInDays < 1) {
+    res.status(400).json({ ok: false, error: "INVALID_EXPIRES_IN_DAYS" });
+    return;
+  }
+
+  const expiresAt = new Date(
+    Date.now() + expiresInDays * 24 * 60 * 60 * 1000
+  ).toISOString();
 
   const fromDate = parseDate(body.from);
   const toDate = parseDate(body.to);
@@ -80,23 +104,31 @@ export default async function handler(req, res) {
       return;
     }
 
+    const guests = Number.isInteger(body.guests) && body.guests >= 1 ? body.guests : 1;
+
     const result = await pool.query(
       "INSERT INTO booking_intents " +
         "(property_id, unit_id, check_in, check_out, guests, customer_email, customer_name, status, hold_expires_at) " +
-        "VALUES ($1,$2,$3,$4,$5,$6,$7,'hold', now() + interval '24 hours') " +
+        "VALUES ($1,$2,$3,$4,$5,$6,$7,'hold',$8) " +
         "RETURNING id, created_at, property_id, unit_id, check_in, check_out, guests, customer_email, customer_name, status, hold_expires_at",
       [
         body.propertyId,
         body.unitId,
         body.from,
         body.to,
-        Number.isInteger(body.guests) ? body.guests : null,
+        guests,
         body.customerEmail || null,
-        body.customerName || null
+        body.customerName || null,
+        expiresAt
       ]
     );
 
-    res.status(200).json({ ok: true, inserted: result.rows[0] || null });
+    res.status(200).json({
+      ok: true,
+      inserted: result.rows[0] || null,
+      expiresInDays,
+      expiresAt
+    });
   } catch (err) {
     res.status(500).json({
       ok: false,
