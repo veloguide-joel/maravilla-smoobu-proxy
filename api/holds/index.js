@@ -1,5 +1,6 @@
 import { pool } from "../_db.js";
 
+// Helper: Parse and validate date in YYYY-MM-DD format
 function parseDate(value) {
   if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
     return null;
@@ -18,16 +19,33 @@ function parseDate(value) {
   return date;
 }
 
-export default async function handler(req, res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-
-  if (req.method === "OPTIONS") {
-    res.status(200).end();
+// Action: Get active holds
+async function handleActive(req, res) {
+  if (req.method !== "GET" && req.method !== "POST") {
+    res.status(405).json({ ok: false, error: "METHOD_NOT_ALLOWED" });
     return;
   }
 
+  try {
+    const result = await pool.query(
+      "SELECT * FROM booking_intents " +
+        "WHERE status IN ('hold','confirmed') " +
+        "AND (hold_expires_at IS NULL OR hold_expires_at > NOW()) " +
+        "ORDER BY created_at DESC"
+    );
+
+    res.status(200).json({ ok: true, holds: result.rows });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: "ACTIVE_HOLDS_FAILED",
+      detail: err?.message || "Unknown error"
+    });
+  }
+}
+
+// Action: Create a new hold
+async function handleCreate(req, res) {
   if (req.method !== "POST") {
     res.status(405).json({ ok: false, error: "METHOD_NOT_ALLOWED" });
     return;
@@ -135,5 +153,85 @@ export default async function handler(req, res) {
       error: "DB_INSERT_FAILED",
       detail: err?.message || String(err)
     });
+  }
+}
+
+// Action: Release a hold
+async function handleRelease(req, res) {
+  if (req.method !== "POST") {
+    res.status(405).json({ ok: false, error: "METHOD_NOT_ALLOWED" });
+    return;
+  }
+
+  const body = req.body || {};
+
+  if (!body.id) {
+    res.status(400).json({ ok: false, error: "MISSING_FIELDS", missing: ["id"] });
+    return;
+  }
+
+  try {
+    const result = await pool.query(
+      "UPDATE booking_intents " +
+        "SET status = 'cancelled', hold_expires_at = NULL, updated_at = NOW() " +
+        "WHERE id = $1 " +
+        "RETURNING id, created_at, updated_at, property_id, unit_id, check_in, check_out, guests, customer_email, customer_name, status, hold_expires_at",
+      [body.id]
+    );
+
+    if (result.rows.length === 0) {
+      res.status(404).json({ ok: false, error: "NOT_FOUND" });
+      return;
+    }
+
+    res.status(200).json({
+      ok: true,
+      released: result.rows[0]
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: "DB_UPDATE_FAILED",
+      detail: err?.message || String(err)
+    });
+  }
+}
+
+// Main handler
+export default async function handler(req, res) {
+  // CORS headers
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+  // Handle preflight
+  if (req.method === "OPTIONS") {
+    res.status(200).end();
+    return;
+  }
+
+  // Get action from query parameter
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const action = url.searchParams.get("action");
+
+  if (!action) {
+    res.status(400).json({ ok: false, error: "MISSING_ACTION" });
+    return;
+  }
+
+  // Route to appropriate handler
+  switch (action) {
+    case "active":
+      await handleActive(req, res);
+      break;
+    case "create":
+      await handleCreate(req, res);
+      break;
+    case "release":
+      await handleRelease(req, res);
+      break;
+    default:
+      res.status(400).json({ ok: false, error: "UNKNOWN_ACTION", action });
+      break;
   }
 }
