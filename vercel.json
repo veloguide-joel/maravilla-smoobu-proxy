@@ -1,0 +1,16 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/holds/active",
+      "destination": "/api/holds?action=active"
+    },
+    {
+      "source": "/api/holds/create",
+      "destination": "/api/holds?action=create"
+    },
+    {
+      "source": "/api/holds/release",
+      "destination": "/api/holds?action=release"
+    }
+  ]
+}
