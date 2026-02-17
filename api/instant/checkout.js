@@ -31,6 +31,7 @@ export default async function handler(req, res) {
   const guests = body.guests;
   const customerEmail = body.customerEmail || null;
   const customerName = body.customerName || null;
+  const holdId = body.holdId;
 
   // Validate required fields
   const errors = [];
@@ -70,7 +71,15 @@ export default async function handler(req, res) {
       payment_method_types: ["card"],
       success_url: successUrl,
       cancel_url: cancelUrl,
-      metadata: { holdId: inserted.id },
+      client_reference_id: inserted.id,
+      metadata: {
+        holdId: inserted.id,
+        propertyId: body.propertyId || null,
+        unitId: body.unitId || null,
+        from: from || null,
+        to: to || null,
+        guests: guests || null
+      },
       line_items: [
         {
           price_data: {
@@ -81,6 +90,11 @@ export default async function handler(req, res) {
           quantity: 1,
         },
       ],
+    });
+    console.log("[instant-checkout] created session", {
+      id: session.id,
+      client_reference_id: session.client_reference_id,
+      metadata: session.metadata
     });
 
     res.status(200).json({
