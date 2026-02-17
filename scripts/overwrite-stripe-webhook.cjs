@@ -1,6 +1,7 @@
-import Stripe from "stripe";
+const fs = require("fs");
+const path = require("path");
 
-export const config = { api: { bodyParser: false } };
+const webhookContent = `const Stripe = require("stripe");
 
 function getRawBody(req) {
   return new Promise((resolve, reject) => {
@@ -15,14 +16,12 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: "2026-01-28.clover",
 });
 
-export default async function handler(req, res) {
+async function handler(req, res) {
   try {
     if (req.method !== "POST") {
       res.setHeader("Allow", "POST");
       return res.status(405).json({ ok: false, error: "METHOD_NOT_ALLOWED" });
     }
-
-    console.log("[stripe-webhook] hit POST");
 
     const sig = req.headers["stripe-signature"];
     if (!sig) {
@@ -38,7 +37,6 @@ export default async function handler(req, res) {
         sig,
         process.env.STRIPE_WEBHOOK_SECRET
       );
-      console.log("[stripe-webhook] event", event.type);
     } catch (err) {
       return res.status(400).json({ ok: false, error: "BAD_SIGNATURE" });
     }
@@ -49,17 +47,8 @@ export default async function handler(req, res) {
 
     const session = event.data && event.data.object;
     const sessionId = session && session.id ? session.id : null;
-    const paymentIntentId = session && session.payment_intent ? session.payment_intent : null;
-
-    // Log required session fields
-    console.log("[stripe-webhook] checkout.session.completed", {
-      id: session?.id,
-      payment_intent: session?.payment_intent,
-      metadata: session?.metadata,
-      client_reference_id: session?.client_reference_id,
-      customer_details_email: session?.customer_details?.email,
-      customer_email: session?.customer_email
-    });
+    const paymentIntentId =
+      session && session.payment_intent ? session.payment_intent : null;
 
     return res.status(200).json({
       ok: true,
@@ -71,3 +60,14 @@ export default async function handler(req, res) {
     return res.status(500).json({ ok: false, error: "INTERNAL" });
   }
 }
+
+module.exports = handler;
+module.exports.config = { api: { bodyParser: false } };
+`;
+
+const outPath = path.join(process.cwd(), "api", "stripe", "webhook.js");
+fs.writeFileSync(outPath, webhookContent, "utf8");
+
+const bytes = fs.statSync(outPath).size;
+console.log("WROTE api/stripe/webhook.js");
+console.log("BYTES:", bytes);
