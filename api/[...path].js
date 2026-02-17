@@ -1,4 +1,7 @@
 import { pool } from "./_db.js";
+import { createHold } from "../lib/holds.js";
+import { getQuote } from "../lib/quote.js";
+import Stripe from "stripe";
 
 // --- Utility: CORS Handling ---
 function setCorsHeaders(res, methods = "GET,POST,OPTIONS") {
@@ -118,6 +121,110 @@ async function handleSmoobuTest(req, res) { /* ...existing code... */ }
 export default async function handler(req, res) {
   const pathSegments = getPathSegments(req);
   const root = pathSegments[0];
+  if (root === "stripe" && pathSegments[1] === "checkout") {
+    // --- Stripe Checkout Handler ---
+    setCorsHeaders(res, "POST,OPTIONS");
+    if (req.method === "OPTIONS") {
+      res.status(200).end();
+      return;
+    }
+    if (req.method !== "POST") {
+      res.status(405).json({ ok: false, error: "METHOD_NOT_ALLOWED" });
+      return;
+    }
+    // Env checks
+    const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
+    const SUCCESS_URL = process.env.SUCCESS_URL;
+    const CANCEL_URL = process.env.CANCEL_URL;
+    if (!STRIPE_SECRET_KEY || !SUCCESS_URL || !CANCEL_URL) {
+      res.status(500).json({ ok: false, error: "MISSING_ENV_VARS" });
+      return;
+    }
+    let body = req.body;
+    if (!body || typeof body !== "object") {
+      try {
+        body = JSON.parse(await new Promise((resolve, reject) => {
+          let data = "";
+          req.on("data", chunk => { data += chunk; });
+          req.on("end", () => resolve(data));
+          req.on("error", reject);
+        }));
+      } catch (e) {
+        res.status(400).json({ ok: false, error: "INVALID_JSON" });
+        return;
+      }
+    }
+    const { propertyId, unitId, from, to, guests, customerEmail, customerName } = body;
+    if (!unitId || !from || !to || !customerEmail) {
+      res.status(400).json({ ok: false, error: "MISSING_FIELDS" });
+      return;
+    }
+    // 1. Create Hold (pending_payment)
+    const holdResult = await createHold({ propertyId, unitId, from, to, guests, customerEmail, customerName, status: "pending_payment" });
+    if (!holdResult.ok) {
+      res.status(400).json({ ok: false, error: holdResult.error, ...(holdResult.missing ? { missing: holdResult.missing } : {}) });
+      return;
+    }
+    const hold = holdResult.hold;
+    // 2. Get Quote
+    const quoteResult = await getQuote({ apartmentId: unitId, from, to, guests });
+    if (!quoteResult.ok) {
+      res.status(400).json({ ok: false, error: quoteResult.error });
+      return;
+    }
+    const amount = Math.round(quoteResult.total * 100); // cents
+    const currency = quoteResult.currency || "MXN";
+    // 3. Create Stripe Session
+    const stripe = new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2022-11-15" });
+    let session;
+    try {
+      session = await stripe.checkout.sessions.create({
+        mode: "payment",
+        customer_email: customerEmail,
+        line_items: [
+          {
+            price_data: {
+              currency,
+              product_data: {
+                name: `Booking: ${unitId} ${from} to ${to}`
+              },
+              unit_amount: amount
+            },
+            quantity: 1
+          }
+        ],
+        success_url: `${SUCCESS_URL}?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: CANCEL_URL,
+        metadata: {
+          holdId: hold.id,
+          unitId,
+          propertyId: propertyId || "",
+          from,
+          to,
+          guests: String(guests || 2),
+          customerEmail,
+        }
+      });
+    } catch (err) {
+      console.log("[stripe] session error", err.message);
+      res.status(500).json({ ok: false, error: "STRIPE_SESSION_FAILED", detail: err.message });
+      return;
+    }
+    // 4. Update hold with sessionId and status
+    try {
+      await pool.query(
+        "UPDATE booking_intents SET stripe_session_id = $1, status = 'awaiting_payment' WHERE id = $2",
+        [session.id, hold.id]
+      );
+    } catch (err) {
+      console.log("[stripe] hold update error", err.message);
+      // Don't fail the flow, but log
+    }
+    // 5. Respond
+    res.status(200).json({ ok: true, checkoutUrl: session.url, sessionId: session.id, holdId: hold.id });
+    return;
+  }
+  // --- Existing router ---
   switch (root) {
     case "health":
       handleHealth(req, res);
@@ -129,6 +236,7 @@ export default async function handler(req, res) {
       await handleSmoobu(req, res, pathSegments);
       break;
     default:
+      console.log("[router] unmatched pathSegments:", pathSegments);
       res.status(404).json({ ok: false, error: "UNKNOWN_API_ROUTE", route: root });
       break;
   }
