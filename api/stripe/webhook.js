@@ -1,3 +1,5 @@
+
+import { confirmHoldById } from "../../lib/holds.js";
 import Stripe from "stripe";
 
 export const config = { api: { bodyParser: false } };
@@ -48,8 +50,9 @@ export default async function handler(req, res) {
     }
 
     const session = event.data && event.data.object;
-    const sessionId = session && session.id ? session.id : null;
-    const paymentIntentId = session && session.payment_intent ? session.payment_intent : null;
+    const holdId = session?.metadata?.holdId || null;
+    const stripeSessionId = session?.id || null;
+    const stripePaymentIntentId = session?.payment_intent || null;
 
     // Log required session fields
     console.log("[stripe-webhook] checkout.session.completed", {
@@ -61,12 +64,17 @@ export default async function handler(req, res) {
       customer_email: session?.customer_email
     });
 
-    return res.status(200).json({
-      ok: true,
-      received: true,
-      sessionId,
-      paymentIntentId,
-    });
+    if (!holdId) {
+      return res.status(200).json({ ok: true, ignored: true, reason: "MISSING_HOLD_ID" });
+    }
+
+    try {
+      const confirmed = await confirmHoldById({ holdId, stripeSessionId, stripePaymentIntentId });
+      return res.status(200).json({ ok: true, version: "WEBHOOK_V2_WITH_CONFIRM", type: event.type });
+    } catch (err) {
+      console.error("[stripe-webhook] confirmHoldById error", err);
+      return res.status(200).json({ ok: true, version: "WEBHOOK_V2_WITH_CONFIRM", type: event.type });
+    }
   } catch (err) {
     return res.status(500).json({ ok: false, error: "INTERNAL" });
   }
