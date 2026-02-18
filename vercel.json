@@ -12,5 +12,11 @@
       "source": "/api/holds/release",
       "destination": "/api/holds?action=release"
     }
+  ],
+  "crons": [
+    {
+      "path": "/api/holds/expire",
+      "schedule": "*/30 * * * *"
+    }
   ]
 }
