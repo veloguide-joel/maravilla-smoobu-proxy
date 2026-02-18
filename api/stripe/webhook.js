@@ -46,7 +46,7 @@ export default async function handler(req, res) {
     }
 
     if (event.type !== "checkout.session.completed") {
-      return res.status(200).json({ ok: true, ignored: true, type: event.type });
+      return res.status(200).json({ ok: true });
     }
 
     const session = event.data && event.data.object;
@@ -65,15 +65,15 @@ export default async function handler(req, res) {
     });
 
     if (!holdId) {
-      return res.status(200).json({ ok: true, ignored: true, reason: "MISSING_HOLD_ID" });
+      return res.status(200).json({ ok: true });
     }
 
     try {
       const confirmed = await confirmHoldById({ holdId, stripeSessionId, stripePaymentIntentId });
-      return res.status(200).json({ ok: true, version: "WEBHOOK_V2_WITH_CONFIRM", type: event.type });
+      return res.status(200).json({ ok: true });
     } catch (err) {
       console.error("[stripe-webhook] confirmHoldById error", err);
-      return res.status(200).json({ ok: true, version: "WEBHOOK_V2_WITH_CONFIRM", type: event.type });
+      return res.status(200).json({ ok: true });
     }
   } catch (err) {
     return res.status(500).json({ ok: false, error: "INTERNAL" });
