@@ -45,6 +45,7 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok: false, error: "BAD_SIGNATURE" });
     }
 
+    const stripeEventId = event.id;
     if (event.type !== "checkout.session.completed") {
       return res.status(200).json({ ok: true });
     }
@@ -62,7 +63,7 @@ export default async function handler(req, res) {
     }
 
     try {
-      const confirmed = await confirmHoldById({ holdId, stripeSessionId, stripePaymentIntentId });
+      const confirmed = await confirmHoldById({ holdId, stripeSessionId, stripePaymentIntentId, stripeEventId });
       return res.status(200).json({ ok: true });
     } catch (err) {
       console.error("[stripe-webhook] confirmHoldById error", err?.message || String(err));
