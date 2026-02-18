@@ -54,15 +54,8 @@ export default async function handler(req, res) {
     const stripeSessionId = session?.id || null;
     const stripePaymentIntentId = session?.payment_intent || null;
 
-    // Log required session fields
-    console.log("[stripe-webhook] checkout.session.completed", {
-      id: session?.id,
-      payment_intent: session?.payment_intent,
-      metadata: session?.metadata,
-      client_reference_id: session?.client_reference_id,
-      customer_details_email: session?.customer_details?.email,
-      customer_email: session?.customer_email
-    });
+    // Minimal log for completed checkout
+    console.log("[stripe-webhook] checkout.session.completed", { holdId, stripeSessionId, stripePaymentIntentId });
 
     if (!holdId) {
       return res.status(200).json({ ok: true });
@@ -72,7 +65,7 @@ export default async function handler(req, res) {
       const confirmed = await confirmHoldById({ holdId, stripeSessionId, stripePaymentIntentId });
       return res.status(200).json({ ok: true });
     } catch (err) {
-      console.error("[stripe-webhook] confirmHoldById error", err);
+      console.error("[stripe-webhook] confirmHoldById error", err?.message || String(err));
       return res.status(200).json({ ok: true });
     }
   } catch (err) {
