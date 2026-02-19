@@ -1,5 +1,6 @@
 
 import { confirmHoldById } from "../../lib/holds.js";
+import { createSmoobuReservationForBookingIntentId } from "../../lib/smoobu.js";
 import Stripe from "stripe";
 
 export const config = { api: { bodyParser: false } };
@@ -64,6 +65,23 @@ export default async function handler(req, res) {
 
     try {
       const confirmed = await confirmHoldById({ holdId, stripeSessionId, stripePaymentIntentId, stripeEventId });
+      // Smoobu reservation creation (idempotent, safe for replays)
+      try {
+        const smoobuResult = await createSmoobuReservationForBookingIntentId({ bookingIntentId: holdId });
+        if (!smoobuResult?.ok) {
+          console.error("[stripe-webhook] Smoobu reservation failed", {
+            bookingIntentId: holdId,
+            stripeEventId,
+            error: smoobuResult?.error || smoobuResult?.reason || "Unknown"
+          });
+        }
+      } catch (smoobuErr) {
+        console.error("[stripe-webhook] Smoobu reservation exception", {
+          bookingIntentId: holdId,
+          stripeEventId,
+          error: smoobuErr?.message || String(smoobuErr)
+        });
+      }
       return res.status(200).json({ ok: true });
     } catch (err) {
       console.error("[stripe-webhook] confirmHoldById error", err?.message || String(err));
