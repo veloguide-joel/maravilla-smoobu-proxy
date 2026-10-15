@@ -3,3 +3,6 @@
 .env*
 .env.local
 .env*.local
+
+# dependencies — installed by Vercel/npm from package-lock.json, never committed
+node_modules/
