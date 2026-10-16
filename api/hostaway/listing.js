@@ -80,7 +80,12 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { status, json, tokenSource, retried } = await hostawayGet(`/listings/${id}`);
+    // includeResources=1: without it GET /v1/listings/{id} omits listingImages,
+    // listingAmenities and listingBedTypes (verified live 2026-10-16: 0/0/0 vs
+    // 16/19/0 on the list endpoint). Documented query parameter for listings.
+    const { status, json, tokenSource, retried } = await hostawayGet(`/listings/${id}`, {
+      query: { includeResources: 1 }
+    });
 
     if (status < 200 || status >= 300 || !json) {
       res.status(502).json({ ok: false, error: "HOSTAWAY_UPSTREAM_FAILED", upstream: { status } });
