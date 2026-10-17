@@ -2,6 +2,9 @@
   "name": "maravilla-smoobu-proxy",
   "private": true,
   "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
   "dependencies": {
     "@supabase/supabase-js": "^2.95.3",
     "dotenv": "^17.3.1",
