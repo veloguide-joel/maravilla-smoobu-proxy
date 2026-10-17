@@ -23,12 +23,8 @@
 
 import { getHostawayEnvStatus, hostawayGet } from "../../lib/hostaway.js";
 import { PUBLIC_LISTING_IDS, PUBLIC_LISTING_KEYS, toPublicListing } from "../../lib/listing-public.js";
+import { applyPublicCors, withDeadline } from "../../lib/public-api.js"; // shared allowlist (F2)
 
-const DEFAULT_ALLOWED_ORIGINS = Object.freeze([
-  "https://maravilla-booking-ui-git-dev-joel-goralskis-projects.vercel.app", // booking-ui DEV preview
-  "http://localhost:5500",   // local static server used by the UI's own scripts
-  "http://127.0.0.1:5500"
-]);
 const UPSTREAM_TIMEOUT_MS = 8000;   // per listing request (after token mint)
 const OVERALL_DEADLINE_MS = 20000;  // whole handler, incl. token mint + retry
 const CACHE_TTL_MS = 10 * 60 * 1000;
@@ -36,34 +32,6 @@ const BROWSER_MAX_AGE_S = 300;
 
 // Optimisation only; may be empty on any invocation (Vercel instances are not shared).
 let cache = null; // { expiresAt:number, body:object }
-
-function allowedOrigins() {
-  const extra = typeof process.env.BOOKING_UI_ORIGINS === "string"
-    ? process.env.BOOKING_UI_ORIGINS.split(",").map((s) => s.trim()).filter((s) => /^https?:\/\/[a-z0-9.-]+(:\d+)?$/i.test(s))
-    : [];
-  return new Set([...DEFAULT_ALLOWED_ORIGINS, ...extra]);
-}
-
-function applyCors(req, res) {
-  const origin = req.headers.origin;
-  res.setHeader("Vary", "Origin");
-  if (typeof origin === "string" && allowedOrigins().has(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Accept");
-    res.setHeader("Access-Control-Max-Age", "600");
-    return true;
-  }
-  return false;
-}
-
-function withDeadline(promise, ms, label) {
-  let timer;
-  const deadline = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(Object.assign(new Error(`${label} deadline`), { code: "DEADLINE" })), ms);
-  });
-  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
-}
 
 async function fetchPublicListing(id) {
   const { status, json } = await hostawayGet(`/listings/${id}`, { query: { includeResources: 1 }, timeoutMs: UPSTREAM_TIMEOUT_MS });
@@ -101,7 +69,7 @@ async function buildBody() {
 }
 
 export default async function handler(req, res) {
-  const corsAllowed = applyCors(req, res);
+  const corsAllowed = applyPublicCors(req, res);
 
   if (req.method === "OPTIONS") {
     // Preflight: 204 for allowed origins, 403 otherwise (no CORS headers were set).
