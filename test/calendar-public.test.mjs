@@ -110,13 +110,25 @@ test("duplicate or malformed day objects are an integrity failure (route answers
   assert.equal(pub([], "2026-11-03", "2026-11-01").error, "INVALID_WINDOW");
 });
 
-test("restrictions: closed-on-arrival/departure dates and min/max stay (>1 / >0) are listed per date", () => {
+test("restrictions: closed-on-arrival/departure dates; min (>1) / max (>0) stay as date ranges", () => {
   const days = range("2026-11-01", "2026-11-06", (d) => d === "2026-11-02" ? { closedOnArrival: 1, minimumStay: 3 } : d === "2026-11-04" ? { closedOnDeparture: true, maximumStay: 7 } : {});
   const r = pub(days, "2026-11-01", "2026-11-06").public.restrictions;
   assert.deepEqual(r, {
     closedOnArrival: ["2026-11-02"], closedOnDeparture: ["2026-11-04"],
-    minimumStay: [{ date: "2026-11-02", nights: 3 }], maximumStay: [{ date: "2026-11-04", nights: 7 }]
+    minimumStay: [{ from: "2026-11-02", to: "2026-11-02", nights: 3 }], maximumStay: [{ from: "2026-11-04", to: "2026-11-04", nights: 7 }]
   });
+});
+
+test("live shape (2026-10-17): maximumStay 365 on every day compresses to ONE range; a change splits it", () => {
+  const all365 = range("2026-11-01", "2026-11-10", () => ({ maximumStay: 365 }));
+  assert.deepEqual(pub(all365, "2026-11-01", "2026-11-10").public.restrictions.maximumStay, [{ from: "2026-11-01", to: "2026-11-10", nights: 365 }]);
+  const mixed = range("2026-11-01", "2026-11-10", (d) => ({ maximumStay: d >= "2026-11-05" && d <= "2026-11-06" ? 7 : 365, minimumStay: d >= "2026-11-03" && d <= "2026-11-04" ? 3 : 1 }));
+  const r = pub(mixed, "2026-11-01", "2026-11-10").public.restrictions;
+  assert.deepEqual(r.maximumStay, [{ from: "2026-11-01", to: "2026-11-04", nights: 365 }, { from: "2026-11-05", to: "2026-11-06", nights: 7 }, { from: "2026-11-07", to: "2026-11-10", nights: 365 }]);
+  assert.deepEqual(r.minimumStay, [{ from: "2026-11-03", to: "2026-11-04", nights: 3 }]);
+  // a missing day breaks a range
+  const gap = range("2026-11-01", "2026-11-06", () => ({ maximumStay: 365 })).filter((d) => d.date !== "2026-11-03");
+  assert.deepEqual(pub(gap, "2026-11-01", "2026-11-06").public.restrictions.maximumStay, [{ from: "2026-11-01", to: "2026-11-02", nights: 365 }, { from: "2026-11-04", to: "2026-11-06", nights: 365 }]);
 });
 
 test("public shape never contains kind, price, note, reservations or counters", () => {
