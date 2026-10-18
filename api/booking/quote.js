@@ -25,6 +25,7 @@ import { fetchCalendarDays } from "../../lib/hostaway-calendar.js";
 import { evaluateStay, parseISODate, nightsBetween, DEFAULT_POLICY } from "../../lib/bookability.js";
 import { validatePriceDetails, publicReasons, decisionFor, PUBLIC_QUOTE_KEYS, QUOTE_NOTE } from "../../lib/quote-public.js";
 import { applyPublicCors, withDeadline, todayInTimeZone } from "../../lib/public-api.js";
+import { buildDirectEstimate } from "../../lib/direct-public.js";
 
 const MAX_NIGHTS = DEFAULT_POLICY.maxStayNights; // 90 — API search limit, independent of the listing's 365
 const MAX_GUESTS = 10;                           // request sanity only; real capacity comes from the listing
@@ -121,6 +122,11 @@ export default async function handler(req, res) {
       }
 
       // --- 6. sanitized quote in the LISTING currency ---
+      // --- 7. Book Direct ESTIMATE (D2): derived from the same validated payload; no extra
+      //        upstream call, no effect on availability/decision; suppressed (never guessed)
+      //        on unknown components, unresolved tax policy or invalid server configuration.
+      const direct = buildDirectEstimate({ priceDetails: pr.json, currency: lc.currency, standardTotal: price.total, env: process.env });
+      if (direct.status !== "estimated") console.warn("[booking/quote] direct estimate unavailable", { id, reason: direct.reason });
       return {
         status: 200,
         body: {
@@ -131,7 +137,8 @@ export default async function handler(req, res) {
           breakdown: price.breakdown,
           checkedAt,
           quoteBasis: "hostaway.priceDetails.v2",
-          note: QUOTE_NOTE
+          note: QUOTE_NOTE,
+          direct
         }
       };
     })();
