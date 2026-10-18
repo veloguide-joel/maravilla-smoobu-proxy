@@ -19,6 +19,11 @@
 //    `Cache-Control: private, max-age=300` for the browser. Deliberately not
 //    CDN-cached (`s-maxage`) for now: CDN caching plus per-origin CORS headers
 //    needs Vary:Origin behaviour verified on Vercel first.
+//    D3a (2026-10-18): the browser copy is made ONLY for requests carrying an
+//    allowlisted Origin (the response then has Access-Control-Allow-Origin).
+//    Any other request (direct visit, curl, unlisted origin) gets `no-store`.
+//    Vary: Origin alone was proven insufficient: a cached no-Origin copy was
+//    reused for a later cross-origin fetch and failed CORS.
 //  - No prices. Currency only. No Smoobu data.
 
 import { getHostawayEnvStatus, hostawayGet } from "../../lib/hostaway.js";
@@ -92,9 +97,12 @@ export default async function handler(req, res) {
     return;
   }
 
+  // Browser-cacheable only when CORS headers are present on this response (see D3a note above).
+  const okCacheControl = corsAllowed ? `private, max-age=${BROWSER_MAX_AGE_S}` : "no-store";
+
   const now = Date.now();
   if (cache && cache.expiresAt > now) {
-    res.setHeader("Cache-Control", `private, max-age=${BROWSER_MAX_AGE_S}`);
+    res.setHeader("Cache-Control", okCacheControl);
     res.setHeader("X-Listings-Cache", "hit");
     res.status(200).json(cache.body);
     return;
@@ -108,7 +116,7 @@ export default async function handler(req, res) {
       return;
     }
     if (!result.body.partial) cache = { expiresAt: Date.now() + CACHE_TTL_MS, body: result.body }; // only cache complete answers
-    res.setHeader("Cache-Control", `private, max-age=${BROWSER_MAX_AGE_S}`);
+    res.setHeader("Cache-Control", okCacheControl);
     res.setHeader("X-Listings-Cache", "miss");
     res.status(200).json(result.body);
   } catch (err) {
