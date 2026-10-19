@@ -25,11 +25,11 @@ test("no Origin (direct visit / curl): 200 but no-store; Vary: Origin; no ACAO",
   assert.equal("access-control-allow-origin" in r.headers, false);
 });
 
-test("allowed origins: browser-cacheable AND carry matching ACAO + Vary: Origin (miss and hit paths)", async () => {
+test("allowed origins: matching ACAO + Vary: Origin, and (C2) no-store like every other response (miss and hit paths)", async () => {
   for (const o of [DEV, "http://localhost:5500", "http://127.0.0.1:5500"]) {
     for (let i = 0; i < 2; i++) { // first may be a miss, second is a memory-cache hit
       const r = await call({ origin: o });
-      assert.equal(r.headers["cache-control"], "private, max-age=300", o);
+      assert.equal(r.headers["cache-control"], "no-store", o);
       assert.equal(r.headers["access-control-allow-origin"], o);
       assert.equal(r.headers.vary, "Origin");
     }
