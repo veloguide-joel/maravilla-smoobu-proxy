@@ -14,6 +14,8 @@
 
 import { getHostawayEnvStatus, hostawayGet } from "../../lib/hostaway.js";
 import { requireDiagKey } from "../../lib/diag-auth.js";
+import { toPublicContent } from "../../lib/listing-content.js";
+import { PUBLISH_DESCRIPTION } from "../../lib/listing-public.js";
 
 // Owner-approved pilot inventory (Stage A evidence, 2026-10-16).
 const PILOT_LISTING_IDS = new Set([603564, 603566]);
@@ -147,7 +149,9 @@ export default async function handler(req, res) {
       length: description.length,
       excerpt: description.slice(0, DESCRIPTION_EXCERPT_CHARS) + (description.length > DESCRIPTION_EXCERPT_CHARS ? "…" : ""),
       hasHouseRules: typeof raw.houseRules === "string" && raw.houseRules.length > 0,
-      houseRulesLength: typeof raw.houseRules === "string" ? raw.houseRules.length : 0
+      houseRulesLength: typeof raw.houseRules === "string" ? raw.houseRules.length : 0,
+      // UX2a audit view: exactly what the public feed WOULD publish, plus the private-content scan verdict.
+      publicCandidate: (() => { const c = toPublicContent(raw); return { description: c.description, flags: c.descriptionFlags, publishedNow: PUBLISH_DESCRIPTION && !!c.description, amenities: c.amenities, beds: c.beds, checkInFrom: c.checkInFrom, checkOutBy: c.checkOutBy }; })()
     };
 
     res.status(200).json({

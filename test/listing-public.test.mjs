@@ -38,11 +38,14 @@ function rawListing(over = {}) {
 }
 // Substrings that must not appear anywhere in the public JSON (keys or values).
 const FORBIDDEN = ["address", "street", "zipcode", "63732", "\"lat\"", "\"lng\"", "20.75", "105.33", "contact", "owner@", "+52", "door", "4321", "wifi", "secret-pass",
-  "airbnb.com", "bookingcom", "vrbo", "cleaningFee", "Tax", "License", "LIC-1", "invoic", "amenit", "price", "2200", "internalListingName", "_schema", "_meta"];
+  "airbnb.com", "bookingcom", "vrbo", "cleaningFee", "Tax", "License", "LIC-1", "invoic", "price", "2200", "internalListingName", "_schema", "_meta"];
 
 test("module is pure: no network, env, clock or imports", () => {
   const src = readFileSync(fileURLToPath(new URL("../lib/listing-public.js", import.meta.url)), "utf8");
-  for (const f of ["fetch(", "process.env", "Date.now", "import ", "require("]) assert.equal(src.includes(f), false, f);
+  for (const f of ["fetch(", "process.env", "Date.now", "require("]) assert.equal(src.includes(f), false, f);
+  // UX2a: the only import allowed is the pure content module (checked for purity in listing-content.test.mjs)
+  const imports = [...src.matchAll(/^import .* from "([^"]+)";/gm)].map((m) => m[1]);
+  assert.deepEqual(imports, ["./listing-content.js"]);
 });
 
 test("pilot allowlist is exactly the two owner-approved ids", () => {
