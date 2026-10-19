@@ -15,15 +15,14 @@
 //    from other origins get no Access-Control-Allow-Origin header.
 //  - Timeouts: per-request upstream timeout + overall deadline, so a hung
 //    Hostaway call turns into a 502 instead of a hanging function.
-//  - Caching: per-instance memory cache (optimisation only, TTL 10 min) and
-//    `Cache-Control: private, max-age=300` for the browser. Deliberately not
-//    CDN-cached (`s-maxage`) for now: CDN caching plus per-origin CORS headers
-//    needs Vary:Origin behaviour verified on Vercel first.
-//    D3a (2026-10-18): the browser copy is made ONLY for requests carrying an
-//    allowlisted Origin (the response then has Access-Control-Allow-Origin).
-//    Any other request (direct visit, curl, unlisted origin) gets `no-store`.
-//    Vary: Origin alone was proven insufficient: a cached no-Origin copy was
-//    reused for a later cross-origin fetch and failed CORS.
+//  - Caching: per-instance memory cache (optimisation only, TTL 10 min; it
+//    stores the body only — CORS and cache headers are computed per request).
+//    Browser/CDN: `Cache-Control: no-store` on EVERY response (C2, 2026-10-19).
+//    Why: Vercel adds a weak ETag and answers revalidations with a 304 that
+//    omits Access-Control-Allow-Origin. A copy cached for one allowlisted
+//    origin was revalidated by another, kept the first origin's ACAO and failed
+//    CORS persistently (each 304 renewed it) — see C1 audit. D3a (allowlisted
+//    origins only cacheable) narrowed but did not remove that. Vary: Origin stays.
 //  - No prices. Currency only. No Smoobu data.
 
 import { getHostawayEnvStatus, hostawayGet } from "../../lib/hostaway.js";
@@ -33,7 +32,6 @@ import { applyPublicCors, withDeadline } from "../../lib/public-api.js"; // shar
 const UPSTREAM_TIMEOUT_MS = 8000;   // per listing request (after token mint)
 const OVERALL_DEADLINE_MS = 20000;  // whole handler, incl. token mint + retry
 const CACHE_TTL_MS = 10 * 60 * 1000;
-const BROWSER_MAX_AGE_S = 300;
 
 // Optimisation only; may be empty on any invocation (Vercel instances are not shared).
 let cache = null; // { expiresAt:number, body:object }
@@ -97,8 +95,8 @@ export default async function handler(req, res) {
     return;
   }
 
-  // Browser-cacheable only when CORS headers are present on this response (see D3a note above).
-  const okCacheControl = corsAllowed ? `private, max-age=${BROWSER_MAX_AGE_S}` : "no-store";
+  // C2: never browser-cacheable, for any origin (see the Caching note above).
+  const okCacheControl = "no-store";
 
   const now = Date.now();
   if (cache && cache.expiresAt > now) {

@@ -99,7 +99,7 @@ test("happy path: pilot-scoped, exact 20-key allowlist, original 15 fields intac
   assert.deepEqual([a.amenities, a.beds, a.checkInFrom, a.checkOutBy], [["Wireless", "Air conditioning"], 1, "15:00", "11:00"]);
   // headers (D3a behaviour unchanged)
   assert.equal(res.headers["access-control-allow-origin"], DEV_ORIGIN); assert.equal(res.headers.vary, "Origin");
-  assert.equal(res.headers["cache-control"], "private, max-age=300"); assert.equal(res.headers["x-listings-cache"], "miss");
+  assert.equal(res.headers["cache-control"], "no-store"); assert.equal(res.headers["x-listings-cache"], "miss"); // C2: never browser-cacheable
   // upstream: one token mint + exactly the two pilot listing GETs, nothing else
   assert.equal(calls.length, 3);
   assert.deepEqual(calls.filter((c) => c.hasAuth).map((c) => c.url.match(/\/listings\/(\d+)\?includeResources=1/)?.[1]), ["603564", "603566"]);
