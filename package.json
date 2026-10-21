@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "test:db": "node --test --test-concurrency=4 test/db/*.test.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.95.3",
