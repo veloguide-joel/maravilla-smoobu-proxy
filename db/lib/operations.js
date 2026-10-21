@@ -96,6 +96,13 @@ async function completeOperationOnce(pool, opId, { workerId, now, outcome, cfg =
 
 async function markUnknown(c, op, now, errorCode, cfg) {
   const t = new Date(now);
+  if (op.retry_class === "reconcile_first") {
+    // E3.2: capture / void / cancel — never re-queued. E3 is told the outcome is unknown and reads the provider;
+    // the row is settled only by settle_operation_from_evidence() (or an owner resolution).
+    await c.query(`UPDATE booking.external_operations SET state = 'outcome_unknown', error_code = $3, lease_worker_id = NULL, lease_until = NULL,
+                   updated_at = $2 WHERE id = $1`, [op.id, t, errorCode]);
+    return "outcome_unknown";
+  }
   if (op.retry_class === "non_idempotent") {
     await c.query(`UPDATE booking.external_operations SET state = 'outcome_unknown', error_code = $3, lease_worker_id = NULL, lease_until = NULL,
                    updated_at = $2 WHERE id = $1`, [op.id, t, errorCode]);
@@ -180,4 +187,37 @@ export async function dispatchOperation(op, { executors = {} } = {}) {
     throw e;
   }
   return fn(op);
+}
+
+// ---------------------------------------------------------------------------------------------
+// E3.2: reconcile-first provider writes (capture / void / cancel)
+
+/** Settle an ambiguous capture/void/cancel from persisted API evidence (a verified provider read). */
+export async function settleOperationFromEvidence(pool, opId, evidenceId) {
+  try {
+    const r = await pool.query("SELECT booking.settle_operation_from_evidence($1, $2) AS state", [opId, evidenceId]);
+    return { ok: true, state: r.rows[0].state };
+  } catch (e) {
+    const m = /^([A-Z_]+)/.exec(e.message || "");
+    if (e.code === "23514" && m) return { ok: false, error: m[1] };
+    throw e;
+  }
+}
+
+const UNKNOWN_EVENT_FOR = Object.freeze({
+  "stripe.capture_payment_intent": "CAPTURE_OUTCOME_UNKNOWN",
+  "stripe.void_payment_intent": "VOID_OUTCOME_UNKNOWN",
+  "hostaway.cancel_reservation": "RESERVATION_CANCEL_OUTCOME_UNKNOWN"
+});
+
+/**
+ * After a worker interruption, tell E3 that a reconcile-first write has an unknown outcome so that E3 schedules the
+ * authoritative read (and never a blind re-send). Idempotent per operation.
+ */
+export async function reportUnknownOutcome(pool, opId, { now, config }) {
+  const { applyEvent } = await import("./repo.js");
+  const op = (await pool.query("SELECT * FROM booking.external_operations WHERE id = $1", [opId])).rows[0];
+  if (!op || op.state !== "outcome_unknown" || !UNKNOWN_EVENT_FOR[op.op_type]) return { ok: false, error: "NOT_APPLICABLE" };
+  return applyEvent(pool, op.intent_id, { type: UNKNOWN_EVENT_FOR[op.op_type], id: `op-unknown:${op.id}`, code: op.error_code || "OUTCOME_UNKNOWN" },
+    { now, config, actor: "reconciler" });
 }

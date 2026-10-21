@@ -164,51 +164,49 @@ test("C4 / P3b: manual 'released' needs persisted evidence — booleans are refu
 });
 
 // ---------------------------------------------------------------- C5 (was P3c)
-test("C5 / P3c: failed capture — void scheduled; cancellation must be verified; dates kept until the authorization is settled", async () => {
+test("C5 / P3c: failed capture — E3 schedules cancel + void; each leg needs verification; dates kept until both settle", async () => {
   const r = await F.reserved(db.app, { listingId: L(30) });
   await F.runOp(db.app, r.id, "stripe.capture_payment_intent", 8, { status: "failed_definite", errorCode: "CARD_DECLINED" });
   const cf = F.ok(await applyEvent(db.app, r.id, { type: "CAPTURE_FAILED", definite: true, code: "CARD_DECLINED" }, { now: F.at(8) }));
   assert.deepEqual(cf.operations.map((o) => o.opType).sort(), ["alert.owner", "hostaway.cancel_reservation", "stripe.void_payment_intent"]);
+  assert.equal(await F.count(db.app, "SELECT count(*) AS n FROM booking.external_operations WHERE intent_id = $1 AND op_type = 'stripe.void_payment_intent'", [r.id]), 1,
+    "exactly one void (no database-side duplicate)");
   assert.equal((await applyEvent(db.app, r.id, { type: "RESERVATION_CANCELLED" }, { now: F.at(9) })).error, "CANCELLATION_NOT_VERIFIED");
   await F.runOp(db.app, r.id, "hostaway.cancel_reservation", 9);
   assert.equal((await applyEvent(db.app, r.id, { type: "RESERVATION_CANCELLED" }, { now: F.at(9) })).error, "CANCELLATION_NOT_VERIFIED",
     "the cancel call returning is not enough; a read must show the reservation cancelled");
   await F.reservationStatus(db.app, r.id, String(r.reservationId), "cancelled", {}, 10);
   F.ok(await applyEvent(db.app, r.id, { type: "RESERVATION_CANCELLED" }, { now: F.at(10) }));
-  assert.equal(await F.state(db.app, r.id), "cancelled");
+  assert.equal(await F.state(db.app, r.id), "capture_failed", "E3.2: cancellation is one of two legs");
   assert.equal(await active(r.id), 1, "authorization not yet settled");
   const b = await claimReleaseBlockers(db.app, r.id, { now: F.at(10) });
-  assert.ok(b.some((x) => x.startsWith("AUTHORIZATION_UNSETTLED")) && b.some((x) => x.startsWith("PROVIDER_OPERATION_UNRESOLVED:stripe.void_payment_intent")), b.join());
+  assert.ok(b.some((x) => x.startsWith("STATE_NOT_RELEASABLE")), b.join());
+  assert.equal((await applyEvent(db.app, r.id, { type: "VOID_SUCCEEDED" }, { now: F.at(11) })).error, "AUTHORIZATION_NOT_VERIFIED_SETTLED");
   await F.runOp(db.app, r.id, "stripe.void_payment_intent", 11);
-  assert.equal(await tryReleaseClaim(db.app, r.id, { now: F.at(11) }), false, "void call returned, but the PaymentIntent is not yet verified");
-  await F.piStatus(db.app, r.id, r.piId, "canceled", {}, 12);
-  assert.equal(await tryReleaseClaim(db.app, r.id, { now: F.at(12) }), true);
+  F.ok(await applyEvent(db.app, r.id, { type: "VOID_SUCCEEDED" }, { now: F.at(11) }));
+  assert.equal(await F.state(db.app, r.id), "cancelled");
+  assert.equal(await active(r.id), 0, "released in the same transaction once both legs are verified");
 });
 
-test("C5: cancellation failure keeps the dates and goes to owner reconciliation", async () => {
+test("C5: an ambiguous cancellation keeps the dates and is reconciled by a read, never re-sent blindly", async () => {
   const r = await F.reserved(db.app, { listingId: L(31) });
   await F.runOp(db.app, r.id, "stripe.capture_payment_intent", 8, { status: "failed_definite", errorCode: "CARD_DECLINED" });
   F.ok(await applyEvent(db.app, r.id, { type: "CAPTURE_FAILED", definite: true, code: "CARD_DECLINED" }, { now: F.at(8) }));
-  await F.runOp(db.app, r.id, "hostaway.cancel_reservation", 9, { status: "outcome_unknown", errorCode: "TIMEOUT" });
-  F.ok(await applyEvent(db.app, r.id, { type: "RESERVATION_CANCEL_FAILED" }, { now: F.at(9) }));
-  assert.equal(await F.state(db.app, r.id), "reconciliation_required");
+  const { op: cancelOp } = await F.runOp(db.app, r.id, "hostaway.cancel_reservation", 9, { status: "outcome_unknown", errorCode: "TIMEOUT" });
+  assert.equal((await db.app.query("SELECT state FROM booking.external_operations WHERE id = $1", [cancelOp.id])).rows[0].state, "outcome_unknown");
+  F.ok(await applyEvent(db.app, r.id, { type: "RESERVATION_CANCEL_OUTCOME_UNKNOWN", code: "TIMEOUT" }, { now: F.at(9) }));
+  assert.equal(await F.state(db.app, r.id), "capture_failed");
   assert.equal(await active(r.id), 1);
-  // 'cancelled' needs a verified cancelled reservation AND a settled authorization
-  const piC = await F.piStatus(db.app, r.id, r.piId, "canceled", {}, 20);
-  assert.equal((await adminResolveIntent(db.reconciler, { intentId: r.id, decision: "cancelled", evidenceIds: [piC], resolver: "owner", justification: "X", at: F.at(21) })).error,
-    "INSUFFICIENT_EVIDENCE");
-  const resCancelled = await F.reservationStatus(db.app, r.id, String(r.reservationId), "cancelled", {}, 22);
-  const res = F.ok(await adminResolveIntent(db.reconciler, { intentId: r.id, decision: "cancelled", evidenceIds: [piC, resCancelled], resolver: "owner", justification: "CANCELLED_IN_HOSTAWAY", at: F.at(23) }));
-  F.ok(await applyResolution(db.app, r.id, res.id, { now: F.at(24) }));
-  assert.equal(await F.state(db.app, r.id), "cancelled");
-  // the cancel op is still recorded as ambiguous: dates stay until the owner settles it with evidence too
-  assert.equal(await active(r.id), 1);
-  const cancelOp = (await db.app.query("SELECT id FROM booking.external_operations WHERE intent_id = $1 AND op_type = 'hostaway.cancel_reservation'", [r.id])).rows[0];
-  const st = (await db.app.query("SELECT state FROM booking.external_operations WHERE id = $1", [cancelOp.id])).rows[0].state;
-  assert.equal(st, "pending", "idempotent cancel was re-queued for a provider read + retry");
+  assert.equal(await claimNextOperation(db.app, { workerId: "w9", now: F.at(500), intentId: r.id, opTypes: ["hostaway.cancel_reservation"] }), null, "no blind re-send");
+  // definite cancel failure instead -> owner reconciliation, dates kept
+  const r2 = await F.reserved(db.app, { listingId: L(32) });
+  await F.runOp(db.app, r2.id, "stripe.capture_payment_intent", 8, { status: "failed_definite", errorCode: "CARD_DECLINED" });
+  F.ok(await applyEvent(db.app, r2.id, { type: "CAPTURE_FAILED", definite: true, code: "CARD_DECLINED" }, { now: F.at(8) }));
+  F.ok(await applyEvent(db.app, r2.id, { type: "RESERVATION_CANCEL_FAILED" }, { now: F.at(9) }));
+  assert.equal(await F.state(db.app, r2.id), "reconciliation_required");
+  assert.equal(await active(r2.id), 1);
 });
 
-// ---------------------------------------------------------------- C2 / C7 (was P3d)
 test("C2 / P3d: the runtime role cannot release claims; even the owner cannot release while anything is unresolved", async () => {
   const a = await F.authorized(db.app, { listingId: L(40) });
   await assert.rejects(db.app.query("UPDATE booking.inventory_claims SET released_at = now(), release_reason = 'X' WHERE intent_id = $1", [a.id]), /permission denied/);

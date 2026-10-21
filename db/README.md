@@ -105,7 +105,7 @@ node scripts/db-migrate.mjs status|up|down --env test --url-env MY_LOCAL_DB_URL 
 - **Payment end and void**
   - A payment attempt ends (`expired`/`failed`) only with Checkout Session evidence showing `expired`. A declined card ends nothing.
   - `authorization_released` after a refusal requires the void operation to have succeeded.
-- **Cancellation:** `capture_failed → cancelled` requires the Hostaway cancel operation to have succeeded **and** a read showing the reservation cancelled. A definite capture failure also schedules a void, which the E3 state machine doesn't emit (E3.2 candidate).
+- **Cancellation:** `capture_failed → cancelled` requires both recovery legs verified (E3.2, migration `0004`): the Hostaway cancel succeeded **and** a read shows the reservation cancelled; and the card authorization voided or verified gone. E3 emits the void itself; there is no database-side workaround any more.
 - **Owner decisions**
   - Leaving `reconciliation_required` consumes an unconsumed owner resolution for exactly that outcome (one use). The E3 `RESOLVE` evidence is derived from that resolution, never from caller booleans.
   - Re-recording a Hostaway payment after an ambiguous outcome needs every earlier recording settled as failed: by a catalogued definite refusal, or by an owner resolution citing **both** an API read **and** an attested dashboard check showing no matching charge, each observed at least 15 minutes after the call.
@@ -118,3 +118,29 @@ node scripts/db-migrate.mjs status|up|down --env test --url-env MY_LOCAL_DB_URL 
 3. **The runtime role is trusted for the success path.** It can still drive ordinary E3 transitions and report provider successes. The database guarantees that uncertainty is never resolved toward releasing dates or re-sending a non-idempotent write without evidence; it doesn't prevent a compromised runtime from reporting a false success.
 4. **The schema owner bypasses everything.** The migration/owner credential must stay out of Vercel and be used only for migrations.
 5. **Catalogue changes are code changes.** Entries in the definite-refusal catalogue change what counts as "definite". They must come through an owner-approved migration after E4.
+
+## E3.2: failed-capture recovery (migration `0004`)
+
+**Definite vs ambiguous**
+- A capture, void or cancel is a `reconcile_first` operation: one attempt per row.
+- **Definite:** an explicit provider error. `failed_definite` needs a real error code; `TIMEOUT`, `NETWORK_ERROR`, `HTTP_5XX`, `RATE_LIMITED`, `LEASE_EXPIRED` and `OUTCOME_UNKNOWN` are refused.
+- **Ambiguous:** timeout, 5xx, lost worker. The row becomes `outcome_unknown` and is **never re-queued**. E3 is told (`*_OUTCOME_UNKNOWN`, or `reportUnknownOutcome()` after a crash) and schedules a provider **read**.
+- **Settling an ambiguous row:** only `booking.settle_operation_from_evidence()` (runtime, API evidence observed ≥ 2 minutes after the call) or an owner resolution.
+- **Retries:** only then may E3 emit another attempt, as a **new row with its own provider key**. A partial unique index allows at most one open capture or void per PaymentIntent, and one open cancel per reservation.
+
+**Recovery sequence after a capture failure**
+
+```
+reservation_confirmed --capture--> definite refusal (1st attempt, card-level) -> capture_failed
+                                   refusal on a retry / "unexpected state"   -> capture_unknown (read first)
+                                   timeout / 5xx / worker lost               -> capture_unknown (read first)
+capture_unknown --read--> captured (exact amount) -> payment_captured (paid booking)
+                          still authorized        -> capture again (new key, bounded) | past deadline -> capture_failed
+                          authorization gone      -> capture_failed (authorization leg already settled)
+capture_failed: leg 1 cancel reservation (ambiguous -> read; still active -> cancel again, bounded; refused -> owner)
+                leg 2 void authorization (ambiguous/refused -> read; still held -> void again, new key, bounded;
+                                          gone -> settled; captured after all -> owner review, no auto refund)
+both legs verified -> cancelled (guest told "not charged") -> dates released in the same transaction
+```
+
+**Unchanged:** a captured payment whose Hostaway accounting update fails or is ambiguous stays a valid paid booking (`payment_captured`). It goes to accounting reconciliation, never to automatic cancellation or refund.

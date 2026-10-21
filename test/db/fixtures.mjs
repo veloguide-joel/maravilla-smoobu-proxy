@@ -138,9 +138,14 @@ const READ_FOR_KIND = { checkout_session: "stripe.retrieve_checkout_session", pa
 /** Mocked provider read -> persisted API evidence. Returns the evidence id. */
 export async function readEvidence(pool, intentId, kind, externalRef, status, observed = {}, minutes = 20) {
   const opType = READ_FOR_KIND[kind];
-  const opId = await requestRead(pool, intentId, opType, String(externalRef), { now: at(minutes) });
-  const op = await claimNextOperation(pool, { workerId: "w-read", now: at(minutes), intentId, opTypes: [opType] });
-  assert.equal(op.id, opId, "read op claimed");
+  // use a read E3 already scheduled (e.g. after an ambiguous capture/void/cancel); otherwise queue one
+  let op = await claimNextOperation(pool, { workerId: "w-read", now: at(minutes), intentId, opTypes: [opType] });
+  if (!op) {
+    await requestRead(pool, intentId, opType, String(externalRef), { now: at(minutes) });
+    op = await claimNextOperation(pool, { workerId: "w-read", now: at(minutes), intentId, opTypes: [opType] });
+  }
+  assert.ok(op, "read op claimed");
+  const opId = op.id;
   ok(await completeOperation(pool, opId, { workerId: "w-read", now: at(minutes), outcome: { status: "succeeded", resultRef: externalRef } }), "read");
   return ok(await recordProviderEvidence(pool, { readOpId: opId, kind, externalRef: String(externalRef), status, observed, providerRequestId: `req_${opId.slice(0, 8)}` }), "evidence").id;
 }

@@ -9,7 +9,9 @@ export const DB_CONFIG = Object.freeze({
   operationLeaseMs: 60 * 1000,              // outbox worker lease
   casMaxRetries: 3,                         // reload-and-retry when another worker won the version race
   retryBackoffMs: Object.freeze({ read: 30 * 1000, idempotent: 60 * 1000 }),
-  maxAttempts: Object.freeze({ read: 10, idempotent: 5, non_idempotent: 1 }),  // non_idempotent = 1 is also enforced by the DB
+  // non_idempotent and reconcile_first = 1 are also enforced by the DB: such a row is attempted once; anything further
+  // is a NEW operation that E3 emits only after reconciliation
+  maxAttempts: Object.freeze({ read: 10, idempotent: 5, non_idempotent: 1, reconcile_first: 1 }),
   releaseConfirmedClaimsAfterCheckout: true // O5 (provisional): a confirmed booking keeps its claim until check-out
 });
 

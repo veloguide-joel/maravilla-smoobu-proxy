@@ -12,7 +12,7 @@
 // A unique outbox or attempt row bounds what THIS system may send. It is not a claim of exactly-once delivery
 // to Stripe or Hostaway: that depends on provider idempotency (Stripe) or reconciliation (Hostaway, R1).
 import { randomUUID } from "node:crypto";
-import { createIntent, transition, voidKey, TERMINAL_STATES, STATES as S } from "../../lib/checkout/intent-state.js";
+import { createIntent, transition, TERMINAL_STATES, STATES as S } from "../../lib/checkout/intent-state.js";
 import { rowToIntent, intentToRow, MUTABLE_COLUMNS, INTENT_SELECT, num } from "./codec.js";
 import { DB_CONFIG } from "./config.js";
 
@@ -80,12 +80,15 @@ export function effectToOperation(effect, after, versionAfter) {
   const id = after.id;
   const base = (opType, retryClass, key, payload) => ({ opType, retryClass, key, payload });
   switch (effect.type) {
+    // E3.2: provider WRITES that are reconciled first — attempted once per row; an ambiguous result is settled by a
+    // provider read (settle_operation_from_evidence) before E3 may emit another attempt as a new row.
     case "stripe.void_payment_intent":
-      return base(effect.type, "idempotent", `void:${id}:v${versionAfter}`,
-        { paymentIntentId: effect.paymentIntentId, providerIdempotencyKey: effect.idempotencyKey });
+      return base(effect.type, "reconcile_first", `void:${id}:v${versionAfter}`,
+        { paymentIntentId: effect.paymentIntentId, attempt: effect.attempt ?? 1, providerIdempotencyKey: effect.idempotencyKey });
     case "stripe.capture_payment_intent":
-      return base(effect.type, "idempotent", `cap:${id}:v${versionAfter}`,
-        { paymentIntentId: effect.paymentIntentId, amountMinor: effect.amountMinor, providerIdempotencyKey: effect.idempotencyKey });
+      return base(effect.type, "reconcile_first", `cap:${id}:v${versionAfter}`,
+        { paymentIntentId: effect.paymentIntentId, amountMinor: effect.amountMinor, attempt: effect.attempt ?? 1,
+          providerIdempotencyKey: effect.idempotencyKey });
     case "stripe.retrieve_payment_intent":
       return base(effect.type, "read", `read-pi:${id}:v${versionAfter}`, { paymentIntentId: effect.paymentIntentId });
     case "hostaway.lookup_reservation":
@@ -94,8 +97,10 @@ export function effectToOperation(effect, after, versionAfter) {
       if (effect.forceOverbooking !== false) throw new RepoError("FORCE_OVERBOOKING_REFUSED");
       return base(effect.type, "non_idempotent", `hcreate:${id}`, { ref: effect.ref, forceOverbooking: false });
     case "hostaway.cancel_reservation":
-      return base(effect.type, "idempotent", `hcancel:${id}:${effect.reservationId}`,
-        { reservationId: String(effect.reservationId), cancelledBy: effect.cancelledBy });
+      return base(effect.type, "reconcile_first", `hcancel:${id}:${effect.reservationId}:${effect.attempt ?? 1}`,
+        { reservationId: String(effect.reservationId), cancelledBy: effect.cancelledBy, attempt: effect.attempt ?? 1 });
+    case "hostaway.retrieve_reservation":
+      return base(effect.type, "read", `read-res:${id}:v${versionAfter}`, { reservationId: String(effect.reservationId) });
     case "hostaway.record_offline_charge":
       return base(effect.type, "non_idempotent", `och:${id}:${after.counters.offlineChargeAttempts + 1}`,
         { reservationId: String(effect.reservationId), amountMinor: effect.amountMinor });
@@ -280,6 +285,7 @@ async function guardEvent(pool, intentId, event) {
 
 // Safety refusals raised by the E2B.1 triggers, surfaced as result codes.
 export const DB_SAFETY_CODES = Object.freeze(["CLAIM_REQUIRED", "CHECKOUT_EXPIRY_NOT_VERIFIED", "VOID_NOT_VERIFIED", "CANCELLATION_NOT_VERIFIED",
+  "AUTHORIZATION_NOT_VERIFIED_SETTLED", "AMBIGUOUS_RESULT_NOT_DEFINITE",
   "RESOLUTION_REQUIRED", "RESOLUTION_MISMATCH", "CLAIM_RELEASE_BLOCKED", "PRIOR_RECORDING_NOT_VERIFIED_FAILED", "REFUSAL_NOT_CATALOGUED",
   "OWNER_RESOLUTION_REQUIRED", "NOT_A_CATALOGUED_DEFINITE_REFUSAL"]);
 export function dbSafetyCode(e) {
@@ -316,12 +322,7 @@ export async function applyEvent(pool, intentId, event, opts = {}) {
     if (res.duplicate) return { ok: true, duplicate: true, intent: before, effects: [], operations: [], casRetries: attempt };
     const after = res.intent;
     const openedBy = eventId || `${event.type}:v${after.version}`;
-    // C5: a definite capture failure leaves the card authorization possibly held; schedule its void as well.
-    // (E3 emits only the reservation cancel + alert; candidate for an E3.2 correction.)
-    const effects = event.type === "CAPTURE_FAILED" && after.payment?.paymentIntentId
-      ? [...res.effects, { type: "stripe.void_payment_intent", paymentIntentId: after.payment.paymentIntentId,
-          idempotencyKey: voidKey(after.id, after.payment.paymentIntentId) }]
-      : res.effects;
+    const effects = res.effects; // E3.2: E3 itself emits every recovery action (no database-side additions)
 
     const client = await pool.connect();
     let outcome;
@@ -363,6 +364,7 @@ export async function applyEvent(pool, intentId, event, opts = {}) {
       else if (e.code === "23505" && /one_open_offline_charge/.test(e.constraint || "")) return { ok: false, error: "OFFLINE_CHARGE_OUTCOME_UNRESOLVED" };
       else if (dbSafetyCode(e)) return { ok: false, error: dbSafetyCode(e) };
       else if (e.code === "23505" && /one_hostaway_create|hostaway_reservation_attempts_intent_id/.test(e.constraint || "")) return { ok: false, error: "HOSTAWAY_CREATE_ALREADY_RECORDED" };
+      else if (e.code === "23505" && /one_open_provider_write/.test(e.constraint || "")) return { ok: false, error: "PRIOR_PROVIDER_WRITE_UNRESOLVED" };
       else throw e;
     } finally {
       client.release();

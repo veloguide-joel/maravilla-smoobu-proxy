@@ -71,7 +71,9 @@ test("every E3 state is reachable through persisted transitions, with exact roun
   await step(d.id, { type: "CAPTURE_FAILED", definite: true, code: "CARD_DECLINED" }, 8);
   await F.runOp(db.app, d.id, "hostaway.cancel_reservation", 9);           // E2B.1 (C5): verified cancellation
   await F.reservationStatus(db.app, d.id, "9102", "cancelled", {}, 9);
-  await step(d.id, { type: "RESERVATION_CANCELLED" }, 9);
+  await step(d.id, { type: "RESERVATION_CANCELLED" }, 9);                  // E3.2: leg 1 of 2 (still capture_failed)
+  await F.runOp(db.app, d.id, "stripe.void_payment_intent", 10);           // E3.2: leg 2 — authorization voided
+  await step(d.id, { type: "VOID_SUCCEEDED" }, 10);
 
   // reconciliation_required -> RESOLVE (evidence)
   a = await F.authorized(db.app, { from: "2027-01-28", to: "2027-01-30" });

@@ -62,8 +62,12 @@ export function rowToIntent(row) {
       voidAttempts: row.void_attempts,
       reconcileAttempts: row.reconcile_attempts,
       offlineChargeAttempts: row.offline_charge_attempts,
-      checkoutAttempts: row.checkout_attempts
+      checkoutAttempts: row.checkout_attempts,
+      captureAttempts: row.capture_attempts,
+      cancelAttempts: row.cancel_attempts
     },
+    settlement: row.settlement_reservation_cancelled == null ? null
+      : { reservationCancelled: row.settlement_reservation_cancelled, authorizationSettled: row.settlement_authorization_settled },
     offlineChargeId: row.offline_charge_id,
     reasonCode: row.reason_code,
     seenEventIds: [],
@@ -79,7 +83,8 @@ export const MUTABLE_COLUMNS = Object.freeze([
   "authorized_minor", "authorization_created_at", "capture_before", "authorization_deadline", "authorization_accepted_at",
   "captured_minor", "hostaway_reservation_id", "reservation_confirmed_at", "lease_worker_id", "lease_until",
   "dispatch_at", "dispatch_attempt", "offline_charge_id", "checkout_attempts", "reservation_attempts", "void_attempts",
-  "reconcile_attempts", "offline_charge_attempts", "reason_code", "updated_at"
+  "reconcile_attempts", "offline_charge_attempts", "reason_code", "updated_at",
+  "capture_attempts", "cancel_attempts", "settlement_reservation_cancelled", "settlement_authorization_settled"
 ]);
 
 export function intentToRow(intent) {
@@ -131,6 +136,10 @@ export function intentToRow(intent) {
     void_attempts: c.voidAttempts,
     reconcile_attempts: c.reconcileAttempts,
     offline_charge_attempts: c.offlineChargeAttempts,
+    capture_attempts: c.captureAttempts ?? 0,
+    cancel_attempts: c.cancelAttempts ?? 0,
+    settlement_reservation_cancelled: intent.settlement ? intent.settlement.reservationCancelled : null,
+    settlement_authorization_settled: intent.settlement ? intent.settlement.authorizationSettled : null,
     reason_code: intent.reasonCode,
     updated_at: ts(intent.updatedAt)
   };

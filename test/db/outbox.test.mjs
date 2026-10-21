@@ -52,12 +52,12 @@ test("duplicate dispatch attempts: 6 workers race for one operation -> exactly o
 });
 
 test("worker interruption: expired leases are recovered according to retry class", async () => {
-  // idempotent (Stripe void): back to pending, provider state must be read first
+  // reconcile_first (Stripe void): an interrupted call is NEVER re-queued — outcome_unknown, settled only by a read
   const a = await F.authorized(db.app, { listingId: 730003 });
   const r = F.ok(await applyEvent(db.app, a.id, { type: "RESERVATION_STARTED", workerId: "w1", recheck: { bookable: false } }, { now: F.at(6) }));
   const voidOp = await claimNextOperation(db.app, { workerId: "w1", now: F.at(7), intentId: a.id, opTypes: VOID, leaseMs: 60000 });
   assert.equal(voidOp.id, r.operations[0].id);
-  // read (lookup) op from another intent
+  // read (lookup) op from another intent: safe to repeat
   const d = await F.authorized(db.app, { listingId: 730004 });
   F.ok(await applyEvent(db.app, d.id, { type: "RESERVATION_STARTED", workerId: "w2", recheck: { bookable: true, priceSame: true } }, { now: F.at(6), workerId: "w2" }));
   const lookupOp = await claimNextOperation(db.app, { workerId: "w2", now: F.at(7), intentId: d.id, opTypes: ["hostaway.lookup_reservation"], leaseMs: 60000 });
@@ -65,28 +65,33 @@ test("worker interruption: expired leases are recovered according to retry class
   // both workers die; leases expire
   const rec = await recoverExpiredOperations(db.app, { now: F.at(9) });
   const byId = Object.fromEntries(rec.map((x) => [x.id, x.state]));
-  assert.equal(byId[voidOp.id], "pending");
+  assert.equal(byId[voidOp.id], "outcome_unknown", "E3.2: an interrupted void is not re-sent");
   assert.equal(byId[lookupOp.id], "pending");
-  assert.equal((await opRow(voidOp.id)).requires_provider_read, true);
-  assert.equal((await opRow(lookupOp.id)).requires_provider_read, false);
+  assert.equal(await claimNextOperation(db.app, { workerId: "w3", now: F.at(100), intentId: a.id, opTypes: VOID }), null);
+  await assert.rejects(db.app.query("UPDATE booking.external_operations SET state = 'pending' WHERE id = $1", [voidOp.id]), /not allowed/);
   // a worker that comes back late cannot complete
   assert.equal((await completeOperation(db.app, voidOp.id, { workerId: "w1", now: F.at(9.5), outcome: { status: "succeeded" } })).error, "LEASE_LOST");
 });
 
-test("retry limits: idempotent ops escalate after max attempts; the database refuses attempts beyond max", async () => {
+test("retry limits: idempotent ops escalate after max attempts; reconcile-first writes allow exactly one attempt", async () => {
   const a = await F.authorized(db.app, { listingId: 730005 });
-  const r = F.ok(await applyEvent(db.app, a.id, { type: "RESERVATION_STARTED", workerId: "w1", recheck: { bookable: false } }, { now: F.at(6) }));
-  const id = r.operations[0].id;
+  const e = F.ok(await applyEvent(db.app, a.id, { type: "ESCALATE", code: "MANUAL_REVIEW" }, { now: F.at(6) }));
+  const alertId = e.operations.find((o) => o.opType === "alert.owner").id;
   let t = 10;
   for (let i = 0; i < 5; i++) {
-    const op = await claimNextOperation(db.app, { workerId: "w1", now: F.at(t), intentId: a.id, opTypes: VOID });
-    assert.equal(op.id, id);
-    const c = F.ok(await completeOperation(db.app, id, { workerId: "w1", now: F.at(t), outcome: { status: "outcome_unknown", errorCode: "TIMEOUT" } }));
+    const op = await claimNextOperation(db.app, { workerId: "w1", now: F.at(t), intentId: a.id, opTypes: ["alert.owner"] });
+    assert.equal(op.id, alertId);
+    const c = F.ok(await completeOperation(db.app, alertId, { workerId: "w1", now: F.at(t), outcome: { status: "outcome_unknown", errorCode: "TIMEOUT" } }));
     assert.equal(c.state, i < 4 ? "pending" : "escalated");
     t += 5;
   }
   assert.equal(await F.count(db.app, "SELECT count(*) AS n FROM booking.reconciliation_cases WHERE intent_id = $1 AND kind = 'OPERATION_RETRIES_EXHAUSTED'", [a.id]), 1);
-  await assert.rejects(db.app.query("UPDATE booking.external_operations SET attempts = 6 WHERE id = $1", [id]), /check constraint/);
+  await assert.rejects(db.app.query("UPDATE booking.external_operations SET attempts = 6 WHERE id = $1", [alertId]), /check constraint/);
+  const b = await F.authorized(db.app, { listingId: 730006 });
+  const v = F.ok(await applyEvent(db.app, b.id, { type: "RESERVATION_STARTED", workerId: "w1", recheck: { bookable: false } }, { now: F.at(6) }));
+  const voidRow = (await db.app.query("SELECT retry_class, max_attempts FROM booking.external_operations WHERE id = $1", [v.operations[0].id])).rows[0];
+  assert.deepEqual(voidRow, { retry_class: "reconcile_first", max_attempts: 1 });
+  await assert.rejects(db.owner.query("UPDATE booking.external_operations SET max_attempts = 3 WHERE id = $1", [v.operations[0].id]), /immutable|check constraint/);
 });
 
 test("external dispatch is disabled: no executor, no send; no route imports the booking database layer", async () => {
