@@ -1,0 +1,5 @@
+# C8: never upload internal-only trees to Vercel (defence in depth; outputDirectory "public" already keeps
+# everything else out of static serving). NEVER list api/ or lib/: API functions bundle their lib/ imports.
+/db
+/test
+/scripts
