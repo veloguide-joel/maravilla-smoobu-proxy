@@ -9,24 +9,64 @@ import pg from "pg";
 
 const LOOPBACK = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 
+// URL options that pg/pg-connection-string turn into an `ssl` setting REPLACING the verified one passed below
+// (sslmode, ssl, sslcert, sslkey, sslrootcert, sslpassword, ...), or that change how it is interpreted.
+const TLS_OVERRIDE_PARAM = /^(ssl.*|uselibpqcompat)$/i;
+
+function reject(reason) {
+  return new TypeError(`createBookingPool: connection string rejected (${reason})`); // never includes the URL
+}
+
+/**
+ * Validate a booking connection string and decide where it really points. Fails closed on anything that could
+ * make pg connect somewhere other than the URL's host, or with weaker TLS than the pool configures.
+ * Allowed: postgres(ql)://host/... (remote: verified TLS; loopback: plain), and Unix sockets given unambiguously
+ * either as a percent-encoded path host or as ?host=/absolute/path with an empty or loopback URL host.
+ */
+export function resolveBookingTarget(connectionString) {
+  let u;
+  try { u = new URL(connectionString); } catch { throw reject("not a valid URL"); }
+  if (u.protocol !== "postgres:" && u.protocol !== "postgresql:") throw reject("scheme must be postgres or postgresql");
+  const keys = [...u.searchParams.keys()];
+  const tlsKey = keys.find((k) => TLS_OVERRIDE_PARAM.test(k));
+  if (tlsKey) throw reject(`URL option '${tlsKey}' would override the verified TLS configuration`);
+  let urlHost;
+  try { urlHost = decodeURIComponent(u.hostname); } catch { throw reject("malformed host"); }
+  const hostParams = u.searchParams.getAll("host");
+  if (hostParams.length > 1) throw reject("more than one host option");
+  let host = urlHost;
+  if (hostParams.length === 1) {
+    const h = hostParams[0];
+    const socketOverride = h.startsWith("/") && !h.includes(",") && (urlHost === "" || LOOPBACK.has(urlHost));
+    if (!socketOverride) throw reject("ambiguous host: ?host= may only name a Unix socket directory for a local URL");
+    host = h;
+  }
+  if (!host) throw reject("no host");
+  return { host, local: LOOPBACK.has(host) || host.startsWith("/") }; // unix socket directories are local too
+}
+
 export function isLoopbackUrl(connectionString) {
-  const u = new URL(connectionString);
-  const host = u.hostname || new URLSearchParams(u.search).get("host") || "";
-  return LOOPBACK.has(host) || host.startsWith("/"); // unix socket directories are local too
+  return resolveBookingTarget(connectionString).local;
 }
 
 export function createBookingPool({ connectionString, caPem, max = 3, statementTimeoutMs = 5000 } = {}) {
   if (typeof connectionString !== "string" || !connectionString) throw new TypeError("createBookingPool: connectionString required");
-  const local = isLoopbackUrl(connectionString);
+  const { host, local } = resolveBookingTarget(connectionString);
   if (!local && !caPem) throw new TypeError("createBookingPool: remote databases require caPem (verified TLS)");
-  return new pg.Pool({
+  const ssl = local ? false : { rejectUnauthorized: true, ca: caPem };
+  const config = {
     connectionString,
     max,
-    ssl: local ? false : { rejectUnauthorized: true, ca: caPem },
+    ssl,
     statement_timeout: statementTimeoutMs,          // no statement can hold locks for long
     idle_in_transaction_session_timeout: 10000,     // a stuck client cannot keep a transaction open
     application_name: "maravilla-booking"
-  });
+  };
+  // Fail closed on what pg will EFFECTIVELY use (constructing a Client does not connect).
+  const eff = new pg.Client(config).connectionParameters;
+  if (eff.host !== host) throw reject("effective host differs from the URL host");
+  if (eff.ssl !== ssl) throw reject("effective TLS settings differ from the verified configuration");
+  return new pg.Pool(config);
 }
 
 /** Refuse to operate on a database whose environment marker differs from the expected one. */
