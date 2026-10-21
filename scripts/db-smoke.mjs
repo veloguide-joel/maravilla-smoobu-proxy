@@ -7,7 +7,7 @@
 // matrix, function privileges, empty data, and a database-clock function.
 //
 // - READ-ONLY by default: every check runs inside one `BEGIN READ ONLY` transaction that is always rolled back.
-// - --write-probe (separate explicit approval): only when the database marker is `test`; inserts ONE synthetic
+// - --write-probe (separate explicit approval): only when EVERY read-only check passed and the marker is `test`; inserts ONE synthetic
 //   intent with raw SQL on the same single client inside its own transaction that is ALWAYS rolled back
 //   (no repository helper is called, so nothing can commit), then confirms the probe row does not exist.
 // - Fails closed: exit 0 only if at least one check ran and every check passed.
@@ -159,11 +159,11 @@ async function main() {
 
       await client.query("SAVEPOINT data");
       try {
-        const [c0] = await q(`SELECT (SELECT count(*) FROM booking.instance)::int AS instance,
-            (SELECT count(*) FROM booking.intents)::int AS intents, (SELECT count(*) FROM booking.intent_guests)::int AS guests,
-            (SELECT count(*) FROM booking.inventory_claims)::int AS claims, (SELECT count(*) FROM booking.external_operations)::int AS ops,
-            (SELECT count(*) FROM booking.payment_ledger)::int AS ledger`);
-        check("data_only_instance_row", c0.instance === 1 && c0.intents === 0 && c0.guests === 0 && c0.claims === 0 && c0.ops === 0 && c0.ledger === 0);
+        // Every expected booking table (fixed names from EXPECTED_TABLE_PRIVS): only instance may hold one row.
+        const names = Object.keys(EXPECTED_TABLE_PRIVS).sort();
+        const [c0] = await q(`SELECT ${names.map((t) => `(SELECT count(*) FROM booking.${t})::int AS ${t}`).join(", ")}`);
+        const unexpected = names.filter((t) => c0[t] !== (t === "instance" ? 1 : 0));
+        check("data_only_instance_row", unexpected.length === 0, unexpected.length ? unexpected : `${names.length} tables`);
         const [blk] = await q("SELECT booking.claim_release_blockers(gen_random_uuid()) AS b");
         check("db_clock_function_callable", JSON.stringify(blk.b) === JSON.stringify(["INTENT_NOT_FOUND"]));
         await client.query("RELEASE SAVEPOINT data");
@@ -178,7 +178,12 @@ async function main() {
     }
 
     if (o["write-probe"]) {
-      if (!(envOk && o.env === "test")) { check("write_probe_allowed_only_on_test_marker", false); return; }
+      // Gate: every check completed so far must have passed (identity, privileges, TLS, limits, data, environment),
+      // and the database marker must be `test`. Otherwise no write transaction is ever started.
+      if (!(results.length > 0 && results.every((r) => r.pass) && envOk && o.env === "test")) {
+        check("write_probe_refused_prerequisites_not_met", false);
+        return;
+      }
       // One synthetic intent on THIS client only, raw SQL, ALWAYS rolled back. No repository helper (they commit).
       const id = randomUUID(), ref = "MV-SMK" + randomUUID().replace(/-/g, "").slice(0, 5).toUpperCase();
       const token = createHash("sha256").update(randomUUID()).digest();

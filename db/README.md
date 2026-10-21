@@ -188,11 +188,11 @@ node scripts/db-smoke.mjs --url-env BOOKING_DATABASE_URL --ca-file prod-ca-2021.
 - Environment marker, and effective `statement_timeout` 5 s / `idle_in_transaction_session_timeout` 10 s.
 - The exact table-privilege matrix: no DELETE or TRUNCATE.
 - Runtime functions executable; `admin_*` functions not executable; migration bookkeeping denied.
-- Empty data apart from the `instance` row.
+- Empty data in all 17 booking tables apart from the single `instance` row.
 
 **Safety:**
 - Read-only by default: all checks run in one `BEGIN READ ONLY` transaction that is rolled back.
-- `--write-probe` needs separate approval. It runs only on a `test` marker, inserts one synthetic intent with raw SQL on the same client, and always rolls back.
+- `--write-probe` needs separate approval. It runs only if **every** read-only check passed and the marker is `test`; otherwise it records a refusal and never starts a write transaction. It inserts one synthetic intent with raw SQL on the same client and always rolls back.
 - Output is check names, booleans and codes only: never the URL, user name, password or server error text.
 - Exit code 0 only when every check passes.
 
