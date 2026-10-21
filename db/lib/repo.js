@@ -141,19 +141,27 @@ async function openCase(c, intentId, kind, openedBy, evidence, now) {
 
 // E2B.1 (C2/C7): claims are changed only through SECURITY DEFINER functions; the database re-checks every blocker
 // (payment attempts, authorizations, reservations, provider operations, open cases) before any release.
-async function releaseClaimIfSafe(c, intentId, reason, now) {
-  const r = await c.query("SELECT booking.release_claim_if_safe($1, $2, $3) AS ok", [intentId, reason, new Date(now)]);
+// E2B.2 (A): release and purge decisions use PostgreSQL's own clock. No caller can supply "now" for them.
+function refuseCallerTime(opts) {
+  if (opts && opts.now !== undefined) {
+    throw new TypeError("TIME_IS_DATABASE_CONTROLLED: release and purge decisions use the database clock; do not pass now");
+  }
+}
+async function releaseClaimIfSafe(c, intentId, reason) {
+  const r = await c.query("SELECT booking.release_claim_if_safe($1, $2) AS ok", [intentId, reason]);
   return r.rows[0].ok === true;
 }
 
-/** Ask the database to release the claim; it does so only if nothing is unresolved. Returns true if released. */
-export async function tryReleaseClaim(pool, intentId, { reason = "SAFE_RELEASE", now }) {
-  return withTx(pool, (c) => releaseClaimIfSafe(c, intentId, reason, now));
+/** Ask the database to release the claim; it does so only if nothing is unresolved (database clock). Returns true if released. */
+export async function tryReleaseClaim(pool, intentId, opts = {}) {
+  refuseCallerTime(opts);
+  return withTx(pool, (c) => releaseClaimIfSafe(c, intentId, opts.reason || "SAFE_RELEASE"));
 }
 
-/** Why the claim of this intent cannot be released right now (empty = it can). */
-export async function claimReleaseBlockers(q, intentId, { now }) {
-  return (await q.query("SELECT booking.claim_release_blockers($1, $2) AS b", [intentId, new Date(now)])).rows[0].b;
+/** Why the claim of this intent cannot be released right now, by the database clock (empty = it can). */
+export async function claimReleaseBlockers(q, intentId, opts = {}) {
+  refuseCallerTime(opts);
+  return (await q.query("SELECT booking.claim_release_blockers($1) AS b", [intentId])).rows[0].b;
 }
 
 /** Records that must change in the same transaction as the E3 transition. */
@@ -245,7 +253,7 @@ async function sideRecords(c, before, after, event, now, ops, openedBy) {
     await c.query("SELECT booking.claim_upgrade($1, 'reserved')", [id]);
   }
   if (CLAIM_RELEASE_STATES.has(after.status) && after.status !== before.status) {
-    await releaseClaimIfSafe(c, id, `INTENT_${after.status.toUpperCase()}`, now);
+    await releaseClaimIfSafe(c, id, `INTENT_${after.status.toUpperCase()}`);
   }
 
   // reconciliation cases
@@ -407,10 +415,14 @@ export async function collectGuestDetails(pool, intentId, guest, { now, termsVer
   });
 }
 
-/** Delete guest data that has passed the (provisional, caller-supplied) retention periods. Returns rows deleted. */
-export async function purgeGuestData(pool, { now, retention }) {
-  const r = await pool.query("SELECT booking.purge_guest_data($1, $2, $3) AS n",
-    [new Date(now), retention.failedAttemptDays, retention.postCheckoutDays]);
+/**
+ * Delete guest data that has passed the (provisional, configurable) retention periods. The database decides what is
+ * due with its own clock (E2B.2); callers cannot supply "now". Returns rows deleted.
+ */
+export async function purgeGuestData(pool, opts) {
+  refuseCallerTime(opts);
+  const { retention } = opts;
+  const r = await pool.query("SELECT booking.purge_guest_data($1, $2) AS n", [retention.failedAttemptDays, retention.postCheckoutDays]);
   return r.rows[0].n;
 }
 
@@ -435,7 +447,11 @@ async function beginPayStepOnce(pool, intentId, { now, cfg = DB_CONFIG } = {}) {
       if (!(t < row.quote_expires_at)) return { ok: false, error: "QUOTE_EXPIRED" };
       const existing = await c.query("SELECT * FROM booking.payment_attempts WHERE intent_id = $1 AND status = ANY($2) ORDER BY attempt DESC LIMIT 1",
         [intentId, UNRESOLVED_PAYMENT_ATTEMPT]);
-      if (existing.rows[0]) return { ok: true, reused: true, attempt: existing.rows[0] };
+      if (existing.rows[0]) {
+        // E2B.2 (B): a create whose outcome is unknown is reconciled first; no further create is ever requested for it
+        if (existing.rows[0].status === "outcome_unknown") return { ok: false, error: "CHECKOUT_CREATE_UNRESOLVED", attempt: existing.rows[0] };
+        return { ok: true, reused: true, attempt: existing.rows[0] };
+      }
       const claim = await c.query("SELECT id FROM booking.inventory_claims WHERE intent_id = $1 AND released_at IS NULL", [intentId]);
       if (!claim.rows[0]) {
         await c.query(`INSERT INTO booking.inventory_claims (intent_id, listing_id, stay, kind, claimed_at, review_after)
@@ -454,10 +470,10 @@ async function beginPayStepOnce(pool, intentId, { now, cfg = DB_CONFIG } = {}) {
       await c.query(
         `INSERT INTO booking.external_operations (id, intent_id, op_type, idempotency_key, retry_class, state, payload, source_version,
            max_attempts, next_attempt_at, created_at, updated_at)
-         VALUES ($1,$2,'stripe.create_checkout_session',$3,'idempotent','pending',$4,$5,$6,$7,$7,$7)`,
+         VALUES ($1,$2,'stripe.create_checkout_session',$3,'reconcile_first','pending',$4,$5,$6,$7,$7,$7)`,
         [randomUUID(), intentId, `cs-op:${intentId}:${n}`,
           { providerIdempotencyKey: key, amountMinor: num(row.final_total_minor), currency: row.currency, expiresAt: planned.toISOString(), paymentAttemptId: attemptId },
-          row.version, cfg.maxAttempts.idempotent, t]);
+          row.version, cfg.maxAttempts.reconcile_first, t]);
       return { ok: true, reused: false, attempt: a.rows[0] };
     });
   } catch (e) {
@@ -486,7 +502,7 @@ export async function listClaimsDueForReview(pool, { now, limit = 50 }) {
     `SELECT c.id AS claim_id, c.intent_id, c.kind, c.review_count, i.state,
             (SELECT json_agg(json_build_object('id', a.id, 'status', a.status, 'sessionId', a.checkout_session_id) ORDER BY a.attempt)
                FROM booking.payment_attempts a WHERE a.intent_id = c.intent_id AND a.status = ANY($3)) AS unresolved_attempts,
-            booking.claim_release_blockers(c.intent_id, $1) AS blockers
+            booking.claim_release_blockers(c.intent_id) AS blockers
        FROM booking.inventory_claims c JOIN booking.intents i ON i.id = c.intent_id
       WHERE c.released_at IS NULL AND c.review_after <= $1 ORDER BY c.review_after LIMIT $2`,
     [new Date(now), limit, UNRESOLVED_PAYMENT_ATTEMPT]);
@@ -536,14 +552,15 @@ export async function applyCheckoutSessionEvidence(pool, intentId, attemptId, ev
                    WHERE id = $1 AND status IN ('creating', 'open', 'outcome_unknown')`, [attemptId, ev.external_ref, new Date(now)]);
     const row = await loadIntentRow(c, intentId, { forUpdate: true });
     if (!CLAIM_RELEASE_STATES.has(row.state)) return false; // still in progress
-    return releaseClaimIfSafe(c, intentId, "CHECKOUT_EXPIRED", now);
+    return releaseClaimIfSafe(c, intentId, "CHECKOUT_EXPIRED");
   });
   return { ok: true, released };
 }
 
-/** O5 (provisional): confirmed bookings release their claim once check-out day (Mexico City) is reached. */
-export async function releaseCompletedStayClaims(pool, { now }) {
-  return (await pool.query("SELECT booking.release_completed_stays($1) AS n", [new Date(now)])).rows[0].n;
+/** O5 (provisional): confirmed bookings release their claim once check-out day (Mexico City) is reached, by the database clock. */
+export async function releaseCompletedStayClaims(pool, opts = {}) {
+  refuseCallerTime(opts);
+  return (await pool.query("SELECT booking.release_completed_stays() AS n")).rows[0].n;
 }
 
 /** Build and apply the E3 RESOLVE event from a persisted OWNER RESOLUTION (never from caller-supplied booleans). */

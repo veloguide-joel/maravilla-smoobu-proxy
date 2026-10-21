@@ -8,6 +8,11 @@
 //   idempotent      -> repeat with the SAME provider idempotency key, after reading provider state first
 //   non_idempotent  -> attempted at most once; an ambiguous result becomes outcome_unknown + a reconciliation case,
 //                      never an automatic retry (Hostaway create; Hostaway payment recording)
+//   reconcile_first -> attempted at most once per row; an ambiguous result becomes outcome_unknown and is settled only
+//                      from evidence (E3.2: capture / void / cancel; E2B.2: Stripe Checkout Session create)
+//
+// Notification operations (guest.notify / alert.owner) stay "idempotent": a retry after an ambiguous send can deliver
+// a DUPLICATE message (e-mail/SMS providers have no shared idempotency here). Accepted for E2B; revisit with E8.
 import { randomUUID } from "node:crypto";
 import { DB_CONFIG } from "./config.js";
 import { withTx, dbSafetyCode } from "./repo.js";
@@ -16,8 +21,10 @@ export const EXTERNAL_DISPATCH_ENABLED = false;
 
 const UNKNOWN_CASE_KIND = Object.freeze({
   "hostaway.create_reservation": "HOSTAWAY_CREATE_OUTCOME_UNKNOWN",
-  "hostaway.record_offline_charge": "OFFLINE_CHARGE_OUTCOME_UNKNOWN"
+  "hostaway.record_offline_charge": "OFFLINE_CHARGE_OUTCOME_UNKNOWN",
+  "stripe.create_checkout_session": "CHECKOUT_CREATE_OUTCOME_UNKNOWN"
 });
+const CHECKOUT_CREATE = "stripe.create_checkout_session";
 
 async function openCase(c, intentId, kind, openedBy, evidence, now) {
   await c.query(
@@ -87,6 +94,11 @@ async function completeOperationOnce(pool, opId, { workerId, now, outcome, cfg =
     if (outcome.status === "succeeded" || outcome.status === "failed_definite") {
       await c.query(`UPDATE booking.external_operations SET state = $5, result_ref = $3, error_code = $4, completed_at = $2,
                      lease_worker_id = NULL, lease_until = NULL, updated_at = $2 WHERE id = $1`, [...common, outcome.status]);
+      if (op.op_type === CHECKOUT_CREATE && outcome.status === "failed_definite") {
+        // an explicit Stripe refusal of the create: no session exists for this attempt
+        await c.query("UPDATE booking.payment_attempts SET status = 'not_created', updated_at = $2 WHERE id = $1::uuid AND status = 'creating'",
+          [op.payload.paymentAttemptId, t]);
+      }
       return { ok: true, state: outcome.status };
     }
     if (outcome.status !== "outcome_unknown") throw new TypeError("outcome.status");
@@ -101,6 +113,14 @@ async function markUnknown(c, op, now, errorCode, cfg) {
     // the row is settled only by settle_operation_from_evidence() (or an owner resolution).
     await c.query(`UPDATE booking.external_operations SET state = 'outcome_unknown', error_code = $3, lease_worker_id = NULL, lease_until = NULL,
                    updated_at = $2 WHERE id = $1`, [op.id, t, errorCode]);
+    if (op.op_type === CHECKOUT_CREATE) {
+      // E2B.2 (B): a Checkout Session may or may not exist. The attempt waits on reconciliation (no second create is
+      // ever requested for it) and the owner is told: with no session id, only a manual check can settle it until E5.
+      await c.query("UPDATE booking.payment_attempts SET status = 'outcome_unknown', updated_at = $2 WHERE id = $1::uuid AND status = 'creating'",
+        [op.payload.paymentAttemptId, t]);
+      await openCase(c, op.intent_id, UNKNOWN_CASE_KIND[op.op_type], `op:${op.id}`,
+        { operationId: op.id, opType: op.op_type, errorCode, paymentAttemptId: op.payload.paymentAttemptId }, now);
+    }
     return "outcome_unknown";
   }
   if (op.retry_class === "non_idempotent") {
@@ -192,7 +212,10 @@ export async function dispatchOperation(op, { executors = {} } = {}) {
 // ---------------------------------------------------------------------------------------------
 // E3.2: reconcile-first provider writes (capture / void / cancel)
 
-/** Settle an ambiguous capture/void/cancel from persisted API evidence (a verified provider read). */
+/**
+ * Settle an ambiguous capture/void/cancel — or Checkout Session create (E2B.2) — from persisted API evidence (a verified
+ * provider read). A create is settled only as "applied", from a read of a KNOWN session bound to its payment attempt.
+ */
 export async function settleOperationFromEvidence(pool, opId, evidenceId) {
   try {
     const r = await pool.query("SELECT booking.settle_operation_from_evidence($1, $2) AS state", [opId, evidenceId]);

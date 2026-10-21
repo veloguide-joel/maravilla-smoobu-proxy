@@ -1,4 +1,4 @@
-# Booking database (Stage E2B — offline foundation, with E2B.1 safety corrections)
+# Booking database (Stage E2B — offline foundation, with E2B.1, E3.2 and E2B.2 corrections)
 
 Schema `booking` for the new maraVilla direct-booking checkout. Design: project doc
 `claude/e2a-booking-database-design-2026-10-21.md`.
@@ -12,7 +12,7 @@ Schema `booking` for the new maraVilla direct-booking checkout. Design: project 
 
 | Path | Purpose |
 |---|---|
-| `db/migrations/NNNN_name.{up,down}.sql` | Versioned migrations. `0001` is the schema; `0002` adds roles and grants (no passwords); `0003` adds the E2B.1 evidence, settlement and privilege rules |
+| `db/migrations/NNNN_name.{up,down}.sql` | Versioned migrations. `0001` is the schema; `0002` adds roles and grants (no passwords); `0003` adds the E2B.1 evidence, settlement and privilege rules; `0004` the E3.2 capture recovery; `0005` the E2B.2 database clock and Checkout-create reconciliation |
 | `db/lib/migrate.js`, `scripts/db-migrate.mjs` | Migration runner, with checksums, an environment marker and an advisory lock |
 | `db/lib/repo.js` | E3 persistence: CAS transitions, audit, event de-dup, outbox, claims, payment and Hostaway attempts, cases, guest data |
 | `db/lib/operations.js` | Outbox claim, complete and recover, by retry class. `dispatchOperation` refuses without an injected executor |
@@ -101,7 +101,7 @@ node scripts/db-migrate.mjs status|up|down --env test --url-env MY_LOCAL_DB_URL 
     - every possible reservation is verified cancelled, or the create was refused with a catalogued code;
     - no Stripe/Hostaway operation is pending, in flight, unknown or escalated;
     - no reconciliation case is open.
-  - A confirmed booking releases on check-out day, computed in Mexico City time.
+  - A confirmed booking releases on check-out day, computed in Mexico City time **by the database clock** (E2B.2).
 - **Payment end and void**
   - A payment attempt ends (`expired`/`failed`) only with Checkout Session evidence showing `expired`. A declined card ends nothing.
   - `authorization_released` after a refusal requires the void operation to have succeeded.
@@ -144,3 +144,32 @@ both legs verified -> cancelled (guest told "not charged") -> dates released in 
 ```
 
 **Unchanged:** a captured payment whose Hostaway accounting update fails or is ambiguous stays a valid paid booking (`payment_captured`). It goes to accounting reconciliation, never to automatic cancellation or refund.
+
+## E2B.2: database clock and Checkout Session create (migration `0005`)
+
+**A. Time for safety decisions comes from PostgreSQL**
+- `release_completed_stays()`, `release_claim_if_safe(intent, reason)`, `claim_release_blockers(intent)` and `purge_guest_data(failedDays, postCheckoutDays)` take **no time argument**. They use `statement_timestamp()`. The old caller-time signatures were dropped, so no role can ask for a decision "as of" 2099.
+- `released_at` is stamped by the claims trigger with the database time, whoever issues the UPDATE (the schema owner included), and every blocker is re-checked on that clock.
+- `intent_transitions.recorded_at` is stamped by the database on insert. The failed-attempt retention period runs from the last database-stamped transition, not from the caller's `updated_at`. The post-checkout period runs from the immutable check-out date.
+- The repository functions `tryReleaseClaim`, `claimReleaseBlockers`, `releaseCompletedStayClaims` and `purgeGuestData` refuse a `now` option (`TIME_IS_DATABASE_CONTROLLED`).
+- Tests use genuinely historical fixtures: stays dated before the database's today, and, for failed-attempt retention, transition rows aged by the cluster superuser in the throwaway test cluster (`F.ageIntent`).
+- **Still caller time (not safety decisions):** review scheduling (`review_after`, `listClaimsDueForReview`), lease and backoff times, and the evidence `observed_at` used by the 2-minute and 15-minute settle windows (review Finding C, before E5).
+
+**B. An uncertain Checkout Session create is reconciled first**
+- `stripe.create_checkout_session` is `reconcile_first`: one attempt per row. A timeout, 5xx or lost worker makes it `outcome_unknown`; it is **never re-queued**, whatever the delay. Stripe's 24-hour idempotency-key retention is not relied on.
+- The payment attempt becomes `outcome_unknown`, a `CHECKOUT_CREATE_OUTCOME_UNKNOWN` case is opened, and the Pay step returns `CHECKOUT_CREATE_UNRESOLVED` instead of preparing another session.
+- **Database-enforced:** at most one open create per intent; at most one unresolved payment attempt per intent; an attempt becomes `open` only for the session id that a **succeeded** create returned.
+- **Preserved for reconciliation:** the operation row, its error code, and any late response from the interrupted worker (`late_result_status`, `late_result_ref`).
+
+**How an unknown create is settled**
+
+| Situation | Who | How |
+|---|---|---|
+| Session id known (late response, or a Stripe event carrying it) | Runtime | Read the session by id; `settle_operation_from_evidence` accepts it only if the read shows the session belongs to this payment attempt (`observed.paymentAttemptId`) and was taken ≥ 2 minutes after the call. The result is always "applied"; then `recordCheckoutSession` |
+| Session found in the Stripe dashboard | Owner | `admin_resolve_operation(…, 'succeeded', [dashboard evidence], sessionId)`, then as above |
+| No session id, none found | **Owner, manual until E5** | `admin_resolve_operation(…, 'failed_definite', [none_found evidence])`, only after the `expires_at` sent to Stripe + 15 minutes has passed **by the database clock**, citing a dashboard search for this payment attempt that found no session. The attempt becomes `not_created`; a new Pay creates attempt n+1 with a new Stripe key |
+| Explicit Stripe refusal (error object with a code) | Runtime | `failed_definite` with that code; the attempt becomes `not_created`. Timeouts, 5xx, 429 and lease expiry are refused as "definite" |
+
+E5 must confirm which Stripe lookup can find a session when its id is unknown, e.g. listing Checkout Sessions and matching our metadata. It must also confirm that the create request sets `metadata.paymentAttemptId`, which reads are matched on. Until then, the no-id case is manual.
+
+**Notifications (documented, not changed):** `guest.notify` and `alert.owner` remain `idempotent` operations. A retry after an ambiguous send can deliver a **duplicate message** to the guest or owner. This is accepted until the notification stage defines provider-side de-duplication.

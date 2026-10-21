@@ -165,3 +165,24 @@ export async function runOp(pool, intentId, opType, minutes, outcome = { status:
   const r = await completeOperation(pool, op.id, { workerId, now: at(minutes), outcome });
   return { op, r };
 }
+
+// ---- E2B.2: the database clock decides release and purge. Tests use genuinely historical dates relative to it. ----
+/** Today's date (YYYY-MM-DD) by the DATABASE clock in a time zone. */
+export async function dbToday(pool, tz = "UTC") {
+  return (await pool.query("SELECT to_char((statement_timestamp() AT TIME ZONE $1)::date, 'YYYY-MM-DD') AS d", [tz])).rows[0].d;
+}
+export const addDays = (ymd, n) => new Date(Date.parse(`${ymd}T00:00:00Z`) + n * DAY).toISOString().slice(0, 10);
+/**
+ * TEST-ONLY historical data: make an intent's audit trail look as if it ended `days` ago. Done as the cluster
+ * superuser in the throwaway test cluster with triggers bypassed (session_replication_role = replica), which is the
+ * one way to create old rows now that the database stamps transition times itself. No runtime role can do this.
+ */
+export async function ageIntent(superPool, intentId, days) {
+  const c = await superPool.connect();
+  try {
+    await c.query("BEGIN");
+    await c.query("SET LOCAL session_replication_role = replica");
+    await c.query("UPDATE booking.intent_transitions SET recorded_at = recorded_at - make_interval(days => $2) WHERE intent_id = $1", [intentId, days]);
+    await c.query("COMMIT");
+  } catch (e) { await c.query("ROLLBACK"); throw e; } finally { c.release(); }
+}

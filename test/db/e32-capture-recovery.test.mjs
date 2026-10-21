@@ -114,7 +114,7 @@ test("void pending: an ambiguous void is read first; verified-gone authorization
   F.ok(await applyEvent(db.app, r.id, { type: "RECONCILED_AUTHORIZATION_GONE" }, { now: F.at(13) }));
   assert.equal(await F.state(db.app, r.id), "cancelled");
   assert.equal(await active(r.id), 0, "verified settlement of both legs releases the dates");
-  assert.deepEqual(await claimReleaseBlockers(db.app, r.id, { now: F.at(14) }), [], "nothing left unresolved");
+  assert.deepEqual(await claimReleaseBlockers(db.app, r.id), [], "nothing left unresolved");
 });
 
 test("void read shows the authorization still held -> exactly one new void with its own key", async () => {

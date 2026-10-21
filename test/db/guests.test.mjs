@@ -56,33 +56,45 @@ test("O6 retention is provisional and configurable; purge never touches in-progr
     { failedAttemptDays: 7, postCheckoutDays: 45, status: PROVISIONAL_RETENTION.status });
   assert.throws(() => retentionFromEnv({ BOOKING_RETENTION_FAILED_DAYS: "0" }), /between 1 and 3650/);
 
+  // E2B.2: the DATABASE clock decides what is due. Fixtures are genuinely historical relative to it.
+  const today = await F.dbToday(db.app, "UTC");
   const failed = await F.pending(db.app, { listingId: 760005 });                        // will expire (no booking)
   await F.sessionExpired(db.app, failed);                                               // verified expiry (E2B.1, C3)
   F.ok(await applyEvent(db.app, failed.id, { type: "CHECKOUT_EXPIRED", id: "evt_g5" }, { now: F.at(33) }));
-  const booked = await F.confirmed(db.app, { listingId: 760006, from: "2026-12-20", to: "2026-12-24" }); // check-out 2026-12-24
+  // booking whose check-out was 91 days ago (past the 90-day period) and one 89 days ago (not yet)
+  const oldStay = { listingId: 760006, from: F.addDays(today, -95), to: F.addDays(today, -91) };
+  const recentStay = { listingId: 760010, from: F.addDays(today, -93), to: F.addDays(today, -89) };
+  const booked = await F.confirmed(db.app, oldStay);
+  const recent = await F.confirmed(db.app, recentStay);
   const live = await F.authorized(db.app, { listingId: 760007 });                       // in progress
   const review = await F.dispatched(db.app, { listingId: 760008 });
   await applyEvent(db.app, review.id, { type: "ESCALATE", code: "MANUAL_REVIEW" }, { now: F.at(7) });
 
-  const day = 24 * 60;
   const ret = { failedAttemptDays: 30, postCheckoutDays: 90 };
-  assert.equal(await purgeGuestData(db.app, { now: F.at(29 * day), retention: ret }), 0, "nothing due yet");
-  await purgeGuestData(db.app, { now: F.at(31 * day), retention: ret });
-  assert.equal(await guests(failed.id), 0, "failed attempt purged after 30 days");
-  assert.equal(await guests(booked.id), 1, "booking kept");
-  const ninety = Date.UTC(2026, 11, 24) + 90 * 86400000;
-  await purgeGuestData(db.app, { now: ninety - 1000, retention: ret });
-  assert.equal(await guests(booked.id), 1);
-  await purgeGuestData(db.app, { now: ninety + 1000, retention: ret });
+  await F.ageIntent(db.owner, failed.id, 29);                                           // ended 29 days ago
+  await purgeGuestData(db.app, { retention: ret });
+  assert.equal(await guests(failed.id), 1, "failed attempt kept before 30 days");
   assert.equal(await guests(booked.id), 0, "booking purged 90 days after check-out");
-  await purgeGuestData(db.app, { now: F.at(5000 * day), retention: ret });
+  assert.equal(await guests(recent.id), 1, "booking kept until 90 days after check-out");
+  await F.ageIntent(db.owner, failed.id, 2);                                            // now ended 31 days ago
+  assert.equal(await purgeGuestData(db.app, { retention: ret }), 1);
+  assert.equal(await guests(failed.id), 0, "failed attempt purged after 30 days");
+  // intents that are not finished, or are under review, are never purged however old they are
+  await F.ageIntent(db.owner, live.id, 5000);
+  await F.ageIntent(db.owner, review.id, 5000);
+  await purgeGuestData(db.app, { retention: { failedAttemptDays: 1, postCheckoutDays: 1 } });
   assert.equal(await guests(live.id), 1, "in-progress intent never purged");
   assert.equal(await guests(review.id), 1, "open reconciliation case blocks purge");
   // a shorter configured period takes effect without any migration
   const quick = await F.pending(db.app, { listingId: 760009 });
   await F.sessionExpired(db.app, quick);
   F.ok(await applyEvent(db.app, quick.id, { type: "CHECKOUT_EXPIRED", id: "evt_g9" }, { now: F.at(33) }));
-  await purgeGuestData(db.app, { now: F.at(33 + 2 * day), retention: { failedAttemptDays: 1, postCheckoutDays: 90 } });
+  await purgeGuestData(db.app, { retention: { failedAttemptDays: 30, postCheckoutDays: 90 } });
+  assert.equal(await guests(quick.id), 1);
+  await F.ageIntent(db.owner, quick.id, 2);
+  await purgeGuestData(db.app, { retention: { failedAttemptDays: 1, postCheckoutDays: 90 } });
   assert.equal(await guests(quick.id), 0);
-  await assert.rejects(purgeGuestData(db.app, { now: F.at(0), retention: { failedAttemptDays: 0, postCheckoutDays: 90 } }), /invalid retention/);
+  await assert.rejects(purgeGuestData(db.app, { retention: { failedAttemptDays: 0, postCheckoutDays: 90 } }), /invalid retention/);
+  // the caller cannot say what time it is
+  await assert.rejects(purgeGuestData(db.app, { now: Date.UTC(2099, 0, 1), retention: ret }), /TIME_IS_DATABASE_CONTROLLED/);
 });

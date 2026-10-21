@@ -179,7 +179,7 @@ test("C5 / P3c: failed capture — E3 schedules cancel + void; each leg needs ve
   F.ok(await applyEvent(db.app, r.id, { type: "RESERVATION_CANCELLED" }, { now: F.at(10) }));
   assert.equal(await F.state(db.app, r.id), "capture_failed", "E3.2: cancellation is one of two legs");
   assert.equal(await active(r.id), 1, "authorization not yet settled");
-  const b = await claimReleaseBlockers(db.app, r.id, { now: F.at(10) });
+  const b = await claimReleaseBlockers(db.app, r.id);
   assert.ok(b.some((x) => x.startsWith("STATE_NOT_RELEASABLE")), b.join());
   assert.equal((await applyEvent(db.app, r.id, { type: "VOID_SUCCEEDED" }, { now: F.at(11) })).error, "AUTHORIZATION_NOT_VERIFIED_SETTLED");
   await F.runOp(db.app, r.id, "stripe.void_payment_intent", 11);
@@ -210,13 +210,13 @@ test("C5: an ambiguous cancellation keeps the dates and is reconciled by a read,
 test("C2 / P3d: the runtime role cannot release claims; even the owner cannot release while anything is unresolved", async () => {
   const a = await F.authorized(db.app, { listingId: L(40) });
   await assert.rejects(db.app.query("UPDATE booking.inventory_claims SET released_at = now(), release_reason = 'X' WHERE intent_id = $1", [a.id]), /permission denied/);
-  assert.equal(await tryReleaseClaim(db.app, a.id, { now: F.at(6) }), false);
+  assert.equal(await tryReleaseClaim(db.app, a.id), false);
   await assert.rejects(db.owner.query("UPDATE booking.inventory_claims SET released_at = now(), release_reason = 'X' WHERE intent_id = $1", [a.id]), /CLAIM_RELEASE_BLOCKED/);
   // corrupting the intent state with raw SQL does not unlock the dates either
   await db.app.query("UPDATE booking.intents SET state = 'cancelled', version = version + 1 WHERE id = $1", [a.id]);
-  const b = await claimReleaseBlockers(db.app, a.id, { now: F.at(7) });
+  const b = await claimReleaseBlockers(db.app, a.id);
   assert.ok(b.some((x) => x.startsWith("AUTHORIZATION_UNSETTLED")), b.join());
-  assert.equal(await tryReleaseClaim(db.app, a.id, { now: F.at(7) }), false);
+  assert.equal(await tryReleaseClaim(db.app, a.id), false);
   assert.equal(await active(a.id), 1);
 });
 
