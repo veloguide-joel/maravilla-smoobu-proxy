@@ -5,7 +5,8 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   createIntentRecord, applyEvent, collectGuestDetails, beginPayStep, recordCheckoutSession, loadIntent, recordHostawayCreateResult
 } from "../../db/lib/repo.js";
-import { claimNextOperation, completeOperation } from "../../db/lib/operations.js";
+import { claimNextOperation, completeOperation, requestRead, recordProviderEvidence } from "../../db/lib/operations.js";
+import { adminRecordEvidence } from "../../db/lib/admin.js";
 
 export const T0 = Date.UTC(2026, 9, 21, 15, 0, 0);
 export const MIN = 60 * 1000;
@@ -128,4 +129,34 @@ export function barrier(n = 2) {
   let arrived = 0; let release;
   const all = new Promise((r) => { release = r; });
   return async () => { arrived += 1; if (arrived >= n) release(); await all; };
+}
+
+// ---- E2B.1 evidence helpers: every provider fact enters through a recorded, succeeded READ operation ----
+const READ_FOR_KIND = { checkout_session: "stripe.retrieve_checkout_session", payment_intent: "stripe.retrieve_payment_intent",
+  hostaway_reservation: "hostaway.retrieve_reservation", hostaway_offline_charges: "hostaway.list_offline_charges" };
+
+/** Mocked provider read -> persisted API evidence. Returns the evidence id. */
+export async function readEvidence(pool, intentId, kind, externalRef, status, observed = {}, minutes = 20) {
+  const opType = READ_FOR_KIND[kind];
+  const opId = await requestRead(pool, intentId, opType, String(externalRef), { now: at(minutes) });
+  const op = await claimNextOperation(pool, { workerId: "w-read", now: at(minutes), intentId, opTypes: [opType] });
+  assert.equal(op.id, opId, "read op claimed");
+  ok(await completeOperation(pool, opId, { workerId: "w-read", now: at(minutes), outcome: { status: "succeeded", resultRef: externalRef } }), "read");
+  return ok(await recordProviderEvidence(pool, { readOpId: opId, kind, externalRef: String(externalRef), status, observed, providerRequestId: `req_${opId.slice(0, 8)}` }), "evidence").id;
+}
+/** Owner-attested dashboard evidence (admin login). */
+export async function dashboardEvidence(adminPool, intentId, kind, externalRef, status, observed = {}, minutes = 20) {
+  return ok(await adminRecordEvidence(adminPool, { intentId, kind, externalRef: String(externalRef), status, observed,
+    observedAt: at(minutes), attestedBy: "owner", reference: `dashboard-check-${minutes}` }), "dashboard evidence").id;
+}
+export const sessionExpired = (pool, p, minutes = 33) => readEvidence(pool, p.id, "checkout_session", p.sessionId, "expired", {}, minutes);
+export const piStatus = (pool, id, pi, status, observed = {}, minutes = 20) => readEvidence(pool, id, "payment_intent", pi, status, observed, minutes);
+export const reservationStatus = (pool, id, rid, status, observed = {}, minutes = 20) => readEvidence(pool, id, "hostaway_reservation", rid, status, observed, minutes);
+
+/** Worker completes the pending op of a type for an intent with a mocked provider outcome. */
+export async function runOp(pool, intentId, opType, minutes, outcome = { status: "succeeded" }, workerId = "w-op") {
+  const op = await claimNextOperation(pool, { workerId, now: at(minutes), intentId, opTypes: [opType] });
+  assert.ok(op, `${opType} claimable`);
+  const r = await completeOperation(pool, op.id, { workerId, now: at(minutes), outcome });
+  return { op, r };
 }

@@ -16,6 +16,7 @@ const transitionsOf = async (id) => (await db.app.query("SELECT version_after, t
 
 test("CAS race: two workers, same version, conflicting events -> exactly one commits; loser re-evaluates", async () => {
   const p = await F.pending(db.app, { from: "2027-04-01", to: "2027-04-03" });
+  await F.sessionExpired(db.app, p, 5); // E2B.1: expiry must be verified; the race is between two valid events
   const v0 = (await loadIntentRow(db.app, p.id)).version;
   const wait = F.barrier(2);
   const hooks = { afterLoad: async (attempt) => { if (attempt === 0) await wait(); } };
@@ -142,9 +143,17 @@ test("pay step and quote expiry are serialised on the intent row (no orphan clai
   const row = await loadIntentRow(db.app, id);
   const claim = await F.claimOf(db.app, id);
   if (pay.ok) {
-    // pay first: the expiry kept the claim because a payment attempt is unresolved
     assert.equal(row.state, exp.ok ? "expired" : "details_collected");
-    assert.ok(claim && claim.released_at === null);
+    if (exp.ok) {
+      // E2B.1: the Stripe create was queued but never handed to a sender, so no session can exist: the operation is
+      // retired, the attempt is provably not_created, and only then may the database release the nights.
+      const op = (await db.app.query("SELECT state, dispatched_at FROM booking.external_operations WHERE intent_id = $1 AND op_type = 'stripe.create_checkout_session'", [id])).rows[0];
+      assert.deepEqual([op.state, op.dispatched_at], ["superseded", null]);
+      assert.equal((await db.app.query("SELECT status FROM booking.payment_attempts WHERE intent_id = $1", [id])).rows[0].status, "not_created");
+      assert.ok(claim.released_at, "released only because the attempt is proven never sent");
+    } else {
+      assert.ok(claim && claim.released_at === null);
+    }
   } else {
     assert.equal(pay.error, "NOT_READY_FOR_PAYMENT");
     assert.equal(claim, undefined);

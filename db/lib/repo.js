@@ -12,7 +12,7 @@
 // A unique outbox or attempt row bounds what THIS system may send. It is not a claim of exactly-once delivery
 // to Stripe or Hostaway: that depends on provider idempotency (Stripe) or reconciliation (Hostaway, R1).
 import { randomUUID } from "node:crypto";
-import { createIntent, transition, TERMINAL_STATES, STATES as S } from "../../lib/checkout/intent-state.js";
+import { createIntent, transition, voidKey, TERMINAL_STATES, STATES as S } from "../../lib/checkout/intent-state.js";
 import { rowToIntent, intentToRow, MUTABLE_COLUMNS, INTENT_SELECT, num } from "./codec.js";
 import { DB_CONFIG } from "./config.js";
 
@@ -134,17 +134,21 @@ async function openCase(c, intentId, kind, openedBy, evidence, now) {
     [randomUUID(), intentId, kind, new Date(now), openedBy, evidence]);
 }
 
+// E2B.1 (C2/C7): claims are changed only through SECURITY DEFINER functions; the database re-checks every blocker
+// (payment attempts, authorizations, reservations, provider operations, open cases) before any release.
 async function releaseClaimIfSafe(c, intentId, reason, now) {
-  const open = await c.query("SELECT count(*)::int AS n FROM booking.payment_attempts WHERE intent_id = $1 AND status = ANY($2)",
-    [intentId, UNRESOLVED_PAYMENT_ATTEMPT]);
-  if (open.rows[0].n > 0) {
-    // A Checkout Session may still produce an authorization: keep the claim and ask for evidence-based review.
-    await c.query("UPDATE booking.inventory_claims SET review_after = $2 WHERE intent_id = $1 AND released_at IS NULL", [intentId, new Date(now)]);
-    return false;
-  }
-  const r = await c.query("UPDATE booking.inventory_claims SET released_at = $2, release_reason = $3 WHERE intent_id = $1 AND released_at IS NULL",
-    [intentId, new Date(now), reason]);
-  return r.rowCount > 0;
+  const r = await c.query("SELECT booking.release_claim_if_safe($1, $2, $3) AS ok", [intentId, reason, new Date(now)]);
+  return r.rows[0].ok === true;
+}
+
+/** Ask the database to release the claim; it does so only if nothing is unresolved. Returns true if released. */
+export async function tryReleaseClaim(pool, intentId, { reason = "SAFE_RELEASE", now }) {
+  return withTx(pool, (c) => releaseClaimIfSafe(c, intentId, reason, now));
+}
+
+/** Why the claim of this intent cannot be released right now (empty = it can). */
+export async function claimReleaseBlockers(q, intentId, { now }) {
+  return (await q.query("SELECT booking.claim_release_blockers($1, $2) AS b", [intentId, new Date(now)])).rows[0].b;
 }
 
 /** Records that must change in the same transaction as the E3 transition. */
@@ -172,7 +176,7 @@ async function sideRecords(c, before, after, event, now, ops, openedBy) {
                      WHERE intent_id = $1 AND checkout_session_id = $2 AND status <> 'completed'`,
         [id, after.checkout.sessionId, after.payment.paymentIntentId, after.payment.livemode, t]);
       await ledger("authorization_accepted", after.payment.amountMinor, after.price.currency, "stripe", after.payment.paymentIntentId);
-      await c.query("UPDATE booking.inventory_claims SET kind = 'authorized' WHERE intent_id = $1 AND released_at IS NULL", [id]);
+      await c.query("SELECT booking.claim_upgrade($1, 'authorized')", [id]);
     } else if (after.status === S.RECONCILIATION_REQUIRED) {
       // money held that this intent did not accept (closed intent, mismatch, second PaymentIntent): record the fact
       const amt = Number.isSafeInteger(event.amountMinor) && event.amountMinor >= 0 ? event.amountMinor : 0;
@@ -180,12 +184,9 @@ async function sideRecords(c, before, after, event, now, ops, openedBy) {
       await ledger("authorization_rejected", amt, cur, "stripe", event.paymentIntentId);
     }
   }
-  if (event.type === "CHECKOUT_EXPIRED" && after.checkout) {
+  // C3: both end the attempt only on VERIFIED session expiry (the database refuses 'expired' without that evidence)
+  if ((event.type === "CHECKOUT_EXPIRED" || event.type === "PAYMENT_FAILED") && after.checkout) {
     await c.query(`UPDATE booking.payment_attempts SET status = 'expired', updated_at = $3
-                   WHERE intent_id = $1 AND checkout_session_id = $2 AND status IN ('open', 'outcome_unknown')`, [id, after.checkout.sessionId, t]);
-  }
-  if (event.type === "PAYMENT_FAILED" && after.checkout) {
-    await c.query(`UPDATE booking.payment_attempts SET status = 'failed', updated_at = $3
                    WHERE intent_id = $1 AND checkout_session_id = $2 AND status IN ('open', 'outcome_unknown')`, [id, after.checkout.sessionId, t]);
   }
   if ((event.type === "CAPTURE_SUCCEEDED" || event.type === "RECONCILED_CAPTURE_SUCCEEDED") && after.status === S.PAYMENT_CAPTURED) {
@@ -223,9 +224,20 @@ async function sideRecords(c, before, after, event, now, ops, openedBy) {
                    WHERE intent_id = $1 AND op_type = 'hostaway.create_reservation' AND state = 'pending'`, [id, t]);
   }
 
+  // A Checkout Session create that was queued but never handed to a sender cannot have reached Stripe: once the
+  // intent is closed, retire it so it is never sent, and record that its attempt was not created.
+  if (TERMINAL.has(after.status) && !TERMINAL.has(before.status)) {
+    const sup = await c.query(`UPDATE booking.external_operations SET state = 'superseded', updated_at = $2
+                               WHERE intent_id = $1 AND op_type = 'stripe.create_checkout_session' AND state = 'pending' AND dispatched_at IS NULL
+                               RETURNING payload ->> 'paymentAttemptId' AS aid`, [id, t]);
+    for (const r of sup.rows) {
+      await c.query("UPDATE booking.payment_attempts SET status = 'not_created', updated_at = $2 WHERE id = $1::uuid AND status = 'creating'", [r.aid, t]);
+    }
+  }
+
   // inventory claim
   if (after.reservation && !before.reservation) {
-    await c.query("UPDATE booking.inventory_claims SET kind = 'reserved' WHERE intent_id = $1 AND released_at IS NULL", [id]);
+    await c.query("SELECT booking.claim_upgrade($1, 'reserved')", [id]);
   }
   if (CLAIM_RELEASE_STATES.has(after.status) && after.status !== before.status) {
     await releaseClaimIfSafe(c, id, `INTENT_${after.status.toUpperCase()}`, now);
@@ -239,10 +251,7 @@ async function sideRecords(c, before, after, event, now, ops, openedBy) {
       reservationId: after.reservation?.reservationId ?? null
     }, now);
   }
-  if (event.type === "RESOLVE") {
-    await c.query(`UPDATE booking.reconciliation_cases SET status = 'resolved', resolution = $2, resolved_by = $3, resolved_at = $4
-                   WHERE intent_id = $1 AND status = 'open'`, [id, event.outcome, String(event.resolvedBy || "admin").slice(0, 200), t]);
-  }
+  // RESOLVE: the database consumes the owner resolution and closes the cases (booking.intents_safety_guard)
 
   // work schedule (not versioned)
   const idle = TERMINAL.has(after.status) || after.status === S.RECONCILIATION_REQUIRED;
@@ -252,6 +261,8 @@ async function sideRecords(c, before, after, event, now, ops, openedBy) {
 async function guardEvent(pool, intentId, event) {
   // R1: until E4 proves Hostaway lookup reliability, "not found" is never proof of non-creation.
   if (event.type === "RECONCILED_RESERVATION_ABSENT" && event.authoritative === true) return "ABSENCE_NOT_AUTHORITATIVE_UNTIL_E4";
+  // C4: owner decisions enter only as a persisted resolution (applyResolution builds the event); never as booleans.
+  if (event.type === "RESOLVE" && !event.resolutionId) return "RESOLUTION_REQUIRED";
   // Ambiguous Hostaway payment recording: a retry is allowed only after the previous attempt is DEFINITELY failed.
   if (event.type === "OFFLINE_CHARGE_FAILED") {
     const r = await pool.query(`SELECT state FROM booking.external_operations WHERE intent_id = $1 AND op_type = 'hostaway.record_offline_charge'
@@ -265,6 +276,16 @@ async function guardEvent(pool, intentId, event) {
     if (!r.rows[0] || r.rows[0].state !== "succeeded" || r.rows[0].result_ref !== String(event.chargeId)) return "OFFLINE_CHARGE_NOT_VERIFIED";
   }
   return null;
+}
+
+// Safety refusals raised by the E2B.1 triggers, surfaced as result codes.
+export const DB_SAFETY_CODES = Object.freeze(["CLAIM_REQUIRED", "CHECKOUT_EXPIRY_NOT_VERIFIED", "VOID_NOT_VERIFIED", "CANCELLATION_NOT_VERIFIED",
+  "RESOLUTION_REQUIRED", "RESOLUTION_MISMATCH", "CLAIM_RELEASE_BLOCKED", "PRIOR_RECORDING_NOT_VERIFIED_FAILED", "REFUSAL_NOT_CATALOGUED",
+  "OWNER_RESOLUTION_REQUIRED", "NOT_A_CATALOGUED_DEFINITE_REFUSAL"]);
+export function dbSafetyCode(e) {
+  if (!e || !["23514", "42501"].includes(e.code)) return null;
+  const m = /^([A-Z_]+)/.exec(e.message || "");
+  return m && DB_SAFETY_CODES.includes(m[1]) ? m[1] : null;
 }
 
 /**
@@ -295,6 +316,12 @@ export async function applyEvent(pool, intentId, event, opts = {}) {
     if (res.duplicate) return { ok: true, duplicate: true, intent: before, effects: [], operations: [], casRetries: attempt };
     const after = res.intent;
     const openedBy = eventId || `${event.type}:v${after.version}`;
+    // C5: a definite capture failure leaves the card authorization possibly held; schedule its void as well.
+    // (E3 emits only the reservation cancel + alert; candidate for an E3.2 correction.)
+    const effects = event.type === "CAPTURE_FAILED" && after.payment?.paymentIntentId
+      ? [...res.effects, { type: "stripe.void_payment_intent", paymentIntentId: after.payment.paymentIntentId,
+          idempotencyKey: voidKey(after.id, after.payment.paymentIntentId) }]
+      : res.effects;
 
     const client = await pool.connect();
     let outcome;
@@ -323,7 +350,7 @@ export async function applyEvent(pool, intentId, event, opts = {}) {
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
           [intentId, after.version, before.status, after.status, event.type, eventId, after.reasonCode !== before.reasonCode ? after.reasonCode : null,
             actor, workerId, new Date(now)]);
-        const operations = await insertOperations(client, res.effects, after, now);
+        const operations = await insertOperations(client, effects, after, now);
         await sideRecords(client, before, after, event, now, operations, openedBy);
         if (inTx) await inTx(client, { before, after, operations });
         if (hooks.beforeCommit) await hooks.beforeCommit(attempt);
@@ -334,13 +361,14 @@ export async function applyEvent(pool, intentId, event, opts = {}) {
       await client.query("ROLLBACK").catch(() => {});
       if (e.code === "40P01" || e.code === "40001") outcome = { lost: true }; // deadlock/serialization victim: reload, retry
       else if (e.code === "23505" && /one_open_offline_charge/.test(e.constraint || "")) return { ok: false, error: "OFFLINE_CHARGE_OUTCOME_UNRESOLVED" };
+      else if (dbSafetyCode(e)) return { ok: false, error: dbSafetyCode(e) };
       else if (e.code === "23505" && /one_hostaway_create|hostaway_reservation_attempts_intent_id/.test(e.constraint || "")) return { ok: false, error: "HOSTAWAY_CREATE_ALREADY_RECORDED" };
       else throw e;
     } finally {
       client.release();
     }
     if (outcome.duplicate) return { ok: true, duplicate: true, intent: rowToIntent(await loadIntentRow(pool, intentId)), effects: [], operations: [], casRetries: attempt };
-    if (outcome.done) return { ok: true, duplicate: false, intent: after, effects: res.effects, operations: outcome.operations, casRetries: attempt };
+    if (outcome.done) return { ok: true, duplicate: false, intent: after, effects, operations: outcome.operations, casRetries: attempt };
     // lost the version race: reload and re-evaluate against the winner's state
   }
   return { ok: false, error: "CAS_CONTENTION" };
@@ -444,8 +472,7 @@ export async function recordCheckoutSession(pool, intentId, attemptId, { session
                              WHERE id = $1 AND intent_id = $2 AND status IN ('creating', 'outcome_unknown')`,
       [attemptId, intentId, sessionId, new Date(expiresAt), t]);
     if (r.rowCount === 0) throw new RepoError("PAYMENT_ATTEMPT_NOT_OPENABLE");
-    await c.query("UPDATE booking.inventory_claims SET review_after = $2 WHERE intent_id = $1 AND released_at IS NULL",
-      [intentId, new Date(expiresAt + cfg.claimReviewMarginMs)]);
+    await c.query("SELECT booking.claim_schedule_review($1, $2, false)", [intentId, new Date(expiresAt + cfg.claimReviewMarginMs)]);
   });
   return applyEvent(pool, intentId, { type: "CHECKOUT_PREPARED", id: `cs-prepared:${sessionId}`, sessionId }, { now, config, actor: "guest" });
 }
@@ -456,7 +483,8 @@ export async function listClaimsDueForReview(pool, { now, limit = 50 }) {
   const r = await pool.query(
     `SELECT c.id AS claim_id, c.intent_id, c.kind, c.review_count, i.state,
             (SELECT json_agg(json_build_object('id', a.id, 'status', a.status, 'sessionId', a.checkout_session_id) ORDER BY a.attempt)
-               FROM booking.payment_attempts a WHERE a.intent_id = c.intent_id AND a.status = ANY($3)) AS unresolved_attempts
+               FROM booking.payment_attempts a WHERE a.intent_id = c.intent_id AND a.status = ANY($3)) AS unresolved_attempts,
+            booking.claim_release_blockers(c.intent_id, $1) AS blockers
        FROM booking.inventory_claims c JOIN booking.intents i ON i.id = c.intent_id
       WHERE c.released_at IS NULL AND c.review_after <= $1 ORDER BY c.review_after LIMIT $2`,
     [new Date(now), limit, UNRESOLVED_PAYMENT_ATTEMPT]);
@@ -466,56 +494,73 @@ export async function listClaimsDueForReview(pool, { now, limit = 50 }) {
 /** Keep the claim, review again later; after maxClaimReviews open a reconciliation case (claim still held). */
 export async function deferClaimReview(pool, claimId, { now, reason = "EVIDENCE_MISSING", cfg = DB_CONFIG }) {
   return withTx(pool, async (c) => {
-    const r = await c.query(`UPDATE booking.inventory_claims SET review_count = review_count + 1, review_after = $2
-                             WHERE id = $1 AND released_at IS NULL RETURNING intent_id, review_count`,
-      [claimId, new Date(now + cfg.claimReviewBackoffMs)]);
-    const row = r.rows[0];
-    if (!row) return { ok: false, error: "CLAIM_NOT_ACTIVE" };
-    if (row.review_count >= cfg.maxClaimReviews) {
-      await openCase(c, row.intent_id, "CLAIM_UNRESOLVED", `claim:${claimId}`, { claimId: String(claimId), reason }, now);
+    const claim = (await c.query("SELECT intent_id FROM booking.inventory_claims WHERE id = $1 AND released_at IS NULL", [claimId])).rows[0];
+    if (!claim) return { ok: false, error: "CLAIM_NOT_ACTIVE" };
+    const n = (await c.query("SELECT booking.claim_schedule_review($1, $2, true) AS n", [claim.intent_id, new Date(now + cfg.claimReviewBackoffMs)])).rows[0].n;
+    if (n >= cfg.maxClaimReviews) {
+      await openCase(c, claim.intent_id, "CLAIM_UNRESOLVED", `claim:${claimId}`, { claimId: String(claimId), reason }, now);
     }
-    return { ok: true, reviewCount: row.review_count };
+    return { ok: true, reviewCount: n };
   });
 }
 
 /**
- * Apply Stripe evidence about a Checkout Session (from a fresh Stripe read; mocked in tests).
- *   { sessionId, sessionStatus: 'expired' }  -> attempt expired; E3 CHECKOUT_EXPIRED if applicable; claim released if safe
- *   { sessionStatus: 'open' | 'unknown' }     -> deferred review (claim kept)
- *   { sessionStatus: 'complete' }             -> NOT handled here: the caller must apply the verified E3 PAYMENT_AUTHORIZED
+ * Apply PERSISTED Stripe evidence about a Checkout Session (a provider_evidence row recorded from a verified read).
+ *   status 'expired'  -> attempt expired; E3 CHECKOUT_EXPIRED if the intent still waits on it; claim released only if
+ *                        the database finds nothing else unresolved
+ *   status 'open'     -> review again after the session's expiry (claim kept)
+ *   status 'complete' -> not handled here: the caller applies the verified E3 PAYMENT_AUTHORIZED
  */
-export async function resolveCheckoutEvidence(pool, intentId, attemptId, evidence, { now, config }) {
+export async function applyCheckoutSessionEvidence(pool, intentId, attemptId, evidenceId, { now, config, cfg = DB_CONFIG }) {
+  const ev = (await pool.query("SELECT * FROM booking.provider_evidence WHERE id = $1 AND intent_id = $2 AND kind = 'checkout_session'",
+    [evidenceId, intentId])).rows[0];
+  if (!ev) return { ok: false, error: "EVIDENCE_NOT_FOUND" };
   const a = (await pool.query("SELECT * FROM booking.payment_attempts WHERE id = $1 AND intent_id = $2", [attemptId, intentId])).rows[0];
   if (!a) return { ok: false, error: "ATTEMPT_NOT_FOUND" };
-  if (evidence.sessionStatus === "complete") return { ok: false, error: "APPLY_PAYMENT_AUTHORIZED" };
-  if (evidence.sessionStatus !== "expired" || !evidence.sessionId || (a.checkout_session_id && a.checkout_session_id !== evidence.sessionId)) {
-    const claim = (await pool.query("SELECT id FROM booking.inventory_claims WHERE intent_id = $1 AND released_at IS NULL", [intentId])).rows[0];
-    if (claim) await deferClaimReview(pool, claim.id, { now, reason: "SESSION_NOT_FINAL" });
+  if (a.checkout_session_id && a.checkout_session_id !== ev.external_ref) return { ok: false, error: "EVIDENCE_SESSION_MISMATCH" };
+  if (ev.status === "complete") return { ok: false, error: "APPLY_PAYMENT_AUTHORIZED" };
+  if (ev.status === "open") {
+    const until = a.session_expires_at ? new Date(a.session_expires_at).getTime() + cfg.claimReviewMarginMs : now + cfg.claimReviewBackoffMs;
+    await pool.query("SELECT booking.claim_schedule_review($1, $2, false)", [intentId, new Date(until)]);
     return { ok: true, released: false, deferred: true };
   }
   const intent = await loadIntent(pool, intentId);
-  if (intent.status === S.PAYMENT_PENDING && intent.checkout?.sessionId === evidence.sessionId) {
-    const r = await applyEvent(pool, intentId, { type: "CHECKOUT_EXPIRED", id: `cs-expired:${evidence.sessionId}` }, { now, config, actor: "reconciler" });
+  if (intent.status === S.PAYMENT_PENDING && intent.checkout?.sessionId === ev.external_ref) {
+    const r = await applyEvent(pool, intentId, { type: "CHECKOUT_EXPIRED", id: `cs-expired:${ev.external_ref}` }, { now, config, actor: "reconciler" });
     if (!r.ok) return r;
   }
   const released = await withTx(pool, async (c) => {
-    await c.query(`UPDATE booking.payment_attempts SET status = 'expired', checkout_session_id = coalesce(checkout_session_id, $2), updated_at = $3
-                   WHERE id = $1 AND status IN ('creating', 'open', 'outcome_unknown')`, [attemptId, evidence.sessionId, new Date(now)]);
+    await c.query(`UPDATE booking.payment_attempts SET checkout_session_id = coalesce(checkout_session_id, $2), status = 'expired', updated_at = $3
+                   WHERE id = $1 AND status IN ('creating', 'open', 'outcome_unknown')`, [attemptId, ev.external_ref, new Date(now)]);
     const row = await loadIntentRow(c, intentId, { forUpdate: true });
-    if (!CLAIM_RELEASE_STATES.has(row.state)) return false; // still in progress (e.g. payment_pending with another session)
+    if (!CLAIM_RELEASE_STATES.has(row.state)) return false; // still in progress
     return releaseClaimIfSafe(c, intentId, "CHECKOUT_EXPIRED", now);
   });
   return { ok: true, released };
 }
 
-/** O5 (provisional): confirmed bookings release their claim once the stay has ended. */
-export async function releaseCompletedStayClaims(pool, { today, now }) {
-  const r = await pool.query(
-    `UPDATE booking.inventory_claims c SET released_at = $2, release_reason = 'STAY_COMPLETED'
-       FROM booking.intents i
-      WHERE i.id = c.intent_id AND c.released_at IS NULL AND i.state = 'confirmed' AND i.to_date <= $1::date`,
-    [today, new Date(now)]);
-  return r.rowCount;
+/** O5 (provisional): confirmed bookings release their claim once check-out day (Mexico City) is reached. */
+export async function releaseCompletedStayClaims(pool, { now }) {
+  return (await pool.query("SELECT booking.release_completed_stays($1) AS n", [new Date(now)])).rows[0].n;
+}
+
+/** Build and apply the E3 RESOLVE event from a persisted OWNER RESOLUTION (never from caller-supplied booleans). */
+export async function applyResolution(pool, intentId, resolutionId, { now, config } = {}) {
+  const r = (await pool.query("SELECT * FROM booking.reconciliation_resolutions WHERE id = $1 AND intent_id = $2", [resolutionId, intentId])).rows[0];
+  if (!r) return { ok: false, error: "RESOLUTION_NOT_FOUND" };
+  if (r.consumed_at) return { ok: false, error: "RESOLUTION_ALREADY_USED" };
+  const row = await loadIntentRow(pool, intentId);
+  let outcome, evidence;
+  if (r.decision === "intent_confirmed") {
+    outcome = "confirmed";
+    evidence = { reservationId: r.result_ref, capturedMinor: num(row.final_total_minor), currency: row.currency };
+  } else if (r.decision === "intent_released") {
+    outcome = "released"; evidence = { authorizationVoided: true, noReservation: true };      // derived from verified DB facts
+  } else if (r.decision === "intent_cancelled") {
+    outcome = "cancelled"; evidence = { reservationCancelled: true, notCaptured: true };       // derived from verified DB facts
+  } else return { ok: false, error: "NOT_AN_INTENT_RESOLUTION" };
+  return applyEvent(pool, intentId, { type: "RESOLVE", id: `resolution:${r.id}`, resolutionId: r.id, outcome, evidence, resolvedBy: r.resolver },
+    { now, config, actor: "admin" });
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -66,6 +66,7 @@ export async function startPostgres() {
     adminUrl: base.replace("%USER%", "postgres"),
     appUrl: () => base.replace("%USER%", "test_app"),
     reportUrl: () => base.replace("%USER%", "test_report"),
+    adminUrl2: () => base.replace("%USER%", "test_admin"),
     stop
   };
 }
@@ -79,16 +80,20 @@ export async function startMigratedDatabase() {
     await migrateUp(admin, { env: "test" });
     await admin.query("CREATE ROLE test_app LOGIN IN ROLE mv_booking_app");
     await admin.query("CREATE ROLE test_report LOGIN IN ROLE mv_booking_report");
+    await admin.query("CREATE ROLE test_admin LOGIN IN ROLE mv_booking_admin"); // owner reconciliation login (E2B.1)
   } finally {
     await admin.end();
   }
   // All repository code under test runs as the least-privilege runtime role, never as the owner.
   const app = new pg.Pool({ connectionString: db.appUrl(), max: 12 });
   const owner = new pg.Pool({ connectionString: db.adminUrl, max: 4 });
+  // owner-only reconciliation runs through the mv_booking_admin login, never the runtime role
+  const reconciler = new pg.Pool({ connectionString: db.adminUrl2(), max: 3 });
   return {
     ...db,
     app,
     owner,
-    async close() { await app.end().catch(() => {}); await owner.end().catch(() => {}); db.stop(); }
+    reconciler,
+    async close() { await app.end().catch(() => {}); await owner.end().catch(() => {}); await reconciler.end().catch(() => {}); db.stop(); }
   };
 }

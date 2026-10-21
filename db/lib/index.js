@@ -7,3 +7,4 @@ export * from "./operations.js";
 export * from "./webhooks.js";
 export { createBookingPool, assertEnvironment } from "./pool.js";
 export { migrateUp, migrateDown, migrationStatus, loadMigrations } from "./migrate.js";
+export * from "./admin.js";

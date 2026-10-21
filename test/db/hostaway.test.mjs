@@ -136,6 +136,8 @@ test("ambiguous create (timeout/5xx/429): reservation_unknown; 'not found' is ne
 });
 
 test("definite refusal (catalogued 4xx, mocked): reservation_failed -> one void op; the create is never re-sent", async () => {
+  // E2B.1: "definite" requires a catalogued response. The catalogue is empty until E4; this row stands in for it.
+  await db.owner.query("INSERT INTO booking.definite_refusal_codes (op_type, code, note) VALUES ('hostaway.create_reservation', 'OVERBOOKING_REFUSED', 'test stand-in for E4 catalogue') ON CONFLICT DO NOTHING");
   const d = await F.dispatched(db.app, { listingId: 740010 });
   const op = await claimNextOperation(db.app, { workerId: "w1", now: F.at(6.5), intentId: d.id, opTypes: ["hostaway.create_reservation"] });
   await recordHostawayCreateResult(db.app, d.id, { httpStatus: 409, refusalCode: "OVERBOOKING_REFUSED" }, { now: F.at(7) });

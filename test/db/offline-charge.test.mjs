@@ -1,4 +1,4 @@
-// Stage E2B — REGRESSION: ambiguous Hostaway accounting update (offline charge recording).
+// Stage E2B (+E2B.1 C1) — REGRESSION: ambiguous Hostaway accounting update (offline charge recording).
 // E2A §5.4: E3's OFFLINE_CHARGE_FAILED retries up to 10 times, but Hostaway's offline-charge create has no
 // idempotency key. A timeout followed by an automatic retry could record the same payment twice in Hostaway's books.
 // Required: an ambiguous recording is NEVER retried automatically; it is marked for reconciliation.
@@ -8,7 +8,8 @@ import { randomUUID } from "node:crypto";
 import { startMigratedDatabase } from "./harness.mjs";
 import * as F from "./fixtures.mjs";
 import { applyEvent, loadIntent } from "../../db/lib/repo.js";
-import { claimNextOperation, completeOperation, recoverExpiredOperations, resolveOperation } from "../../db/lib/operations.js";
+import { claimNextOperation, completeOperation, recoverExpiredOperations } from "../../db/lib/operations.js";
+import { adminResolveOperation } from "../../db/lib/admin.js";
 import { isConfirmedPaid } from "../../lib/checkout/intent-state.js";
 
 let db;
@@ -42,7 +43,7 @@ test("database backstops: no second open recording per intent, no re-queue of an
   F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(9.2), outcome: { status: "outcome_unknown" } }));
   // bypassing the code: insert a second recording op directly
   await assert.rejects(db.app.query(`INSERT INTO booking.external_operations (id, intent_id, op_type, idempotency_key, retry_class, state, source_version, max_attempts, next_attempt_at, created_at, updated_at)
-    VALUES ($1, $2, 'hostaway.record_offline_charge', $3, 'non_idempotent', 'pending', 99, 1, now(), now(), now())`, [randomUUID(), c.id, `och:${c.id}:bypass`]), /one_open_offline_charge/);
+    VALUES ($1, $2, 'hostaway.record_offline_charge', $3, 'non_idempotent', 'pending', 99, 1, now(), now(), now())`, [randomUUID(), c.id, `och:${c.id}:bypass`]), /PRIOR_RECORDING_NOT_VERIFIED_FAILED|one_open_offline_charge/); // E2B.1 trigger refuses first; the unique index remains behind it
   // bypassing the code: put the ambiguous op back in the queue
   await assert.rejects(db.app.query("UPDATE booking.external_operations SET state = 'pending' WHERE id = $1", [op.id]), /not allowed/);
   // bypassing the code: allow more attempts
@@ -58,31 +59,51 @@ test("worker crash mid-recording (lease expiry) is treated exactly like a timeou
   assert.equal((await ochOps(c.id)).length, 1);
 });
 
-test("owner resolution A — the charge WAS recorded (found in Hostaway): mark succeeded, confirm, ledger once", async () => {
+// Charge-list evidence for the reservation (mocked Hostaway reads / owner dashboard checks).
+const charges = (ids) => ({ matchingChargeCount: ids.length, matchingChargeIds: ids.map(String) });
+
+test("owner resolution A — the charge WAS recorded (found in Hostaway): evidence-cited resolution, confirm, ledger once", async () => {
   const c = await F.captured(db.app, { listingId: 750004 });
   const op = await claimNextOperation(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
   F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(9.2), outcome: { status: "outcome_unknown" } }));
-  F.ok(await resolveOperation(db.app, op.id, { now: F.at(60), resolution: "succeeded", resultRef: 880001, resolvedBy: "owner" }));
+  const ev = await F.readEvidence(db.app, c.id, "hostaway_offline_charges", String(c.reservationId), "listed", charges([880001]), 30);
+  F.ok(await adminResolveOperation(db.reconciler, { operationId: op.id, decision: "succeeded", evidenceIds: [ev], resultRef: 880001,
+    resolver: "owner", justification: "CHARGE_FOUND_IN_HOSTAWAY", at: F.at(60) }));
   F.ok(await applyEvent(db.app, c.id, { type: "OFFLINE_CHARGE_RECORDED", chargeId: 880001 }, { now: F.at(60), actor: "admin" }));
   assert.equal(await F.state(db.app, c.id), "confirmed");
   assert.equal(await F.count(db.app, "SELECT count(*) AS n FROM booking.payment_ledger WHERE intent_id = $1 AND entry = 'offline_charge_recorded'", [c.id]), 1);
   assert.equal((await ochOps(c.id)).length, 1, "recorded exactly once by this system");
   assert.equal(await F.count(db.app, "SELECT count(*) AS n FROM booking.reconciliation_cases WHERE intent_id = $1 AND status = 'open'", [c.id]), 0);
+  const res = (await db.app.query("SELECT * FROM booking.reconciliation_resolutions WHERE operation_id = $1", [op.id])).rows[0];
+  assert.deepEqual([res.decision, res.resolver, res.justification_code, res.evidence_ids], ["operation_succeeded", "owner", "CHARGE_FOUND_IN_HOSTAWAY", [ev]]);
 });
 
-test("owner resolution B — verified NOT recorded: only then may E3 schedule a new recording", async () => {
+test("owner resolution B — verified NOT recorded by an API read AND an owner dashboard check, after the settle period: only then a new recording", async () => {
   const c = await F.captured(db.app, { listingId: 750005 });
+  const rid = String(c.reservationId);
   const op = await claimNextOperation(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
   F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(9.2), outcome: { status: "outcome_unknown" } }));
-  F.ok(await resolveOperation(db.app, op.id, { now: F.at(60), resolution: "failed_definite", resolvedBy: "owner" }));
+  const resolve = (ids, minutes = 60) => adminResolveOperation(db.reconciler, { operationId: op.id, decision: "failed_definite", evidenceIds: ids,
+    resolver: "owner", justification: "NO_CHARGE_IN_HOSTAWAY", at: F.at(minutes) });
+  const apiEarly = await F.readEvidence(db.app, c.id, "hostaway_offline_charges", rid, "listed", charges([]), 12);   // inside settle period
+  const api = await F.readEvidence(db.app, c.id, "hostaway_offline_charges", rid, "listed", charges([]), 40);
+  const dash = await F.dashboardEvidence(db.reconciler, c.id, "hostaway_offline_charges", rid, "listed", charges([]), 45);
+  assert.equal((await resolve([api])).error, "INSUFFICIENT_EVIDENCE", "an API absence alone is not proof");
+  assert.equal((await resolve([dash])).error, "INSUFFICIENT_EVIDENCE", "an attested dashboard check alone is not proof");
+  assert.equal((await resolve([apiEarly, dash])).error, "INSUFFICIENT_EVIDENCE", "absence read too soon after the call");
+  assert.equal(await claimNextOperation(db.app, { workerId: "w2", now: F.at(50), intentId: c.id, opTypes: OCH }), null);
+  F.ok(await resolve([api, dash]));
   const r = F.ok(await applyEvent(db.app, c.id, { type: "OFFLINE_CHARGE_FAILED" }, { now: F.at(61) }));
   assert.equal(r.intent.status, "payment_captured");
   const ops = await ochOps(c.id);
   assert.deepEqual(ops.map((o) => o.state), ["failed_definite", "pending"]);
   assert.deepEqual(ops.map((o) => o.idempotency_key.split(":").pop()), ["1", "2"]);
+  assert.ok(ops[0].resolution_id, "the retry is traceable to the owner resolution and its evidence");
 });
 
-test("definite failure (e.g. catalogued 4xx) follows E3's bounded retry; each retry is a NEW single-attempt operation", async () => {
+test("definite failure (catalogued response) follows E3's bounded retry; each retry is a NEW single-attempt operation", async () => {
+  // E2B.1: "definite" requires a catalogued response; the catalogue is empty until E4 — this row stands in for it.
+  await db.owner.query("INSERT INTO booking.definite_refusal_codes (op_type, code, note) VALUES ('hostaway.record_offline_charge', 'VALIDATION_ERROR', 'test stand-in for E4 catalogue') ON CONFLICT DO NOTHING");
   const c = await F.captured(db.app, { listingId: 750006 });
   for (let n = 1; n <= 3; n++) {
     const op = await claimNextOperation(db.app, { workerId: "w1", now: F.at(9 + n), intentId: c.id, opTypes: OCH });

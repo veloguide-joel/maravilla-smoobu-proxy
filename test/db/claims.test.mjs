@@ -1,12 +1,14 @@
-// Stage E2B — inventory claims: start at the Pay step (O4), release only when safe, expiry = review, never time-based release.
+// Stage E2B (+E2B.1) — inventory claims: start at the Pay step (O4), release only when safe, expiry = review, never time-based release.
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { startMigratedDatabase } from "./harness.mjs";
 import * as F from "./fixtures.mjs";
 import {
-  applyEvent, beginPayStep, listClaimsDueForReview, deferClaimReview, resolveCheckoutEvidence, releaseCompletedStayClaims,
-  recoverInterruptedReservations
+  applyEvent, beginPayStep, listClaimsDueForReview, deferClaimReview, applyCheckoutSessionEvidence, releaseCompletedStayClaims,
+  recoverInterruptedReservations, recordCheckoutSession, tryReleaseClaim, claimReleaseBlockers
 } from "../../db/lib/repo.js";
+import { claimNextOperation, recoverExpiredOperations } from "../../db/lib/operations.js";
+import { adminCloseCase } from "../../db/lib/admin.js";
 import { DB_CONFIG } from "../../db/lib/config.js";
 
 let db;
@@ -37,8 +39,12 @@ test("Pay step refuses an expired quote and states other than details_collected"
   assert.equal(await active(L(2)), 0);
 });
 
-test("safe release: a definite terminal outcome with no unresolved payment attempt releases in the same transaction", async () => {
+test("safe release: a VERIFIED terminal outcome with nothing unresolved releases in the same transaction", async () => {
   const p = await F.pending(db.app, { listingId: L(3), from: "2027-09-01", to: "2027-09-03" });
+  // E2B.1 (C3): expiry must be verified by a provider read before it can end the attempt
+  assert.equal((await applyEvent(db.app, p.id, { type: "CHECKOUT_EXPIRED", id: "evt_l3_exp" }, { now: F.at(33) })).error, "CHECKOUT_EXPIRY_NOT_VERIFIED");
+  assert.equal(await active(L(3)), 1);
+  await F.sessionExpired(db.app, p);
   F.ok(await applyEvent(db.app, p.id, { type: "CHECKOUT_EXPIRED", id: "evt_l3_exp" }, { now: F.at(33) }));
   const c = await F.claimOf(db.app, p.id);
   assert.ok(c.released_at, "released");
@@ -51,39 +57,57 @@ test("safe release: a definite terminal outcome with no unresolved payment attem
 test("expiry while a Checkout Session may still exist: claim KEPT, due for evidence review, never released by time", async () => {
   const stay = { listingId: L(4), from: "2027-09-01", to: "2027-09-03" };
   const id = await F.withDetails(db.app, stay);
-  const pay = F.ok(await beginPayStep(db.app, id, { now: F.at(2) }));      // Stripe call outcome unknown (crash)
+  const pay = F.ok(await beginPayStep(db.app, id, { now: F.at(2) }));
+  // a worker handed the create-session call to Stripe, then crashed: a session may exist
+  const csOp = await claimNextOperation(db.app, { workerId: "w-cs", now: F.at(2), intentId: id, opTypes: ["stripe.create_checkout_session"] });
+  assert.ok(csOp);
   F.ok(await applyEvent(db.app, id, { type: "EXPIRE" }, { now: F.at(31) })); // quote window over
   assert.equal(await F.state(db.app, id), "expired");
   assert.equal(await active(L(4)), 1, "claim kept: the session could still be paid");
+  assert.equal((await db.app.query("SELECT state FROM booking.external_operations WHERE id = $1", [csOp.id])).rows[0].state, "in_flight",
+    "a possibly-sent create is never superseded");
   const rival = await F.withDetails(db.app, stay, 30); // a second guest with a valid quote
   assert.equal((await beginPayStep(db.app, rival, { now: F.at(32) })).error, "DATES_CLAIMED");
 
-  // the review sweeper sees it as due, but missing/unclear evidence only defers
+  // the review sweeper sees it as due, but missing evidence only defers
   const due = await listClaimsDueForReview(db.app, { now: F.at(31) });
   const mine = due.find((d) => d.intent_id === id);
   assert.ok(mine && mine.unresolved_attempts.length === 1);
-  for (let i = 0; i < DB_CONFIG.maxClaimReviews; i++) {
-    F.ok(await resolveCheckoutEvidence(db.app, id, pay.attempt.id, { sessionStatus: "unknown" }, { now: F.at(40 + i * 10) }));
-  }
+  assert.ok(mine.blockers.some((b) => b.startsWith("PAYMENT_ATTEMPT_UNRESOLVED")));
+  const claimId = (await F.claimOf(db.app, id)).id;
+  for (let i = 0; i < DB_CONFIG.maxClaimReviews; i++) F.ok(await deferClaimReview(db.app, claimId, { now: F.at(40 + i * 10) }));
   assert.equal(await active(L(4)), 1, "still held after repeated reviews with no evidence");
-  assert.equal(await F.count(db.app, "SELECT count(*) AS n FROM booking.reconciliation_cases WHERE intent_id = $1 AND kind = 'CLAIM_UNRESOLVED' AND status = 'open'", [id]), 1);
+  const caseRow = (await db.app.query("SELECT id FROM booking.reconciliation_cases WHERE intent_id = $1 AND kind = 'CLAIM_UNRESOLVED' AND status = 'open'", [id])).rows[0];
+  assert.ok(caseRow);
+  // time alone releases nothing, not even for the owner
+  assert.equal(await tryReleaseClaim(db.app, id, { now: F.at(60 * 24 * 365) }), false);
 
-  // years later, time alone still releases nothing
-  assert.equal(await active(L(4)), 1);
-  // provider evidence: the session expired unpaid -> safe release
-  F.ok(await resolveCheckoutEvidence(db.app, id, pay.attempt.id, { sessionStatus: "expired", sessionId: "cs_test_l4" }, { now: F.at(500) }));
+  // recovery: the idempotent create is replayed (same Stripe key) and returns the session; a read shows it expired
+  await recoverExpiredOperations(db.app, { now: F.at(100) });
+  F.ok(await (await import("../../db/lib/operations.js")).completeOperation(db.app,
+    (await claimNextOperation(db.app, { workerId: "w-cs2", now: F.at(500), intentId: id, opTypes: ["stripe.create_checkout_session"] })).id,
+    { workerId: "w-cs2", now: F.at(500), outcome: { status: "succeeded", resultRef: "cs_test_l4" } }));
+  const prepared = await recordCheckoutSession(db.app, id, pay.attempt.id, { sessionId: "cs_test_l4", expiresAt: F.at(32), now: F.at(500) });
+  assert.equal(prepared.error, "ILLEGAL_TRANSITION"); // intent already expired; the session is recorded as evidence anyway
+  const ev = await F.readEvidence(db.app, id, "checkout_session", "cs_test_l4", "expired", {}, 501);
+  const r = F.ok(await applyCheckoutSessionEvidence(db.app, id, pay.attempt.id, ev, { now: F.at(501) }));
+  assert.equal(r.released, false, "the open CLAIM_UNRESOLVED case still blocks");
+  // owner closes the case citing the same evidence; only then can the database release
+  F.ok(await adminCloseCase(db.reconciler, { caseId: caseRow.id, evidenceIds: [ev], resolver: "owner", justification: "SESSION_EXPIRED_UNPAID", at: F.at(502) }));
+  assert.equal(await tryReleaseClaim(db.app, id, { now: F.at(502) }), true);
   assert.equal(await active(L(4)), 0);
   const late = await F.withDetails(db.app, stay, 500);
-  F.ok(await beginPayStep(db.app, late, { now: F.at(502) }));
+  F.ok(await beginPayStep(db.app, late, { now: F.at(503) }));
 });
 
-test("open session at review time: claim kept and review pushed back", async () => {
+test("open session at review time: claim kept and review pushed back; completion must be applied as an authorization", async () => {
   const p = await F.pending(db.app, { listingId: L(5), from: "2027-09-01", to: "2027-09-03" });
-  const r = F.ok(await resolveCheckoutEvidence(db.app, p.id, p.attemptId, { sessionStatus: "open", sessionId: p.sessionId }, { now: F.at(45) }));
+  const open = await F.readEvidence(db.app, p.id, "checkout_session", p.sessionId, "open", {}, 20);
+  const r = F.ok(await applyCheckoutSessionEvidence(db.app, p.id, p.attemptId, open, { now: F.at(20) }));
   assert.equal(r.deferred, true);
   assert.equal(await active(L(5)), 1);
-  // completed session: this helper refuses to guess; the verified authorization must be applied as an E3 event
-  assert.equal((await resolveCheckoutEvidence(db.app, p.id, p.attemptId, { sessionStatus: "complete" }, { now: F.at(46) })).error, "APPLY_PAYMENT_AUTHORIZED");
+  const done = await F.readEvidence(db.app, p.id, "checkout_session", p.sessionId, "complete", {}, 25);
+  assert.equal((await applyCheckoutSessionEvidence(db.app, p.id, p.attemptId, done, { now: F.at(25) })).error, "APPLY_PAYMENT_AUTHORIZED");
   F.ok(await applyEvent(db.app, p.id, F.authEvent(p.sessionId, "pi_l5", 30), { now: F.at(30) }));
   assert.equal((await F.claimOf(db.app, p.id)).kind, "authorized");
 });
@@ -103,25 +127,32 @@ test("claims are kept through every uncertain state: reservation_unknown, reserv
   F.ok(await applyEvent(db.app, a.id, { type: "RESERVATION_STARTED", workerId: "w", recheck: { bookable: false } }, { now: F.at(6) }));
   assert.equal(await F.state(db.app, a.id), "reservation_failed");
   assert.equal(await active(L(7)), 1);
+  assert.equal((await applyEvent(db.app, a.id, { type: "VOID_SUCCEEDED" }, { now: F.at(7) })).error, "VOID_NOT_VERIFIED");
+  assert.equal(await active(L(7)), 1);
+  await F.runOp(db.app, a.id, "stripe.void_payment_intent", 7);
   F.ok(await applyEvent(db.app, a.id, { type: "VOID_SUCCEEDED" }, { now: F.at(7) }));
   assert.equal(await active(L(7)), 0);
 });
 
-test("a released claim can never be reactivated; claims cannot be deleted", async () => {
+test("a released claim can never be reactivated; the runtime role cannot touch claims; claims cannot be deleted", async () => {
   const p = await F.pending(db.app, { listingId: L(8), from: "2027-09-01", to: "2027-09-03" });
+  await F.sessionExpired(db.app, p);
   F.ok(await applyEvent(db.app, p.id, { type: "CHECKOUT_EXPIRED", id: "evt_l8" }, { now: F.at(33) }));
   const c = await F.claimOf(db.app, p.id);
-  await assert.rejects(db.app.query("UPDATE booking.inventory_claims SET released_at = NULL, release_reason = NULL WHERE id = $1", [c.id]), /cannot be reactivated/);
+  assert.ok(c.released_at);
+  await assert.rejects(db.app.query("UPDATE booking.inventory_claims SET released_at = NULL, release_reason = NULL WHERE id = $1", [c.id]), /permission denied/);
+  await assert.rejects(db.owner.query("UPDATE booking.inventory_claims SET released_at = NULL, release_reason = NULL WHERE id = $1", [c.id]), /cannot be reactivated/);
   await assert.rejects(db.app.query("DELETE FROM booking.inventory_claims WHERE id = $1", [c.id]), /permission denied/);
   await assert.rejects(db.owner.query("DELETE FROM booking.inventory_claims WHERE id = $1", [c.id]), /not allowed/);
 });
 
-test("O5 (provisional): a confirmed booking keeps its claim until check-out, then releases", async () => {
+test("O5 (provisional): a confirmed booking keeps its claim until check-out day in Mexico City, then releases", async () => {
   const c = await F.confirmed(db.app, { listingId: L(9), from: "2027-09-01", to: "2027-09-03" });
   assert.equal((await F.claimOf(db.app, c.id)).kind, "reserved");
-  assert.equal(await releaseCompletedStayClaims(db.app, { today: "2027-09-02", now: F.at(1) }), 0);
+  // 2027-09-03 05:59Z is still 2027-09-02 23:59 in Mexico City (UTC-6): the guest's last night is in progress
+  assert.equal(await releaseCompletedStayClaims(db.app, { now: Date.UTC(2027, 8, 3, 5, 59) }), 0);
   assert.equal(await active(L(9)), 1);
-  assert.equal(await releaseCompletedStayClaims(db.app, { today: "2027-09-03", now: F.at(2) }), 1);
+  assert.equal(await releaseCompletedStayClaims(db.app, { now: Date.UTC(2027, 8, 3, 6, 0) }), 1);
   assert.equal(await active(L(9)), 0);
 });
 
@@ -130,7 +161,8 @@ test("claims are never released for in-progress money states even if their revie
   const claim = await F.claimOf(db.app, a.id);
   F.ok(await deferClaimReview(db.app, claim.id, { now: F.at(10_000) }));
   assert.equal(await active(L(10)), 1);
-  const r = await resolveCheckoutEvidence(db.app, a.id, a.attemptId, { sessionStatus: "expired", sessionId: a.sessionId }, { now: F.at(10_001) });
-  assert.equal(r.released, false, "authorized intent keeps its claim even with session evidence");
+  assert.equal(await tryReleaseClaim(db.app, a.id, { now: F.at(10_001) }), false);
+  const blockers = await claimReleaseBlockers(db.app, a.id, { now: F.at(10_001) });
+  assert.deepEqual(blockers, ["STATE_NOT_RELEASABLE:payment_authorized"]);
   assert.equal(await active(L(10)), 1);
 });

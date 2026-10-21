@@ -4,10 +4,12 @@ import assert from "node:assert/strict";
 import pg from "pg";
 import { startMigratedDatabase } from "./harness.mjs";
 import * as F from "./fixtures.mjs";
-import { applyEvent, loadIntent, loadIntentRow } from "../../db/lib/repo.js";
+import { applyEvent, loadIntent, loadIntentRow, beginPayStep } from "../../db/lib/repo.js";
 import { rowToIntent, intentToRow } from "../../db/lib/codec.js";
 import { STATES } from "../../lib/checkout/intent-state.js";
 import { completeOperation } from "../../db/lib/operations.js";
+import { applyResolution } from "../../db/lib/repo.js";
+import { adminResolveIntent } from "../../db/lib/admin.js";
 
 let db, report;
 before(async () => { db = await startMigratedDatabase(); report = new pg.Pool({ connectionString: db.reportUrl(), max: 2 }); });
@@ -44,13 +46,16 @@ test("every E3 state is reachable through persisted transitions, with exact roun
 
   // payment_failed / payment_expired
   let p = await F.pending(db.app, { from: "2027-01-10", to: "2027-01-12" });
-  await step(p.id, { type: "PAYMENT_FAILED", code: "PAYMENT_INTENT_CANCELED" }, 10);
+  await F.sessionExpired(db.app, p);   // E2B.1 (C3): only a verified expiry ends a payment attempt
+  await step(p.id, { type: "PAYMENT_FAILED", code: "PAYMENT_INTENT_CANCELED" }, 34);
   p = await F.pending(db.app, { from: "2027-01-13", to: "2027-01-15" });
+  await F.sessionExpired(db.app, p);
   await step(p.id, { type: "CHECKOUT_EXPIRED", id: "evt_exp_1" }, 33);
 
   // reservation_failed -> authorization_released
   let a = await F.authorized(db.app, { from: "2027-01-16", to: "2027-01-18" });
   await step(a.id, { type: "RESERVATION_STARTED", workerId: "w9", recheck: { bookable: false } }, 6);
+  await F.runOp(db.app, a.id, "stripe.void_payment_intent", 7);           // E2B.1: void reported only after it succeeded
   await step(a.id, { type: "VOID_SUCCEEDED" }, 7);
 
   // reservation_unknown -> reconciled found; capture_unknown -> captured
@@ -64,13 +69,21 @@ test("every E3 state is reachable through persisted transitions, with exact roun
   d = await F.dispatched(db.app, { from: "2027-01-24", to: "2027-01-26" });
   await step(d.id, { type: "RESERVATION_SUCCEEDED", reservation: F.reservationFor({ from: "2027-01-24", to: "2027-01-26" }, 9102) }, 7);
   await step(d.id, { type: "CAPTURE_FAILED", definite: true, code: "CARD_DECLINED" }, 8);
+  await F.runOp(db.app, d.id, "hostaway.cancel_reservation", 9);           // E2B.1 (C5): verified cancellation
+  await F.reservationStatus(db.app, d.id, "9102", "cancelled", {}, 9);
   await step(d.id, { type: "RESERVATION_CANCELLED" }, 9);
 
   // reconciliation_required -> RESOLVE (evidence)
   a = await F.authorized(db.app, { from: "2027-01-28", to: "2027-01-30" });
   await step(a.id, { type: "ESCALATE", code: "MANUAL_REVIEW" }, 6);
   assert.equal(await F.count(db.app, "SELECT count(*) AS n FROM booking.reconciliation_cases WHERE intent_id = $1 AND status = 'open'", [a.id]), 1);
-  await step(a.id, { type: "RESOLVE", outcome: "released", evidence: { authorizationVoided: true, noReservation: true }, resolvedBy: "owner" }, 60, { actor: "admin" });
+  // E2B.1 (C4): the owner decision is a persisted resolution citing provider evidence, not booleans
+  await F.runOp(db.app, a.id, "alert.owner", 7);
+  const ev = await F.piStatus(db.app, a.id, a.piId, "canceled", {}, 30);
+  const res = F.ok(await adminResolveIntent(db.reconciler, { intentId: a.id, decision: "released", evidenceIds: [ev], resolver: "owner", justification: "VOIDED_IN_STRIPE", at: F.at(59) }));
+  const rr = F.ok(await applyResolution(db.app, a.id, res.id, { now: F.at(60) }));
+  assert.equal(rr.intent.status, "authorization_released");
+  reached.add(rr.intent.status);
   assert.equal(await F.count(db.app, "SELECT count(*) AS n FROM booking.reconciliation_cases WHERE intent_id = $1 AND status = 'resolved'", [a.id]), 1);
 
   for (const s of Object.values(STATES)) assert.ok(reached.has(s), `state ${s} persisted`);
@@ -120,6 +133,7 @@ test("database invariants: price immutable, identity immutable, terminal states 
 
 test("payment attempts: amount must equal the confirmed price; key format is fixed", async () => {
   const id = await F.withDetails(db.app, { from: "2027-03-01", to: "2027-03-03" });
+  F.ok(await beginPayStep(db.app, id, { now: F.at(2) })); // E2B.1 (C6): an attempt needs the intent's active claim
   const ins = (amount, key) => db.app.query(
     `INSERT INTO booking.payment_attempts (id, intent_id, attempt, idempotency_key, status, amount_minor, currency, planned_session_expires_at, created_at, updated_at)
      VALUES (gen_random_uuid(), $1, 9, $2, 'creating', $3, 'MXN', now(), now(), now())`, [id, key, amount]);
@@ -148,7 +162,7 @@ test("least privilege: runtime role has no DDL; report role cannot read guest da
   assert.ok((await report.query("SELECT count(*) FROM booking.intents")).rows[0]);
   await assert.rejects(report.query("UPDATE booking.intent_work SET next_action_at = NULL"), /permission denied/);
   const rls = (await db.owner.query("SELECT relname, relrowsecurity FROM pg_class WHERE relnamespace = 'booking'::regnamespace AND relkind = 'r'")).rows;
-  assert.equal(rls.length, 14);
+  assert.equal(rls.length, 17);
   assert.ok(rls.every((r) => r.relrowsecurity), "RLS enabled everywhere");
   const pub = (await db.owner.query("SELECT has_schema_privilege('public', 'booking', 'USAGE') AS u")).rows[0].u;
   assert.equal(pub, false, "PUBLIC has no access to schema booking");

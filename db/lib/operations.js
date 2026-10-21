@@ -10,7 +10,7 @@
 //                      never an automatic retry (Hostaway create; Hostaway payment recording)
 import { randomUUID } from "node:crypto";
 import { DB_CONFIG } from "./config.js";
-import { withTx } from "./repo.js";
+import { withTx, dbSafetyCode } from "./repo.js";
 
 export const EXTERNAL_DISPATCH_ENABLED = false;
 
@@ -64,7 +64,12 @@ export async function claimNextOperation(pool, { workerId, now, leaseMs = DB_CON
  * If the lease was lost (expired / recovered), the result is kept as late evidence on ambiguous rows and
  * { ok:false, error:'LEASE_LOST' } is returned — the caller must not apply an E3 event.
  */
-export async function completeOperation(pool, opId, { workerId, now, outcome, cfg = DB_CONFIG }) {
+export async function completeOperation(pool, opId, opts) {
+  try { return await completeOperationOnce(pool, opId, opts); }
+  catch (e) { const code = dbSafetyCode(e); if (code) return { ok: false, error: code }; throw e; }
+}
+
+async function completeOperationOnce(pool, opId, { workerId, now, outcome, cfg = DB_CONFIG }) {
   const t = new Date(now);
   return withTx(pool, async (c) => {
     const op = (await c.query("SELECT * FROM booking.external_operations WHERE id = $1 FOR UPDATE", [opId])).rows[0];
@@ -121,25 +126,49 @@ export async function recoverExpiredOperations(pool, { now, cfg = DB_CONFIG, lim
   });
 }
 
+// Owner resolution of uncertain operations is NOT available to the runtime role (E2B.1, C1/C7):
+// see db/lib/admin.js -> booking.admin_resolve_operation(), granted to mv_booking_admin only.
+
+const READ_TYPES = Object.freeze({
+  "stripe.retrieve_checkout_session": "sessionId",
+  "stripe.retrieve_payment_intent": "paymentIntentId",
+  "hostaway.retrieve_reservation": "reservationId",
+  "hostaway.list_offline_charges": "reservationId",
+  "hostaway.lookup_reservation": "ref"
+});
+
+/** Queue a provider READ (no side effects at the provider). Its result can then be recorded as evidence. */
+export async function requestRead(pool, intentId, opType, ref, { now }) {
+  const field = READ_TYPES[opType];
+  if (!field) throw new TypeError(`not a read operation: ${opType}`);
+  if (typeof ref !== "string" || !ref) throw new TypeError("ref required");
+  const v = (await pool.query("SELECT version FROM booking.intents WHERE id = $1", [intentId])).rows[0];
+  if (!v) throw new Error("NOT_FOUND");
+  const id = randomUUID();
+  await pool.query(
+    `INSERT INTO booking.external_operations (id, intent_id, op_type, idempotency_key, retry_class, state, payload, source_version,
+       max_attempts, next_attempt_at, created_at, updated_at)
+     VALUES ($1,$2,$3,$4,'read','pending',$5,$6,$7,$8,$8,$8)`,
+    [id, intentId, opType, `read:${opType}:${id}`, { [field]: ref }, v.version, DB_CONFIG.maxAttempts.read, new Date(now)]);
+  return id;
+}
+
 /**
- * Owner/admin resolution of an ambiguous or escalated operation, WITH evidence gathered outside the system.
- * resolution: 'succeeded' (e.g. the Hostaway payment record exists, resultRef = its id) or 'failed_definite'
- * (verified absent). Closes the matching reconciliation case. The caller then applies the matching E3 event.
+ * Record what a SUCCEEDED read operation observed (Stripe/Hostaway API). The database binds the evidence to that
+ * read (type, identifier, completion time, recording role). TRUST BOUNDARY: the database cannot verify that the
+ * observed values are what the provider actually returned; only verified provider reads may be recorded here.
  */
-export async function resolveOperation(pool, opId, { now, resolution, resultRef = null, resolvedBy }) {
-  if (!["succeeded", "failed_definite"].includes(resolution)) throw new TypeError("resolution");
-  if (typeof resolvedBy !== "string" || !resolvedBy) throw new TypeError("resolvedBy required");
-  const t = new Date(now);
-  return withTx(pool, async (c) => {
-    const op = (await c.query("SELECT * FROM booking.external_operations WHERE id = $1 FOR UPDATE", [opId])).rows[0];
-    if (!op || !["outcome_unknown", "escalated"].includes(op.state)) return { ok: false, error: "NOT_RESOLVABLE" };
-    await c.query(`UPDATE booking.external_operations SET state = $2, result_ref = $3, completed_at = $4, updated_at = $4 WHERE id = $1`,
-      [opId, resolution, resultRef != null ? String(resultRef) : null, t]);
-    await c.query(`UPDATE booking.reconciliation_cases SET status = 'resolved', resolution = $3, resolved_by = $4, resolved_at = $5
-                   WHERE intent_id = $1 AND opened_by = $2 AND status = 'open'`,
-      [op.intent_id, `op:${opId}`, resolution === "succeeded" ? "recorded" : "no_action", resolvedBy.slice(0, 200), t]);
-    return { ok: true };
-  });
+export async function recordProviderEvidence(pool, { readOpId, kind, externalRef, status, observed, providerRequestId = null }) {
+  try {
+    const r = await pool.query("SELECT booking.record_provider_evidence($1, $2, $3, $4, $5, $6) AS id",
+      [readOpId, kind, externalRef, status, observed, providerRequestId]);
+    return { ok: true, id: r.rows[0].id };
+  } catch (e) {
+    const m = /^([A-Z_]+)/.exec(e.message || "");
+    if (e.code === "23514" && m) return { ok: false, error: m[1] };
+    if (e.code === "23505" && /read_operation_id/.test(e.constraint || "")) return { ok: false, error: "EVIDENCE_ALREADY_RECORDED" };
+    throw e;
+  }
 }
 
 /** Execute one claimed operation through an INJECTED executor. With no executor, nothing is ever sent. */

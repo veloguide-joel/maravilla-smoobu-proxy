@@ -40,7 +40,7 @@ test("personal data appears ONLY in intent_guests (full-database scan after comp
     const rows = (await db.owner.query(`SELECT row_to_json(x)::text AS j FROM booking.${t} x`)).rows;
     for (const r of rows) for (const n of needles) assert.ok(!r.j.toLowerCase().includes(n.toLowerCase()), `PII "${n}" found in ${t}`);
   }
-  assert.ok(tables.length === 14);
+  assert.ok(tables.length === 17); // 14 core + provider_evidence, reconciliation_resolutions, definite_refusal_codes (E2B.1)
 });
 
 test("access: report role cannot read guests; runtime role cannot update or delete them", async () => {
@@ -57,6 +57,7 @@ test("O6 retention is provisional and configurable; purge never touches in-progr
   assert.throws(() => retentionFromEnv({ BOOKING_RETENTION_FAILED_DAYS: "0" }), /between 1 and 3650/);
 
   const failed = await F.pending(db.app, { listingId: 760005 });                        // will expire (no booking)
+  await F.sessionExpired(db.app, failed);                                               // verified expiry (E2B.1, C3)
   F.ok(await applyEvent(db.app, failed.id, { type: "CHECKOUT_EXPIRED", id: "evt_g5" }, { now: F.at(33) }));
   const booked = await F.confirmed(db.app, { listingId: 760006, from: "2026-12-20", to: "2026-12-24" }); // check-out 2026-12-24
   const live = await F.authorized(db.app, { listingId: 760007 });                       // in progress
@@ -79,6 +80,7 @@ test("O6 retention is provisional and configurable; purge never touches in-progr
   assert.equal(await guests(review.id), 1, "open reconciliation case blocks purge");
   // a shorter configured period takes effect without any migration
   const quick = await F.pending(db.app, { listingId: 760009 });
+  await F.sessionExpired(db.app, quick);
   F.ok(await applyEvent(db.app, quick.id, { type: "CHECKOUT_EXPIRED", id: "evt_g9" }, { now: F.at(33) }));
   await purgeGuestData(db.app, { now: F.at(33 + 2 * day), retention: { failedAttemptDays: 1, postCheckoutDays: 90 } });
   assert.equal(await guests(quick.id), 0);
