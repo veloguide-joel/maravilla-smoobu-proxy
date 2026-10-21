@@ -173,3 +173,29 @@ both legs verified -> cancelled (guest told "not charged") -> dates released in 
 E5 must confirm which Stripe lookup can find a session when its id is unknown, e.g. listing Checkout Sessions and matching our metadata. It must also confirm that the create request sets `metadata.paymentAttemptId`, which reads are matched on. Until then, the no-id case is manual.
 
 **Notifications (documented, not changed):** `guest.notify` and `alert.owner` remain `idempotent` operations. A retry after an ambiguous send can deliver a **duplicate message** to the guest or owner. This is accepted until the notification stage defines provider-side de-duplication.
+
+## Authenticated smoke test (E2C; local validation only so far)
+
+`scripts/db-smoke.mjs` checks a **runtime** login end to end. It has been validated only against throwaway local PostgreSQL 17 (`test/db/smoke.test.mjs`); it has **not** been run against a hosted database.
+
+```
+node scripts/db-smoke.mjs --url-env BOOKING_DATABASE_URL --ca-file prod-ca-2021.crt --expect-role <runtime login> [--env test] [--write-probe]
+```
+
+**What it checks:**
+- TLS with the pinned official Supabase CA (`prod-ca-2021.crt`, SHA-256 `700723…f3b7`). Any other file stops it before connecting.
+- Identity: the expected login, member of `mv_booking_app` only, no superuser or BYPASSRLS.
+- Environment marker, and effective `statement_timeout` 5 s / `idle_in_transaction_session_timeout` 10 s.
+- The exact table-privilege matrix: no DELETE or TRUNCATE.
+- Runtime functions executable; `admin_*` functions not executable; migration bookkeeping denied.
+- Empty data apart from the `instance` row.
+
+**Safety:**
+- Read-only by default: all checks run in one `BEGIN READ ONLY` transaction that is rolled back.
+- `--write-probe` needs separate approval. It runs only on a `test` marker, inserts one synthetic intent with raw SQL on the same client, and always rolls back.
+- Output is check names, booleans and codes only: never the URL, user name, password or server error text.
+- Exit code 0 only when every check passes.
+
+`--loopback-rehearsal` is for local clusters only.
+
+**Not yet established:** the hosted login, its secret-entry workflow and any `BOOKING_DATABASE_URL` wiring are owner decisions. Nothing reads that variable yet.
