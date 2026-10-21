@@ -1,14 +1,22 @@
 // Booking pool TLS/target guard: offline checks of the EFFECTIVE pg connection parameters.
-// Fabricated .invalid hosts and dummy data only; any network connect attempt throws.
+// Fabricated .invalid hosts and dummy data only; a deny-network preload makes every connect/DNS/TLS attempt throw.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import net from "node:net";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { createBookingPool, isLoopbackUrl } from "../db/lib/pool.js";
 
-net.Socket.prototype.connect = function () { throw new Error("NETWORK_FORBIDDEN_IN_TEST"); };
+// Deny-network preload, used in this process AND inside the CLI child (node --import), so no check can reach the
+// network: socket connects, DNS lookups and TLS connects throw before any I/O and leave a marker on stderr.
+const DENY_NETWORK_SRC = `
+import net from "node:net"; import tls from "node:tls"; import dns from "node:dns";
+const deny = (what) => function () { process.stderr.write("NETWORK_ATTEMPT_BLOCKED:" + what + "\\n"); throw new Error("NETWORK_ATTEMPT_BLOCKED"); };
+net.Socket.prototype.connect = deny("socket.connect"); net.connect = deny("net.connect"); net.createConnection = deny("net.createConnection");
+tls.connect = deny("tls.connect"); dns.lookup = deny("dns.lookup"); dns.promises.lookup = deny("dns.promises.lookup");
+`;
+const DENY_NETWORK = "data:text/javascript," + encodeURIComponent(DENY_NETWORK_SRC);
+await import(DENY_NETWORK);
 
 const CA = "-----BEGIN CERTIFICATE-----\nDUMMY-NOT-A-REAL-CA\n-----END CERTIFICATE-----\n";
 const R = "db.remote.example.invalid";
@@ -86,13 +94,34 @@ test("remote URL still requires a CA", () => {
   assert.throws(() => createBookingPool({ connectionString: `postgresql://u@${R}/d` }), /require caPem/);
 });
 
+test("rejection messages are static: no supplied URL text is echoed (key, value, userinfo, host, path markers)", () => {
+  const M = "zqmarker7731";
+  const urls = [
+    `postgresql://${M}u:${M}p@${M}h.example.invalid/${M}d?ssl${M}=${M}v`,
+    `postgresql://${M}u:${M}p@${M}h.example.invalid/${M}d?SSLMODE=${M}v`,
+    `postgresql://${M}u:${M}p@localhost/${M}d?host=${M}remote.example.invalid`,
+    `postgresql://${M}u@localhost/${M}d?host=/${M}a&host=/${M}b`,
+    `${M}scheme://${M}h/${M}d`,
+    `not a url ${M}`
+  ];
+  const STATIC = /^createBookingPool: connection string rejected \((not a valid URL|scheme must be postgres or postgresql|a URL option would override the verified TLS configuration|malformed host|more than one host option|ambiguous host: \?host= may only name a Unix socket directory for a local URL|no host|effective host differs from the URL host|effective TLS settings differ from the verified configuration)\)$/;
+  for (const url of urls) {
+    assert.throws(() => createBookingPool({ connectionString: url, caPem: CA }), (e) => {
+      assert.match(e.message, STATIC);
+      assert.ok(!e.message.toLowerCase().includes(M), "error must not echo supplied URL text");
+      return true;
+    });
+  }
+});
+
 test("migration CLI refuses an ambiguous host override before any connection, without printing the URL", () => {
   const cli = fileURLToPath(new URL("../scripts/db-migrate.mjs", import.meta.url));
-  const r = spawnSync(process.execPath, [cli, "status", "--env", "test", "--url-env", "MV_GUARD_URL"], {
+  const r = spawnSync(process.execPath, ["--import", DENY_NETWORK, cli, "status", "--env", "test", "--url-env", "MV_GUARD_URL"], {
     env: { PATH: process.env.PATH, MV_GUARD_URL: "postgresql://u:dummy@localhost:5432/d?host=remote.example.invalid" },
     encoding: "utf8", timeout: 20000
   });
   assert.equal(r.status, 1);
   assert.match(r.stderr, /connection string rejected/);
+  assert.ok(!/NETWORK_ATTEMPT_BLOCKED/.test(r.stderr), "the CLI must refuse before any network attempt");
   assert.ok(!/dummy|example\.invalid|ENOTFOUND|ECONNREFUSED/.test(r.stdout + r.stderr));
 });

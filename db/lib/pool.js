@@ -27,9 +27,9 @@ export function resolveBookingTarget(connectionString) {
   let u;
   try { u = new URL(connectionString); } catch { throw reject("not a valid URL"); }
   if (u.protocol !== "postgres:" && u.protocol !== "postgresql:") throw reject("scheme must be postgres or postgresql");
-  const keys = [...u.searchParams.keys()];
-  const tlsKey = keys.find((k) => TLS_OVERRIDE_PARAM.test(k));
-  if (tlsKey) throw reject(`URL option '${tlsKey}' would override the verified TLS configuration`);
+  if ([...u.searchParams.keys()].some((k) => TLS_OVERRIDE_PARAM.test(k))) {
+    throw reject("a URL option would override the verified TLS configuration");
+  }
   let urlHost;
   try { urlHost = decodeURIComponent(u.hostname); } catch { throw reject("malformed host"); }
   const hostParams = u.searchParams.getAll("host");
