@@ -230,7 +230,8 @@ test("deadline = earliest of (Stripe capture deadline − safety margin) and (St
 test("reservation verified after Stripe's capture deadline: cancel, never capture", () => {
   const r = transition(toDispatched(), { type: "RESERVATION_SUCCEEDED", reservation: RES }, { now: AUTH.captureBefore });
   assert.deepEqual([r.intent.status, r.intent.reasonCode], [S.CAPTURE_FAILED, "AUTHORIZATION_EXPIRED"]);
-  assert.deepEqual(effectTypes(r), ["hostaway.cancel_reservation", "alert.owner"]);
+  // E3.2: both recovery legs — cancel the reservation AND void the authorization (lapse is never assumed)
+  assert.deepEqual(effectTypes(r), ["hostaway.cancel_reservation", "stripe.void_payment_intent", "alert.owner"]);
   assert.equal(r.effects[0].reservationId, "9001");
   const u = drive(toReserved(), [[{ type: "CAPTURE_OUTCOME_UNKNOWN" }, 8]]);
   const still = transition(u, { type: "RECONCILED_STILL_AUTHORIZED" }, { now: AUTH.captureBefore });
@@ -353,10 +354,13 @@ test("only the lease holder can dispatch, and only once", () => {
 test("Hostaway reservation succeeds but Stripe capture fails: cancel reservation, not a paid booking", () => {
   const r = transition(toReserved(), { type: "CAPTURE_FAILED", definite: true, code: "card_declined" }, { now: T0 + 8 * MIN });
   assert.equal(r.intent.status, S.CAPTURE_FAILED);
-  assert.deepEqual(effectTypes(r), ["hostaway.cancel_reservation", "alert.owner"]);
+  // E3.2: both recovery legs are explicit
+  assert.deepEqual(effectTypes(r), ["hostaway.cancel_reservation", "stripe.void_payment_intent", "alert.owner"]);
   assert.equal(isConfirmedPaid(r.intent), false);
   const c = transition(r.intent, { type: "RESERVATION_CANCELLED" }, { now: T0 + 9 * MIN });
-  assert.equal(c.intent.status, S.CANCELLED);
+  assert.equal(c.intent.status, S.CAPTURE_FAILED, "cancellation alone is not enough: the authorization must be settled too");
+  const c2 = transition(c.intent, { type: "VOID_SUCCEEDED" }, { now: T0 + 9 * MIN });
+  assert.equal(c2.intent.status, S.CANCELLED);
   const cf = transition(r.intent, { type: "RESERVATION_CANCEL_FAILED" }, { now: T0 + 9 * MIN });
   assert.equal(cf.intent.status, S.RECONCILIATION_REQUIRED);
 });
@@ -370,7 +374,7 @@ test("reservation succeeded but capture outcome unknown: reconciliation state, n
   // Stripe says captured -> paid
   const ok = transition(u.intent, { type: "RECONCILED_CAPTURE_SUCCEEDED", amountMinor: 576000, currency: "MXN" }, { now: T0 + 9 * MIN });
   assert.equal(ok.intent.status, S.PAYMENT_CAPTURED);
-  // still only authorized -> retry capture (same idempotency key)
+  // still only authorized -> retry capture (E3.2: attempt-scoped key, only after this authoritative read)
   const retry = transition(u.intent, { type: "RECONCILED_STILL_AUTHORIZED" }, { now: T0 + 9 * MIN });
   assert.deepEqual([retry.intent.status, effectTypes(retry)], [S.RESERVATION_CONFIRMED, ["stripe.capture_payment_intent"]]);
   // authorization gone -> cancel reservation
