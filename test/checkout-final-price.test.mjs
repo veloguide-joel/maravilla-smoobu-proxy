@@ -103,7 +103,7 @@ test("fees pass through undiscounted and appear as their own line", () => {
 });
 
 test("optional (not included) components are not charged", () => {
-  const pd = payload([comp(), comp({ id: 4, type: "fee", name: "petFee", total: 300, isIncludedInTotalPrice: 0 })], 6400);
+  const pd = payload([comp(), comp({ id: 4, type: "fee", name: "petFee", total: 300, isIncludedInTotalPrice: 0, isMandatory: 0 })], 6400);
   const r = run({ priceDetails: pd });
   assert.equal(r.ok, true);
   assert.equal(r.price.finalTotalMinor, 576000);
@@ -115,24 +115,49 @@ test("never labelled or described as an Airbnb or channel price", () => {
   for (const w of ["airbnb", "vrbo", "booking.com"]) assert.ok(!s.includes(w), w);
 });
 
-// ---------- taxes: no policy is assumed ----------
-test("tax component with unresolved policy: refused", () => {
-  const pd = payload([comp(), comp({ id: 5, type: "tax", name: "lodgingTax", total: 192 })], 6592);
-  assert.equal(run({ priceDetails: pd }).error, "TAX_POLICY_UNRESOLVED");
+// ---------- taxes: no policy is assumed (D2 open) — every tax line is refused ----------
+const taxLine = (over = {}) => comp({ id: 5, type: "tax", name: "lodgingTax", total: 192, ...over });
+
+test("included tax line: refused under every policy value (no provisional tax policy)", () => {
+  const pd = payload([comp(), taxLine()], 6592);
+  for (const t of ["unresolved", "standard_base", "discounted_base"]) {
+    const r = run({ priceDetails: pd, policy: { ...P, taxOnDiscountedBase: t } });
+    assert.equal(r.ok, false, t);
+    assert.equal(r.error, "TAX_POLICY_UNRESOLVED", t);
+  }
 });
 
-test("tax on discounted base: refused (recalculation not implemented)", () => {
-  const pd = payload([comp(), comp({ id: 5, type: "tax", name: "lodgingTax", total: 192 })], 6592);
-  const r = run({ priceDetails: pd, policy: { ...P, taxOnDiscountedBase: "discounted_base" } });
-  assert.equal(r.error, "TAX_POLICY_UNSUPPORTED");
+test("REGRESSION: excluded tax line (mandatory or not) can't produce a checkout amount", () => {
+  for (const isMandatory of [1, 0]) {
+    const r = run({ priceDetails: payload([comp(), taxLine({ isIncludedInTotalPrice: 0, isMandatory })], 6400) });
+    assert.equal(r.ok, false, `isMandatory=${isMandatory}`);
+    assert.equal(r.error, "TAX_POLICY_UNRESOLVED");
+    assert.equal(r.price, undefined);
+  }
 });
 
-test("tax on standard base (explicit owner policy): passes through unchanged", () => {
-  const pd = payload([comp(), comp({ id: 5, type: "tax", name: "lodgingTax", total: 192 })], 6592);
-  const r = run({ priceDetails: pd, policy: { ...P, taxOnDiscountedBase: "standard_base" } });
-  assert.equal(r.ok, true);
-  assert.equal(r.price.finalTotalMinor, 659200 - 64000);
-  assert.ok(r.price.lines.some((l) => l.kind === "tax" && l.amountMinor === 19200));
+test("REGRESSION: excluded mandatory fee can't produce a checkout amount", () => {
+  for (const isMandatory of [1, true]) {
+    const r = run({ priceDetails: payload([comp(), comp({ id: 6, type: "fee", name: "cleaningFee", total: 500, isIncludedInTotalPrice: 0, isMandatory })], 6400) });
+    assert.deepEqual([r.ok, r.error, r.price], [false, "MANDATORY_CHARGE_EXCLUDED", undefined]);
+  }
+});
+
+test("REGRESSION: unknown excluded charges and ambiguous inclusion/mandatory flags are refused", () => {
+  const unknownOptional = run({ priceDetails: payload([comp(), comp({ id: 7, type: "surcharge", name: "resortCharge", total: 250, isIncludedInTotalPrice: 0, isMandatory: 0 })], 6400) });
+  assert.deepEqual([unknownOptional.ok, unknownOptional.error], [false, "UNKNOWN_CHARGE"]);
+  for (const flag of [undefined, null, "1", "0", 2, -1]) {
+    const inc = run({ priceDetails: payload([comp({ isIncludedInTotalPrice: flag })], 6400) });
+    assert.deepEqual([inc.ok, inc.error], [false, "AMBIGUOUS_INCLUSION"], `isIncludedInTotalPrice=${flag}`);
+    const mand = run({ priceDetails: payload([comp(), comp({ id: 8, type: "fee", name: "petFee", total: 300, isIncludedInTotalPrice: 0, isMandatory: flag })], 6400) });
+    assert.deepEqual([mand.ok, mand.error], [false, "AMBIGUOUS_INCLUSION"], `isMandatory=${flag}`);
+  }
+});
+
+test("supported tax-free fixtures keep the 10 % discount and exact reconciliation", () => {
+  const r = run();
+  assert.deepEqual([r.ok, r.price.finalTotalMinor, r.price.lines.reduce((s, l) => s + l.amountMinor, 0)], [true, 576000, 576000]);
+  assert.ok(!r.price.lines.some((l) => l.kind === "tax"));
 });
 
 test("ambiguous or unmapped components fail closed", () => {

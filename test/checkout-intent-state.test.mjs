@@ -3,18 +3,22 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  createIntent, transition, publicStatus, isConfirmedPaid, idempotencyKeys, allowedEvents,
+  createIntent, transition, publicStatus, isConfirmedPaid, idempotencyKeys, allowedEvents, voidKey, captureKey,
   STATES as S, TERMINAL_STATES, EVENTS, DEFAULT_CONFIG
 } from "../lib/checkout/intent-state.js";
 
 const T0 = Date.UTC(2026, 9, 21, 15, 0, 0);
 const MIN = 60 * 1000;
+const HOUR = 60 * MIN;
+const DAY = 24 * HOUR;
 const PRICE = Object.freeze({
   listingId: 603566, from: "2026-12-20", to: "2026-12-24", guests: 2, nights: 4, currency: "MXN",
   standardTotalMinor: 640000, eligibleMinor: 640000, discountMinor: 64000, finalTotalMinor: 576000,
   policyVersion: "direct-v1", rateBps: 1000, lines: [], charge: { currency: "mxn", amountMinor: 576000, quantity: 1 }, quoteHash: "a".repeat(64)
 });
-const AUTH = { type: "PAYMENT_AUTHORIZED", paymentIntentId: "pi_test_1", sessionId: "cs_test_1", amountMinor: 576000, currency: "mxn", livemode: false };
+// Stripe-provided timestamps: authorization created at T0+4m; capture deadline 7 days later (example value, not an assumption).
+const AUTH = { type: "PAYMENT_AUTHORIZED", paymentIntentId: "pi_test_1", sessionId: "cs_test_1", amountMinor: 576000, currency: "mxn", livemode: false,
+  authorizationCreatedAt: T0 + 4 * MIN, captureBefore: T0 + 4 * MIN + 7 * DAY };
 const RES = { reservationId: 9001, listingId: 603566, from: "2026-12-20", to: "2026-12-24", totalMinor: 576000, currency: "MXN" };
 
 const fresh = () => createIntent({ id: "int_1", ref: "MV-7K3Q9P", listingId: 603566, from: "2026-12-20", to: "2026-12-24", guests: 2, now: T0 });
@@ -98,9 +102,9 @@ test("terminal states cannot be left except by money-safety escalation", () => {
 test("expired booking intent (before payment)", () => {
   const pc = drive(fresh(), [[{ type: "PRICE_CONFIRMED", price: PRICE }, 0]]);
   assert.equal(transition(pc, { type: "EXPIRE" }, { now: T0 + 29 * MIN }).error, "NOT_EXPIRED");
-  assert.equal(transition(pc, { type: "DETAILS_COLLECTED" }, { now: T0 + 31 * MIN }).error, "PRICE_EXPIRED");
+  assert.equal(transition(pc, { type: "DETAILS_COLLECTED" }, { now: T0 + 31 * MIN }).error, "QUOTE_EXPIRED");
   const dc = drive(pc, [[{ type: "DETAILS_COLLECTED" }, 1]]);
-  assert.equal(transition(dc, { type: "CHECKOUT_PREPARED", sessionId: "cs" }, { now: T0 + 30 * MIN }).error, "PRICE_EXPIRED");
+  assert.equal(transition(dc, { type: "CHECKOUT_PREPARED", sessionId: "cs" }, { now: T0 + 30 * MIN }).error, "QUOTE_EXPIRED");
   const e = transition(dc, { type: "EXPIRE" }, { now: T0 + 30 * MIN });
   assert.equal(e.intent.status, S.EXPIRED);
   assert.equal(publicStatus(e.intent), "expired");
@@ -144,13 +148,29 @@ test("replayed checkout request reuses the same session; a second session is ref
   assert.deepEqual([replay.ok, replay.duplicate], [true, true]);
   assert.equal(transition(p, { type: "CHECKOUT_PREPARED", sessionId: "cs_test_2" }, { now: T0 + 3 * MIN }).error, "CHECKOUT_ALREADY_PREPARED");
   assert.equal(idempotencyKeys(p).checkoutSession, "cs:int_1:1");
-  assert.deepEqual({ ...idempotencyKeys(p) }, { checkoutSession: "cs:int_1:1", capture: "cap:int_1", void: "void:int_1", offlineCharge: "och:int_1", hostawayReservationRef: "MV-7K3Q9P" });
+  assert.deepEqual({ ...idempotencyKeys(p) }, { checkoutSession: "cs:int_1:1", capture: null, void: null, offlineCharge: "och:int_1", hostawayReservationRef: "MV-7K3Q9P" });
+  assert.deepEqual([idempotencyKeys(toAuthorized()).void, idempotencyKeys(toAuthorized()).capture], ["void:int_1:pi_test_1", "cap:int_1:pi_test_1"]);
 });
 
 test("a second, different PaymentIntent for the same intent is voided and escalated", () => {
   const r = transition(toAuthorized(), { ...AUTH, id: "evt_x", paymentIntentId: "pi_other" }, { now: T0 + 6 * MIN });
   assert.equal(r.intent.status, S.RECONCILIATION_REQUIRED);
   assert.deepEqual(r.effects.find((e) => e.type === "stripe.void_payment_intent").paymentIntentId, "pi_other");
+});
+
+test("REGRESSION: distinct payment attempts on one intent get distinct void/capture keys", () => {
+  const a = toAuthorized();
+  const stray = transition(a, { ...AUTH, id: "evt_stray", paymentIntentId: "pi_other" }, { now: T0 + 6 * MIN });
+  const strayVoid = stray.effects.find((e) => e.type === "stripe.void_payment_intent");
+  assert.equal(strayVoid.idempotencyKey, voidKey("int_1", "pi_other"));
+  const failed = transition(a, { type: "RESERVATION_STARTED", workerId: "w1", recheck: { bookable: false, priceSame: true } }, { now: T0 + 6 * MIN });
+  const ownVoid = failed.effects.find((e) => e.type === "stripe.void_payment_intent");
+  assert.equal(ownVoid.idempotencyKey, voidKey("int_1", "pi_test_1"));
+  assert.notEqual(strayVoid.idempotencyKey, ownVoid.idempotencyKey);
+  const cap = transition(toDispatched(), { type: "RESERVATION_SUCCEEDED", reservation: RES }, { now: T0 + 7 * MIN });
+  assert.equal(cap.effects[0].idempotencyKey, captureKey("int_1", "pi_test_1"));
+  // every Stripe-side effect carries an idempotency key
+  for (const r of [stray, failed, cap]) for (const e of r.effects) if (e.type.startsWith("stripe.") && e.type !== "stripe.retrieve_payment_intent") assert.ok(e.idempotencyKey, e.type);
 });
 
 // ---------- authorization verification ----------
@@ -169,9 +189,52 @@ test("authorization with wrong amount, currency, mode or session is never accept
   }
 });
 
-test("authorization too old to rely on: void + review instead of reserving", () => {
-  const r = transition(toAuthorized(), { type: "RESERVATION_STARTED", workerId: "w1", recheck: { bookable: true, priceSame: true } }, { now: T0 + 5 * MIN + DEFAULT_CONFIG.maxAuthorizationAgeMs + 1 });
-  assert.equal(r.intent.reasonCode, "AUTHORIZATION_TOO_OLD");
+// ---------- authorization deadlines (from Stripe data; 5 days is only an internal cap) ----------
+test("authorization without Stripe's timestamps is not accepted (fail closed, nothing changes)", () => {
+  const p = toPending();
+  for (const drop of ["authorizationCreatedAt", "captureBefore"]) {
+    const ev = { ...AUTH }; delete ev[drop];
+    const r = transition(p, ev, { now: T0 + 5 * MIN });
+    assert.deepEqual([r.ok, r.error, r.intent], [false, "AUTHORIZATION_DEADLINE_UNKNOWN", p], drop);
+  }
+});
+
+test("inconsistent Stripe timestamps: void + review", () => {
+  const before = transition(toPending(), { ...AUTH, captureBefore: AUTH.authorizationCreatedAt }, { now: T0 + 5 * MIN });
+  assert.equal(before.intent.reasonCode, "AUTHORIZATION_TIMESTAMPS_INVALID");
+  const future = transition(toPending(), { ...AUTH, authorizationCreatedAt: T0 + 60 * MIN }, { now: T0 + 5 * MIN });
+  assert.equal(future.intent.reasonCode, "AUTHORIZATION_TIMESTAMPS_INVALID");
+  assert.ok(effectTypes(future).includes("stripe.void_payment_intent"));
+});
+
+test("deadline = earliest of (Stripe capture deadline − safety margin) and (Stripe authorization time + internal cap)", () => {
+  // Stripe allows 7 days -> the internal 5-day cap from Stripe's authorization time wins
+  const long = toAuthorized();
+  assert.equal(long.payment.authorizationDeadline, AUTH.authorizationCreatedAt + DEFAULT_CONFIG.internalAuthorizationDeadlineMs);
+  // Stripe allows only 2 days -> Stripe's deadline minus the margin wins
+  const shortAuth = { ...AUTH, id: "evt_s", captureBefore: AUTH.authorizationCreatedAt + 2 * DAY };
+  const short = drive(toPending(), [[shortAuth, 5]]);
+  assert.equal(short.payment.authorizationDeadline, shortAuth.captureBefore - DEFAULT_CONFIG.captureSafetyMarginMs);
+  const startAt = (i, t) => transition(i, { type: "RESERVATION_STARTED", workerId: "w1", recheck: { bookable: true, priceSame: true } }, { now: t });
+  assert.equal(startAt(short, AUTH.authorizationCreatedAt + 1 * DAY).intent.status, S.RESERVATION_PENDING);
+  const late = startAt(short, short.payment.authorizationDeadline);
+  assert.deepEqual([late.intent.status, late.intent.reasonCode], [S.RECONCILIATION_REQUIRED, "AUTHORIZATION_DEADLINE_PASSED"]);
+  assert.ok(effectTypes(late).includes("stripe.void_payment_intent"));
+  // the internal cap applies even when Stripe would allow longer
+  assert.equal(startAt(long, long.payment.authorizationDeadline).intent.reasonCode, "AUTHORIZATION_DEADLINE_PASSED");
+  // an authorization that arrives already past its deadline is not accepted
+  const stale = transition(toPending(), { ...AUTH, captureBefore: T0 + 5 * MIN + DEFAULT_CONFIG.captureSafetyMarginMs }, { now: T0 + 5 * MIN });
+  assert.equal(stale.intent.reasonCode, "AUTHORIZATION_DEADLINE_PASSED");
+});
+
+test("reservation verified after Stripe's capture deadline: cancel, never capture", () => {
+  const r = transition(toDispatched(), { type: "RESERVATION_SUCCEEDED", reservation: RES }, { now: AUTH.captureBefore });
+  assert.deepEqual([r.intent.status, r.intent.reasonCode], [S.CAPTURE_FAILED, "AUTHORIZATION_EXPIRED"]);
+  assert.deepEqual(effectTypes(r), ["hostaway.cancel_reservation", "alert.owner"]);
+  assert.equal(r.effects[0].reservationId, "9001");
+  const u = drive(toReserved(), [[{ type: "CAPTURE_OUTCOME_UNKNOWN" }, 8]]);
+  const still = transition(u, { type: "RECONCILED_STILL_AUTHORIZED" }, { now: AUTH.captureBefore });
+  assert.deepEqual([still.intent.status, still.intent.reasonCode], [S.CAPTURE_FAILED, "AUTHORIZATION_EXPIRED"]);
 });
 
 // ---------- re-validation at reservation time ----------
