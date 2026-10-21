@@ -8,6 +8,8 @@
 //
 //   --repeat N   runs (default 1; 1..MAX_REPEAT). Stops at the first failure.
 //   --out DIR    where logs go (default: <os tmpdir>/mv-diag-runs/<timestamp>-<label>). Logs are never deleted.
+//                The final directory must NOT exist: it is created atomically (parents as needed); an existing one is
+//                refused (exit 73) before any command runs, so earlier evidence is never overwritten.
 //   --label      a short name used in the default directory.
 //
 // Files per run: run-NNN.stdout.log, run-NNN.stderr.log, run-NNN.json. Plus summary.json for the batch.
@@ -16,7 +18,7 @@
 import { spawn, execFileSync } from "node:child_process";
 import { createWriteStream, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, dirname } from "node:path";
 import { constants as osConstants } from "node:os";
 
 const MAX_REPEAT = 20;
@@ -76,7 +78,11 @@ async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const dir = resolve(opts.out || join(tmpdir(), "mv-diag-runs", `${stamp}-${opts.label}`));
-  mkdirSync(dir, { recursive: true });
+  mkdirSync(dirname(dir), { recursive: true });
+  try { mkdirSync(dir); } catch (e) {        // non-recursive: atomic create, EEXIST if it is already there
+    console.error(`diag-repeat: refusing output directory ${dir}: ${e.code === "EEXIST" ? "it already exists (use a new --out)" : e.message}`);
+    process.exit(73);
+  }
   const commit = git(["rev-parse", "HEAD"]);
   const dirty = git(["status", "--porcelain"]);
   const batch = { command: opts.command, cwd: process.cwd(), commit, worktreeDirty: dirty === null ? null : dirty.length > 0,
