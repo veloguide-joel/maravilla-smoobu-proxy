@@ -70,6 +70,8 @@ const EXPECTED_API_FILES = Object.freeze([
   "api/hostaway/e4-check.js",
   "api/hostaway/listing.js",
   "api/hostaway/listings.js",
+  "api/hostaway/payment-rules-check.js",
+  "api/hostaway/payment-rules-page.js",
   "api/hostaway/quote.js"
 ]);
 
