@@ -1,0 +1,14 @@
+{
+  "manifestVersion": "e4-write-manifest-v1",
+  "listingId": 606998,
+  "refFieldId": 105433,
+  "currency": "USD",
+  "nightlyMinor": 10000,
+  "cleaningFeeMinor": 5000,
+  "guests": 2,
+  "window": "<OWNER_INPUT>",
+  "r1Block": "<OWNER_INPUT>",
+  "r2Stay": "<OWNER_INPUT>",
+  "x1bOverlap": "<OWNER_INPUT>",
+  "guest": "<OWNER_INPUT>"
+}
