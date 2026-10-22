@@ -1,0 +1,8 @@
+{
+  "status": "success",
+  "result": [
+    { "date": "2027-03-10", "isAvailable": 1, "status": "available", "price": 100, "minimumStay": 1, "maximumStay": 365, "closedOnArrival": null, "closedOnDeparture": null, "note": "synthetic note (must never be printed)", "reservations": [] },
+    { "date": "2027-03-11", "isAvailable": 1, "status": "available", "price": 100, "minimumStay": 1, "maximumStay": 365, "closedOnArrival": null, "closedOnDeparture": null, "note": null, "reservations": [] },
+    { "date": "2027-03-12", "isAvailable": 1, "status": "available", "price": 100, "minimumStay": 1, "maximumStay": 365, "closedOnArrival": null, "closedOnDeparture": null, "note": null, "reservations": [] }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "status": "success",
+  "result": [
+    { "id": 105433, "accountId": 1, "name": "maraVilla booking ref", "varName": "reservation_maravilla_booking_ref", "possibleValues": null, "type": "text", "objectType": "reservation", "isPublic": 0, "sortOrder": 1 },
+    { "id": 999001, "accountId": 1, "name": "Synthetic other field", "varName": "reservation_other", "possibleValues": null, "type": "textarea", "objectType": "reservation", "isPublic": 1, "sortOrder": 2 }
+  ],
+  "limit": 100, "offset": 0, "count": 2
+}

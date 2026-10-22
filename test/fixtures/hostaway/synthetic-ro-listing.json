@@ -1,0 +1,9 @@
+{
+  "status": "success",
+  "result": {
+    "id": 606998, "name": "maraVilla TEST - DO NOT BOOK.", "address": "Synthetic street 1 (must never be printed)",
+    "description": "Synthetic description (must never be printed)", "contactEmail": "owner-synthetic@example.invalid",
+    "price": 100, "cleaningFee": 50, "currencyCode": "USD", "minNights": 1, "maxNights": 365, "personCapacity": 2,
+    "checkInTimeStart": 15, "checkInTimeEnd": 22, "checkOutTime": 11, "instantBookable": 1, "isBookingEngineActive": 0, "specialStatus": null
+  }
+}

@@ -515,5 +515,6 @@ test("containment: the adapter is pure and unreachable — no imports, network, 
     }
   };
   for (const d of ["api", "lib", "db", "scripts"]) walk(d);
-  assert.deepEqual(importers, [], "nothing outside tests references the adapter");
+  // E4 read-only CLI (scripts/, excluded from deployment by .vercelignore) reuses the pure amount/date helpers only.
+  assert.deepEqual(importers, ["scripts/hostaway-readonly-check.mjs"], "nothing deployable references the adapter");
 });

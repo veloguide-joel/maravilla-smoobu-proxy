@@ -1,0 +1,14 @@
+{
+  "status": "success",
+  "result": {
+    "totalPrice": 250,
+    "originalTotalPrice": 0,
+    "selectedComponentsAmount": 0,
+    "components": [
+      { "id": null, "listingFeeSettingId": null, "type": "price", "name": "baseRate", "title": "Base rate", "alias": null, "quantity": null, "value": 200, "total": 200, "isIncludedInTotalPrice": 1, "isOverriddenByUser": 0, "isQuantitySelectable": 0, "isMandatory": null, "isDeleted": 0 },
+      { "id": null, "listingFeeSettingId": null, "type": "fee", "name": "cleaningFee", "title": "Cleaning fee", "alias": null, "quantity": null, "value": 50, "total": 50, "isIncludedInTotalPrice": 1, "isOverriddenByUser": 0, "isQuantitySelectable": 0, "isMandatory": null, "isDeleted": 0 }
+    ],
+    "extraComponents": [],
+    "selectedComponents": []
+  }
+}
