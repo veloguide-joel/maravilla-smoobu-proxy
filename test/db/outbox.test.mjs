@@ -102,5 +102,5 @@ test("external dispatch is disabled: no executor, no send; no route imports the 
   // deployable code (api/ and the lib/ it imports) never references the booking database layer
   for (const f of [...walk("api"), ...walk("lib")]) assert.doesNotMatch(readFileSync(f, "utf8"), /db\/lib|booking_migrations|BOOKING_DATABASE_URL|db\/migrations/, f);
   const pkg = JSON.parse(readFileSync("package.json", "utf8"));
-  assert.deepEqual(Object.keys(pkg.dependencies).sort(), ["@supabase/supabase-js", "dotenv", "pg", "stripe"], "no new dependency");
+  assert.deepEqual(Object.keys(pkg.dependencies).sort(), ["dotenv", "pg", "stripe"], "no new dependency");
 });

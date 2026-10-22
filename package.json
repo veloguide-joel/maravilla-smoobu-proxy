@@ -7,7 +7,6 @@
     "test:db": "node --test --test-concurrency=4 test/db/*.test.mjs"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.95.3",
     "dotenv": "^17.3.1",
     "pg": "^8.11.5",
     "stripe": "^20.3.1"
