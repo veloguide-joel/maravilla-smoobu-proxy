@@ -7,8 +7,9 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import {
   parseArgs, buildPlan, assertAllowedRequest, manifest, summarizeCustomFields, summarizeListing, summarizeCalendar,
-  summarizePriceDetails, takeCredentials, runReadonlyChecks, main, CheckError, CREDENTIAL_ENV, TEST_LISTING_ID
+  summarizePriceDetails, takeCredentials, runReadonlyChecks, main, CheckError, CREDENTIAL_ENV, TEST_LISTING_ID, KNOWN_COMPONENT_NAMES
 } from "../scripts/hostaway-readonly-check.mjs";
+import { validatePriceDetails } from "../lib/quote-public.js";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const fixture = (n) => JSON.parse(readFileSync(join(ROOT, "test/fixtures/hostaway", n), "utf8"));
@@ -131,7 +132,7 @@ test("credentials: read once from the two env variables, removed from env, valid
 // ---------- execution with a stub transport ----------
 test("execute: exactly five sequential calls, in order, to api.hostaway.com only, each once, documented shapes", async () => {
   const { report, calls, sleeps } = await run(HAPPY());
-  assert.equal(report.outcome, "ALL_CHECKS_OK");
+  assert.equal(report.outcome, "READ_ONLY_CHECKS_PASSED");
   assert.deepEqual(calls.map((c) => `${c.method} ${c.path}`), ["POST /v1/accessTokens", "GET /v1/customFields", "GET /v1/listings/606998",
     "GET /v1/listings/606998/calendar", "POST /v1/listings/606998/calendar/priceDetails"]);
   assert.ok(calls.every((c) => c.origin === "https://api.hostaway.com" && c.redirect === "error" && c.hasSignal));
@@ -148,17 +149,28 @@ test("execute: exactly five sequential calls, in order, to api.hostaway.com only
 test("execute: the report verifies field 105433, listing 606998, calendar and the cleaning-fee price calculation", async () => {
   const { report } = await run(HAPPY());
   const r = report.results;
-  assert.deepEqual([r.customFields.ok, r.customFields.fieldId, r.customFields.objectType, r.customFields.type, r.customFields.isPublic, r.customFields.varName],
-    [true, 105433, "reservation", "text", false, "reservation_maravilla_booking_ref"]);
-  assert.deepEqual(r.customFields.checks, { idMatches: true, nameExact: true, objectTypeReservation: true, typeText: true, private: true, uniqueName: true });
+  assert.deepEqual([r.customFields.ok, r.customFields.matchesForId, r.customFields.objectType, r.customFields.type, r.customFields.isPublic],
+    [true, 1, "reservation", "text", false]);
+  assert.equal(r.customFields.varName, undefined, "provider varName text is compared, never copied");
+  assert.deepEqual(r.customFields.checks, { fieldFoundOnce: "pass", nameExact: "pass", objectTypeReservation: "pass", typeText: "pass", private: "pass", uniqueName: "pass" });
+  assert.deepEqual(r.customFields.comparisons, { varNameMatchesExpected: "pass" });
+  assert.deepEqual(r.listing.checks, { nameExpected: "pass", currencyUSD: "pass", notArchived: "pass", bookingEngineInactive: "pass" });
+  assert.deepEqual(r.listing.comparisons, { nightlyPriceMatchesTestValue: "pass", cleaningFeeMatchesOwnerBaseline: "pass" });
+  assert.equal(report.readiness.verdict, "PASSED");
+  assert.deepEqual(report.readiness.reads, { customFields: "ok", listing: "ok", calendar: "ok", priceDetails: "ok" });
+  assert.equal(Object.keys(report.readiness.checks).length, 11);
+  assert.deepEqual(report.comparisons, { "customFields.varNameMatchesExpected": "pass", "listing.nightlyPriceMatchesTestValue": "pass",
+    "listing.cleaningFeeMatchesOwnerBaseline": "pass", "priceDetails.cleaningFeeMatchesOwnerBaseline": "pass" });
+  assert.match(report.scope, /never authorizes a booking/);
+  assert.match(report.scope, /does not establish full isolation/);
   assert.deepEqual([r.listing.listingId, r.listing.nameStatus, r.listing.archived, r.listing.priceMinor, r.listing.cleaningFeeMinor, r.listing.currencyCode, r.listing.isBookingEngineActive],
     [606998, "TRAILING_PERIOD", false, 10000, 5000, "USD", false]);
   assert.deepEqual([r.calendar.ok, r.calendar.daysRequested, r.calendar.complete, r.calendar.unavailableNights, r.calendar.nightlyPriceMinor],
     [true, 3, true, 0, { min: 10000, max: 10000, nightsWithPrice: 2, nightsWithoutPrice: 0 }]);
   assert.deepEqual([r.priceDetails.ok, r.priceDetails.totalMinor, r.priceDetails.cleaningFeeMinor], [true, 25000, 5000]);
   assert.deepEqual(r.priceDetails.components, [
-    { type: "price", name: "baseRate", totalMinor: 20000, included: true, mandatory: null },
-    { type: "fee", name: "cleaningFee", totalMinor: 5000, included: true, mandatory: null }
+    { index: 0, type: "price", name: "baseRate", totalMinor: 20000, included: true, mandatory: null },
+    { index: 1, type: "fee", name: "cleaningFee", totalMinor: 5000, included: true, mandatory: null }
   ]);
 });
 
@@ -187,7 +199,8 @@ test("execute: failures are reported per step, never retried; auth failure stops
     const t = HAPPY(); t["GET /v1/listings/606998"] = { status, json: { status: "fail", result: "x" } };
     const { report, calls } = await run(t);
     assert.equal(calls.length, 5, `${status}: each step called once, no retry`);
-    assert.deepEqual([report.outcome, report.results.listing.code], ["SOME_CHECKS_FAILED", `HTTP_${status}`]);
+    assert.deepEqual([report.outcome, report.results.listing.code, report.readiness.reads.listing], ["READ_ONLY_CHECKS_UNRESOLVED", `HTTP_${status}`, `HTTP_${status}`]);
+    assert.equal(report.readiness.checks["listing.currencyUSD"], "unknown", "a failed read leaves its checks unresolved, never passed");
     assert.equal(report.results.priceDetails.ok, true, "independent read steps still reported");
   }
   const t = HAPPY(); t["GET /v1/listings/606998/calendar"] = new Error("timeout");
@@ -218,39 +231,90 @@ test("execute: a forged or altered plan is refused before the token request — 
 });
 
 // ---------- sanitizers ----------
-test("custom field: exact id, name, objectType reservation, type text, private, unique name — anything else is a mismatch", () => {
+test("custom field: exact id, name, objectType reservation, type text, private, unique name — tri-state, unknown never passes", () => {
   const f = (over, extra = []) => { const j = clone(FIELDS); Object.assign(j.result[0], over); j.result.push(...extra); return summarizeCustomFields(j); };
   assert.equal(f({}).ok, true);
-  assert.deepEqual([f({ isPublic: 1 }).ok, f({ isPublic: 1 }).checks.private], [false, false]);
-  assert.equal(f({ isPublic: true }).checks.private, false);
-  assert.equal(f({ isPublic: false }).checks.private, true);
-  assert.equal(f({ objectType: "listing" }).checks.objectTypeReservation, false);
-  assert.equal(f({ type: "textarea" }).checks.typeText, false);
-  assert.equal(f({ name: "maraVilla booking ref " }).checks.nameExact, false);
-  assert.equal(f({}, [{ id: 7, name: "maraVilla booking ref", type: "text", objectType: "reservation", isPublic: 0 }]).checks.uniqueName, false);
-  assert.equal(f({ varName: "x; a@example.invalid" }).varName, null);
-  assert.equal(f({ id: 105434 }).code, "FIELD_ID_NOT_FOUND");
-  assert.equal(f({}, [{ id: 105433, name: "dup" }]).code, "FIELD_ID_DUPLICATED");
-  assert.equal(f({ id: "105433" }).code, "FIELD_ID_NOT_FOUND", "string id is not the configured numeric id");
+  assert.equal(f({ isPublic: 1 }).checks.private, "fail");
+  assert.equal(f({ isPublic: true }).checks.private, "fail");
+  assert.equal(f({ isPublic: false }).checks.private, "pass");
+  assert.equal(f({ isPublic: "0" }).checks.private, "unknown");
+  assert.equal(f({ isPublic: undefined }).checks.private, "unknown");
+  assert.equal(f({ objectType: "listing" }).checks.objectTypeReservation, "fail");
+  assert.equal(f({ type: "textarea" }).checks.typeText, "fail");
+  assert.equal(f({ name: "maraVilla booking ref " }).checks.nameExact, "fail");
+  assert.equal(f({}, [{ id: 7, name: "maraVilla booking ref", type: "text", objectType: "reservation", isPublic: 0 }]).checks.uniqueName, "fail");
+  assert.equal(f({ id: 105434 }).checks.fieldFoundOnce, "fail");
+  assert.equal(f({ id: 105434 }).checks.private, "unknown");
+  assert.equal(f({}, [{ id: 105433, name: "dup" }]).checks.fieldFoundOnce, "fail");
+  assert.equal(f({ id: "105433" }).checks.fieldFoundOnce, "fail", "string id is not the configured numeric id");
+  assert.equal(f({ varName: "reservation_other" }).comparisons.varNameMatchesExpected, "fail");
+  assert.equal(f({ varName: undefined }).comparisons.varNameMatchesExpected, "unknown");
   const many = clone(FIELDS); many.result = Array.from({ length: 100 }, (_, i) => ({ id: i + 1, name: `f${i}` }));
   assert.equal(summarizeCustomFields(many).code, "LIST_POSSIBLY_TRUNCATED");
   for (const j of [null, {}, { status: "fail", result: [] }, { status: "success", result: {} }]) assert.equal(summarizeCustomFields(j).code, "UNEXPECTED_SHAPE");
 });
 
-test("listing: sanitized fields only; wrong id, archived, odd types fail closed or become null", () => {
+test("adversarial: secret-shaped alphanumeric varName and component names are never echoed", async () => {
+  const SECRET = "sk4f9Qz7Lm2Xp8Rt6Wv1Yb3Nc5Hd0Jk";            // alphanumeric, would have matched the old SAFE_* patterns
+  const fields = clone(FIELDS); fields.result[0].varName = SECRET.toLowerCase(); fields.result[1].varName = `reservation_${SECRET.toLowerCase()}`;
+  const price = clone(PRICE); price.result.components[0].name = SECRET; price.result.components.push({ type: "fee", name: `${SECRET}Fee`, title: SECRET, total: 0, isIncludedInTotalPrice: 1 });
+  const listing = clone(LISTING); listing.result.name = SECRET;
+  const { report } = await run({ ...HAPPY(), "GET /v1/customFields": { json: fields }, "GET /v1/listings/606998": { json: listing },
+    "POST /v1/listings/606998/calendar/priceDetails": { json: price } });
+  const text = JSON.stringify(report);
+  assert.ok(!text.toLowerCase().includes(SECRET.toLowerCase()), "no secret-shaped provider text in the report");
+  assert.equal(report.results.customFields.comparisons.varNameMatchesExpected, "fail");
+  assert.deepEqual(report.results.priceDetails.components.map((c) => c.name), [null, "cleaningFee", null]);
+  assert.equal(report.results.priceDetails.unknownComponentNames, 2);
+  assert.deepEqual([report.results.listing.nameStatus, report.results.listing.checks.nameExpected, report.readiness.verdict], ["OTHER", "fail", "FAILED"]);
+});
+
+test("listing: constraints are tri-state — unknown or wrong currency, archive state, booking engine or name never pass", () => {
   const l = (over) => { const j = clone(LISTING); Object.assign(j.result, over); return summarizeListing(j); };
   assert.equal(l({ id: 603564 }).code, "LISTING_ID_MISMATCH");
-  assert.equal(l({ specialStatus: "archived" }).code, "LISTING_ARCHIVED");
-  assert.equal(l({ name: "maraVilla TEST - DO NOT BOOK" }).nameStatus, "EXACT");
-  assert.equal(l({ name: "Hacienda" }).nameStatus, "OTHER");
-  assert.equal(l({ price: "100" }).priceMinor, null);
-  assert.equal(l({ cleaningFee: 50.005 }).cleaningFeeMinor, null);
-  assert.equal(l({ currencyCode: "usd" }).currencyCode, null);
-  assert.equal(l({ isBookingEngineActive: undefined }).isBookingEngineActive, null);
+  assert.equal(l({ specialStatus: "archived" }).checks.notArchived, "fail");
+  assert.equal(l({ specialStatus: undefined }).checks.notArchived, "unknown", "absent specialStatus is unknown, not 'not archived'");
+  assert.equal(l({ specialStatus: "active" }).checks.notArchived, "unknown");
+  assert.equal(l({ name: "maraVilla TEST - DO NOT BOOK" }).checks.nameExpected, "pass");
+  assert.equal(l({ name: "maraVilla TEST - DO NOT BOOK." }).checks.nameExpected, "pass", "trailing period accepted");
+  assert.equal(l({ name: "Hacienda" }).checks.nameExpected, "fail");
+  assert.equal(l({ name: undefined }).checks.nameExpected, "unknown");
+  assert.equal(l({ currencyCode: "MXN" }).checks.currencyUSD, "fail", "MXN is reported as a mismatch, never converted or accepted");
+  assert.equal(l({ currencyCode: "usd" }).checks.currencyUSD, "unknown");
+  assert.equal(l({ currencyCode: undefined }).checks.currencyUSD, "unknown");
+  assert.equal(l({ isBookingEngineActive: 1 }).checks.bookingEngineInactive, "fail");
+  assert.equal(l({ isBookingEngineActive: undefined }).checks.bookingEngineInactive, "unknown");
+  assert.equal(l({ cleaningFee: 40 }).comparisons.cleaningFeeMatchesOwnerBaseline, "fail");
+  assert.equal(l({ cleaningFee: 50.005 }).comparisons.cleaningFeeMatchesOwnerBaseline, "unknown");
+  assert.equal(l({ price: "100" }).comparisons.nightlyPriceMatchesTestValue, "unknown");
   assert.equal(l({ checkOutTime: 24 }).checkOutTime, null);
-  const keys = Object.keys(summarizeListing(LISTING)).sort();
-  assert.deepEqual(keys, ["archived", "checkInTimeEnd", "checkInTimeStart", "checkOutTime", "cleaningFeeMinor", "code", "currencyCode", "instantBookable",
-    "isBookingEngineActive", "listingId", "maxNights", "minNights", "nameStatus", "ok", "personCapacity", "priceMinor"]);
+  assert.equal(summarizeListing(LISTING).name, undefined, "listing name text is never copied");
+});
+
+test("readiness verdict: reads OK but unresolved or failed constraints are never PASSED; comparisons never change the verdict", async () => {
+  const withListing = (over) => { const j = clone(LISTING); Object.assign(j.result, over); return { ...HAPPY(), "GET /v1/listings/606998": { json: j } }; };
+  const cases = [
+    [{ currencyCode: "MXN" }, "FAILED"], [{ isBookingEngineActive: 1 }, "FAILED"], [{ specialStatus: "archived" }, "FAILED"],
+    [{ currencyCode: undefined }, "UNRESOLVED"], [{ isBookingEngineActive: undefined }, "UNRESOLVED"], [{ specialStatus: undefined }, "UNRESOLVED"],
+    [{ cleaningFee: 40, price: 90 }, "PASSED"]
+  ];
+  for (const [over, verdict] of cases) {
+    const { report } = await run(withListing(over));
+    assert.equal(report.readiness.verdict, verdict, JSON.stringify(over));
+    assert.deepEqual(report.readiness.reads, { customFields: "ok", listing: "ok", calendar: "ok", priceDetails: "ok" }, "reads succeeded in every case");
+    assert.equal(report.outcome, `READ_ONLY_CHECKS_${verdict}`);
+  }
+  const pdFail = await run({ ...HAPPY(), "POST /v1/listings/606998/calendar/priceDetails": { status: 500, json: { status: "fail" } } });
+  assert.deepEqual([pdFail.report.readiness.reads.priceDetails, pdFail.report.readiness.verdict], ["HTTP_500", "UNRESOLVED"],
+    "a failed calculation (no readiness checks of its own) still prevents PASSED");
+  const { report } = await run(withListing({ cleaningFee: 40 }));
+  assert.equal(report.comparisons["listing.cleaningFeeMatchesOwnerBaseline"], "fail", "fee difference reported, no forced change");
+  let printed = "";
+  const env = { [CREDENTIAL_ENV.accountId]: "12345", [CREDENTIAL_ENV.clientSecret]: FAKE_SECRET };
+  const s = stubFetch(withListing({ currencyCode: "MXN" }));
+  const rc = await main([...ARGS, "--execute-readonly"], { env, fetchImpl: s.fn, out: (x) => { printed += x; } });
+  assert.equal(rc, 2, "non-zero exit unless PASSED");
+  assert.equal(JSON.parse(printed).readiness.verdict, "FAILED");
 });
 
 test("calendar: notes/reservations dropped; gaps and unavailable nights reported; malformed shapes fail closed", () => {
@@ -277,6 +341,22 @@ test("price details: exact minor units; sum must match; discounts negative; malf
   assert.equal(pd((r) => { r.components[1].isIncludedInTotalPrice = 0; r.totalPrice = 200; }).cleaningFeeMinor, 5000);
   assert.equal(pd((r) => { r.components = []; }).code, "PRICE_NO_COMPONENTS");
   assert.equal(summarizePriceDetails({ status: "fail", result: "x" }).code, "PRICE_UPSTREAM_REJECTED");
+  assert.equal(pd((r) => { r.components[1].total = 40; r.totalPrice = 240; }).comparisons.cleaningFeeMatchesOwnerBaseline, "fail");
+  assert.equal(pd((r) => { r.components[1].name = "cleaningFeeX"; }).comparisons.cleaningFeeMatchesOwnerBaseline, "unknown");
+});
+
+test("component-name allowlist = exactly the names lib/quote-public.js labels explicitly", () => {
+  const LABELS = { baseRate: "Accommodation", weeklyDiscount: "Weekly discount", monthlyDiscount: "Monthly discount", cleaningFee: "Cleaning fee", lengthOfStayDiscount: "Length-of-stay discount" };
+  assert.deepEqual([...KNOWN_COMPONENT_NAMES].sort(), Object.keys(LABELS).sort());
+  for (const name of KNOWN_COMPONENT_NAMES) {
+    const type = /Discount$/.test(name) ? "discount" : "fee";
+    const total = type === "discount" ? -1 : 1;
+    const v = validatePriceDetails({ status: "success", result: { totalPrice: 10 + total, components: [
+      { type: "price", name: "zzzBase", title: "zzz", total: 10, isIncludedInTotalPrice: 1 },
+      { type, name, title: "zzz", total, isIncludedInTotalPrice: 1 }] } });
+    assert.equal(v.ok, true, name);
+    assert.equal(v.breakdown[1].label, LABELS[name], `${name} is labelled by the existing validator, not by its title`);
+  }
 });
 
 // ---------- containment ----------
