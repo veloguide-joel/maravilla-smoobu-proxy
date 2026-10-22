@@ -554,6 +554,9 @@ export async function executeRun(opts = {}) {
   await runStep("S3_LOOKUP_W1_REF", async () => {
     const lk = await lookup("S3_LOOKUP_W1_REF", ref1, r2);
     if (lk.outcome !== "found" || lk.reservation.reservationId !== w1Id) return halt("S3_LOOKUP_W1_REF", `W1_LOOKUP_NOT_CONFIRMED:${lk.code}`);
+    // Full identity, not just the id: the list item must agree with the verified create on every field.
+    const mm = identityMismatches(lk.reservation, { ...w1Expect, reservationId: w1Id, status: "new" });
+    if (mm.length) return halt("S3_LOOKUP_W1_REF", "W1_LOOKUP_IDENTITY_MISMATCH", { mismatches: mm });
     record("S3_LOOKUP_W1_REF", { code: "W1_FOUND_BY_REF", reservationId: w1Id });
   });
   await runStep("W2_CREATE_X1B_OVERLAP", () => refusalStep("W2_CREATE_X1B_OVERLAP", ref2, m.x1bOverlap));

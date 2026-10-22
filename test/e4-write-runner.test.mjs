@@ -373,6 +373,20 @@ test("halt: W1 read-back by id disagreeing with the verified create (status/tota
   }
 });
 
+test("halt: S3 lookup with matching id+ref but different total/currency/status (valid S2) => halt before W2", async () => {
+  for (const [field, value, mismatch] of [["totalPrice", 240, "totalMinor"], ["currency", "MXN", "currency"], ["status", "modified", "status"]]) {
+    const fake = fakeHostaway({ intercept: (req, i, { reservations }) => (req.method === "GET" && req.path === "/reservations" &&
+      reservations.length && req.query.afterId === undefined && req.query.arrivalStartDate === "2027-03-03"
+      ? { httpStatus: 200, json: { status: "success", result: [{ ...reservations[0], [field]: value }] } } : undefined) });
+    const { report } = await run({ fake });
+    assert.ok(report.steps.some((x) => x.step === "W1_CREATE_R2" && x.code === "W1_VERIFIED_CREATED"), field);
+    assert.ok(fake.log.some((r) => r.method === "GET" && /^\/reservations\/\d+$/.test(r.path)), `${field}: S2 read-back ran (and was valid)`);
+    assert.deepEqual([report.halt.step, report.halt.code, report.halt.mismatches], ["S3_LOOKUP_W1_REF", "W1_LOOKUP_IDENTITY_MISMATCH", [mismatch]], field);
+    assert.equal(writesOf(fake.log).length, 1, `${field}: W2 never dispatched`);
+    assert.deepEqual(report.writes, { create: 1, cancel: 0 }, field);
+  }
+});
+
 test("halt: preflight price differs from the manifest total => zero writes", async () => {
   const fake = fakeHostaway({ priceTotal: 260 });
   const { report } = await run({ fake });

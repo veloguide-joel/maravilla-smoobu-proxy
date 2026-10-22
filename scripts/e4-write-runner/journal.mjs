@@ -9,6 +9,12 @@
 //    read-only reconciliation only).
 //  - The runner's write budget is counted from these durable entries, not from in-memory counters.
 //  - Deleting the journal or choosing another directory defeats this; it is an operator-procedure control.
+//  - Residuals: the parent-directory fsync after creation is BEST EFFORT (unsupported on some OSes/filesystems;
+//    reported by dirSynced()). fsync is only as reliable as the OS, filesystem and disk. No absolute guarantee
+//    against an OS crash or power loss is claimed.
+//  - append() writes the complete UTF-8 entry with a checked loop; any short/zero/invalid progress or error fails
+//    the append (nothing is mirrored, the caller sends nothing) and permanently fails the journal. The partial file
+//    is kept as-is and reads back as JOURNAL_CORRUPT.
 // Entries are pre-sanitized by the runner (sanitizeJournalEntry); this module stores and parses JSON only.
 
 import { openSync, writeSync, fsyncSync, closeSync, readFileSync } from "node:fs";
@@ -34,6 +40,7 @@ export function createFileJournal(dir, manifestHash) {
   try { const d = openSync(dirname(path), "r"); try { fsyncSync(d); dirSynced = true; } finally { closeSync(d); } } catch { /* not supported on every OS */ }
   const mirror = [];
   let closed = false;
+  let failed = false;
   return Object.freeze({
     durable: true,
     boundHash: manifestHash,
@@ -42,10 +49,25 @@ export function createFileJournal(dir, manifestHash) {
     load: () => mirror.map((e) => JSON.parse(JSON.stringify(e))),
     append(entry) {
       if (closed) throw new JournalError("JOURNAL_CLOSED");
+      if (failed) throw new JournalError("JOURNAL_FAILED"); // an earlier append failed: the file is used/corrupt
       const line = `${JSON.stringify(entry)}\n`;
-      writeSync(fd, line);
-      fsyncSync(fd);                          // durable before the caller proceeds
-      mirror.push(JSON.parse(line));          // mirrors only what was durably written
+      const buf = Buffer.from(line, "utf8");
+      // Write the COMPLETE buffer: writeSync may write fewer bytes than asked. Any non-integer, zero, negative or
+      // out-of-range progress, or a thrown error, fails the append. The partial file is left as it is (never
+      // truncated, deleted or retried); the journal refuses all further appends.
+      try {
+        let off = 0;
+        while (off < buf.length) {
+          const n = writeSync(fd, buf, off, buf.length - off);
+          if (!Number.isSafeInteger(n) || n <= 0 || n > buf.length - off) throw new JournalError("JOURNAL_WRITE_INCOMPLETE");
+          off += n;
+        }
+        fsyncSync(fd);                        // only after the whole entry is written
+      } catch (e) {
+        failed = true;
+        throw e instanceof JournalError ? e : new JournalError("JOURNAL_WRITE_FAILED");
+      }
+      mirror.push(JSON.parse(line));          // only after a complete write AND a successful fsync
     },
     close() { if (!closed) { closed = true; closeSync(fd); } }
   });
