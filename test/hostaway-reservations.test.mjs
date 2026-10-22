@@ -271,70 +271,111 @@ test("lookup query: documented parameters, channel 2000, exact arrival, no force
   assert.equal(code(() => buildLookupQuery(SPEC, CFG, { afterId: 0 })), "CURSOR_INVALID");
 });
 
-test("lookup: one verified match on a short page is found; not found is never authoritative", async () => {
-  const p1 = pager([page([item(10), item(11, { customFieldValues: [{ customFieldId: 105433, value: "MV-E4TEST01" }] })])]);
+const MINE = Object.freeze({ customFieldValues: [{ customFieldId: 105433, value: "MV-E4TEST01" }] });
+const EMPTY = () => page([]);
+const afterIds = (calls) => calls.map((c) => c.query.afterId);
+
+test("lookup: one verified match is found only after the documented EMPTY terminal page; not found is never authoritative", async () => {
+  const p1 = pager([page([item(10), item(11, MINE)]), EMPTY()]);
   const f = await lookupByRef(SPEC, CFG, p1.fn);
-  assert.deepEqual([f.outcome, f.reservation.reservationId, f.authoritative, p1.calls.length], ["found", 11, false, 1]);
+  assert.deepEqual([f.outcome, f.reservation.reservationId, f.authoritative, f.pagesRead], ["found", 11, false, 2]);
+  assert.deepEqual(afterIds(p1.calls), [undefined, 11]);
 
-  const p2 = pager([page([item(10), item(12)])]);
+  const p2 = pager([page([item(10), item(12)]), EMPTY()]);
   const n = await lookupByRef(SPEC, CFG, p2.fn);
-  assert.deepEqual([n.outcome, n.authoritative, n.code], ["not_found", false, "NOT_FOUND_NON_AUTHORITATIVE"]);
-  const e = await lookupByRef(SPEC, CFG, pager([page([])]).fn);
-  assert.deepEqual([e.outcome, e.authoritative], ["not_found", false]);
+  assert.deepEqual([n.outcome, n.authoritative, n.code, p2.calls.length], ["not_found", false, "NOT_FOUND_NON_AUTHORITATIVE", 2]);
+  const p3 = pager([EMPTY()]);
+  const e = await lookupByRef(SPEC, CFG, p3.fn);
+  assert.deepEqual([e.outcome, e.authoritative, p3.calls.length], ["not_found", false, 1]);
 });
 
-test("lookup: paginates with the afterId cursor and stops at a short page", async () => {
-  const p = pager([page(fullPage(1)), page([item(101), item(102, { customFieldValues: [{ customFieldId: 105433, value: "MV-E4TEST01" }] })])]);
+test("lookup: a short NON-empty page is not the end — paging continues to an empty page", async () => {
+  const p = pager([page([item(10)]), page([item(20, MINE)]), EMPTY()]);
   const r = await lookupByRef(SPEC, CFG, p.fn);
-  assert.equal(r.outcome, "found");
-  assert.equal(p.calls.length, 2);
-  assert.equal(p.calls[0].query.afterId, undefined);
-  assert.equal(p.calls[1].query.afterId, 100);
+  assert.deepEqual([r.outcome, r.reservation.reservationId, p.calls.length], ["found", 20, 3]);
+  assert.deepEqual(afterIds(p.calls), [undefined, 10, 20]);
+  // Had the lookup stopped at the first short page, it would have reported "not_found": it must not.
+  const miss = pager([page([item(10)]), page([item(20, MINE)])]);       // provider stops answering after page 2
+  const r2 = await lookupByRef(SPEC, CFG, miss.fn);
+  assert.notEqual(r2.outcome, "not_found");
+  assert.equal(r2.code, "TRANSPORT_UNCERTAIN");
 });
 
-test("lookup: reaching the page cap is 'incomplete' and never asserts absence (even with a match so far)", async () => {
-  const p = pager([page(fullPage(1)), page(fullPage(101)), page(fullPage(201)), page(fullPage(301)), page(fullPage(401)), page([])]);
+test("lookup: documented descending ids (updatedOn DESC, id DESC) page correctly with the opaque last-item cursor", async () => {
+  const p = pager([page([item(500), item(400), item(300, MINE)]), page([item(200), item(100)]), EMPTY()]);
+  const r = await lookupByRef(SPEC, CFG, p.fn);
+  assert.deepEqual([r.outcome, r.reservation.reservationId], ["found", 300]);
+  assert.deepEqual(afterIds(p.calls), [undefined, 300, 100]);
+  const full = Array.from({ length: LOOKUP_PAGE_LIMIT }, (_, k) => item(1000 - k));       // 1000..901, descending
+  const p2 = pager([page(full), page([item(900, MINE)]), EMPTY()]);
+  const r2 = await lookupByRef(SPEC, CFG, p2.fn);
+  assert.deepEqual([r2.outcome, afterIds(p2.calls)], ["found", [undefined, 901, 900]]);
+});
+
+test("lookup: non-monotonic unique ids are accepted (updatedOn order need not follow ids)", async () => {
+  const p = pager([page([item(7), item(900), item(3)]), page([item(55, MINE), item(2), item(4000)]), EMPTY()]);
+  const r = await lookupByRef(SPEC, CFG, p.fn);
+  assert.deepEqual([r.outcome, r.reservation.reservationId], ["found", 55]);
+  assert.deepEqual(afterIds(p.calls), [undefined, 3, 4000]);
+  const n = await lookupByRef(SPEC, CFG, pager([page([item(9), item(1), item(5)]), page([item(8)]), EMPTY()]).fn);
+  assert.deepEqual([n.outcome, n.authoritative], ["not_found", false]);
+});
+
+test("lookup: duplicate refs are conflicts, including a second match after a short non-empty page", async () => {
+  const d = await lookupByRef(SPEC, CFG, pager([page([item(10, MINE), item(11, MINE)])]).fn);
+  assert.deepEqual([d.outcome, d.code, d.matchCount], ["conflict", "DUPLICATE_REF", 2]);
+  const p2 = pager([page([item(10, MINE)]), page([item(20, MINE)]), EMPTY()]);
+  const d2 = await lookupByRef(SPEC, CFG, p2.fn);
+  assert.deepEqual([d2.outcome, d2.code, d2.matchCount, p2.calls.length], ["conflict", "DUPLICATE_REF", 2, 2], "stops at the second match");
+  const p3 = pager([page([item(10, MINE)]), page([item(20)]), page([item(30, MINE)]), EMPTY()]);
+  const d3 = await lookupByRef(SPEC, CFG, p3.fn);
+  assert.deepEqual([d3.outcome, d3.code, p3.calls.length], ["conflict", "DUPLICATE_REF", 3]);
+  const w = await lookupByRef(SPEC, CFG, pager([page([item(10, { ...MINE, departureDate: "2027-03-13" })]), EMPTY()]).fn);
+  assert.deepEqual([w.outcome, w.code, w.mismatches], ["conflict", "MATCH_DISAGREES", ["to"]]);
+});
+
+test("lookup: the five-page cap (terminal empty page included) gives 'incomplete', never absence", async () => {
+  const fivePages = [page([item(1)]), page([item(2)]), page([item(3)]), page([item(4)]), page([item(5)]), EMPTY()];
+  const p = pager(fivePages);
   const r = await lookupByRef(SPEC, CFG, p.fn);
   assert.deepEqual([r.outcome, r.code, r.authoritative, p.calls.length], ["incomplete", "PAGE_CAP_REACHED", false, 5]);
-  const withMatch = fullPage(1); withMatch[5] = item(6, { customFieldValues: [{ customFieldId: 105433, value: "MV-E4TEST01" }] });
-  const r2 = await lookupByRef(SPEC, CFG, pager([page(withMatch)]).fn, { maxPages: 1 });
+  const four = await lookupByRef(SPEC, CFG, pager([page([item(1)]), page([item(2)]), page([item(3)]), page([item(4, MINE)]), EMPTY()]).fn);
+  assert.deepEqual([four.outcome, four.pagesRead], ["found", 5]);
+  const fullCap = pager([page(fullPage(1)), page(fullPage(101)), page(fullPage(201)), page(fullPage(301)), page(fullPage(401)), EMPTY()]);
+  assert.equal((await lookupByRef(SPEC, CFG, fullCap.fn)).outcome, "incomplete");
+  assert.equal(fullCap.calls.length, 5);
+  const r2 = await lookupByRef(SPEC, CFG, pager([page([item(6, MINE)]), EMPTY()]).fn, { maxPages: 1 });
   assert.deepEqual([r2.outcome, r2.matchCount], ["incomplete", 1]);
   await assert.rejects(lookupByRef(SPEC, CFG, p.fn, { maxPages: 6 }), (e) => e.code === "MAX_PAGES_INVALID");
   await assert.rejects(lookupByRef(SPEC, CFG, p.fn, { maxPages: 0 }), (e) => e.code === "MAX_PAGES_INVALID");
 });
 
-test("lookup: duplicate refs and disagreeing matches are conflicts", async () => {
-  const mine = { customFieldValues: [{ customFieldId: 105433, value: "MV-E4TEST01" }] };
-  const d = await lookupByRef(SPEC, CFG, pager([page([item(10, mine), item(11, mine)])]).fn);
-  assert.deepEqual([d.outcome, d.code, d.matchCount], ["conflict", "DUPLICATE_REF", 2]);
-  const d2 = await lookupByRef(SPEC, CFG, pager([page([...fullPage(1).slice(0, 99), item(100, mine)]), page([item(101, mine)])]).fn);
-  assert.deepEqual([d2.outcome, d2.code], ["conflict", "DUPLICATE_REF"]);
-  const w = await lookupByRef(SPEC, CFG, pager([page([item(10, { ...mine, departureDate: "2027-03-13" })])]).fn);
-  assert.deepEqual([w.outcome, w.code, w.mismatches], ["conflict", "MATCH_DISAGREES", ["to"]]);
-});
-
-test("lookup: errors, transport failures and malformed pages stop at once, without retries", async () => {
+test("lookup: errors, transport failures, cursor overlap and malformed pages stop at once, without retries", async () => {
   const cases = [
     [[new Error("socket hang up")], "TRANSPORT_UNCERTAIN"], [[{ transportError: "timeout" }], "TRANSPORT_UNCERTAIN"], [[null], "TRANSPORT_UNCERTAIN"],
     [[{ httpStatus: 429, json: fixture("synthetic-rate-limited.json") }], "HTTP_NOT_OK"], [[{ httpStatus: 401 }], "HTTP_NOT_OK"],
     [[{ httpStatus: 500 }], "HTTP_NOT_OK"], [[{ httpStatus: 201, json: { status: "success", result: [] } }], "HTTP_NOT_OK"],
+    [[page([item(1)]), { httpStatus: 503 }], "HTTP_NOT_OK"],
     [[{ httpStatus: 200, json: fixture("synthetic-fail-envelope.json") }], "FAIL_ENVELOPE"],
     [[{ httpStatus: 200, json: { status: "success", result: {} } }], "MALFORMED_PAGE"],
     [[page([item(10, { totalPrice: "x" })])], "ITEM_AMOUNT_NOT_EXACT"],
+    [[page([item(10, { status: "booked by a@example.invalid" })])], "ITEM_STATUS_INVALID"],
     [[page([item(10, { customFieldValues: [{ customFieldId: 105433, value: "a" }, { customFieldId: 105433, value: "b" }] })])], "ITEM_REF_FIELD_DUPLICATED"],
-    [[page([item(10), item(10)])], "CURSOR_OVERLAP"], [[page([item(11), item(10)])], "CURSOR_NOT_ADVANCING"],
-    [[page(fullPage(1)), page([item(50)])], "CURSOR_OVERLAP"], [[page(fullPage(1)), page([item(99999), item(500)])], "CURSOR_NOT_ADVANCING"],
+    [[page([item(10), item(10)])], "CURSOR_OVERLAP"],                                  // repeat within a page
+    [[page([item(10)]), page([item(10)])], "CURSOR_OVERLAP"],                          // cursor item returned again
+    [[page(fullPage(1)), page([item(50)])], "CURSOR_OVERLAP"],                         // earlier item shifted into a later page
+    [[page([item(30), item(20)]), page([item(5), item(30)])], "CURSOR_OVERLAP"],
     [[page([...fullPage(1), item(101)])], "PAGE_OVER_LIMIT"],
     [[page([item(10, { listingMapId: 603564 })])], "FILTER_NOT_APPLIED"], [[page([item(10, { channelId: 2001 })])], "FILTER_NOT_APPLIED"],
     [[page([item(10, { arrivalDate: "2027-03-09" })])], "FILTER_NOT_APPLIED"]
   ];
   for (const [pages, want] of cases) {
-    const p = pager(pages);
+    const p = pager([...pages, EMPTY()]);
     const r = await lookupByRef(SPEC, CFG, p.fn);
     assert.equal(r.outcome, "error", want);
     assert.equal(r.code, want);
     assert.equal(r.authoritative, false);
-    assert.equal(p.calls.length, pages.length, `${want}: one call per page, no retry`);
+    assert.equal(p.calls.length, pages.length, `${want}: one call per page, no retry, nothing after the stop`);
   }
   await assert.rejects(lookupByRef(SPEC, CFG, null), (e) => e.code === "FETCH_PAGE_REQUIRED");
   await assert.rejects(lookupByRef({ ...SPEC, listingId: 603566 }, CFG, async () => page([])), (e) => e.code === "PILOT_LISTING_FORBIDDEN");
@@ -345,8 +386,103 @@ test("evidence: only allowlisted keys survive; guest data is dropped", () => {
   const c = classifyCreateResponse({ httpStatus: 200, json: SUCCESS }, plan(), CFG);
   const ev = sanitizeForEvidence({ ...c, guestEmail: "x@example.invalid", token: "secret", reservation: { ...c.reservation, guestName: "Synthetic Tester" } });
   assert.deepEqual(Object.keys(ev).sort(), ["code", "definiteRefusal", "httpStatus", "outcome", "reservation"]);
+  assert.deepEqual(ev.reservation, { reservationId: 70000001, listingId: 990001, from: "2027-03-10", to: "2027-03-12", totalMinor: 20000,
+    currency: "USD", channelId: 2000, status: "new", bookingRef: "MV-E4TEST01" });
   assert.ok(!/example\.invalid|secret|Synthetic/.test(JSON.stringify(ev)));
   assert.deepEqual(sanitizeForEvidence(null), {});
+  assert.deepEqual(sanitizeForEvidence([{ outcome: "created" }]), {});
+});
+
+test("evidence (adversarial): allowlisted key NAMES with hostile VALUES are omitted, never copied", () => {
+  const SECRET = /secret|tok_|@|example|Synthetic|\+52|http/i;
+  const hostile = {
+    outcome: "created; guest=a@example.invalid", code: "VERIFIED_CREATED\nguestEmail: a@example.invalid", httpStatus: "200",
+    candidateCode: "HTTP_409 contact a@example.invalid", definiteRefusal: true, authoritative: true,
+    matchCount: -1, pagesRead: 6, reservationId: { token: "secret" },
+    status: { token: "secret" },
+    mismatches: [{ guestEmail: "a@example.invalid" }, "listingId", "guestEmail", "listingId", ["from"], "to"],
+    reservation: {
+      reservationId: "70000001", listingId: 0, from: "2027-02-30", to: { secret: "x" }, totalMinor: 100.5, currency: "usd ",
+      channelId: -2000, status: "new — call +52 555 0100", bookingRef: { secret: "tok_abc" }, guestName: "Synthetic Tester"
+    },
+    extra: { nested: { token: "secret" } }
+  };
+  const ev = sanitizeForEvidence(hostile);
+  assert.deepEqual(ev, { mismatches: ["listingId", "to"] });
+  assert.doesNotMatch(JSON.stringify(ev), SECRET);
+
+  // Each example from the review, one at a time.
+  assert.deepEqual(sanitizeForEvidence({ outcome: "conflict", status: { token: "secret" } }), { outcome: "conflict" });
+  assert.deepEqual(sanitizeForEvidence({ outcome: "conflict", mismatches: [{ guestEmail: "a@example.invalid" }] }), { outcome: "conflict" });
+  assert.deepEqual(sanitizeForEvidence({ outcome: "found", reservation: { bookingRef: { secret: "tok_abc" } } }), { outcome: "found" });
+  assert.deepEqual(sanitizeForEvidence({ reservation: { bookingRef: "MV-E4TEST01 a@example.invalid" } }), {});
+  assert.deepEqual(sanitizeForEvidence({ code: "SOMETHING_NEW" }), {});
+  assert.deepEqual(sanitizeForEvidence({ candidateCode: "HTTP_999" }), {});
+  assert.deepEqual(sanitizeForEvidence({ matchCount: 501, pagesRead: 1.5 }), {});
+});
+
+test("evidence (adversarial): arbitrary provider status strings never reach a result or evidence", () => {
+  const raw = ["confirmed by a@example.invalid", "new ", "NEW", "call +52 555 0100", "x".repeat(5000), ""];
+  for (const s of raw) {
+    assert.equal(normalizeReservation({ ...SUCCESS.result, status: s }, CFG).code, "STATUS_INVALID");
+    const c = classifyCreateResponse({ httpStatus: 200, json: success({ status: s }) }, plan(), CFG);
+    assert.deepEqual([c.outcome, c.code], ["ambiguous", "STATUS_INVALID"]);
+    assert.ok(!JSON.stringify(c).includes(s || "\u0000"), "no raw status in the result");
+    assert.equal(sanitizeForEvidence({ status: s, reservation: { status: s } }).status, undefined);
+  }
+  for (const s of ["cancelled", "pending", "inquiry"]) {   // documented enum values only
+    const c = classifyCreateResponse({ httpStatus: 200, json: success({ status: s }) }, plan(), CFG);
+    assert.equal(sanitizeForEvidence(c).status, s, "a documented enum value is kept as evidence");
+    assert.equal(c.code, "UNEXPECTED_RESERVATION_STATUS");
+  }
+});
+
+test("evidence: output is freshly allocated; the caller's input stays mutable and unmodified", () => {
+  const input = {
+    outcome: "conflict", code: "RESERVATION_MISMATCH", mismatches: ["totalMinor"], extra: { a: 1 },
+    reservation: { reservationId: 5, listingId: 990001, from: "2027-03-10", to: "2027-03-12", totalMinor: 1, currency: "USD", channelId: 2000,
+      status: "new", bookingRef: "MV-E4TEST01", nested: { b: 2 } }
+  };
+  const snapshot = structuredClone(input);
+  const ev = sanitizeForEvidence(input);
+  assert.deepEqual(input, snapshot, "input unmodified");
+  for (const o of [input, input.mismatches, input.reservation, input.reservation.nested, input.extra]) assert.equal(Object.isFrozen(o), false);
+  assert.notEqual(ev.reservation, input.reservation);
+  assert.notEqual(ev.mismatches, input.mismatches);
+  input.reservation.totalMinor = 2; input.mismatches.push("to"); input.extra.a = 3;   // still mutable
+  assert.equal(ev.reservation.totalMinor, 1);
+  assert.deepEqual(ev.mismatches, ["totalMinor"]);
+  assert.ok(Object.isFrozen(ev) && Object.isFrozen(ev.reservation) && Object.isFrozen(ev.mismatches));
+
+  // Classification and lookup do not freeze caller-owned response bodies either.
+  const json = structuredClone(SUCCESS);
+  classifyCreateResponse({ httpStatus: 200, json }, plan(), CFG);
+  assert.equal(Object.isFrozen(json) || Object.isFrozen(json.result) || Object.isFrozen(json.result.customFieldValues), false);
+  assert.deepEqual(json, SUCCESS);
+});
+
+test("evidence: every code and outcome the module actually emits survives sanitisation unchanged", async () => {
+  const results = [];
+  for (let s = 100; s <= 599; s += 1) for (const json of [SUCCESS, fixture("synthetic-fail-envelope.json"), null]) {
+    results.push(classifyCreateResponse({ httpStatus: s, json }, plan(), CFG));
+  }
+  for (const over of [{ listingMapId: 990002 }, { status: "cancelled" }, { status: "bogus" }, { totalPrice: 1.001 }, { id: 0 }]) {
+    results.push(classifyCreateResponse({ httpStatus: 200, json: success(over) }, plan(), CFG));
+  }
+  results.push(classifyCreateResponse({ transportError: true }, plan(), CFG), classifyCreateResponse(null, plan(), CFG));
+  const mine = { customFieldValues: [{ customFieldId: 105433, value: "MV-E4TEST01" }] };
+  for (const pages of [[page([item(10, mine)]), page([])], [page([item(10)]), page([])], [page([item(10, mine), item(11, mine)])],
+    [page([item(10, { status: "zzz" })])], [page([item(10), item(10)])], [{ httpStatus: 500 }],
+    [page([item(10, { ...mine, departureDate: "2027-03-13" })]), page([])], [page([item(1)]), page([item(2)]), page([item(3)]), page([item(4)]), page([item(5)])]]) {
+    results.push(await lookupByRef(SPEC, CFG, pager(pages).fn));
+  }
+  for (const r of results) {
+    const ev = sanitizeForEvidence(r);
+    assert.equal(ev.outcome, r.outcome, JSON.stringify(r));
+    assert.equal(ev.code, r.code, JSON.stringify(r));
+    if (r.mismatches) assert.deepEqual(ev.mismatches, r.mismatches);
+    if (r.reservation) assert.deepEqual(ev.reservation, { ...r.reservation });
+  }
 });
 
 // ---------- provenance and containment ----------
@@ -355,6 +491,9 @@ test("mapping: every response/lookup assumption not stated in the docs is labell
   for (const k of ["envelope", "totalMinor", "status", "bookingRef"]) assert.match(HOSTAWAY_RESERVATION_MAPPING.response[k], /LIVE-UNVERIFIED/, k);
   assert.match(HOSTAWAY_RESERVATION_MAPPING.request.customFieldValues, /PROVISIONAL/);
   assert.match(HOSTAWAY_RESERVATION_MAPPING.errors.refusal, /never classified as definite/);
+  assert.match(HOSTAWAY_RESERVATION_MAPPING.lookup.pagination, /EMPTY page/);
+  assert.match(HOSTAWAY_RESERVATION_MAPPING.lookup.pagination, /updatedOn DESC, id DESC/);
+  assert.doesNotMatch(HOSTAWAY_RESERVATION_MAPPING.lookup.pagination, /short page|increasing/);
   assert.ok(s.includes("financeField") && s.includes("not built"));
   assert.equal(DIRECT_CHANNEL_ID, 2000);
 });
