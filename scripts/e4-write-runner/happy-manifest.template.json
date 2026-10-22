@@ -1,0 +1,12 @@
+{
+  "manifestVersion": "e4-happy-manifest-v1",
+  "listingId": 606998,
+  "refFieldId": 105433,
+  "currency": "USD",
+  "nightlyMinor": 10000,
+  "cleaningFeeMinor": 5000,
+  "guests": 2,
+  "window": "<OWNER_INPUT>",
+  "stay": "<OWNER_INPUT>",
+  "guest": "<OWNER_INPUT>"
+}

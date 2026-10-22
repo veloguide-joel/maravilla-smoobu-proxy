@@ -516,5 +516,5 @@ test("containment: the adapter is pure and unreachable — no imports, network, 
   };
   for (const d of ["api", "lib", "db", "scripts"]) walk(d);
   // The only importer is the offline E4 write runner under scripts/ (excluded from Vercel; no transport, no env).
-  assert.deepEqual(importers, ["scripts/e4-write-runner/runner.mjs"], "nothing deployable references the adapter");
+  assert.deepEqual(importers.sort(), ["scripts/e4-write-runner/happy-path.mjs", "scripts/e4-write-runner/runner.mjs"], "nothing deployable references the adapter");
 });

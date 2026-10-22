@@ -56,8 +56,8 @@ export const MAX_WINDOW_NIGHTS = 31;
 export const MAX_STAY_NIGHTS = 7;
 export const DEFAULT_TIMEOUT_MS = 15000;
 export const EXECUTION_WIRED = false;           // no real transport exists on this branch
-const CANCEL_BODY = Object.freeze({ cancelledBy: "host" });
-const READ_QUERY = Object.freeze({ includeResources: 1 });
+export const CANCEL_BODY = Object.freeze({ cancelledBy: "host" });
+export const READ_QUERY = Object.freeze({ includeResources: 1 });
 
 export const ADAPTER_CFG = Object.freeze({
   allowedListingIds: Object.freeze([E4_TEST_LISTING_ID]), refFieldId: E4_REF_FIELD_ID, channelId: DIRECT_CHANNEL_ID, currency: E4_CURRENCY
@@ -134,7 +134,7 @@ const FIXED = Object.freeze({ manifestVersion: MANIFEST_VERSION, refFieldId: E4_
 
 export const expectedTotalMinor = (stay) => nightsBetween(stay.arrivalDate, stay.departureDate) * E4_NIGHTLY_MINOR + E4_CLEANING_FEE_MINOR;
 
-function planFor(m, stay, ref) {
+export function planFor(m, stay, ref) {
   return { ref, listingId: E4_TEST_LISTING_ID, arrivalDate: stay.arrivalDate, departureDate: stay.departureDate, guests: m.guests,
     guest: { ...m.guest }, totalMinor: expectedTotalMinor(stay), currency: E4_CURRENCY };
 }
@@ -245,10 +245,13 @@ const JOURNAL_FIELDS = Object.freeze({
   mismatches: (v) => Array.isArray(v) && v.length <= IDENTITY_FIELDS.length && v.every((f) => IDENTITY_FIELDS.includes(f)),
   status: (v) => typeof v === "string" && /^[A-Z_]{1,40}$/.test(v)
 });
-export function sanitizeJournalEntry(entry) {
+export function sanitizeJournalEntry(entry, { steps = STEP_BUDGETS } = {}) {
   const out = {};
   if (!isObj(entry)) return Object.freeze(out);
-  for (const [k, ok] of Object.entries(JOURNAL_FIELDS)) if (Object.prototype.hasOwnProperty.call(entry, k) && ok(entry[k])) out[k] = entry[k];
+  for (const [k, ok] of Object.entries(JOURNAL_FIELDS)) {
+    const valid = k === "step" ? (v) => Object.prototype.hasOwnProperty.call(steps, v) : ok; // step names of the calling sequence
+    if (Object.prototype.hasOwnProperty.call(entry, k) && valid(entry[k])) out[k] = entry[k];
+  }
   if (isObj(entry.evidence)) out.evidence = sanitizeForEvidence(entry.evidence);
   return deepFreeze(out);
 }
@@ -295,19 +298,19 @@ const normalizeTransportResult = (r) => {
   return { httpStatus: r.httpStatus, json: r.json };
 };
 
-async function withTimeout(promiseFactory, timeoutMs, onTimeout) {
+export async function withTimeout(promiseFactory, timeoutMs, onTimeout) {
   let timer;
   const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve(onTimeout), timeoutMs); });
   try { return await Promise.race([Promise.resolve().then(promiseFactory), timeout]); } finally { clearTimeout(timer); }
 }
 
-export function createGate({ transport, journal, timeoutMs, state }) {
+export function createGate({ transport, journal, timeoutMs, state, budgets = STEP_BUDGETS, writeBudget = WRITE_BUDGET }) {
   const reads = new Map();
   const writes = new Map();
   let requests = 0;
   const journalWrites = (kind) => journal.load().filter((e) => e.type === "intent" && e.kind === kind).length;
   async function send(step, req, { writeKind = null, intent = null } = {}) {
-    const budget = STEP_BUDGETS[step];
+    const budget = Object.prototype.hasOwnProperty.call(budgets, step) ? budgets[step] : undefined;
     if (!budget) throw new RunnerError("STEP_UNKNOWN");
     assertAllowedRequest(req, state, writeKind);
     if (writeKind) {
@@ -316,10 +319,10 @@ export function createGate({ transport, journal, timeoutMs, state }) {
       if (budget.kind !== writeKind) throw new RunnerError("STEP_KIND_MISMATCH");
       if (budget.executable !== true) throw new RunnerError("STEP_NOT_EXECUTABLE");
       if ((writes.get(step) ?? 0) >= budget.writes) throw new RunnerError("STEP_WRITE_BUDGET_EXHAUSTED");
-      if (journalWrites(writeKind) >= WRITE_BUDGET[writeKind]) throw new RunnerError("RUN_WRITE_BUDGET_EXHAUSTED");
+      if (journalWrites(writeKind) >= writeBudget[writeKind]) throw new RunnerError("RUN_WRITE_BUDGET_EXHAUSTED");
       if (!isObj(intent)) throw new RunnerError("INTENT_REQUIRED");
       writes.set(step, (writes.get(step) ?? 0) + 1);
-      try { journal.append(sanitizeJournalEntry({ ...intent, type: "intent", step, kind: writeKind })); } // write-ahead, durable
+      try { journal.append(sanitizeJournalEntry({ ...intent, type: "intent", step, kind: writeKind }, { steps: budgets })); } // write-ahead, durable
       catch { state.halted = true; throw new RunnerError("JOURNAL_WRITE_FAILED"); }                  // nothing sent
     } else {
       if ((reads.get(step) ?? 0) >= budget.reads) throw new RunnerError("STEP_READ_BUDGET_EXHAUSTED");
@@ -337,7 +340,7 @@ export function createGate({ transport, journal, timeoutMs, state }) {
 // ---------------------------------------------------------------------------------------------
 // 5. Response interpretation not covered by the adapter
 
-function parsePriceTotal(resp) {
+export function parsePriceTotal(resp) {
   if (resp.transportError) return { ok: false, code: resp.code === "TIMEOUT" ? "PRICE_TIMEOUT" : "PRICE_TRANSPORT_UNCERTAIN" };
   if (resp.httpStatus !== 200) return { ok: false, code: "PRICE_HTTP_NOT_OK" };
   const env = unwrapEnvelope(resp.json);
@@ -346,7 +349,7 @@ function parsePriceTotal(resp) {
   return t === null ? { ok: false, code: "PRICE_TOTAL_NOT_EXACT" } : { ok: true, totalMinor: t };
 }
 
-function parseReservationResponse(resp, prefix) {
+export function parseReservationResponse(resp, prefix) {
   if (resp.transportError) return { ok: false, code: `${prefix}_TRANSPORT_UNCERTAIN`, transport: resp.code };
   const s = resp.httpStatus;
   if (!Number.isSafeInteger(s) || s < 100 || s > 599) return { ok: false, code: `${prefix}_NO_HTTP_STATUS` };
@@ -576,14 +579,14 @@ export async function executeRun(opts = {}) {
 }
 
 /** Read-only reconciliation of create attempts: read-by-id when an id is known, plus the bounded ref lookup. */
-async function reconcileAttempts(gate, attempts, cfg, append) {
+export async function reconcileAttempts(gate, attempts, cfg, append, step = "R_RECONCILE") {
   const out = [];
   for (const a of attempts) {
-    const item = { step: "R_RECONCILE", ref: a.ref };
+    const item = { step, ref: a.ref };
     if (a.reservationId) {
       item.reservationId = a.reservationId;
       try {
-        const resp = await gate.send("R_RECONCILE", { method: "GET", path: `/reservations/${a.reservationId}`, query: READ_QUERY });
+        const resp = await gate.send(step, { method: "GET", path: `/reservations/${a.reservationId}`, query: READ_QUERY });
         const p = parseReservationResponse(resp, "READ");
         item.readCode = p.ok ? "READ_OK" : p.code;
         if (p.ok) item.reservationStatus = p.reservation.status; // documented enum only (adapter normalizeReservation)
@@ -591,11 +594,11 @@ async function reconcileAttempts(gate, attempts, cfg, append) {
     }
     try {
       const r = await lookupByRef({ ref: a.ref, listingId: E4_TEST_LISTING_ID, arrivalDate: a.stay.arrivalDate, departureDate: a.stay.departureDate },
-        cfg, (req) => gate.send("R_RECONCILE", req));
+        cfg, (req) => gate.send(step, req));
       item.lookupCode = r.code;
       if (r.reservation) item.foundReservationId = r.reservation.reservationId;
     } catch (e) { item.lookupCode = e instanceof RunnerError ? e.code : "INTERNAL_ERROR"; }
-    append({ type: "reconcile", step: "R_RECONCILE", ref: a.ref, code: item.lookupCode,
+    append({ type: "reconcile", step, ref: a.ref, code: item.lookupCode,
       ...(item.reservationId ? { reservationId: item.reservationId } : {}) });
     out.push(deepFreeze(item));
   }
