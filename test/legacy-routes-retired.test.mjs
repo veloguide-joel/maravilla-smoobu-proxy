@@ -67,6 +67,7 @@ const EXPECTED_API_FILES = Object.freeze([
   "api/booking/quote.js",
   "api/health.js",
   "api/hostaway/calendar.js",
+  "api/hostaway/e4-check.js",
   "api/hostaway/listing.js",
   "api/hostaway/listings.js",
   "api/hostaway/quote.js"

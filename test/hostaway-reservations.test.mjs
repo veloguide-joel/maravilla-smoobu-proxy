@@ -516,5 +516,6 @@ test("containment: the adapter is pure and unreachable — no imports, network, 
   };
   for (const d of ["api", "lib", "db", "scripts"]) walk(d);
   // E4 read-only CLI (scripts/, excluded from deployment by .vercelignore) reuses the pure amount/date helpers only.
-  assert.deepEqual(importers, ["scripts/hostaway-readonly-check.mjs"], "nothing deployable references the adapter");
+  // E4 read-only route branch: the pure checks module (lib/, bundled only by api/hostaway/e4-check.js) uses the same helpers.
+  assert.deepEqual(importers.sort(), ["lib/e4-readonly-checks.js", "scripts/hostaway-readonly-check.mjs"], "only the reviewed read-only callers reference the adapter");
 });
