@@ -1,0 +1,26 @@
+{
+  "status": "success",
+  "result": {
+    "id": 70000001,
+    "hostawayReservationId": 70000001,
+    "listingMapId": 990001,
+    "channelId": 2000,
+    "channelName": "direct",
+    "reservationId": "70000001",
+    "guestName": "Synthetic Tester",
+    "guestFirstName": "Synthetic",
+    "guestLastName": "Tester",
+    "guestEmail": "e4-synthetic@example.invalid",
+    "numberOfGuests": 2,
+    "arrivalDate": "2027-03-10",
+    "departureDate": "2027-03-12",
+    "nights": 2,
+    "totalPrice": 200,
+    "currency": "USD",
+    "status": "new",
+    "customFieldValues": [
+      { "customFieldId": 105433, "value": "MV-E4TEST01" },
+      { "customFieldId": 999, "value": "unrelated field" }
+    ]
+  }
+}
