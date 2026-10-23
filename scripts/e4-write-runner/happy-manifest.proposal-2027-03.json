@@ -1,0 +1,12 @@
+{
+  "manifestVersion": "e4-happy-manifest-v1",
+  "listingId": 606998,
+  "refFieldId": 105433,
+  "currency": "USD",
+  "nightlyMinor": 10000,
+  "cleaningFeeMinor": 5000,
+  "guests": 2,
+  "window": { "start": "2027-03-08", "end": "2027-03-15" },
+  "stay": { "arrivalDate": "2027-03-10", "departureDate": "2027-03-12" },
+  "guest": "<OWNER_INPUT>"
+}
