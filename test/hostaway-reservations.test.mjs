@@ -145,6 +145,33 @@ test("normaliser: malformed or inconsistent reservations fail closed", () => {
   assert.equal(normalizeReservation(null, CFG).code, "MALFORMED_RESERVATION");
 });
 
+test("normaliser: hostawayReservationId alias — identical int or exactly String(id) accepted; everything else inconsistent", () => {
+  const r = SUCCESS.result; // id 70000001 (synthetic)
+  for (const over of [{ hostawayReservationId: 70000001 }, { hostawayReservationId: "70000001" }, { hostawayReservationId: undefined }]) {
+    const n = normalizeReservation({ ...r, ...over }, CFG);
+    assert.equal(n.ok, true, JSON.stringify(over));
+    assert.equal(n.reservation.reservationId, 70000001);
+  }
+  const { hostawayReservationId: _drop, ...noAlias } = r;
+  assert.equal(normalizeReservation(noAlias, CFG).ok, true, "absent alias accepted (unchanged)");
+  for (const bad of [null, "", " ", " 70000001", "70000001 ", "\t70000001", "070000001", "+70000001", "-70000001", "7.0000001e7", "70000001.0",
+    "70000001n", "0x42C1D81", "70000002", 70000002, 70000001.5, "9007199254740993", 9007199254740993, true, false, [70000001], ["70000001"], {}, { id: 70000001 }]) {
+    assert.equal(normalizeReservation({ ...r, hostawayReservationId: bad }, CFG).code, "RESERVATION_ID_INCONSISTENT", JSON.stringify(bad) ?? String(bad));
+  }
+  // id itself must still be a positive safe integer; a string id is never rescued by a matching alias.
+  assert.equal(normalizeReservation({ ...r, id: "70000001", hostawayReservationId: "70000001" }, CFG).code, "RESERVATION_ID_INVALID");
+  assert.equal(normalizeReservation({ ...r, id: 9007199254740992, hostawayReservationId: "9007199254740992" }, CFG).code, "RESERVATION_ID_INVALID");
+});
+
+test("classify: a create reply carrying the String(id) alias is VERIFIED_CREATED; a different alias stays ambiguous with no id", () => {
+  const ok = classifyCreateResponse({ httpStatus: 200, json: success({ hostawayReservationId: "70000001" }) }, plan(), CFG);
+  assert.deepEqual([ok.outcome, ok.code, ok.reservation.reservationId], ["created", "VERIFIED_CREATED", 70000001]);
+  for (const bad of ["70000002", null, "070000001", " 70000001"]) {
+    const c = classifyCreateResponse({ httpStatus: 200, json: success({ hostawayReservationId: bad }) }, plan(), CFG);
+    assert.deepEqual([c.outcome, c.code, c.reservationId, c.reservation], ["ambiguous", "RESERVATION_ID_INCONSISTENT", undefined, undefined], String(bad));
+  }
+});
+
 test("normaliser: the ref is read ONLY from the configured field id (string ids and other fields do not count)", () => {
   const r = SUCCESS.result;
   assert.equal(normalizeReservation({ ...r, customFieldValues: [{ customFieldId: "105433", value: "MV-E4TEST01" }] }, CFG).reservation.bookingRef, null);
@@ -287,6 +314,19 @@ test("lookup: one verified match is found only after the documented EMPTY termin
   const p3 = pager([EMPTY()]);
   const e = await lookupByRef(SPEC, CFG, p3.fn);
   assert.deepEqual([e.outcome, e.authoritative, p3.calls.length], ["not_found", false, 1]);
+});
+
+test("lookup: items carrying the String(id) alias page and match normally; a different alias still stops the lookup", async () => {
+  const str = (id, over = {}) => item(id, { hostawayReservationId: String(id), ...over });
+  const p1 = pager([page([str(10), str(11, MINE)]), EMPTY()]);
+  const f = await lookupByRef(SPEC, CFG, p1.fn);
+  assert.deepEqual([f.outcome, f.code, f.reservation.reservationId], ["found", "FOUND_BY_REF", 11]);
+  assert.deepEqual(afterIds(p1.calls), [undefined, 11]);
+  for (const bad of ["12", null, "011"]) {
+    const p2 = pager([page([str(10), item(11, { ...MINE, hostawayReservationId: bad })]), EMPTY()]);
+    const e = await lookupByRef(SPEC, CFG, p2.fn);
+    assert.deepEqual([e.outcome, e.code, p2.calls.length], ["error", "ITEM_RESERVATION_ID_INCONSISTENT", 1], String(bad));
+  }
 });
 
 test("lookup: a short NON-empty page is not the end — paging continues to an empty page", async () => {
@@ -489,6 +529,9 @@ test("evidence: every code and outcome the module actually emits survives saniti
 test("mapping: every response/lookup assumption not stated in the docs is labelled LIVE-UNVERIFIED; the field id is provisional", () => {
   const s = JSON.stringify(HOSTAWAY_RESERVATION_MAPPING);
   for (const k of ["envelope", "totalMinor", "status", "bookingRef"]) assert.match(HOSTAWAY_RESERVATION_MAPPING.response[k], /LIVE-UNVERIFIED/, k);
+  assert.match(HOSTAWAY_RESERVATION_MAPPING.response.reservationId, /documented int/);
+  assert.match(HOSTAWAY_RESERVATION_MAPPING.response.reservationId, /owner-observed live GET/);
+  assert.match(HOSTAWAY_RESERVATION_MAPPING.response.reservationId, /String\(id\)/);
   assert.match(HOSTAWAY_RESERVATION_MAPPING.request.customFieldValues, /PROVISIONAL/);
   assert.match(HOSTAWAY_RESERVATION_MAPPING.errors.refusal, /never classified as definite/);
   assert.match(HOSTAWAY_RESERVATION_MAPPING.lookup.pagination, /EMPTY page/);

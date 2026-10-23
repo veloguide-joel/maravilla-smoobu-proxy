@@ -24,7 +24,7 @@ const manifest = (over = {}) => ({ ...JSON.parse(JSON.stringify(MANIFEST)), ...o
 const tmp = () => mkdtempSync(join(tmpdir(), "e4-happy-"));
 const SILENT = async () => ({ signals: [] });
 
-function fakeHostaway({ intercept } = {}) {
+function fakeHostaway({ intercept, alias } = {}) {
   const reservations = [];
   const log = [];
   let nextId = 8000001;
@@ -48,6 +48,7 @@ function fakeHostaway({ intercept } = {}) {
       const b = req.body;
       const r = { id: nextId++, listingMapId: b.listingMapId, channelId: b.channelId, arrivalDate: b.arrivalDate, departureDate: b.departureDate,
         totalPrice: b.totalPrice, currency: b.currency, status: "new", guestName: b.guestName, guestEmail: b.guestEmail, customFieldValues: b.customFieldValues };
+      if (alias) r.hostawayReservationId = alias(r.id); // optional id alias on every later reply of this reservation (synthetic)
       reservations.push(r);
       return ok(r);
     }
@@ -167,6 +168,35 @@ test("execute (fake): create -> verify -> cancel the SAME verified id; exactly 1
   for (const s of ["HW1_CREATE", "HW2_CANCEL"]) assert.ok(steps.indexOf(`intent:${s}`) > -1 && steps.indexOf(`intent:${s}`) < steps.indexOf(`outcome:${s}`), s);
   for (const x of [GUEST.firstName, GUEST.lastName, GUEST.email, "guestName", "guestEmail"]) assert.ok(!journalText.includes(x), x);
   assert.ok(fake.log.every((r) => r.method !== "DELETE" && !JSON.stringify(r).toLowerCase().includes("forceoverbooking")));
+});
+
+test("execute (fake, string alias): every reply carries hostawayReservationId = String(id) => COMPLETED, probe scoped to the created id", async () => {
+  for (const alias of [(id) => String(id), (id) => id]) {
+    const seen = [];
+    const probe = async (input) => { seen.push([input.step, [...input.reservationIds]]); return { signals: [] }; };
+    const fake = fakeHostaway({ alias });
+    const { report } = await run({ fake, probe });
+    const id = fake.reservations[0].id;
+    assert.equal(fake.reservations[0].hostawayReservationId, alias(id));
+    assert.deepEqual([report.status, report.writes, report.halt], ["COMPLETED", { create: 1, cancel: 1 }, null]);
+    assert.deepEqual(report.steps.map((x) => x.code), ["PRICE_MATCHES_MANIFEST", "NO_ITEMS_SEEN_NON_AUTHORITATIVE", "VERIFIED_CREATED", "VERIFIED_CANCELLED"]);
+    assert.deepEqual(seen, [["HW1_CREATE", [id]], ["HW2_CANCEL", [id]]]);
+    assert.deepEqual(writesOf(fake.log).map((r) => `${r.method} ${r.path}`), ["POST /reservations", `PUT /reservations/${id}/statuses/cancelled`]);
+    assert.equal(fake.reservations[0].status, "cancelled");
+  }
+});
+
+test("execute (fake, bad alias): a different/non-canonical/null alias still halts at HW1 with no cancel and no readable id", async () => {
+  for (const alias of [(id) => String(id + 1), (id) => `0${id}`, () => null, (id) => ` ${id}`]) {
+    const seen = [];
+    const probe = async (input) => { seen.push([...input.reservationIds]); return { signals: [] }; };
+    const fake = fakeHostaway({ alias });
+    const { report } = await run({ fake, probe });
+    assert.deepEqual([report.status, report.halt.step, report.halt.code, report.writes], ["HALTED", "HW1_CREATE", "CREATE_NOT_VERIFIED:RESERVATION_ID_INCONSISTENT", { create: 1, cancel: 0 }]);
+    assert.deepEqual(seen, [[]]);
+    assert.equal(puts(fake.log).length, 0);
+    assert.equal(report.reconcile[0].lookupCode, "ITEM_RESERVATION_ID_INCONSISTENT");
+  }
 });
 
 // ---------- create-side halts: never a cancel ----------
