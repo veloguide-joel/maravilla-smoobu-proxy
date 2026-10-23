@@ -83,8 +83,14 @@ const addDays = (d, n) => new Date(Date.parse(`${d}T00:00:00Z`) + n * 86400000).
 
 // ---------------------------------------------------------------------------------------------
 // Manifest: fixed listing/prices/currency/guests; owner inputs = window, stay, synthetic guest.
+// Optional `attempt` (integer 2..MAX_ATTEMPT): an explicit retry of the SAME business manifest. Absent = attempt 1, and
+// the hash is exactly what it was before this field existed (so an original manifest keeps its hash, token and journal,
+// and its replay refusal). Present: the hash covers it, and the prior attempts' hashes are derived from the identical
+// business fields, so a prior journal can only match a run of exactly the same listing/guest/stay/price/window.
 
 const KEYS = ["manifestVersion", "listingId", "refFieldId", "currency", "nightlyMinor", "cleaningFeeMinor", "guests", "window", "stay", "guest"];
+export const MAX_ATTEMPT = 9;
+const hashOf = (o) => createHash("sha256").update(canonical(o)).digest("hex");
 const FIXED = Object.freeze({ manifestVersion: HAPPY_MANIFEST_VERSION, refFieldId: E4_REF_FIELD_ID, nightlyMinor: E4_NIGHTLY_MINOR,
   cleaningFeeMinor: E4_CLEANING_FEE_MINOR, guests: E4_GUESTS });
 
@@ -93,7 +99,7 @@ export function validateHappyManifest(input, { now } = {}) {
   if (typeof now !== "function") return fail(["CLOCK_REQUIRED"]);
   if (!isObj(input)) return fail(["MANIFEST_NOT_OBJECT"]);
   const errors = [];
-  for (const k of Object.keys(input)) if (!KEYS.includes(k)) errors.push(`UNKNOWN_FIELD:${k}`);
+  for (const k of Object.keys(input)) if (!KEYS.includes(k) && k !== "attempt") errors.push(`UNKNOWN_FIELD:${k}`);
   for (const k of KEYS) if (!Object.prototype.hasOwnProperty.call(input, k)) errors.push(`MISSING_FIELD:${k}`);
   if (hasKeyCI(input, "forceoverbooking")) errors.push("FORCE_OVERBOOKING_REFUSED");
   if (errors.length) return fail(errors);
@@ -102,6 +108,8 @@ export function validateHappyManifest(input, { now } = {}) {
   const m = JSON.parse(JSON.stringify(input));
   if (m.listingId !== E4_TEST_LISTING_ID) errors.push(FORBIDDEN_PILOT_LISTING_IDS.includes(m.listingId) ? "PILOT_LISTING_FORBIDDEN" : "LISTING_NOT_E4_TEST");
   if (m.currency !== E4_CURRENCY) errors.push("CURRENCY_NOT_USD");
+  const hasAttempt = Object.prototype.hasOwnProperty.call(m, "attempt");
+  if (hasAttempt && !(Number.isSafeInteger(m.attempt) && m.attempt >= 2 && m.attempt <= MAX_ATTEMPT)) errors.push("ATTEMPT_INVALID");
   for (const [k, v] of Object.entries(FIXED)) if (m[k] !== v) errors.push(`FIXED_VALUE_MISMATCH:${k}`);
   const range = (a, b, name, max) => {
     if (!isRealDate(a) || !isRealDate(b)) { errors.push(`DATES_INVALID:${name}`); return false; }
@@ -119,8 +127,42 @@ export function validateHappyManifest(input, { now } = {}) {
     catch (e) { errors.push(e instanceof AdapterError ? `GUEST_OR_PLAN_INVALID:${e.code}` : "GUEST_OR_PLAN_INVALID"); }
   }
   if (errors.length) return fail(errors);
-  const hash = createHash("sha256").update(canonical(m)).digest("hex");
-  return { ok: true, manifest: deepFreeze(m), hash, confirmToken: `E4-HAPPY-${hash.slice(0, 12)}` };
+  const hash = hashOf(m);
+  const attempt = hasAttempt ? m.attempt : 1;
+  const { attempt: _omit, ...business } = m;
+  const priorHashes = [];
+  for (let k = 1; k < attempt; k++) priorHashes.push(hashOf(k === 1 ? business : { ...business, attempt: k }));
+  return { ok: true, manifest: deepFreeze(m), hash, confirmToken: `E4-HAPPY-${hash.slice(0, 12)}`, attempt, priorHashes: Object.freeze(priorHashes) };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Prior-attempt clearance (read-only; used by the preflight before any prompt or network). A prior attempt's journal
+// is CLEAR only if it is exactly a run of `expectedHash` that HALTED before any write was possible:
+//   run-start (that manifest hash) -> only P0/P1 reads -> exactly one P0/P1 halt -> run-end HALTED.
+// Any intent/outcome/side-effect/reconcile record, any other step/type/field, a missing end, a second run, or any
+// other shape is NOT clear. Fail closed: unknown => not clear.
+const PRE_WRITE_STEPS = ["P0_PREFLIGHT_PRICE", "P1_PREFLIGHT_CLEAR"];
+const PRIOR_KEYS = Object.freeze({
+  "run-start": ["type", "at", "runId", "manifestHash", "refs"],
+  read: ["type", "at", "step", "kind", "code", "httpStatus", "observedTotalMinor", "ref", "itemsSeen", "diag"],
+  halt: ["type", "at", "step", "code", "httpStatus", "observedTotalMinor", "itemsSeen", "diag"],
+  "run-end": ["type", "at", "code"]
+});
+export function checkPriorJournalClear(entries, expectedHash) {
+  const no = (reason) => ({ ok: false, code: `NOT_CLEAR_${reason}` });
+  if (!Array.isArray(entries) || entries.length < 3) return no("SHAPE");
+  for (const e of entries) {
+    if (!isObj(e) || typeof e.type !== "string" || !Object.prototype.hasOwnProperty.call(PRIOR_KEYS, e.type)) return no("UNRECOGNIZED_ENTRY");
+    if (Object.keys(e).some((k) => !PRIOR_KEYS[e.type].includes(k))) return no("UNRECOGNIZED_FIELD");
+    if (typeof e.at !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/.test(e.at)) return no("UNRECOGNIZED_FIELD");
+  }
+  const first = entries[0], end = entries[entries.length - 1], halt = entries[entries.length - 2], mid = entries.slice(1, -2);
+  if (first.type !== "run-start") return no("NOT_RUN_START");
+  if (first.manifestHash !== expectedHash) return no("MANIFEST_MISMATCH");
+  if (end.type !== "run-end" || end.code !== "HALTED") return no("NOT_TERMINAL_HALTED");
+  if (halt.type !== "halt" || !PRE_WRITE_STEPS.includes(halt.step) || typeof halt.code !== "string") return no("HALT_NOT_PRE_WRITE");
+  if (!mid.every((e) => e.type === "read" && PRE_WRITE_STEPS.includes(e.step))) return no("NOT_PRE_WRITE_ONLY");
+  return { ok: true, code: "CLEAR_HALTED_BEFORE_WRITE", haltStep: halt.step, haltCode: halt.code };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -134,6 +176,7 @@ export function planHappyRun(manifestInput, { now } = {}) {
   const step = (id, method, path, expect) => ({ step: id, method, path, expect, budget: HAPPY_STEPS[id] });
   return deepFreeze({
     mode: "dry-run", network: "none", ok: true, version: HAPPY_VERSION, manifestHash: v.hash, confirmToken: v.confirmToken,
+    attempt: v.attempt, priorManifestHashes: v.priorHashes,
     writeBudget: HAPPY_WRITE_BUDGET, executionWired: HAPPY_EXECUTION_WIRED, liveUnverified: HAPPY_LIVE_UNVERIFIED,
     stay: { from: s.arrivalDate, to: s.departureDate, nights: nightsBetween(s.arrivalDate, s.departureDate), totalMinor: expectedTotalMinor(s),
       currency: req.body.currency, listingId: req.body.listingMapId, channelId: req.body.channelId, guests: req.body.numberOfGuests,

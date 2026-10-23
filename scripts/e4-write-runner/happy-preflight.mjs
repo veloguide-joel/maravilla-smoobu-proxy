@@ -4,6 +4,9 @@
 //  - the manifest verdict (errors / owner-input blockers), its SHA-256 and the confirm token;
 //  - the journal file that a run would create exclusively (e4-journal-<hash12>.jsonl) and whether it already exists
 //    (it must NOT) and whether the directory exists and is writable;
+//  - for an explicit retry (`attempt` >= 2): every prior attempt's journal, in the SAME journal directory, read-only and
+//    strictly — each must exist and be CLEAR (halted before any write; see checkPriorJournalClear). Missing, unreadable,
+//    torn/corrupt or not-clear => blocker. Prior journals are only read, never modified;
 //  - the Node runtime (>= 20, AbortSignal.timeout available);
 //  - git BLOB hashes of every source file the run would load, so the operator can compare them with the
 //    reviewer-visible commit (`git ls-tree`) before anything is executed.
@@ -13,8 +16,8 @@ import { readFileSync, statSync, accessSync, constants } from "node:fs";
 import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { validateHappyManifest, HAPPY_VERSION } from "./happy-path.mjs";
-import { journalFileName } from "./journal.mjs";
+import { validateHappyManifest, checkPriorJournalClear, HAPPY_VERSION } from "./happy-path.mjs";
+import { journalFileName, readJournalFile } from "./journal.mjs";
 import { expectedTotalMinor } from "./runner.mjs";
 
 const ROOT = resolve(fileURLToPath(new URL("../..", import.meta.url)));
@@ -47,11 +50,11 @@ export function happyPreflight({ manifestText, journalDir, now = () => new Date(
   try { parsed = JSON.parse(manifestText); } catch { parsed = null; }
   const v = parsed === null ? { ok: false, errors: ["MANIFEST_UNREADABLE"], blockers: [] } : validateHappyManifest(parsed, { now });
   const manifest = v.ok
-    ? { ok: true, hash: v.hash, confirmToken: v.confirmToken, stay: { ...v.manifest.stay }, totalMinor: expectedTotalMinor(v.manifest.stay), currency: v.manifest.currency }
+    ? { ok: true, hash: v.hash, confirmToken: v.confirmToken, attempt: v.attempt, stay: { ...v.manifest.stay }, totalMinor: expectedTotalMinor(v.manifest.stay), currency: v.manifest.currency }
     : { ok: false, errors: v.errors, blockers: v.blockers };
   if (!v.ok) blockers.push(...(v.blockers.length ? v.blockers : ["MANIFEST_INVALID"]));
   // Journal (never created here)
-  const journal = { dir: null, file: null, exists: null, dirWritable: false, ok: false };
+  const journal = { dir: null, file: null, exists: null, dirWritable: false, ok: false, prior: [] };
   if (typeof journalDir === "string" && journalDir) {
     journal.dir = resolve(journalDir);
     try { journal.dirWritable = statSync(journal.dir).isDirectory() && (accessSync(journal.dir, constants.W_OK), true); } catch { journal.dirWritable = false; }
@@ -60,6 +63,25 @@ export function happyPreflight({ manifestText, journalDir, now = () => new Date(
       try { statSync(join(journal.dir, journal.file)); journal.exists = true; } catch (e) { journal.exists = e && e.code === "ENOENT" ? false : null; }
     }
     journal.ok = journal.dirWritable && journal.exists === false;
+  }
+  if (v.ok && v.attempt > 1) {
+    v.priorHashes.forEach((h, i) => {
+      const n = i + 1, file = journalFileName(h);
+      let code;
+      if (!journal.dir) code = "PRIOR_JOURNAL_DIR_REQUIRED";
+      else {
+        let entries = null;
+        try { entries = readJournalFile(join(journal.dir, file)); }
+        catch (e) {
+          let missing = false;
+          try { statSync(join(journal.dir, file)); } catch (se) { missing = se && se.code === "ENOENT"; }
+          code = missing ? "PRIOR_JOURNAL_MISSING" : e && e.code === "JOURNAL_CORRUPT" ? "PRIOR_JOURNAL_CORRUPT" : "PRIOR_JOURNAL_UNREADABLE";
+        }
+        if (entries) { const c = checkPriorJournalClear(entries, h); code = c.ok ? c.code : `PRIOR_JOURNAL_${c.code}`; }
+      }
+      journal.prior.push({ attempt: n, file, code });
+      if (code !== "CLEAR_HALTED_BEFORE_WRITE") blockers.push(`${code}:attempt${n}`);
+    });
   }
   if (!journal.dirWritable) blockers.push("JOURNAL_DIR_NOT_WRITABLE");
   if (journal.exists === true) blockers.push("JOURNAL_EXISTS");
