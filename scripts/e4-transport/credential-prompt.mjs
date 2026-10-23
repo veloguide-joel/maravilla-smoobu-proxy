@@ -22,6 +22,7 @@ export function readHiddenLine({ input, output, label }) {
     if (!input || input.isTTY !== true || typeof input.setRawMode !== "function") { reject(new CredentialPromptError("TTY_REQUIRED")); return; }
     let value = "";
     let done = false;
+    let esc = 0;            // 0 = normal, 1 = after ESC, 2 = inside CSI "ESC [ ... final", 3 = SS3 "ESC O x"
     const finish = (err) => {
       if (done) return;
       done = true;
@@ -33,6 +34,12 @@ export function readHiddenLine({ input, output, label }) {
     };
     const onData = (chunk) => {
       for (const ch of String(chunk)) {
+        // Terminal escape sequences are never part of the value: bracketed paste markers (ESC[200~ / ESC[201~),
+        // arrow/function keys (ESC[A, ESC[1;5C, ESCOP ...). Their printable tail used to be kept (E4 corrective).
+        if (esc === 1) { esc = ch === "[" ? 2 : ch === "O" ? 3 : 0; continue; }
+        if (esc === 2) { if (ch >= "@" && ch <= "~") esc = 0; continue; }
+        if (esc === 3) { esc = 0; continue; }
+        if (ch === "\u001b") { esc = 1; continue; }
         if (ch === "\r" || ch === "\n") return finish();
         if (ch === "\u0003" || ch === "\u0004") return finish(new CredentialPromptError("ABORTED"));
         if (ch === "\u007f" || ch === "\b") { value = value.slice(0, -1); continue; }

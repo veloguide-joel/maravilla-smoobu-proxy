@@ -196,15 +196,25 @@ export async function executeHappyRun(opts = {}) {
   try { jappend({ type: "run-start", runId, manifestHash: pre.hash, refs }); }
   catch { return deepFreeze({ status: "REFUSED", requests: 0, prerequisites: ["JOURNAL_WRITE_FAILED"] }); }
 
-  const gate = createGate({ transport, journal, timeoutMs, state, budgets: HAPPY_STEPS, writeBudget: HAPPY_WRITE_BUDGET });
+  const rawGate = createGate({ transport, journal, timeoutMs, state, budgets: HAPPY_STEPS, writeBudget: HAPPY_WRITE_BUDGET });
+  // Remember the allowlisted diagnostic of the most recent transport failure so that a halt caused by it records WHY
+  // (token refused / invalid token response / network / local refusal / timeout). Reset on every request.
+  let lastDiag = null;
+  const gate = Object.freeze({ requestCount: () => rawGate.requestCount(), send: async (...a) => {
+    lastDiag = null;
+    const r = await rawGate.send(...a);
+    if (r && r.transportError && r.diag) lastDiag = r.diag;
+    return r;
+  } });
   const attempts = [];
   const record = (step, o) => report.steps.push(san({ step, ...o }));
   const halt = (step, code, extra = {}) => {
     if (state.halted && report.halt) return;
     state.halted = true;
     state.cancellableId = null;
-    report.halt = san({ step, code, ...extra });
-    try { jappend({ type: "halt", step, code, ...extra }); } catch { /* latch already set */ }
+    const withDiag = lastDiag ? { ...extra, diag: lastDiag } : extra;
+    report.halt = san({ step, code, ...withDiag });
+    try { jappend({ type: "halt", step, code, ...withDiag }); } catch { /* latch already set */ }
   };
   const safeAppend = (step, e) => { try { jappend(e); } catch { halt(step, "JOURNAL_WRITE_FAILED"); } };
   const runStep = async (step, fn) => {
@@ -240,9 +250,10 @@ export async function executeHappyRun(opts = {}) {
     const resp = await gate.send("P0_PREFLIGHT_PRICE", { method: "POST", path: `/listings/${E4_TEST_LISTING_ID}/calendar/priceDetails`, query: {},
       body: { startingDate: s.arrivalDate, endingDate: s.departureDate, numberOfGuests: m.guests, version: 2 } });
     const p = parsePriceTotal(resp);
+    const priceStatus = !resp.transportError && Number.isSafeInteger(resp.httpStatus) ? { httpStatus: resp.httpStatus } : {};
     safeAppend("P0_PREFLIGHT_PRICE", { type: "read", step: "P0_PREFLIGHT_PRICE", kind: "calc", code: p.ok ? "PRICE_OK" : p.code,
-      ...(p.ok ? { observedTotalMinor: p.totalMinor } : {}) });
-    if (!p.ok) return halt("P0_PREFLIGHT_PRICE", p.code);
+      ...(p.ok ? { observedTotalMinor: p.totalMinor } : {}), ...priceStatus, ...(resp.diag ? { diag: resp.diag } : {}) });
+    if (!p.ok) return halt("P0_PREFLIGHT_PRICE", p.code, priceStatus);
     if (p.totalMinor !== expectNew.totalMinor) return halt("P0_PREFLIGHT_PRICE", "PREFLIGHT_TOTAL_MISMATCH", { observedTotalMinor: p.totalMinor });
     record("P0_PREFLIGHT_PRICE", { code: "PRICE_MATCHES_MANIFEST", totalMinor: p.totalMinor });
   });

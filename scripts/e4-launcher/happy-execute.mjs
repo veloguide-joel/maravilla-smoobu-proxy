@@ -91,7 +91,7 @@ export function summarize(report, extra) {
   return {
     status: report.status, version: report.version, manifestHash: report.manifestHash,
     writes: report.writes, requests: report.requests ?? null,
-    halt: report.halt ? pick(report.halt, ["step", "code", "mismatches", "httpStatus", "observedTotalMinor", "itemsSeen"]) : null,
+    halt: report.halt ? pick(report.halt, ["step", "code", "mismatches", "httpStatus", "observedTotalMinor", "itemsSeen", "diag"]) : null,
     steps: (report.steps || []).map((s) => pick(s, ["step", "code", "reservationId", "totalMinor", "httpStatus"])),
     reconcile: (report.reconcile || []).map((r) => pick(r, ["step", "ref", "reservationId", "readCode", "reservationStatus", "lookupCode", "foundReservationId"])),
     ...extra

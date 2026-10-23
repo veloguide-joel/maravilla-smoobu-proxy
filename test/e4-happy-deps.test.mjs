@@ -122,8 +122,9 @@ test("transport: 401/403/429/5xx returned as-is — no retry, no re-mint; a fail
   for (const mint of [() => json(401, { status: "fail" }), () => json(200, {}), () => new Response("not json", { status: 200 }), () => { throw new Error("net"); }]) {
     m = mockFetch((c) => (c.path === "/v1/accessTokens" ? mint() : json(200, { status: "success" })));
     t = createHostawayTransport({ fetchImpl: m.fetchImpl, getCredentials: CREDS, sleep: noSleep });
-    assert.deepEqual({ ...(await t.send({ method: "GET", path: "/reservations/1" })) }, { transportError: true, code: "AUTH_UNAVAILABLE" });
-    assert.deepEqual({ ...(await t.send({ method: "GET", path: "/reservations/1" })) }, { transportError: true, code: "AUTH_UNAVAILABLE" });
+    const codeOf = (r) => ({ transportError: r.transportError, code: r.code, diagStage: r.diag?.stage }); // diag detail: test/e4-transport-diagnostics.test.mjs
+    assert.deepEqual(codeOf(await t.send({ method: "GET", path: "/reservations/1" })), { transportError: true, code: "AUTH_UNAVAILABLE", diagStage: "TOKEN" });
+    assert.deepEqual(codeOf(await t.send({ method: "GET", path: "/reservations/1" })), { transportError: true, code: "AUTH_UNAVAILABLE", diagStage: "TOKEN" });
     assert.equal(m.calls.length, 1, "failed mint is final: no second mint, no data request");
   }
   for (const creds of [async () => ({ accountId: "", clientSecret: "x" }), async () => ({ accountId: "12345" }), async () => null, async () => { throw new Error("prompt"); }]) {
@@ -134,7 +135,8 @@ test("transport: 401/403/429/5xx returned as-is — no retry, no re-mint; a fail
   }
   m = mockFetch((c) => { if (c.path === "/v1/accessTokens") return MINT_OK(); throw new Error("socket"); });
   t = createHostawayTransport({ fetchImpl: m.fetchImpl, getCredentials: CREDS, sleep: noSleep });
-  assert.deepEqual({ ...(await t.send({ method: "GET", path: "/reservations/1" })) }, { transportError: true, code: "TRANSPORT_ERROR" });
+  const te = await t.send({ method: "GET", path: "/reservations/1" });
+  assert.deepEqual([te.transportError, te.code, te.diag?.code], [true, "TRANSPORT_ERROR", "REQUEST_NETWORK_FAILED"]);
 });
 
 test("transport: refuses DELETE/PATCH, traversal, odd paths, nested/odd query values, bodies on GET — with zero network calls", async () => {
@@ -144,7 +146,8 @@ test("transport: refuses DELETE/PATCH, traversal, odd paths, nested/odd query va
     { method: "GET", path: "//evil.example/x" }, { method: "GET", path: "/reservations?x=1" }, { method: "GET", path: "/reservations/%2e%2e" }, { method: "GET", path: "reservations" },
     { method: "GET", path: "/reservations", query: { a: { b: 1 } } }, { method: "GET", path: "/reservations", query: { a: [1] } }, { method: "GET", path: "/reservations", query: { "a b": 1 } },
     { method: "GET", path: "/reservations", query: { a: Number.NaN } }, { method: "GET", path: "/reservations", body: {} }, { method: "PUT", path: "/reservations/1" }, null]) {
-    assert.deepEqual({ ...(await t.send(req)) }, { transportError: true, code: "REQUEST_REFUSED" }, JSON.stringify(req));
+    const rr = await t.send(req);
+    assert.deepEqual([rr.transportError, rr.code, rr.diag?.code], [true, "REQUEST_REFUSED", "REQUEST_REFUSED_LOCAL"], JSON.stringify(req));
   }
   assert.equal(m.calls.length, 0);
   assert.throws(() => createHostawayTransport({ getCredentials: CREDS }), TypeError);

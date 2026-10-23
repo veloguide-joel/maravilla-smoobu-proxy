@@ -245,6 +245,27 @@ const JOURNAL_FIELDS = Object.freeze({
   mismatches: (v) => Array.isArray(v) && v.length <= IDENTITY_FIELDS.length && v.every((f) => IDENTITY_FIELDS.includes(f)),
   status: (v) => typeof v === "string" && /^[A-Z_]{1,40}$/.test(v)
 });
+// Allowlisted transport diagnostics (E4 corrective, after the owner's 2026-10-23 HALTED run). Only these enum values and
+// an integer HTTP status ever pass; never provider bodies, error messages, stacks, account ids, keys or tokens.
+export const TRANSPORT_DIAG_STAGES = Object.freeze(["TOKEN", "REQUEST", "GATE"]);
+export const TRANSPORT_DIAG_CODES = Object.freeze([
+  "TOKEN_LOCAL_INPUT_INVALID", "TOKEN_HTTP_REFUSED", "TOKEN_RESPONSE_INVALID", "TOKEN_NETWORK_FAILED",
+  "REQUEST_REFUSED_LOCAL", "REQUEST_NETWORK_FAILED", "REQUEST_BODY_READ_FAILED", "GATE_TIMEOUT", "TRANSPORT_THREW"]);
+export const TRANSPORT_ERROR_KINDS = Object.freeze(["TIMEOUT", "ABORTED", "FETCH_TYPE_ERROR", "OTHER"]);
+export const TRANSPORT_CAUSE_CODES = Object.freeze(["NONE", "UNLISTED", "ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ECONNRESET",
+  "ETIMEDOUT", "EPIPE", "EHOSTUNREACH", "ENETUNREACH", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT",
+  "UND_ERR_SOCKET", "CERT_HAS_EXPIRED", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+  "SELF_SIGNED_CERT_IN_CHAIN", "DEPTH_ZERO_SELF_SIGNED_CERT", "ERR_TLS_CERT_ALTNAME_INVALID"]);
+/** -> frozen { stage, code, httpStatus?, errorKind?, causeCode? } built only from allowlisted values, or null. */
+export function sanitizeTransportDiag(d) {
+  if (!isObj(d) || !TRANSPORT_DIAG_STAGES.includes(d.stage) || !TRANSPORT_DIAG_CODES.includes(d.code)) return null;
+  const out = { stage: d.stage, code: d.code };
+  if (Number.isSafeInteger(d.httpStatus) && d.httpStatus >= 100 && d.httpStatus <= 599) out.httpStatus = d.httpStatus;
+  if (TRANSPORT_ERROR_KINDS.includes(d.errorKind)) out.errorKind = d.errorKind;
+  if (TRANSPORT_CAUSE_CODES.includes(d.causeCode)) out.causeCode = d.causeCode;
+  return Object.freeze(out);
+}
+
 export function sanitizeJournalEntry(entry, { steps = STEP_BUDGETS } = {}) {
   const out = {};
   if (!isObj(entry)) return Object.freeze(out);
@@ -253,6 +274,7 @@ export function sanitizeJournalEntry(entry, { steps = STEP_BUDGETS } = {}) {
     if (Object.prototype.hasOwnProperty.call(entry, k) && valid(entry[k])) out[k] = entry[k];
   }
   if (isObj(entry.evidence)) out.evidence = sanitizeForEvidence(entry.evidence);
+  if (Object.prototype.hasOwnProperty.call(entry, "diag")) { const d = sanitizeTransportDiag(entry.diag); if (d) out.diag = d; }
   return deepFreeze(out);
 }
 
@@ -294,7 +316,10 @@ export function assertAllowedRequest(req, state, writeKind) {
 
 const normalizeTransportResult = (r) => {
   if (!isObj(r)) return { transportError: true, code: "MALFORMED_TRANSPORT_RESULT" };
-  if (r.transportError) return { transportError: true, code: "TRANSPORT_ERROR" };
+  if (r.transportError) {
+    const diag = sanitizeTransportDiag(r.diag);            // safe, allowlisted detail only; the code stays generic
+    return diag ? { transportError: true, code: "TRANSPORT_ERROR", diag } : { transportError: true, code: "TRANSPORT_ERROR" };
+  }
   return { httpStatus: r.httpStatus, json: r.json };
 };
 
@@ -331,8 +356,9 @@ export function createGate({ transport, journal, timeoutMs, state, budgets = STE
     requests++;
     const frozen = deepFreeze(JSON.parse(JSON.stringify({ method: req.method, path: req.path, query: req.query ?? {}, ...(req.body === undefined ? {} : { body: req.body }) })));
     return withTimeout(
-      () => Promise.resolve(transport.send(frozen)).then(normalizeTransportResult, () => ({ transportError: true, code: "TRANSPORT_ERROR" })),
-      timeoutMs, { transportError: true, code: "TIMEOUT" });
+      () => Promise.resolve(transport.send(frozen)).then(normalizeTransportResult,
+        () => ({ transportError: true, code: "TRANSPORT_ERROR", diag: Object.freeze({ stage: "GATE", code: "TRANSPORT_THREW" }) })),
+      timeoutMs, { transportError: true, code: "TIMEOUT", diag: Object.freeze({ stage: "GATE", code: "GATE_TIMEOUT" }) });
   }
   return Object.freeze({ send, requestCount: () => requests });
 }
