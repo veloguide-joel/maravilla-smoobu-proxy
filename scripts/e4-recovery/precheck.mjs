@@ -132,7 +132,7 @@ export async function runPrecheck({ transport, timeoutMs = DEFAULT_TIMEOUT_MS })
   out.precheckComplete = out.identity.code === "IDENTITY_OK" && out.lookup.code === "FOUND_BY_REF" && out.lookup.sameId &&
     ["CHARGES_NONE", "CHARGES_PRESENT"].includes(out.charges) && conv.state === "complete" && tasks.state === "complete" && out.calendar.code === "CALENDAR_READ";
   out.baselineMatches = out.precheckComplete && out.charges === "CHARGES_NONE" && same(conv.ids, BASELINE.conversations) && same(tasks.ids, BASELINE.tasks) &&
-    out.calendar.nights.every((n) => n.status === "reserved");
+    out.calendar.nights.length === TARGET.nights.length && out.calendar.nights.every((n) => n.status === "reserved" && n.isAvailable === false);
   out.requests = gate.requestCount() + direct;
   return out;
 }

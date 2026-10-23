@@ -33,27 +33,48 @@ export function nightsState(resp, nights) {
 
 /**
  * opts: { readCalendar: async () => resp, nights: [YYYY-MM-DD...], expect: "blocked"|"open", intervalMs, timeoutMs, maxReads,
- *         confirmReads (default 2), sleep: async ms, now: () => ms }
+ *         confirmReads (default 2), startTimer: (ms) => { promise, cancel }, now: () => ms }
  * -> { code: "OBSERVED_STABLE" | "TIMEOUT" | "READ_CAP_REACHED" | "INVALID_OPTIONS", reads, history: [state...], observedAfterMs? }
+ * One overall deadline = start + timeoutMs, enforced INCLUDING in-flight reads and waits: each read is raced against a
+ * cancellable deadline timer that is ALWAYS cancelled after the race (no stray timer keeps a process alive or accumulates);
+ * a read that settles at/after the deadline (or never settles) never counts; no read starts at/after the deadline.
+ * Timers are injected (`startTimer`); `realTimer` below is the minimal setTimeout/clearTimeout implementation for
+ * production. Tradeoff: a hung read is abandoned (its late result ignored), not cancelled — reads must be bounded by the
+ * caller's transport timeout too.
  */
+/** Minimal cancellable timer (the only timer use in this module). */
+export function realTimer(ms) {
+  let id; let done;
+  const promise = new Promise((resolve) => { done = resolve; id = setTimeout(resolve, ms); });
+  return { promise, cancel: () => { clearTimeout(id); done(); } };
+}
+
 export async function observeSync(opts = {}) {
-  const { readCalendar, nights, expect, intervalMs, timeoutMs, maxReads, confirmReads = 2, sleep, now } = opts;
+  const { readCalendar, nights, expect, intervalMs, timeoutMs, maxReads, confirmReads = 2, startTimer, now } = opts;
   const valid = typeof readCalendar === "function" && Array.isArray(nights) && nights.length >= 1 && nights.length <= 31 && nights.every((d) => DATE.test(d)) &&
     new Set(nights).size === nights.length && ["blocked", "open"].includes(expect) && Number.isSafeInteger(intervalMs) && intervalMs >= 1000 &&
     Number.isSafeInteger(timeoutMs) && timeoutMs >= intervalMs && timeoutMs <= 2 * 3600 * 1000 && Number.isSafeInteger(maxReads) && maxReads >= 1 && maxReads <= 120 &&
-    Number.isSafeInteger(confirmReads) && confirmReads >= 1 && confirmReads <= 5 && typeof sleep === "function" && typeof now === "function";
+    Number.isSafeInteger(confirmReads) && confirmReads >= 1 && confirmReads <= 5 && typeof startTimer === "function" && typeof now === "function";
   if (!valid) return { code: "INVALID_OPTIONS", reads: 0, history: [] };
-  const start = now(); const history = []; let streak = 0;
+  const start = now(); const deadline = start + timeoutMs; const history = []; let streak = 0;
+  const TIMED_OUT = Symbol("timedOut");
   for (let reads = 1; reads <= maxReads; reads++) {
+    const remaining = deadline - now();
+    if (remaining <= 0) return { code: "TIMEOUT", reads: reads - 1, history };          // never start a read at/after the deadline
     let resp;
-    try { resp = await readCalendar(); } catch { resp = { transportError: true }; }
+    const deadlineTimer = startTimer(remaining);
+    try {
+      resp = await Promise.race([Promise.resolve().then(() => readCalendar()), deadlineTimer.promise.then(() => TIMED_OUT)]);
+    } catch { resp = { transportError: true }; }
+    finally { deadlineTimer.cancel(); }                                                   // never leave the deadline timer pending
+    if (resp === TIMED_OUT || now() >= deadline) return { code: "TIMEOUT", reads, history }; // hung or late: never counts
     const s = nightsState(resp, nights);
     history.push(s);
     streak = s === expect ? streak + 1 : 0;
     if (streak >= confirmReads) return { code: "OBSERVED_STABLE", reads, history, observedAfterMs: now() - start };
     if (reads === maxReads) return { code: "READ_CAP_REACHED", reads, history };
-    if (now() - start + intervalMs > timeoutMs) return { code: "TIMEOUT", reads, history };
-    await sleep(intervalMs);
+    if (now() + intervalMs >= deadline) return { code: "TIMEOUT", reads, history };   // the next read would start at/after it
+    await startTimer(intervalMs).promise;
   }
   return { code: "READ_CAP_REACHED", reads: maxReads, history };
 }

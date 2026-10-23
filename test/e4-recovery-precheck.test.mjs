@@ -27,7 +27,8 @@ function world(over = {}) {
     departureDate: "2027-03-12", totalPrice: 250, currency: "USD", status: "new", guestName: "Joel Test", guestEmail: "Joel@veloguide.com",
     customFieldValues: [{ customFieldId: 105433, value: "MV-OTHL9CQU" }], ...(over.reservation ?? {}) };
   const w = { log: [], conversations: over.conversations ?? [{ id: 55098382, reservationId: String(RID), lastMessage: "MESSAGE-BODY" }],
-    tasks: over.tasks ?? [], charges: over.charges ?? [], convCount: over.convCount, calStatus: over.calStatus ?? "reserved" };
+    tasks: over.tasks ?? [], charges: over.charges ?? [], convCount: over.convCount, calStatus: over.calStatus ?? "reserved",
+    calAvail: Object.prototype.hasOwnProperty.call(over, "calAvail") ? over.calAvail : [0, 0], calDays: over.calDays };
   const ok = (r, extra = {}) => ({ httpStatus: 200, json: { status: "success", result: JSON.parse(JSON.stringify(r)), ...extra } });
   w.handle = (method, path, q) => {
     w.log.push(`${method} ${path}`);
@@ -38,7 +39,10 @@ function world(over = {}) {
       const list = path === "/conversations" ? w.conversations : w.tasks;
       return ok(list.slice(Number(q.offset), Number(q.offset) + 100), path === "/conversations" && w.convCount !== undefined ? { count: w.convCount } : {});
     }
-    if (method === "GET" && path === "/listings/606998/calendar") return ok([{ date: "2027-03-10", status: w.calStatus, isAvailable: 0, note: "PROVIDER-TEXT" }, { date: "2027-03-11", status: w.calStatus, isAvailable: 0 }]);
+    if (method === "GET" && path === "/listings/606998/calendar") {
+      const day = (date, i) => { const d = { date, status: w.calStatus, note: "PROVIDER-TEXT" }; if (w.calAvail[i] !== "absent") d.isAvailable = w.calAvail[i]; return d; };
+      return ok(w.calDays ?? ["2027-03-10", "2027-03-11"].map(day));
+    }
     return { httpStatus: 404, json: { status: "fail", result: "PROVIDER-TEXT" } };
   };
   w.transport = { send: async (req) => w.handle(req.method, req.path, req.query ?? {}) };
@@ -126,7 +130,15 @@ test("precheck: differences are reported, never acted on (extra/different conver
     [{ charges: [{ id: 1, reservationId: RID }] }, (o) => o.precheckComplete && o.charges === "CHARGES_PRESENT" && !o.baselineMatches],
     [{ reservation: { status: "cancelled" } }, (o) => !o.precheckComplete && o.identity.code === "IDENTITY_MISMATCH"],
     [{ reservation: { hostawayReservationId: "70636077" } }, (o) => !o.precheckComplete && o.identity.code === "READ_RESERVATION_ID_INCONSISTENT"],
-    [{ calStatus: "available" }, (o) => o.precheckComplete && !o.baselineMatches]
+    [{ calStatus: "available" }, (o) => o.precheckComplete && !o.baselineMatches],
+    // root's reproduction: reserved but isAvailable true must NOT match the baseline
+    [{ calAvail: [true, true] }, (o) => o.precheckComplete && !o.baselineMatches && o.calendar.nights.every((n) => n.isAvailable === true)],
+    [{ calAvail: [1, 0] }, (o) => o.precheckComplete && !o.baselineMatches],
+    [{ calAvail: [null, 0] }, (o) => o.precheckComplete && !o.baselineMatches && o.calendar.nights[0].isAvailable === null],
+    [{ calAvail: ["absent", 0] }, (o) => o.precheckComplete && !o.baselineMatches && o.calendar.nights[0].isAvailable === null],
+    [{ calAvail: ["0", 0] }, (o) => o.precheckComplete && !o.baselineMatches],
+    [{ calDays: [{ date: "2027-03-10", status: "reserved", isAvailable: 0 }] }, (o) => !o.precheckComplete && !o.baselineMatches && o.calendar.code === "CALENDAR_DAYS_MISSING"],
+    [{ calAvail: [false, false] }, (o) => o.precheckComplete && o.baselineMatches]
   ];
   for (const [over, pred] of cases) {
     const w = world(over);
