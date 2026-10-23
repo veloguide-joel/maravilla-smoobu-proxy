@@ -10,8 +10,10 @@
 //        identity read of 70636076, unique-by-ref lookup, charges (complete count), conversations and tasks (bounded
 //        traversal to a terminal empty page), calendar 2027-03-10..11. A local allowlist refuses every other request
 //        (no PUT/POST except the token) before fetch. Nothing is journaled; no file is written.
-// Output: codes, booleans, counts, ids of the fixed target/baseline, list metadata presence. Never provider bodies,
-// guest data, conversation/task contents, the channel reservation id, tokens or error text.
+// Output: codes, booleans, counts, ids of the fixed target/baseline, list metadata presence, and the FIRST transport
+// failure's allowlisted diagnostic (stage/code/httpStatus/errorKind/causeCode via the runner's sanitizeTransportDiag) plus
+// the transport's mint state/fetch count. Never provider bodies, guest data, conversation/task contents, the channel
+// reservation id, URLs, account ids, tokens, keys or error text.
 
 import { fileURLToPath } from "node:url";
 import { resolve, join } from "node:path";
@@ -20,7 +22,7 @@ import { verifyProvenance, makeGit, EXECUTE_SOURCES } from "../e4-launcher/happy
 import { createHostawayTransport, HOSTAWAY_BASE } from "../e4-transport/hostaway-transport.mjs";
 import { promptHostawayCredentials } from "../e4-transport/credential-prompt.mjs";
 import { createGate, parseReservationResponse, identityMismatches, reconcileAttempts, withTimeout, RunnerError, ADAPTER_CFG, READ_QUERY,
-  DEFAULT_TIMEOUT_MS } from "../e4-write-runner/runner.mjs";
+  DEFAULT_TIMEOUT_MS, sanitizeTransportDiag } from "../e4-write-runner/runner.mjs";
 import { evaluateSideEffectResponse, sideEffectRequest, SIDE_EFFECT_SOURCES } from "../e4-write-runner/side-effects.mjs";
 import { readJournalFile, journalFileName } from "../e4-write-runner/journal.mjs";
 import { TARGET, BASELINE, RECOVERY_HASH, LIST_LIMIT, LIST_MAX_PAGES, LOOKUP_PAGES, checkAttempt2Journal, traverseList } from "./cancel-only.mjs";
@@ -96,17 +98,28 @@ export function guardFetch(fetchImpl) {
 }
 
 /** Read-only reads against an injected transport. Never sends a write (the gate has no write budget and no cancellable id). */
+const MINT_STATES = ["none", "ok", "failed"];
 export async function runPrecheck({ transport, timeoutMs = DEFAULT_TIMEOUT_MS }) {
   const T = TARGET;
+  // First transport failure, reduced to the runner's allowlisted diagnostic shape (or null). Observation only: it never
+  // changes control flow, triggers a retry or a re-mint.
+  let firstDiag = null;
+  const note = (r) => { if (firstDiag === null && r && r.transportError) { const d = sanitizeTransportDiag(r.diag); if (d) firstDiag = d; } return r; };
+  // Gate reads (identity, and the lookup pages inside reconcileAttempts): transport results are noted at the transport
+  // boundary; the gate's own synthesized timeout/throw results are noted where gate.send returns to this function.
+  const tracked = Object.freeze({ send: async (req) => note(await transport.send(req)) });
+  const GATE_TIMEOUT = Object.freeze({ transportError: true, diag: Object.freeze({ stage: "GATE", code: "GATE_TIMEOUT" }) });
   const state = { halted: false, readOnly: true, readableIds: new Set([T.reservationId]), cancellableId: null };
   const noJournal = Object.freeze({ durable: false, load: () => [], append: () => { throw new RunnerError("PRECHECK_WRITES_NOTHING"); } });
-  const gate = createGate({ transport, journal: noJournal, timeoutMs, state, budgets: STEPS, writeBudget: NO_WRITES });
+  const gate = createGate({ transport: tracked, journal: noJournal, timeoutMs, state, budgets: STEPS, writeBudget: NO_WRITES });
   let direct = 0;
-  const send = (req) => { direct++; return withTimeout(() => Promise.resolve(transport.send(req)).then((r) => r, () => ({ transportError: true })), timeoutMs, { transportError: true }); };
+  // Direct reads: noted once here (covers the transport result and the locally synthesized throw/timeout results).
+  const THREW = Object.freeze({ transportError: true, diag: Object.freeze({ stage: "GATE", code: "TRANSPORT_THREW" }) });
+  const send = async (req) => { direct++; return note(await withTimeout(() => Promise.resolve(transport.send(req)).then((r) => r, () => THREW), timeoutMs, GATE_TIMEOUT)); };
   const out = {};
   // identity
   let resp;
-  try { resp = await gate.send("C1_IDENTITY", { method: "GET", path: `/reservations/${T.reservationId}`, query: READ_QUERY }); } catch { resp = { transportError: true, code: "GATE" }; }
+  try { resp = note(await gate.send("C1_IDENTITY", { method: "GET", path: `/reservations/${T.reservationId}`, query: READ_QUERY })); } catch { resp = { transportError: true, code: "GATE" }; }
   const p = parseReservationResponse(resp, "READ");
   const mm = p.ok ? identityMismatches(p.reservation, { reservationId: T.reservationId, listingId: T.listingId, from: T.from, to: T.to,
     totalMinor: T.totalMinor, currency: T.currency, channelId: T.channelId, bookingRef: T.ref, status: "new" }) : [];
@@ -133,7 +146,12 @@ export async function runPrecheck({ transport, timeoutMs = DEFAULT_TIMEOUT_MS })
     ["CHARGES_NONE", "CHARGES_PRESENT"].includes(out.charges) && conv.state === "complete" && tasks.state === "complete" && out.calendar.code === "CALENDAR_READ";
   out.baselineMatches = out.precheckComplete && out.charges === "CHARGES_NONE" && same(conv.ids, BASELINE.conversations) && same(tasks.ids, BASELINE.tasks) &&
     out.calendar.nights.length === TARGET.nights.length && out.calendar.nights.every((n) => n.status === "reserved" && n.isAvailable === false);
-  out.requests = gate.requestCount() + direct;
+  out.requests = gate.requestCount() + direct;                  // runner-level calls, NOT provider HTTP requests
+  out.transportDiag = firstDiag;
+  let usage = null;
+  try { usage = typeof transport.usage === "function" ? transport.usage() : null; } catch { usage = null; }
+  out.transportUsage = usage && MINT_STATES.includes(usage.mintState) && Number.isSafeInteger(usage.fetches) && usage.fetches >= 0 && usage.fetches <= 100
+    ? { mintState: usage.mintState, fetches: usage.fetches } : null;  // fetches = real fetch() calls incl. the token mint
   return out;
 }
 

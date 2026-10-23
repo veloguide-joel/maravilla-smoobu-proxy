@@ -189,3 +189,122 @@ test("calendar night states and containment", () => {
     /process\.env/, /console\./, /runRecovery\b/]) assert.doesNotMatch(src, re, String(re));
   assert.equal(globalFetchCalls, 0);
 });
+
+// ---------- owner run 2026-10-23 (exit 3): the reported signature, and why the new diagnostic is needed ----------
+// Owner-reported (relayed by root): identity READ_TRANSPORT_UNCERTAIN, lookup TRANSPORT_UNCERTAIN, charges/conversations/
+// tasks/calendar *_TRANSPORT_UNCERTAIN (pagesRead 0), requests 6, guard {token:1, all reads 0, refused:0}.
+const OWNER_SIGNATURE = {
+  identity: { code: "READ_TRANSPORT_UNCERTAIN" }, lookup: { code: "TRANSPORT_UNCERTAIN", sameId: false }, charges: "CHARGES_TRANSPORT_UNCERTAIN",
+  conversations: { code: "CONVERSATIONS_TRANSPORT_UNCERTAIN", pagesRead: 0 }, tasks: { code: "TASKS_TRANSPORT_UNCERTAIN", pagesRead: 0 },
+  calendar: { code: "CALENDAR_TRANSPORT_UNCERTAIN" }, precheckComplete: false, baselineMatches: false, requests: 6,
+  guard: { token: 1, read: 0, lookup: 0, charges: 0, conversations: 0, tasks: 0, calendar: 0, refused: 0 }
+};
+const pickOld = (o) => ({ identity: o.identity, lookup: o.lookup, charges: o.charges, conversations: o.conversations, tasks: o.tasks,
+  calendar: o.calendar, precheckComplete: o.precheckComplete, baselineMatches: o.baselineMatches, requests: o.requests, guard: o.guard });
+const mintFailures = [
+  ["token 401", async () => new Response(JSON.stringify({ status: "fail", result: "PROVIDER-TEXT" }), { status: 401 }), { stage: "TOKEN", code: "TOKEN_HTTP_REFUSED", httpStatus: 401 }],
+  ["token 403", async () => new Response("PROVIDER-TEXT", { status: 403 }), { stage: "TOKEN", code: "TOKEN_HTTP_REFUSED", httpStatus: 403 }],
+  ["token 429", async () => new Response("PROVIDER-TEXT", { status: 429 }), { stage: "TOKEN", code: "TOKEN_HTTP_REFUSED", httpStatus: 429 }],
+  ["token 500", async () => new Response("PROVIDER-TEXT", { status: 500 }), { stage: "TOKEN", code: "TOKEN_HTTP_REFUSED", httpStatus: 500 }],
+  ["token 200 without access_token", async () => new Response(JSON.stringify({ status: "success", result: "PROVIDER-TEXT" }), { status: 200 }), { stage: "TOKEN", code: "TOKEN_RESPONSE_INVALID", httpStatus: 200 }],
+  ["token 200 non-JSON", async () => new Response("<html>PROVIDER-TEXT</html>", { status: 200 }), { stage: "TOKEN", code: "TOKEN_RESPONSE_INVALID", httpStatus: 200 }],
+  ["DNS failure", async () => { throw Object.assign(new TypeError("fetch failed PROVIDER-TEXT"), { cause: { code: "ENOTFOUND" } }); }, { stage: "TOKEN", code: "TOKEN_NETWORK_FAILED", errorKind: "FETCH_TYPE_ERROR", causeCode: "ENOTFOUND" }],
+  ["TLS interception", async () => { throw Object.assign(new TypeError("fetch failed"), { cause: { code: "SELF_SIGNED_CERT_IN_CHAIN" } }); }, { stage: "TOKEN", code: "TOKEN_NETWORK_FAILED", errorKind: "FETCH_TYPE_ERROR", causeCode: "SELF_SIGNED_CERT_IN_CHAIN" }],
+  ["fetch timeout", async () => { throw Object.assign(new Error("PROVIDER-TEXT"), { name: "TimeoutError" }); }, { stage: "TOKEN", code: "TOKEN_NETWORK_FAILED", errorKind: "TIMEOUT", causeCode: "NONE" }],
+  ["unlisted cause", async () => { throw Object.assign(new TypeError("x"), { cause: { code: "EWHATEVER" } }); }, { stage: "TOKEN", code: "TOKEN_NETWORK_FAILED", errorKind: "FETCH_TYPE_ERROR", causeCode: "UNLISTED" }]
+];
+test("owner exit-3 signature: EVERY mint-failure class yields the identical old output; only transportDiag tells them apart", async () => {
+  const seen = new Set();
+  for (const [name, tokenReply, wantDiag] of mintFailures) {
+    const f = folder(); const before = snap(f.dir); const calls = [];
+    const fetchImpl = async (url, init = {}) => { calls.push(`${init.method ?? "GET"} ${new URL(String(url)).pathname}`); return tokenReply(); };
+    const r = await runPrecheckCli(["--precheck", "--journal-dir", f.jdir, "--reviewed-commit", SHA], { git: git(), fetchImpl, sleep: async () => {}, timeoutMs: 500,
+      prompt: async () => ({ accountId: FAKE.account, clientSecret: FAKE.secret }) });
+    assert.equal(r.exitCode, PRECHECK_EXIT.INCOMPLETE, name);
+    assert.deepEqual(pickOld(r.output), OWNER_SIGNATURE, `${name}: old fields reproduce the owner's signature exactly`);
+    assert.deepEqual(r.output.transportDiag, wantDiag, name);
+    assert.deepEqual(r.output.transportUsage, { mintState: "failed", fetches: 1 }, name);
+    assert.deepEqual(calls, ["POST /v1/accessTokens"], `${name}: exactly one fetch, the mint; no GET reached fetch`);
+    assert.deepEqual(snap(f.dir), before, `${name}: nothing written`);
+    leakFree(r.output);
+    seen.add(JSON.stringify(wantDiag));
+  }
+  // 9 distinct diagnostics for 10 cases: both 200-without-token shapes are intentionally one class (TOKEN_RESPONSE_INVALID/200);
+  // no body detail is exposed to tell them apart.
+  assert.equal(seen.size, 9, "every class except the two 200-response shapes has a distinct diagnostic");
+});
+
+test("malformed credential input never reaches fetch (guard token 0): excluded by the owner's token:1", async () => {
+  for (const creds of [{ accountId: "", clientSecret: FAKE.secret }, { accountId: "12a", clientSecret: FAKE.secret }, { accountId: FAKE.account, clientSecret: "" }]) {
+    const f = folder(); let fetched = 0;
+    const r = await runPrecheckCli(["--precheck", "--journal-dir", f.jdir, "--reviewed-commit", SHA], { git: git(), fetchImpl: async () => { fetched++; },
+      sleep: async () => {}, timeoutMs: 500, prompt: async () => creds });
+    assert.deepEqual([fetched, r.output.guard.token, r.output.transportDiag, r.output.transportUsage], [0, 0, { stage: "TOKEN", code: "TOKEN_LOCAL_INPUT_INVALID" }, { mintState: "failed", fetches: 0 }]);
+    assert.notDeepEqual(pickOld(r.output), OWNER_SIGNATURE);
+  }
+});
+
+test("success path: transportDiag null, mint ok; fetch count = mint + reads", async () => {
+  const f = folder(); const w = world();
+  const r = await runPrecheckCli(["--precheck", "--journal-dir", f.jdir, "--reviewed-commit", SHA], { git: git(), fetchImpl: w.fetchImpl, sleep: async () => {},
+    timeoutMs: 500, prompt: async () => ({ accountId: FAKE.account, clientSecret: FAKE.secret }) });
+  assert.deepEqual([r.exitCode, r.output.transportDiag, r.output.transportUsage.mintState], [PRECHECK_EXIT.OK, null, "ok"]);
+  assert.equal(r.output.transportUsage.fetches, w.log.length, "every fetch counted (token + GETs)");
+  // a REQUEST-stage failure after a good mint is reported as such (first failure only)
+  const w2 = world(); const inner = w2.fetchImpl; let n = 0;
+  const flaky = async (url, init) => { if (String(url).includes("/reservations/70636076")) { n++; throw Object.assign(new TypeError("x"), { cause: { code: "ECONNRESET" } }); } return inner(url, init); };
+  const r2 = await runPrecheckCli(["--precheck", "--journal-dir", folder().jdir, "--reviewed-commit", SHA], { git: git(), fetchImpl: flaky, sleep: async () => {},
+    timeoutMs: 500, prompt: async () => ({ accountId: FAKE.account, clientSecret: FAKE.secret }) });
+  assert.deepEqual([n, r2.output.transportDiag], [1, { stage: "REQUEST", code: "REQUEST_NETWORK_FAILED", errorKind: "FETCH_TYPE_ERROR", causeCode: "ECONNRESET" }]);
+  assert.equal(r2.output.transportUsage.mintState, "ok");
+});
+
+test("transportDiag is allowlist-only: hostile diag fields are dropped", async () => {
+  const hostile = { send: async () => ({ transportError: true, diag: { stage: "TOKEN", code: "TOKEN_HTTP_REFUSED", httpStatus: 401, message: "PROVIDER-TEXT", url: "https://x", accountId: FAKE.account, token: FAKE.token } }),
+    usage: () => ({ mintState: "failed", fetches: 1, secret: FAKE.secret }) };
+  const o = await runPrecheck({ transport: hostile, timeoutMs: 100 });
+  assert.deepEqual([o.transportDiag, o.transportUsage], [{ stage: "TOKEN", code: "TOKEN_HTTP_REFUSED", httpStatus: 401 }, { mintState: "failed", fetches: 1 }]);
+  leakFree(o);
+  const weird = { send: async () => ({ transportError: true, diag: { stage: "X", code: "Y" } }), usage: () => ({ mintState: "weird", fetches: -1 }) };
+  const o2 = await runPrecheck({ transport: weird, timeoutMs: 100 });
+  assert.deepEqual([o2.transportDiag, o2.transportUsage], [null, null]);
+});
+
+test("timeouts are reported as GATE_TIMEOUT (gate path and direct reads alike); first failure wins", async () => {
+  const hang = { send: () => new Promise(() => {}), usage: () => ({ mintState: "ok", fetches: 3 }) };
+  const o = await runPrecheck({ transport: hang, timeoutMs: 20 });
+  assert.deepEqual([o.transportDiag, o.transportUsage, o.identity.code, o.charges], [{ stage: "GATE", code: "GATE_TIMEOUT" }, { mintState: "ok", fetches: 3 }, "READ_TRANSPORT_UNCERTAIN", "CHARGES_TRANSPORT_UNCERTAIN"]);
+  // identity/lookup succeed-as-transport (no transportError), the first direct read hangs: still GATE_TIMEOUT from the direct path
+  const direct = { send: (req) => req.path === "/guestPayments/charges" ? new Promise(() => {}) : Promise.resolve({ httpStatus: 503 }) };
+  const o2 = await runPrecheck({ transport: direct, timeoutMs: 20 });
+  assert.deepEqual([o2.transportDiag, o2.transportUsage], [{ stage: "GATE", code: "GATE_TIMEOUT" }, null]);
+  // a later different failure never overwrites the first
+  let k = 0;
+  const seq = { send: async () => ({ transportError: true, diag: k++ === 0 ? { stage: "TOKEN", code: "TOKEN_HTTP_REFUSED", httpStatus: 401 } : { stage: "REQUEST", code: "REQUEST_NETWORK_FAILED", errorKind: "TIMEOUT", causeCode: "NONE" } }) };
+  const o3 = await runPrecheck({ transport: seq, timeoutMs: 20 });
+  assert.ok(k >= 6);
+  assert.deepEqual(o3.transportDiag, { stage: "TOKEN", code: "TOKEN_HTTP_REFUSED", httpStatus: 401 });
+});
+
+test("diagnostic capture covers every read path: identity gate timeout, lookup inside the gate, direct throw; usage fields checked individually", async () => {
+  const X = { stage: "REQUEST", code: "REQUEST_NETWORK_FAILED", errorKind: "FETCH_TYPE_ERROR", causeCode: "ECONNRESET" };
+  const Y = { stage: "REQUEST", code: "REQUEST_BODY_READ_FAILED" };
+  // identity hangs in the gate (gate-synthesized GATE_TIMEOUT) and is the first failure; later failures carry X
+  const a = { send: (req) => req.path === "/reservations/70636076" ? new Promise(() => {}) : Promise.resolve({ transportError: true, diag: X }) };
+  assert.deepEqual((await runPrecheck({ transport: a, timeoutMs: 20 })).transportDiag, { stage: "GATE", code: "GATE_TIMEOUT" });
+  // identity is a non-transport HTTP reply; the lookup page (sent by reconcileAttempts through the gate) is the first failure
+  const b = { send: async (req) => req.path === "/reservations/70636076" ? { httpStatus: 503 } : req.path === "/reservations" ? { transportError: true, diag: X } : { transportError: true, diag: Y } };
+  assert.deepEqual((await runPrecheck({ transport: b, timeoutMs: 20 })).transportDiag, X);
+  // a throwing transport on a direct read is reported as TRANSPORT_THREW (never the error text)
+  const c = { send: (req) => req.path.startsWith("/reservations") ? Promise.resolve({ httpStatus: 503 }) : Promise.reject(new Error("PROVIDER-TEXT")) };
+  const oc = await runPrecheck({ transport: c, timeoutMs: 20 });
+  assert.deepEqual(oc.transportDiag, { stage: "GATE", code: "TRANSPORT_THREW" }); leakFree(oc);
+  for (const [u, want] of [[{ mintState: "weird", fetches: 1 }, null], [{ mintState: "ok", fetches: 101 }, null], [{ mintState: "ok", fetches: -1 }, null],
+    [{ mintState: "ok", fetches: 1.5 }, null], [{ mintState: "ok", fetches: "1" }, null], [{ mintState: "none", fetches: 0 }, { mintState: "none", fetches: 0 }],
+    [{ mintState: "ok", fetches: 100 }, { mintState: "ok", fetches: 100 }]]) {
+    const o = await runPrecheck({ transport: { send: async () => ({ httpStatus: 503 }), usage: () => u }, timeoutMs: 20 });
+    assert.deepEqual(o.transportUsage, want, JSON.stringify(u));
+  }
+  const thrower = await runPrecheck({ transport: { send: async () => ({ httpStatus: 503 }), usage: () => { throw new Error("PROVIDER-TEXT"); } }, timeoutMs: 20 });
+  assert.equal(thrower.transportUsage, null); leakFree(thrower);
+});
