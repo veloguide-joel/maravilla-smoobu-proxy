@@ -23,7 +23,7 @@ test("proposal manifest: Mar 10-12 2027 inside the window, but NOT approvable un
   assert.equal(r.checksPassed, false);
   assert.deepEqual(r.manifest.blockers, ["OWNER_INPUT_REQUIRED:guest"]);
   assert.ok(r.blockers.includes("OWNER_INPUT_REQUIRED:guest"));
-  assert.deepEqual([r.network, r.credentialsRequested, r.filesWritten, r.executionWired], ["none", false, 0, false]);
+  assert.deepEqual([r.network, r.credentialsRequested, r.filesWritten, r.preflightExecutes], ["none", false, 0, false]);
   const p = JSON.parse(PROPOSAL);
   assert.deepEqual([p.window, p.stay], [{ start: "2027-03-08", end: "2027-03-15" }, { arrivalDate: "2027-03-10", departureDate: "2027-03-12" }]);
 });
@@ -36,7 +36,7 @@ test("complete manifest: hash/token/journal name; journal must not exist; dir mu
   assert.deepEqual([r.manifest.hash, r.manifest.confirmToken, r.manifest.totalMinor, r.manifest.currency], [v.hash, v.confirmToken, 25000, "USD"]);
   assert.deepEqual([r.journal.file, r.journal.exists, r.journal.dirWritable], [journalFileName(v.hash), false, true]);
   assert.deepEqual(readdirSync(dir), [], "preflight created nothing");
-  assert.equal(r.executionWired, false, "a passing preflight never enables execution");
+  assert.equal(r.preflightExecutes, false, "a passing preflight executes nothing");
   writeFileSync(join(dir, journalFileName(v.hash)), "");
   const again = happyPreflight({ manifestText: COMPLETE, journalDir: dir, now: NOW });
   assert.deepEqual([r.journal.ok, again.checksPassed, again.journal.exists, again.journal.ok], [true, false, true, false]);
@@ -56,7 +56,7 @@ test("provenance: git blob ids of every source a run would load (match git hash-
   if (g.status === 0) assert.deepEqual(g.stdout.trim().split("\n"), r.sources.map((s) => s.gitBlob));
 });
 
-test("cli: --preflight is read-only and needs no credentials; --execute still refused", () => {
+test("cli: --preflight is read-only and needs no credentials; a malformed --execute is refused before anything", () => {
   const dir = mkdtempSync(join(tmpdir(), "e4-pf-"));
   const m = join(dir, "m.json");
   writeFileSync(m, PROPOSAL);
@@ -64,10 +64,10 @@ test("cli: --preflight is read-only and needs no credentials; --execute still re
   const pf = spawnSync(process.execPath, [cli, "--preflight", m, dir], { encoding: "utf8", env: {}, input: "" });
   assert.equal(pf.status, 1);
   const out = JSON.parse(pf.stdout);
-  assert.deepEqual([out.mode, out.network, out.credentialsRequested, out.executionWired], ["preflight", "none", false, false]);
+  assert.deepEqual([out.mode, out.network, out.credentialsRequested, out.preflightExecutes], ["preflight", "none", false, false]);
   assert.deepEqual(readdirSync(dir), ["m.json"]);
-  const ex = spawnSync(process.execPath, [cli, "--execute", m], { encoding: "utf8", env: {} });
-  assert.deepEqual([ex.status, JSON.parse(ex.stdout).error], [2, "EXECUTION_NOT_WIRED"]);
+  const ex = spawnSync(process.execPath, [cli, "--execute", m], { encoding: "utf8", env: {}, input: "" });
+  assert.deepEqual([ex.status, JSON.parse(ex.stdout).error, JSON.parse(ex.stdout).credentialsRequested], [64, "USAGE", false]);
   const src = readFileSync(cli, "utf8");
   assert.doesNotMatch(src, /hostaway-transport|side-effects|credential-prompt|executeHappyRun|process\.env/);
   const pfsrc = readFileSync(join(ROOT, "scripts/e4-write-runner/happy-preflight.mjs"), "utf8");

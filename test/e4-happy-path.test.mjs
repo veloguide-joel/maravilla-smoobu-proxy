@@ -345,8 +345,8 @@ test("containment: no env/fetch/URLs in the happy-path files; nothing deployable
   assert.deepEqual([...walk("api"), ...walk("lib"), ...walk("db")], []);
   assert.equal(HAPPY_EXECUTION_WIRED, false);
   const cli = join(ROOT, "scripts/e4-write-runner/happy-cli.mjs");
-  const ex = spawnSync(process.execPath, [cli, "--execute", "x"], { encoding: "utf8", env: {} });
-  assert.deepEqual([ex.status, JSON.parse(ex.stdout).error], [2, "EXECUTION_NOT_WIRED"]);
+  const ex = spawnSync(process.execPath, [cli, "--execute", "x"], { encoding: "utf8", env: {}, input: "" });
+  assert.deepEqual([ex.status, JSON.parse(ex.stdout).error, JSON.parse(ex.stdout).credentialsRequested], [64, "USAGE", false]); // execute path: see test/e4-happy-execute.test.mjs
   const dr = spawnSync(process.execPath, [cli, "--dry-run", join(ROOT, "scripts/e4-write-runner/happy-manifest.template.json")], { encoding: "utf8", env: {} });
   assert.deepEqual([dr.status, JSON.parse(dr.stdout).network], [1, "none"]);
 });

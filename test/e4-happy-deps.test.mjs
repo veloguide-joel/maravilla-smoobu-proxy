@@ -233,7 +233,7 @@ test("integration: a 401 on the create => exactly one create fetch, no re-mint, 
 });
 
 // ---------- containment ----------
-test("containment: transport/reader read no env/files/globals; nothing deployable imports them; CLI still not wired", () => {
+test("containment: transport/reader read no env/files/globals; nothing deployable imports them; the CLI imports them only via the launcher", () => {
   const tsrc = readFileSync(join(ROOT, "scripts/e4-transport/hostaway-transport.mjs"), "utf8");
   const ssrc = readFileSync(join(ROOT, "scripts/e4-write-runner/side-effects.mjs"), "utf8");
   for (const [n, src] of [["transport", tsrc], ["side-effects", ssrc]]) {

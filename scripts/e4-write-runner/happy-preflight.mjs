@@ -7,13 +7,13 @@
 //  - the Node runtime (>= 20, AbortSignal.timeout available);
 //  - git BLOB hashes of every source file the run would load, so the operator can compare them with the
 //    reviewer-visible commit (`git ls-tree`) before anything is executed.
-// `executionWired` stays false on this branch: a passing preflight never enables execution.
+// The preflight itself never executes anything (`preflightExecutes: false`); execution is a separate, gated CLI mode.
 
 import { readFileSync, statSync, accessSync, constants } from "node:fs";
 import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { validateHappyManifest, HAPPY_EXECUTION_WIRED, HAPPY_VERSION } from "./happy-path.mjs";
+import { validateHappyManifest, HAPPY_VERSION } from "./happy-path.mjs";
 import { journalFileName } from "./journal.mjs";
 import { expectedTotalMinor } from "./runner.mjs";
 
@@ -27,7 +27,8 @@ export const PREFLIGHT_SOURCES = Object.freeze([
   "scripts/e4-write-runner/happy-preflight.mjs",
   "scripts/e4-write-runner/happy-cli.mjs",
   "scripts/e4-transport/hostaway-transport.mjs",
-  "scripts/e4-transport/credential-prompt.mjs"
+  "scripts/e4-transport/credential-prompt.mjs",
+  "scripts/e4-launcher/happy-execute.mjs"
 ]);
 
 /** git's blob id: sha1("blob <bytes>\0" + content). Matches `git ls-tree` / `git hash-object`. */
@@ -69,7 +70,7 @@ export function happyPreflight({ manifestText, journalDir, now = () => new Date(
   });
   return Object.freeze({
     mode: "preflight", version: HAPPY_VERSION, network: "none", credentialsRequested: false, filesWritten: 0,
-    executionWired: HAPPY_EXECUTION_WIRED, node, manifest, journal, sources,
+    preflightExecutes: false, node, manifest, journal, sources,
     checksPassed: blockers.length === 0, blockers
   });
 }
