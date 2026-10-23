@@ -73,21 +73,49 @@ const sameId = (v, id) => v === id || (typeof v === "string" && v === String(id)
 // ---------------------------------------------------------------------------------------------
 // Pure checks
 
-/** The ORIGINAL attempt-2 journal must prove: one create sent for our ref, never a cancel, run ended HALTED. */
+/**
+ * The ORIGINAL attempt-2 journal must be EXACTLY the sequence the reviewed runner (ad5510f) writes when the create reply
+ * fails the id check: run-start -> P0 read -> P1 read -> HW1 create intent -> HW1 outcome -> HW1 side-effect-check ->
+ * HW1 halt -> one HR_RECONCILE -> run-end HALTED. Each record may carry only the fields that runner writes for it;
+ * the intent and outcome must be bound to the target ref, dates and total. Unknown types/steps/fields, any other or
+ * extra record (a potential write), reordering or truncation => refused. The journal is only read, never modified.
+ */
+const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+const ATTEMPT2_SEQUENCE = Object.freeze([
+  { type: "run-start", keys: ["runId", "manifestHash", "refs"], ok: (e) => /^[0-9a-f]{16}$/.test(e.runId) && e.manifestHash === TARGET.attempt2Hash &&
+    Array.isArray(e.refs) && e.refs.length === 2 && e.refs[1] === TARGET.ref && e.refs[0] !== TARGET.ref && e.refs.every((r) => typeof r === "string" && /^MV-[A-Z0-9]{6,10}$/.test(r)) },
+  { type: "read", step: "P0_PREFLIGHT_PRICE", keys: ["kind", "code", "observedTotalMinor", "httpStatus"], ok: (e) => e.kind === "calc" && e.code === "PRICE_OK" &&
+    e.observedTotalMinor === TARGET.totalMinor && e.httpStatus === 200 },
+  { type: "read", step: "P1_PREFLIGHT_CLEAR", keys: ["kind", "code", "ref", "itemsSeen"], ok: (e, es) => e.kind === "lookup" && e.code === "NOT_FOUND_NON_AUTHORITATIVE" &&
+    e.ref === es[0].refs[0] && e.itemsSeen === 0 },
+  { type: "intent", step: "HW1_CREATE", noAt: true, keys: ["kind", "ref", "from", "to", "totalMinor"], ok: (e) => e.kind === "create" && e.ref === TARGET.ref &&
+    e.from === TARGET.from && e.to === TARGET.to && e.totalMinor === TARGET.totalMinor },
+  { type: "outcome", step: "HW1_CREATE", keys: ["kind", "ref", "code", "evidence", "transport"], ok: (e) => e.kind === "create" && e.ref === TARGET.ref &&
+    e.code === "RESERVATION_ID_INCONSISTENT" && e.transport === undefined && isObj(e.evidence) && e.evidence.outcome === "ambiguous" &&
+    e.evidence.code === "RESERVATION_ID_INCONSISTENT" && e.evidence.httpStatus === 200 && e.evidence.reservationId === undefined && e.evidence.reservation === undefined },
+  { type: "side-effect-check", step: "HW1_CREATE", keys: ["code"], ok: (e) => e.code === "SIDE_EFFECT_CHECK_UNKNOWN" },
+  { type: "halt", step: "HW1_CREATE", keys: ["code"], ok: (e) => e.code === "SIDE_EFFECT_CHECK_UNKNOWN" },
+  { type: "reconcile", step: "HR_RECONCILE", keys: ["ref", "code"], ok: (e) => e.ref === TARGET.ref && e.code === "ITEM_RESERVATION_ID_INCONSISTENT" },
+  { type: "run-end", keys: ["code"], ok: (e) => e.code === "HALTED" }
+]);
 export function checkAttempt2Journal(entries) {
-  const no = (code) => ({ ok: false, code: `ATTEMPT2_JOURNAL_${code}` });
-  if (!Array.isArray(entries) || entries.length < 4 || !entries.every(isObj)) return no("SHAPE");
-  const first = entries[0], last = entries[entries.length - 1];
-  if (first.type !== "run-start" || first.manifestHash !== TARGET.attempt2Hash) return no("NOT_ATTEMPT2");
-  if (!Array.isArray(first.refs) || !first.refs.includes(TARGET.ref)) return no("REF_NOT_IN_RUN");
-  if (entries.filter((e) => e.type === "run-start").length !== 1 || entries.filter((e) => e.type === "run-end").length !== 1) return no("SHAPE");
-  if (last.type !== "run-end" || last.code !== "HALTED") return no("NOT_HALTED");
+  const no = (code, i) => ({ ok: false, code: `ATTEMPT2_JOURNAL_${code}`, ...(i === undefined ? {} : { at: i }) });
+  if (!Array.isArray(entries) || !entries.every(isObj)) return no("SHAPE");
   if (entries.some((e) => e.step === "HW2_CANCEL" || e.kind === "cancel")) return no("CANCEL_ALREADY_ATTEMPTED");
-  const intents = entries.filter((e) => e.type === "intent");
-  if (intents.length !== 1 || intents[0].step !== "HW1_CREATE" || intents[0].kind !== "create" || intents[0].ref !== TARGET.ref) return no("CREATE_INTENT_UNEXPECTED");
-  const outcomes = entries.filter((e) => e.type === "outcome");
-  if (outcomes.length !== 1 || outcomes[0].step !== "HW1_CREATE" || outcomes[0].code !== "RESERVATION_ID_INCONSISTENT") return no("CREATE_OUTCOME_UNEXPECTED");
-  if (entries.indexOf(intents[0]) > entries.indexOf(outcomes[0])) return no("SHAPE");
+  if (entries.length !== ATTEMPT2_SEQUENCE.length) return no(entries.length < ATTEMPT2_SEQUENCE.length ? "TRUNCATED_OR_SHORT" : "UNEXPECTED_EXTRA_RECORDS");
+  for (let i = 0; i < ATTEMPT2_SEQUENCE.length; i++) {
+    const want = ATTEMPT2_SEQUENCE[i], e = entries[i];
+    if (e.type !== want.type || e.step !== want.step) return no("UNEXPECTED_RECORD", i);
+    // The reviewed createGate appends the write INTENT directly (no jappend/now()), so the authentic intent has NO `at`;
+    // every other record is written via jappend and carries one. Exactly that shape is accepted.
+    const allowed = ["type", ...(want.noAt ? [] : ["at"]), ...(want.step ? ["step"] : []), ...want.keys];
+    if (Object.keys(e).some((k) => !allowed.includes(k))) return no("UNKNOWN_FIELD", i);
+    if (!want.noAt) {
+      const prev = entries.slice(0, i).reverse().find((x) => typeof x.at === "string");
+      if (typeof e.at !== "string" || !ISO.test(e.at) || (prev && e.at < prev.at)) return no("TIMESTAMP_INVALID", i);
+    }
+    if (!want.ok(e, entries)) return no("RECORD_MISMATCH", i);
+  }
   return { ok: true, code: "ATTEMPT2_JOURNAL_CANCEL_UNUSED" };
 }
 
@@ -210,16 +238,19 @@ export async function runRecovery({ transport, journal, now, timeoutMs = DEFAULT
   const T = TARGET;
   const state = { halted: false, readOnly: false, readableIds: new Set([T.reservationId]), cancellableId: null };
   const report = { status: "RUNNING", version: RECOVERY_VERSION, recoveryHash: RECOVERY_HASH, steps: [], cancel: { sent: false, code: null },
-    sideEffectsBefore: null, sideEffectsAfter: null, postcancelStatus: null, postcancelIdentityOk: false, calendar: null, halt: null };
+    sideEffectsBefore: null, sideEffectsAfter: null, postcancelStatus: null, postcancelIdentityOk: false, calendar: null, halt: null,
+    journalDurable: true, journalFailures: [], runEndRecorded: false };
   const san = (e) => sanitizeJournalEntry(e, { steps: RECOVERY_STEPS });
   const jappend = (e) => journal.append(san({ ...e, at: now().toISOString() }));
   try { jappend({ type: "run-start", manifestHash: RECOVERY_HASH, refs: [T.ref] }); }
-  catch { return { ...report, status: "REFUSED", halt: { step: "R0", code: "JOURNAL_WRITE_FAILED" }, requests: 0 }; }
+  catch { return { ...report, status: "REFUSED", halt: { step: "R0", code: "JOURNAL_WRITE_FAILED" }, journalDurable: false, journalFailures: ["RUN_START"], requests: 0 }; }
   const gate = createGate({ transport, journal, timeoutMs, state, budgets: RECOVERY_STEPS, writeBudget: WRITE_BUDGET });
   let direct = 0;
   const send = (req) => { direct++; return withTimeout(() => Promise.resolve(transport.send(req)).then((r) => r, () => ({ transportError: true })),
     timeoutMs, { transportError: true }); };
-  const safe = (e) => { try { jappend(e); return true; } catch { return false; } };
+  // Every journal append failure LATCHES: the run can never again report a clean/durable result (no retry, no extra write).
+  const latch = (step) => { report.journalDurable = false; if (report.journalFailures.length < 16) report.journalFailures.push(step ?? "UNKNOWN"); };
+  const safe = (e) => { try { jappend(e); return true; } catch { latch(e && e.step ? e.step : e && e.type === "run-end" ? "RUN_END" : undefined); return false; } };
   const halt = (step, code) => {
     state.halted = true; state.cancellableId = null;          // the gate may already have latched halted itself
     if (report.halt) return;
@@ -273,7 +304,10 @@ export async function runRecovery({ transport, journal, now, timeoutMs = DEFAULT
       resp = await gate.send("W1_CANCEL", { method: "PUT", path: `/reservations/${T.reservationId}/statuses/cancelled`, query: {}, body: CANCEL_BODY },
         { writeKind: "cancel", intent: { reservationId: T.reservationId, ref: T.ref } });
       report.cancel.sent = true;
-    } catch (e) { report.cancel.code = e instanceof RunnerError ? e.code : "INTERNAL_ERROR"; }
+    } catch (e) {
+      report.cancel.code = e instanceof RunnerError ? e.code : "INTERNAL_ERROR";
+      if (report.cancel.code === "JOURNAL_WRITE_FAILED") latch("W1_CANCEL");       // the write-ahead intent was not durable
+    }
     state.cancellableId = null;                                     // one attempt, whatever happened
     if (resp) {
       const p = parseReservationResponse(resp, "CANCEL");
@@ -299,8 +333,11 @@ export async function runRecovery({ transport, journal, now, timeoutMs = DEFAULT
   }
   const verified = report.cancel.code === "VERIFIED_CANCELLED" && report.postcancelIdentityOk === true && report.postcancelStatus === "cancelled";
   report.status = verified ? "CANCELLED_VERIFIED" : "HALTED";
-  report.allPostChecksPassed = verified && !!report.sideEffectsAfter?.ok && report.calendar === "CALENDAR_REOPENED";
-  safe({ type: "run-end", code: report.status === "HALTED" ? "HALTED" : "COMPLETED" });
+  report.runEndRecorded = safe({ type: "run-end", code: report.status === "HALTED" || !report.journalDurable ? "HALTED" : "COMPLETED" });
+  // Provider verification stays reported truthfully (status), but a clean result also requires a durable journal,
+  // including the terminal run-end record.
+  report.allPostChecksPassed = verified && !!report.sideEffectsAfter?.ok && report.calendar === "CALENDAR_REOPENED" &&
+    report.journalDurable && report.runEndRecorded;
   report.requests = gate.requestCount() + direct;
   return report;
 }
@@ -347,7 +384,9 @@ export async function runRecoveryCli(argv, deps = {}) {
     const guard = guardFetch(deps.fetchImpl ?? globalThis.fetch);
     const transport = createHostawayTransport({ fetchImpl: guard.guarded, getCredentials, ...(deps.sleep ? { sleep: deps.sleep } : {}) });
     const r = await runRecovery({ transport, journal, now: deps.now ?? (() => new Date()), ...(deps.timeoutMs ? { timeoutMs: deps.timeoutMs } : {}) });
-    const output = Object.freeze({ ok: r.status === "CANCELLED_VERIFIED" && r.allPostChecksPassed, mode: "cancel-only-recovery", reviewedCommit,
+    const ok = r.status === "CANCELLED_VERIFIED" && r.allPostChecksPassed === true && r.journalDurable === true && r.runEndRecorded === true;
+    const output = Object.freeze({ ok, mode: "cancel-only-recovery", reviewedCommit,
+      journalDurable: r.journalDurable === true, runEndRecorded: r.runEndRecorded === true, journalFailures: r.journalFailures ?? [],
       status: r.status, allPostChecksPassed: !!r.allPostChecksPassed, target: { reservationId: TARGET.reservationId, ref: TARGET.ref },
       halt: r.halt, cancel: r.cancel, steps: r.steps, sideEffectsBefore: r.sideEffectsBefore, sideEffectsAfter: r.sideEffectsAfter,
       postcancelStatus: r.postcancelStatus, postcancelIdentityOk: r.postcancelIdentityOk, calendar: r.calendar, requests: r.requests, guard: guard.used(), recoveryJournalFile: recoveryFile });

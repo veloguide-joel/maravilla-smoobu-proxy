@@ -89,7 +89,7 @@ const A2 = [
   { type: "run-start", runId: "0123456789abcdef", manifestHash: TARGET.attempt2Hash, refs: ["MV-PROBE1234", "MV-OTHL9CQU"], at: at("00.100") },
   { type: "read", step: "P0_PREFLIGHT_PRICE", kind: "calc", code: "PRICE_OK", observedTotalMinor: 25000, httpStatus: 200, at: at("01.000") },
   { type: "read", step: "P1_PREFLIGHT_CLEAR", kind: "lookup", code: "NOT_FOUND_NON_AUTHORITATIVE", ref: "MV-PROBE1234", itemsSeen: 0, at: at("02.000") },
-  { type: "intent", step: "HW1_CREATE", kind: "create", ref: "MV-OTHL9CQU", from: "2027-03-10", to: "2027-03-12", totalMinor: 25000, at: at("03.000") },
+  { type: "intent", step: "HW1_CREATE", kind: "create", ref: "MV-OTHL9CQU", from: "2027-03-10", to: "2027-03-12", totalMinor: 25000 }, // gate-written: no `at` (source-authentic)
   { type: "outcome", step: "HW1_CREATE", kind: "create", ref: "MV-OTHL9CQU", code: "RESERVATION_ID_INCONSISTENT", evidence: { outcome: "ambiguous", code: "RESERVATION_ID_INCONSISTENT", httpStatus: 200 }, at: at("04.000") },
   { type: "side-effect-check", step: "HW1_CREATE", code: "SIDE_EFFECT_CHECK_UNKNOWN", at: at("04.100") },
   { type: "halt", step: "HW1_CREATE", code: "SIDE_EFFECT_CHECK_UNKNOWN", at: at("04.200") },
@@ -243,6 +243,69 @@ test("post-cancel checks are reported, never acted on: calendar not reopened / n
 test("journal: if the cancel intent cannot be written durably, nothing is sent", async () => {
   const { r, w } = await run(world(), memJournal((e) => e.type === "intent"));
   assert.deepEqual([puts(w).length, r.cancel.sent, r.status, r.halt.step], [0, false, "HALTED", "W1_CANCEL"]);
+  assert.deepEqual([r.journalDurable, r.journalFailures, r.allPostChecksPassed], [false, ["W1_CANCEL"], false]);
+});
+
+test("attempt-2 journal (strict): only the exact reviewed ad5510f sequence, fields and bindings; anything else refused", () => {
+  const set = (i, over) => A2.map((e, k) => (k === i ? { ...e, ...over } : e));
+  const drop = (i, key) => A2.map((e, k) => { if (k !== i) return e; const c = { ...e }; delete c[key]; return c; });
+  const ins = (i, e) => [...A2.slice(0, i), e, ...A2.slice(i)];
+  const bad = {
+    "unknown type": ins(5, { type: "probe", step: "HW1_CREATE", at: at("04.050") }),
+    "unknown step": set(1, { step: "P9_UNKNOWN" }),
+    "unknown field": set(3, { forceOverbooking: true }),
+    "intent from": set(3, { from: "2027-03-11" }), "intent to": set(3, { to: "2027-03-13" }), "intent total": set(3, { totalMinor: 26000 }),
+    "intent kind": set(3, { kind: "cancel" }), "intent ref": set(3, { ref: "MV-ZZZZZZZZ" }),
+    "outcome ref": set(4, { ref: "MV-ZZZZZZZZ" }), "outcome kind": set(4, { kind: "read" }), "outcome code": set(4, { code: "VERIFIED_CREATED" }),
+    "outcome with id": set(4, { evidence: { outcome: "ambiguous", code: "RESERVATION_ID_INCONSISTENT", httpStatus: 200, reservationId: 70636076 } }),
+    "outcome evidence created": set(4, { evidence: { outcome: "created", code: "VERIFIED_CREATED", httpStatus: 200 } }),
+    "outcome transport": set(4, { transport: "TIMEOUT" }), "outcome http 5xx": set(4, { evidence: { outcome: "ambiguous", code: "RESERVATION_ID_INCONSISTENT", httpStatus: 503 } }),
+    "probe ref in intent position": set(0, { refs: ["MV-OTHL9CQU", "MV-PROBE1234"] }), "three refs": set(0, { refs: ["MV-PROBE1234", "MV-OTHL9CQU", "MV-EXTRA123"] }),
+    "price not ok": set(1, { code: "PRICE_TOTAL_NOT_EXACT" }), "items seen": set(2, { itemsSeen: 1 }),
+    "halt other": set(6, { code: "CREATE_NOT_VERIFIED:RESERVATION_ID_INCONSISTENT" }), "side-effect missing": A2.filter((e, k) => k !== 5),
+    "reconcile missing": A2.filter((e, k) => k !== 7), "second reconcile": ins(8, A2[7]), "reordered": [A2[0], A2[2], A2[1], ...A2.slice(3)],
+    "truncated": A2.slice(0, 7), "extra trailing": [...A2, A2[8]], "potential write after halt": ins(7, { ...A2[3], at: at("04.250") }),
+    "timestamp backwards": set(4, { at: at("01.500") }), "timestamp format": set(2, { at: "2026-10-23T15:28:02Z" }),
+    "run-end completed": set(8, { code: "COMPLETED" }), "runId invalid": set(0, { runId: "xyz" }), "missing at": drop(1, "at"),
+    "intent with fabricated at": set(3, { at: at("03.000") }), "outcome missing at": drop(4, "at")
+  };
+  for (const [name, es] of Object.entries(bad)) assert.equal(checkAttempt2Journal(es).ok, false, name);
+  assert.equal(checkAttempt2Journal(A2).ok, true);
+});
+
+test("durability: ANY journal append failure after the cancel latches — status stays truthful, but never ok/allPostChecksPassed; no extra write", async () => {
+  const failOn = {
+    "outcome": (e) => e.type === "outcome",
+    "post-cancel read": (e) => e.type === "read" && e.step === "R5_POSTCANCEL",
+    "side effects after": (e) => e.type === "side-effect-check" && e.step === "R6_SIDE_EFFECTS_AFTER",
+    "calendar read": (e) => e.type === "read" && e.step === "R7_CALENDAR",
+    "run-end": (e) => e.type === "run-end"
+  };
+  for (const [name, f] of Object.entries(failOn)) {
+    const { r, w } = await run(world(), memJournal(f));
+    assert.equal(puts(w).length, 1, name);
+    assert.equal(r.journalDurable, false, name);
+    assert.equal(r.allPostChecksPassed, false, name);
+    assert.ok(r.journalFailures.length >= 1, name);
+    if (name === "run-end") assert.deepEqual([r.runEndRecorded, r.journalFailures], [false, ["RUN_END"]]);
+    if (name === "outcome") assert.equal(r.halt.code, "JOURNAL_WRITE_FAILED");
+    assert.ok(["CANCELLED_VERIFIED", "HALTED"].includes(r.status), name);
+  }
+  const ok = await run(world());
+  assert.deepEqual([ok.r.journalDurable, ok.r.runEndRecorded, ok.r.journalFailures, ok.r.allPostChecksPassed], [true, true, [], true]);
+  const startFail = await run(world(), memJournal((e) => e.type === "run-start"));
+  assert.deepEqual([startFail.r.status, startFail.r.journalDurable, puts(startFail.w).length, startFail.w.log.length], ["REFUSED", false, 0, 0]);
+});
+
+test("cli: a durability failure (run-end / post-cancel read) is never ok and never exit 0, even though the provider cancel verified", async () => {
+  for (const f of [(e) => e.type === "run-end", (e) => e.type === "read" && e.step === "R5_POSTCANCEL"]) {
+    const dir = folder();
+    const w = world();
+    const r = await runRecoveryCli(["--journal-dir", dir.jdir, "--confirm", CONFIRM_TOKEN, "--reviewed-commit", SHA], { git: git(), fetchImpl: w.fetchImpl, now: NOW,
+      sleep: async () => {}, timeoutMs: 200, prompt: async () => ({ accountId: FAKE.account, clientSecret: FAKE.secret }), createJournal: () => memJournal(f) });
+    assert.deepEqual([r.exitCode, r.output.ok, r.output.journalDurable, r.output.allPostChecksPassed, r.output.status], [RECOVERY_EXIT.HALTED, false, false, false, "CANCELLED_VERIFIED"]);
+    assert.equal(puts(w).length, 1);
+  }
 });
 
 // ---------- allowlist ----------
