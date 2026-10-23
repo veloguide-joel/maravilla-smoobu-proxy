@@ -36,12 +36,13 @@ export function readHiddenLine({ input, output, label }) {
       for (const ch of String(chunk)) {
         // Terminal escape sequences are never part of the value: bracketed paste markers (ESC[200~ / ESC[201~),
         // arrow/function keys (ESC[A, ESC[1;5C, ESCOP ...). Their printable tail used to be kept (E4 corrective).
+        // Ctrl-C / Ctrl-D abort FIRST, in every state, so a partial escape sequence can never swallow an abort.
+        if (ch === "\u0003" || ch === "\u0004") return finish(new CredentialPromptError("ABORTED"));
         if (esc === 1) { esc = ch === "[" ? 2 : ch === "O" ? 3 : 0; continue; }
         if (esc === 2) { if (ch >= "@" && ch <= "~") esc = 0; continue; }
         if (esc === 3) { esc = 0; continue; }
         if (ch === "\u001b") { esc = 1; continue; }
         if (ch === "\r" || ch === "\n") return finish();
-        if (ch === "\u0003" || ch === "\u0004") return finish(new CredentialPromptError("ABORTED"));
         if (ch === "\u007f" || ch === "\b") { value = value.slice(0, -1); continue; }
         if (ch < " ") continue;                       // other control characters are ignored
         if (value.length >= MAX_LEN) return finish(new CredentialPromptError("INPUT_TOO_LONG"));

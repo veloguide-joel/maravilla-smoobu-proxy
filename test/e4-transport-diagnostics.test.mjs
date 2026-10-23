@@ -152,4 +152,27 @@ test("prompt: bracketed paste markers, arrow/function keys and Alt-sequences are
   assert.ok(!(await typed(["\x1b[200~FAKEsecret123\x1b[201~\r"])).written.includes("FAKE"), "still never echoed");
 });
 
+test("prompt: Ctrl-C / Ctrl-D abort in EVERY escape state (ESC, CSI, SS3), also split across chunks; raw mode restored, listener removed", async () => {
+  const cases = [
+    ["ESC then Ctrl-C", ["\x1b\x03"]], ["ESC then Ctrl-D", ["\x1b\x04"]],
+    ["CSI then Ctrl-C (root probe)", ["\x1b[\x03"]], ["CSI params then Ctrl-D", ["\x1b[20\x04"]],
+    ["SS3 then Ctrl-C", ["\x1bO\x03"]],
+    ["chunked: ESC | [ | Ctrl-C", ["FAKE\x1b", "[", "\x03"]], ["chunked: bracketed paste start | Ctrl-D", ["\x1b[200~FAKEsec", "ret\x04"]],
+    ["chunked: ESC | Ctrl-C", ["\x1b", "\x03"]]
+  ];
+  for (const [name, chunks] of cases) {
+    const input = tty();
+    const modes = [];
+    input.setRawMode = (on) => { modes.push(on); };
+    const written = [];
+    const p = readHiddenLine({ input, output: { write: (s) => written.push(String(s)) }, label: "x" });
+    for (const c of chunks) input.emit("data", Buffer.from(c));
+    const outcome = await Promise.race([p.then(() => "RESOLVED", (e) => e.code), new Promise((r) => setTimeout(() => r("ABORT_SWALLOWED"), 30))]);
+    assert.equal(outcome, "ABORTED", name);
+    assert.deepEqual(modes, [true, false], `${name}: raw mode restored`);
+    assert.equal(input.listenerCount("data"), 0, `${name}: listener removed`);
+    assert.ok(!written.join("").includes("FAKE"), `${name}: nothing echoed`);
+  }
+});
+
 test("no global fetch was used by any test in this file", () => { assert.equal(globalFetchCalls, 0); });
