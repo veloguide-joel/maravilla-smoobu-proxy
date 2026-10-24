@@ -308,3 +308,35 @@ test("diagnostic capture covers every read path: identity gate timeout, lookup i
   const thrower = await runPrecheck({ transport: { send: async () => ({ httpStatus: 503 }), usage: () => { throw new Error("PROVIDER-TEXT"); } }, timeoutMs: 20 });
   assert.equal(thrower.transportUsage, null); leakFree(thrower);
 });
+
+// ---------- root review of aa3b1ae: gate-synthesized failures on the LOOKUP path (inside reconcileAttempts) ----------
+const { createHostawayTransport } = await import("../scripts/e4-transport/hostaway-transport.mjs");
+function lookupFaultTransport(fault) {
+  const w = world();
+  const real = createHostawayTransport({ fetchImpl: w.fetchImpl, getCredentials: async () => ({ accountId: FAKE.account, clientSecret: FAKE.secret }), sleep: async () => {} });
+  const calls = [];
+  const t = { send: (req) => { calls.push(req.path); return req.path === "/reservations" ? fault() : real.send(req); }, usage: () => real.usage() };
+  return { t, calls };
+}
+for (const [name, fault, want] of [
+  ["hang (gate GATE_TIMEOUT)", () => new Promise(() => {}), { stage: "GATE", code: "GATE_TIMEOUT" }],
+  ["reject (gate TRANSPORT_THREW)", () => Promise.reject(new Error("PROVIDER-TEXT")), { stage: "GATE", code: "TRANSPORT_THREW" }],
+  // A SYNCHRONOUS throw escapes createGate as an exception (its withTimeout factory rejects before the TRANSPORT_THREW
+  // handler is attached); reconcileAttempts absorbs it as TRANSPORT_UNCERTAIN. There is no gate result to note, so no
+  // diagnostic is invented. The real transport's send is `async` and cannot throw synchronously.
+  ["sync throw (escapes the gate; no diagnostic invented)", () => { throw new Error("PROVIDER-TEXT"); }, null]]) {
+  test(`lookup-only ${name}: identity ok, later reads ok, transportDiag as specified`, async () => {
+    const { t, calls } = lookupFaultTransport(fault);
+    const o = await runPrecheck({ transport: t, timeoutMs: 50 });
+    assert.equal(o.identity.code, "IDENTITY_OK");
+    assert.equal(o.lookup.sameId, false);
+    assert.equal(o.lookup.code, "TRANSPORT_UNCERTAIN");
+    assert.deepEqual([o.charges, o.conversations.code, o.tasks.code, o.calendar.code], ["CHARGES_NONE", "CONVERSATIONS_COMPLETE", "TASKS_COMPLETE", "CALENDAR_READ"]);
+    assert.deepEqual(o.transportDiag, want);
+    assert.deepEqual(o.transportUsage.mintState, "ok");
+    assert.equal(calls.filter((p) => p === "/reservations").length, 1, "one lookup page sent; no retry");
+    assert.equal(o.requests, calls.length, "every runner-level call reached the transport exactly once (requests unchanged by decoration)");
+    assert.equal(o.precheckComplete, false);
+    leakFree(o);
+  });
+}

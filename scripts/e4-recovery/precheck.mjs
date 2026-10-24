@@ -105,13 +105,14 @@ export async function runPrecheck({ transport, timeoutMs = DEFAULT_TIMEOUT_MS })
   // changes control flow, triggers a retry or a re-mint.
   let firstDiag = null;
   const note = (r) => { if (firstDiag === null && r && r.transportError) { const d = sanitizeTransportDiag(r.diag); if (d) firstDiag = d; } return r; };
-  // Gate reads (identity, and the lookup pages inside reconcileAttempts): transport results are noted at the transport
-  // boundary; the gate's own synthesized timeout/throw results are noted where gate.send returns to this function.
-  const tracked = Object.freeze({ send: async (req) => note(await transport.send(req)) });
   const GATE_TIMEOUT = Object.freeze({ transportError: true, diag: Object.freeze({ stage: "GATE", code: "GATE_TIMEOUT" }) });
   const state = { halted: false, readOnly: true, readableIds: new Set([T.reservationId]), cancellableId: null };
   const noJournal = Object.freeze({ durable: false, load: () => [], append: () => { throw new RunnerError("PRECHECK_WRITES_NOTHING"); } });
-  const gate = createGate({ transport: tracked, journal: noJournal, timeoutMs, state, budgets: STEPS, writeBudget: NO_WRITES });
+  const rawGate = createGate({ transport, journal: noJournal, timeoutMs, state, budgets: STEPS, writeBudget: NO_WRITES });
+  // Every gate read (identity here, and the lookup pages sent by reconcileAttempts) is noted on the gate's RESULT, so the
+  // gate-synthesized GATE_TIMEOUT / TRANSPORT_THREW are seen as well as transport failures. Pure pass-through: same
+  // arguments, same result object, same throw; budgets, request counting, retries and flow stay the gate's own.
+  const gate = Object.freeze({ send: async (step, req) => note(await rawGate.send(step, req)), requestCount: () => rawGate.requestCount() });
   let direct = 0;
   // Direct reads: noted once here (covers the transport result and the locally synthesized throw/timeout results).
   const THREW = Object.freeze({ transportError: true, diag: Object.freeze({ stage: "GATE", code: "TRANSPORT_THREW" }) });
@@ -119,7 +120,7 @@ export async function runPrecheck({ transport, timeoutMs = DEFAULT_TIMEOUT_MS })
   const out = {};
   // identity
   let resp;
-  try { resp = note(await gate.send("C1_IDENTITY", { method: "GET", path: `/reservations/${T.reservationId}`, query: READ_QUERY })); } catch { resp = { transportError: true, code: "GATE" }; }
+  try { resp = await gate.send("C1_IDENTITY", { method: "GET", path: `/reservations/${T.reservationId}`, query: READ_QUERY }); } catch { resp = { transportError: true, code: "GATE" }; }
   const p = parseReservationResponse(resp, "READ");
   const mm = p.ok ? identityMismatches(p.reservation, { reservationId: T.reservationId, listingId: T.listingId, from: T.from, to: T.to,
     totalMinor: T.totalMinor, currency: T.currency, channelId: T.channelId, bookingRef: T.ref, status: "new" }) : [];
