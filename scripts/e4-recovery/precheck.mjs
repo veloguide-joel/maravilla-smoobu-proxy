@@ -28,7 +28,7 @@ import { readJournalFile, journalFileName } from "../e4-write-runner/journal.mjs
 import { TARGET, BASELINE, RECOVERY_HASH, LIST_LIMIT, LIST_MAX_PAGES, LOOKUP_PAGES, checkAttempt2Journal, traverseList } from "./cancel-only.mjs";
 
 const ROOT = resolve(fileURLToPath(new URL("../..", import.meta.url)));
-export const PRECHECK_SOURCES = Object.freeze([...EXECUTE_SOURCES, "scripts/e4-recovery/cancel-only.mjs", "scripts/e4-recovery/precheck.mjs"]);
+export const PRECHECK_SOURCES = Object.freeze([...EXECUTE_SOURCES, "scripts/e4-connected/safeguards.mjs", "scripts/e4-recovery/cancel-only.mjs", "scripts/e4-recovery/precheck.mjs"]);
 export const PRECHECK_EXIT = Object.freeze({ OK: 0, USAGE: 64, REFUSED: 2, INCOMPLETE: 3, INTERNAL: 70 });
 const STEPS = Object.freeze({ C1_IDENTITY: Object.freeze({ reads: 1, writes: 0 }), C2_LOOKUP: Object.freeze({ reads: LOOKUP_PAGES, writes: 0 }) });
 const NO_WRITES = Object.freeze({ create: 0, cancel: 0 });

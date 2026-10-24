@@ -20,6 +20,11 @@
 //   W1 ONE host cancel (write-ahead intent in the recovery journal; one attempt; reply must show the same identity,
 //      cancelled). Ambiguous/failed => HALT; never retried.
 //   R5 read by id after (cancelled?)   R6 side effects AFTER (same rules; reported)   R7 calendar 2027-03-10/11 (reported)
+//   R8 (only if R7 is not reopened AND R5 independently read `cancelled`): bounded read-only calendar observation
+//      (safeguards.observeSync: N consecutive confirming reads, overall deadline, read cap). Never a write, never a retry.
+// Three results are reported SEPARATELY and never merged: the cancel COMMAND REPLY (code, httpStatus, mismatching identity
+// field NAMES), the independent FINAL STATE read (R5), and the calendar (immediate R7, then delayed R8). A command reply
+// that does not show the full identity with `cancelled` keeps status HALTED / ok false whatever R5..R8 show.
 // Output: codes, booleans, counts and ids of the fixed target only. Never provider bodies, guest data, the channel
 // reservation identifier, conversation/task contents, tokens or error text.
 // Residuals: list reads are sequential, not an atomic snapshot; a concurrent change between pages can go undetected
@@ -38,10 +43,11 @@ import {
 } from "../e4-write-runner/runner.mjs";
 import { evaluateSideEffectResponse, sideEffectRequest, SIDE_EFFECT_SOURCES } from "../e4-write-runner/side-effects.mjs";
 import { createFileJournal, readJournalFile, journalFileName } from "../e4-write-runner/journal.mjs";
+import { observeSync, realTimer } from "../e4-connected/safeguards.mjs";
 
 const ROOT = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 export const RECOVERY_VERSION = "e4-cancel-only-v1";
-export const RECOVERY_SOURCES = Object.freeze([...EXECUTE_SOURCES, "scripts/e4-recovery/cancel-only.mjs"]);
+export const RECOVERY_SOURCES = Object.freeze([...EXECUTE_SOURCES, "scripts/e4-connected/safeguards.mjs", "scripts/e4-recovery/cancel-only.mjs"]);
 export const RECOVERY_EXIT = Object.freeze({ OK: 0, USAGE: 64, REFUSED: 2, HALTED: 3, INTERNAL: 70 });
 export const TARGET = Object.freeze({
   attempt2Hash: "f34575db1138082472d4fe63ac2b29f464043e0ca2c0287b6a37c828bb20e112",
@@ -53,6 +59,9 @@ export const BASELINE = Object.freeze({ conversations: Object.freeze([55098382])
 export const LIST_LIMIT = 100;          // requested page size; completeness never assumes the server honoured it
 export const LIST_MAX_PAGES = 3;        // per list per pass (terminal empty page included)
 export const LOOKUP_PAGES = 5;          // = adapter LOOKUP_MAX_PAGES (asserted in tests)
+// Delayed calendar observation after a cancel (read-only): first read at once, then every 5 s; 2 consecutive "open"
+// reads needed; at most 10 reads and 60 s overall. A timeout or cap concludes nothing.
+export const SETTLE = Object.freeze({ intervalMs: 5000, timeoutMs: 60000, maxReads: 10, confirmReads: 2 });
 export const RECOVERY_HASH = createHash("sha256").update(`${RECOVERY_VERSION}:${TARGET.attempt2Hash}:${TARGET.reservationId}:${TARGET.ref}`).digest("hex");
 export const CONFIRM_TOKEN = `E4-RECOVER-${RECOVERY_HASH.slice(0, 12)}`;
 export const RECOVERY_STEPS = Object.freeze({
@@ -63,7 +72,8 @@ export const RECOVERY_STEPS = Object.freeze({
   W1_CANCEL: Object.freeze({ reads: 0, writes: 1, kind: "cancel", executable: true }),
   R5_POSTCANCEL: Object.freeze({ reads: 1, writes: 0 }),
   R6_SIDE_EFFECTS_AFTER: Object.freeze({ reads: 1 + 2 * LIST_MAX_PAGES, writes: 0 }),
-  R7_CALENDAR: Object.freeze({ reads: 1, writes: 0 })
+  R7_CALENDAR: Object.freeze({ reads: 1, writes: 0 }),
+  R8_CALENDAR_SETTLE: Object.freeze({ reads: SETTLE.maxReads, writes: 0 })
 });
 const WRITE_BUDGET = Object.freeze({ create: 0, cancel: 1 });
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -194,6 +204,20 @@ export function evaluateCalendar(resp) {
   return days.every((d) => d.status === "available" && (d.isAvailable === 1 || d.isAvailable === true)) ? "CALENDAR_REOPENED" : "CALENDAR_NOT_REOPENED";
 }
 
+const CAL_STATUSES = Object.freeze(["available", "reserved", "pending", "blocked", "hardBlock", "mreserved", "mblocked", "conflicted"]);
+/** Per-night state codes for exactly TARGET.nights, built only from enums: NIGHT_<STATUS|OTHER|MISSING>_<TRUE|FALSE|OTHER>. */
+export function calendarNightCodes(resp) {
+  const ok = isObj(resp) && !resp.transportError && resp.httpStatus === 200 && isObj(resp.json) && resp.json.status === "success" && Array.isArray(resp.json.result);
+  if (!ok) return null;
+  return TARGET.nights.map((date) => {
+    const d = resp.json.result.filter((x) => isObj(x) && x.date === date);
+    if (d.length !== 1) return { date, code: d.length ? "NIGHT_DUPLICATED" : "NIGHT_MISSING" };
+    const st = CAL_STATUSES.includes(d[0].status) ? d[0].status.toUpperCase() : "OTHER";
+    const av = d[0].isAvailable === 1 || d[0].isAvailable === true ? "TRUE" : d[0].isAvailable === 0 || d[0].isAvailable === false ? "FALSE" : "OTHER";
+    return { date, code: `NIGHT_${st}_${av}` };
+  });
+}
+
 // ---------------------------------------------------------------------------------------------
 // Network allowlist (defence in depth under the gate): exact method + path + query sets, each with a hard count.
 
@@ -213,7 +237,7 @@ export function guardFetch(fetchImpl) {
     ...["conversations", "tasks"].map((n) => ({ name: n, max: 2 * LIST_MAX_PAGES, m: "GET", path: `/v1/${n}`,
       q: (p) => [...p.keys()].length === 3 && p.get("reservationId") === String(R) && p.get("limit") === String(LIST_LIMIT) && /^(0|[1-9]\d{0,3})$/.test(p.get("offset") ?? "") })),
     { name: "cancel", max: 1, m: "PUT", path: `/v1/reservations/${R}/statuses/cancelled`, q: (p) => [...p.keys()].length === 0, body: true },
-    { name: "calendar", max: 1, m: "GET", path: `/v1/listings/${TARGET.listingId}/calendar`, q: exact({ startDate: TARGET.nights[0], endDate: TARGET.nights[1] }) }
+    { name: "calendar", max: 1 + SETTLE.maxReads, m: "GET", path: `/v1/listings/${TARGET.listingId}/calendar`, q: exact({ startDate: TARGET.nights[0], endDate: TARGET.nights[1] }) }
   ];
   const used = Object.fromEntries(rules.map((r) => [r.name, 0]));
   let refused = 0;
@@ -234,11 +258,12 @@ export function guardFetch(fetchImpl) {
 // ---------------------------------------------------------------------------------------------
 // The run (transport + journal injected; no file or network access of its own)
 
-export async function runRecovery({ transport, journal, now, timeoutMs = DEFAULT_TIMEOUT_MS }) {
+export async function runRecovery({ transport, journal, now, timeoutMs = DEFAULT_TIMEOUT_MS, startTimer = realTimer, clock = () => Date.now(), settle = SETTLE }) {
   const T = TARGET;
   const state = { halted: false, readOnly: false, readableIds: new Set([T.reservationId]), cancellableId: null };
   const report = { status: "RUNNING", version: RECOVERY_VERSION, recoveryHash: RECOVERY_HASH, steps: [], cancel: { sent: false, code: null },
     sideEffectsBefore: null, sideEffectsAfter: null, postcancelStatus: null, postcancelIdentityOk: false, calendar: null, halt: null,
+    finalState: null, calendarImmediate: null, calendarSettled: null, calendarFinal: null,
     journalDurable: true, journalFailures: [], runEndRecorded: false };
   const san = (e) => sanitizeJournalEntry(e, { steps: RECOVERY_STEPS });
   const jappend = (e) => journal.append(san({ ...e, at: now().toISOString() }));
@@ -251,11 +276,11 @@ export async function runRecovery({ transport, journal, now, timeoutMs = DEFAULT
   // Every journal append failure LATCHES: the run can never again report a clean/durable result (no retry, no extra write).
   const latch = (step) => { report.journalDurable = false; if (report.journalFailures.length < 16) report.journalFailures.push(step ?? "UNKNOWN"); };
   const safe = (e) => { try { jappend(e); return true; } catch { latch(e && e.step ? e.step : e && e.type === "run-end" ? "RUN_END" : undefined); return false; } };
-  const halt = (step, code) => {
+  const halt = (step, code, extra = {}) => {
     state.halted = true; state.cancellableId = null;          // the gate may already have latched halted itself
     if (report.halt) return;
-    report.halt = { step, code };
-    safe({ type: "halt", step, code });
+    report.halt = { step, code, ...extra };
+    safe({ type: "halt", step, code, ...extra });
   };
   const expected = (status) => ({ reservationId: T.reservationId, listingId: T.listingId, from: T.from, to: T.to, totalMinor: T.totalMinor,
     currency: T.currency, channelId: T.channelId, bookingRef: T.ref, status });
@@ -309,14 +334,19 @@ export async function runRecovery({ transport, journal, now, timeoutMs = DEFAULT
       if (report.cancel.code === "JOURNAL_WRITE_FAILED") latch("W1_CANCEL");       // the write-ahead intent was not durable
     }
     state.cancellableId = null;                                     // one attempt, whatever happened
+    let mm = [];
     if (resp) {
       const p = parseReservationResponse(resp, "CANCEL");
-      const mm = p.ok ? identityMismatches(p.reservation, expected("cancelled")) : [];
+      mm = p.ok ? identityMismatches(p.reservation, expected("cancelled")) : [];
       report.cancel.code = !p.ok ? p.code : mm.length ? "CANCEL_RESPONSE_MISMATCH" : "VERIFIED_CANCELLED";
+      // The command reply is reported on its own: code, HTTP status and the NAMES of mismatching identity fields (never values).
+      if (p.httpStatus) report.cancel.httpStatus = p.httpStatus;
+      if (mm.length) report.cancel.mismatches = mm;
       if (!safe({ type: "outcome", step: "W1_CANCEL", kind: "cancel", reservationId: T.reservationId, code: report.cancel.code,
-        ...(p.httpStatus ? { httpStatus: p.httpStatus } : {}), ...(resp.transportError ? { transport: resp.code } : {}) })) halt("W1_CANCEL", "JOURNAL_WRITE_FAILED");
+        ...(p.httpStatus ? { httpStatus: p.httpStatus } : {}), ...(resp.transportError ? { transport: resp.code } : {}),
+        ...(mm.length ? { mismatches: mm } : {}) })) halt("W1_CANCEL", "JOURNAL_WRITE_FAILED");
     }
-    if (report.cancel.code !== "VERIFIED_CANCELLED") halt("W1_CANCEL", report.cancel.code ?? "CANCEL_NOT_VERIFIED");
+    if (report.cancel.code !== "VERIFIED_CANCELLED") halt("W1_CANCEL", report.cancel.code ?? "CANCEL_NOT_VERIFIED", mm.length ? { mismatches: mm } : {});
   }
   state.readOnly = true;
   // R5..R7: read-only verification (also after an ambiguous cancel: reads only)
@@ -324,19 +354,40 @@ export async function runRecovery({ transport, journal, now, timeoutMs = DEFAULT
     const r5 = await readId("R5_POSTCANCEL", "cancelled");
     report.postcancelStatus = r5 && r5.reservation ? r5.reservation.status : null;
     report.postcancelIdentityOk = !!(r5 && r5.ok);
+    const r5mm = report.steps.find((x) => x.step === "R5_POSTCANCEL")?.mismatches;
+    report.finalState = { code: r5 ? r5.code : "NOT_READ", status: report.postcancelStatus, identityOk: report.postcancelIdentityOk, ...(r5mm ? { mismatches: r5mm } : {}) };
     report.sideEffectsAfter = await sideEffects("R6_SIDE_EFFECTS_AFTER");
-    let cal;
-    try { cal = await send({ method: "GET", path: `/listings/${T.listingId}/calendar`, query: { startDate: T.nights[0], endDate: T.nights[1] } }); }
-    catch { cal = { transportError: true }; }
+    const calendarRead = async () => {
+      try { return await send({ method: "GET", path: `/listings/${T.listingId}/calendar`, query: { startDate: T.nights[0], endDate: T.nights[1] } }); }
+      catch { return { transportError: true }; }
+    };
+    const cal = await calendarRead();
     report.calendar = evaluateCalendar(cal);
+    const nights = calendarNightCodes(cal);
+    report.calendarImmediate = { code: report.calendar, ...(nights ? { nights } : {}) };
     safe({ type: "read", step: "R7_CALENDAR", kind: "read", code: report.calendar });
+    for (const n of nights ?? []) safe({ type: "read", step: "R7_CALENDAR", kind: "read", code: n.code, from: n.date });
+    report.calendarFinal = report.calendar;
+    // R8: delayed, read-only observation; only when the immediate read is not reopened AND the independent final state is
+    // cancelled with full identity (otherwise no reopening is expected and nothing is polled).
+    if (report.calendar !== "CALENDAR_REOPENED" && report.postcancelIdentityOk && report.postcancelStatus === "cancelled") {
+      let o;
+      try {
+        o = await observeSync({ readCalendar: calendarRead, nights: [...T.nights], expect: "open", intervalMs: settle.intervalMs, timeoutMs: settle.timeoutMs,
+          maxReads: settle.maxReads, confirmReads: settle.confirmReads, startTimer, now: clock });
+      } catch { o = { code: "SETTLE_INTERNAL_ERROR", reads: 0, history: [] }; }
+      report.calendarSettled = { code: o.code, reads: o.reads, history: o.history, ...(o.observedAfterMs !== undefined ? { observedAfterMs: o.observedAfterMs } : {}) };
+      safe({ type: "read", step: "R8_CALENDAR_SETTLE", kind: "read", code: `SETTLE_${o.code}`, itemsSeen: Math.min(o.reads, 500) });
+      if (o.code === "OBSERVED_STABLE") report.calendarFinal = "CALENDAR_REOPENED_DELAYED";
+    }
   }
   const verified = report.cancel.code === "VERIFIED_CANCELLED" && report.postcancelIdentityOk === true && report.postcancelStatus === "cancelled";
   report.status = verified ? "CANCELLED_VERIFIED" : "HALTED";
   report.runEndRecorded = safe({ type: "run-end", code: report.status === "HALTED" || !report.journalDurable ? "HALTED" : "COMPLETED" });
   // Provider verification stays reported truthfully (status), but a clean result also requires a durable journal,
   // including the terminal run-end record.
-  report.allPostChecksPassed = verified && !!report.sideEffectsAfter?.ok && report.calendar === "CALENDAR_REOPENED" &&
+  // Delayed reopening (R8 OBSERVED_STABLE) counts as reopened, but only on top of a VERIFIED command reply and final state.
+  report.allPostChecksPassed = verified && !!report.sideEffectsAfter?.ok && ["CALENDAR_REOPENED", "CALENDAR_REOPENED_DELAYED"].includes(report.calendarFinal) &&
     report.journalDurable && report.runEndRecorded;
   report.requests = gate.requestCount() + direct;
   return report;
@@ -383,13 +434,16 @@ export async function runRecoveryCli(argv, deps = {}) {
     journal = (deps.createJournal ?? createFileJournal)(jdir, RECOVERY_HASH);
     const guard = guardFetch(deps.fetchImpl ?? globalThis.fetch);
     const transport = createHostawayTransport({ fetchImpl: guard.guarded, getCredentials, ...(deps.sleep ? { sleep: deps.sleep } : {}) });
-    const r = await runRecovery({ transport, journal, now: deps.now ?? (() => new Date()), ...(deps.timeoutMs ? { timeoutMs: deps.timeoutMs } : {}) });
+    const r = await runRecovery({ transport, journal, now: deps.now ?? (() => new Date()), ...(deps.timeoutMs ? { timeoutMs: deps.timeoutMs } : {}),
+      ...(deps.startTimer ? { startTimer: deps.startTimer } : {}), ...(deps.clock ? { clock: deps.clock } : {}), ...(deps.settle ? { settle: deps.settle } : {}) });
     const ok = r.status === "CANCELLED_VERIFIED" && r.allPostChecksPassed === true && r.journalDurable === true && r.runEndRecorded === true;
     const output = Object.freeze({ ok, mode: "cancel-only-recovery", reviewedCommit,
       journalDurable: r.journalDurable === true, runEndRecorded: r.runEndRecorded === true, journalFailures: r.journalFailures ?? [],
       status: r.status, allPostChecksPassed: !!r.allPostChecksPassed, target: { reservationId: TARGET.reservationId, ref: TARGET.ref },
       halt: r.halt, cancel: r.cancel, steps: r.steps, sideEffectsBefore: r.sideEffectsBefore, sideEffectsAfter: r.sideEffectsAfter,
-      postcancelStatus: r.postcancelStatus, postcancelIdentityOk: r.postcancelIdentityOk, calendar: r.calendar, requests: r.requests, guard: guard.used(), recoveryJournalFile: recoveryFile });
+      postcancelStatus: r.postcancelStatus, postcancelIdentityOk: r.postcancelIdentityOk, calendar: r.calendar,
+      commandReply: r.cancel, finalState: r.finalState, calendarImmediate: r.calendarImmediate, calendarSettled: r.calendarSettled, calendarFinal: r.calendarFinal,
+      requests: r.requests, guard: guard.used(), recoveryJournalFile: recoveryFile });
     return { exitCode: output.ok ? RECOVERY_EXIT.OK : r.status === "REFUSED" ? RECOVERY_EXIT.REFUSED : RECOVERY_EXIT.HALTED, output };
   } catch (e) {
     return { exitCode: RECOVERY_EXIT.INTERNAL, output: Object.freeze({ ok: false, mode: "cancel-only-recovery", stage: "run",

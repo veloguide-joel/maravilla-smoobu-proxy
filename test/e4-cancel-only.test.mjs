@@ -80,7 +80,9 @@ function world(over = {}) {
 }
 const memJournal = (failOn) => { const es = []; return { durable: true, entries: es, load: () => es.map((e) => JSON.parse(JSON.stringify(e))),
   append: (e) => { if (failOn && failOn(e)) throw new Error("disk"); es.push(JSON.parse(JSON.stringify(e))); }, close() {} }; };
-const run = async (w, j = memJournal()) => ({ r: await runRecovery({ transport: w.transport, journal: j, now: NOW, timeoutMs: 50 }), j, w });
+// Virtual clock for the delayed calendar observation (R8): tests never wait on real timers (S and vclock are defined below;
+// they are initialised before any test body runs).
+const run = async (w, j = memJournal()) => ({ r: await runRecovery({ transport: w.transport, journal: j, now: NOW, timeoutMs: 50, settle: S, ...vclock() }), j, w });
 const puts = (w) => w.log.filter((l) => l.startsWith("PUT "));
 
 // The original attempt-2 journal, shaped exactly as the reviewed runner (ad5510f) writes it (synthetic values).
@@ -173,7 +175,8 @@ test("calendar: both nights available + isAvailable 1/true => reopened; anything
 // ---------- the run ----------
 test("happy recovery: identity -> unique ref -> baseline -> fresh read -> ONE cancel of 70636076 -> verified; nothing else written", async () => {
   const { r, j, w } = await run(world());
-  assert.deepEqual([r.status, r.allPostChecksPassed, r.cancel, r.halt, r.postcancelStatus, r.calendar], ["CANCELLED_VERIFIED", true, { sent: true, code: "VERIFIED_CANCELLED" }, null, "cancelled", "CALENDAR_REOPENED"]);
+  assert.deepEqual([r.status, r.allPostChecksPassed, r.cancel, r.halt, r.postcancelStatus, r.calendar], ["CANCELLED_VERIFIED", true, { sent: true, code: "VERIFIED_CANCELLED", httpStatus: 200 }, null, "cancelled", "CALENDAR_REOPENED"]);
+  assert.deepEqual([r.calendarFinal, r.calendarSettled, r.finalState], ["CALENDAR_REOPENED", null, { code: "IDENTITY_OK", status: "cancelled", identityOk: true }], "no delayed observation when reopened at once");
   assert.deepEqual(puts(w), [`PUT /reservations/${RID}/statuses/cancelled`]);
   assert.ok(!w.log.some((l) => l.startsWith("POST ")), "never a create or any POST");
   const iPut = w.log.indexOf(puts(w)[0]);
@@ -344,6 +347,7 @@ const snap = (dir) => readdirSync(dir, { recursive: true }).sort().map((p) => { 
 async function cli(f, { argv, w = world(), g = git(), prompt } = {}) {
   let prompts = 0;
   const r = await runRecoveryCli(argv ?? ["--journal-dir", f.jdir, "--confirm", CONFIRM_TOKEN, "--reviewed-commit", SHA], { git: g, fetchImpl: w.fetchImpl, now: NOW, sleep: async () => {}, timeoutMs: 200,
+    settle: S, ...vclock(),
     prompt: prompt ?? (async () => { prompts++; return { accountId: FAKE.account, clientSecret: FAKE.secret }; }) });
   return { r, prompts, w };
 }
@@ -402,4 +406,104 @@ test("containment: no create/price paths, env, console or file writes of its own
   assert.ok(readFileSync(join(ROOT, ".vercelignore"), "utf8").split("\n").includes("/scripts"));
   assert.deepEqual([CONFIRM_TOKEN, BASELINE.conversations, BASELINE.tasks], [`E4-RECOVER-${RECOVERY_HASH.slice(0, 12)}`, [55098382], []]);
   assert.equal(globalFetchCalls, 0);
+});
+
+// ---------- owner run 2026-10-24 (exit 3): command reply / final state / calendar reported separately ----------
+// Owner-reported: W1 CANCEL_RESPONSE_MISMATCH (HTTP 200), R5 IDENTITY_OK cancelled, side effects = baseline, R7
+// CALENDAR_NOT_REOPENED; root later saw the nights available in the dashboard. WHICH identity field(s) mismatched was NOT
+// recorded by the reviewed code, and the raw reply is unknown. The variants below are SYNTHETIC hypotheses, not evidence.
+const S = { intervalMs: 1000, timeoutMs: 7000000, maxReads: 10, confirmReads: 2 };
+function vclock() {
+  let t = 0;
+  return { clock: () => t, startTimer: (ms) => ms === S.intervalMs
+    ? { promise: Promise.resolve().then(() => { t += ms; }), cancel() {} }
+    : { promise: new Promise(() => {}), cancel() {} } };
+}
+const nightsReply = (st) => ({ httpStatus: 200, json: { status: "success", result: ["2027-03-10", "2027-03-11"].map((date) => ({ date, status: st, isAvailable: st === "available" ? 1 : 0 })) } });
+const calSeq = (openFrom) => { let n = 0; return () => { n++; return nightsReply(n >= openFrom ? "available" : "reserved"); }; };
+const runS = async (w, j = memJournal()) => { const v = vclock(); return { r: await runRecovery({ transport: w.transport, journal: j, now: NOW, timeoutMs: 50, settle: S, ...v }), j, w }; };
+const cals = (w) => w.log.filter((l) => l === "GET /listings/606998/calendar").length;
+const replyWith = (over) => (w) => { w.res.status = "cancelled"; const r = { ...w.res, ...over(w.res) }; if (r.customFieldValues === undefined) delete r.customFieldValues; return { httpStatus: 200, json: { status: "success", result: r } }; };
+
+test("owner signature: mismatching cancel reply stays HALTED/ok false even with cancelled final state and delayed reopening; mismatch NAMES now recorded", async () => {
+  const variants = [
+    ["reply without custom fields", replyWith(() => ({ customFieldValues: undefined })), ["bookingRef"]],
+    ["reply still shows new", (w) => { const r = { ...w.res }; w.res.status = "cancelled"; return { httpStatus: 200, json: { status: "success", result: r } }; }, ["status"]],
+    ["reply with another total", replyWith(() => ({ totalPrice: 200 })), ["totalMinor"]],
+    ["reply with two differences", replyWith(() => ({ customFieldValues: undefined, totalPrice: 200 })), ["totalMinor", "bookingRef"]]
+  ];
+  const oldShapes = new Set();
+  for (const [name, cancelReply, mm] of variants) {
+    const { r, j, w } = await runS(world({ cancelReply, calendarReply: calSeq(3) }));
+    assert.equal(puts(w).length, 1, name);
+    assert.deepEqual([r.status, r.allPostChecksPassed, r.halt], ["HALTED", false, { step: "W1_CANCEL", code: "CANCEL_RESPONSE_MISMATCH", mismatches: mm }], name);
+    assert.deepEqual(r.cancel, { sent: true, code: "CANCEL_RESPONSE_MISMATCH", httpStatus: 200, mismatches: mm }, `${name}: command reply`);
+    assert.deepEqual(r.finalState, { code: "IDENTITY_OK", status: "cancelled", identityOk: true }, `${name}: independent final state`);
+    assert.deepEqual(r.calendarImmediate, { code: "CALENDAR_NOT_REOPENED", nights: [{ date: "2027-03-10", code: "NIGHT_RESERVED_FALSE" }, { date: "2027-03-11", code: "NIGHT_RESERVED_FALSE" }] });
+    assert.deepEqual([r.calendarSettled.code, r.calendarSettled.history, r.calendarFinal], ["OBSERVED_STABLE", ["blocked", "open", "open"], "CALENDAR_REOPENED_DELAYED"], name);
+    assert.deepEqual([r.sideEffectsBefore.code, r.sideEffectsAfter.code], ["SIDE_EFFECTS_MATCH_BASELINE", "SIDE_EFFECTS_MATCH_BASELINE"]);
+    const out = j.entries.find((e) => e.type === "outcome");
+    assert.deepEqual(out.mismatches, mm, `${name}: journaled names`);
+    assert.deepEqual(j.entries.find((e) => e.type === "halt").mismatches, mm);
+    oldShapes.add(JSON.stringify({ code: out.code, httpStatus: out.httpStatus }));          // what the reviewed 80bee4a code journaled
+    assert.ok(w.log.slice(w.log.indexOf(puts(w)[0]) + 1).every((l) => l.startsWith("GET ")), `${name}: reads only after the cancel`);
+    assert.deepEqual(j.entries.filter((e) => e.step === "R7_CALENDAR").map((e) => e.code), ["CALENDAR_NOT_REOPENED", "NIGHT_RESERVED_FALSE", "NIGHT_RESERVED_FALSE"]);
+    assert.equal(j.entries.find((e) => e.step === "R8_CALENDAR_SETTLE").code, "SETTLE_OBSERVED_STABLE");
+    leakFree(r); leakFree(j.entries);
+  }
+  assert.equal(oldShapes.size, 1, "the old journal fields (code, httpStatus) are identical for every variant: the cause was unrecordable");
+});
+
+test("verified reply + delayed reopening is a pass only with everything else verified; never-reopening is not", async () => {
+  let { r, w } = await runS(world({ calendarReply: calSeq(2) }));
+  assert.deepEqual([r.status, r.allPostChecksPassed, r.calendar, r.calendarFinal, r.calendarSettled.reads], ["CANCELLED_VERIFIED", true, "CALENDAR_NOT_REOPENED", "CALENDAR_REOPENED_DELAYED", 2]);
+  ({ r, w } = await runS(world({ calendarReply: calSeq(99) })));
+  assert.deepEqual([r.status, r.allPostChecksPassed, r.calendarFinal, r.calendarSettled.code, r.calendarSettled.reads], ["CANCELLED_VERIFIED", false, "CALENDAR_NOT_REOPENED", "READ_CAP_REACHED", S.maxReads]);
+  assert.equal(cals(w), 1 + S.maxReads, "bounded: immediate + at most maxReads");
+  // flapping never counts
+  let n = 0;
+  ({ r } = await runS(world({ calendarReply: () => { n++; return nightsReply(n % 2 ? "reserved" : "available"); } })));
+  assert.deepEqual([r.allPostChecksPassed, r.calendarSettled.code], [false, "READ_CAP_REACHED"]);
+  // a post-cancel side-effect difference still fails, delayed reopening or not
+  ({ r } = await runS(world({ calendarReply: calSeq(2), afterCancel: (w2) => { w2.tasks.push({ id: 77, reservationId: RID }); } })));
+  assert.deepEqual([r.calendarFinal, r.allPostChecksPassed], ["CALENDAR_REOPENED_DELAYED", false]);
+});
+
+test("no delayed polling unless the independent final state is cancelled with full identity; never a second write", async () => {
+  // mismatching reply AND the reservation is in fact still new: R5 shows new, no R8, one PUT only
+  const { r, j, w } = await runS(world({ cancelReply: (w2) => ({ httpStatus: 200, json: { status: "success", result: { ...w2.res } } }), calendarReply: calSeq(99) }));
+  assert.deepEqual([puts(w).length, r.status, r.finalState.status, r.finalState.identityOk, r.calendarSettled, cals(w)], [1, "HALTED", "new", false, null, 1]);
+  assert.deepEqual(r.finalState.mismatches, ["status"]);
+  assert.ok(!j.entries.some((e) => e.step === "R8_CALENDAR_SETTLE"));
+  // transport-uncertain reply: still one PUT, reads only
+  const t = await runS(world({ cancelReply: () => "throw", calendarReply: calSeq(99) }));
+  assert.deepEqual([puts(t.w).length, t.r.status, t.r.allPostChecksPassed], [1, "HALTED", false]);
+});
+
+test("calendarNightCodes: enums only; guard allows exactly 1 + SETTLE.maxReads calendar reads", async () => {
+  const { calendarNightCodes, SETTLE } = M;
+  const mk = (arr) => ({ httpStatus: 200, json: { status: "success", result: arr } });
+  assert.deepEqual(calendarNightCodes(mk([{ date: "2027-03-10", status: "available", isAvailable: true }, { date: "2027-03-11", status: "PROVIDER-TEXT", isAvailable: "1" }])),
+    [{ date: "2027-03-10", code: "NIGHT_AVAILABLE_TRUE" }, { date: "2027-03-11", code: "NIGHT_OTHER_OTHER" }]);
+  assert.deepEqual(calendarNightCodes(mk([{ date: "2027-03-10", status: "hardBlock", isAvailable: 0 }, { date: "2027-03-10", status: "x" }])),
+    [{ date: "2027-03-10", code: "NIGHT_DUPLICATED" }, { date: "2027-03-11", code: "NIGHT_MISSING" }]);
+  assert.equal(calendarNightCodes({ transportError: true }), null);
+  const g = guardFetch(async () => new Response("{}"));
+  const u = "https://api.hostaway.com/v1/listings/606998/calendar?startDate=2027-03-10&endDate=2027-03-11";
+  for (let i = 0; i < 1 + SETTLE.maxReads; i++) await g.guarded(u);
+  await assert.rejects(g.guarded(u), { name: "LocalRefusal" });
+  assert.deepEqual(SETTLE, { intervalMs: 5000, timeoutMs: 60000, maxReads: 10, confirmReads: 2 });
+});
+
+test("cli: owner-signature run prints command reply, final state and calendar separately; exit 3; never ok", async () => {
+  const f = folder(); const v = vclock();
+  const w = world({ cancelReply: replyWith(() => ({ customFieldValues: undefined })), calendarReply: calSeq(3) });
+  const r = await runRecoveryCli(["--journal-dir", f.jdir, "--confirm", CONFIRM_TOKEN, "--reviewed-commit", SHA], { git: git(), fetchImpl: w.fetchImpl, now: NOW,
+    sleep: async () => {}, timeoutMs: 200, settle: S, ...v, prompt: async () => ({ accountId: FAKE.account, clientSecret: FAKE.secret }) });
+  assert.equal(r.exitCode, RECOVERY_EXIT.HALTED);
+  const o = r.output;
+  assert.deepEqual([o.ok, o.status, o.commandReply.code, o.commandReply.mismatches, o.finalState.status, o.calendarImmediate.code, o.calendarSettled.code, o.calendarFinal],
+    [false, "HALTED", "CANCEL_RESPONSE_MISMATCH", ["bookingRef"], "cancelled", "CALENDAR_NOT_REOPENED", "OBSERVED_STABLE", "CALENDAR_REOPENED_DELAYED"]);
+  assert.equal(o.guard.cancel, 1);
+  leakFree(o);
 });

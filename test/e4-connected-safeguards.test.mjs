@@ -156,9 +156,13 @@ test("evaluateCreateSideEffects: only charges complete-zero + tasks complete-emp
   for (const [input, code] of bad) assert.deepEqual(evaluateCreateSideEffects(input), { ok: false, code }, code);
 });
 
-test("containment: no listing/currency/channel constants, no I/O, nothing imports it", () => {
+test("containment: no listing/currency/channel constants, no I/O; only the cancel-only recovery imports it (read-only calendar observation)", () => {
   const src = readFileSync(join(ROOT, "scripts/e4-connected/safeguards.mjs"), "utf8");
   for (const re of [/60\d{4}/, /\b(USD|MXN)\b/, /airbnb\.com|rooms\//i, /\bimport\b/, /fetch\(|process\.env|console\.|writeFileSync|readFileSync/]) assert.doesNotMatch(src, re, String(re));
   const walk = (p) => readdirSync(join(ROOT, p), { withFileTypes: true }).flatMap((e) => e.isDirectory() ? (e.name === "node_modules" ? [] : walk(join(p, e.name))) : [join(p, e.name)]);
-  for (const f of [...walk("api"), ...walk("lib"), ...walk("scripts")].filter((f) => !f.endsWith("safeguards.mjs"))) assert.doesNotMatch(readFileSync(join(ROOT, f), "utf8"), /e4-connected/, f);
+  // Only IMPORTS count (a provenance list naming the path, as in precheck's PRECHECK_SOURCES, is not an import).
+  const importers = [...walk("api"), ...walk("lib"), ...walk("scripts")].filter((f) => !f.endsWith("safeguards.mjs") &&
+    /(from\s*|import\s*\(\s*)["'][^"']*e4-connected/.test(readFileSync(join(ROOT, f), "utf8")));
+  assert.deepEqual(importers.map((f) => f.replace(/\\/g, "/")), ["scripts/e4-recovery/cancel-only.mjs"]);
+  assert.match(readFileSync(join(ROOT, "scripts/e4-recovery/cancel-only.mjs"), "utf8"), /^import \{ observeSync, realTimer \} from "\.\.\/e4-connected\/safeguards\.mjs";$/m);
 });
