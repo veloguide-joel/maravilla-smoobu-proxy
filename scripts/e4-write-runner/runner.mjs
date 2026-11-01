@@ -329,7 +329,9 @@ export async function withTimeout(promiseFactory, timeoutMs, onTimeout) {
   try { return await Promise.race([Promise.resolve().then(promiseFactory), timeout]); } finally { clearTimeout(timer); }
 }
 
-export function createGate({ transport, journal, timeoutMs, state, budgets = STEP_BUDGETS, writeBudget = WRITE_BUDGET }) {
+// `allowRequest` defaults to this module's 606998-only allowlist. The ONLY other caller-supplied allowlist is the connected
+// test's (scripts/e4-connected/connected-path.mjs; asserted by a containment test). Every other gate check is unchanged.
+export function createGate({ transport, journal, timeoutMs, state, budgets = STEP_BUDGETS, writeBudget = WRITE_BUDGET, allowRequest = assertAllowedRequest }) {
   const reads = new Map();
   const writes = new Map();
   let requests = 0;
@@ -337,7 +339,7 @@ export function createGate({ transport, journal, timeoutMs, state, budgets = STE
   async function send(step, req, { writeKind = null, intent = null } = {}) {
     const budget = Object.prototype.hasOwnProperty.call(budgets, step) ? budgets[step] : undefined;
     if (!budget) throw new RunnerError("STEP_UNKNOWN");
-    assertAllowedRequest(req, state, writeKind);
+    allowRequest(req, state, writeKind);
     if (writeKind) {
       if (state.halted) throw new RunnerError("WRITE_AFTER_HALT");
       if (state.readOnly) throw new RunnerError("WRITE_IN_READ_ONLY_MODE");
