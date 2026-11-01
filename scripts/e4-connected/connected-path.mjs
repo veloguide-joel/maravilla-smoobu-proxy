@@ -1,10 +1,12 @@
 // E4 CONNECTED-LISTING test sequence — OFFLINE-ONLY first slice (feature/e4-connected-runner, 2026-11-01).
 //
-// One bounded create -> observe -> cancel -> observe of a single SANDBOX test reservation on the Airbnb-connected pilot
-// listing 603566 (Hostaway, MXN, direct channel 2000; Airbnb listing 1798070853315176756). Purpose: evidence that a
-// Hostaway-side block reaches Airbnb and that the cancel reopens it there. Owner direction: USD is settled for future
-// listings; the existing MXN pilot is accepted for the sandbox test; nothing is converted and no provider currency,
-// mapping or connection is changed. 603564 is never addressable (adapter + allowlist).
+// One bounded create -> observe -> cancel -> observe of a single test reservation on the Airbnb-connected pilot listing
+// 603566 (Hostaway, MXN, direct channel 2000; Airbnb listing 1798070853315176756). If ever executed, the create and the
+// cancel are LIVE provider writes on Hostaway (and visible to Airbnb): there is no Hostaway/Airbnb sandbox. Only the later
+// Stripe step uses Stripe's sandbox. Purpose: evidence that a Hostaway-side block reaches Airbnb and that the cancel
+// reopens it there. Owner direction: USD is settled for future listings; the existing MXN pilot is accepted for this test
+// (with Stripe sandbox conversion later); nothing is converted here and no provider currency, mapping or connection is
+// changed. 603564 is never addressable (adapter + allowlist). Everything in this module and its tests is offline.
 //
 // This module has NO transport, credentials, environment, file or CLI access and is not wired to anything:
 // CONNECTED_EXECUTION_WIRED = false. Every provider request goes through an INJECTED transport behind the reviewed

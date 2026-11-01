@@ -6,7 +6,7 @@
 //        zero files written.
 //   node scripts/e4-connected/connected-precheck.mjs --precheck --manifest <file.json> --reviewed-commit <sha>
 //        the same, then the reviewed hidden prompt (the owner's EXISTING key only) and ONE token mint, then exactly:
-//          P1 GET  /listings/603566                      identity, currency MXN, capacity >= guests, Airbnb id seen?
+//          P1 GET  /listings/603566                      identity, currency MXN, capacity >= guests, documented airbnbListingUrl
 //          P2 POST /listings/603566/calendar/priceDetails price for the manifest stay (calculation only; creates nothing)
 //          P3 GET  /listings/603566/calendar              every stay night open
 //          P4 GET  /reservations (<= 5 pages)             nothing at all on the arrival date (bounded, to an empty page)
@@ -159,6 +159,22 @@ function nightCodes(resp, nights) {
     return { date, code: `NIGHT_${st}_${av}` };
   });
 }
+// Airbnb link evidence: ONLY the documented read-only Listing field `airbnbListingUrl` (official Hostaway Listing object),
+// parsed structurally: https, host www.airbnb.com or airbnb.com, no credentials/port/query/fragment, path exactly
+// /rooms/<digits> compared as a STRING (no numeric precision loss). Expected id => link seen; another id => explicit
+// mismatch; absent/unparseable/other host => unknown. A link is not proof of an active connection or of sync.
+const AIRBNB_HOSTS = Object.freeze(["www.airbnb.com", "airbnb.com"]);
+export function airbnbLinkEvidence(listing) {
+  const v = isObj(listing) ? listing.airbnbListingUrl : undefined;
+  if (v === undefined || v === null || v === "") return "AIRBNB_URL_ABSENT_UNKNOWN";
+  if (typeof v !== "string" || v.length > 300) return "AIRBNB_URL_INVALID_UNKNOWN";
+  let u;
+  try { u = new URL(v); } catch { return "AIRBNB_URL_INVALID_UNKNOWN"; }
+  if (u.protocol !== "https:" || !AIRBNB_HOSTS.includes(u.hostname) || u.username || u.password || u.port || u.search || u.hash) return "AIRBNB_URL_INVALID_UNKNOWN";
+  const m = /^\/rooms\/([1-9]\d{0,24})\/?$/.exec(u.pathname);
+  if (!m) return "AIRBNB_URL_INVALID_UNKNOWN";
+  return m[1] === CONNECTED_AIRBNB_LISTING_ID ? "AIRBNB_URL_MATCHES" : "AIRBNB_URL_OTHER_ID";
+}
 function listingCheck(resp, guests) {
   if (!isObj(resp) || resp.transportError) return { code: "LISTING_TRANSPORT_UNCERTAIN" };
   if (resp.httpStatus !== 200) return { code: "LISTING_HTTP_NOT_OK", ...(Number.isSafeInteger(resp.httpStatus) ? { httpStatus: resp.httpStatus } : {}) };
@@ -169,8 +185,7 @@ function listingCheck(resp, guests) {
   const currencyOk = r.currencyCode === "MXN";
   const capacity = Number.isSafeInteger(r.personCapacity) && r.personCapacity > 0 && r.personCapacity <= 50 ? r.personCapacity : null;
   const capacityOk = capacity !== null && capacity >= guests;
-  // The Airbnb listing id appearing anywhere in the listing object is positive evidence; its absence proves nothing.
-  const mapping = JSON.stringify(r).includes(CONNECTED_AIRBNB_LISTING_ID) ? "AIRBNB_ID_SEEN_IN_LISTING" : "AIRBNB_ID_NOT_SEEN_UNKNOWN";
+  const mapping = airbnbLinkEvidence(r);
   return { code: idMatches && currencyOk && capacityOk ? "LISTING_OK" : "LISTING_MISMATCH", idMatches, currency: currencyOk ? "MXN" : "NOT_MXN", currencyOk, capacity, capacityOk, mapping };
 }
 
@@ -187,7 +202,9 @@ export async function runConnectedPrecheck({ transport, checked, airbnbCheckpoin
     guests: checked.guests, priceMode: checked.proposal.includes("totalMinor") ? "proposal" : "bound", refFieldStorage: REF_FIELD_STORAGE };
   out.listing = listingCheck(await send("P1_LISTING", { method: "GET", path: `/listings/${L}`, query: {} }), checked.guests);
   const pr = parsePriceTotal(await send("P2_PRICE", { method: "POST", path: `/listings/${L}/calendar/priceDetails`, query: {}, body: bound.priceBody }));
-  out.price = !pr.ok ? { code: pr.code } : out.priceMode === "proposal"
+  // priceDetails carries no currency: an amount is labelled MXN (matched or proposed) only when THIS run read the listing
+  // currency as MXN; otherwise the currency of the amount is unproven and no amount is reported.
+  out.price = !pr.ok ? { code: pr.code } : out.listing.currencyOk !== true ? { code: "PRICE_CURRENCY_UNPROVEN" } : out.priceMode === "proposal"
     ? { code: "PRICE_OBSERVED_PROPOSAL", observedTotalMinor: pr.totalMinor, currency: "MXN" }
     : { code: pr.totalMinor === checked.totalMinor ? "PRICE_MATCHES_MANIFEST" : "PRICE_DIFFERS_FROM_MANIFEST", observedTotalMinor: pr.totalMinor, manifestTotalMinor: checked.totalMinor, currency: "MXN" };
   const cal = await send("P3_CALENDAR", { method: "GET", path: `/listings/${L}/calendar`, query: bound.calendar });
@@ -206,7 +223,7 @@ export async function runConnectedPrecheck({ transport, checked, airbnbCheckpoin
   try { a = await airbnbCheckpoint(deepFreeze({ airbnbListingId: CONNECTED_AIRBNB_LISTING_ID, nights: [...checked.nights] })); } catch { a = undefined; }
   out.airbnb = { attested: ["OPEN", "BLOCKED"].includes(a) ? a : "UNKNOWN", source: "OPERATOR_ATTESTED" };
   out.checks = {
-    listing: out.listing.code === "LISTING_OK", price: ["PRICE_MATCHES_MANIFEST", "PRICE_OBSERVED_PROPOSAL"].includes(out.price.code),
+    listing: out.listing.code === "LISTING_OK", mappingNotContradicted: out.listing.mapping !== "AIRBNB_URL_OTHER_ID", price: ["PRICE_MATCHES_MANIFEST", "PRICE_OBSERVED_PROPOSAL"].includes(out.price.code),
     calendarOpen: out.calendar.code === "CALENDAR_OPEN", arrivalClear: out.lookup.code === "NO_RESERVATION_ON_ARRIVAL_SEEN", airbnbOpen: out.airbnb.attested === "OPEN"
   };
   out.precheckPassed = Object.values(out.checks).every(Boolean);

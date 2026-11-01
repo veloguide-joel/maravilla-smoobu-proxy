@@ -37,7 +37,7 @@ function world(over = {}) {
     if (u.pathname === "/v1/accessTokens") return over.token ? over.token() : new Response(JSON.stringify({ access_token: FAKE.token }), { status: 200 });
     const send = (body, status = 200) => new Response(JSON.stringify(body), { status });
     if (m === "GET" && u.pathname === "/v1/listings/603566") return send(ok({ id: 603566, name: "PROVIDER-TEXT", currencyCode: "MXN", personCapacity: 2,
-      channelListing: "https://www.airbnb.com/rooms/1798070853315176756", ...(over.listing ?? {}) }));
+      airbnbListingUrl: "https://www.airbnb.com/rooms/1798070853315176756", ...(over.listing ?? {}) }));
     if (m === "POST" && u.pathname === "/v1/listings/603566/calendar/priceDetails") return send(ok({ totalPrice: over.price ?? 4400, components: "PROVIDER-TEXT" }));
     if (m === "GET" && u.pathname === "/v1/listings/603566/calendar") {
       const st = over.night ?? (() => "available");
@@ -106,8 +106,8 @@ test("precheck: one token + exactly listing, price, calendar, lookup (to an empt
   assert.deepEqual(w.log.map((l) => l.split("?")[0]), ["POST /v1/accessTokens", "GET /v1/listings/603566", "POST /v1/listings/603566/calendar/priceDetails",
     "GET /v1/listings/603566/calendar", "GET /v1/reservations"]);
   const o = r.output;
-  assert.deepEqual(o.checks, { listing: true, price: true, calendarOpen: true, arrivalClear: true, airbnbOpen: true });
-  assert.deepEqual([o.listing.code, o.listing.currency, o.listing.capacity, o.listing.mapping], ["LISTING_OK", "MXN", 2, "AIRBNB_ID_SEEN_IN_LISTING"]);
+  assert.deepEqual(o.checks, { listing: true, mappingNotContradicted: true, price: true, calendarOpen: true, arrivalClear: true, airbnbOpen: true });
+  assert.deepEqual([o.listing.code, o.listing.currency, o.listing.capacity, o.listing.mapping], ["LISTING_OK", "MXN", 2, "AIRBNB_URL_MATCHES"]);
   assert.deepEqual([o.price.code, o.price.observedTotalMinor, o.priceMode], ["PRICE_MATCHES_MANIFEST", 440000, "bound"]);
   assert.deepEqual(o.calendar, { code: "CALENDAR_OPEN", nights: [{ date: "2027-04-05", code: "NIGHT_AVAILABLE_TRUE" }, { date: "2027-04-06", code: "NIGHT_AVAILABLE_TRUE" }] });
   assert.deepEqual([o.lookup.code, o.airbnb, o.refFieldStorage, o.filesWritten], ["NO_RESERVATION_ON_ARRIVAL_SEEN", { attested: "OPEN", source: "OPERATOR_ATTESTED" }, "UNPROVEN_WITHOUT_CREATE", 0]);
@@ -144,9 +144,45 @@ test("every failed check is reported, never acted on (exit 3), and the Airbnb an
     assert.ok(check(r.output), name);
     leakFree(r.output);
   }
-  // the mapping not being visible is reported as unknown, not as a failure
-  const { r } = await cli(PRE, { w: world({ listing: { channelListing: null } }) });
-  assert.deepEqual([r.exitCode, r.output.listing.mapping], [EXIT.OK, "AIRBNB_ID_NOT_SEEN_UNKNOWN"]);
+  // the documented link being absent is reported as unknown, not as a failure (and never as a readiness claim)
+  const { r } = await cli(PRE, { w: world({ listing: { airbnbListingUrl: null } }) });
+  assert.deepEqual([r.exitCode, r.output.listing.mapping], [EXIT.OK, "AIRBNB_URL_ABSENT_UNKNOWN"]);
+});
+
+test("price is labelled MXN (matched or proposed) only when this run read the listing currency as MXN", async () => {
+  const proposal = manifest({ totalMinor: R.PLACEHOLDER });
+  for (const [name, w, m] of [["proposal, listing USD", world({ listing: { currencyCode: "USD" } }), proposal],
+    ["proposal, currency missing", world({ listing: { currencyCode: undefined } }), proposal],
+    ["proposal, listing unreadable", world({ listing: { id: 603566 }, }), proposal],
+    ["bound, listing USD", world({ listing: { currencyCode: "USD" } }), manifest()]]) {
+    if (name === "proposal, listing unreadable") {
+      const inner = w.fetchImpl;
+      w.fetchImpl = async (u, init) => (new URL(String(u)).pathname === "/v1/listings/603566" ? new Response("{}", { status: 503 }) : inner(u, init));
+    }
+    const { r } = await cli(PRE, { w, m });
+    assert.deepEqual([r.exitCode, r.output.price, r.output.checks.price], [EXIT.INCOMPLETE, { code: "PRICE_CURRENCY_UNPROVEN" }, false], name);
+    assert.ok(!JSON.stringify(r.output.price).includes("MXN") && !("observedTotalMinor" in r.output.price), name);
+  }
+});
+
+test("Airbnb link evidence: only the documented airbnbListingUrl, parsed structurally; unrelated text never qualifies", async () => {
+  const ev = (v) => P.airbnbLinkEvidence(v === undefined ? {} : { airbnbListingUrl: v });
+  for (const ok of ["https://www.airbnb.com/rooms/1798070853315176756", "https://airbnb.com/rooms/1798070853315176756/"]) assert.equal(ev(ok), "AIRBNB_URL_MATCHES", ok);
+  assert.equal(ev("https://www.airbnb.com/rooms/1798047712926775907"), "AIRBNB_URL_OTHER_ID");
+  assert.equal(ev("https://www.airbnb.com/rooms/1798070853315176757"), "AIRBNB_URL_OTHER_ID", "string compare: no precision loss");
+  for (const v of [undefined, null, ""]) assert.equal(ev(v), "AIRBNB_URL_ABSENT_UNKNOWN");
+  for (const bad of [1798070853315176756, "not a url", "http://www.airbnb.com/rooms/1798070853315176756", "https://www.airbnb.com.evil.example/rooms/1798070853315176756",
+    "https://evil.example/rooms/1798070853315176756", "https://user:pw@www.airbnb.com/rooms/1798070853315176756", "https://www.airbnb.com:8443/rooms/1798070853315176756",
+    "https://www.airbnb.com/rooms/1798070853315176756?source_impression_id=x", "https://www.airbnb.com/rooms/1798070853315176756#x",
+    "https://www.airbnb.com/rooms/plus/1798070853315176756", "https://www.airbnb.com/rooms/01798070853315176756", "https://www.airbnb.com/s/1798070853315176756"]) {
+    assert.equal(ev(bad), "AIRBNB_URL_INVALID_UNKNOWN", String(bad));
+  }
+  // root's regression: the id in unrelated text (and no link) is NOT mapping evidence
+  let { r } = await cli(PRE, { w: world({ listing: { airbnbListingUrl: null, internalNote: "See 1798070853315176756", channelListing: "https://www.airbnb.com/rooms/1798070853315176756" } }) });
+  assert.equal(r.output.listing.mapping, "AIRBNB_URL_ABSENT_UNKNOWN");
+  // another id in the documented link is an explicit contradiction: reported, exit 3
+  ({ r } = await cli(PRE, { w: world({ listing: { airbnbListingUrl: "https://www.airbnb.com/rooms/1798047712926775907" } }) }));
+  assert.deepEqual([r.exitCode, r.output.listing.mapping, r.output.checks.mappingNotContradicted], [EXIT.INCOMPLETE, "AIRBNB_URL_OTHER_ID", false]);
 });
 
 test("token refused: only the token was fetched; everything uncertain; sanitized diagnostic; exit 3", async () => {
