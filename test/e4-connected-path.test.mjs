@@ -407,9 +407,11 @@ test("containment: no I/O of its own; nothing imports it; the minted config and 
   const walk = (p) => readdirSync(join(ROOT, p), { withFileTypes: true }).flatMap((e) => e.isDirectory() ? (e.name === "node_modules" ? [] : walk(join(p, e.name))) : [join(p, e.name)]);
   const files = [...walk("api"), ...walk("lib"), ...walk("scripts"), ...walk("public")];
   const users = (re) => files.filter((f) => re.test(readFileSync(join(ROOT, f), "utf8"))).map((f) => f.replace(/\\/g, "/")).sort();
-  assert.deepEqual(users(/(from\s*|import\s*\(\s*)["'][^"']*connected-path/), [], "nothing deployable or runnable imports the connected runner");
-  assert.deepEqual(users(/connectedTestAdapterConfig/), ["lib/hostaway-reservations.js", "scripts/e4-connected/connected-path.mjs"]);
-  assert.deepEqual(users(/allowRequest:/), ["scripts/e4-connected/connected-path.mjs"]);
+  // only the read-only precheck CLI imports it (for manifest validation and constants; it never calls executeConnectedRun)
+  assert.deepEqual(users(/(from\s*|import\s*\(\s*)["'][^"']*connected-path/), ["scripts/e4-connected/connected-precheck.mjs"]);
+  assert.doesNotMatch(readFileSync(join(ROOT, "scripts/e4-connected/connected-precheck.mjs"), "utf8"), /executeConnectedRun/);
+  assert.deepEqual(users(/connectedTestAdapterConfig/), ["lib/hostaway-reservations.js", "scripts/e4-connected/connected-path.mjs", "scripts/e4-connected/connected-precheck.mjs"]);
+  assert.deepEqual(users(/allowRequest:/), ["scripts/e4-connected/connected-path.mjs", "scripts/e4-connected/connected-precheck.mjs"]);
   assert.equal(CONNECTED_EXECUTION_WIRED, false);
   assert.ok(readFileSync(join(ROOT, ".vercelignore"), "utf8").split("\n").includes("/scripts"));
 });

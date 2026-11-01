@@ -329,8 +329,8 @@ export async function withTimeout(promiseFactory, timeoutMs, onTimeout) {
   try { return await Promise.race([Promise.resolve().then(promiseFactory), timeout]); } finally { clearTimeout(timer); }
 }
 
-// `allowRequest` defaults to this module's 606998-only allowlist. The ONLY other caller-supplied allowlist is the connected
-// test's (scripts/e4-connected/connected-path.mjs; asserted by a containment test). Every other gate check is unchanged.
+// `allowRequest` defaults to this module's 606998-only allowlist. The ONLY other caller-supplied allowlists are the connected
+// test's runner and read-only precheck (scripts/e4-connected/; asserted by a containment test). Every other gate check is unchanged.
 export function createGate({ transport, journal, timeoutMs, state, budgets = STEP_BUDGETS, writeBudget = WRITE_BUDGET, allowRequest = assertAllowedRequest }) {
   const reads = new Map();
   const writes = new Map();

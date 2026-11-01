@@ -560,7 +560,7 @@ test("containment: the adapter is pure and unreachable — no imports, network, 
   for (const d of ["api", "lib", "db", "scripts"]) walk(d);
   // The only importers are the offline E4 write runner and the offline connected-test runner under scripts/ (excluded
   // from Vercel; no transport, no env). happy-preflight.mjs names the adapter's PATH only, to hash it for provenance.
-  assert.deepEqual(importers.sort(), ["scripts/e4-connected/connected-path.mjs", "scripts/e4-write-runner/happy-path.mjs", "scripts/e4-write-runner/happy-preflight.mjs",
+  assert.deepEqual(importers.sort(), ["scripts/e4-connected/connected-path.mjs", "scripts/e4-connected/connected-precheck.mjs", "scripts/e4-write-runner/happy-path.mjs", "scripts/e4-write-runner/happy-preflight.mjs",
     "scripts/e4-write-runner/runner.mjs"], "nothing deployable references the adapter");
   assert.doesNotMatch(readFileSync(join(ROOT, "scripts/e4-write-runner/happy-preflight.mjs"), "utf8"), /^import[^\n]*hostaway-reservations/m);
 });
