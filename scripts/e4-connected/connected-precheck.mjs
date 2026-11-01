@@ -259,6 +259,14 @@ export function askAirbnbOnTty({ input = process.stdin, output = process.stderr 
   };
 }
 
+/**
+ * The connected precheck's credential prompt: the reviewed hidden prompt with leading blank terminators tolerated
+ * (a CR/LF still pending from a pasted PowerShell launch must not submit an empty account id). Validation unchanged.
+ */
+export function connectedCredentialPrompt({ input = process.stdin, output = process.stderr } = {}) {
+  return promptHostawayCredentials({ input, output, tolerateLeadingBlankLines: true });
+}
+
 const refuse = (exitCode, stage, error, extra = {}) => ({ exitCode, output: Object.freeze({ ok: false, mode: "connected-precheck", stage, error, network: "none", credentialsRequested: false, filesWritten: 0, ...extra }) });
 
 /** deps (tests): { git, readManifest, now, prompt, fetchImpl, sleep, airbnbCheckpoint, timeoutMs, rng } */
@@ -295,7 +303,7 @@ export async function runConnectedPrecheckCli(argv, deps = {}) {
   }
   // 3. the owner's existing key, privately; then the read-only run
   let creds;
-  try { creds = await (deps.prompt ?? promptHostawayCredentials)(); } catch (e) {
+  try { creds = await (deps.prompt ?? connectedCredentialPrompt)(); } catch (e) {
     return refuse(CONNECTED_PRECHECK_EXIT.REFUSED, "credentials", typeof e?.code === "string" && /^[A-Z_]{1,40}$/.test(e.code) ? e.code : "CREDENTIALS_UNAVAILABLE", { credentialsRequested: true });
   }
   const getCredentials = async () => { const c = creds; creds = null; return c; };

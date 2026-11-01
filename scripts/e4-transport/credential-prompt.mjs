@@ -16,8 +16,14 @@ export class CredentialPromptError extends Error {
 const ACCOUNT_RE = /^[1-9]\d{0,15}$/;
 const MAX_LEN = 512;
 
-/** Read one line from a TTY with echo off. Enter finishes, Backspace deletes, Ctrl-C/Ctrl-D aborts. */
-export function readHiddenLine({ input, output, label }) {
+/**
+ * Read one line from a TTY with echo off. Enter finishes, Backspace deletes, Ctrl-C/Ctrl-D aborts.
+ * skipLeadingTerminators (opt-in; default false = unchanged behaviour): CR/LF received while NOTHING has been typed yet
+ * is ignored instead of finishing an empty line — e.g. a CR/LF still pending from a pasted launch command, or the LF
+ * half of a CR-LF Enter of the previous prompt arriving in a separate chunk. It never accepts an empty value: the
+ * caller's validation still applies, and Ctrl-C/Ctrl-D still abort at any time.
+ */
+export function readHiddenLine({ input, output, label, skipLeadingTerminators = false }) {
   return new Promise((resolve, reject) => {
     if (!input || input.isTTY !== true || typeof input.setRawMode !== "function") { reject(new CredentialPromptError("TTY_REQUIRED")); return; }
     let value = "";
@@ -42,7 +48,7 @@ export function readHiddenLine({ input, output, label }) {
         if (esc === 2) { if (ch >= "@" && ch <= "~") esc = 0; continue; }
         if (esc === 3) { esc = 0; continue; }
         if (ch === "\u001b") { esc = 1; continue; }
-        if (ch === "\r" || ch === "\n") return finish();
+        if (ch === "\r" || ch === "\n") { if (skipLeadingTerminators === true && value.length === 0) continue; return finish(); }
         if (ch === "\u007f" || ch === "\b") { value = value.slice(0, -1); continue; }
         if (ch < " ") continue;                       // other control characters are ignored
         if (value.length >= MAX_LEN) return finish(new CredentialPromptError("INPUT_TOO_LONG"));
@@ -56,11 +62,15 @@ export function readHiddenLine({ input, output, label }) {
   });
 }
 
-/** -> frozen { accountId, clientSecret }. Throws CredentialPromptError (code only, never a value). */
-export async function promptHostawayCredentials({ input = process.stdin, output = process.stderr } = {}) {
-  const accountId = await readHiddenLine({ input, output, label: "Hostaway account ID (hidden)" });
+/**
+ * -> frozen { accountId, clientSecret }. Throws CredentialPromptError (code only, never a value).
+ * tolerateLeadingBlankLines (opt-in, default false): passed to both prompts as skipLeadingTerminators.
+ */
+export async function promptHostawayCredentials({ input = process.stdin, output = process.stderr, tolerateLeadingBlankLines = false } = {}) {
+  const skip = tolerateLeadingBlankLines === true;
+  const accountId = await readHiddenLine({ input, output, label: "Hostaway account ID (hidden)", skipLeadingTerminators: skip });
   if (!ACCOUNT_RE.test(accountId)) throw new CredentialPromptError("ACCOUNT_ID_INVALID");
-  const clientSecret = await readHiddenLine({ input, output, label: "Hostaway API secret (hidden)" });
+  const clientSecret = await readHiddenLine({ input, output, label: "Hostaway API secret (hidden)", skipLeadingTerminators: skip });
   if (!clientSecret || /\s/.test(clientSecret)) throw new CredentialPromptError("SECRET_INVALID");
   return Object.freeze({ accountId, clientSecret });
 }
