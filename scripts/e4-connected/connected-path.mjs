@@ -52,6 +52,10 @@ export const CONNECTED_SOURCES = Object.freeze([
 ]);
 export const CONNECTED_MAX_GUESTS = 2;                               // 603566 capacity (dashboard read-only evidence)
 export const CONNECTED_WRITE_BUDGET = Object.freeze({ create: 1, cancel: 1 });
+// Reservations this runner must never read, cancel or adopt, whatever a provider reply claims (the 2026-10-23 E4 test
+// reservation on 606998, cancelled 2026-10-24 by the reviewed recovery tool).
+export const CONNECTED_PROTECTED_RESERVATION_IDS = Object.freeze([70636076]);
+const isProtected = (v) => CONNECTED_PROTECTED_RESERVATION_IDS.includes(Number(v));
 // Hostaway-side calendar observation after the create and after the cancel: read at once, then every 10 s; 2 consecutive
 // confirming reads; at most 12 reads and 120 s each. A timeout or cap concludes nothing (and writes nothing).
 export const CONNECTED_SYNC = Object.freeze({ intervalMs: 10000, timeoutMs: 120000, maxReads: 12, confirmReads: 2 });
@@ -168,13 +172,14 @@ export function validateConnectedManifest(input, { now } = {}) {
 // ---------------------------------------------------------------------------------------------
 // Allowlist (passed to the reviewed gate). Listing 603566 only; reads/cancel only of an id THIS run verified.
 
-const CREATE_BODY_KEYS = Object.freeze(["channelId", "listingMapId", "arrivalDate", "departureDate", "numberOfGuests", "guestName",
-  "guestFirstName", "guestLastName", "guestEmail", "totalPrice", "currency", "customFieldValues"]);
 const LOOKUP_QUERY_KEYS = Object.freeze(["listingId", "channelId", "arrivalStartDate", "arrivalEndDate", "limit", "includeResources", "afterId"]);
-const PRICE_BODY_KEYS = Object.freeze(["startingDate", "endingDate", "numberOfGuests", "version"]);
 const SIDE_PATHS = Object.freeze({ "/guestPayments/charges": "charges", "/conversations": "conversations", "/tasks": "tasks" });
 
-/** Throws RunnerError unless `req` is one of the connected test's allowed shapes. state.calendar = { startDate, endDate }. */
+/**
+ * Throws RunnerError unless `req` is one of the connected test's allowed shapes, each bound EXACTLY to this run's private
+ * state: state.bound = { priceBody, createBody, arrivalDate } (from the validated manifest and the generated ref) and
+ * state.calendar = { startDate, endDate }. Reads/cancel only of an id this run verified; protected ids never.
+ */
 export function assertConnectedRequest(req, state, writeKind) {
   if (!isObj(req) || typeof req.method !== "string" || typeof req.path !== "string") throw new RunnerError("REQUEST_MALFORMED");
   if (hasKeyCI(req, "forceoverbooking")) throw new RunnerError("FORCE_OVERBOOKING_REFUSED");
@@ -182,22 +187,27 @@ export function assertConnectedRequest(req, state, writeKind) {
   if (!isObj(q)) throw new RunnerError("REQUEST_MALFORMED");
   const L = CONNECTED_TEST_LISTING_ID;
   const emptyQuery = Object.keys(q).length === 0;
-  const readable = (v) => (Number.isSafeInteger(v) || (typeof v === "string" && /^[1-9]\d{0,15}$/.test(v))) && state.readableIds.has(Number(v));
+  const b = state.bound;
+  if (!isObj(b) || !isObj(b.priceBody) || !isObj(b.createBody) || typeof b.arrivalDate !== "string") throw new RunnerError("REQUEST_NOT_BOUND_TO_RUN");
+  for (const m0 of req.path.matchAll(/\d+/g)) if (isProtected(m0[0])) throw new RunnerError("PROTECTED_RESERVATION");
+  if (Object.prototype.hasOwnProperty.call(q, "reservationId") && isProtected(q.reservationId)) throw new RunnerError("PROTECTED_RESERVATION");
+  const readable = (v) => (Number.isSafeInteger(v) || (typeof v === "string" && /^[1-9]\d{0,15}$/.test(v))) && !isProtected(v) && state.readableIds.has(Number(v));
+  const lookupBase = { listingId: L, channelId: DIRECT_CHANNEL_ID, arrivalStartDate: b.arrivalDate, arrivalEndDate: b.arrivalDate, limit: 100, includeResources: 1 };
   let kind; let m;
   if (req.method === "POST" && req.path === `/listings/${L}/calendar/priceDetails` && emptyQuery && isObj(req.body) &&
-    Object.keys(req.body).every((k) => PRICE_BODY_KEYS.includes(k)) && req.body.version === 2) kind = "calc";
+    canonical(req.body) === canonical(b.priceBody)) kind = "calc";
   else if (req.method === "POST" && req.path === "/reservations" && emptyQuery && isObj(req.body) &&
-    Object.keys(req.body).every((k) => CREATE_BODY_KEYS.includes(k)) &&
-    req.body.listingMapId === L && req.body.channelId === DIRECT_CHANNEL_ID && req.body.currency === CONNECTED_TEST_CURRENCY) kind = "create";
-  else if (req.method === "GET" && req.path === "/reservations" && Object.keys(q).every((k) => LOOKUP_QUERY_KEYS.includes(k)) &&
-    q.listingId === L && q.channelId === DIRECT_CHANNEL_ID && req.body === undefined) kind = "lookup";
+    canonical(req.body) === canonical(b.createBody)) kind = "create";
+  else if (req.method === "GET" && req.path === "/reservations" && req.body === undefined && Object.keys(q).every((k) => LOOKUP_QUERY_KEYS.includes(k)) &&
+    canonical(Object.fromEntries(Object.entries(q).filter(([k]) => k !== "afterId"))) === canonical(lookupBase) &&
+    (!Object.prototype.hasOwnProperty.call(q, "afterId") || isPosInt(q.afterId))) kind = "lookup";
   else if (req.method === "GET" && (m = /^\/reservations\/([1-9]\d{0,15})$/.exec(req.path)) && req.body === undefined &&
     canonical(q) === canonical(READ_QUERY)) {
-    if (!state.readableIds.has(Number(m[1]))) throw new RunnerError("READ_TARGET_NOT_FROM_THIS_RUN");
+    if (!readable(m[1])) throw new RunnerError("READ_TARGET_NOT_FROM_THIS_RUN");
     kind = "read";
   } else if (req.method === "PUT" && (m = /^\/reservations\/([1-9]\d{0,15})\/statuses\/cancelled$/.exec(req.path)) && emptyQuery &&
     canonical(req.body) === canonical(CANCEL_BODY)) {
-    if (state.cancellableId === null || Number(m[1]) !== state.cancellableId) throw new RunnerError("CANCEL_TARGET_NOT_VERIFIED");
+    if (state.cancellableId === null || Number(m[1]) !== state.cancellableId || !readable(m[1])) throw new RunnerError("CANCEL_TARGET_NOT_VERIFIED");
     kind = "cancel";
   } else if (req.method === "GET" && req.path === `/listings/${L}/calendar` && req.body === undefined && isObj(state.calendar) &&
     canonical(q) === canonical(state.calendar)) kind = "read";
@@ -274,15 +284,25 @@ export async function executeConnectedRun(opts = {}) {
     calendar: Object.freeze({ startDate: nights[0], endDate: nights[nights.length - 1] }) };
   const report = { status: "RUNNING", version: CONNECTED_VERSION, manifestHash: pre.hash, steps: [], writes: { create: 0, cancel: 0 }, halt: null,
     commandReply: null, finalState: null, sideEffectsCreate: null, sideEffectsCancel: null,
-    evidence: { hostawayBlocked: null, airbnbBlocked: null, hostawayReopened: null, airbnbReopened: null }, reconcile: [] };
+    evidence: { hostawayBlocked: null, airbnbBlocked: null, hostawayReopened: null, airbnbReopened: null }, reconcile: [],
+    journalDurable: true, journalFailures: [], runEndRecorded: false };
+  // Every journal append failure LATCHES (never cleared by later successful appends): the run can never again report a
+  // clean or durable result, and a failure before the cancel stops every later write.
+  const latch = (what) => { report.journalDurable = false; if (report.journalFailures.length < 16) report.journalFailures.push(what ?? "UNKNOWN"); };
   let refs;
   try { refs = generateRunRefs(opts.rng ?? randomBytes, 2); }
   catch { return deepFreeze({ status: "REFUSED", requests: 0, prerequisites: ["REF_GENERATION_FAILED"] }); }
   const [probeRef, ref] = refs;
+  const priceBody = { startingDate: s.arrivalDate, endingDate: s.departureDate, numberOfGuests: m.guests, version: 2 };
+  const plan = planOf(m, ref);
+  let createReq;
+  try { createReq = buildCreateReservationRequest(plan, cfg); }
+  catch { return deepFreeze({ status: "REFUSED", requests: 0, prerequisites: ["PLAN_INVALID"] }); }
+  state.bound = deepFreeze({ priceBody, createBody: createReq.body, arrivalDate: s.arrivalDate });   // private: the only shapes the guard admits
   const runId = createHash("sha256").update(`${pre.hash}:${refs.join(",")}`).digest("hex").slice(0, 16);
   const jappend = (e) => journal.append(san({ ...e, at: now().toISOString() }));
   try { jappend({ type: "run-start", runId, manifestHash: pre.hash, refs }); }
-  catch { return deepFreeze({ status: "REFUSED", requests: 0, prerequisites: ["JOURNAL_WRITE_FAILED"] }); }
+  catch { return deepFreeze({ status: "REFUSED", requests: 0, prerequisites: ["JOURNAL_WRITE_FAILED"], journalDurable: false, journalFailures: ["RUN_START"], runEndRecorded: false }); }
 
   const rawGate = createGate({ transport, journal, timeoutMs, state, budgets: CONNECTED_STEPS, writeBudget: CONNECTED_WRITE_BUDGET,
     allowRequest: assertConnectedRequest });
@@ -301,12 +321,15 @@ export async function executeConnectedRun(opts = {}) {
     state.cancellableId = null;
     const withDiag = lastDiag ? { ...extra, diag: lastDiag } : extra;
     report.halt = san({ step, code, ...withDiag });
-    try { jappend({ type: "halt", step, code, ...withDiag }); } catch { /* status already HALTED */ }
+    try { jappend({ type: "halt", step, code, ...withDiag }); } catch { latch(`HALT:${step}`); }
   };
-  const safeAppend = (step, e) => { try { jappend(e); } catch { halt(step, "JOURNAL_WRITE_FAILED"); } };
+  const safeAppend = (step, e) => { try { jappend(e); } catch { latch(`${e.type}:${step}`); halt(step, "JOURNAL_WRITE_FAILED"); } };
   const runStep = async (step, fn) => {
     if (state.halted) return;
-    try { await fn(); } catch (e) { halt(step, e instanceof RunnerError ? e.code : "INTERNAL_ERROR"); }
+    try { await fn(); } catch (e) {
+      if (e instanceof RunnerError && e.code === "JOURNAL_WRITE_FAILED") latch(`intent:${step}`);   // the gate's write-ahead intent: nothing was sent
+      halt(step, e instanceof RunnerError ? e.code : "INTERNAL_ERROR");
+    }
   };
   const expectNew = { listingId: CONNECTED_TEST_LISTING_ID, from: s.arrivalDate, to: s.departureDate, totalMinor: m.totalMinor,
     currency: CONNECTED_TEST_CURRENCY, channelId: DIRECT_CHANNEL_ID, bookingRef: ref, status: "new" };
@@ -394,14 +417,17 @@ export async function executeConnectedRun(opts = {}) {
 
   // ---- the one create
   await runStep("KW1_CREATE", async () => {
-    const plan = planOf(m, ref);
-    const req = buildCreateReservationRequest(plan, cfg);
+    const req = createReq;
     const attempt = { ref, reservationId: null };
     attempts.push(attempt);
     const resp = await gate.send("KW1_CREATE", req, { writeKind: "create", intent: { ref, from: s.arrivalDate, to: s.departureDate, totalMinor: m.totalMinor } });
     report.writes.create++;
     const cls = classifyCreateResponse(resp, plan, cfg);
     const rid = cls.reservation?.reservationId ?? cls.reservationId;
+    if (isPosInt(rid) && isProtected(rid)) {                  // never adopted: not readable, not cancellable, not reconciled by id
+      safeAppend("KW1_CREATE", { type: "outcome", step: "KW1_CREATE", kind: "create", ref, code: "CREATE_RETURNED_PROTECTED_ID" });
+      return halt("KW1_CREATE", "CREATE_RETURNED_PROTECTED_ID");
+    }
     if (isPosInt(rid)) { attempt.reservationId = rid; state.readableIds.add(rid); }
     safeAppend("KW1_CREATE", { type: "outcome", step: "KW1_CREATE", kind: "create", ref, code: cls.code, evidence: cls,
       ...(resp.transportError ? { transport: resp.code } : {}) });
@@ -421,7 +447,7 @@ export async function executeConnectedRun(opts = {}) {
     const lk = await lookupByRef({ ref, listingId: CONNECTED_TEST_LISTING_ID, arrivalDate: s.arrivalDate, departureDate: s.departureDate }, cfg,
       (req) => gate.send("K5_LOOKUP_REF", req));
     safeAppend("K5_LOOKUP_REF", { type: "read", step: "K5_LOOKUP_REF", kind: "lookup", code: lk.code, ref });
-    if (lk.outcome !== "found" || lk.reservation.reservationId !== id) return halt("K5_LOOKUP_REF", `LOOKUP_NOT_CONFIRMED:${lk.code}`);
+    if (lk.outcome !== "found" || lk.reservation.reservationId !== id || isProtected(id)) return halt("K5_LOOKUP_REF", `LOOKUP_NOT_CONFIRMED:${lk.code}`);
     const mm = identityMismatches(lk.reservation, { ...expectNew, reservationId: id });
     if (mm.length) return halt("K5_LOOKUP_REF", "LOOKUP_IDENTITY_MISMATCH", { mismatches: mm });
   });
@@ -475,13 +501,15 @@ export async function executeConnectedRun(opts = {}) {
     state.cancellableId = null;
     report.reconcile = await reconcileReadOnly(gate, attempts, cfg, s, (e) => safeAppend("KR_RECONCILE", e));
   }
-  report.status = state.halted ? "HALTED" : "COMPLETED";
   const ev = report.evidence;
   report.syncProven = ev.hostawayBlocked?.code === "OBSERVED_STABLE" && ev.airbnbBlocked === "blocked" &&
     ev.hostawayReopened?.code === "OBSERVED_STABLE" && ev.airbnbReopened === "open";
+  const endCode = state.halted || !report.journalDurable ? "HALTED" : "COMPLETED";
+  try { jappend({ type: "run-end", code: endCode }); report.runEndRecorded = true; } catch { latch("RUN_END"); }
+  // COMPLETED only with no halt AND a durable journal including the terminal record; otherwise never a clean completion.
+  report.status = state.halted ? "HALTED" : report.journalDurable && report.runEndRecorded ? "COMPLETED" : "COMPLETED_JOURNAL_NOT_DURABLE";
   report.passed = report.status === "COMPLETED" && report.commandReply?.code === "VERIFIED_CANCELLED" && report.finalState?.identityOk === true &&
-    report.sideEffectsCancel?.ok === true && report.syncProven;
-  try { jappend({ type: "run-end", code: report.status }); } catch { report.passed = false; }
+    report.sideEffectsCancel?.ok === true && report.syncProven === true;
   report.requests = gate.requestCount();
   return deepFreeze(report);
 }

@@ -155,6 +155,7 @@ test("prerequisites refuse with zero requests (token, code binding, journal, che
 test("full run: price -> clear -> calendar open -> Airbnb open -> ONE create -> side effects -> blocked (both) -> ONE cancel -> reopened (both)", async () => {
   const { r, j, w, stages } = await run(world());
   assert.deepEqual([r.status, r.passed, r.syncProven, r.halt, r.writes], ["COMPLETED", true, true, null, { create: 1, cancel: 1 }]);
+  assert.deepEqual([r.journalDurable, r.journalFailures, r.runEndRecorded], [true, [], true]);
   assert.deepEqual(writes(w), ["POST /reservations", `PUT /reservations/${w.res.id}/statuses/cancelled`]);
   assert.ok(w.log.indexOf("POST /reservations") > w.log.indexOf(`POST /listings/${L}/calendar/priceDetails`), "price before create");
   assert.equal(w.log[w.log.indexOf(writes(w)[1]) - 1], `GET /reservations/${w.res.id}`, "fresh read immediately before the cancel");
@@ -259,11 +260,21 @@ test("journal: a non-durable write-ahead intent sends nothing", async () => {
 });
 
 // ---------- allowlist, adapter profile, containment ----------
+// A run's private bound shapes, exactly as executeConnectedRun derives them from the validated manifest + generated ref.
+const REF = "MV-ABCDEF12";
+function boundState(over = {}) {
+  const createBody = A.buildCreateReservationRequest({ ref: REF, listingId: L, arrivalDate: STAY.arrivalDate, departureDate: STAY.departureDate, guests: 2,
+    guest: GUEST, totalMinor: TOTAL, currency: "MXN" }, A.connectedTestAdapterConfig()).body;
+  return { readableIds: new Set([91000001]), cancellableId: 91000001, calendar: { startDate: "2027-04-05", endDate: "2027-04-06" },
+    bound: { priceBody: { startingDate: STAY.arrivalDate, endingDate: STAY.departureDate, numberOfGuests: 2, version: 2 }, createBody, arrivalDate: STAY.arrivalDate }, ...over };
+}
+const LOOKUP = { listingId: L, channelId: 2000, arrivalStartDate: STAY.arrivalDate, arrivalEndDate: STAY.arrivalDate, limit: 100, includeResources: 1 };
+
 test("allowlist: 603566 only; reads/cancel only of an id this run verified; exact calendar range; no other listing, reservation or method", () => {
-  const st = { readableIds: new Set([91000001]), cancellableId: 91000001, calendar: { startDate: "2027-04-05", endDate: "2027-04-06" } };
-  const refused = (req, wk) => assert.throws(() => assertConnectedRequest(req, st, wk), (e) => e instanceof R.RunnerError, JSON.stringify(req));
-  const body = { channelId: 2000, listingMapId: L, arrivalDate: "2027-04-05", departureDate: "2027-04-07", totalPrice: 4400, currency: "MXN" };
-  assert.equal(assertConnectedRequest({ method: "POST", path: "/reservations", query: {}, body }, st, "create"), "create");
+  const st = boundState();
+  const refused = (req, wk, s2 = st) => assert.throws(() => assertConnectedRequest(req, s2, wk), (e) => e instanceof R.RunnerError, JSON.stringify(req));
+  const body = st.bound.createBody;
+  assert.equal(assertConnectedRequest({ method: "POST", path: "/reservations", query: {}, body: JSON.parse(JSON.stringify(body)) }, st, "create"), "create");
   assert.equal(assertConnectedRequest({ method: "PUT", path: "/reservations/91000001/statuses/cancelled", query: {}, body: { cancelledBy: "host" } }, st, "cancel"), "cancel");
   assert.equal(assertConnectedRequest({ method: "GET", path: `/listings/${L}/calendar`, query: { startDate: "2027-04-05", endDate: "2027-04-06" } }, st), "read");
   refused({ method: "POST", path: "/reservations", query: {}, body: { ...body, listingMapId: 603564 } }, "create");
@@ -277,11 +288,92 @@ test("allowlist: 603566 only; reads/cancel only of an id this run verified; exac
   refused({ method: "DELETE", path: "/reservations/91000001", query: {} });
   refused({ method: "GET", path: "/listings/603564/calendar", query: { startDate: "2027-04-05", endDate: "2027-04-06" } });
   refused({ method: "GET", path: `/listings/${L}/calendar`, query: { startDate: "2027-04-01", endDate: "2027-04-30" } });
-  refused({ method: "POST", path: "/listings/603564/calendar/priceDetails", query: {}, body: { version: 2 } });
-  refused({ method: "GET", path: "/reservations", query: { listingId: 603564, channelId: 2000 } });
+  refused({ method: "POST", path: "/listings/603564/calendar/priceDetails", query: {}, body: st.bound.priceBody });
+  refused({ method: "GET", path: "/reservations", query: { ...LOOKUP, listingId: 603564 } });
   refused({ method: "GET", path: "/conversations", query: { reservationId: 70636076, limit: 100, offset: 0 } });
   refused({ method: "GET", path: "/conversations/7701/messages", query: {} });
   refused({ method: "GET", path: "/guestPayments/charges", query: { reservationId: 91000001, limit: 100, offset: 100 } });
+});
+
+test("allowlist binds price/create/lookup EXACTLY to the run's validated manifest and generated ref; unbound state admits nothing", () => {
+  const st = boundState();
+  const ok = (req, wk) => assert.ok(["calc", "create", "lookup"].includes(assertConnectedRequest(req, st, wk)), JSON.stringify(req));
+  const refused = (req, wk, s2 = st) => assert.throws(() => assertConnectedRequest(req, s2, wk), (e) => e instanceof R.RunnerError, JSON.stringify(req));
+  const body = st.bound.createBody, price = st.bound.priceBody;
+  ok({ method: "POST", path: `/listings/${L}/calendar/priceDetails`, query: {}, body: { ...price } }, null);
+  ok({ method: "GET", path: "/reservations", query: { ...LOOKUP } }, null);
+  ok({ method: "GET", path: "/reservations", query: { ...LOOKUP, afterId: 123 } }, null);
+  // create: any different date, amount, guest count/name/email, ref, channel, or a missing/extra field
+  for (const [k, v] of [["arrivalDate", "2027-04-06"], ["departureDate", "2027-04-08"], ["totalPrice", 4400.01], ["totalPrice", 1], ["numberOfGuests", 1],
+    ["guestFirstName", "Other"], ["guestName", "Other Person"], ["guestEmail", "other@example.invalid"], ["channelId", 2005]]) {
+    refused({ method: "POST", path: "/reservations", query: {}, body: { ...body, [k]: v } }, "create");
+  }
+  refused({ method: "POST", path: "/reservations", query: {}, body: { ...body, customFieldValues: [{ customFieldId: 105433, value: "MV-ZZZZZZ99" }] } }, "create");
+  for (const k of Object.keys(body)) { const { [k]: _drop, ...missing } = body; refused({ method: "POST", path: "/reservations", query: {}, body: missing }, "create"); }
+  refused({ method: "POST", path: "/reservations", query: {}, body: { ...body, extra: 1 } }, "create");
+  // price: other dates, guests, version, missing or extra field
+  for (const b2 of [{ ...price, startingDate: "2027-04-06" }, { ...price, endingDate: "2027-05-01" }, { ...price, numberOfGuests: 1 }, { ...price, version: 1 },
+    { startingDate: price.startingDate, endingDate: price.endingDate, numberOfGuests: 2 }, { ...price, x: 1 }]) {
+    refused({ method: "POST", path: `/listings/${L}/calendar/priceDetails`, query: {}, body: b2 }, null);
+  }
+  // lookup: other arrival, missing bound keys, extra keys, bad cursor
+  for (const q of [{ ...LOOKUP, arrivalStartDate: "2027-04-01" }, { ...LOOKUP, arrivalEndDate: "2027-04-30" }, { listingId: L, channelId: 2000 },
+    { ...LOOKUP, limit: 50 }, { ...LOOKUP, includeResources: 0 }, { ...LOOKUP, x: 1 }, { ...LOOKUP, afterId: 0 }, { ...LOOKUP, afterId: "12" }]) {
+    refused({ method: "GET", path: "/reservations", query: q });
+  }
+  // nothing is admitted without the run's private bound shapes
+  for (const s2 of [boundState({ bound: undefined }), boundState({ bound: { ...st.bound, createBody: null } })]) {
+    refused({ method: "POST", path: `/listings/${L}/calendar/priceDetails`, query: {}, body: { ...price } }, null, s2);
+    refused({ method: "GET", path: "/reservations/91000001", query: { includeResources: 1 } }, null, s2);
+  }
+});
+
+test("protected reservation 70636076 is refused even if it were readable/cancellable, in paths and in list queries", () => {
+  const st = boundState({ readableIds: new Set([70636076]), cancellableId: 70636076 });
+  const code = (req, wk) => { try { assertConnectedRequest(req, st, wk); return "ALLOWED"; } catch (e) { return e.code; } };
+  assert.equal(code({ method: "GET", path: "/reservations/70636076", query: { includeResources: 1 } }), "PROTECTED_RESERVATION");
+  assert.equal(code({ method: "PUT", path: "/reservations/70636076/statuses/cancelled", query: {}, body: { cancelledBy: "host" } }, "cancel"), "PROTECTED_RESERVATION");
+  assert.equal(code({ method: "GET", path: "/conversations", query: { reservationId: 70636076, limit: 100, offset: 0 } }), "PROTECTED_RESERVATION");
+  assert.equal(code({ method: "GET", path: "/guestPayments/charges", query: { reservationId: "70636076", limit: 100, offset: 0 } }), "PROTECTED_RESERVATION");
+  assert.deepEqual(C.CONNECTED_PROTECTED_RESERVATION_IDS, [70636076]);
+});
+
+test("a create reply claiming the protected id 70636076 is never adopted: safety halt, no read or cancel of it, no further write", async () => {
+  const w = world(); w.nextId = 70636076;
+  const { r, j } = await run(w);
+  assert.deepEqual([r.status, r.passed, r.halt.step, r.halt.code, r.writes], ["HALTED", false, "KW1_CREATE", "CREATE_RETURNED_PROTECTED_ID", { create: 1, cancel: 0 }]);
+  assert.deepEqual(writes(w), ["POST /reservations"]);
+  assert.ok(!w.log.some((l) => l.includes("70636076")), "the protected id is never requested");
+  assert.ok(w.log.slice(w.log.indexOf("POST /reservations") + 1).every((l) => l.startsWith("GET ")), "reads only after");
+  assert.ok(r.reconcile.every((x) => x.reservationId === undefined), "not reconciled by id");
+  assert.equal(j.entries.find((e) => e.type === "outcome").code, "CREATE_RETURNED_PROTECTED_ID");
+});
+
+test("journal durability latch: any append failure (run-start, intent, outcome, read, halt, run-end) means never a clean completion; later appends never clear it", async () => {
+  const v = validateConnectedManifest(manifest(), { now: NOW });
+  const go = async (failOn, w = world()) => { const j = memJournal(v.hash, failOn); const out = await run(w, { journal: j }); return { ...out, w }; };
+  // run-start: refused, nothing sent
+  let { r, w } = await go((e) => e.type === "run-start");
+  assert.deepEqual([r.status, r.requests, w.log.length, r.journalDurable, r.journalFailures, r.runEndRecorded], ["REFUSED", 0, 0, false, ["RUN_START"], false]);
+  // intent of the create: nothing written, halted, latched; the later halt and run-end appends succeed but do not clear it
+  ({ r, w } = await go((e) => e.type === "intent" && e.step === "KW1_CREATE"));
+  assert.deepEqual([r.status, writes(w).length, r.journalDurable, r.journalFailures, r.runEndRecorded, r.passed], ["HALTED", 0, false, ["intent:KW1_CREATE"], true, false]);
+  // outcome of the create: one create sent, never a cancel
+  ({ r, w } = await go((e) => e.type === "outcome" && e.step === "KW1_CREATE"));
+  assert.deepEqual([r.status, writes(w).length, r.halt.code, r.journalDurable, r.journalFailures[0], r.passed], ["HALTED", 1, "JOURNAL_WRITE_FAILED", false, "outcome:KW1_CREATE", false]);
+  // an ordinary read record before any write: no write at all
+  ({ r, w } = await go((e) => e.type === "read" && e.step === "K0_PRICE"));
+  assert.deepEqual([r.status, writes(w).length, r.journalDurable, r.journalFailures[0]], ["HALTED", 0, false, "read:K0_PRICE"]);
+  // the halt record itself
+  ({ r, w } = await go((e) => e.type === "halt", world({ price: 1 })));
+  assert.deepEqual([r.status, r.halt.code, writes(w).length, r.journalDurable, r.journalFailures, r.runEndRecorded], ["HALTED", "PREFLIGHT_TOTAL_MISMATCH", 0, false, ["HALT:K0_PRICE"], true]);
+  // the terminal run-end record of an otherwise perfect run: never COMPLETED, never passed
+  ({ r, w } = await go((e) => e.type === "run-end"));
+  assert.deepEqual([r.status, r.passed, r.journalDurable, r.runEndRecorded, r.journalFailures, writes(w).length],
+    ["COMPLETED_JOURNAL_NOT_DURABLE", false, false, false, ["RUN_END"], 2]);
+  // a read record failing AFTER the cancel: latched, no extra write, not passed
+  ({ r, w } = await go((e) => e.type === "read" && e.step === "K10_CALENDAR_REOPENED"));
+  assert.deepEqual([r.status, r.passed, r.journalDurable, writes(w).length], ["HALTED", false, false, 2]);
 });
 
 test("adapter: only a MINTED connected config can address 603566; plain objects and every default config still reject BOTH pilots; 603564 never", () => {
