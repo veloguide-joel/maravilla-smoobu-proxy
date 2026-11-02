@@ -310,7 +310,8 @@ test("halt before the cancel (side effects present): recovery reports OWNER_DECI
 const H = V.hash; const REF0 = "MV-PROBE001"; const REF = "MV-ABCDEF12";
 const start = { type: "run-start", runId: "a".repeat(16), manifestHash: H, refs: [REF0, REF] };
 const ci = { type: "intent", step: "KW1_CREATE", kind: "create", ref: REF };
-const co = (id) => ({ type: "outcome", step: "KW1_CREATE", kind: "create", ref: REF, code: "CREATED", evidence: { reservationId: id } });
+// the producer's real code for a reply-verified create (a cancel after any other create outcome is a CANCEL_WITHOUT_VERIFIED_CREATE conflict)
+const co = (id, code = "VERIFIED_CREATED") => ({ type: "outcome", step: "KW1_CREATE", kind: "create", ref: REF, code, evidence: { reservationId: id } });
 const xi = (id) => ({ type: "intent", step: "KW2_CANCEL", kind: "cancel", reservationId: id, ref: REF });
 const xo = (id, code, extra = {}) => ({ type: "outcome", step: "KW2_CANCEL", kind: "cancel", reservationId: id, code, ...extra });
 
@@ -601,9 +602,9 @@ const A = await import("../lib/hostaway-reservations.js");
 const reconcileWith = async (sb, w) => RC.runConnectedRecoverCli(["--reconcile", "--manifest", sb.mpath, "--reviewed-commit", SHA, "--location", loc(sb.base).token],
   { root: sb.root, base: sb.base, git: RGIT, fetchImpl: w.fetch, sleep: async () => {}, prompt: async () => ({ accountId: "201434", clientSecret: "FAKE-SECRET" }) });
 
-test("create reply WITHOUT the ref custom field but later read WITH it: strict halt unchanged (1 create, 0 cancel); recovery now shows the reply's mismatching field NAMES", async () => {
+test("create reply whose ref field is MALFORMED (item keyed by id) but later read WITH the ref: strict halt (1 create, 0 cancel); recovery shows the reply's mismatching field NAMES", async () => {
   const sb = sandbox();
-  const w = world({ createReply: (wd) => { const { customFieldValues, ...noRef } = wd.res; return { status: 200, json: { status: "success", result: noRef } }; } });
+  const w = world({ createReply: (wd) => ({ status: 200, json: { status: "success", result: { ...wd.res, customFieldValues: [{ id: 105433, value: wd.res.customFieldValues[0].value }] } } }) });
   const { d, calls } = deps(sb, w);
   const r = await X.runConnectedExecuteCli(execArgs(sb), d);
   assert.equal(r.exitCode, 3); assert.equal(r.output.status, "HALTED");
@@ -611,7 +612,8 @@ test("create reply WITHOUT the ref custom field but later read WITH it: strict h
   assert.deepEqual(r.output.writes, { create: 1, cancel: 0 }); assert.deepEqual(writes(w), ["POST /reservations"]);
   assert.deepEqual(calls.stages, ["before-create"]);                                   // no after-create checkpoint is reached
   assert.equal(r.output.reconcile[0].reservationId, w.res.id); assert.equal(r.output.reconcile[0].reservationStatus, "new");
-  // the guard itself is NOT weakened: a reply without the ref is still a conflict
+  assert.deepEqual(r.output.createVerification, { path: "NONE", result: "NOT_VERIFIED", refEcho: "MALFORMED", refusal: "CUSTOM_FIELDS_NOT_DEMONSTRABLY_ABSENT", readVerify: null, lookupVerify: null });
+  // the classification itself is NOT weakened: a reply without the ref is still a conflict (only the narrow KV path may follow)
   const plan = { ref: "MV-ABCDEF12", listingId: L, arrivalDate: STAY.arrivalDate, departureDate: STAY.departureDate, guests: 2, guest: GUEST, totalMinor: TOTAL, currency: "MXN" };
   const noRef = { httpStatus: 200, json: { status: "success", result: { id: 5, listingMapId: L, channelId: 2000, arrivalDate: STAY.arrivalDate, departureDate: STAY.departureDate,
     totalPrice: 3200, currency: "MXN", status: "new" } } };
@@ -623,6 +625,7 @@ test("create reply WITHOUT the ref custom field but later read WITH it: strict h
   assert.equal(ri.exitCode, 3);
   assert.equal(ri.output.classification.state, "CREATED_NO_CANCEL_ATTEMPT");
   assert.deepEqual(ri.output.classification.createOutcome, { code: "RESERVATION_MISMATCH", replyMismatchFields: ["bookingRef"], replyHttpStatus: 200 });
+  assert.deepEqual(ri.output.classification.createVerification, { path: "NONE", result: "NOT_VERIFIED", refEcho: null, readVerify: null, lookupVerify: null });
   const rr = await reconcileWith(sb, w);
   assert.equal(rr.output.reconcile.read.code, "READ_IDENTITY_OK"); assert.equal(rr.output.reconcile.verdict, "RESERVATION_ACTIVE_OWNER_DECISION_REQUIRED");
   assert.ok(w.log.filter((x) => x === "POST /reservations" || x.startsWith("PUT ")).length === 1);
@@ -652,9 +655,9 @@ test("calendar API/UI discrepancy: an active reservation while the API calendar 
   ];
   for (const [days, code, expect] of cases) {
     const sb = sandbox();
-    const w = world({ createReply: (wd) => { const { customFieldValues, ...noRef } = wd.res; return { status: 200, json: { status: "success", result: noRef } }; } });
+    const w = world({ createReply: (wd) => ({ status: 200, json: { status: "success", result: { ...wd.res, customFieldValues: "PROVIDER-TEXT" } } }) });
     const { d } = deps(sb, w);
-    await X.runConnectedExecuteCli(execArgs(sb), d);                      // creates, halts (reply lacks the ref)
+    await X.runConnectedExecuteCli(execArgs(sb), d);                      // creates, halts (reply's ref field malformed)
     const w2 = { ...w, fetch: world({ calendarDays: days }).fetch };
     // reuse the same reservation in a second fake world for the recovery reads
     const wr = world({ calendarDays: days }); wr.res = w.res;
@@ -666,4 +669,57 @@ test("calendar API/UI discrepancy: an active reservation while the API calendar 
     assert.ok(!s.includes("1600") && !s.includes("PROVIDER-TEXT") && !s.includes("price") && !s.includes("note"));
     void w2;
   }
+});
+
+// ---------- 2026-11-02 read-only create verification through the real launcher, file journal, URL guard and recovery ----------
+const noRefReply = (wd) => { const { customFieldValues, ...rest } = wd.res; return { status: 200, json: { status: "success", result: rest } }; };
+
+test("launcher end-to-end: an unechoed ref is READ_VERIFIED (fresh read + same-id unique lookup), then the unchanged checks and one cancel; recovery says READ_VERIFIED; replay refused", async () => {
+  const sb = sandbox();
+  const w = world({ createReply: noRefReply });
+  const { d, calls } = deps(sb, w);
+  const r = await X.runConnectedExecuteCli(execArgs(sb), d);
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output.halt)); assert.equal(r.output.passed, true);
+  assert.deepEqual(r.output.writes, { create: 1, cancel: 1 }); assert.equal(writes(w).length, 2);
+  assert.deepEqual(r.output.createVerification, { path: "READ_FALLBACK", result: "READ_VERIFIED", refEcho: "ABSENT_UNDEFINED", refusal: null,
+    readVerify: "VERIFY_READ_IDENTITY_OK", lookupVerify: "VERIFY_LOOKUP_SAME_ID_IDENTITY_OK" });
+  assert.deepEqual(calls.stages, ["before-create", "after-create", "after-cancel"]);
+  assert.equal(r.output.guard.refused, 0); assert.equal(r.output.guard.read, 4); assert.equal(r.output.guard.lookup, 5);   // reads: KV1+K4+K7+K8; lookup pages: K1 (1 empty) + KV2 (2) + K5 (2)
+  const ri = await inspect(sb, loc(sb.base));
+  assert.equal(ri.exitCode, 0, JSON.stringify(ri.output.classification));
+  assert.equal(ri.output.classification.state, "CANCEL_VERIFIED"); assert.equal(ri.output.classification.clean, true);
+  assert.deepEqual(ri.output.classification.createVerification, { path: "READ_FALLBACK", result: "READ_VERIFIED", refEcho: "CREATE_REF_NOT_ECHOED:ABSENT_UNDEFINED",
+    readVerify: "VERIFY_READ_IDENTITY_OK", lookupVerify: "VERIFY_LOOKUP_SAME_ID_IDENTITY_OK" });
+  assert.deepEqual(ri.output.classification.createOutcome, { code: "RESERVATION_MISMATCH", replyMismatchFields: ["bookingRef"], replyHttpStatus: 200 });   // original evidence kept
+  const before = w.log.length; const x2 = deps(sb, w);
+  const r2 = await X.runConnectedExecuteCli(execArgs(sb), x2.d);
+  assert.equal(r2.output.error, "REPLAY_REFUSED_RUN_LOCATION_EXISTS"); assert.equal(x2.calls.prompt, 0); assert.equal(w.log.length, before);
+  leakFree(r.output); leakFree(ri.output);
+});
+
+test("launcher end-to-end: a KV2 lookup returning another id halts read-only (no cancel); recovery shows the conflict and never a clean result; reconcile writes nothing", async () => {
+  const sb = sandbox();
+  const w = world({ createReply: noRefReply });
+  const base = w.fetch;
+  let creates = 0;
+  w.fetch = async (url, init = {}) => {
+    const u = new URL(String(url));
+    if ((init.method ?? "GET") === "POST" && u.pathname === "/v1/reservations") creates++;
+    if (creates && (init.method ?? "GET") === "GET" && u.pathname === "/v1/reservations" && !u.searchParams.get("afterId") && w.res) {
+      w.log.push("GET /reservations");
+      const other = { ...w.res, id: 91000078, hostawayReservationId: "91000078" };
+      return new Response(JSON.stringify({ status: "success", result: [other] }), { status: 200 });
+    }
+    return base(url, init);
+  };
+  const { d } = deps(sb, w);
+  const r = await X.runConnectedExecuteCli(execArgs(sb), d);
+  assert.equal(r.exitCode, 3); assert.equal(r.output.halt.step, "KV2_LOOKUP_VERIFY"); assert.equal(r.output.halt.code, "VERIFY_LOOKUP_ID_DIFFERS");
+  assert.deepEqual(r.output.writes, { create: 1, cancel: 0 }); assert.equal(r.output.passed, false);
+  assert.equal(r.output.createVerification.result, "NOT_VERIFIED");
+  const ri = await inspect(sb, loc(sb.base));
+  assert.equal(ri.exitCode, 3); assert.equal(ri.output.classification.clean, false);
+  assert.ok(ri.output.classification.conflicts.includes("RESERVATION_IDS_INCONSISTENT"));
+  assert.equal(ri.output.classification.createVerification.result, "NOT_VERIFIED");
+  leakFree(r.output); leakFree(ri.output);
 });

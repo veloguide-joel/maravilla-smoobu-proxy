@@ -42,11 +42,11 @@ import { verifyProvenance, makeGit } from "../e4-launcher/happy-execute.mjs";
 import { createHostawayTransport, HOSTAWAY_BASE } from "../e4-transport/hostaway-transport.mjs";
 import { createFileJournal } from "../e4-write-runner/journal.mjs";
 import { READ_QUERY, CANCEL_BODY } from "../e4-write-runner/runner.mjs";
-import { LOOKUP_MAX_PAGES, DIRECT_CHANNEL_ID } from "../../lib/hostaway-reservations.js";
+import { LOOKUP_MAX_PAGES, DIRECT_CHANNEL_ID, REF_ECHO_SHAPES, REF_NOT_ECHOED_REFUSALS } from "../../lib/hostaway-reservations.js";
 import { realTimer } from "./safeguards.mjs";
 import {
   validateConnectedManifest, planConnectedRun, executeConnectedRun, stayNights, CONNECTED_SOURCES, CONNECTED_STEPS,
-  CONNECTED_PROTECTED_RESERVATION_IDS, CONNECTED_VERSION
+  CONNECTED_PROTECTED_RESERVATION_IDS, CONNECTED_VERSION, CONNECTED_VERIFY_READ_CODES, CONNECTED_VERIFY_LOOKUP_CODES
 } from "./connected-path.mjs";
 
 const ROOT = resolve(fileURLToPath(new URL("../..", import.meta.url)));
@@ -137,11 +137,11 @@ export function guardConnectedFetch(fetchImpl, { calendar, arrivalDate, departur
     { name: "price", max: CONNECTED_STEPS.K0_PRICE.reads, m: "POST", re: new RegExp(`^/v1/listings/${L}/calendar/priceDetails$`), q: exact({}), body: true, bodyOk: priceOk },
     { name: "create", max: 1, m: "POST", re: /^\/v1\/reservations$/, q: exact({}), body: true, bodyOk: createOk },
     { name: "cancel", max: 1, m: "PUT", re: /^\/v1\/reservations\/[1-9]\d{0,15}\/statuses\/cancelled$/, q: exact({}), body: true, bodyOk: cancelOk },
-    { name: "lookup", max: sum("K1_CLEAR", "K5_LOOKUP_REF") + LOOKUP_MAX_PAGES, m: "GET", re: /^\/v1\/reservations$/, q: (p) => {
+    { name: "lookup", max: sum("K1_CLEAR", "KV2_LOOKUP_VERIFY", "K5_LOOKUP_REF") + LOOKUP_MAX_PAGES, m: "GET", re: /^\/v1\/reservations$/, q: (p) => {
       const rest = new URLSearchParams([...p.keys()].filter((k) => k !== "afterId").map((k) => [k, p.get(k)]));
       return exact(lookupBase)(rest) && (!p.has("afterId") || /^[1-9]\d{0,15}$/.test(p.get("afterId")));
     } },
-    { name: "read", max: sum("K4_READBACK", "K7_PRECANCEL", "K8_POSTCANCEL") + 1, m: "GET", re: /^\/v1\/reservations\/[1-9]\d{0,15}$/, q: exact(READ_QUERY) },
+    { name: "read", max: sum("KV1_READ_VERIFY", "K4_READBACK", "K7_PRECANCEL", "K8_POSTCANCEL") + 1, m: "GET", re: /^\/v1\/reservations\/[1-9]\d{0,15}$/, q: exact(READ_QUERY) },
     { name: "calendar", max: sum("K2_CALENDAR_BEFORE", "K6_CALENDAR_BLOCKED", "K10_CALENDAR_REOPENED"), m: "GET", re: new RegExp(`^/v1/listings/${L}/calendar$`), q: exact(calendar) },
     { name: "side", max: sum("K3_SIDE_EFFECTS_CREATE", "K9_SIDE_EFFECTS_CANCEL"), m: "GET", re: /^\/v1\/(guestPayments\/charges|conversations|tasks)$/, q: side }
   ];
@@ -162,6 +162,17 @@ export function guardConnectedFetch(fetchImpl, { calendar, arrivalDate, departur
   return { guarded, used: () => Object.freeze({ ...used, refused }) };
 }
 
+// How the one create was verified, from explicit enums only: REPLY_VERIFIED (the strict full create reply) vs READ_VERIFIED
+// (unechoed ref; fresh read by id + unique same-id ref lookup) vs NOT_VERIFIED. Any value outside the allowlists -> "OTHER".
+const CV_PATHS = Object.freeze(["NONE", "REPLY", "READ_FALLBACK"]);
+const CV_RESULTS = Object.freeze(["NOT_VERIFIED", "REPLY_VERIFIED", "READ_VERIFIED"]);
+export function createVerificationSummary(cv) {
+  if (!isObj(cv)) return { path: "NONE", result: "NOT_VERIFIED", refEcho: null, refusal: null, readVerify: null, lookupVerify: null };
+  const en = (v, list) => (v === null || v === undefined ? null : list.includes(v) ? v : "OTHER");
+  return { path: en(cv.path, CV_PATHS) ?? "NONE", result: en(cv.result, CV_RESULTS) ?? "NOT_VERIFIED", refEcho: en(cv.refEcho, REF_ECHO_SHAPES),
+    refusal: en(cv.refusal, REF_NOT_ECHOED_REFUSALS), readVerify: en(cv.readVerify, CONNECTED_VERIFY_READ_CODES), lookupVerify: en(cv.lookupVerify, CONNECTED_VERIFY_LOOKUP_CODES) };
+}
+
 /** Explicit allowlist of the report (already codes/ids only); nothing else leaves the process. */
 export function summarizeConnected(report, extra = {}) {
   const pick = (o, keys) => (isObj(o) ? Object.fromEntries(keys.filter((k) => Object.prototype.hasOwnProperty.call(o, k)).map((k) => [k, o[k]])) : null);
@@ -178,6 +189,7 @@ export function summarizeConnected(report, extra = {}) {
     sideEffectsCreate: side(report.sideEffectsCreate), sideEffectsCancel: side(report.sideEffectsCancel),
     evidence: { hostawayBlocked: obs(ev.hostawayBlocked), airbnbBlocked: ev.airbnbBlocked ?? null, hostawayReopened: obs(ev.hostawayReopened), airbnbReopened: ev.airbnbReopened ?? null },
     syncProven: report.syncProven === true,
+    createVerification: createVerificationSummary(report.createVerification),
     reconcile: (report.reconcile || []).map((r) => pick(r, ["ref", "reservationId", "readCode", "reservationStatus", "lookupCode", "foundReservationId"])),
     journalDurable: report.journalDurable !== false, journalFailures: report.journalFailures ?? [], runEndRecorded: report.runEndRecorded === true,
     ...(report.prerequisites ? { prerequisites: report.prerequisites } : {}),

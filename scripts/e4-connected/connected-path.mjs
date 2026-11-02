@@ -19,6 +19,9 @@
 //   K0 priceDetails total == manifest totalMinor (MXN)      K1 no reservation at all on the arrival date (non-authoritative)
 //   K2 Hostaway calendar: every stay night open             A0 operator: Airbnb shows the nights OPEN (else no write)
 //   KW1 create -> verified full identity, status new        K3 side effects: charges zero, exactly ONE conversation, no task
+//   (only if the KW1 reply's sole difference is an unechoed ref whose raw field is demonstrably absent and its status is new:
+//    KV1 fresh read by the returned id, full identity + new; KV2 unique ref lookup -> the SAME id, full identity + new.
+//    Both read-only; any doubt halts with no cancel. Otherwise the KW1 reply alone decides, exactly as before.)
 //   K4 read by id (full identity, new)                      K5 ref lookup finds the same id with full identity
 //   K6 Hostaway calendar blocked (bounded observation)      A1 operator: Airbnb shows the nights BLOCKED   (evidence only)
 //   K7 FRESH read by id; only then is the id cancellable    KW2 cancel -> reply must carry the full identity, cancelled
@@ -30,7 +33,7 @@
 import { randomBytes, createHash } from "node:crypto";
 import {
   connectedTestAdapterConfig, CONNECTED_TEST_LISTING_ID, CONNECTED_TEST_CURRENCY, CONNECTED_TEST_REF_FIELD_ID,
-  buildCreateReservationRequest, classifyCreateResponse, lookupByRef, isRealDate, DIRECT_CHANNEL_ID, LOOKUP_MAX_PAGES, AdapterError
+  buildCreateReservationRequest, classifyCreateResponse, assessRefNotEchoed, REF_ECHO_ABSENT_SHAPES, EVIDENCE_CODES, lookupByRef, isRealDate, DIRECT_CHANNEL_ID, LOOKUP_MAX_PAGES, AdapterError
 } from "../../lib/hostaway-reservations.js";
 import {
   PLACEHOLDER, MIN_LEAD_DAYS, MAX_WINDOW_NIGHTS, MAX_STAY_NIGHTS, DEFAULT_TIMEOUT_MS, CANCEL_BODY, READ_QUERY, RunnerError,
@@ -54,9 +57,15 @@ export const CONNECTED_SOURCES = Object.freeze([
 ]);
 export const CONNECTED_MAX_GUESTS = 2;                               // 603566 capacity (dashboard read-only evidence)
 export const CONNECTED_WRITE_BUDGET = Object.freeze({ create: 1, cancel: 1 });
-// Reservations this runner must never read, cancel or adopt, whatever a provider reply claims (the 2026-10-23 E4 test
-// reservation on 606998, cancelled 2026-10-24 by the reviewed recovery tool).
-export const CONNECTED_PROTECTED_RESERVATION_IDS = Object.freeze([70636076]);
+// Reservations a NEW run must never read, cancel or adopt, whatever a provider reply claims: 70636076 (the 2026-10-23 E4 test
+// reservation on 606998, cancelled 2026-10-24 by the reviewed recovery tool) and 71045356 (the 2026-11-01 connected-run
+// reservation on 603566, cancelled manually by the owner 2026-11-02; cleanup CLOSED).
+export const CONNECTED_PROTECTED_RESERVATION_IDS = Object.freeze([70636076, 71045356]);
+// Read-only RECOVERY exception, nothing else: the historical run bound to exactly this manifest hash created that one id, so
+// recovery of THAT run's own journal may still name and read it. Never consulted by execution (gate, launcher guard, adoption).
+export const CONNECTED_HISTORICAL_RUN_IDS = Object.freeze({
+  "6c58baedce5c735c6b9766a328c015d36a5e631dbf5bd69ebf6f7653b65697bf": 71045356
+});
 const isProtected = (v) => CONNECTED_PROTECTED_RESERVATION_IDS.includes(Number(v));
 // Hostaway-side calendar observation after the create and after the cancel: read at once, then every 10 s; 2 consecutive
 // confirming reads; at most 12 reads and 120 s each. A timeout or cap concludes nothing (and writes nothing).
@@ -68,6 +77,9 @@ export const CONNECTED_STEPS = Object.freeze({
   K2_CALENDAR_BEFORE: Object.freeze({ reads: 1, writes: 0 }),
   A0_AIRBNB_BEFORE: Object.freeze({ reads: 0, writes: 0 }),
   KW1_CREATE: Object.freeze({ reads: 0, writes: 1, kind: "create", executable: true }),
+  // read-only follow-up verification, ONLY after a create reply whose sole difference is an unechoed ref (assessRefNotEchoed)
+  KV1_READ_VERIFY: Object.freeze({ reads: 1, writes: 0 }),
+  KV2_LOOKUP_VERIFY: Object.freeze({ reads: LOOKUP_MAX_PAGES, writes: 0 }),
   K3_SIDE_EFFECTS_CREATE: Object.freeze({ reads: SIDE_READS, writes: 0 }),
   K4_READBACK: Object.freeze({ reads: 1, writes: 0 }),
   K5_LOOKUP_REF: Object.freeze({ reads: LOOKUP_MAX_PAGES, writes: 0 }),
@@ -81,6 +93,17 @@ export const CONNECTED_STEPS = Object.freeze({
   A2_AIRBNB_AFTER_CANCEL: Object.freeze({ reads: 0, writes: 0 }),
   KR_RECONCILE: Object.freeze({ reads: 1 + LOOKUP_MAX_PAGES, writes: 0 })
 });
+// Explicit allowlists of the read-only create-verification journal/report codes (KV1/KV2). Recovery and the launcher summary
+// accept exactly these; anything else is reported as "OTHER" (never echoed).
+const PARSE_FAIL_CODES = ["TRANSPORT_UNCERTAIN", "NO_HTTP_STATUS", "AUTH_UNCERTAIN", "RATE_LIMITED", "UPSTREAM_5XX", "REFUSAL_CANDIDATE",
+  "UNEXPECTED_HTTP_STATUS", "MALFORMED_ENVELOPE", "FAIL_ENVELOPE", "MALFORMED_RESERVATION", "RESERVATION_ID_INVALID", "RESERVATION_ID_INCONSISTENT",
+  "LISTING_ID_INVALID", "CHANNEL_ID_INVALID", "DATES_INVALID", "AMOUNT_NOT_EXACT", "CURRENCY_INVALID", "STATUS_INVALID", "CUSTOM_FIELDS_MALFORMED",
+  "REF_FIELD_DUPLICATED", "REF_VALUE_INVALID"];
+export const CONNECTED_VERIFY_MARKER_CODES = Object.freeze(REF_ECHO_ABSENT_SHAPES.map((x) => `CREATE_REF_NOT_ECHOED:${x}`));
+export const CONNECTED_VERIFY_READ_CODES = Object.freeze(["VERIFY_READ_IDENTITY_OK", "VERIFY_READ_IDENTITY_MISMATCH",
+  ...PARSE_FAIL_CODES.map((c) => `VERIFY_READ_${c}`)]);
+export const CONNECTED_VERIFY_LOOKUP_CODES = Object.freeze(["VERIFY_LOOKUP_SAME_ID_IDENTITY_OK", "VERIFY_LOOKUP_ID_INVALID", "VERIFY_LOOKUP_PROTECTED_ID",
+  "VERIFY_LOOKUP_ID_DIFFERS", "VERIFY_LOOKUP_IDENTITY_MISMATCH", ...EVIDENCE_CODES.map((c) => `VERIFY_LOOKUP_NOT_CONFIRMED:${c}`)]);
 export const CONNECTED_LIVE_UNVERIFIED = Object.freeze([
   "custom field 105433 (booking ref) is stored and returned for reservations on 603566 (verified only on 606998)",
   "priceDetails v2 result.totalPrice for 603566 in MXN equals the create totalPrice Hostaway accepts",
@@ -287,7 +310,8 @@ export async function executeConnectedRun(opts = {}) {
   const report = { status: "RUNNING", version: CONNECTED_VERSION, manifestHash: pre.hash, steps: [], writes: { create: 0, cancel: 0 }, halt: null,
     commandReply: null, finalState: null, sideEffectsCreate: null, sideEffectsCancel: null,
     evidence: { hostawayBlocked: null, airbnbBlocked: null, hostawayReopened: null, airbnbReopened: null }, reconcile: [],
-    journalDurable: true, journalFailures: [], runEndRecorded: false };
+    journalDurable: true, journalFailures: [], runEndRecorded: false,
+    createVerification: { path: "NONE", result: "NOT_VERIFIED", refEcho: null, refusal: null, readVerify: null, lookupVerify: null } };
   // Every journal append failure LATCHES (never cleared by later successful appends): the run can never again report a
   // clean or durable result, and a failure before the cancel stops every later write.
   const latch = (what) => { report.journalDurable = false; if (report.journalFailures.length < 16) report.journalFailures.push(what ?? "UNKNOWN"); };
@@ -336,6 +360,7 @@ export async function executeConnectedRun(opts = {}) {
   const expectNew = { listingId: CONNECTED_TEST_LISTING_ID, from: s.arrivalDate, to: s.departureDate, totalMinor: m.totalMinor,
     currency: CONNECTED_TEST_CURRENCY, channelId: DIRECT_CHANNEL_ID, bookingRef: ref, status: "new" };
   let id = null;
+  let pendingVerify = null;                                    // set only on the narrow unechoed-ref path; never makes `id` by itself
   const readFull = async (step, status, code) => {
     const resp = await gate.send(step, { method: "GET", path: `/reservations/${id}`, query: READ_QUERY });
     const p = parseReservationResponse(resp, "READ");
@@ -433,13 +458,66 @@ export async function executeConnectedRun(opts = {}) {
     if (isPosInt(rid)) { attempt.reservationId = rid; state.readableIds.add(rid); }
     safeAppend("KW1_CREATE", { type: "outcome", step: "KW1_CREATE", kind: "create", ref, code: cls.code, evidence: cls,
       ...(resp.transportError ? { transport: resp.code } : {}) });
-    if (cls.outcome !== "created") return halt("KW1_CREATE", `CREATE_NOT_VERIFIED:${cls.code}`);
+    if (cls.outcome !== "created") {
+      // The one narrow exception: the reply's ONLY difference is a ref that was not echoed (raw field demonstrably absent,
+      // original status accepted). It is NOT adopted here; KV1 + KV2 must verify it read-only first. Anything else halts as before.
+      const ne = cls.code === "RESERVATION_MISMATCH" && !resp.transportError ? assessRefNotEchoed(resp, plan, cfg) : null;
+      if (ne) { report.createVerification.refEcho = ne.shape ?? null; report.createVerification.refusal = ne.eligible ? null : ne.code; }
+      if (!ne || !ne.eligible || !isPosInt(rid) || ne.reservationId !== rid || isProtected(rid) || state.halted) {
+        return halt("KW1_CREATE", `CREATE_NOT_VERIFIED:${cls.code}`);
+      }
+      report.createVerification.path = "READ_FALLBACK";
+      pendingVerify = { reservationId: rid, shape: ne.shape };
+      record("KW1_CREATE", { code: `CREATE_REF_NOT_ECHOED:${ne.shape}`, reservationId: rid });
+      return;
+    }
     const mm = identityMismatches(cls.reservation, expectNew);
     if (mm.length) return halt("KW1_CREATE", "CREATE_IDENTITY_MISMATCH", { mismatches: mm });
     if (state.halted) return;
     id = cls.reservation.reservationId;
+    report.createVerification.path = "REPLY";
+    report.createVerification.result = "REPLY_VERIFIED";
     record("KW1_CREATE", { code: "VERIFIED_CREATED", reservationId: id });
   });
+  // ---- read-only follow-up verification (only on the narrow unechoed-ref path; no write, no retry, no second create)
+  await runStep("KV1_READ_VERIFY", async () => {
+    if (!pendingVerify) return;
+    const rid = pendingVerify.reservationId;
+    const cv = report.createVerification;
+    // write-ahead marker of the path taken (enum only); a journal failure here halts before any read and forbids the cancel
+    safeAppend("KV1_READ_VERIFY", { type: "read", step: "KV1_READ_VERIFY", kind: "read", code: `CREATE_REF_NOT_ECHOED:${pendingVerify.shape}`, reservationId: rid });
+    if (state.halted) return;
+    const resp = await gate.send("KV1_READ_VERIFY", { method: "GET", path: `/reservations/${rid}`, query: READ_QUERY });
+    const p = parseReservationResponse(resp, "READ");
+    const mm = p.ok ? identityMismatches(p.reservation, { ...expectNew, reservationId: rid, status: "new" }) : [];
+    const rc = !p.ok ? `VERIFY_${p.code}` : mm.length ? "VERIFY_READ_IDENTITY_MISMATCH" : "VERIFY_READ_IDENTITY_OK";
+    cv.readVerify = rc;
+    safeAppend("KV1_READ_VERIFY", { type: "read", step: "KV1_READ_VERIFY", kind: "read", code: rc, reservationId: rid, ...(p.httpStatus ? { httpStatus: p.httpStatus } : {}),
+      ...(p.transport ? { transport: p.transport } : {}), ...(mm.length ? { mismatches: mm } : {}) });
+    record("KV1_READ_VERIFY", { code: rc, ...(mm.length ? { mismatches: mm } : {}) });
+    if (rc !== "VERIFY_READ_IDENTITY_OK") halt("KV1_READ_VERIFY", rc, mm.length ? { mismatches: mm } : {});
+  });
+  await runStep("KV2_LOOKUP_VERIFY", async () => {
+    if (!pendingVerify) return;
+    const rid = pendingVerify.reservationId;
+    const cv = report.createVerification;
+    const lk = await lookupByRef({ ref, listingId: CONNECTED_TEST_LISTING_ID, arrivalDate: s.arrivalDate, departureDate: s.departureDate }, cfg,
+      (req) => gate.send("KV2_LOOKUP_VERIFY", req));
+    const fid = lk.outcome === "found" ? lk.reservation.reservationId : null;
+    const mm = lk.outcome === "found" && fid === rid ? identityMismatches(lk.reservation, { ...expectNew, reservationId: rid, status: "new" }) : [];
+    const rc = lk.outcome !== "found" ? `VERIFY_LOOKUP_NOT_CONFIRMED:${lk.code}` : !isPosInt(fid) ? "VERIFY_LOOKUP_ID_INVALID"
+      : isProtected(fid) ? "VERIFY_LOOKUP_PROTECTED_ID" : fid !== rid ? "VERIFY_LOOKUP_ID_DIFFERS" : mm.length ? "VERIFY_LOOKUP_IDENTITY_MISMATCH" : "VERIFY_LOOKUP_SAME_ID_IDENTITY_OK";
+    cv.lookupVerify = rc;
+    safeAppend("KV2_LOOKUP_VERIFY", { type: "read", step: "KV2_LOOKUP_VERIFY", kind: "lookup", code: rc, ref,
+      ...(isPosInt(fid) && !isProtected(fid) ? { reservationId: fid } : {}), ...(mm.length ? { mismatches: mm } : {}) });
+    record("KV2_LOOKUP_VERIFY", { code: rc, ...(mm.length ? { mismatches: mm } : {}) });
+    if (rc !== "VERIFY_LOOKUP_SAME_ID_IDENTITY_OK") return halt("KV2_LOOKUP_VERIFY", rc, mm.length ? { mismatches: mm } : {});
+    if (state.halted || cv.readVerify !== "VERIFY_READ_IDENTITY_OK") return halt("KV2_LOOKUP_VERIFY", "VERIFY_INCOMPLETE");
+    id = rid;                                                  // adopted only now: same id by fresh read AND unique ref lookup
+    cv.result = "READ_VERIFIED";
+    record("KV2_LOOKUP_VERIFY", { code: "VERIFIED_CREATED_BY_READ", reservationId: id });
+  });
+  if (!state.halted && !isPosInt(id)) halt("KW1_CREATE", "CREATE_NOT_ADOPTED");   // defensive: nothing below runs without an adopted id
   await runStep("K3_SIDE_EFFECTS_CREATE", async () => {
     report.sideEffectsCreate = await sideEffects("K3_SIDE_EFFECTS_CREATE");
     if (!report.sideEffectsCreate.ok) halt("K3_SIDE_EFFECTS_CREATE", report.sideEffectsCreate.code);

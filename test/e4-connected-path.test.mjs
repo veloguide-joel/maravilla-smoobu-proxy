@@ -328,14 +328,14 @@ test("allowlist binds price/create/lookup EXACTLY to the run's validated manifes
   }
 });
 
-test("protected reservation 70636076 is refused even if it were readable/cancellable, in paths and in list queries", () => {
+test("protected reservations 70636076 and 71045356 are refused even if they were readable/cancellable, in paths and in list queries", () => {
   const st = boundState({ readableIds: new Set([70636076]), cancellableId: 70636076 });
   const code = (req, wk) => { try { assertConnectedRequest(req, st, wk); return "ALLOWED"; } catch (e) { return e.code; } };
   assert.equal(code({ method: "GET", path: "/reservations/70636076", query: { includeResources: 1 } }), "PROTECTED_RESERVATION");
   assert.equal(code({ method: "PUT", path: "/reservations/70636076/statuses/cancelled", query: {}, body: { cancelledBy: "host" } }, "cancel"), "PROTECTED_RESERVATION");
   assert.equal(code({ method: "GET", path: "/conversations", query: { reservationId: 70636076, limit: 100, offset: 0 } }), "PROTECTED_RESERVATION");
   assert.equal(code({ method: "GET", path: "/guestPayments/charges", query: { reservationId: "70636076", limit: 100, offset: 0 } }), "PROTECTED_RESERVATION");
-  assert.deepEqual(C.CONNECTED_PROTECTED_RESERVATION_IDS, [70636076]);
+  assert.deepEqual(C.CONNECTED_PROTECTED_RESERVATION_IDS, [70636076, 71045356]);
 });
 
 test("a create reply claiming the protected id 70636076 is never adopted: safety halt, no read or cancel of it, no further write", async () => {

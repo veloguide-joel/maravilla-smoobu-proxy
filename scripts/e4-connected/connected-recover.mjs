@@ -24,7 +24,8 @@ import { readJournalFile, journalFileName } from "../e4-write-runner/journal.mjs
 import { READ_QUERY, RunnerError, createGate, parseReservationResponse, identityMismatches, sanitizeJournalEntry } from "../e4-write-runner/runner.mjs";
 import { connectedTestAdapterConfig, lookupByRef, LOOKUP_MAX_PAGES, DIRECT_CHANNEL_ID, REF_RE, MISMATCH_FIELDS } from "../../lib/hostaway-reservations.js";
 import { nightsState } from "./safeguards.mjs";
-import { validateConnectedManifest, stayNights, CONNECTED_STEPS, CONNECTED_PROTECTED_RESERVATION_IDS, CONNECTED_WRITE_BUDGET } from "./connected-path.mjs";
+import { validateConnectedManifest, stayNights, CONNECTED_STEPS, CONNECTED_PROTECTED_RESERVATION_IDS, CONNECTED_WRITE_BUDGET, CONNECTED_HISTORICAL_RUN_IDS,
+  CONNECTED_VERIFY_MARKER_CODES, CONNECTED_VERIFY_READ_CODES, CONNECTED_VERIFY_LOOKUP_CODES } from "./connected-path.mjs";
 import { connectedRunLocation, CONNECTED_EXECUTE_SOURCES } from "./connected-execute.mjs";
 
 const ROOT = resolve(fileURLToPath(new URL("../..", import.meta.url)));
@@ -43,7 +44,12 @@ const STRUCTURE_CLOCK = () => new Date("2000-01-01T00:00:00.000Z");
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const isPosInt = (v) => Number.isSafeInteger(v) && v > 0;
-const isProtected = (v) => CONNECTED_PROTECTED_RESERVATION_IDS.includes(Number(v));
+// Protected ids for the recovery of the run bound to `manifestHash`: every protected id, EXCEPT the one id the historical run
+// with exactly that manifest hash itself created (read-only recovery of its own journal keeps working). Any other run: all protected.
+export const recoveryProtection = (manifestHash) => {
+  const own = Object.prototype.hasOwnProperty.call(CONNECTED_HISTORICAL_RUN_IDS, manifestHash) ? CONNECTED_HISTORICAL_RUN_IDS[manifestHash] : null;
+  return (v) => CONNECTED_PROTECTED_RESERVATION_IDS.includes(Number(v)) && Number(v) !== own;
+};
 function canonical(v) {
   if (Array.isArray(v)) return `[${v.map(canonical).join(",")}]`;
   if (isObj(v)) return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canonical(v[k])}`).join(",")}}`;
@@ -94,7 +100,9 @@ export function classifyConnectedJournal(entries, manifestHash) {
   if (!Array.isArray(first.refs) || first.refs.length !== 2 || !first.refs.every((r) => typeof r === "string" && REF_RE.test(r))) return bad("JOURNAL_REFS_INVALID");
   const ref = first.refs[1];
   const intents = { create: [], cancel: [] }; const outcomes = { create: [], cancel: [] };
+  const isProtected = recoveryProtection(manifestHash);
   const ids = new Set(); let protectedSeen = false; let halt = null; let runEnd = null;
+  const kv = { marker: [], read: [], lookup: [], beforeCreateOutcome: false, afterCancel: false };
   for (let i = 0; i < entries.length; i++) {
     const e = entries[i];
     if (!isObj(e) || !JOURNAL_TYPES.includes(e.type)) return bad("JOURNAL_UNEXPECTED_ENTRY");
@@ -116,7 +124,15 @@ export function classifyConnectedJournal(entries, manifestHash) {
       (e.type === "intent" ? intents : outcomes)[e.kind].push(e);
     }
     if (e.type === "outcome" && e.kind === "create" && isObj(e.evidence)) { noteId(e.evidence.reservationId); if (isObj(e.evidence.reservation)) noteId(e.evidence.reservation.reservationId); }
-    if (e.kind === "cancel" || (e.type === "read" && ["K4_READBACK", "K7_PRECANCEL", "K8_POSTCANCEL"].includes(e.step))) noteId(e.reservationId);
+    if (e.kind === "cancel" || (e.type === "read" && ["KV1_READ_VERIFY", "KV2_LOOKUP_VERIFY", "K4_READBACK", "K7_PRECANCEL", "K8_POSTCANCEL"].includes(e.step))) noteId(e.reservationId);
+    if ((e.step === "KV1_READ_VERIFY" || e.step === "KV2_LOOKUP_VERIFY") && e.type !== "halt") {
+      if (e.type !== "read") return bad("JOURNAL_UNEXPECTED_VERIFY_ENTRY");
+      if (!outcomes.create.length) kv.beforeCreateOutcome = true;
+      if (intents.cancel.length) kv.afterCancel = true;
+      if (e.step === "KV2_LOOKUP_VERIFY") kv.lookup.push(e);
+      else if (typeof e.code === "string" && e.code.startsWith("CREATE_REF_NOT_ECHOED:")) kv.marker.push(e);
+      else kv.read.push(e);
+    }
     if (e.type === "halt" && !halt) halt = { step: e.step ?? null, code: e.code ?? null };
     if (e.type === "run-end") runEnd = { code: e.code ?? null };
   }
@@ -131,6 +147,28 @@ export function classifyConnectedJournal(entries, manifestHash) {
   if (ids.size > 1) conflicts.push("RESERVATION_IDS_INCONSISTENT");
   if (protectedSeen) conflicts.push("PROTECTED_ID_IN_JOURNAL");
   const xi = intents.cancel[0] ?? null;
+  // Read-only create verification (KV1/KV2): explicit enums only; order and consistency with the create outcome and the cancel.
+  const en = (v, list) => (v === undefined || v === null ? null : list.includes(v) ? v : "OTHER");
+  const kvAny = kv.marker.length + kv.read.length + kv.lookup.length > 0;
+  const refEcho = kv.marker.length ? en(kv.marker[0].code, CONNECTED_VERIFY_MARKER_CODES) : null;
+  const readVerify = kv.read.length ? en(kv.read[0].code, CONNECTED_VERIFY_READ_CODES) : null;
+  const lookupVerify = kv.lookup.length ? en(kv.lookup[0].code, CONNECTED_VERIFY_LOOKUP_CODES) : null;
+  const kvConflicts = [];
+  if (kvAny) {
+    if (kv.marker.length > 1 || kv.read.length > 1 || kv.lookup.length > 1) kvConflicts.push("CREATE_VERIFICATION_DUPLICATED");
+    if (kv.beforeCreateOutcome) kvConflicts.push("CREATE_VERIFICATION_BEFORE_CREATE_OUTCOME");
+    if (kv.afterCancel) kvConflicts.push("CREATE_VERIFICATION_AFTER_CANCEL");
+    if (!kv.marker.length || co?.code !== "RESERVATION_MISMATCH") kvConflicts.push("CREATE_VERIFICATION_WITHOUT_UNECHOED_REF");
+    if ([refEcho, readVerify, lookupVerify].includes("OTHER")) kvConflicts.push("CREATE_VERIFICATION_CODE_UNKNOWN");
+  }
+  conflicts.push(...kvConflicts);
+  // READ_VERIFIED only for exactly one marker, one read and one lookup, all OK, all on the same id, and no KV contradiction at all
+  const readVerified = !kvConflicts.length && kv.marker.length === 1 && refEcho !== "OTHER" && readVerify === "VERIFY_READ_IDENTITY_OK" && lookupVerify === "VERIFY_LOOKUP_SAME_ID_IDENTITY_OK" &&
+    co?.code === "RESERVATION_MISMATCH" && kv.read[0].reservationId === kv.marker[0].reservationId && kv.lookup[0].reservationId === kv.marker[0].reservationId;
+  const replyVerified = co?.code === "VERIFIED_CREATED" && !kvAny;
+  if (xi && !replyVerified && !readVerified) conflicts.push("CANCEL_WITHOUT_VERIFIED_CREATE");
+  const createVerification = { path: replyVerified || co?.code === "VERIFIED_CREATED" ? "REPLY" : kv.marker.length ? "READ_FALLBACK" : "NONE",
+    result: replyVerified ? "REPLY_VERIFIED" : readVerified ? "READ_VERIFIED" : "NOT_VERIFIED", refEcho, readVerify, lookupVerify };
   if (xi && !isPosInt(xi.reservationId)) conflicts.push("CANCEL_INTENT_WITHOUT_ID");
   if (xo && xi && xo.reservationId !== xi.reservationId) conflicts.push("CANCEL_OUTCOME_ID_DIFFERS_FROM_INTENT");
   if (xi && ids.size === 1 && isPosInt(xi.reservationId) && xi.reservationId !== [...ids][0]) conflicts.push("CANCEL_TARGET_DIFFERS");
@@ -141,7 +179,7 @@ export function classifyConnectedJournal(entries, manifestHash) {
   else if (!xo) state = "CANCEL_OUTCOME_MISSING";
   else state = xo.code === "VERIFIED_CANCELLED" ? "CANCEL_VERIFIED" : "CANCEL_NOT_VERIFIED";
   return freeze({
-    ok: true, state, ref, reservationId, idsConsistent: ids.size <= 1, protectedIdSeen: protectedSeen, conflicts, clean: conflicts.length === 0,
+    ok: true, state, ref, reservationId, manifestHash, createVerification, idsConsistent: ids.size <= 1, protectedIdSeen: protectedSeen, conflicts, clean: conflicts.length === 0,
     createAttempts: intents.create.length, cancelAttempts: intents.cancel.length,
     createOutcome: co ? { code: co.code ?? null, ...(co.transport ? { transport: co.transport } : {}), ...createEvidence(co) } : null,
     cancelOutcome: xo ? { code: xo.code ?? null, ...(xo.httpStatus ? { httpStatus: xo.httpStatus } : {}), ...(xo.mismatches ? { mismatches: xo.mismatches } : {}),
@@ -170,6 +208,7 @@ export function assertRecoverRequest(req, state, writeKind) {
   if (writeKind !== null && writeKind !== undefined) throw new RunnerError("RECOVERY_NEVER_WRITES");
   if (!isObj(req) || req.method !== "GET" || typeof req.path !== "string" || req.body !== undefined) throw new RunnerError("REQUEST_NOT_ALLOWLISTED");
   const q = req.query ?? {};
+  const isProtected = typeof state.isProtected === "function" ? state.isProtected : (v) => CONNECTED_PROTECTED_RESERVATION_IDS.includes(Number(v));
   for (const m of req.path.matchAll(/\d+/g)) if (isProtected(m[0])) throw new RunnerError("PROTECTED_RESERVATION");
   const same = (a, b) => JSON.stringify(Object.keys(a).sort().map((k) => [k, a[k]])) === JSON.stringify(Object.keys(b).sort().map((k) => [k, b[k]]));
   let m;
@@ -215,7 +254,8 @@ export function guardRecoverFetch(fetchImpl, { readId, calendar, arrivalDate }) 
 export async function reconcileConnectedRun({ transport, manifest, classification, timeoutMs = 15000 }) {
   const s = manifest.stay; const nights = stayNights(s);
   const c = classification;
-  const state = { halted: false, readOnly: true, readableIds: new Set(), cancellableId: null, readId: c.idsConsistent && c.reservationId ? c.reservationId : null,
+  const isProtected = recoveryProtection(c.manifestHash);
+  const state = { isProtected, halted: false, readOnly: true, readableIds: new Set(), cancellableId: null, readId: c.idsConsistent && c.reservationId ? c.reservationId : null,
     arrivalDate: s.arrivalDate, calendar: Object.freeze({ startDate: nights[0], endDate: nights[nights.length - 1] }) };
   const noJournal = Object.freeze({ durable: false, load: () => [], append: () => { throw new RunnerError("RECOVERY_WRITES_NOTHING"); } });
   const gate = createGate({ transport, journal: noJournal, timeoutMs, state, budgets: RECOVER_STEPS, writeBudget: { create: 0, cancel: 0 }, allowRequest: assertRecoverRequest });
