@@ -46,7 +46,8 @@ import { LOOKUP_MAX_PAGES, DIRECT_CHANNEL_ID, REF_ECHO_SHAPES, REF_NOT_ECHOED_RE
 import { realTimer } from "./safeguards.mjs";
 import {
   validateConnectedManifest, planConnectedRun, executeConnectedRun, stayNights, CONNECTED_SOURCES, CONNECTED_STEPS,
-  CONNECTED_PROTECTED_RESERVATION_IDS, CONNECTED_VERSION, CONNECTED_VERIFY_READ_CODES, CONNECTED_VERIFY_LOOKUP_CODES
+  CONNECTED_PROTECTED_RESERVATION_IDS, CONNECTED_VERSION, CONNECTED_VERIFY_READ_CODES, CONNECTED_VERIFY_LOOKUP_CODES,
+  CONNECTED_CANCEL_LOOKUP_CODES
 } from "./connected-path.mjs";
 
 const ROOT = resolve(fileURLToPath(new URL("../..", import.meta.url)));
@@ -137,7 +138,7 @@ export function guardConnectedFetch(fetchImpl, { calendar, arrivalDate, departur
     { name: "price", max: CONNECTED_STEPS.K0_PRICE.reads, m: "POST", re: new RegExp(`^/v1/listings/${L}/calendar/priceDetails$`), q: exact({}), body: true, bodyOk: priceOk },
     { name: "create", max: 1, m: "POST", re: /^\/v1\/reservations$/, q: exact({}), body: true, bodyOk: createOk },
     { name: "cancel", max: 1, m: "PUT", re: /^\/v1\/reservations\/[1-9]\d{0,15}\/statuses\/cancelled$/, q: exact({}), body: true, bodyOk: cancelOk },
-    { name: "lookup", max: sum("K1_CLEAR", "KV2_LOOKUP_VERIFY", "K5_LOOKUP_REF") + LOOKUP_MAX_PAGES, m: "GET", re: /^\/v1\/reservations$/, q: (p) => {
+    { name: "lookup", max: sum("K1_CLEAR", "KV2_LOOKUP_VERIFY", "K5_LOOKUP_REF", "KC2_CANCEL_LOOKUP_VERIFY") + LOOKUP_MAX_PAGES, m: "GET", re: /^\/v1\/reservations$/, q: (p) => {
       const rest = new URLSearchParams([...p.keys()].filter((k) => k !== "afterId").map((k) => [k, p.get(k)]));
       return exact(lookupBase)(rest) && (!p.has("afterId") || /^[1-9]\d{0,15}$/.test(p.get("afterId")));
     } },
@@ -173,6 +174,16 @@ export function createVerificationSummary(cv) {
     refusal: en(cv.refusal, REF_NOT_ECHOED_REFUSALS), readVerify: en(cv.readVerify, CONNECTED_VERIFY_READ_CODES), lookupVerify: en(cv.lookupVerify, CONNECTED_VERIFY_LOOKUP_CODES) };
 }
 
+// How the one cancel was verified: REPLY_VERIFIED (strict full cancel reply) vs READ_VERIFIED (unechoed ref; fresh K8 read + unique
+// same-id ref lookup, both cancelled) vs NOT_VERIFIED. Explicit enum lists only; anything else -> "OTHER".
+const CANCEL_READ_CODES = Object.freeze(["VERIFY_CANCEL_READ_IDENTITY_OK", "VERIFY_CANCEL_READ_NOT_CONFIRMED"]);
+export function cancelVerificationSummary(cv) {
+  if (!isObj(cv)) return { path: "NONE", result: "NOT_VERIFIED", refEcho: null, readVerify: null, lookupVerify: null };
+  const en = (v, list) => (v === null || v === undefined ? null : list.includes(v) ? v : "OTHER");
+  return { path: en(cv.path, CV_PATHS) ?? "NONE", result: en(cv.result, CV_RESULTS) ?? "NOT_VERIFIED", refEcho: en(cv.refEcho, REF_ECHO_SHAPES),
+    readVerify: en(cv.readVerify, CANCEL_READ_CODES), lookupVerify: en(cv.lookupVerify, CONNECTED_CANCEL_LOOKUP_CODES) };
+}
+
 /** Explicit allowlist of the report (already codes/ids only); nothing else leaves the process. */
 export function summarizeConnected(report, extra = {}) {
   const pick = (o, keys) => (isObj(o) ? Object.fromEntries(keys.filter((k) => Object.prototype.hasOwnProperty.call(o, k)).map((k) => [k, o[k]])) : null);
@@ -190,6 +201,7 @@ export function summarizeConnected(report, extra = {}) {
     evidence: { hostawayBlocked: obs(ev.hostawayBlocked), airbnbBlocked: ev.airbnbBlocked ?? null, hostawayReopened: obs(ev.hostawayReopened), airbnbReopened: ev.airbnbReopened ?? null },
     syncProven: report.syncProven === true,
     createVerification: createVerificationSummary(report.createVerification),
+    cancelVerification: cancelVerificationSummary(report.cancelVerification),
     reconcile: (report.reconcile || []).map((r) => pick(r, ["ref", "reservationId", "readCode", "reservationStatus", "lookupCode", "foundReservationId"])),
     journalDurable: report.journalDurable !== false, journalFailures: report.journalFailures ?? [], runEndRecorded: report.runEndRecorded === true,
     ...(report.prerequisites ? { prerequisites: report.prerequisites } : {}),

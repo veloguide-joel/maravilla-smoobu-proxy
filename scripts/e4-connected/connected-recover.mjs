@@ -25,7 +25,8 @@ import { READ_QUERY, RunnerError, createGate, parseReservationResponse, identity
 import { connectedTestAdapterConfig, lookupByRef, LOOKUP_MAX_PAGES, DIRECT_CHANNEL_ID, REF_RE, MISMATCH_FIELDS } from "../../lib/hostaway-reservations.js";
 import { nightsState } from "./safeguards.mjs";
 import { validateConnectedManifest, stayNights, CONNECTED_STEPS, CONNECTED_PROTECTED_RESERVATION_IDS, CONNECTED_WRITE_BUDGET, CONNECTED_HISTORICAL_RUN_IDS,
-  CONNECTED_VERIFY_MARKER_CODES, CONNECTED_VERIFY_READ_CODES, CONNECTED_VERIFY_LOOKUP_CODES } from "./connected-path.mjs";
+  CONNECTED_VERIFY_MARKER_CODES, CONNECTED_VERIFY_READ_CODES, CONNECTED_VERIFY_LOOKUP_CODES, CONNECTED_CANCEL_MARKER_CODES,
+  CONNECTED_CANCEL_LOOKUP_CODES } from "./connected-path.mjs";
 import { connectedRunLocation, CONNECTED_EXECUTE_SOURCES } from "./connected-execute.mjs";
 
 const ROOT = resolve(fileURLToPath(new URL("../..", import.meta.url)));
@@ -86,7 +87,7 @@ export function calendarNightShapes(resp, nights) {
 }
 
 const LATER_STEPS = Object.freeze(["K3_SIDE_EFFECTS_CREATE", "K4_READBACK", "K5_LOOKUP_REF", "K6_CALENDAR_BLOCKED", "A1_AIRBNB_AFTER_CREATE", "K7_PRECANCEL",
-  "KW2_CANCEL", "K8_POSTCANCEL", "K9_SIDE_EFFECTS_CANCEL", "K10_CALENDAR_REOPENED", "A2_AIRBNB_AFTER_CANCEL"]);
+  "KW2_CANCEL", "KC1_CANCEL_VERIFY", "K8_POSTCANCEL", "KC2_CANCEL_LOOKUP_VERIFY", "K9_SIDE_EFFECTS_CANCEL", "K10_CALENDAR_REOPENED", "A2_AIRBNB_AFTER_CANCEL"]);
 const KV_ROLES = Object.freeze([
   { step: "KV1_READ_VERIFY", kind: "read", codes: CONNECTED_VERIFY_MARKER_CODES },
   { step: "KV1_READ_VERIFY", kind: "read", codes: CONNECTED_VERIFY_READ_CODES },
@@ -151,6 +152,58 @@ function verifyKvSequence({ kvAt, co, coIdx, firstHaltIdx, xiIdx, laterIdx, ref,
   return out;
 }
 
+// Read-only CANCEL verification (KC1 marker -> K8 fresh read -> KC2 unique same-id lookup), bound EXACTLY to the producer's
+// sequence: the cancel outcome (2xx, CANCEL_RESPONSE_MISMATCH with mismatches exactly [bookingRef], this run's positive
+// unprotected id = the cancel intent's id, no transport) immediately followed, contiguously and before any halt, by the marker,
+// the K8 read (IDENTITY_OK, same id, 2xx, no mismatches/transport) and the KC2 lookup (same id, run ref, no mismatches). A strict
+// prefix (crash/halt) is clean but NOT_VERIFIED; anything else is a conflict and NOT_VERIFIED.
+const KC_MARKER_KEYS = ["type", "step", "kind", "code", "reservationId", "at"];
+const K8_OK_KEYS = ["type", "step", "kind", "code", "reservationId", "httpStatus", "at"];
+const KC2_KEYS = ["type", "step", "kind", "code", "ref", "reservationId", "mismatches", "at"];
+function verifyKcSequence({ entries, kcAt, xi, xo, xoIdx, firstHaltIdx, ref, isProtected }) {
+  const out = { conflicts: [], readVerified: false, refEcho: null, readVerify: null, lookupVerify: null };
+  if (!kcAt.length) return out;
+  const add = (c) => { if (!out.conflicts.includes(c)) out.conflicts.push(c); };
+  const en = (x, list) => (x === undefined || x === null ? null : list.includes(x) ? x : "OTHER");
+  const only = (e, keys) => Object.keys(e).every((k) => keys.includes(k));
+  const xoOk = isObj(xo) && xo.code === "CANCEL_RESPONSE_MISMATCH" && xo.transport === undefined && is2xx(xo.httpStatus) &&
+    Array.isArray(xo.mismatches) && xo.mismatches.length === 1 && xo.mismatches[0] === "bookingRef" &&
+    isPosInt(xo.reservationId) && !isProtected(xo.reservationId) && isObj(xi) && xi.reservationId === xo.reservationId;
+  const id = xoOk ? xo.reservationId : null;
+  if (xoIdx < 0 || kcAt[0][0] < xoIdx) add("CANCEL_VERIFICATION_BEFORE_CANCEL_OUTCOME");
+  if (!xoOk) add("CANCEL_VERIFICATION_WITHOUT_UNECHOED_REF");
+  if (kcAt.length > 2) add("CANCEL_VERIFICATION_DUPLICATED");
+  if (firstHaltIdx >= 0 && kcAt.some(([i]) => i > firstHaltIdx)) add("CANCEL_VERIFICATION_AFTER_HALT");
+  const [mk, lk] = [kcAt[0], kcAt[1]];
+  // slot 1: the marker
+  out.refEcho = en(mk[1].code, CONNECTED_CANCEL_MARKER_CODES);
+  if (xoIdx < 0 || mk[0] !== xoIdx + 1 || mk[1].step !== "KC1_CANCEL_VERIFY" || mk[1].kind !== "read") add("CANCEL_VERIFICATION_OUT_OF_ORDER");
+  if (!CONNECTED_CANCEL_MARKER_CODES.includes(mk[1].code)) add(CONNECTED_CANCEL_LOOKUP_CODES.includes(mk[1].code) ? "CANCEL_VERIFICATION_OUT_OF_ORDER" : "CANCEL_VERIFICATION_CODE_UNKNOWN");
+  if (!isPosInt(mk[1].reservationId) || mk[1].reservationId !== id) add("CANCEL_VERIFICATION_ID_NOT_BOUND");
+  if (!only(mk[1], KC_MARKER_KEYS)) add("CANCEL_VERIFICATION_CONTRADICTORY");
+  // slot 2: the scheduled K8 fresh read (the producer only looks up after an IDENTITY_OK read)
+  const k8 = xoIdx >= 0 ? entries[xoIdx + 2] : undefined;
+  const k8Ok = isObj(k8) && k8.type === "read" && k8.step === "K8_POSTCANCEL" && k8.kind === "read" && k8.code === "IDENTITY_OK" &&
+    k8.reservationId === id && is2xx(k8.httpStatus) && only(k8, K8_OK_KEYS);
+  if (isObj(k8) && k8.type === "read" && k8.step === "K8_POSTCANCEL") out.readVerify = k8Ok ? "VERIFY_CANCEL_READ_IDENTITY_OK" : "VERIFY_CANCEL_READ_NOT_CONFIRMED";
+  // slot 3: the KC2 lookup
+  if (lk) {
+    out.lookupVerify = en(lk[1].code, CONNECTED_CANCEL_LOOKUP_CODES);
+    if (lk[0] !== xoIdx + 3 || lk[1].step !== "KC2_CANCEL_LOOKUP_VERIFY" || lk[1].kind !== "lookup") add("CANCEL_VERIFICATION_OUT_OF_ORDER");
+    if (!CONNECTED_CANCEL_LOOKUP_CODES.includes(lk[1].code)) add(CONNECTED_CANCEL_MARKER_CODES.includes(lk[1].code) ? "CANCEL_VERIFICATION_OUT_OF_ORDER" : "CANCEL_VERIFICATION_CODE_UNKNOWN");
+    if (lk[1].ref !== ref) add("CANCEL_VERIFICATION_REF_NOT_BOUND");
+    if (has(lk[1], "reservationId") && lk[1].reservationId !== id) add("CANCEL_VERIFICATION_ID_NOT_BOUND");
+    if (!only(lk[1], KC2_KEYS)) add("CANCEL_VERIFICATION_CONTRADICTORY");
+    if (!k8Ok) add("CANCEL_VERIFICATION_CONTRADICTORY");                                   // a lookup after a failed/missing read
+    if (lk[1].code === "VERIFY_CANCEL_LOOKUP_SAME_ID_IDENTITY_OK" && (lk[1].reservationId !== id || has(lk[1], "mismatches"))) add("CANCEL_VERIFICATION_CONTRADICTORY");
+    if (lk[1].code === "VERIFY_CANCEL_LOOKUP_IDENTITY_MISMATCH" && !(Array.isArray(lk[1].mismatches) && lk[1].mismatches.length)) add("CANCEL_VERIFICATION_CONTRADICTORY");
+    if (lk[1].code !== "VERIFY_CANCEL_LOOKUP_IDENTITY_MISMATCH" && has(lk[1], "mismatches")) add("CANCEL_VERIFICATION_CONTRADICTORY");
+  }
+  out.readVerified = !out.conflicts.length && kcAt.length === 2 && k8Ok && out.refEcho !== null && out.refEcho !== "OTHER" &&
+    out.lookupVerify === "VERIFY_CANCEL_LOOKUP_SAME_ID_IDENTITY_OK";
+  return out;
+}
+
 /**
  * Pure classification of the bound run's journal. -> { ok:false, code } for a journal that is not exactly this run's, else
  * { ok:true, state, ... } where state is one of:
@@ -169,6 +222,7 @@ export function classifyConnectedJournal(entries, manifestHash) {
   const isProtected = recoveryProtection(manifestHash);
   const ids = new Set(); let protectedSeen = false; let halt = null; let runEnd = null;
   const kvAt = [];                 // [index, entry] of every KV data entry, in journal order
+  const kcAt = []; let xoIdx = -1;  // [index, entry] of every KC (cancel verification) data entry; index of the cancel outcome
   let coIdx = -1; let firstHaltIdx = -1; let xiIdx = -1; const laterIdx = [];
   for (let i = 0; i < entries.length; i++) {
     const e = entries[i];
@@ -191,7 +245,13 @@ export function classifyConnectedJournal(entries, manifestHash) {
       (e.type === "intent" ? intents : outcomes)[e.kind].push(e);
     }
     if (e.type === "outcome" && e.kind === "create" && isObj(e.evidence)) { noteId(e.evidence.reservationId); if (isObj(e.evidence.reservation)) noteId(e.evidence.reservation.reservationId); }
-    if (e.kind === "cancel" || (e.type === "read" && ["KV1_READ_VERIFY", "KV2_LOOKUP_VERIFY", "K4_READBACK", "K7_PRECANCEL", "K8_POSTCANCEL"].includes(e.step))) noteId(e.reservationId);
+    if (e.kind === "cancel" || (e.type === "read" && ["KV1_READ_VERIFY", "KV2_LOOKUP_VERIFY", "K4_READBACK", "K7_PRECANCEL", "KC1_CANCEL_VERIFY", "K8_POSTCANCEL",
+      "KC2_CANCEL_LOOKUP_VERIFY"].includes(e.step))) noteId(e.reservationId);
+    if ((e.step === "KC1_CANCEL_VERIFY" || e.step === "KC2_CANCEL_LOOKUP_VERIFY") && e.type !== "halt") {
+      if (e.type !== "read") return bad("JOURNAL_UNEXPECTED_VERIFY_ENTRY");
+      kcAt.push([i, e]);
+    }
+    if (e.type === "outcome" && e.kind === "cancel" && xoIdx < 0) xoIdx = i;
     if ((e.step === "KV1_READ_VERIFY" || e.step === "KV2_LOOKUP_VERIFY") && e.type !== "halt") {
       if (e.type !== "read") return bad("JOURNAL_UNEXPECTED_VERIFY_ENTRY");
       kvAt.push([i, e]);
@@ -228,6 +288,12 @@ export function classifyConnectedJournal(entries, manifestHash) {
   if (laterIdx.length && !replyVerified && !readVerified) conflicts.push("LATER_STEP_WITHOUT_VERIFIED_CREATE");
   const createVerification = { path: co?.code === "VERIFIED_CREATED" ? "REPLY" : kvAt.length ? "READ_FALLBACK" : "NONE",
     result: replyVerified ? "REPLY_VERIFIED" : readVerified ? "READ_VERIFIED" : "NOT_VERIFIED", refEcho: v.refEcho, readVerify: v.readVerify, lookupVerify: v.lookupVerify };
+  const cv = verifyKcSequence({ entries, kcAt, xi, xo, xoIdx, firstHaltIdx, ref, isProtected });
+  conflicts.push(...cv.conflicts);
+  const cancelReplyVerified = xo?.code === "VERIFIED_CANCELLED" && kcAt.length === 0;
+  const cancelReadVerified = cv.readVerified && (replyVerified || readVerified);         // never on top of an unverified create
+  const cancelVerification = { path: xo?.code === "VERIFIED_CANCELLED" ? "REPLY" : kcAt.length ? "READ_FALLBACK" : "NONE",
+    result: cancelReplyVerified ? "REPLY_VERIFIED" : cancelReadVerified ? "READ_VERIFIED" : "NOT_VERIFIED", refEcho: cv.refEcho, readVerify: cv.readVerify, lookupVerify: cv.lookupVerify };
   if (xi && !isPosInt(xi.reservationId)) conflicts.push("CANCEL_INTENT_WITHOUT_ID");
   if (xo && xi && xo.reservationId !== xi.reservationId) conflicts.push("CANCEL_OUTCOME_ID_DIFFERS_FROM_INTENT");
   if (xi && ids.size === 1 && isPosInt(xi.reservationId) && xi.reservationId !== [...ids][0]) conflicts.push("CANCEL_TARGET_DIFFERS");
@@ -236,9 +302,9 @@ export function classifyConnectedJournal(entries, manifestHash) {
   else if (!co) state = "CREATE_OUTCOME_MISSING";
   else if (!intents.cancel.length) state = reservationId ? "CREATED_NO_CANCEL_ATTEMPT" : "CREATE_NOT_VERIFIED";   // an id from this run => it may be live
   else if (!xo) state = "CANCEL_OUTCOME_MISSING";
-  else state = xo.code === "VERIFIED_CANCELLED" ? "CANCEL_VERIFIED" : "CANCEL_NOT_VERIFIED";
+  else state = cancelReplyVerified || cancelReadVerified ? "CANCEL_VERIFIED" : "CANCEL_NOT_VERIFIED";
   return freeze({
-    ok: true, state, ref, reservationId, manifestHash, createVerification, idsConsistent: ids.size <= 1, protectedIdSeen: protectedSeen, conflicts, clean: conflicts.length === 0,
+    ok: true, state, ref, reservationId, manifestHash, createVerification, cancelVerification, idsConsistent: ids.size <= 1, protectedIdSeen: protectedSeen, conflicts, clean: conflicts.length === 0,
     createAttempts: intents.create.length, cancelAttempts: intents.cancel.length,
     createOutcome: co ? { code: co.code ?? null, ...(co.transport ? { transport: co.transport } : {}), ...createEvidence(co) } : null,
     cancelOutcome: xo ? { code: xo.code ?? null, ...(xo.httpStatus ? { httpStatus: xo.httpStatus } : {}), ...(xo.mismatches ? { mismatches: xo.mismatches } : {}),

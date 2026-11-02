@@ -723,3 +723,36 @@ test("launcher end-to-end: a KV2 lookup returning another id halts read-only (no
   assert.equal(ri.output.classification.createVerification.result, "NOT_VERIFIED");
   leakFree(r.output); leakFree(ri.output);
 });
+
+// ---------- after the 2026-11-02 live run (343afa…): read-only CANCEL verification through the real launcher, file journal and recovery ----------
+test("launcher end-to-end: a cancel reply without the ref is READ_VERIFIED (K8 + KC2), exit 0; recovery CANCEL_VERIFIED clean exit 0; replay refused; one PUT", async () => {
+  const sb = sandbox();
+  const w = world({ cancelReply: (wd) => { wd.res.status = "cancelled"; wd.calendar = "available"; const { customFieldValues, ...rest } = wd.res; return { status: 200, json: { status: "success", result: { ...rest, customFieldValues: [] } } }; } });
+  const { d } = deps(sb, w);
+  const r = await X.runConnectedExecuteCli(execArgs(sb), d);
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output.halt)); assert.equal(r.output.passed, true);
+  assert.deepEqual(r.output.cancelVerification, { path: "READ_FALLBACK", result: "READ_VERIFIED", refEcho: "ABSENT_EMPTY_ARRAY",
+    readVerify: "VERIFY_CANCEL_READ_IDENTITY_OK", lookupVerify: "VERIFY_CANCEL_LOOKUP_SAME_ID_IDENTITY_OK" });
+  assert.deepEqual(r.output.commandReply, { code: "CANCEL_RESPONSE_MISMATCH", httpStatus: 200, mismatches: ["bookingRef"] });
+  assert.equal(writes(w).length, 2); assert.equal(r.output.guard.refused, 0);
+  const ri = await inspect(sb, loc(sb.base));
+  assert.equal(ri.exitCode, 0); assert.equal(ri.output.classification.state, "CANCEL_VERIFIED"); assert.equal(ri.output.classification.clean, true);
+  assert.equal(ri.output.classification.cancelVerification.result, "READ_VERIFIED");
+  const before = w.log.length; const x2 = deps(sb, w);
+  assert.equal((await X.runConnectedExecuteCli(execArgs(sb), x2.d)).output.error, "REPLAY_REFUSED_RUN_LOCATION_EXISTS"); assert.equal(w.log.length, before);
+  leakFree(r.output); leakFree(ri.output);
+});
+
+test("launcher end-to-end: an eligible cancel reply whose K8 read is not cancelled halts (exit 3, NOT_VERIFIED); recovery CANCEL_NOT_VERIFIED; reconcile read-only", async () => {
+  const sb = sandbox();
+  const w = world({ cancelReply: (wd) => { const { customFieldValues, ...rest } = wd.res; return { status: 200, json: { status: "success", result: { ...rest, status: "cancelled" } } }; } });
+  const { d } = deps(sb, w);
+  const r = await X.runConnectedExecuteCli(execArgs(sb), d);          // the fake keeps the reservation "new": the fresh K8 read contradicts the reply
+  assert.equal(r.exitCode, 3); assert.equal(r.output.halt.step, "K8_POSTCANCEL"); assert.equal(r.output.cancelVerification.result, "NOT_VERIFIED");
+  assert.equal(writes(w).length, 2);
+  const ri = await inspect(sb, loc(sb.base));
+  assert.equal(ri.exitCode, 3); assert.equal(ri.output.classification.state, "CANCEL_NOT_VERIFIED"); assert.equal(ri.output.classification.clean, true);
+  const rr = await reconcileWith(sb, w);
+  assert.equal(rr.output.reconcile.verdict, "RESERVATION_ACTIVE_OWNER_DECISION_REQUIRED"); assert.equal(writes(w).length, 2);
+  leakFree(r.output); leakFree(ri.output); leakFree(rr.output);
+});
