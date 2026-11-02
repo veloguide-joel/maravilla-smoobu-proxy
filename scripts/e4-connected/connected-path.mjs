@@ -61,13 +61,16 @@ export const CONNECTED_WRITE_BUDGET = Object.freeze({ create: 1, cancel: 1 });
 // Reservations a NEW run must never read, cancel or adopt, whatever a provider reply claims: 70636076 (the 2026-10-23 E4 test
 // reservation on 606998, cancelled 2026-10-24 by the reviewed recovery tool) and 71045356 (the 2026-11-01 connected-run
 // reservation on 603566, cancelled manually by the owner 2026-11-02; cleanup CLOSED) and 71072615 (the 2026-11-02 connected-run
-// reservation on 603566, cancelled by that run's one cancel and confirmed by read-only recovery; cleanup CLOSED).
-export const CONNECTED_PROTECTED_RESERVATION_IDS = Object.freeze([70636076, 71045356, 71072615]);
+// reservation on 603566, cancelled by that run's one cancel and confirmed by read-only recovery; cleanup CLOSED) and 71081885
+// (the 2026-11-02 connected-run reservation b0209446… on 603566, created and cancelled by that run; owner-reported PASS;
+// cleanup CLOSED).
+export const CONNECTED_PROTECTED_RESERVATION_IDS = Object.freeze([70636076, 71045356, 71072615, 71081885]);
 // Read-only RECOVERY exception, nothing else: the historical run bound to exactly this manifest hash created that one id, so
 // recovery of THAT run's own journal may still name and read it. Never consulted by execution (gate, launcher guard, adoption).
 export const CONNECTED_HISTORICAL_RUN_IDS = Object.freeze({
   "6c58baedce5c735c6b9766a328c015d36a5e631dbf5bd69ebf6f7653b65697bf": 71045356,
-  "343afa623817102097eff3d0b5d86fcc174333aeb65037198f0468ccf14baca4": 71072615
+  "343afa623817102097eff3d0b5d86fcc174333aeb65037198f0468ccf14baca4": 71072615,
+  "b0209446b7f40830cbe030311f94c76d1d2791cd11e8e3facd2894a357b7e895": 71081885
 });
 const isProtected = (v) => CONNECTED_PROTECTED_RESERVATION_IDS.includes(Number(v));
 // Hostaway-side calendar observation after the create and after the cancel: read at once, then every 10 s; 2 consecutive

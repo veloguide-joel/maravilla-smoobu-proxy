@@ -227,8 +227,8 @@ test("KC2 lookup failures: halt at KC2, NOT_VERIFIED, passed false; protected id
     assert.deepEqual([r.halt.step, r.halt.code], ["KC2_CANCEL_LOOKUP_VERIFY", code], name);
     assert.equal(r.cancelVerification.result, "NOT_VERIFIED", name); assert.equal(r.cancelVerification.lookupVerify, code, name);
     assert.ok(C.CONNECTED_CANCEL_LOOKUP_CODES.includes(code)); assert.equal(r.passed, false); assert.equal(writes(w).length, 2);
-    assert.ok(!w.log.some((l) => /\/reservations\/(70636076|71045356|71072615)/.test(l)), name);
-    assert.ok(!j.entries.some((e) => [70636076, 71045356, 71072615].includes(e.reservationId)), name);
+    assert.ok(!w.log.some((l) => /\/reservations\/(70636076|71045356|71072615|71081885)/.test(l)), name);
+    assert.ok(!j.entries.some((e) => [70636076, 71045356, 71072615, 71081885].includes(e.reservationId)), name);
     const c = RC.classifyConnectedJournal(j.entries, validateConnectedManifest(manifest(), { now: NOW }).hash);
     assert.equal(c.state, "CANCEL_NOT_VERIFIED", name); assert.notEqual(c.cancelVerification.result, "READ_VERIFIED", name);
     journalSafe(j); leakFree(r);
@@ -352,7 +352,61 @@ test("71072615: protected for NEW execution (gate + launcher guard); the read-on
   const other = hist.map((e, i) => (i === 0 ? { ...e, manifestHash: "f".repeat(64) } : e));
   const co2 = RC.classifyConnectedJournal(other, "f".repeat(64));
   assert.equal(co2.clean, false); assert.ok(co2.conflicts.includes("PROTECTED_ID_IN_JOURNAL")); assert.equal(co2.reservationId, null);
-  assert.deepEqual(C.CONNECTED_PROTECTED_RESERVATION_IDS, [70636076, 71045356, 71072615]);
+  assert.deepEqual(C.CONNECTED_PROTECTED_RESERVATION_IDS, [70636076, 71045356, 71072615, 71081885]);
+});
+
+test("71081885 (b0209446 run, cleanup CLOSED): protected for NEW execution (gate, launcher guard, adoption); read-only recovery exception ONLY for the b0209446 run's own journal", async () => {
+  const HB = "b0209446b7f40830cbe030311f94c76d1d2791cd11e8e3facd2894a357b7e895";
+  const ID = 71081885;
+  assert.ok(C.CONNECTED_PROTECTED_RESERVATION_IDS.includes(ID));
+  assert.equal(C.CONNECTED_HISTORICAL_RUN_IDS[HB], ID);
+  // execution gate: every path or query naming the id is refused even if it were readable/cancellable
+  const st = { readableIds: new Set([ID]), cancellableId: ID, bound: { priceBody: {}, createBody: {}, arrivalDate: STAY.arrivalDate } };
+  const code = (req, wk) => { try { C.assertConnectedRequest(req, st, wk); return "ALLOWED"; } catch (e) { return e.code; } };
+  for (const [req, wk] of [[{ method: "GET", path: `/reservations/${ID}`, query: { includeResources: 1 } }],
+    [{ method: "PUT", path: `/reservations/${ID}/statuses/cancelled`, query: {}, body: { cancelledBy: "host" } }, "cancel"],
+    [{ method: "GET", path: "/tasks", query: { reservationId: ID, limit: 100, offset: 0 } }],
+    [{ method: "GET", path: "/conversations", query: { reservationId: ID, limit: 100, offset: 0 } }],
+    [{ method: "GET", path: "/guestPayments/charges", query: { reservationId: String(ID), limit: 100, offset: 0 } }]]) assert.equal(code(req, wk), "PROTECTED_RESERVATION", req.path);
+  // launcher URL guard
+  const g = X.guardConnectedFetch(async () => new Response("{}"), { calendar: { startDate: "2027-05-10", endDate: "2027-05-11" }, arrivalDate: STAY.arrivalDate, departureDate: STAY.departureDate });
+  await assert.rejects(g.guarded(`https://api.hostaway.com/v1/reservations/${ID}?includeResources=1`));
+  await assert.rejects(g.guarded(`https://api.hostaway.com/v1/reservations/${ID}/statuses/cancelled`, { method: "PUT", body: "{}" }));
+  // a NEW run whose create reply claims the id never adopts it: safety halt, no read/cancel of it, no second write
+  const w = world(); w.nextId = ID;
+  const { r } = await run(w);
+  assert.deepEqual([r.status, r.passed, r.halt.step, r.halt.code, r.writes], ["HALTED", false, "KW1_CREATE", "CREATE_RETURNED_PROTECTED_ID", { create: 1, cancel: 0 }]);
+  assert.ok(!w.log.some((l) => l.includes(`/reservations/${ID}`)), "no read or cancel of the protected id");
+  // recovery: exempt only under the exact b0209446 hash, and only for that one id
+  assert.equal(RC.recoveryProtection(HB)(ID), false);
+  for (const other of [70636076, 71045356, 71072615]) assert.equal(RC.recoveryProtection(HB)(other), true, String(other));
+  for (const h of [H343, "6c58baedce5c735c6b9766a328c015d36a5e631dbf5bd69ebf6f7653b65697bf", "f".repeat(64), HB.toUpperCase(), HB.slice(0, 12), undefined, null, ""])
+    assert.equal(RC.recoveryProtection(h)(ID), true, String(h));
+  const rst = (h) => ({ isProtected: RC.recoveryProtection(h), readId: ID, arrivalDate: STAY.arrivalDate, calendar: { startDate: STAY.arrivalDate, endDate: "2027-05-11" } });
+  assert.equal(RC.assertRecoverRequest({ method: "GET", path: `/reservations/${ID}`, query: { includeResources: 1 } }, rst(HB)), "read");
+  assert.throws(() => RC.assertRecoverRequest({ method: "GET", path: `/reservations/${ID}`, query: { includeResources: 1 } }, rst(H343)));
+  assert.throws(() => RC.assertRecoverRequest({ method: "PUT", path: `/reservations/${ID}/statuses/cancelled`, body: {} }, rst(HB), "cancel"));
+  // synthetic journal in the b0209446 run's shape (create READ_VERIFIED, cancel READ_VERIFIED): clean under its own hash only
+  const REF = "MV-SYNTHB02";
+  const hist = [{ type: "run-start", runId: "c".repeat(16), manifestHash: HB, refs: ["MV-PROBE001", REF] }, { type: "intent", step: "KW1_CREATE", kind: "create", ref: REF },
+    { type: "outcome", step: "KW1_CREATE", kind: "create", ref: REF, code: "RESERVATION_MISMATCH", evidence: { outcome: "conflict", code: "RESERVATION_MISMATCH", httpStatus: 200, mismatches: ["bookingRef"], reservationId: ID } },
+    { type: "read", step: "KV1_READ_VERIFY", kind: "read", code: "CREATE_REF_NOT_ECHOED:ABSENT_EMPTY_ARRAY", reservationId: ID },
+    { type: "read", step: "KV1_READ_VERIFY", kind: "read", code: "VERIFY_READ_IDENTITY_OK", reservationId: ID, httpStatus: 200 },
+    { type: "read", step: "KV2_LOOKUP_VERIFY", kind: "lookup", code: "VERIFY_LOOKUP_SAME_ID_IDENTITY_OK", ref: REF, reservationId: ID },
+    { type: "intent", step: "KW2_CANCEL", kind: "cancel", reservationId: ID, ref: REF },
+    { type: "outcome", step: "KW2_CANCEL", kind: "cancel", reservationId: ID, code: "CANCEL_RESPONSE_MISMATCH", mismatches: ["bookingRef"], httpStatus: 200 },
+    { type: "read", step: "KC1_CANCEL_VERIFY", kind: "read", code: "CANCEL_REF_NOT_ECHOED:ABSENT_EMPTY_ARRAY", reservationId: ID },
+    { type: "read", step: "K8_POSTCANCEL", kind: "read", code: "IDENTITY_OK", reservationId: ID, httpStatus: 200 },
+    { type: "read", step: "KC2_CANCEL_LOOKUP_VERIFY", kind: "lookup", code: "VERIFY_CANCEL_LOOKUP_SAME_ID_IDENTITY_OK", ref: REF, reservationId: ID }];
+  const c = RC.classifyConnectedJournal(hist.map(clone), HB);
+  assert.equal(c.ok, true); assert.equal(c.clean, true, String(c.conflicts)); assert.equal(c.state, "CANCEL_VERIFIED"); assert.equal(c.reservationId, ID);
+  assert.equal(c.createVerification.result, "READ_VERIFIED"); assert.equal(c.cancelVerification.result, "READ_VERIFIED");
+  for (const h of [H343, "f".repeat(64)]) {
+    const o = RC.classifyConnectedJournal(hist.map((e, i) => (i === 0 ? { ...e, manifestHash: h } : clone(e))), h);
+    assert.equal(o.clean, false, h); assert.ok(o.conflicts.includes("PROTECTED_ID_IN_JOURNAL"), h); assert.equal(o.reservationId, null, h);
+  }
+  // the earlier historical runs keep their own (and only their own) exemption
+  assert.equal(RC.recoveryProtection(H343)(71072615), false); assert.equal(RC.recoveryProtection(H343)(ID), true);
 });
 
 test("launcher cancelVerification summary is an explicit allowlist; budgets and steps", () => {

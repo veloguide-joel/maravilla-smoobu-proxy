@@ -24,6 +24,7 @@ const STAY = { arrivalDate: "2027-05-10", departureDate: "2027-05-12" };
 const TOTAL = 440000;
 const HIST = "6c58baedce5c735c6b9766a328c015d36a5e631dbf5bd69ebf6f7653b65697bf";
 const HIST343 = "343afa623817102097eff3d0b5d86fcc174333aeb65037198f0468ccf14baca4";
+const HISTB020 = "b0209446b7f40830cbe030311f94c76d1d2791cd11e8e3facd2894a357b7e895";
 const manifest = (over = {}) => ({ ...connectedManifestTemplate(), guests: 2, totalMinor: TOTAL, window: { start: "2027-05-01", end: "2027-05-20" },
   stay: { ...STAY }, guest: { ...GUEST }, reviewedCommit: SHA, ...over });
 const LEAKS = ["Synthetic", "Tester", "example.invalid", "PROVIDER-TEXT", "MESSAGE-BODY", "98765-603566", "customFieldValues"];
@@ -372,7 +373,7 @@ test("71045356 protection: refused for NEW execution (gate + launcher guard) eve
   assert.equal(RC.recoveryProtection(HIST)(70636076), true);
   assert.equal(RC.recoveryProtection("f".repeat(64))(71045356), true);
   assert.equal(RC.recoveryProtection(undefined)(71045356), true);
-  assert.deepEqual(C.CONNECTED_HISTORICAL_RUN_IDS, { [HIST]: 71045356, [HIST343]: 71072615 });
+  assert.deepEqual(C.CONNECTED_HISTORICAL_RUN_IDS, { [HIST]: 71045356, [HIST343]: 71072615, [HISTB020]: 71081885 });
   const rst = (h) => ({ isProtected: RC.recoveryProtection(h), readId: 71045356, arrivalDate: "2027-04-05", calendar: { startDate: "2027-04-05", endDate: "2027-04-06" } });
   assert.equal(RC.assertRecoverRequest({ method: "GET", path: "/reservations/71045356", query: { includeResources: 1 } }, rst(HIST)), "read");
   assert.throws(() => RC.assertRecoverRequest({ method: "GET", path: "/reservations/71045356", query: { includeResources: 1 } }, rst("f".repeat(64))), /PROTECTED_RESERVATION|Runner/);

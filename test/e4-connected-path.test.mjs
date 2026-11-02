@@ -336,7 +336,7 @@ test("protected reservations 70636076, 71045356 and 71072615 are refused even if
   assert.equal(code({ method: "PUT", path: "/reservations/70636076/statuses/cancelled", query: {}, body: { cancelledBy: "host" } }, "cancel"), "PROTECTED_RESERVATION");
   assert.equal(code({ method: "GET", path: "/conversations", query: { reservationId: 70636076, limit: 100, offset: 0 } }), "PROTECTED_RESERVATION");
   assert.equal(code({ method: "GET", path: "/guestPayments/charges", query: { reservationId: "70636076", limit: 100, offset: 0 } }), "PROTECTED_RESERVATION");
-  assert.deepEqual(C.CONNECTED_PROTECTED_RESERVATION_IDS, [70636076, 71045356, 71072615]);
+  assert.deepEqual(C.CONNECTED_PROTECTED_RESERVATION_IDS, [70636076, 71045356, 71072615, 71081885]);
 });
 
 test("a create reply claiming the protected id 70636076 is never adopted: safety halt, no read or cancel of it, no further write", async () => {
