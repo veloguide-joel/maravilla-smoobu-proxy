@@ -65,6 +65,7 @@ const EXPECTED_API_FILES = Object.freeze([
   "api/booking/calendar.js",
   "api/booking/listings.js",
   "api/booking/quote.js",
+  "api/checkout/stripe-webhook.js",
   "api/health.js",
   "api/hostaway/calendar.js",
   "api/hostaway/listing.js",
@@ -87,12 +88,22 @@ test("the api/ directory contains exactly the expected files", () => {
   assert.deepEqual(actual, [...EXPECTED_API_FILES].sort());
 });
 
+// E5a (root-authorized offline slice, 2026-11-02): the ONLY places allowed to name Stripe Checkout creation or load the
+// SDK. Creation lives in a library with an injected client and is reachable from no route; the SDK is loaded lazily by
+// the TEST-only webhook wrapper after its gate. Everything else keeps the original E1 rules.
+const E5A_CHECKOUT_CREATE_FILE = "lib/checkout/stripe-test-mode.js";
+const E5A_SDK_LOADER_FILE = "lib/checkout/stripe-webhook-http.js";
+
 test("no deployed code can create Stripe sessions, write the database or call Smoobu", () => {
   const files = [...listFiles(join(ROOT, "api")), ...listFiles(join(ROOT, "lib"))]
     .filter((f) => f.endsWith(".js") && !rel(f).endsWith("lib/stripe-checkout-draft.js")); // inert, commented reference only
+  for (const f of files) {
+    const src = readFileSync(f, "utf8");
+    if (rel(f) !== E5A_CHECKOUT_CREATE_FILE) assert.equal(/checkout\.sessions\.create/.test(src), false, `${rel(f)} contains Checkout Session creation`);
+    if (rel(f) !== E5A_SDK_LOADER_FILE) assert.equal(/import\(\s*["']stripe["']\s*\)/.test(src), false, `${rel(f)} loads the Stripe SDK`);
+  }
   const forbidden = [
     [/from\s+["']stripe["']|require\(\s*["']stripe["']\s*\)/, "stripe import"],
-    [/checkout\.sessions\.create/, "Checkout Session creation"],
     [/\b(INSERT\s+INTO|UPDATE\s+booking_intents|DELETE\s+FROM)\b/i, "database write"],
     [/smoobu\.com/i, "Smoobu API call"],
     [/from\s+["'][./]*(api\/)?_db\.js["']/, "database pool import"]
@@ -101,6 +112,21 @@ test("no deployed code can create Stripe sessions, write the database or call Sm
     const src = readFileSync(f, "utf8");
     for (const [re, what] of forbidden) assert.equal(re.test(src), false, `${rel(f)} contains ${what}`);
   }
+});
+
+test("E5a: no route can reach a Stripe Checkout create, and no deployed code names a Stripe money-moving call", () => {
+  const files = [...listFiles(join(ROOT, "api")), ...listFiles(join(ROOT, "lib"))]
+    .filter((f) => f.endsWith(".js") && !rel(f).endsWith("lib/stripe-checkout-draft.js"));
+  const money = /paymentIntents\.(create|update|capture|cancel|confirm|incrementAuthorization)|refunds\.create|charges\.(create|capture)|\.capture\(|payouts\.|transfers\./;
+  for (const f of files) assert.equal(money.test(readFileSync(f, "utf8")), false, `${rel(f)} names a Stripe money-moving call`);
+  // the creation helper is never imported by a route; the webhook wrapper does not import the creation entry point
+  for (const f of listFiles(join(ROOT, "api"))) assert.doesNotMatch(readFileSync(f, "utf8"), /stripe-test-mode|stripe-test-webhook|startTestCheckout/, rel(f));
+  const http = readFileSync(join(ROOT, E5A_SDK_LOADER_FILE), "utf8");
+  assert.doesNotMatch(http, /startTestCheckout|createCheckoutSessionExecutor/);
+  // the creation library itself imports nothing (client injected; no SDK, env, database or network)
+  const mode = readFileSync(join(ROOT, E5A_CHECKOUT_CREATE_FILE), "utf8");
+  assert.equal(/^\s*import\s/m.test(mode), false);
+  assert.equal(/process\.env|fetch\(|console\./.test(mode), false);
 });
 
 test("lib/stripe-checkout-draft.js stays inert (no runtime imports, not a route)", () => {

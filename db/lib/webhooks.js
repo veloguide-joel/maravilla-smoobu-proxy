@@ -36,3 +36,37 @@ export async function finishStripeEvent(pool, eventId, { status, intentId = null
     [eventId, status, intentId, errorCode, new Date(now)]);
   return { updated: r.rowCount === 1 };
 }
+
+// ---------------------------------------------------------------------------------------------
+// E5a (Stripe TEST mode only). Helpers for the signed-webhook handler in lib/checkout/stripe-test-webhook.js.
+
+/**
+ * Mark a received event processed INSIDE the transaction that applies its E3 transition (applyEvent inTx), so the
+ * de-dup record, the transition and the completion commit together or not at all. Throws if the row is not open.
+ */
+export async function markStripeEventProcessedInTx(client, eventId, { intentId, now }) {
+  const r = await client.query(
+    `UPDATE booking.stripe_webhook_events SET status = 'processed', processed_at = $3, intent_id = coalesce(intent_id, $2), error_code = NULL
+      WHERE event_id = $1 AND status IN ('received', 'failed_retryable')`, [eventId, intentId, new Date(now)]);
+  if (r.rowCount !== 1) {
+    const e = new Error("WEBHOOK_EVENT_NOT_OPEN");
+    e.code = "WEBHOOK_EVENT_NOT_OPEN";
+    throw e;
+  }
+}
+
+/** The payment attempt bound to a Checkout Session id (null if none). Read-only. */
+export async function findAttemptBySession(q, sessionId) {
+  const r = await q.query(
+    `SELECT id, intent_id, attempt, status, checkout_session_id, session_expires_at, amount_minor, currency
+       FROM booking.payment_attempts WHERE checkout_session_id = $1`, [sessionId]);
+  return r.rows[0] || null;
+}
+
+/** A payment attempt by id (used only to tell "not recorded yet" from "unknown"). Read-only. */
+export async function findAttemptById(q, attemptId) {
+  const r = await q.query(
+    `SELECT id, intent_id, attempt, status, checkout_session_id, amount_minor, currency
+       FROM booking.payment_attempts WHERE id = $1::uuid`, [attemptId]);
+  return r.rows[0] || null;
+}

@@ -99,8 +99,24 @@ test("external dispatch is disabled: no executor, no send; no route imports the 
   await assert.rejects(dispatchOperation({ op_type: "hostaway.create_reservation" }), (e) => e.code === "DISPATCH_DISABLED");
   await assert.rejects(dispatchOperation({ op_type: "stripe.capture_payment_intent" }, { executors: {} }), (e) => e.code === "DISPATCH_DISABLED");
   const walk = (dir) => readdirSync(dir, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? walk(join(dir, e.name)) : [join(dir, e.name)]);
-  // deployable code (api/ and the lib/ it imports) never references the booking database layer
-  for (const f of [...walk("api"), ...walk("lib")]) assert.doesNotMatch(readFileSync(f, "utf8"), /db\/lib|booking_migrations|BOOKING_DATABASE_URL|db\/migrations/, f);
+  // deployable code (api/ and the lib/ it imports) never references the booking database layer — except the three E5a
+  // Stripe TEST-mode files (root-authorized offline slice 2026-11-02), whose route refuses (404) before loading any of it
+  const E5A = new Set(["lib/checkout/stripe-test-mode.js", "lib/checkout/stripe-test-webhook.js", "lib/checkout/stripe-webhook-http.js"]);
+  for (const f of [...walk("api"), ...walk("lib")]) {
+    if (E5A.has(f.split("\\").join("/"))) continue;
+    assert.doesNotMatch(readFileSync(f, "utf8"), /db\/lib|booking_migrations|BOOKING_DATABASE_URL|db\/migrations/, f);
+  }
+  // the E5a HTTP wrapper loads the database layer only lazily (never at module load), and no api/ file imports it directly
+  const http = readFileSync("lib/checkout/stripe-webhook-http.js", "utf8");
+  assert.doesNotMatch(http, /^\s*import\s[^;]*db\/lib/m);
+  assert.doesNotMatch(http, /^\s*import\s[^;]*stripe-test-webhook/m);
+  assert.doesNotMatch(readFileSync("lib/checkout/stripe-test-mode.js", "utf8"), /^\s*import\s/m);
+  // E3 effects other than the one Checkout create are still never executed: the only executor map in lib/ is E5a's,
+  // and it holds exactly the Checkout create
+  const users = walk("lib").filter((f) => /dispatchOperation|executors\s*:/.test(readFileSync(f, "utf8"))).map((f) => f.split("\\").join("/"));
+  assert.deepEqual(users, ["lib/checkout/stripe-test-webhook.js"]);
+  const wh = readFileSync("lib/checkout/stripe-test-webhook.js", "utf8");
+  assert.deepEqual(wh.match(/executors\s*:\s*\{[^}]*\}/g), ["executors: { [CHECKOUT_CREATE_OP]: executor }"]);
   const pkg = JSON.parse(readFileSync("package.json", "utf8"));
   assert.deepEqual(Object.keys(pkg.dependencies).sort(), ["dotenv", "pg", "stripe"], "no new dependency");
 });

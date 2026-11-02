@@ -37,8 +37,9 @@ async function openCase(c, intentId, kind, openedBy, evidence, now) {
  * Claim the next due operation for this worker (one short transaction; the row lock lasts one statement).
  * A Hostaway create is only claimable while its intent is reservation_pending with a dispatch record and a live
  * lease; otherwise it is superseded and can never be sent.
+ * E5a: `opId` restricts the claim to one known row (a webhook claims exactly the read it queued).
  */
-export async function claimNextOperation(pool, { workerId, now, leaseMs = DB_CONFIG.operationLeaseMs, opTypes = null, intentId = null, hooks = {} }) {
+export async function claimNextOperation(pool, { workerId, now, leaseMs = DB_CONFIG.operationLeaseMs, opTypes = null, intentId = null, opId = null, hooks = {} }) {
   const t = new Date(now);
   return withTx(pool, async (c) => {
     await c.query(
@@ -50,12 +51,12 @@ export async function claimNextOperation(pool, { workerId, now, leaseMs = DB_CON
       `WITH c AS (
          SELECT o.id FROM booking.external_operations o
           WHERE o.state = 'pending' AND o.next_attempt_at <= $2
-            AND ($4::text[] IS NULL OR o.op_type = ANY($4)) AND ($5::uuid IS NULL OR o.intent_id = $5)
+            AND ($4::text[] IS NULL OR o.op_type = ANY($4)) AND ($5::uuid IS NULL OR o.intent_id = $5) AND ($6::uuid IS NULL OR o.id = $6)
           ORDER BY o.next_attempt_at, o.created_at FOR UPDATE OF o SKIP LOCKED LIMIT 1)
        UPDATE booking.external_operations o
           SET state = 'in_flight', lease_worker_id = $1, lease_until = $3, attempts = o.attempts + 1, dispatched_at = $2, updated_at = $2
          FROM c WHERE o.id = c.id RETURNING o.*`,
-      [workerId, t, new Date(now + leaseMs), opTypes, intentId]);
+      [workerId, t, new Date(now + leaseMs), opTypes, intentId, opId]);
     const op = r.rows[0] || null;
     if (op && op.op_type === "hostaway.create_reservation") {
       await c.query("UPDATE booking.hostaway_reservation_attempts SET send_started_at = $2, updated_at = $2 WHERE operation_id = $1", [op.id, t]);
@@ -243,4 +244,13 @@ export async function reportUnknownOutcome(pool, opId, { now, config }) {
   if (!op || op.state !== "outcome_unknown" || !UNKNOWN_EVENT_FOR[op.op_type]) return { ok: false, error: "NOT_APPLICABLE" };
   return applyEvent(pool, op.intent_id, { type: UNKNOWN_EVENT_FOR[op.op_type], id: `op-unknown:${op.id}`, code: op.error_code || "OUTCOME_UNKNOWN" },
     { now, config, actor: "reconciler" });
+}
+
+/** E5a: the latest Checkout Session create row for one payment attempt ({ id, state, result_ref } or null). Read-only. */
+export async function findCheckoutCreateForAttempt(q, intentId, paymentAttemptId) {
+  const r = await q.query(
+    `SELECT id, state, result_ref FROM booking.external_operations
+      WHERE intent_id = $1 AND op_type = 'stripe.create_checkout_session' AND payload ->> 'paymentAttemptId' = $2
+      ORDER BY created_at DESC LIMIT 1`, [intentId, String(paymentAttemptId)]);
+  return r.rows[0] || null;
 }
