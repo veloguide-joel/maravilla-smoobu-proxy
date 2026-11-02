@@ -2,7 +2,8 @@
 // lazy pool/client, code-only responses and logs. Offline: Stripe's local signing helper only (no network, no keys).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { Readable } from "node:stream";
+import { Readable, PassThrough } from "node:stream";
+import http from "node:http";
 import Stripe from "stripe";
 import { createStripeTestWebhookHandler, MAX_BODY_BYTES, readBoundedBody } from "../lib/checkout/stripe-webhook-http.js";
 import { ENV_OK } from "./e5a-fixtures.mjs";
@@ -124,4 +125,68 @@ test("responses and logs carry codes only (no body, ids, secrets or guest data)"
   const thrower = harness({ deps: { loadProcessor: async () => async () => { throw new Error("guest@example.invalid boom"); } } });
   const r2 = res(); await thrower.h(req({ body, headers: { "stripe-signature": signed(body) } }), r2);
   assert.equal(r2.statusCode, 503); assert.deepEqual(r2.body, { code: "PROCESSING_FAILED" }); assert.deepEqual(thrower.calls.logs, ["PROCESSING_FAILED"]);
+});
+
+const listenerCount = (r) => ["data", "end", "error", "aborted", "close"].reduce((n, e) => n + r.listenerCount(e), 0);
+
+test("body reader settles on abort, premature close, stall and overflow; listeners and timer are always removed", async () => {
+  const mk = () => { const r = new PassThrough(); r.method = "POST"; r.headers = {}; return r; };
+  let r = mk(); let p = readBoundedBody(r, 100, { deadlineMs: 5000 }); r.write("abc"); r.emit("aborted");
+  await assert.rejects(p, (e) => e.code === "BODY_ABORTED"); assert.equal(listenerCount(r), 0);
+  r = mk(); p = readBoundedBody(r, 100, { deadlineMs: 5000 }); r.write("abc"); r.destroy();
+  await assert.rejects(p, (e) => e.code === "BODY_ABORTED"); assert.equal(listenerCount(r), 0);
+  r = mk(); p = readBoundedBody(r, 100, { deadlineMs: 40 }); r.write("abc");                  // never ends
+  await assert.rejects(p, (e) => e.code === "BODY_TIMEOUT"); assert.equal(listenerCount(r), 0);
+  r = mk(); p = readBoundedBody(r, 10, { deadlineMs: 5000 }); r.write(Buffer.alloc(11));
+  await assert.rejects(p, (e) => e.code === "BODY_TOO_LARGE"); assert.equal(listenerCount(r), 0);
+  r = mk(); p = readBoundedBody(r, 10, { deadlineMs: 5000 }); r.end("ok");
+  assert.equal((await p).toString(), "ok"); assert.equal(listenerCount(r), 0);
+  r = mk(); r.on("error", () => {}); p = readBoundedBody(r, 10, { deadlineMs: 5000 }); r.emit("error", new Error("x"));
+  await assert.rejects(p, (e) => e.code === "BODY_READ_FAILED");
+});
+
+test("stalled or aborted webhook requests: no SDK load, pool or processing", async () => {
+  const { calls, h } = harness({ deps: { bodyDeadlineMs: 40 } });
+  const stalled = new PassThrough(); stalled.method = "POST"; stalled.headers = { "stripe-signature": "t=1,v1=a" }; stalled.write("{");
+  let r = res(); await h(stalled, r);
+  assert.equal(r.statusCode, 408); assert.deepEqual(r.body, { code: "BODY_TIMEOUT" });
+  const aborted = new PassThrough(); aborted.method = "POST"; aborted.headers = { "stripe-signature": "t=1,v1=a" };
+  r = res(); const done = h(aborted, r); aborted.write("{"); aborted.emit("aborted"); await done;
+  assert.deepEqual(r.body, { code: "BODY_ABORTED" });
+  assert.deepEqual([calls.loadStripe, calls.createPool, calls.createStripe, calls.process], [0, 0, 0, 0]);
+});
+
+test("real local HTTP: oversized streamed and declared bodies get a 413 response (no reset); a stalled sender gets 408; a client abort settles the handler", async () => {
+  const { calls, h } = harness({ deps: { bodyDeadlineMs: 150 } });
+  let settled = 0;
+  const server = http.createServer(async (req, rs) => { await h(req, rs); settled++; });
+  await new Promise((ok) => server.listen(0, "127.0.0.1", ok));
+  const port = server.address().port;
+  const send = (headers, write) => new Promise((ok, bad) => {
+    const rq = http.request({ host: "127.0.0.1", port, method: "POST", path: "/", headers: { "stripe-signature": "t=1,v1=a", ...headers } }, (rs) => {
+      let b = ""; rs.on("data", (c) => { b += c; }); rs.on("end", () => ok({ status: rs.statusCode, body: JSON.parse(b) }));
+    });
+    rq.on("error", bad);
+    write(rq);
+  });
+  try {
+    // chunked (no Content-Length): 300 KiB in 10 KiB pieces
+    const big = await send({ "transfer-encoding": "chunked" }, async (rq) => { for (let i = 0; i < 30; i++) rq.write(Buffer.alloc(10240, 0x20)); rq.end(); });
+    assert.deepEqual(big, { status: 413, body: { code: "BODY_TOO_LARGE" } });
+    const declared = await send({ "content-length": String(MAX_BODY_BYTES + 1) }, (rq) => { rq.end(Buffer.alloc(MAX_BODY_BYTES + 1, 0x20)); });
+    assert.deepEqual(declared, { status: 413, body: { code: "BODY_TOO_LARGE" } });
+    const stalled = await send({ "content-length": "100" }, (rq) => { rq.write("{"); });          // never finishes
+    assert.deepEqual(stalled, { status: 408, body: { code: "BODY_TIMEOUT" } });
+    // client aborts mid-body: the handler must still settle
+    const before = settled;
+    await new Promise((ok) => {
+      const rq = http.request({ host: "127.0.0.1", port, method: "POST", path: "/", headers: { "stripe-signature": "t=1,v1=a", "content-length": "100" } });
+      rq.on("error", () => ok()); rq.write("{"); setTimeout(() => { rq.destroy(); ok(); }, 20);
+    });
+    const t0 = Date.now(); while (settled === before && Date.now() - t0 < 2000) await new Promise((ok) => setTimeout(ok, 10));
+    assert.equal(settled, before + 1, "handler settled after client abort");
+    assert.deepEqual([calls.loadStripe, calls.createPool, calls.createStripe, calls.process], [0, 0, 0, 0]);
+  } finally {
+    server.closeAllConnections?.(); await new Promise((ok) => server.close(ok));
+  }
 });

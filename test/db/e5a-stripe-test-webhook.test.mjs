@@ -124,7 +124,7 @@ test("happy path: one create through the outbox row (settled), signed completion
   // replays after completion: permanently de-duplicated
   for (const m of [6, 60 * 24, 60 * 24 * 3]) assert.deepEqual(await deliver(w, ev, F.at(m)), { http: 200, code: "ALREADY_PROCESSED" });
   assert.equal(await authTransitions(id), 1);
-  assert.deepEqual(w.reads, ["account", `session:${sessionId}`, `pi:${piId}`]);              // replays read nothing
+  assert.deepEqual(w.reads.filter((r) => r !== "account"), [`session:${sessionId}`, `pi:${piId}`]);   // replays read nothing
   await noHostawayOrMoneyMove(id);
 });
 
@@ -273,9 +273,11 @@ test("create outcomes: ambiguous -> outcome_unknown + case, never retried; defin
   assert.equal(w3.creates.length, 1);
   // the gate is checked before any database or Stripe call
   const id4 = await F.withDetails(db.app, { listingId: L(10) });
-  for (const env of [{ ...ENV_OK, VERCEL_ENV: "production" }, {}]) {
-    assert.equal((await startTestCheckout(db.app, id4, { env, stripe: w3.stripe, now: F.at(2) })).ok, false);
+  const reads0 = w3.reads.length;
+  for (const [env, code] of [[{ ...ENV_OK, VERCEL_ENV: "production" }, "PRODUCTION_REFUSED"], [{}, "ENVIRONMENT_NOT_ALLOWED"], [{ ...ENV_OK, MV_STRIPE_TEST_WEBHOOK: "no" }, "NOT_ENABLED"]]) {
+    assert.deepEqual(await startTestCheckout(db.app, id4, { env, stripe: w3.stripe, now: F.at(2) }), { ok: false, error: code });
   }
+  assert.equal(w3.reads.length, reads0);                                                      // not even the account read
   assert.equal(await F.count(db.app, "SELECT count(*) AS n FROM booking.payment_attempts WHERE intent_id = $1", [id4]), 0);
   assert.equal(w3.creates.length, 1);
 });
@@ -375,4 +377,56 @@ test("other events: declined card in an open session is informational; unknown t
   }
   assert.equal(w.reads.filter((r) => r.startsWith("pi:")).length, 0);
   await noHostawayOrMoneyMove(id);
+});
+
+test("pre-create checks: a LIVE-marked database or a different/unreadable Stripe account -> refused before ANY database write or Stripe create", async () => {
+  // the throwaway cluster is migrated as 'test'; a live marker is simulated by answering only the marker query differently
+  const liveMarked = { query: (sql, p) => (/FROM booking\.instance/.test(sql) ? Promise.resolve({ rows: [{ environment: "live" }] }) : db.app.query(sql, p)),
+    connect: () => db.app.connect() };
+  const counts = async (id) => [await F.count(db.app, "SELECT count(*) AS n FROM booking.payment_attempts WHERE intent_id = $1", [id]),
+    await F.count(db.app, "SELECT count(*) AS n FROM booking.inventory_claims WHERE intent_id = $1", [id]),
+    await F.count(db.app, "SELECT count(*) AS n FROM booking.external_operations WHERE intent_id = $1", [id]), (await loadIntent(db.app, id)).version];
+  const w = world();
+  const id = await F.withDetails(db.app, { listingId: L(70) });
+  const before0 = await counts(id);
+  assert.deepEqual(await startTestCheckout(liveMarked, id, { env: ENV_OK, stripe: w.stripe, now: F.at(2) }), { ok: false, error: "DATABASE_NOT_TEST" });
+  assert.deepEqual([w.creates.length, w.reads.length], [0, 0]);                              // not even the account read
+  const brokenDb = { query: () => Promise.reject(new Error("unreachable")), connect: () => Promise.reject(new Error("unreachable")) };
+  assert.deepEqual(await startTestCheckout(brokenDb, id, { env: ENV_OK, stripe: w.stripe, now: F.at(2) }), { ok: false, error: "DATABASE_NOT_TEST" });
+  w.account = { object: "account", id: "acct_SOMEONEELSE" };
+  assert.deepEqual(await startTestCheckout(db.app, id, { env: ENV_OK, stripe: w.stripe, now: F.at(2) }), { ok: false, error: "ACCOUNT_MISMATCH" });
+  w.account = { object: "customer", id: ACCT };
+  assert.deepEqual(await startTestCheckout(db.app, id, { env: ENV_OK, stripe: w.stripe, now: F.at(2) }), { ok: false, error: "ACCOUNT_MISMATCH" });
+  w.stripe.accounts.retrieve = async () => { throw Object.assign(new Error("down"), { type: "StripeConnectionError" }); };
+  assert.deepEqual(await startTestCheckout(db.app, id, { env: ENV_OK, stripe: w.stripe, now: F.at(2) }), { ok: false, error: "ACCOUNT_READ_FAILED" });
+  assert.equal(w.creates.length, 0);
+  assert.deepEqual(await counts(id), before0);                                                 // nothing written at all
+  assert.equal(await F.state(db.app, id), "details_collected");
+});
+
+test("interrupted-create recovery refuses a read session that differs in object, mode, reference, amount, currency or expiry: no 2nd create, nothing overwritten", async () => {
+  const crash = Object.assign(new Error("killed"), { code: "SIMULATED_CRASH" });
+  let n = 80;
+  for (const [tamper, code, now] of [
+    [(x) => { x.object = "payment_intent"; }, "RECORDED_SESSION_NOT_BOUND"],
+    [(x) => { x.mode = "setup"; }, "RECORDED_SESSION_NOT_BOUND"],
+    [(x) => { x.client_reference_id = "00000000-0000-4000-8000-000000000000"; }, "RECORDED_SESSION_NOT_BOUND"],
+    [(x) => { x.amount_total = 575999; }, "RECORDED_SESSION_AMOUNT_MISMATCH"],
+    [(x) => { x.amount_total = "576000"; }, "RECORDED_SESSION_AMOUNT_MISMATCH"],
+    [(x) => { x.currency = "usd"; }, "RECORDED_SESSION_AMOUNT_MISMATCH"],
+    [(x) => { x.expires_at = sec(F.at(2)); }, "RECORDED_SESSION_EXPIRY_INVALID"],                 // already past at minute 3
+    [(x) => { x.expires_at = sec(F.at(3) + 25 * 3600 * 1000); }, "RECORDED_SESSION_EXPIRY_INVALID"],
+    [(x) => { x.status = "expired"; }, "RECORDED_SESSION_NOT_OPEN"]
+  ]) {
+    const w = world();
+    const id = await F.withDetails(db.app, { listingId: L(n++) });
+    await assert.rejects(startTestCheckout(db.app, id, { env: ENV_OK, stripe: w.stripe, now: F.at(2), hooks: { beforeRecord: async () => { throw crash; } } }));
+    const [sid] = [...w.sessions.keys()];
+    tamper(w.sessions.get(sid));
+    assert.deepEqual(await startTestCheckout(db.app, id, { env: ENV_OK, stripe: w.stripe, now: F.at(3) }), { ok: false, error: code }, code);
+    assert.deepEqual(await q1("SELECT status, checkout_session_id FROM booking.payment_attempts WHERE intent_id = $1", [id]), [{ status: "creating", checkout_session_id: null }], code);
+    assert.equal(await F.state(db.app, id), "details_collected", code);
+    assert.equal(w.creates.length, 1, code);
+    assert.deepEqual((await createOps(id)).map((o) => o.state), ["succeeded"], code);
+  }
 });

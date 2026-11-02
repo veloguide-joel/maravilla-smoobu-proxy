@@ -4,8 +4,9 @@
 // settings and a booking database are configured. In production it is always 404, before anything else runs.
 // It makes no Stripe write (reads only: account, Checkout Session, PaymentIntent) and no Hostaway call.
 //
-// PACKAGING GAP (not validated): .vercelignore excludes /db, which this route needs at runtime. Until a reviewed
-// packaging decision exists, an enabled deployment answers 503 NOT_READY; nothing is exposed by this file.
+// PACKAGING GAP (UNVERIFIED; HOLD, no deployment): .vercelignore excludes /db, which this route loads at runtime, and
+// Vercel's bundling, module loading and raw-body handling for this file have never been exercised. An enabled
+// deployment might fail to build, fail to load, or answer 503; no specific deployed behaviour is claimed.
 import { createStripeTestWebhookHandler } from "../../lib/checkout/stripe-webhook-http.js";
 
 export default createStripeTestWebhookHandler({ env: process.env });
