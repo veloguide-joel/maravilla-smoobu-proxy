@@ -756,3 +756,12 @@ test("launcher end-to-end: an eligible cancel reply whose K8 read is not cancell
   assert.equal(rr.output.reconcile.verdict, "RESERVATION_ACTIVE_OWNER_DECISION_REQUIRED"); assert.equal(writes(w).length, 2);
   leakFree(r.output); leakFree(ri.output); leakFree(rr.output);
 });
+
+test("inspect: a journal with NO create but a contradiction (a stray KV marker) still exits 3, never clean", async () => {
+  const stray = { type: "read", step: "KV1_READ_VERIFY", kind: "read", code: "CREATE_REF_NOT_ECHOED:ABSENT_NULL", reservationId: 5 };
+  const c = RC.classifyConnectedJournal([start, stray], H);
+  assert.equal(c.state, "NO_CREATE_ATTEMPTED"); assert.equal(c.clean, false);
+  const { sb, l } = prepared([start, stray]);
+  const r = await inspect(sb, l);
+  assert.equal(r.exitCode, 3); assert.equal(r.output.nextStep, "NONE_NOTHING_SENT_BY_A_CREATE");
+});
