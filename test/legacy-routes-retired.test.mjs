@@ -108,9 +108,15 @@ test("no deployed code can create Stripe sessions, write the database or call Sm
     [/smoobu\.com/i, "Smoobu API call"],
     [/from\s+["'][./]*(api\/)?_db\.js["']/, "database pool import"]
   ];
+  // Packaging (2026-11-02): the booking DB layer moved verbatim from db/lib to lib/booking-db so the gated E5a webhook can
+  // bundle it. It is the only place allowed to write SQL; test/packaging-closure.test.mjs proves only that route reaches it.
   for (const f of files) {
     const src = readFileSync(f, "utf8");
-    for (const [re, what] of forbidden) assert.equal(re.test(src), false, `${rel(f)} contains ${what}`);
+    const dbLayer = rel(f).startsWith("lib/booking-db/");
+    for (const [re, what] of forbidden) {
+      if (dbLayer && what === "database write") continue;
+      assert.equal(re.test(src), false, `${rel(f)} contains ${what}`);
+    }
   }
 });
 
