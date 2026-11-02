@@ -193,7 +193,7 @@ export async function reconcileConnectedRun({ transport, manifest, classificatio
   const gate = createGate({ transport, journal: noJournal, timeoutMs, state, budgets: RECOVER_STEPS, writeBudget: { create: 0, cancel: 0 }, allowRequest: assertRecoverRequest });
   const send = async (step, req) => { try { return await gate.send(step, req); } catch (e) { return { transportError: true, code: e instanceof RunnerError ? e.code : "GATE" }; } };
   const expect = { listingId: L, from: s.arrivalDate, to: s.departureDate, totalMinor: manifest.totalMinor, currency: "MXN", channelId: DIRECT_CHANNEL_ID, bookingRef: c.ref };
-  const out = { read: null, lookup: null, calendar: null };
+  const out = { read: null, lookup: null, calendar: null, evidenceConflicts: [] };
   if (state.readId) {
     const p = parseReservationResponse(await send("RC_READ", { method: "GET", path: `/reservations/${state.readId}`, query: READ_QUERY }), "READ");
     const mm = p.ok ? identityMismatches(p.reservation, { ...expect, reservationId: state.readId }) : [];
@@ -214,8 +214,18 @@ export async function reconcileConnectedRun({ transport, manifest, classificatio
   const idOk = r && r.code === "READ_IDENTITY_OK";
   const lkOk = lk && lk.outcome === "found" && !lk.mismatches && isPosInt(lk.foundReservationId) && (!state.readId || lk.foundReservationId === state.readId);
   const status = idOk ? r.status : lkOk ? lk.status : null;
+  // Explicit contradictions between the provider reads themselves: a clean read by id must not mask a conflicting lookup.
+  // The reads are kept as evidence; the verdict becomes manual review and no decision is offered.
+  const evidenceConflicts = [];
+  if (lk && lk.protectedIdReturned) evidenceConflicts.push("LOOKUP_RETURNED_PROTECTED_ID");
+  if (lk && lk.outcome === "conflict") evidenceConflicts.push(`LOOKUP_${lk.code}`);
+  if (lk && lk.outcome === "found" && lk.mismatches) evidenceConflicts.push("LOOKUP_IDENTITY_MISMATCH");
+  if (state.readId && lk && lk.outcome === "found" && isPosInt(lk.foundReservationId) && lk.foundReservationId !== state.readId) evidenceConflicts.push("LOOKUP_ID_DIFFERS_FROM_READ");
+  if (idOk && lk && lk.outcome === "found" && lk.foundReservationId === state.readId && lk.status !== r.status) evidenceConflicts.push("LOOKUP_STATUS_DIFFERS_FROM_READ");
+  out.evidenceConflicts = evidenceConflicts;
   let verdict;
   if (!c.clean) verdict = "CONFLICT_MANUAL_REVIEW";                 // contradictions in the journal: evidence only, never a clean verdict
+  else if (evidenceConflicts.length) verdict = "EVIDENCE_CONFLICT_MANUAL_REVIEW";
   else if (r && r.code === "READ_IDENTITY_MISMATCH") verdict = "IDENTITY_MISMATCH_MANUAL_REVIEW";
   else if ((idOk || lkOk) && status === "cancelled") verdict = "RESERVATION_CANCELLED_CONFIRMED";
   else if (idOk || lkOk) verdict = "RESERVATION_ACTIVE_OWNER_DECISION_REQUIRED";

@@ -558,3 +558,38 @@ test("launcher URL guard body binding: create for another listing/dates/currency
   await g.guarded(`${B}/reservations`, { method: "POST", body: JSON.stringify(body) });
   assert.deepEqual(sent, [`/v1/listings/${L}/calendar/priceDetails`, "/v1/reservations"]);
 });
+
+test("recovery truthfulness: a clean read by id never masks a contradicting ref lookup (other id, protected id, status/identity disagreement, duplicate ref)", async () => {
+  const es = [start, ci, co(5), xi(5), xo(5, "VERIFIED_CANCELLED")];
+  const resv = (over = {}) => ({ id: 5, hostawayReservationId: "5", listingMapId: L, channelId: 2000, reservationId: "98765-603566-2000-1", arrivalDate: STAY.arrivalDate,
+    departureDate: STAY.departureDate, totalPrice: 3200, currency: "MXN", status: "cancelled", guestName: "Synthetic Tester",
+    customFieldValues: [{ customFieldId: 105433, value: REF }], ...over });
+  const cases = [
+    [[resv({ id: 6, hostawayReservationId: "6" })], "LOOKUP_ID_DIFFERS_FROM_READ"],
+    [[resv({ id: 70636076, hostawayReservationId: "70636076" })], "LOOKUP_RETURNED_PROTECTED_ID"],
+    [[resv({ status: "new" })], "LOOKUP_STATUS_DIFFERS_FROM_READ"],
+    [[resv({ totalPrice: 9999 })], "LOOKUP_IDENTITY_MISMATCH"],
+    [[resv(), resv({ id: 7, hostawayReservationId: "7" })], "LOOKUP_DUPLICATE_REF"]
+  ];
+  for (const [lookupItems, expected] of cases) {
+    const { sb, l } = prepared(es);
+    const log = [];
+    const fetchImpl = async (url, init = {}) => {
+      const u = new URL(String(url)); const path = u.pathname.replace(/^\/v1/, ""); log.push(`${init.method ?? "GET"} ${path}`);
+      const J2 = (o) => new Response(JSON.stringify(o), { status: 200 });
+      if (path === "/accessTokens") return J2({ access_token: "FAKE-TOKEN" });
+      if (path === "/reservations/5") return J2({ status: "success", result: resv() });
+      if (path === "/reservations") return J2({ status: "success", result: u.searchParams.get("afterId") ? [] : lookupItems });
+      if (path === `/listings/${L}/calendar`) return J2({ status: "success", result: NIGHTS.map((date) => ({ date, status: "available", isAvailable: 1 })) });
+      return new Response("{}", { status: 404 });
+    };
+    const rr = await RC.runConnectedRecoverCli(["--reconcile", "--manifest", sb.mpath, "--reviewed-commit", SHA, "--location", l.token],
+      { root: sb.root, base: sb.base, git: RGIT, fetchImpl, sleep: async () => {}, prompt: async () => ({ accountId: "201434", clientSecret: "FAKE-SECRET" }) });
+    assert.equal(rr.output.reconcile.read.code, "READ_IDENTITY_OK", expected);                 // the useful read is preserved
+    assert.ok(rr.output.reconcile.evidenceConflicts.includes(expected), `${expected} in ${rr.output.reconcile.evidenceConflicts}`);
+    assert.equal(rr.output.reconcile.verdict, "EVIDENCE_CONFLICT_MANUAL_REVIEW"); assert.equal(rr.output.reconcile.decision, null);
+    assert.equal(rr.exitCode, 3);
+    assert.ok(log.every((x) => x.startsWith("GET ") || x === "POST /accessTokens") && !log.includes("GET /reservations/70636076"));
+    leakFree(rr.output);
+  }
+});
