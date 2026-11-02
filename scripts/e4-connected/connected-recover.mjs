@@ -85,6 +85,72 @@ export function calendarNightShapes(resp, nights) {
   });
 }
 
+const LATER_STEPS = Object.freeze(["K3_SIDE_EFFECTS_CREATE", "K4_READBACK", "K5_LOOKUP_REF", "K6_CALENDAR_BLOCKED", "A1_AIRBNB_AFTER_CREATE", "K7_PRECANCEL",
+  "KW2_CANCEL", "K8_POSTCANCEL", "K9_SIDE_EFFECTS_CANCEL", "K10_CALENDAR_REOPENED", "A2_AIRBNB_AFTER_CANCEL"]);
+const KV_ROLES = Object.freeze([
+  { step: "KV1_READ_VERIFY", kind: "read", codes: CONNECTED_VERIFY_MARKER_CODES },
+  { step: "KV1_READ_VERIFY", kind: "read", codes: CONNECTED_VERIFY_READ_CODES },
+  { step: "KV2_LOOKUP_VERIFY", kind: "lookup", codes: CONNECTED_VERIFY_LOOKUP_CODES }
+]);
+const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+const is2xx = (v) => Number.isSafeInteger(v) && v >= 200 && v <= 299;   // = classifyCreateResponse / parseReservationResponse success range
+/** The create outcome qualifies for the read-only path only exactly as the producer writes it. -> positive id | null */
+function unechoedRefOutcomeId(co, isProtected) {
+  if (!isObj(co) || co.code !== "RESERVATION_MISMATCH" || co.transport !== undefined || !isObj(co.evidence)) return null;
+  const ev = co.evidence;
+  if (ev.outcome !== "conflict" || ev.code !== "RESERVATION_MISMATCH" || !is2xx(ev.httpStatus)) return null;
+  if (!Array.isArray(ev.mismatches) || ev.mismatches.length !== 1 || ev.mismatches[0] !== "bookingRef") return null;
+  if (!isPosInt(ev.reservationId) || isProtected(ev.reservationId) || has(ev, "reservation")) return null;
+  return ev.reservationId;
+}
+function verifyKvSequence({ kvAt, co, coIdx, firstHaltIdx, xiIdx, laterIdx, ref, isProtected }) {
+  const out = { conflicts: [], readVerified: false, refEcho: null, readVerify: null, lookupVerify: null };
+  if (!kvAt.length) return out;
+  const en = (x, list) => (x === undefined || x === null ? null : list.includes(x) ? x : "OTHER");
+  const add = (c) => { if (!out.conflicts.includes(c)) out.conflicts.push(c); };
+  // reported codes by POSITION (role), never by guessing from the code text
+  for (let r = 0; r < kvAt.length && r < 3; r++) {
+    const val = en(kvAt[r][1].code, KV_ROLES[r].codes);
+    if (r === 0) out.refEcho = val; else if (r === 1) out.readVerify = val; else out.lookupVerify = val;
+  }
+  const coId = unechoedRefOutcomeId(co, isProtected);
+  if (coIdx < 0 || kvAt[0][0] < coIdx) add("CREATE_VERIFICATION_BEFORE_CREATE_OUTCOME");
+  if (coId === null) add("CREATE_VERIFICATION_WITHOUT_UNECHOED_REF");
+  if (kvAt.length > 3) add("CREATE_VERIFICATION_DUPLICATED");
+  if (firstHaltIdx >= 0 && kvAt.some(([i]) => i > firstHaltIdx)) add("CREATE_VERIFICATION_AFTER_HALT");
+  if (xiIdx >= 0 && kvAt.some(([i]) => i > xiIdx)) add("CREATE_VERIFICATION_AFTER_CANCEL");
+  if (laterIdx.length && kvAt.some(([i]) => i > laterIdx[0])) add("CREATE_VERIFICATION_AFTER_LATER_STEP");
+  kvAt.forEach(([i, e], r) => {
+    const role = KV_ROLES[Math.min(r, 2)];
+    if (coIdx < 0 || i !== coIdx + 1 + r) add("CREATE_VERIFICATION_OUT_OF_ORDER");     // contiguous: outcome, marker, read, lookup
+    if (e.step !== role.step || e.kind !== role.kind) add("CREATE_VERIFICATION_OUT_OF_ORDER");
+    if (!role.codes.includes(e.code)) {
+      // a code of ANOTHER role in this slot is an ordering violation (e.g. the read before the marker); otherwise unknown
+      add(KV_ROLES.some((o) => o !== role && o.codes.includes(e.code)) ? "CREATE_VERIFICATION_OUT_OF_ORDER" : "CREATE_VERIFICATION_CODE_UNKNOWN");
+    }
+    if (r < 2) {                                                                         // marker and read: the outcome id, always
+      if (!isPosInt(e.reservationId) || e.reservationId !== coId) add("CREATE_VERIFICATION_ID_NOT_BOUND");
+      if (has(e, "ref")) add("CREATE_VERIFICATION_CONTRADICTORY");
+    } else {
+      if (e.ref !== ref) add("CREATE_VERIFICATION_REF_NOT_BOUND");
+      if (has(e, "reservationId") && e.reservationId !== coId) add("CREATE_VERIFICATION_ID_NOT_BOUND");
+    }
+  });
+  // success / marker codes must not coexist with contradicting metadata
+  const [m, rd, lk] = [kvAt[0]?.[1], kvAt[1]?.[1], kvAt[2]?.[1]];
+  const extra = (e, allowed) => Object.keys(e).some((k) => !allowed.includes(k));
+  if (m && extra(m, ["type", "step", "kind", "code", "reservationId", "at"])) add("CREATE_VERIFICATION_CONTRADICTORY");
+  if (rd && rd.code === "VERIFY_READ_IDENTITY_OK" && (!is2xx(rd.httpStatus) || extra(rd, ["type", "step", "kind", "code", "reservationId", "httpStatus", "at"]))) add("CREATE_VERIFICATION_CONTRADICTORY");
+  if (rd && rd.code === "VERIFY_READ_IDENTITY_MISMATCH" && !(Array.isArray(rd.mismatches) && rd.mismatches.length)) add("CREATE_VERIFICATION_CONTRADICTORY");
+  if (lk && lk.code === "VERIFY_LOOKUP_SAME_ID_IDENTITY_OK" && (lk.reservationId !== coId || extra(lk, ["type", "step", "kind", "code", "ref", "reservationId", "at"]))) add("CREATE_VERIFICATION_CONTRADICTORY");
+  if (lk && lk.code === "VERIFY_LOOKUP_IDENTITY_MISMATCH" && !(Array.isArray(lk.mismatches) && lk.mismatches.length)) add("CREATE_VERIFICATION_CONTRADICTORY");
+  // a later-success after an earlier failure (the producer halts on any KV failure)
+  if (rd && rd.code !== "VERIFY_READ_IDENTITY_OK" && lk) add("CREATE_VERIFICATION_CONTRADICTORY");
+  out.readVerified = !out.conflicts.length && kvAt.length === 3 && out.readVerify === "VERIFY_READ_IDENTITY_OK" &&
+    out.lookupVerify === "VERIFY_LOOKUP_SAME_ID_IDENTITY_OK" && out.refEcho !== null && out.refEcho !== "OTHER";
+  return out;
+}
+
 /**
  * Pure classification of the bound run's journal. -> { ok:false, code } for a journal that is not exactly this run's, else
  * { ok:true, state, ... } where state is one of:
@@ -102,7 +168,8 @@ export function classifyConnectedJournal(entries, manifestHash) {
   const intents = { create: [], cancel: [] }; const outcomes = { create: [], cancel: [] };
   const isProtected = recoveryProtection(manifestHash);
   const ids = new Set(); let protectedSeen = false; let halt = null; let runEnd = null;
-  const kv = { marker: [], read: [], lookup: [], beforeCreateOutcome: false, afterCancel: false };
+  const kvAt = [];                 // [index, entry] of every KV data entry, in journal order
+  let coIdx = -1; let firstHaltIdx = -1; let xiIdx = -1; const laterIdx = [];
   for (let i = 0; i < entries.length; i++) {
     const e = entries[i];
     if (!isObj(e) || !JOURNAL_TYPES.includes(e.type)) return bad("JOURNAL_UNEXPECTED_ENTRY");
@@ -127,12 +194,13 @@ export function classifyConnectedJournal(entries, manifestHash) {
     if (e.kind === "cancel" || (e.type === "read" && ["KV1_READ_VERIFY", "KV2_LOOKUP_VERIFY", "K4_READBACK", "K7_PRECANCEL", "K8_POSTCANCEL"].includes(e.step))) noteId(e.reservationId);
     if ((e.step === "KV1_READ_VERIFY" || e.step === "KV2_LOOKUP_VERIFY") && e.type !== "halt") {
       if (e.type !== "read") return bad("JOURNAL_UNEXPECTED_VERIFY_ENTRY");
-      if (!outcomes.create.length) kv.beforeCreateOutcome = true;
-      if (intents.cancel.length) kv.afterCancel = true;
-      if (e.step === "KV2_LOOKUP_VERIFY") kv.lookup.push(e);
-      else if (typeof e.code === "string" && e.code.startsWith("CREATE_REF_NOT_ECHOED:")) kv.marker.push(e);
-      else kv.read.push(e);
+      kvAt.push([i, e]);
     }
+    if (e.type === "outcome" && e.kind === "create" && coIdx < 0) coIdx = i;
+    if (e.type === "halt" && firstHaltIdx < 0) firstHaltIdx = i;
+    if (e.type === "intent" && e.kind === "cancel" && xiIdx < 0) xiIdx = i;
+    // entries of steps that only ever follow an adopted create (reads/side effects/observations/checkpoints, the cancel)
+    if (e.type !== "halt" && typeof e.step === "string" && LATER_STEPS.includes(e.step)) laterIdx.push(i);
     if (e.type === "halt" && !halt) halt = { step: e.step ?? null, code: e.code ?? null };
     if (e.type === "run-end") runEnd = { code: e.code ?? null };
   }
@@ -147,28 +215,19 @@ export function classifyConnectedJournal(entries, manifestHash) {
   if (ids.size > 1) conflicts.push("RESERVATION_IDS_INCONSISTENT");
   if (protectedSeen) conflicts.push("PROTECTED_ID_IN_JOURNAL");
   const xi = intents.cancel[0] ?? null;
-  // Read-only create verification (KV1/KV2): explicit enums only; order and consistency with the create outcome and the cancel.
-  const en = (v, list) => (v === undefined || v === null ? null : list.includes(v) ? v : "OTHER");
-  const kvAny = kv.marker.length + kv.read.length + kv.lookup.length > 0;
-  const refEcho = kv.marker.length ? en(kv.marker[0].code, CONNECTED_VERIFY_MARKER_CODES) : null;
-  const readVerify = kv.read.length ? en(kv.read[0].code, CONNECTED_VERIFY_READ_CODES) : null;
-  const lookupVerify = kv.lookup.length ? en(kv.lookup[0].code, CONNECTED_VERIFY_LOOKUP_CODES) : null;
-  const kvConflicts = [];
-  if (kvAny) {
-    if (kv.marker.length > 1 || kv.read.length > 1 || kv.lookup.length > 1) kvConflicts.push("CREATE_VERIFICATION_DUPLICATED");
-    if (kv.beforeCreateOutcome) kvConflicts.push("CREATE_VERIFICATION_BEFORE_CREATE_OUTCOME");
-    if (kv.afterCancel) kvConflicts.push("CREATE_VERIFICATION_AFTER_CANCEL");
-    if (!kv.marker.length || co?.code !== "RESERVATION_MISMATCH") kvConflicts.push("CREATE_VERIFICATION_WITHOUT_UNECHOED_REF");
-    if ([refEcho, readVerify, lookupVerify].includes("OTHER")) kvConflicts.push("CREATE_VERIFICATION_CODE_UNKNOWN");
-  }
-  conflicts.push(...kvConflicts);
-  // READ_VERIFIED only for exactly one marker, one read and one lookup, all OK, all on the same id, and no KV contradiction at all
-  const readVerified = !kvConflicts.length && kv.marker.length === 1 && refEcho !== "OTHER" && readVerify === "VERIFY_READ_IDENTITY_OK" && lookupVerify === "VERIFY_LOOKUP_SAME_ID_IDENTITY_OK" &&
-    co?.code === "RESERVATION_MISMATCH" && kv.read[0].reservationId === kv.marker[0].reservationId && kv.lookup[0].reservationId === kv.marker[0].reservationId;
-  const replyVerified = co?.code === "VERIFIED_CREATED" && !kvAny;
+  // Read-only create verification (KV1/KV2), bound EXACTLY to the sequence the producer writes: the matching create outcome
+  // (2xx conflict RESERVATION_MISMATCH, mismatches exactly [bookingRef], a positive unprotected id) immediately followed
+  // by marker -> KV1 result -> KV2 result, contiguous, before any halt, later step or cancel; every KV id equal to the outcome
+  // id, the lookup ref equal to the run ref, and success codes free of contradicting metadata. A strict PREFIX of that
+  // sequence (crash/halt) is clean but NOT_VERIFIED. Anything else is a conflict and NOT_VERIFIED. Explicit enums only.
+  const v = verifyKvSequence({ kvAt, co, coIdx, firstHaltIdx, xiIdx, laterIdx, ref, isProtected });
+  conflicts.push(...v.conflicts);
+  const readVerified = v.readVerified;
+  const replyVerified = co?.code === "VERIFIED_CREATED" && kvAt.length === 0;
   if (xi && !replyVerified && !readVerified) conflicts.push("CANCEL_WITHOUT_VERIFIED_CREATE");
-  const createVerification = { path: replyVerified || co?.code === "VERIFIED_CREATED" ? "REPLY" : kv.marker.length ? "READ_FALLBACK" : "NONE",
-    result: replyVerified ? "REPLY_VERIFIED" : readVerified ? "READ_VERIFIED" : "NOT_VERIFIED", refEcho, readVerify, lookupVerify };
+  if (laterIdx.length && !replyVerified && !readVerified) conflicts.push("LATER_STEP_WITHOUT_VERIFIED_CREATE");
+  const createVerification = { path: co?.code === "VERIFIED_CREATED" ? "REPLY" : kvAt.length ? "READ_FALLBACK" : "NONE",
+    result: replyVerified ? "REPLY_VERIFIED" : readVerified ? "READ_VERIFIED" : "NOT_VERIFIED", refEcho: v.refEcho, readVerify: v.readVerify, lookupVerify: v.lookupVerify };
   if (xi && !isPosInt(xi.reservationId)) conflicts.push("CANCEL_INTENT_WITHOUT_ID");
   if (xo && xi && xo.reservationId !== xi.reservationId) conflicts.push("CANCEL_OUTCOME_ID_DIFFERS_FROM_INTENT");
   if (xi && ids.size === 1 && isPosInt(xi.reservationId) && xi.reservationId !== [...ids][0]) conflicts.push("CANCEL_TARGET_DIFFERS");

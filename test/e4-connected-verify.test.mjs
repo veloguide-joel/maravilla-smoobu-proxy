@@ -404,7 +404,10 @@ test("recovery: KV stages classify truthfully at every crash point; READ_VERIFIE
   const co = (code) => ({ type: "outcome", step: "KW1_CREATE", kind: "create", ref: REF, code, evidence: { outcome: code === "VERIFIED_CREATED" ? "created" : "conflict", code,
     httpStatus: 200, ...(code === "RESERVATION_MISMATCH" ? { mismatches: ["bookingRef"] } : {}), reservationId: 5 } });
   const mk = { type: "read", step: "KV1_READ_VERIFY", kind: "read", code: "CREATE_REF_NOT_ECHOED:ABSENT_UNDEFINED", reservationId: 5 };
-  const rd = (code = "VERIFY_READ_IDENTITY_OK", id = 5) => ({ type: "read", step: "KV1_READ_VERIFY", kind: "read", code, reservationId: id, httpStatus: 200 });
+  const rd = (code = "VERIFY_READ_IDENTITY_OK", id = 5, extra = {}) => ({ type: "read", step: "KV1_READ_VERIFY", kind: "read", code, reservationId: id, httpStatus: 200,
+    ...(code === "VERIFY_READ_IDENTITY_MISMATCH" ? { mismatches: ["status"] } : {}), ...extra });
+  const hl = (step, code) => ({ type: "halt", step, code });
+  const rc = { type: "reconcile", step: "KR_RECONCILE", ref: REF, code: "FOUND_BY_REF", reservationId: 5 };
   const lk = (code = "VERIFY_LOOKUP_SAME_ID_IDENTITY_OK", id = 5) => ({ type: "read", step: "KV2_LOOKUP_VERIFY", kind: "lookup", code, ref: REF, ...(id ? { reservationId: id } : {}) });
   const xi = { type: "intent", step: "KW2_CANCEL", kind: "cancel", reservationId: 5, ref: REF };
   const xo = { type: "outcome", step: "KW2_CANCEL", kind: "cancel", reservationId: 5, code: "VERIFIED_CANCELLED" };
@@ -421,8 +424,19 @@ test("recovery: KV stages classify truthfully at every crash point; READ_VERIFIE
       cv("READ_FALLBACK", "NOT_VERIFIED", MK, "VERIFY_READ_IDENTITY_OK", "VERIFY_LOOKUP_NOT_CONFIRMED:NOT_FOUND_NON_AUTHORITATIVE")],
     [[start, ci, co("RESERVATION_MISMATCH"), mk, rd(), lk(), xi], "CANCEL_OUTCOME_MISSING", cv("READ_FALLBACK", "READ_VERIFIED", MK, "VERIFY_READ_IDENTITY_OK", "VERIFY_LOOKUP_SAME_ID_IDENTITY_OK")],
     [[start, ci, co("RESERVATION_MISMATCH"), mk, rd(), lk(), xi, xo], "CANCEL_VERIFIED", cv("READ_FALLBACK", "READ_VERIFIED", MK, "VERIFY_READ_IDENTITY_OK", "VERIFY_LOOKUP_SAME_ID_IDENTITY_OK")],
-    [[start, ci, co("VERIFIED_CREATED"), xi, xo], "CANCEL_VERIFIED", cv("REPLY", "REPLY_VERIFIED", null, null, null)]
-  ];
+    [[start, ci, co("VERIFIED_CREATED"), xi, xo], "CANCEL_VERIFIED", cv("REPLY", "REPLY_VERIFIED", null, null, null)],
+    // a valid non-200 2xx create reply (classifyCreateResponse accepts 200..299) and a 2xx read stay compatible
+    [[start, ci, { ...co("RESERVATION_MISMATCH"), evidence: { ...co("RESERVATION_MISMATCH").evidence, httpStatus: 201 } }, mk, rd("VERIFY_READ_IDENTITY_OK", 5, { httpStatus: 203 }), lk()],
+      "CREATED_NO_CANCEL_ATTEMPT", cv("READ_FALLBACK", "READ_VERIFIED", MK, "VERIFY_READ_IDENTITY_OK", "VERIFY_LOOKUP_SAME_ID_IDENTITY_OK")],
+    // crash/halt prefixes exactly as the producer writes them (halt + read-only reconcile + run-end after the last KV entry)
+    [[start, ci, co("RESERVATION_MISMATCH"), hl("KV1_READ_VERIFY", "JOURNAL_WRITE_FAILED"), rc], "CREATED_NO_CANCEL_ATTEMPT", cv("NONE", "NOT_VERIFIED", null, null, null)],
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, rd("VERIFY_READ_IDENTITY_MISMATCH"), hl("KV1_READ_VERIFY", "VERIFY_READ_IDENTITY_MISMATCH"), rc, { type: "run-end", code: "HALTED" }],
+      "CREATED_NO_CANCEL_ATTEMPT", cv("READ_FALLBACK", "NOT_VERIFIED", MK, "VERIFY_READ_IDENTITY_MISMATCH", null)],
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, rd("VERIFY_READ_TRANSPORT_UNCERTAIN", 5, { httpStatus: undefined, transport: "TIMEOUT" }), hl("KV1_READ_VERIFY", "VERIFY_READ_TRANSPORT_UNCERTAIN"), rc],
+      "CREATED_NO_CANCEL_ATTEMPT", cv("READ_FALLBACK", "NOT_VERIFIED", MK, "VERIFY_READ_TRANSPORT_UNCERTAIN", null)],
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, rd(), lk("VERIFY_LOOKUP_NOT_CONFIRMED:DUPLICATE_REF", null), hl("KV2_LOOKUP_VERIFY", "VERIFY_LOOKUP_NOT_CONFIRMED:DUPLICATE_REF"), rc],
+      "CREATED_NO_CANCEL_ATTEMPT", cv("READ_FALLBACK", "NOT_VERIFIED", MK, "VERIFY_READ_IDENTITY_OK", "VERIFY_LOOKUP_NOT_CONFIRMED:DUPLICATE_REF")]
+  ].map(([es, st, w]) => [es.map((e) => JSON.parse(JSON.stringify(e))), st, w]);
   for (const [es, state, want] of stages) {
     const c = K(es);
     assert.equal(c.ok, true, JSON.stringify(c)); assert.equal(c.clean, true, `${state} ${c.conflicts}`);
@@ -433,18 +447,69 @@ test("recovery: KV stages classify truthfully at every crash point; READ_VERIFIE
     [[start, ci, co("RESERVATION_MISMATCH"), xi], "CANCEL_WITHOUT_VERIFIED_CREATE"],
     [[start, ci, co("RESERVATION_MISMATCH"), mk, rd(), lk("VERIFY_LOOKUP_ID_DIFFERS", 6)], "RESERVATION_IDS_INCONSISTENT"],
     [[start, ci, co("VERIFIED_CREATED"), mk, rd(), lk()], "CREATE_VERIFICATION_WITHOUT_UNECHOED_REF"],
-    [[start, ci, co("RESERVATION_MISMATCH"), rd(), lk()], "CREATE_VERIFICATION_WITHOUT_UNECHOED_REF"],
+    [[start, ci, co("RESERVATION_MISMATCH"), rd(), lk()], "CREATE_VERIFICATION_OUT_OF_ORDER"],                          // no marker: the read sits in the marker slot
     [[start, ci, mk, co("RESERVATION_MISMATCH")], "CREATE_VERIFICATION_BEFORE_CREATE_OUTCOME"],
     [[start, ci, co("RESERVATION_MISMATCH"), mk, rd(), lk(), xi, lk()], "CREATE_VERIFICATION_AFTER_CANCEL"],
     [[start, ci, co("RESERVATION_MISMATCH"), mk, mk, rd(), lk()], "CREATE_VERIFICATION_DUPLICATED"],
     [[start, ci, co("RESERVATION_MISMATCH"), mk, rd("VERIFY_READ_SOMETHING_NEW"), lk()], "CREATE_VERIFICATION_CODE_UNKNOWN"],
     [[start, ci, co("RESERVATION_MISMATCH"), { ...mk, code: "CREATE_REF_NOT_ECHOED:MALFORMED" }, rd(), lk()], "CREATE_VERIFICATION_CODE_UNKNOWN"],
-    [[start, ci, co("RESERVATION_MISMATCH"), mk, rd(), lk("VERIFY_LOOKUP_SAME_ID_IDENTITY_OK", 71045356)], "PROTECTED_ID_IN_JOURNAL"]
-  ];
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, rd(), lk("VERIFY_LOOKUP_SAME_ID_IDENTITY_OK", 71045356)], "PROTECTED_ID_IN_JOURNAL"],
+    // ---- root HOLD f6d00ab regressions (sanitizer-valid entries that must never be READ_VERIFIED)
+    [[start, ci, co("RESERVATION_MISMATCH"), lk(), rd(), mk], "CREATE_VERIFICATION_OUT_OF_ORDER"],                       // (1) reordered after the outcome
+    [[start, ci, { ...co("RESERVATION_MISMATCH"), evidence: { ...co("RESERVATION_MISMATCH").evidence, mismatches: ["totalMinor"] } }, mk, rd(), lk()],
+      "CREATE_VERIFICATION_WITHOUT_UNECHOED_REF"],                                                                       // (2) original mismatch not exactly bookingRef
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, rd(), { ...lk(), ref: "MV-ZZZZZZ99" }], "CREATE_VERIFICATION_REF_NOT_BOUND"],  // (3) lookup ref is not the run ref
+    // original outcome evidence must be exactly the producer's
+    [[start, ci, { ...co("RESERVATION_MISMATCH"), evidence: { ...co("RESERVATION_MISMATCH").evidence, mismatches: ["bookingRef", "totalMinor"] } }, mk, rd(), lk()], "CREATE_VERIFICATION_WITHOUT_UNECHOED_REF"],
+    [[start, ci, { ...co("RESERVATION_MISMATCH"), evidence: { ...co("RESERVATION_MISMATCH").evidence, httpStatus: 300 } }, mk, rd(), lk()], "CREATE_VERIFICATION_WITHOUT_UNECHOED_REF"],
+    [[start, ci, { ...co("RESERVATION_MISMATCH"), evidence: { ...co("RESERVATION_MISMATCH").evidence, httpStatus: 199 } }, mk, rd(), lk()], "CREATE_VERIFICATION_WITHOUT_UNECHOED_REF"],
+    [[start, ci, { ...co("RESERVATION_MISMATCH"), evidence: { ...co("RESERVATION_MISMATCH").evidence, httpStatus: undefined } }, mk, rd(), lk()], "CREATE_VERIFICATION_WITHOUT_UNECHOED_REF"],
+    [[start, ci, { ...co("RESERVATION_MISMATCH"), evidence: { ...co("RESERVATION_MISMATCH").evidence, outcome: "ambiguous" } }, mk, rd(), lk()], "CREATE_VERIFICATION_WITHOUT_UNECHOED_REF"],
+    [[start, ci, { ...co("RESERVATION_MISMATCH"), evidence: { ...co("RESERVATION_MISMATCH").evidence, code: "UNEXPECTED_RESERVATION_STATUS" } }, mk, rd(), lk()], "CREATE_VERIFICATION_WITHOUT_UNECHOED_REF"],
+    [[start, ci, { ...co("RESERVATION_MISMATCH"), transport: "TIMEOUT" }, mk, rd(), lk()], "CREATE_VERIFICATION_WITHOUT_UNECHOED_REF"],
+    [[start, ci, { ...co("RESERVATION_MISMATCH"), evidence: { outcome: "conflict", code: "RESERVATION_MISMATCH", httpStatus: 200, mismatches: ["bookingRef"] } }, mk, rd(), lk()],
+      "CREATE_VERIFICATION_WITHOUT_UNECHOED_REF"],                                                                       // outcome without an id
+    [[start, ci, co("RESERVATION_MISMATCH"), { ...mk, reservationId: undefined }, rd(), lk()].map((e) => JSON.parse(JSON.stringify(e))), "CREATE_VERIFICATION_ID_NOT_BOUND"],   // missing marker id
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, rd("VERIFY_READ_IDENTITY_OK", 6), lk()], "CREATE_VERIFICATION_ID_NOT_BOUND"],       // read of another id
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, rd(), lk("VERIFY_LOOKUP_SAME_ID_IDENTITY_OK", null)], "CREATE_VERIFICATION_CONTRADICTORY"],   // success without an id
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, rd(), { ...lk(), ref: undefined }].map((e) => JSON.parse(JSON.stringify(e))), "CREATE_VERIFICATION_REF_NOT_BOUND"],
+    // order and kind
+    [[start, ci, co("RESERVATION_MISMATCH"), rd(), mk, lk()], "CREATE_VERIFICATION_OUT_OF_ORDER"],                      // read before marker
+    [[start, ci, co("RESERVATION_MISMATCH"), lk(), mk, rd()], "CREATE_VERIFICATION_OUT_OF_ORDER"],                      // lookup before marker
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, lk(), rd()], "CREATE_VERIFICATION_OUT_OF_ORDER"],                      // lookup before read
+    [[start, ci, co("RESERVATION_MISMATCH"), rc, mk, rd(), lk()], "CREATE_VERIFICATION_OUT_OF_ORDER"],                  // not contiguous
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, { ...rd(), kind: "lookup" }, lk()], "CREATE_VERIFICATION_OUT_OF_ORDER"],   // wrong kind
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, rd(), { ...lk(), kind: "read" }], "CREATE_VERIFICATION_OUT_OF_ORDER"],
+    [[start, ci, co("RESERVATION_MISMATCH"), { ...mk, code: "VERIFY_READ_IDENTITY_OK" }, rd(), lk()], "CREATE_VERIFICATION_OUT_OF_ORDER"],   // a read code in the marker slot
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, mk, lk()], "CREATE_VERIFICATION_OUT_OF_ORDER"],                        // marker in the read slot
+    // entries after a halt, or after later steps
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, hl("KV1_READ_VERIFY", "X"), rd(), lk()], "CREATE_VERIFICATION_AFTER_HALT"],
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, rd(), hl("KV1_READ_VERIFY", "X"), lk()], "CREATE_VERIFICATION_AFTER_HALT"],
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, rd(), { type: "side-effect-check", step: "K3_SIDE_EFFECTS_CREATE", code: "SIDE_EFFECTS_OK" }], "LATER_STEP_WITHOUT_VERIFIED_CREATE"],
+    [[start, ci, co("RESERVATION_MISMATCH"), { type: "read", step: "K4_READBACK", kind: "read", code: "IDENTITY_OK", reservationId: 5 }], "LATER_STEP_WITHOUT_VERIFIED_CREATE"],
+    // success codes contradicted by their own metadata
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, rd("VERIFY_READ_IDENTITY_OK", 5, { mismatches: ["status"] }), lk()], "CREATE_VERIFICATION_CONTRADICTORY"],
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, rd("VERIFY_READ_IDENTITY_OK", 5, { httpStatus: 500 }), lk()], "CREATE_VERIFICATION_CONTRADICTORY"],
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, rd("VERIFY_READ_IDENTITY_OK", 5, { transport: "TIMEOUT" }), lk()], "CREATE_VERIFICATION_CONTRADICTORY"],
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, rd("VERIFY_READ_IDENTITY_OK", 5, { httpStatus: undefined }), lk()].map((e) => JSON.parse(JSON.stringify(e))), "CREATE_VERIFICATION_CONTRADICTORY"],
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, rd(), { ...lk(), mismatches: ["status"] }], "CREATE_VERIFICATION_CONTRADICTORY"],
+    [[start, ci, co("RESERVATION_MISMATCH"), { ...mk, mismatches: ["status"] }, rd(), lk()], "CREATE_VERIFICATION_CONTRADICTORY"],
+    [[start, ci, co("RESERVATION_MISMATCH"), { ...mk, httpStatus: 200 }, rd(), lk()], "CREATE_VERIFICATION_CONTRADICTORY"],
+    [[start, ci, co("RESERVATION_MISMATCH"), { ...mk, ref: REF }, rd(), lk()], "CREATE_VERIFICATION_CONTRADICTORY"],
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, rd("VERIFY_READ_UPSTREAM_5XX"), lk()], "CREATE_VERIFICATION_CONTRADICTORY"],   // lookup after a failed read
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, rd("VERIFY_READ_IDENTITY_MISMATCH", 5, { mismatches: undefined })].map((e) => JSON.parse(JSON.stringify(e))), "CREATE_VERIFICATION_CONTRADICTORY"],
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, rd(), lk(), xi, xo, lk()], "CREATE_VERIFICATION_DUPLICATED"],
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, rd("VERIFY_READ_IDENTITY_OK", 5, { httpStatus: 300 }), lk()], "CREATE_VERIFICATION_CONTRADICTORY"],
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, rd("VERIFY_READ_IDENTITY_MISMATCH", 5, { ref: REF })], "CREATE_VERIFICATION_CONTRADICTORY"],   // a ref on the read entry
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, rd(), lk("VERIFY_LOOKUP_ID_DIFFERS", 6)], "CREATE_VERIFICATION_ID_NOT_BOUND"],
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, rd(), lk("VERIFY_LOOKUP_IDENTITY_MISMATCH")], "CREATE_VERIFICATION_CONTRADICTORY"]
+  ].map(([es, w]) => [es.map((e) => JSON.parse(JSON.stringify(e))), w]);
   for (const [es, want] of conflicts) {
     const c = K(es);
     assert.equal(c.ok, true); assert.equal(c.clean, false, want); assert.ok(c.conflicts.includes(want), `${want} in ${c.conflicts}`);
-    assert.notEqual(c.createVerification.result, "READ_VERIFIED", want);
+    assert.equal(c.createVerification.result, "NOT_VERIFIED", want);                    // never READ_ or REPLY_VERIFIED under a conflict
+    const canon = (x) => (Array.isArray(x) ? `[${x.map(canon).join(",")}]` : x && typeof x === "object" ? `{${Object.keys(x).sort().map((k) => `${k}:${canon(x[k])}`).join(",")}}` : JSON.stringify(x));
+    for (const e of es) assert.equal(canon(R.sanitizeJournalEntry(e, { steps: CONNECTED_STEPS })), canon(e), `fixture not sanitizer-valid: ${want} ${JSON.stringify(e)}`);
   }
   // unknown codes are reported as OTHER, never echoed
   assert.equal(K([start, ci, co("RESERVATION_MISMATCH"), mk, rd("VERIFY_READ_SOMETHING_NEW")]).createVerification.readVerify, "OTHER");
@@ -522,4 +587,32 @@ test("launcher summary: createVerification is an explicit allowlist; unknown val
   const bad = S0({ path: "PROVIDER-TEXT", result: "PASSED", refEcho: "MV-ABCDEF12", refusal: { x: 1 }, readVerify: "VERIFY_READ_PROVIDER", lookupVerify: 5 });
   assert.deepEqual(bad, { path: "OTHER", result: "OTHER", refEcho: "OTHER", refusal: "OTHER", readVerify: "OTHER", lookupVerify: "OTHER" });
   assert.equal(globalFetchCalls, 0);
+});
+
+test("end-to-end HTTP 201 create reply with an absent ref: READ_VERIFIED by the producer, and recovery classifies the real journal READ_VERIFIED / CANCEL_VERIFIED, clean", async () => {
+  const v = validateConnectedManifest(manifest(), { now: NOW });
+  const w = world({ createRaw: (wd) => { const x = clone(wd.res); delete x.customFieldValues; return { httpStatus: 201, json: { status: "success", result: x } }; } });
+  const { r, j } = await run(w);
+  createdOk(r);
+  assert.equal(r.createVerification.result, "READ_VERIFIED"); assert.equal(r.createVerification.refEcho, "ABSENT_UNDEFINED");
+  const co = j.entries.find((e) => e.type === "outcome" && e.kind === "create");
+  assert.equal(co.evidence.httpStatus, 201); assert.deepEqual(co.evidence.mismatches, ["bookingRef"]);
+  const c = RC.classifyConnectedJournal(j.entries, v.hash);
+  assert.equal(c.ok, true); assert.equal(c.clean, true, String(c.conflicts)); assert.equal(c.state, "CANCEL_VERIFIED");
+  assert.equal(c.createVerification.result, "READ_VERIFIED"); assert.equal(c.createOutcome.replyHttpStatus, 201);
+  journalSafe(j);
+});
+
+test("end-to-end HTTP 201 on the KV1 read (parseReservationResponse accepts 200..299): READ_VERIFIED; recovery clean; a 3xx read still fails", async () => {
+  const v = validateConnectedManifest(manifest(), { now: NOW });
+  const w = world({ reply: noRef, read: (wd, n) => (n === 1 ? { httpStatus: 201, json: { status: "success", result: clone(wd.res) } } : undefined) });
+  const { r, j } = await run(w);
+  createdOk(r);
+  assert.equal(r.createVerification.readVerify, "VERIFY_READ_IDENTITY_OK");
+  assert.equal(j.entries.find((e) => e.step === "KV1_READ_VERIFY" && e.code === "VERIFY_READ_IDENTITY_OK").httpStatus, 201);
+  const c = RC.classifyConnectedJournal(j.entries, v.hash);
+  assert.equal(c.clean, true, String(c.conflicts)); assert.equal(c.createVerification.result, "READ_VERIFIED"); assert.equal(c.state, "CANCEL_VERIFIED");
+  const w2 = world({ reply: noRef, read: (wd, n) => (n === 1 ? { httpStatus: 302, json: { status: "success", result: clone(wd.res) } } : undefined) });
+  const { r: r2 } = await run(w2);
+  assert.deepEqual([r2.halt.step, r2.halt.code], ["KV1_READ_VERIFY", "VERIFY_READ_UNEXPECTED_HTTP_STATUS"]); assert.deepEqual(r2.writes, { create: 1, cancel: 0 });
 });
