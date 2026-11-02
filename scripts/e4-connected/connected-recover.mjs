@@ -22,7 +22,7 @@ import { verifyProvenance, makeGit } from "../e4-launcher/happy-execute.mjs";
 import { createHostawayTransport, HOSTAWAY_BASE } from "../e4-transport/hostaway-transport.mjs";
 import { readJournalFile, journalFileName } from "../e4-write-runner/journal.mjs";
 import { READ_QUERY, RunnerError, createGate, parseReservationResponse, identityMismatches, sanitizeJournalEntry } from "../e4-write-runner/runner.mjs";
-import { connectedTestAdapterConfig, lookupByRef, LOOKUP_MAX_PAGES, DIRECT_CHANNEL_ID, REF_RE } from "../../lib/hostaway-reservations.js";
+import { connectedTestAdapterConfig, lookupByRef, LOOKUP_MAX_PAGES, DIRECT_CHANNEL_ID, REF_RE, MISMATCH_FIELDS } from "../../lib/hostaway-reservations.js";
 import { nightsState } from "./safeguards.mjs";
 import { validateConnectedManifest, stayNights, CONNECTED_STEPS, CONNECTED_PROTECTED_RESERVATION_IDS, CONNECTED_WRITE_BUDGET } from "./connected-path.mjs";
 import { connectedRunLocation, CONNECTED_EXECUTE_SOURCES } from "./connected-execute.mjs";
@@ -50,6 +50,34 @@ function canonical(v) {
   return JSON.stringify(v);
 }
 const freeze = (o) => { if (o && typeof o === "object" && !Object.isFrozen(o)) { Object.freeze(o); for (const v of Object.values(o)) freeze(v); } return o; };
+
+// The create outcome's sanitized evidence (already revalidated at the disk boundary): only the mismatching identity field
+// NAMES the create reply was classified with, and the integer HTTP status. Never values.
+function createEvidence(co) {
+  const ev = isObj(co.evidence) ? co.evidence : null;
+  if (!ev) return {};
+  const names = Array.isArray(ev.mismatches) ? ev.mismatches.filter((f) => MISMATCH_FIELDS.includes(f)) : [];
+  return { ...(names.length ? { replyMismatchFields: names } : {}), ...(Number.isSafeInteger(ev.httpStatus) && ev.httpStatus >= 100 && ev.httpStatus <= 599 ? { replyHttpStatus: ev.httpStatus } : {}) };
+}
+
+// Categorical per-night calendar shape (documented calendar-day fields only; enums or bounded small integers; never price,
+// note, reservations or any raw string): for reading API/UI discrepancies without dumping the provider body.
+const DAY_STATUSES = Object.freeze(["available", "blocked", "mblocked", "hardBlock", "conflicted", "reserved", "pending", "mreserved"]);
+const COUNT_KEYS = Object.freeze(["countAvailableUnits", "availableUnitsToSell", "countPendingUnits", "countBlockedUnits", "countReservedUnits"]);
+export function calendarNightShapes(resp, nights) {
+  const ok = isObj(resp) && !resp.transportError && resp.httpStatus === 200 && isObj(resp.json) && resp.json.status === "success" && Array.isArray(resp.json.result);
+  if (!ok) return null;
+  const bit = (v) => (v === 1 || v === true ? "TRUE" : v === 0 || v === false ? "FALSE" : v === null || v === undefined ? "ABSENT" : "OTHER");
+  return nights.map((date) => {
+    const d = resp.json.result.filter((x) => isObj(x) && x.date === date);
+    if (d.length !== 1) return { date, code: d.length ? "NIGHT_DUPLICATED" : "NIGHT_MISSING" };
+    const x = d[0];
+    const counts = {};
+    for (const k of COUNT_KEYS) counts[k] = Number.isSafeInteger(x[k]) && x[k] >= 0 && x[k] <= 99 ? x[k] : x[k] === null || x[k] === undefined ? "ABSENT" : "OTHER";
+    return { date, status: DAY_STATUSES.includes(x.status) ? x.status : x.status === undefined ? "ABSENT" : "OTHER", isAvailable: bit(x.isAvailable), isProcessed: bit(x.isProcessed),
+      ...counts, reservationsListed: Array.isArray(x.reservations) ? Math.min(x.reservations.length, 99) : "ABSENT" };
+  });
+}
 
 /**
  * Pure classification of the bound run's journal. -> { ok:false, code } for a journal that is not exactly this run's, else
@@ -115,7 +143,7 @@ export function classifyConnectedJournal(entries, manifestHash) {
   return freeze({
     ok: true, state, ref, reservationId, idsConsistent: ids.size <= 1, protectedIdSeen: protectedSeen, conflicts, clean: conflicts.length === 0,
     createAttempts: intents.create.length, cancelAttempts: intents.cancel.length,
-    createOutcome: co ? { code: co.code ?? null, ...(co.transport ? { transport: co.transport } : {}) } : null,
+    createOutcome: co ? { code: co.code ?? null, ...(co.transport ? { transport: co.transport } : {}), ...createEvidence(co) } : null,
     cancelOutcome: xo ? { code: xo.code ?? null, ...(xo.httpStatus ? { httpStatus: xo.httpStatus } : {}), ...(xo.mismatches ? { mismatches: xo.mismatches } : {}),
       ...(xo.transport ? { transport: xo.transport } : {}) } : null,
     halt, runEnd, unusedRunBudget: { create: CONNECTED_WRITE_BUDGET.create - intents.create.length, cancel: CONNECTED_WRITE_BUDGET.cancel - intents.cancel.length },
@@ -208,7 +236,7 @@ export async function reconcileConnectedRun({ transport, manifest, classificatio
       ...(isPosInt(rid) && isProtected(rid) ? { protectedIdReturned: true } : {}), ...(mm.length ? { mismatches: mm } : {}), pagesRead: lk.pagesRead ?? null };
   } catch { out.lookup = { code: "LOOKUP_INTERNAL_ERROR" }; }
   const cal = await send("RC_CALENDAR", { method: "GET", path: `/listings/${L}/calendar`, query: state.calendar });
-  out.calendar = { code: `CALENDAR_${nightsState(cal, nights).toUpperCase()}` };
+  out.calendar = { code: `CALENDAR_${nightsState(cal, nights).toUpperCase()}`, nights: calendarNightShapes(cal, nights) };
   // verdict
   const r = out.read; const lk = out.lookup;
   const idOk = r && r.code === "READ_IDENTITY_OK";

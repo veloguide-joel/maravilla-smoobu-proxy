@@ -65,14 +65,15 @@ function world(over = {}) {
       w.res = { id: w.nextId, hostawayReservationId: String(w.nextId), listingMapId: body.listingMapId, channelId: body.channelId, reservationId: "98765-603566-2000-1",
         arrivalDate: body.arrivalDate, departureDate: body.departureDate, totalPrice: body.totalPrice, currency: body.currency, status: "new",
         guestName: body.guestName, guestEmail: body.guestEmail, hostNote: "PROVIDER-TEXT", customFieldValues: body.customFieldValues };
-      w.calendar = "reserved";
+      w.calendar = over.calendarAfterCreate ?? "reserved";
+      if (over.createReply) return over.createReply(w);
       return ok(w.res);
     }
     if (method === "GET" && w.res && path === `/reservations/${w.res.id}`) return ok(w.res);
     if (method === "GET" && path === "/guestPayments/charges") return ok([], { count: 0 });
     if (method === "GET" && path === "/conversations") return ok(Number(q.offset) === 0 ? [{ id: 7701, reservationId: w.res.id, lastMessage: "MESSAGE-BODY" }] : []);
     if (method === "GET" && path === "/tasks") return ok([]);
-    if (method === "GET" && path === `/listings/${L}/calendar`) return ok(NIGHTS.map((date) => ({ date, status: w.calendar, isAvailable: w.calendar === "available" ? 1 : 0 })));
+    if (method === "GET" && path === `/listings/${L}/calendar`) return over.calendarDays ? ok(over.calendarDays(w)) : ok(NIGHTS.map((date) => ({ date, status: w.calendar, isAvailable: w.calendar === "available" ? 1 : 0 })));
     if (method === "PUT" && w.res && path === `/reservations/${w.res.id}/statuses/cancelled`) {
       if (over.cancelReply) return over.cancelReply(w);
       w.res.status = "cancelled"; w.calendar = "available";
@@ -591,5 +592,78 @@ test("recovery truthfulness: a clean read by id never masks a contradicting ref 
     assert.equal(rr.exitCode, 3);
     assert.ok(log.every((x) => x.startsWith("GET ") || x === "POST /accessTokens") && !log.includes("GET /reservations/70636076"));
     leakFree(rr.output);
+  }
+});
+
+
+// ---------- 2026-11-01 live result: create reply vs later read; calendar API/UI discrepancy (reporting only) ----------
+const A = await import("../lib/hostaway-reservations.js");
+const reconcileWith = async (sb, w) => RC.runConnectedRecoverCli(["--reconcile", "--manifest", sb.mpath, "--reviewed-commit", SHA, "--location", loc(sb.base).token],
+  { root: sb.root, base: sb.base, git: RGIT, fetchImpl: w.fetch, sleep: async () => {}, prompt: async () => ({ accountId: "201434", clientSecret: "FAKE-SECRET" }) });
+
+test("create reply WITHOUT the ref custom field but later read WITH it: strict halt unchanged (1 create, 0 cancel); recovery now shows the reply's mismatching field NAMES", async () => {
+  const sb = sandbox();
+  const w = world({ createReply: (wd) => { const { customFieldValues, ...noRef } = wd.res; return { status: 200, json: { status: "success", result: noRef } }; } });
+  const { d, calls } = deps(sb, w);
+  const r = await X.runConnectedExecuteCli(execArgs(sb), d);
+  assert.equal(r.exitCode, 3); assert.equal(r.output.status, "HALTED");
+  assert.equal(r.output.halt.step, "KW1_CREATE"); assert.equal(r.output.halt.code, "CREATE_NOT_VERIFIED:RESERVATION_MISMATCH");
+  assert.deepEqual(r.output.writes, { create: 1, cancel: 0 }); assert.deepEqual(writes(w), ["POST /reservations"]);
+  assert.deepEqual(calls.stages, ["before-create"]);                                   // no after-create checkpoint is reached
+  assert.equal(r.output.reconcile[0].reservationId, w.res.id); assert.equal(r.output.reconcile[0].reservationStatus, "new");
+  // the guard itself is NOT weakened: a reply without the ref is still a conflict
+  const plan = { ref: "MV-ABCDEF12", listingId: L, arrivalDate: STAY.arrivalDate, departureDate: STAY.departureDate, guests: 2, guest: GUEST, totalMinor: TOTAL, currency: "MXN" };
+  const noRef = { httpStatus: 200, json: { status: "success", result: { id: 5, listingMapId: L, channelId: 2000, arrivalDate: STAY.arrivalDate, departureDate: STAY.departureDate,
+    totalPrice: 3200, currency: "MXN", status: "new" } } };
+  const cls = A.classifyCreateResponse(noRef, plan, A.connectedTestAdapterConfig());
+  assert.equal(cls.code, "RESERVATION_MISMATCH"); assert.deepEqual(cls.mismatches, ["bookingRef"]);
+  // recovery: field names only, from the journal's sanitized create evidence
+  const l = loc(sb.base);
+  const ri = await inspect(sb, l);
+  assert.equal(ri.exitCode, 3);
+  assert.equal(ri.output.classification.state, "CREATED_NO_CANCEL_ATTEMPT");
+  assert.deepEqual(ri.output.classification.createOutcome, { code: "RESERVATION_MISMATCH", replyMismatchFields: ["bookingRef"], replyHttpStatus: 200 });
+  const rr = await reconcileWith(sb, w);
+  assert.equal(rr.output.reconcile.read.code, "READ_IDENTITY_OK"); assert.equal(rr.output.reconcile.verdict, "RESERVATION_ACTIVE_OWNER_DECISION_REQUIRED");
+  assert.ok(w.log.filter((x) => x === "POST /reservations" || x.startsWith("PUT ")).length === 1);
+  leakFree(r.output); leakFree(ri.output); leakFree(rr.output);
+});
+
+test("create reply with a different total: field name totalMinor only; never the value", async () => {
+  const sb = sandbox();
+  const w = world({ createReply: (wd) => ({ status: 200, json: { status: "success", result: { ...wd.res, totalPrice: 3200.5 } } }) });
+  const { d } = deps(sb, w);
+  const r = await X.runConnectedExecuteCli(execArgs(sb), d);
+  assert.equal(r.output.halt.code, "CREATE_NOT_VERIFIED:RESERVATION_MISMATCH");
+  const ri = await inspect(sb, loc(sb.base));
+  assert.deepEqual(ri.output.classification.createOutcome.replyMismatchFields, ["totalMinor"]);
+  assert.ok(!JSON.stringify(ri.output).includes("3200.5") && !JSON.stringify(ri.output).includes("320050"));
+});
+
+test("calendar API/UI discrepancy: an active reservation while the API calendar says available/1 is CALENDAR_OPEN with categorical night shapes; contradictions stay UNKNOWN; no price/note/raw text", async () => {
+  const day = (date, o) => ({ id: 1, date, price: 1600, note: "PROVIDER-TEXT", minimumStay: 1, reservations: [], ...o });
+  const cases = [
+    [() => NIGHTS.map((dt) => day(dt, { status: "available", isAvailable: 1, isProcessed: 1, countAvailableUnits: 1, availableUnitsToSell: 1, countPendingUnits: 0, countBlockedUnits: 0 })),
+      "CALENDAR_OPEN", { status: "available", isAvailable: "TRUE", isProcessed: "TRUE", countAvailableUnits: 1, countReservedUnits: "ABSENT" }],
+    [() => NIGHTS.map((dt) => day(dt, { status: "reserved", isAvailable: 1, isProcessed: 0 })), "CALENDAR_UNKNOWN", { status: "reserved", isAvailable: "TRUE", isProcessed: "FALSE" }],
+    [() => NIGHTS.map((dt) => day(dt, { status: "reserved", isAvailable: 0, isProcessed: 1 })), "CALENDAR_BLOCKED", { status: "reserved", isAvailable: "FALSE" }],
+    [() => NIGHTS.map((dt) => day(dt, { status: "weird-PROVIDER-TEXT", isAvailable: "1", countAvailableUnits: 150, countBlockedUnits: -1, countPendingUnits: "2" })), "CALENDAR_UNKNOWN",
+      { status: "OTHER", isAvailable: "OTHER", isProcessed: "ABSENT", countAvailableUnits: "OTHER", countBlockedUnits: "OTHER", countPendingUnits: "OTHER" }]
+  ];
+  for (const [days, code, expect] of cases) {
+    const sb = sandbox();
+    const w = world({ createReply: (wd) => { const { customFieldValues, ...noRef } = wd.res; return { status: 200, json: { status: "success", result: noRef } }; } });
+    const { d } = deps(sb, w);
+    await X.runConnectedExecuteCli(execArgs(sb), d);                      // creates, halts (reply lacks the ref)
+    const w2 = { ...w, fetch: world({ calendarDays: days }).fetch };
+    // reuse the same reservation in a second fake world for the recovery reads
+    const wr = world({ calendarDays: days }); wr.res = w.res;
+    const rr = await reconcileWith(sb, wr);
+    assert.equal(rr.output.reconcile.calendar.code, code, code);
+    assert.equal(rr.output.reconcile.calendar.nights.length, 2);
+    for (const n of rr.output.reconcile.calendar.nights) for (const [k, v] of Object.entries(expect)) assert.equal(n[k], v, `${code} ${k}`);
+    const s = JSON.stringify(rr.output.reconcile.calendar);
+    assert.ok(!s.includes("1600") && !s.includes("PROVIDER-TEXT") && !s.includes("price") && !s.includes("note"));
+    void w2;
   }
 });
