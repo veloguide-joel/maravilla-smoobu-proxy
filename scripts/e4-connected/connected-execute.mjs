@@ -28,7 +28,8 @@
 //   8. the reviewed connected sequence (executeConnectedRun: budgets create 1 / cancel 1, fresh price/lookup/calendar
 //      checks and the Airbnb-open attestation before the write, halt on any identity/journal/side-effect/transport
 //      doubt, no retries, read-only reconciliation) behind the reviewed single-mint transport and a URL-level allowlist;
-//   9. journal closed in `finally`; a SANITIZED summary (codes, ids of this run, our ref, dates, minor units, mismatching
+//   9. the journal is closed BEFORE the final result (a failed close => journalDurable false, not passed, exit 3; the
+//      facts already reported are kept, nothing is retried); then a SANITIZED summary (codes, ids of this run, our ref, dates, minor units, mismatching
 //      identity field NAMES, counts). Never provider bodies, guest data, the channel reservation id, tokens or error text.
 // Residual (operator procedure, stated): deleting the run directory, or copying the checkout to another base, defeats the
 // replay guard; the location token in the approval then no longer matches a different base. Dry-run is zero writes.
@@ -112,21 +113,30 @@ export function claimRunLocation(base, manifestHash) {
 }
 
 /**
- * URL-level allowlist under the transport (defence in depth below the gate's own allowlist): only api.hostaway.com, only
- * the connected shapes for 603566, a protected id never, and per-shape caps derived from CONNECTED_STEPS.
+ * URL-level allowlist under the transport (defence in depth BELOW the gate, which keeps the exact run-bound shapes and the
+ * verified cancel target): only api.hostaway.com, only the connected paths for 603566, a protected id never, per-shape caps
+ * derived from CONNECTED_STEPS, and cheap body checks (create: listing/channel/currency/stay dates; price: stay dates;
+ * cancel: the host body). It deliberately does NOT re-implement the full create body or the cancel-target binding.
  */
-export function guardConnectedFetch(fetchImpl, { calendar, arrivalDate }) {
+export function guardConnectedFetch(fetchImpl, { calendar, arrivalDate, departureDate }) {
   const sum = (...steps) => steps.reduce((n, s) => n + CONNECTED_STEPS[s].reads, 0);
   const exact = (q) => (p) => [...p.keys()].length === Object.keys(q).length && Object.entries(q).every(([k, v]) => p.get(k) === String(v));
   const noProtected = (u) => ![...u.pathname.matchAll(/\d+/g), ...[...u.searchParams.values()].flatMap((v) => [...v.matchAll(/\d+/g)])]
     .some((m) => CONNECTED_PROTECTED_RESERVATION_IDS.includes(Number(m[0])));
   const lookupBase = { listingId: L, channelId: DIRECT_CHANNEL_ID, arrivalStartDate: arrivalDate, arrivalEndDate: arrivalDate, limit: 100, includeResources: 1 };
+  // Cheap body binding (the gate keeps the exact bound shapes): listing/channel/currency/dates for the create, the stay dates
+  // for the price; the cancel body must be the host cancel. The cancel TARGET id is bound by the gate (this run's verified id).
+  const json = (b) => { try { const v = JSON.parse(String(b)); return isObj(v) ? v : null; } catch { return null; } };
+  const createOk = (b) => { const v = json(b); return !!v && v.listingMapId === L && v.channelId === DIRECT_CHANNEL_ID && v.currency === "MXN" &&
+    v.arrivalDate === arrivalDate && v.departureDate === departureDate && !Object.keys(v).some((k) => k.toLowerCase() === "forceoverbooking"); };
+  const priceOk = (b) => { const v = json(b); return !!v && v.startingDate === arrivalDate && v.endingDate === departureDate; };
+  const cancelOk = (b) => { const v = json(b); return !!v && JSON.stringify(v) === JSON.stringify(CANCEL_BODY); };
   const side = (p) => [...p.keys()].length === 3 && /^[1-9]\d{0,15}$/.test(p.get("reservationId") ?? "") && /^\d{1,4}$/.test(p.get("offset") ?? "") && /^\d{1,3}$/.test(p.get("limit") ?? "");
   const rules = [
     { name: "token", max: 1, m: "POST", re: /^\/v1\/accessTokens$/, q: exact({}), body: true },
-    { name: "price", max: CONNECTED_STEPS.K0_PRICE.reads, m: "POST", re: new RegExp(`^/v1/listings/${L}/calendar/priceDetails$`), q: exact({}), body: true },
-    { name: "create", max: 1, m: "POST", re: /^\/v1\/reservations$/, q: exact({}), body: true },
-    { name: "cancel", max: 1, m: "PUT", re: /^\/v1\/reservations\/[1-9]\d{0,15}\/statuses\/cancelled$/, q: exact({}), body: true },
+    { name: "price", max: CONNECTED_STEPS.K0_PRICE.reads, m: "POST", re: new RegExp(`^/v1/listings/${L}/calendar/priceDetails$`), q: exact({}), body: true, bodyOk: priceOk },
+    { name: "create", max: 1, m: "POST", re: /^\/v1\/reservations$/, q: exact({}), body: true, bodyOk: createOk },
+    { name: "cancel", max: 1, m: "PUT", re: /^\/v1\/reservations\/[1-9]\d{0,15}\/statuses\/cancelled$/, q: exact({}), body: true, bodyOk: cancelOk },
     { name: "lookup", max: sum("K1_CLEAR", "K5_LOOKUP_REF") + LOOKUP_MAX_PAGES, m: "GET", re: /^\/v1\/reservations$/, q: (p) => {
       const rest = new URLSearchParams([...p.keys()].filter((k) => k !== "afterId").map((k) => [k, p.get(k)]));
       return exact(lookupBase)(rest) && (!p.has("afterId") || /^[1-9]\d{0,15}$/.test(p.get("afterId")));
@@ -142,9 +152,8 @@ export function guardConnectedFetch(fetchImpl, { calendar, arrivalDate }) {
     const method = init && typeof init.method === "string" ? init.method : "GET";
     const rule = u && u.origin === "https://api.hostaway.com" && u.hash === "" && noProtected(u)
       ? rules.find((r) => r.m === method && r.re.test(u.pathname) && r.q(u.searchParams) && (r.body ? init.body !== undefined : init.body === undefined)) : undefined;
-    const cancelBodyOk = () => { try { return JSON.stringify(JSON.parse(String(init.body))) === JSON.stringify(CANCEL_BODY); } catch { return false; } };
     if (!rule || used[rule.name] >= rule.max || (rule.name === "token" && String(url) !== `${HOSTAWAY_BASE}/accessTokens`) ||
-      (rule.name === "cancel" && !cancelBodyOk())) {
+      (rule.bodyOk && !rule.bodyOk(init.body))) {
       refused++; throw Object.assign(new Error("refused by local allowlist"), { name: "LocalRefusal" });
     }
     used[rule.name]++;
@@ -228,6 +237,7 @@ export async function runConnectedExecuteCli(argv, deps = {}) {
     return out(CONNECTED_EXECUTE_EXIT.REFUSED, { ok: false, stage: "location", error: codeOf(e, "RUN_LOCATION_FAILED"), credentialsRequested: true, network: "none" });
   }
   let journal = null;
+  let journalClosed = false;
   try {
     journal = createFileJournal(claimed.runDir, v.hash);
   } catch (e) {
@@ -238,22 +248,33 @@ export async function runConnectedExecuteCli(argv, deps = {}) {
   try {
     const nights = stayNights(v.manifest.stay);
     const guard = guardConnectedFetch(deps.fetchImpl ?? globalThis.fetch, { calendar: { startDate: nights[0], endDate: nights[nights.length - 1] },
-      arrivalDate: v.manifest.stay.arrivalDate });
+      arrivalDate: v.manifest.stay.arrivalDate, departureDate: v.manifest.stay.departureDate });
     const transport = createHostawayTransport({ fetchImpl: guard.guarded, getCredentials, ...(deps.sleep ? { sleep: deps.sleep } : {}) });
     const report = await executeConnectedRun({ mode: "execute", manifest: input, confirm: args.confirm, reviewedCommit: args.reviewedCommit, transport, journal,
       now, airbnbCheckpoint: deps.airbnbCheckpoint, startTimer: deps.startTimer ?? realTimer, clock: deps.clock ?? (() => Date.now()),
       ...(deps.timeoutMs ? { timeoutMs: deps.timeoutMs } : {}), ...(deps.sync ? { sync: deps.sync } : {}) });
     let usage = null;
     try { usage = transport.usage(); } catch { usage = null; }
-    const output = summarizeConnected(report, { ok: report.passed === true, stage: "run", reviewedCommit: args.reviewedCommit, location: { token: loc.token, runDir: loc.runDir },
+    // Close the journal BEFORE any final result: a failed close latches the run as not durable and not passed (the facts
+    // about the writes, cancel and post-checks are kept as reported; nothing is retried).
+    let closeCode = "JOURNAL_CLOSED";
+    try { journal.close(); } catch { closeCode = "JOURNAL_CLOSE_FAILED"; }
+    journalClosed = true;
+    const closeFailed = closeCode !== "JOURNAL_CLOSED";
+    const passed = report.passed === true && !closeFailed;
+    const base0 = summarizeConnected(report);
+    const output = summarizeConnected(report, { ok: passed, passed, journalClose: closeCode,
+      ...(closeFailed ? { journalDurable: false, journalFailures: [...base0.journalFailures, "CLOSE"].slice(0, 17),
+        status: report.status === "COMPLETED" ? "COMPLETED_JOURNAL_NOT_DURABLE" : report.status } : {}), stage: "run", reviewedCommit: args.reviewedCommit, location: { token: loc.token, runDir: loc.runDir },
       journalFile: journal.path ? journal.path.slice(claimed.runDir.length + 1) : null, filesWritten: 1, credentialsRequested: true,
       transportUsage: usage && ["none", "ok", "failed"].includes(usage.mintState) ? { mintState: usage.mintState, fetches: usage.fetches } : null, guard: guard.used() });
-    const code = report.status === "REFUSED" ? CONNECTED_EXECUTE_EXIT.REFUSED : report.passed === true ? CONNECTED_EXECUTE_EXIT.PASSED : CONNECTED_EXECUTE_EXIT.NOT_PASSED;
+    const code = report.status === "REFUSED" ? CONNECTED_EXECUTE_EXIT.REFUSED : passed ? CONNECTED_EXECUTE_EXIT.PASSED : CONNECTED_EXECUTE_EXIT.NOT_PASSED;
     return out(code, output);
   } catch {
     return out(CONNECTED_EXECUTE_EXIT.INTERNAL, { ok: false, stage: "run", error: "INTERNAL_ERROR", filesWritten: 1, credentialsRequested: true });
   } finally {
     creds = null;
-    if (journal && typeof journal.close === "function") { try { journal.close(); } catch { /* already closed */ } }
+    // only on an early exit (internal error); the normal path closed it above and reported the outcome
+    if (journal && !journalClosed && typeof journal.close === "function") { try { journal.close(); } catch { /* reported as INTERNAL_ERROR already */ } }
   }
 }

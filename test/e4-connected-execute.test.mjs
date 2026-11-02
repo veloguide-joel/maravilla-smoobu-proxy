@@ -329,8 +329,8 @@ test("classification: every state, and refusal of any journal that is not exactl
   assert.equal(p.protectedIdSeen, true); assert.equal(p.reservationId, null);
   for (const [es, code] of [[[], "JOURNAL_EMPTY"], [[ci], "JOURNAL_NO_RUN_START"], [[{ ...start, manifestHash: "f".repeat(64) }], "JOURNAL_FOREIGN_MANIFEST"],
     [[start, ci, ci], "JOURNAL_CREATE_BUDGET_INCONSISTENT"], [[start, ci, co(5), xi(5), xi(5)], "JOURNAL_CANCEL_BUDGET_INCONSISTENT"],
-    [[start, xi(5)], "JOURNAL_CANCEL_WITHOUT_CREATE"], [[start, { ...ci, ref: "MV-OTHER123" }], "JOURNAL_CREATE_NOT_THIS_RUN"],
-    [[start, { type: "intent", step: "HW1_CREATE", kind: "create", ref: REF }], "JOURNAL_UNKNOWN_STEP"], [[start, { type: "weird" }], "JOURNAL_UNEXPECTED_ENTRY"],
+    [[start, xi(5)], "JOURNAL_CANCEL_BEFORE_CREATE_OUTCOME"], [[start, { ...ci, ref: "MV-OTHER123" }], "JOURNAL_CREATE_NOT_THIS_RUN"],
+    [[start, { type: "intent", step: "HW1_CREATE", kind: "create", ref: REF }], "JOURNAL_ENTRY_NOT_SANITIZED"], [[start, { type: "weird" }], "JOURNAL_UNEXPECTED_ENTRY"],
     [[start, start], "JOURNAL_SECOND_RUN_START"], [[start, { type: "run-end", code: "HALTED" }, ci], "JOURNAL_ENTRY_AFTER_RUN_END"]]) {
     assert.equal(K(es).code, code, code);
   }
@@ -361,10 +361,11 @@ test("recovery read guards: no write shape exists; reads only of this run's id, 
 test("launcher URL guard: only 603566 connected shapes, caps from the step budgets, protected id refused, a second create/cancel refused", async () => {
   const sent = [];
   const g = X.guardConnectedFetch(async (u, i) => { sent.push(`${i.method ?? "GET"} ${new URL(u).pathname}`); return new Response("{}"); },
-    { calendar: { startDate: NIGHTS[0], endDate: NIGHTS[1] }, arrivalDate: STAY.arrivalDate });
+    { calendar: { startDate: NIGHTS[0], endDate: NIGHTS[1] }, arrivalDate: STAY.arrivalDate, departureDate: STAY.departureDate });
   const B = "https://api.hostaway.com/v1";
-  await g.guarded(`${B}/reservations`, { method: "POST", body: "{}" });
-  await assert.rejects(g.guarded(`${B}/reservations`, { method: "POST", body: "{}" }));
+  const cb = JSON.stringify({ listingMapId: L, channelId: 2000, currency: "MXN", arrivalDate: STAY.arrivalDate, departureDate: STAY.departureDate });
+  await g.guarded(`${B}/reservations`, { method: "POST", body: cb });
+  await assert.rejects(g.guarded(`${B}/reservations`, { method: "POST", body: cb }));
   await assert.rejects(g.guarded(`${B}/reservations/70636076/statuses/cancelled`, { method: "PUT", body: JSON.stringify({ cancelledBy: "host" }) }));
   await assert.rejects(g.guarded(`${B}/reservations/5/statuses/cancelled`, { method: "PUT", body: JSON.stringify({ cancelledBy: "guest" }) }));
   await g.guarded(`${B}/reservations/5/statuses/cancelled`, { method: "PUT", body: JSON.stringify({ cancelledBy: "host" }) });
@@ -418,4 +419,142 @@ test("provenance metadata: launcher and recovery source lists are exactly their 
   assert.equal(C.CONNECTED_EXECUTION_WIRED, false);   // the core module itself still has no transport/CLI
   const rsrc = readFileSync(join(ROOT, "scripts/e4-connected/connected-recover.mjs"), "utf8");
   assert.doesNotMatch(rsrc, /writeFileSync|appendFileSync|mkdirSync|createFileJournal|statuses\/cancelled|method: "PUT"|method: "POST"/);
+});
+
+// ---------- root review of 9e00f47: R1..R4 regressions ----------
+import { linkSync, statSync as statSyncFs, fstatSync } from "node:fs";
+import { createRequire, syncBuiltinESMExports } from "node:module";
+
+const jfile = (es) => es.map((e) => JSON.stringify(e)).join("\n") + "\n";
+function prepared(es) {
+  const sb = sandbox(); const l = loc(sb.base);
+  mkdirSync(l.runDir, { recursive: true });
+  if (es) writeFileSync(join(l.runDir, J.journalFileName(V.hash)), jfile(es));
+  return { sb, l };
+}
+const inspect = (sb, l, over = {}) => RC.runConnectedRecoverCli(["--inspect", "--manifest", sb.mpath, "--reviewed-commit", SHA, "--location", l.token],
+  { root: sb.root, base: sb.base, git: RGIT, ...over });
+
+test("R1: the journal must be a regular single-linked bounded file; a symlink/hard link named like the journal is refused before any read", async (t) => {
+  const outside = mkdtempSync(join(tmpdir(), "e4-outside-"));
+  const target = join(outside, "elsewhere.jsonl");
+  writeFileSync(target, jfile([start]));
+  const { sb, l } = prepared(null);
+  try { symlinkSync(target, join(l.runDir, J.journalFileName(V.hash)), "file"); } catch { t.skip("symlinks unavailable"); return; }
+  let reads = 0; let asked = 0;
+  const spy = { readJournal: () => { reads++; return [start]; }, prompt: async () => { asked++; return {}; } };
+  const r = await inspect(sb, l, spy);
+  assert.equal(r.output.error, "JOURNAL_NOT_A_REGULAR_FILE"); assert.equal(r.exitCode, 2);
+  const rr = await RC.runConnectedRecoverCli(["--reconcile", "--manifest", sb.mpath, "--reviewed-commit", SHA, "--location", l.token], { root: sb.root, base: sb.base, git: RGIT, ...spy });
+  assert.equal(rr.output.error, "JOURNAL_NOT_A_REGULAR_FILE");
+  assert.equal(reads, 0); assert.equal(asked, 0);
+  // a hard link to another file
+  rmSync(join(l.runDir, J.journalFileName(V.hash)));
+  linkSync(target, join(l.runDir, J.journalFileName(V.hash)));
+  assert.equal((await inspect(sb, l, spy)).output.error, "JOURNAL_HAS_OTHER_LINKS");
+  // a directory with the journal's name, and an oversized file
+  rmSync(join(l.runDir, J.journalFileName(V.hash)));
+  mkdirSync(join(l.runDir, J.journalFileName(V.hash)));
+  assert.equal((await inspect(sb, l, spy)).output.error, "JOURNAL_NOT_A_REGULAR_FILE");
+  rmSync(join(l.runDir, J.journalFileName(V.hash)), { recursive: true });
+  writeFileSync(join(l.runDir, J.journalFileName(V.hash)), "x".repeat(RC.MAX_JOURNAL_BYTES + 1));
+  assert.equal((await inspect(sb, l, spy)).output.error, "JOURNAL_TOO_LARGE");
+  assert.equal(reads, 0); assert.equal(asked, 0);
+});
+
+test("R2: loaded journal values are revalidated at the disk boundary; raw objects/unknown values never reach the output", async () => {
+  const PRIVATE = "PRIVATE_SENTINEL";
+  const variants = [
+    [start, ci, { ...co(5), code: { raw: PRIVATE } }, xi(5), xo(5, "VERIFIED_CANCELLED")],
+    [start, ci, co(5), xi(5), xo(5, "VERIFIED_CANCELLED", { mismatches: [{ guestEmail: PRIVATE }] })],
+    [start, ci, co(5), xi(5), xo(5, "VERIFIED_CANCELLED", { transport: { token: PRIVATE } })],
+    [start, ci, co(5), xi(5), xo(5, "VERIFIED_CANCELLED"), { type: "halt", step: "KW2_CANCEL", code: { raw: PRIVATE } }],
+    [start, ci, co(5), xi(5), xo(5, "VERIFIED_CANCELLED"), { type: "run-end", code: PRIVATE.toLowerCase() }],
+    [start, ci, co(5), xi(5), xo(5, "VERIFIED_CANCELLED", { guestEmail: PRIVATE })],
+    [start, ci, { ...co(5), evidence: { reservationId: 5, rawBody: PRIVATE } }, xi(5), xo(5, "VERIFIED_CANCELLED")],
+    [start, ci, co(5), xi(5), xo(5, "VERIFIED_CANCELLED", { mismatches: ["guestEmail"] })],
+    [start, ci, co(5), xi(5), xo(5, "VERIFIED_CANCELLED", { httpStatus: "200" })]
+  ];
+  for (const es of variants) {
+    const c = RC.classifyConnectedJournal(es, H);
+    assert.equal(c.ok, false, JSON.stringify(es).slice(0, 160)); assert.equal(c.code, "JOURNAL_ENTRY_NOT_SANITIZED");
+    assert.ok(!JSON.stringify(c).includes(PRIVATE) && !JSON.stringify(c).includes(PRIVATE.toLowerCase()));
+    const { sb, l } = prepared(es);
+    const r = await inspect(sb, l);
+    assert.equal(r.output.error, "JOURNAL_ENTRY_NOT_SANITIZED"); assert.equal(r.exitCode, 2);
+    assert.ok(!JSON.stringify(r.output).toLowerCase().includes(PRIVATE.toLowerCase()));
+  }
+  // the field-name-only mismatch report still passes when it is exactly what the producer writes
+  const okc = RC.classifyConnectedJournal([start, ci, co(5), xi(5), xo(5, "CANCEL_RESPONSE_MISMATCH", { mismatches: ["totalMinor", "status"], httpStatus: 200 })], H);
+  assert.equal(okc.ok, true); assert.deepEqual(okc.cancelOutcome.mismatches, ["totalMinor", "status"]);
+});
+
+test("R3: contradictions or protected evidence never exit clean; reconcile collects scoped evidence but returns CONFLICT_MANUAL_REVIEW without a decision", async () => {
+  const contradictions = [
+    [[start, ci, co(5), xi(6), xo(6, "VERIFIED_CANCELLED")], ["RESERVATION_IDS_INCONSISTENT"]],
+    [[start, ci, co(70636076), xi(6), xo(6, "VERIFIED_CANCELLED")], ["PROTECTED_ID_IN_JOURNAL"]],
+    [[start, ci, co(5), xi(5), xo(6, "VERIFIED_CANCELLED")], ["RESERVATION_IDS_INCONSISTENT", "CANCEL_OUTCOME_ID_DIFFERS_FROM_INTENT"]]
+  ];
+  for (const [es, expected] of contradictions) {
+    const c = RC.classifyConnectedJournal(es, H);
+    assert.equal(c.ok, true); assert.equal(c.clean, false);
+    for (const x of expected) assert.ok(c.conflicts.includes(x), `${x} in ${c.conflicts}`);
+    assert.equal(c.reservationId, null);
+    const { sb, l } = prepared(es);
+    const r = await inspect(sb, l);
+    assert.equal(r.exitCode, 3, JSON.stringify(r.output));
+    const w = world();
+    const rr = await RC.runConnectedRecoverCli(["--reconcile", "--manifest", sb.mpath, "--reviewed-commit", SHA, "--location", l.token],
+      { root: sb.root, base: sb.base, git: RGIT, fetchImpl: w.fetch, sleep: async () => {}, prompt: async () => ({ accountId: "201434", clientSecret: "FAKE-SECRET" }) });
+    assert.equal(rr.exitCode, 3); assert.equal(rr.output.reconcile.verdict, "CONFLICT_MANUAL_REVIEW"); assert.equal(rr.output.reconcile.decision, null);
+    assert.equal(rr.output.reconcile.read, null);                       // no read by id when ids conflict or a protected id appears
+    assert.ok(w.log.every((x) => x.startsWith("GET ") || x === "POST /accessTokens") && !w.log.some((x) => x.includes("70636076")));
+  }
+  // ordering that the reviewed sequence never produces is refused outright
+  for (const [es, code] of [[[start, ci, xi(5), co(5)], "JOURNAL_CANCEL_BEFORE_CREATE_OUTCOME"], [[start, co(5)], "JOURNAL_CREATE_OUTCOME_WITHOUT_INTENT"],
+    [[start, ci, co(5), xo(5, "VERIFIED_CANCELLED")], "JOURNAL_CANCEL_OUTCOME_WITHOUT_INTENT"]]) assert.equal(RC.classifyConnectedJournal(es, H).code, code);
+});
+
+test("R4: a journal close failure after the run is never a clean pass: durable false, not passed, exit 3, facts kept, no retry", async () => {
+  const sb = sandbox(); const w = world(); const { d } = deps(sb, w);
+  const l = loc(sb.base); const jpath = join(l.runDir, J.journalFileName(V.hash));
+  const fs = createRequire(import.meta.url)("node:fs");
+  const realClose = fs.closeSync; let injected = 0;
+  fs.closeSync = (fd) => {
+    let target = false;
+    try { target = fstatSync(fd).ino === statSyncFs(jpath).ino; } catch { target = false; }
+    realClose(fd);
+    if (target) { injected++; throw Object.assign(new Error("EIO"), { code: "EIO" }); }
+  };
+  syncBuiltinESMExports();
+  let r;
+  try { r = await X.runConnectedExecuteCli(execArgs(sb), d); } finally { fs.closeSync = realClose; syncBuiltinESMExports(); }
+  assert.equal(injected, 1);
+  assert.equal(r.exitCode, 3, JSON.stringify(r.output));
+  assert.equal(r.output.passed, false); assert.equal(r.output.ok, false);
+  assert.equal(r.output.journalClose, "JOURNAL_CLOSE_FAILED"); assert.equal(r.output.journalDurable, false);
+  assert.ok(r.output.journalFailures.includes("CLOSE"));
+  assert.equal(r.output.status, "COMPLETED_JOURNAL_NOT_DURABLE");
+  assert.deepEqual(r.output.writes, { create: 1, cancel: 1 });           // facts preserved
+  assert.equal(r.output.commandReply.code, "VERIFIED_CANCELLED");
+  assert.equal(writes(w).length, 2);                                      // nothing retried
+  // a normal close is reported as such
+  const sb2 = sandbox(); const w2 = world(); const x2 = deps(sb2, w2);
+  const ok = await X.runConnectedExecuteCli(execArgs(sb2), x2.d);
+  assert.equal(ok.output.journalClose, "JOURNAL_CLOSED"); assert.equal(ok.exitCode, 0);
+});
+
+test("launcher URL guard body binding: create for another listing/dates/currency or with forceOverbooking, and price for other dates, are refused", async () => {
+  const sent = [];
+  const g = X.guardConnectedFetch(async (u) => { sent.push(new URL(u).pathname); return new Response("{}"); },
+    { calendar: { startDate: NIGHTS[0], endDate: NIGHTS[1] }, arrivalDate: STAY.arrivalDate, departureDate: STAY.departureDate });
+  const B = "https://api.hostaway.com/v1";
+  const body = { listingMapId: L, channelId: 2000, currency: "MXN", arrivalDate: STAY.arrivalDate, departureDate: STAY.departureDate };
+  for (const bad of [{ ...body, listingMapId: 603564 }, { ...body, currency: "USD" }, { ...body, departureDate: "2027-04-08" }, { ...body, channelId: 2005 }, { ...body, forceOverbooking: true }]) {
+    await assert.rejects(g.guarded(`${B}/reservations`, { method: "POST", body: JSON.stringify(bad) }));
+  }
+  await assert.rejects(g.guarded(`${B}/listings/${L}/calendar/priceDetails`, { method: "POST", body: JSON.stringify({ startingDate: "2027-04-06", endingDate: STAY.departureDate }) }));
+  await g.guarded(`${B}/listings/${L}/calendar/priceDetails`, { method: "POST", body: JSON.stringify({ startingDate: STAY.arrivalDate, endingDate: STAY.departureDate, numberOfGuests: 2, version: 2 }) });
+  await g.guarded(`${B}/reservations`, { method: "POST", body: JSON.stringify(body) });
+  assert.deepEqual(sent, [`/v1/listings/${L}/calendar/priceDetails`, "/v1/reservations"]);
 });

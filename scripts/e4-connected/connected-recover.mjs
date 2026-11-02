@@ -21,7 +21,7 @@ import { fileURLToPath } from "node:url";
 import { verifyProvenance, makeGit } from "../e4-launcher/happy-execute.mjs";
 import { createHostawayTransport, HOSTAWAY_BASE } from "../e4-transport/hostaway-transport.mjs";
 import { readJournalFile, journalFileName } from "../e4-write-runner/journal.mjs";
-import { READ_QUERY, RunnerError, createGate, parseReservationResponse, identityMismatches } from "../e4-write-runner/runner.mjs";
+import { READ_QUERY, RunnerError, createGate, parseReservationResponse, identityMismatches, sanitizeJournalEntry } from "../e4-write-runner/runner.mjs";
 import { connectedTestAdapterConfig, lookupByRef, LOOKUP_MAX_PAGES, DIRECT_CHANNEL_ID, REF_RE } from "../../lib/hostaway-reservations.js";
 import { nightsState } from "./safeguards.mjs";
 import { validateConnectedManifest, stayNights, CONNECTED_STEPS, CONNECTED_PROTECTED_RESERVATION_IDS, CONNECTED_WRITE_BUDGET } from "./connected-path.mjs";
@@ -35,6 +35,7 @@ const RECOVER_STEPS = Object.freeze({ RC_READ: Object.freeze({ reads: 1, writes:
   RC_CALENDAR: Object.freeze({ reads: 1, writes: 0 }) });
 const JOURNAL_TYPES = Object.freeze(["run-start", "intent", "outcome", "read", "side-effect-check", "halt", "reconcile", "run-end"]);
 const MAX_MANIFEST_BYTES = 16384;
+export const MAX_JOURNAL_BYTES = 1048576;   // a complete connected run journal is a few KB
 const L = 603566;
 // The manifest's lead-time rule is an approval rule, not an identity rule: the hash is recomputed with a fixed early clock
 // so that recovery stays possible after the approval window. It authorizes nothing.
@@ -43,6 +44,11 @@ const STRUCTURE_CLOCK = () => new Date("2000-01-01T00:00:00.000Z");
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const isPosInt = (v) => Number.isSafeInteger(v) && v > 0;
 const isProtected = (v) => CONNECTED_PROTECTED_RESERVATION_IDS.includes(Number(v));
+function canonical(v) {
+  if (Array.isArray(v)) return `[${v.map(canonical).join(",")}]`;
+  if (isObj(v)) return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canonical(v[k])}`).join(",")}}`;
+  return JSON.stringify(v);
+}
 const freeze = (o) => { if (o && typeof o === "object" && !Object.isFrozen(o)) { Object.freeze(o); for (const v of Object.values(o)) freeze(v); } return o; };
 
 /**
@@ -64,6 +70,9 @@ export function classifyConnectedJournal(entries, manifestHash) {
   for (let i = 0; i < entries.length; i++) {
     const e = entries[i];
     if (!isObj(e) || !JOURNAL_TYPES.includes(e.type)) return bad("JOURNAL_UNEXPECTED_ENTRY");
+    // Disk boundary: every loaded entry must be EXACTLY what the reviewed sanitizer would keep (connected step names),
+    // so no raw value, object or unknown field can ever reach the output. Any difference refuses the journal.
+    if (canonical(sanitizeJournalEntry(e, { steps: CONNECTED_STEPS })) !== canonical(e)) return bad("JOURNAL_ENTRY_NOT_SANITIZED");
     if (e.type === "run-start" && i !== 0) return bad("JOURNAL_SECOND_RUN_START");
     if (Object.prototype.hasOwnProperty.call(e, "step") && !Object.prototype.hasOwnProperty.call(CONNECTED_STEPS, e.step)) return bad("JOURNAL_UNKNOWN_STEP");
     if (runEnd && i > 0) return bad("JOURNAL_ENTRY_AFTER_RUN_END");
@@ -72,6 +81,10 @@ export function classifyConnectedJournal(entries, manifestHash) {
       if (!["create", "cancel"].includes(e.kind)) return bad("JOURNAL_UNEXPECTED_WRITE_KIND");
       if (e.kind === "create" && (e.step !== "KW1_CREATE" || e.ref !== ref)) return bad("JOURNAL_CREATE_NOT_THIS_RUN");
       if (e.kind === "cancel" && e.step !== "KW2_CANCEL") return bad("JOURNAL_CANCEL_NOT_THIS_RUN");
+      // ordering exactly as the reviewed sequence produces it: create intent -> create outcome -> cancel intent -> cancel outcome
+      if (e.type === "outcome" && outcomes[e.kind].length >= intents[e.kind].length) return bad(`JOURNAL_${e.kind.toUpperCase()}_OUTCOME_WITHOUT_INTENT`);
+      if (e.kind === "cancel" && e.type === "intent" && outcomes.create.length !== 1) return bad("JOURNAL_CANCEL_BEFORE_CREATE_OUTCOME");
+      if (e.kind === "create" && (intents.cancel.length || outcomes.cancel.length)) return bad("JOURNAL_CREATE_AFTER_CANCEL");
       (e.type === "intent" ? intents : outcomes)[e.kind].push(e);
     }
     if (e.type === "outcome" && e.kind === "create" && isObj(e.evidence)) { noteId(e.evidence.reservationId); if (isObj(e.evidence.reservation)) noteId(e.evidence.reservation.reservationId); }
@@ -83,8 +96,16 @@ export function classifyConnectedJournal(entries, manifestHash) {
     if (intents[k].length > CONNECTED_WRITE_BUDGET[k] || outcomes[k].length > intents[k].length) return bad(`JOURNAL_${k.toUpperCase()}_BUDGET_INCONSISTENT`);
   }
   if (intents.cancel.length && !intents.create.length) return bad("JOURNAL_CANCEL_WITHOUT_CREATE");
-  const reservationId = ids.size === 1 ? [...ids][0] : null;
+  const reservationId = ids.size === 1 && !protectedSeen ? [...ids][0] : null;
   const co = outcomes.create[0] ?? null; const xo = outcomes.cancel[0] ?? null;
+  // Contradictions never yield a clean result: they are listed and force attention (and a manual-review verdict).
+  const conflicts = [];
+  if (ids.size > 1) conflicts.push("RESERVATION_IDS_INCONSISTENT");
+  if (protectedSeen) conflicts.push("PROTECTED_ID_IN_JOURNAL");
+  const xi = intents.cancel[0] ?? null;
+  if (xi && !isPosInt(xi.reservationId)) conflicts.push("CANCEL_INTENT_WITHOUT_ID");
+  if (xo && xi && xo.reservationId !== xi.reservationId) conflicts.push("CANCEL_OUTCOME_ID_DIFFERS_FROM_INTENT");
+  if (xi && ids.size === 1 && isPosInt(xi.reservationId) && xi.reservationId !== [...ids][0]) conflicts.push("CANCEL_TARGET_DIFFERS");
   let state;
   if (!intents.create.length) state = "NO_CREATE_ATTEMPTED";
   else if (!co) state = "CREATE_OUTCOME_MISSING";
@@ -92,7 +113,7 @@ export function classifyConnectedJournal(entries, manifestHash) {
   else if (!xo) state = "CANCEL_OUTCOME_MISSING";
   else state = xo.code === "VERIFIED_CANCELLED" ? "CANCEL_VERIFIED" : "CANCEL_NOT_VERIFIED";
   return freeze({
-    ok: true, state, ref, reservationId, idsConsistent: ids.size <= 1, protectedIdSeen: protectedSeen,
+    ok: true, state, ref, reservationId, idsConsistent: ids.size <= 1, protectedIdSeen: protectedSeen, conflicts, clean: conflicts.length === 0,
     createAttempts: intents.create.length, cancelAttempts: intents.cancel.length,
     createOutcome: co ? { code: co.code ?? null, ...(co.transport ? { transport: co.transport } : {}) } : null,
     cancelOutcome: xo ? { code: xo.code ?? null, ...(xo.httpStatus ? { httpStatus: xo.httpStatus } : {}), ...(xo.mismatches ? { mismatches: xo.mismatches } : {}),
@@ -194,7 +215,8 @@ export async function reconcileConnectedRun({ transport, manifest, classificatio
   const lkOk = lk && lk.outcome === "found" && !lk.mismatches && isPosInt(lk.foundReservationId) && (!state.readId || lk.foundReservationId === state.readId);
   const status = idOk ? r.status : lkOk ? lk.status : null;
   let verdict;
-  if (r && r.code === "READ_IDENTITY_MISMATCH") verdict = "IDENTITY_MISMATCH_MANUAL_REVIEW";
+  if (!c.clean) verdict = "CONFLICT_MANUAL_REVIEW";                 // contradictions in the journal: evidence only, never a clean verdict
+  else if (r && r.code === "READ_IDENTITY_MISMATCH") verdict = "IDENTITY_MISMATCH_MANUAL_REVIEW";
   else if ((idOk || lkOk) && status === "cancelled") verdict = "RESERVATION_CANCELLED_CONFIRMED";
   else if (idOk || lkOk) verdict = "RESERVATION_ACTIVE_OWNER_DECISION_REQUIRED";
   else if (!state.readId && lk && lk.outcome === "not_found") verdict = "NOT_FOUND_BY_REF_NON_AUTHORITATIVE";
@@ -234,8 +256,16 @@ export async function runConnectedRecoverCli(argv, deps = {}) {
   try { names = readdirSync(loc.runDir); } catch { return refuse("journal", "RUN_LOCATION_UNREADABLE"); }
   if (names.length === 0) return refuse("journal", "RUN_LOCATION_HAS_NO_JOURNAL", { note: "the launcher stopped before its journal; nothing was sent" });
   if (names.length !== 1 || names[0] !== jname) return refuse("journal", "RUN_LOCATION_UNEXPECTED_CONTENT");
+  // The journal itself must be a regular, single-linked file of bounded size (never a symlink/junction/reparse point or a
+  // hard link to some other file) BEFORE it is read.
+  const jpath = join(loc.runDir, jname);
+  let jst;
+  try { jst = lstatSync(jpath); } catch { return refuse("journal", "JOURNAL_UNREADABLE"); }
+  if (jst.isSymbolicLink() || !jst.isFile()) return refuse("journal", "JOURNAL_NOT_A_REGULAR_FILE");
+  if (jst.nlink !== 1) return refuse("journal", "JOURNAL_HAS_OTHER_LINKS");
+  if (jst.size > MAX_JOURNAL_BYTES) return refuse("journal", "JOURNAL_TOO_LARGE");
   let entries;
-  try { entries = (deps.readJournal ?? readJournalFile)(join(loc.runDir, jname)); } catch (e) {
+  try { entries = (deps.readJournal ?? readJournalFile)(jpath); } catch (e) {
     return refuse("journal", typeof e?.code === "string" && /^[A-Z_]{1,40}$/.test(e.code) ? e.code : "JOURNAL_UNREADABLE");
   }
   const cls = classifyConnectedJournal(entries, v.hash);
@@ -243,10 +273,11 @@ export async function runConnectedRecoverCli(argv, deps = {}) {
   const summary = { ok: true, stage: args.mode, manifestHash: v.hash, location: { token: loc.token, runDir: loc.runDir }, journalFile: jname, classification: cls };
   const needsReads = cls.providerReservationPossible;
   if (args.mode === "inspect") {
-    return out(needsReads && cls.state !== "CANCEL_VERIFIED" ? CONNECTED_RECOVER_EXIT.ATTENTION : CONNECTED_RECOVER_EXIT.OK,
+    const clean = cls.clean && (!needsReads || cls.state === "CANCEL_VERIFIED");
+    return out(clean ? CONNECTED_RECOVER_EXIT.OK : CONNECTED_RECOVER_EXIT.ATTENTION,
       { ...summary, network: "none", credentialsRequested: false, nextStep: !needsReads ? "NONE_NOTHING_SENT_BY_A_CREATE" : "RECONCILE_READ_ONLY" });
   }
-  if (!needsReads) return out(CONNECTED_RECOVER_EXIT.OK, { ...summary, network: "none", credentialsRequested: false, nextStep: "NONE_NOTHING_SENT_BY_A_CREATE" });
+  if (!needsReads) return out(cls.clean ? CONNECTED_RECOVER_EXIT.OK : CONNECTED_RECOVER_EXIT.ATTENTION, { ...summary, network: "none", credentialsRequested: false, nextStep: "NONE_NOTHING_SENT_BY_A_CREATE" });
   if (typeof deps.prompt !== "function") return refuse("credentials", "OWNER_CHANNEL_MISSING");
   let creds;
   try { creds = await deps.prompt(); } catch (e) {
@@ -261,7 +292,7 @@ export async function runConnectedRecoverCli(argv, deps = {}) {
       ...(deps.sleep ? { sleep: deps.sleep } : {}) });
     const rec = await reconcileConnectedRun({ transport, manifest: v.manifest, classification: cls, ...(deps.timeoutMs ? { timeoutMs: deps.timeoutMs } : {}) });
     let usage = null; try { usage = transport.usage(); } catch { usage = null; }
-    return out(rec.verdict === "RESERVATION_CANCELLED_CONFIRMED" || rec.verdict === "NOT_FOUND_BY_REF_NON_AUTHORITATIVE" ? CONNECTED_RECOVER_EXIT.OK : CONNECTED_RECOVER_EXIT.ATTENTION,
+    return out(cls.clean && (rec.verdict === "RESERVATION_CANCELLED_CONFIRMED" || rec.verdict === "NOT_FOUND_BY_REF_NON_AUTHORITATIVE") ? CONNECTED_RECOVER_EXIT.OK : CONNECTED_RECOVER_EXIT.ATTENTION,
       { ...summary, credentialsRequested: true, reconcile: rec, guard: guard.used(),
         transportUsage: usage && ["none", "ok", "failed"].includes(usage.mintState) ? { mintState: usage.mintState, fetches: usage.fetches } : null });
   } catch {
