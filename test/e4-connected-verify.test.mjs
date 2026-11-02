@@ -500,6 +500,9 @@ test("recovery: KV stages classify truthfully at every crash point; READ_VERIFIE
     [[start, ci, co("RESERVATION_MISMATCH"), mk, rd("VERIFY_READ_UPSTREAM_5XX"), lk()], "CREATE_VERIFICATION_CONTRADICTORY"],   // lookup after a failed read
     [[start, ci, co("RESERVATION_MISMATCH"), mk, rd("VERIFY_READ_IDENTITY_MISMATCH", 5, { mismatches: undefined })].map((e) => JSON.parse(JSON.stringify(e))), "CREATE_VERIFICATION_CONTRADICTORY"],
     [[start, ci, co("RESERVATION_MISMATCH"), mk, rd(), lk(), xi, xo, lk()], "CREATE_VERIFICATION_DUPLICATED"],
+    // a cancel on top of a create proof that is itself contradicted is never "verified create" (independent of global suppression)
+    [[start, ci, co("VERIFIED_CREATED"), mk, rd(), lk(), xi], "CANCEL_WITHOUT_VERIFIED_CREATE"],
+    [[start, ci, co("RESERVATION_MISMATCH"), mk, rd(), hl("KV1_READ_VERIFY", "X"), lk(), xi], "CANCEL_WITHOUT_VERIFIED_CREATE"],
     [[start, ci, co("RESERVATION_MISMATCH"), mk, rd("VERIFY_READ_IDENTITY_OK", 5, { httpStatus: 300 }), lk()], "CREATE_VERIFICATION_CONTRADICTORY"],
     [[start, ci, co("RESERVATION_MISMATCH"), mk, rd("VERIFY_READ_IDENTITY_MISMATCH", 5, { ref: REF })], "CREATE_VERIFICATION_CONTRADICTORY"],   // a ref on the read entry
     [[start, ci, co("RESERVATION_MISMATCH"), mk, rd(), lk("VERIFY_LOOKUP_ID_DIFFERS", 6)], "CREATE_VERIFICATION_ID_NOT_BOUND"],

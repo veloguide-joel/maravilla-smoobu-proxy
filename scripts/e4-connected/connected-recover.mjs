@@ -158,6 +158,7 @@ function verifyKvSequence({ kvAt, co, coIdx, firstHaltIdx, xiIdx, laterIdx, ref,
 // the K8 read (IDENTITY_OK, same id, 2xx, no mismatches/transport) and the KC2 lookup (same id, run ref, no mismatches). A strict
 // prefix (crash/halt) is clean but NOT_VERIFIED; anything else is a conflict and NOT_VERIFIED.
 const KC_MARKER_KEYS = ["type", "step", "kind", "code", "reservationId", "at"];
+const XO_KEYS = ["type", "step", "kind", "code", "reservationId", "mismatches", "httpStatus", "transport", "at"];   // the producer's cancel outcome fields
 const K8_OK_KEYS = ["type", "step", "kind", "code", "reservationId", "httpStatus", "at"];
 const KC2_KEYS = ["type", "step", "kind", "code", "ref", "reservationId", "mismatches", "at"];
 function verifyKcSequence({ entries, kcAt, xi, xo, xoIdx, firstHaltIdx, ref, isProtected }) {
@@ -166,9 +167,9 @@ function verifyKcSequence({ entries, kcAt, xi, xo, xoIdx, firstHaltIdx, ref, isP
   const add = (c) => { if (!out.conflicts.includes(c)) out.conflicts.push(c); };
   const en = (x, list) => (x === undefined || x === null ? null : list.includes(x) ? x : "OTHER");
   const only = (e, keys) => Object.keys(e).every((k) => keys.includes(k));
-  const xoOk = isObj(xo) && xo.code === "CANCEL_RESPONSE_MISMATCH" && xo.transport === undefined && is2xx(xo.httpStatus) &&
+  const xoOk = isObj(xo) && Object.keys(xo).every((k) => XO_KEYS.includes(k)) && xo.code === "CANCEL_RESPONSE_MISMATCH" && xo.transport === undefined && is2xx(xo.httpStatus) &&
     Array.isArray(xo.mismatches) && xo.mismatches.length === 1 && xo.mismatches[0] === "bookingRef" &&
-    isPosInt(xo.reservationId) && !isProtected(xo.reservationId) && isObj(xi) && xi.reservationId === xo.reservationId;
+    isPosInt(xo.reservationId) && !isProtected(xo.reservationId) && isObj(xi) && xi.reservationId === xo.reservationId && xi.ref === ref;
   const id = xoOk ? xo.reservationId : null;
   if (xoIdx < 0 || kcAt[0][0] < xoIdx) add("CANCEL_VERIFICATION_BEFORE_CANCEL_OUTCOME");
   if (!xoOk) add("CANCEL_VERIFICATION_WITHOUT_UNECHOED_REF");
@@ -183,6 +184,7 @@ function verifyKcSequence({ entries, kcAt, xi, xo, xoIdx, firstHaltIdx, ref, isP
   if (!only(mk[1], KC_MARKER_KEYS)) add("CANCEL_VERIFICATION_CONTRADICTORY");
   // slot 2: the scheduled K8 fresh read (the producer only looks up after an IDENTITY_OK read)
   const k8 = xoIdx >= 0 ? entries[xoIdx + 2] : undefined;
+  if (entries.filter((e) => isObj(e) && e.step === "K8_POSTCANCEL" && e.type === "read").length > 1) add("CANCEL_VERIFICATION_DUPLICATED");   // at most one K8 read: the scheduled proof (a missing one fails the slot check)
   const k8Ok = isObj(k8) && k8.type === "read" && k8.step === "K8_POSTCANCEL" && k8.kind === "read" && k8.code === "IDENTITY_OK" &&
     k8.reservationId === id && is2xx(k8.httpStatus) && only(k8, K8_OK_KEYS);
   if (isObj(k8) && k8.type === "read" && k8.step === "K8_POSTCANCEL") out.readVerify = k8Ok ? "VERIFY_CANCEL_READ_IDENTITY_OK" : "VERIFY_CANCEL_READ_NOT_CONFIRMED";
@@ -295,14 +297,19 @@ export function classifyConnectedJournal(entries, manifestHash) {
   const cancelVerification = { path: xo?.code === "VERIFIED_CANCELLED" ? "REPLY" : kcAt.length ? "READ_FALLBACK" : "NONE",
     result: cancelReplyVerified ? "REPLY_VERIFIED" : cancelReadVerified ? "READ_VERIFIED" : "NOT_VERIFIED", refEcho: cv.refEcho, readVerify: cv.readVerify, lookupVerify: cv.lookupVerify };
   if (xi && !isPosInt(xi.reservationId)) conflicts.push("CANCEL_INTENT_WITHOUT_ID");
+  if (xi && xi.ref !== ref) conflicts.push("CANCEL_INTENT_REF_NOT_THIS_RUN");
+  if (xo && !Object.keys(xo).every((k) => XO_KEYS.includes(k))) conflicts.push("CANCEL_OUTCOME_CONTRADICTORY");
   if (xo && xi && xo.reservationId !== xi.reservationId) conflicts.push("CANCEL_OUTCOME_ID_DIFFERS_FROM_INTENT");
   if (xi && ids.size === 1 && isPosInt(xi.reservationId) && xi.reservationId !== [...ids][0]) conflicts.push("CANCEL_TARGET_DIFFERS");
+  // A verification claim is never reported on top of a contradiction anywhere in the journal (identity, provenance, ordering):
+  // the evidence is kept, but create/cancel results become NOT_VERIFIED and the state can never be CANCEL_VERIFIED.
+  if (conflicts.length) { createVerification.result = "NOT_VERIFIED"; cancelVerification.result = "NOT_VERIFIED"; }
   let state;
   if (!intents.create.length) state = "NO_CREATE_ATTEMPTED";
   else if (!co) state = "CREATE_OUTCOME_MISSING";
   else if (!intents.cancel.length) state = reservationId ? "CREATED_NO_CANCEL_ATTEMPT" : "CREATE_NOT_VERIFIED";   // an id from this run => it may be live
   else if (!xo) state = "CANCEL_OUTCOME_MISSING";
-  else state = cancelReplyVerified || cancelReadVerified ? "CANCEL_VERIFIED" : "CANCEL_NOT_VERIFIED";
+  else state = (cancelReplyVerified || cancelReadVerified) && !conflicts.length ? "CANCEL_VERIFIED" : "CANCEL_NOT_VERIFIED";
   return freeze({
     ok: true, state, ref, reservationId, manifestHash, createVerification, cancelVerification, idsConsistent: ids.size <= 1, protectedIdSeen: protectedSeen, conflicts, clean: conflicts.length === 0,
     createAttempts: intents.create.length, cancelAttempts: intents.cancel.length,

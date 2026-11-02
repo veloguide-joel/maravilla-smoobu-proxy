@@ -366,3 +366,45 @@ test("launcher cancelVerification summary is an explicit allowlist; budgets and 
   assert.ok(k.indexOf("KW2_CANCEL") < k.indexOf("KC1_CANCEL_VERIFY") && k.indexOf("KC1_CANCEL_VERIFY") < k.indexOf("K8_POSTCANCEL") && k.indexOf("K8_POSTCANCEL") < k.indexOf("KC2_CANCEL_LOOKUP_VERIFY"));
   assert.equal(globalFetchCalls, 0);
 });
+
+// ---------- root HOLD 80b48b9: five proof mutations of an ACTUAL valid fallback journal must never report a verified cancel ----------
+test("root HOLD 80b48b9 regressions: foreign cancel-intent ref, ref on the cancel outcome, duplicate K8, extra foreign-id K8, foreign create-evidence id -> conflict, NOT_VERIFIED, never CANCEL_VERIFIED", async () => {
+  const v = validateConnectedManifest(manifest(), { now: NOW });
+  const w = world({ cancel: (x) => ({ ...x, customFieldValues: [] }) });
+  const { r, j } = await run(w);
+  assert.equal(r.cancelVerification.result, "READ_VERIFIED"); assert.equal(r.passed, true);
+  const base = j.entries.map(clone);
+  const ok = RC.classifyConnectedJournal(base, v.hash);
+  assert.deepEqual([ok.clean, ok.state, ok.cancelVerification.result, ok.createVerification.result], [true, "CANCEL_VERIFIED", "READ_VERIFIED", "REPLY_VERIFIED"]);
+  const id = w.res.id; const FOREIGN = "MV-ZZZZZZ99";
+  const at = (pred) => base.findIndex(pred);
+  const xiI = at((e) => e.type === "intent" && e.kind === "cancel"); const xoI = at((e) => e.type === "outcome" && e.kind === "cancel");
+  const kc2I = at((e) => e.step === "KC2_CANCEL_LOOKUP_VERIFY"); const k8 = base.find((e) => e.step === "K8_POSTCANCEL" && e.type === "read");
+  const coI = at((e) => e.type === "outcome" && e.kind === "create");
+  assert.ok(base[coI].evidence.reservation && base[coI].evidence.reservation.reservationId === id);
+  const variants = [
+    ["(1) cancel intent with a foreign ref", (es) => { es[xiI] = { ...es[xiI], ref: FOREIGN }; }, "CANCEL_INTENT_REF_NOT_THIS_RUN"],
+    ["(2) foreign ref added to the cancel outcome", (es) => { es[xoI] = { ...es[xoI], ref: FOREIGN }; }, "CANCEL_OUTCOME_CONTRADICTORY"],
+    ["(2b) the run ref added to the cancel outcome", (es) => { es[xoI] = { ...es[xoI], ref: base[xiI].ref }; }, "CANCEL_OUTCOME_CONTRADICTORY"],
+    ["(3) duplicate same-id K8 IDENTITY_OK right after KC2", (es) => { es.splice(kc2I + 1, 0, clone(k8)); }, "CANCEL_VERIFICATION_DUPLICATED"],
+    ["(4) extra K8 after KC2 with a foreign id", (es) => { es.splice(kc2I + 1, 0, { ...clone(k8), reservationId: id + 1 }); }, "RESERVATION_IDS_INCONSISTENT"],
+    ["(5) create evidence reservation id foreign", (es) => { es[coI] = { ...es[coI], evidence: { ...es[coI].evidence, reservation: { ...es[coI].evidence.reservation, reservationId: id + 1 } } }; },
+      "RESERVATION_IDS_INCONSISTENT"]
+  ];
+  for (const [name, mutate, conflict] of variants) {
+    const es = base.map(clone); mutate(es);
+    for (const e of es) assert.equal(canon(R.sanitizeJournalEntry(e, { steps: CONNECTED_STEPS })), canon(e), `fixture not sanitizer-valid: ${name}`);
+    const c = RC.classifyConnectedJournal(es, v.hash);
+    assert.equal(c.ok, true, name); assert.equal(c.clean, false, name); assert.ok(c.conflicts.includes(conflict), `${name}: ${c.conflicts}`);
+    // the cancel proof itself is unbound too (not only the global suppression) when the intent/outcome is not the producer's
+    if (name.startsWith("(1)") || name.startsWith("(2")) assert.ok(c.conflicts.includes("CANCEL_VERIFICATION_WITHOUT_UNECHOED_REF"), `${name}: ${c.conflicts}`);
+    assert.equal(c.cancelVerification.result, "NOT_VERIFIED", name); assert.notEqual(c.state, "CANCEL_VERIFIED", name);
+    assert.equal(c.createVerification.result, "NOT_VERIFIED", name);
+  }
+  // the same suppression on the strict REPLY path: a global contradiction never leaves a verified claim
+  const w2 = world(); const s2 = await run(w2); const b2 = s2.j.entries.map(clone);
+  const x2 = b2.findIndex((e) => e.type === "intent" && e.kind === "cancel"); b2[x2] = { ...b2[x2], ref: FOREIGN };
+  const c2 = RC.classifyConnectedJournal(b2, v.hash);
+  assert.deepEqual([c2.clean, c2.state, c2.cancelVerification.result], [false, "CANCEL_NOT_VERIFIED", "NOT_VERIFIED"]);
+  assert.equal(RC.classifyConnectedJournal(s2.j.entries, v.hash).state, "CANCEL_VERIFIED");                          // unmodified: unchanged
+});
