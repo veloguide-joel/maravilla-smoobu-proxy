@@ -1,5 +1,10 @@
 # E7.4b D1 / D2: DB evidence-link and owner-case contract (DESIGN ONLY), revision 3
 
+> **Current status (as of `abdcf91`):**
+> - **D2 is PRESENT.** Migration 0010 + the evidence-link helpers were accepted offline by root at `d801b43`. The implementation mapping is §12.
+> - **D1 is superseded by `claude/e74b-owner-case-contract.md`** (design only, not implemented). That document governs §3.11 (later conflict), §4, the D1 rows of §7, the 0011 part of §8, and the D1 tests of §9 / §11. Where the two differ, the owner-case contract wins. In particular, the "linked but later contradicted" durable path is now designed there (trigger-fed inbox), so it is no longer "unresolved" as written in §3.11.
+> - The "PROPOSED ONLY" wording below describes this document's state at revision 3.
+
 - **Branch:** `feature/e7-offline-charge-db-contract`.
   - Revision 1: `e772987`, cut from the accepted `4f6b27f`.
   - Revision 2 (`e21889b`) answered root's HOLD on `e772987`, items 1–8; its map is §10.
@@ -312,7 +317,7 @@ This covers API **and** dashboard evidence. Dashboard and legacy count-only rows
 
 **After finalisation, or with a linked row.** There is **no automatic surfacing and no flag in D2**. The link stays immutable and paid/public truth is unchanged.
 - Visibility is a **bounded read-only scan**: a documented query over linked recordings (≤ 500 rows per run, ordered by `observed_at`), run by the owner or the reporting role.
-- A durable owner-case path for "linked but later contradicted" is an **unresolved prerequisite before any dispatch-worker authorization**. No larger design is proposed now.
+- A durable owner-case path for "linked but later contradicted" is an **unresolved prerequisite before any dispatch-worker authorization**. No larger design is proposed now. *(Superseded: designed in `claude/e74b-owner-case-contract.md` §5.3 / §8; still not implemented.)*
 
 ### 3.9 Migration 0010 rollback contract [PROPOSED]
 
@@ -325,6 +330,8 @@ This covers API **and** dashboard evidence. Dashboard and legacy count-only rows
 ---
 
 ## 4. D1 (second): durable case-only holds
+
+> **Superseded by `claude/e74b-owner-case-contract.md`.** Kept for history only.
 
 ### 4.1 Reasons
 
