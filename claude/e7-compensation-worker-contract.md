@@ -72,7 +72,7 @@ The gate classifies the intent's COMPLETE capture history: every `stripe.capture
 | Class | Exact condition | Decision |
 |---|---|---|
 | **Z: no capture ever** | zero capture rows AND `capture_attempts = 0` | PASS. The normal `reservation_failed` void path, and `capture_failed` entered by `afterReservation` when `captureBefore` had already passed. No capture request can exist: one is only emitted together with `capture_attempts + 1` (E3 `afterReservation` / `RECONCILED_STILL_AUTHORIZED`). |
-| **P: initial row never sent** | exactly ONE capture row AND `capture_attempts = 1` AND row `state = pending` AND `attempts = 0` AND `dispatched_at IS NULL` | PASS. The DB proves it never left the outbox:<br>• 0004 `external_operations_guard` creates rows `pending` with `attempts = 0`;<br>• `attempts` may never decrease;<br>• a `reconcile_first` row may never move `in_flight` → `pending`;<br>• the only sender path (`claimNextOperation`) sets `in_flight`, `attempts + 1` and `dispatched_at` atomically.<br>The 0007 `CAPTURE_FENCE` makes the row unclaimable outside `reservation_confirmed`, and E3 has no route from `reservation_failed` / `capture_failed` back to `reservation_confirmed`. The row stays pending as audit; this worker never claims it. |
+| **P: initial row never sent** | exactly ONE capture row AND `capture_attempts = 1` AND row `state = pending` AND `attempts = 0` AND `dispatched_at IS NULL` | PASS. The DB proves it never left the outbox:<br>• 0004 `external_operations_guard` creates rows `pending` with `attempts = 0`;<br>• `attempts` may never decrease;<br>• a `reconcile_first` row may never move `in_flight` → `pending`;<br>• the only sender path (`claimNextOperation`) sets `in_flight`, `attempts + 1` and `dispatched_at` atomically.<br>The 0007 `CAPTURE_FENCE` makes the row unclaimable outside `reservation_confirmed`, and E3 has no route BACK from the E7.4 cleanup states (`reservation_failed`, `capture_failed`) to `reservation_confirmed`. Other E3 states, such as `capture_unknown` via RECONCILED_STILL_AUTHORIZED, do have routes into it. The row stays pending as audit; this worker never claims it. |
 | **D: sent or uncertain** | any capture row with `attempts > 0` or `dispatched_at` set, in ANY state, including `failed_definite`, `succeeded`, `outcome_unknown`, `escalated`, `in_flight`, and `RECONCILED_NOT_APPLIED` | PASS only with a fresh **canceled proof** (below); otherwise owner case. Pending / in-flight / unknown while the PI shows `requires_capture` can never pass. |
 | **M: more than one capture row, or `capture_attempts > 1`, or `capture_attempts` disagreeing with the rows** | | OWNER CASE in v1, even with canceled evidence. History reconciliation is deferred. |
 
@@ -172,19 +172,30 @@ The gate classifies the intent's COMPLETE capture history: every `stripe.capture
 - One recording per intent. Before ANY send, an executed list read (`hostaway.list_offline_charges`) must show NO existing charge carrying this intent's dedupe marker. Any match, or an unparsable list → owner case.
 - A reply alone is not success. A confirming list read must show exactly one charge with the marker and the exact amount/currency → row `succeeded` with the charge id → fenced OFFLINE_CHARGE_RECORDED → `confirmed`.
 - Unknown → owner case. OFFLINE_CHARGE_FAILED is never produced (I6). No second row is ever executed.
-- **Compatibility gap I7 (correction 3; no shared change proposed yet).** The only durable owner-case mechanism today is ESCALATE, which moves `payment_captured` → `reconciliation_required`. Through `publicStatus` (intent-state.js) that shows the guest `under_review` instead of `confirmed`, although the money is captured and the reservation exists.
-  - This applies to the planner's `OFFLINE_CHARGE_OUTCOME_UNKNOWN` operator plan and to E3's `OFFLINE_CHARGE_UNRECORDED` exhaustion.
-  - Proposed for a later reviewed change: a **case-only bookkeeping alert**, i.e. a reconciliation case (`reconciliation_cases`, kind e.g. `OFFLINE_CHARGE_UNRECORDED`) opened WITHOUT an intent state change, so the public status stays `confirmed`/paid. This needs a new DB-level entry point (the existing `openCase` helpers are internal to repo.js / operations.js) and root review.
-  - Until then E7.4b must NOT escalate a paid intent for bookkeeping. It leaves the row unknown and reports that.
+- **Compatibility gap I7 (correction 3; no shared change proposed).** Not every durable owner case requires ESCALATE.
+  - **Existing case-only path:** `operations.js` `markUnknown`, for a `non_idempotent` row (and `hostaway.record_offline_charge` is one), already opens a reconciliation case `OFFLINE_CHARGE_OUTCOME_UNKNOWN` through the internal `openCase`, WITHOUT changing the intent. An unknown offline-charge recording completed through `completeOperation(... outcome_unknown)` therefore leaves the intent `payment_captured` (public `confirmed`) with an open owner case. E7.4b reuses exactly this path, so no schema change is needed.
+  - **The gap is the escalation paths:**
+    - the shared planner's `planOfflineCharge` returns operator `OFFLINE_CHARGE_OUTCOME_UNKNOWN` for an unknown row, and the recovery helper's `escalateOperatorPlan` would ESCALATE it;
+    - E3's `OFFLINE_CHARGE_UNRECORDED` exhaustion also escalates.
+    
+    Both move `payment_captured` → `reconciliation_required` (public `under_review`), although the money is captured and the reservation exists.
+  - **E7.4b rule:** intercept that operator plan (never escalate a paid intent for bookkeeping) and rely on the existing case. Any other case-only alert kind would need a reviewed DB entry point; none is proposed now.
 
 ## 8. Blockers and decisions
 
-- **B1 (blocks E7.4b implementation, not independent work):** Hostaway offline-charge API facts. Next: an offline investigation of the official public docs (no credentials), recording only documented facts. The owner read-only shape check remains a later gate. No response formats are invented.
+- **B1 (blocks E7.4b implementation, not independent work):** Hostaway offline-charge API facts.
+  - **Root's public-doc finding of 2026-11-03** (https://api.hostaway.com/documentation; public-doc evidence only, no live contract validation):
+    - a "Create offline charge" section documents `POST /v1/guestPayments/charges/{reservationId}` with the fields title, description, amount, paymentMethod, status and scheduledDate (examples include `cash` and `paid`);
+    - `GET /guestPayments/charges/{guestChargeId}` is a single-charge read, NOT proof that a charge is absent from the list;
+    - the same doc confirms the cancel `PUT .../statuses/cancelled` with a host/guest body.
+  - **Still unproven:** whether description/title persist and can carry a dedupe marker; the allowed `paymentMethod` values (do NOT assume `cash` for Stripe bookkeeping); list filtering, paging and completeness for a reservation; the reply shapes; dedupe semantics.
+  - No endpoint is called and no format is invented. The owner read-only shape check remains a later gate.
 - **B2: decided.** No automatic resend (§5).
 - **B3: decided** as to the Stripe contract (§3.2). The adapter is not built: it comes in the pure foundation (§11), with no SDK and no client. The Hostaway cancel shape is live-verified only through the E4 runner (`PUT /v1/reservations/{rid}/statuses/cancelled`, body `{cancelledBy: "host"}`).
 - **B4: decided** (§6 arrival gate).
 - **B5: decided.** The I1 limitation is retained: an expired-authorization `capture_failed` with a dispatched capture is an owner path until a canceled proof exists. No shared E3 change.
-- **I7:** the case-only bookkeeping alert (§7) is an open compatibility gap for a later review.
+- **I7:** the planner and E3 escalation paths for bookkeeping are an open compatibility gap. E7.4b uses the existing non-idempotent unknown case (§7).
+- **R-REFUND (residual for the canceled proof):** after a canceled authorization, Stripe may report the latest charge with refund fields set. This is NOT verified. `piCanceledProofV3` stays conservative (`amount_refunded = 0` required), so such a shape refuses (owner case) until a separately reviewed amendment.
 
 ## 9. Executable offline test plan (E7.4a; fake Stripe/Hostaway, existing disposable local PG, node only)
 
