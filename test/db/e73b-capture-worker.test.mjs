@@ -11,6 +11,9 @@ import {
   runCaptureStep, captureWorkerGate, CAPTURE_EXECUTOR_KEYS, CAPTURE_LIMITS, CAPTURE_DEFAULT_TIMEOUTS, PROTECTED_HOSTAWAY_RESERVATION_IDS, OPS, _internal
 } from "../../lib/booking-db/capture-worker.js";
 import { validateAdapterConfig } from "../../lib/hostaway-reservations.js";
+import { paymentIntentProofObservationV3 } from "../../lib/checkout/capture-proof.js";
+import { loadRecoveryFacts, applyRecoveryPlan } from "../../lib/booking-db/recovery.js";
+import { planRecovery } from "../../lib/checkout/recovery-plan.js";
 
 let db;
 before(async () => { db = await startMigratedDatabase(); });
@@ -782,4 +785,135 @@ test("success-event fences (CONTRIVED invariant, owner-tampered disposable fixtu
     assert.equal(await events(a.id, "CAPTURE_SUCCEEDED"), 0, name);
     assert.notEqual((await loadIntent(db.app, a.id)).status, "payment_captured", name);
   }
+});
+
+// ---------------------------------------------------------------------------------------------
+// root HOLD on 479022a: cross-phase races (another actor moves the intent out of the capture phase meanwhile)
+
+const caseCount = (id) => F.count(db.app, "SELECT count(*) AS n FROM booking.reconciliation_cases WHERE intent_id = $1", [id]);
+/** Another actor completes the capture with a valid same-money event (e.g. the Stripe webhook path). */
+const webhookCaptured = (a, w, now) => {
+  const p = w.pis.get(a.piId); p.status = "succeeded"; p.received = 576000;
+  return applyEvent(db.app, a.id, { type: "CAPTURE_SUCCEEDED", id: `evt_webhook_${a.piId}`, amountMinor: 576000, currency: "mxn" }, { now, actor: "webhook" });
+};
+
+test("race (1): another actor captures during the pre-capture PI / reservation read -> the stale worker does nothing (no escalation of the paid intent)", async () => {
+  for (const at of ["pi", "res"]) {
+    const w = world();
+    const a = await capIntent(w, 21, { from: at === "pi" ? "2027-01-02" : "2027-02-02", to: at === "pi" ? "2027-01-06" : "2027-02-06" });
+    const h = harness(w, [21]);
+    const cases0 = await caseCount(a.id);
+    let done = false;
+    const hook = async () => { if (!done) { done = true; F.ok(await webhookCaptured(a, w, h.clk.t)); } };
+    if (at === "pi") w.onPiRead = hook; else w.onResRead = hook;
+    const r = await h.step({ intentId: a.id });
+    assert.ok(r.actions.some((x) => x === "ESCALATE!STALE_OUT_OF_SCOPE"), `${at} ${JSON.stringify(r.actions)}`);
+    assert.equal((await loadIntent(db.app, a.id)).status, "payment_captured", at);
+    assert.equal((await opsOf(a.id, "hostaway.record_offline_charge")).length, 1, `${at}: one offline charge`);
+    assert.equal(w.count("CAPTURE"), 0, `${at}: zero captures from the stale worker`);
+    assert.equal(await events(a.id, "ESCALATE"), 0, at);
+    assert.equal(await caseCount(a.id), cases0, `${at}: no extra case`);
+    // later steps leave the paid intent alone
+    for (let k = 0; k < 3; k++) { h.clk.t += 5 * MIN; await h.step(); }
+    assert.equal((await loadIntent(db.app, a.id)).status, "payment_captured", at);
+  }
+});
+
+test("race (2): another reconciler settles capture_unknown between the worker's facts/decision and its still-authorized escalation -> fenced, no escalation", async () => {
+  const w = world(); w.captureMode = "500";
+  const a = await capIntent(w, 22);
+  const h = harness(w, [22]);
+  await h.step({ intentId: a.id });                       // unknown, original NOT captured; reads show still authorized
+  let raced = false;
+  const beforeRecoveryEscalate = async (facts, code) => {
+    if (raced || code !== "CAPTURE_STILL_AUTHORIZED_UNRESOLVED") return;
+    raced = true;
+    // the provider now shows the original capture (it completed late); another reconciler records and applies it
+    const p = w.pis.get(a.piId); p.status = "succeeded"; p.received = 576000;
+    await F.piStatus(db.app, a.id, a.piId, "succeeded", paymentIntentProofObservationV3(w.piObj(p), { accountVerified: true }), (h.clk.t - F.T0) / MIN);
+    const f2 = await loadRecoveryFacts(db.app, facts.op.id);
+    const plan = planRecovery({ ...f2, now: h.clk.t });
+    assert.equal(plan.event && plan.event.type, "RECONCILED_CAPTURE_SUCCEEDED");
+    F.ok(await applyRecoveryPlan(db.app, plan, { now: h.clk.t }));
+  };
+  const seen = [];
+  for (let k = 0; k < 20 && !raced; k++) { h.clk.t += MIN; const r = await h.step({ intentId: a.id, hooks: { beforeRecoveryEscalate } }); seen.push(...r.actions); }
+  assert.ok(raced, "the still-authorized escalation decision was reached");
+  assert.ok(seen.some((x) => x === "RECOVERY:ESCALATE!STALE_OUT_OF_SCOPE" || x === "RECOVERY:ESCALATE:DUPLICATE_EVENT_ID"), JSON.stringify(seen));
+  assert.equal((await loadIntent(db.app, a.id)).status, "payment_captured");
+  assert.equal(await events(a.id, "ESCALATE"), 0);
+  assert.equal(await events(a.id, "RECONCILED_STILL_AUTHORIZED"), 0);
+  await oneCaptureRow(w, a.id, 1);
+});
+
+test("race (2b): another reconciler bumps capture_unknown (same state, new version) between the decision and the escalation -> fence refuses; re-decided on fresh facts", async () => {
+  // A distinct event id (op-inconclusive:*) keeps the state but advances the version: only the version/state fence (not
+  // event-id de-duplication or E3 route legality) can stop the stale decision here.
+  const w = world(); w.captureMode = "500";
+  const a = await capIntent(w, 23);
+  const h = harness(w, [23]);
+  await h.step({ intentId: a.id });
+  let raced = false; let staleVersion = null;
+  const beforeRecoveryEscalate = async (facts, code) => {
+    if (raced || code !== "CAPTURE_STILL_AUTHORIZED_UNRESOLVED") return;
+    raced = true; staleVersion = facts.intent.version;
+    F.ok(await applyEvent(db.app, a.id, { type: "RECONCILIATION_INCONCLUSIVE", id: `op-inconclusive:${facts.op.id}:other`, code: "OTHER_RECONCILER", subject: "payment" },
+      { now: h.clk.t, actor: "reconciler" }));
+  };
+  const seen = [];
+  for (let k = 0; k < 20 && !raced; k++) { h.clk.t += MIN; const r = await h.step({ intentId: a.id, hooks: { beforeRecoveryEscalate } }); seen.push(...r.actions); }
+  assert.ok(raced);
+  assert.ok(seen.includes("RECOVERY:ESCALATE!STALE_OUT_OF_SCOPE"), JSON.stringify(seen));
+  const mid = await loadIntent(db.app, a.id);
+  assert.equal(mid.status, "capture_unknown", "the stale decision escalated nothing");
+  assert.equal(await events(a.id, "ESCALATE"), 0);
+  assert.ok(mid.version > staleVersion);
+  // later, re-decided on FRESH facts: still authorized -> owner case (once), never a send
+  await h.until(a.id, isEnd, { max: 30, extra: { hooks: { beforeRecoveryEscalate } } });
+  assert.equal(await reasonOf(a.id), "CAPTURE_STILL_AUTHORIZED_UNRESOLVED");
+  assert.equal(await events(a.id, "ESCALATE"), 1);
+  await oneCaptureRow(w, a.id, 1);
+});
+
+test("race (3): the intent leaves the capture phase after the work claim and before maintenance -> its expired PI read row is untouched", async () => {
+  const w = world();
+  const a = await capIntent(w, 24);
+  const h = harness(w, [24]);
+  const rd = await requestRead(db.app, a.id, OPS.PI_READ, a.piId, { now: h.clk.t - 5 * MIN });
+  await claimNextOperation(db.app, { workerId: "x-old", now: h.clk.t - 5 * MIN, opId: rd });          // lease expired at -4 min
+  const before = (await db.app.query("SELECT state, lease_worker_id, updated_at, error_code FROM booking.external_operations WHERE id = $1", [rd])).rows[0];
+  await h.step({ intentId: a.id, hooks: { beforeMaintenance: async () => { F.ok(await webhookCaptured(a, w, h.clk.t)); } } });
+  const after = (await db.app.query("SELECT state, lease_worker_id, updated_at, error_code FROM booking.external_operations WHERE id = $1", [rd])).rows[0];
+  assert.deepEqual(after, before, "out-of-phase row unchanged");
+  assert.equal((await loadIntent(db.app, a.id)).status, "payment_captured");
+  assert.equal(w.count("CAPTURE"), 0);
+  // positive control: the same situation WITHOUT the transition is recovered by this worker
+  const b = await capIntent(w, 24, { from: "2027-01-02", to: "2027-01-06" });
+  const rb = await requestRead(db.app, b.id, OPS.PI_READ, b.piId, { now: h.clk.t - 5 * MIN });
+  await claimNextOperation(db.app, { workerId: "x-old", now: h.clk.t - 5 * MIN, opId: rb });
+  await h.step({ intentId: b.id, hooks: { beforeMaintenance: async () => {} } });
+  assert.notEqual((await db.app.query("SELECT state FROM booking.external_operations WHERE id = $1", [rb])).rows[0].state, "in_flight");
+});
+
+test("(4) pre-send uses CURRENT rows: a stale/cached plan (changed proof snapshot, reservation binding or request) is refused; the real plan sends", async () => {
+  // Focused guard test with an injected stale PLAN (no owner edits): DB invariants (0001 booking.intents guard) already forbid
+  // changing price, stay, PaymentIntent and reservation id, so a mismatch can only come from a stale in-memory plan.
+  const w = world();
+  const a = await capIntent(w, 25);
+  const h = harness(w, [25]);
+  const got = {};
+  await h.step({ intentId: a.id, hooks: { afterClaim: async (op, plan) => {
+    const ctx = { pool: db.app, workerId: "cw1", clock: () => h.clk.t, timeouts: CAPTURE_DEFAULT_TIMEOUTS, stepEndsAt: Number.POSITIVE_INFINITY, mono: () => 0 };
+    const elig = (snap) => ({ ...plan.eligibility, snapshot: { ...plan.eligibility.snapshot, ...snap } });
+    got.real = await _internal.preSendCapture(ctx, a.id, op.id, plan);
+    got.price = await _internal.preSendCapture(ctx, a.id, op.id, { ...plan, eligibility: elig({ priceMinor: 576001 }) });
+    got.deadline = await _internal.preSendCapture(ctx, a.id, op.id, { ...plan, eligibility: elig({ authorizationDeadline: plan.eligibility.snapshot.authorizationDeadline + 1 }) });
+    got.key = await _internal.preSendCapture(ctx, a.id, op.id, { ...plan, eligibility: elig({ idempotencyKey: "cap:other" }) });
+    got.res = await _internal.preSendCapture(ctx, a.id, op.id, { ...plan, reservation: { ...plan.reservation, reservationId: "1" } });
+    got.req = await _internal.preSendCapture(ctx, a.id, op.id, { ...plan, request: { ...plan.request, params: { ...plan.request.params, amount_to_capture: 100 } } });
+  } } });
+  assert.deepEqual(got, { real: null, price: "PROOF_SNAPSHOT_CHANGED", deadline: "PROOF_SNAPSHOT_CHANGED", key: "PROOF_SNAPSHOT_CHANGED",
+    res: "RESERVATION_BINDING_CHANGED", req: "REQUEST_INVALID_FOR_CURRENT" });
+  assert.equal((await loadIntent(db.app, a.id)).status, "payment_captured");
+  assert.equal(w.count("CAPTURE"), 1);
 });
