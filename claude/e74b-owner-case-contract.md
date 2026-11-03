@@ -82,7 +82,7 @@
 |---|---|---|---|---|
 | `ATTEMPT_GT1` | latest recording; `pending`; key attempt > 1; `dispatched_at` NULL | `payment_captured` | `open_recording_visibility_hold` | 0011 |
 | `SUCCEEDED_UNPROVEN` | latest; `succeeded`; `result_ref` set; link NULL | `payment_captured` or `confirmed` | `open_recording_visibility_hold` | 0011 |
-| `LINKED_CONTRADICTED` | latest; `succeeded`; linked; the inbox item's evidence contradicts it | `payment_captured` or `confirmed` | inbox processor only | 0011 |
+| `LINKED_CONTRADICTED` | latest; `succeeded`; linked; the inbox item's evidence contradicts it (exact shared predicate) | **any current intent state** (root-accepted extension at `cd77088` review; visibility only, e.g. a linked booking later moved to `reconciliation_required`) | inbox processor only | 0011 |
 | `PREFLIGHT_EXHAUSTED`, `PREFLIGHT_CONFLICT_MARKER` / `_LOOKALIKE` / `_SAME_AMOUNT` | latest; `pending`; key `:1`; `attempts 0`; undispatched | `payment_captured` | `open_recording_preflight_hold` (worker) | 0012 |
 
 **Dispatched unknown sends** stay on the existing owner-only path (`OFFLINE_CHARGE_OUTCOME_UNKNOWN` → `admin_resolve_operation`). Nothing fakes `dispatched_at` or `outcome_unknown`.
@@ -272,7 +272,7 @@ booking.process_recording_conflict_inbox_one(p_by text) RETURNS jsonb   -- {evid
    - PostgreSQL rolls back the subtransaction **and releases the locks it acquired**;
    - the function then updates only the inbox row: `attempts + 1`, `last_error = SQLSTATE`, `last_attempt_at`;
    - it returns `{error}`. The item stays **unprocessed**.
-5. Errors **outside** the block (the initial SELECT, or the attempt-accounting UPDATE) abort the whole call: nothing is recorded or marked. The helper treats that as a failed call and continues with its bound.
+5. Errors **outside** the block (the initial SELECT, or the attempt-accounting UPDATE) abort the whole call: nothing is recorded or marked. The drain helper then **stops immediately** and re-throws the original error, with no further query and no retry (root R1 at `cd77088`).
 
 **Why this cannot cycle (inferred; tested in T-H2).**
 - The only lock held across the block is the single inbox row, which no other party waits for (`SKIP LOCKED`; the trigger only inserts new rows).
@@ -546,13 +546,13 @@ Its down refuses if any assessment or preflight hold exists. 0011 is complete an
 | `admin_resolve_recording_hold(hold, decision, evidence[], linked_evidence, resolver, justification, at)` (admin only) | `keep_visible`: evidence may be empty; an identical resubmission returns the earlier id. `link_full_proof` (`SUCCEEDED_UNPROVEN` only): proof validator (`owner_historical`) at `v_t` + candidate-reference conflict check; decision + link + release + (last-hold) case resolution in one transaction; does not call `link_recording_evidence`; no bypass input. A same-proof replay on the released hold returns the earlier decision id. The case `resolved_at` is `v_t` (DB time). |
 | Down | Precondition: no hold / observation / decision, and no inbox item with `attempts > 0` or `processed_at`. Then the replaced 0010 / 0004 / 0003 bodies are restored verbatim. Measured: the schema equals a fresh cluster at 10 (bodies, ACLs, triggers, columns, grants, policies, constraints). |
 
-### Deviations from R2 (implementation choices; flagged for root)
+### Deviations from R2 (all three accepted by root at the `cd77088` review)
 
 | # | Deviation |
 |---|---|
-| 1 | `LINKED_CONTRADICTED` opens for **any** intent state of a linked latest recording (R2 table: `payment_captured` / `confirmed`). Visibility only, never a state change; it avoids a poison item if an intent later moved on. |
-| 2 | The drain helper stops a run when the **same item errors twice** in that run (`stoppedOnRepeatedError`); the item stays queued with its attempts. This prevents one poison item from consuming the whole call bound. |
-| 3 | `scripts/db-smoke.mjs` (outside the allowed-file list) needed the 4 tables `[SELECT]` in its exact privilege matrix and the table count 18 → 22. Validation tooling only, no runtime behaviour. |
+| 1 | `LINKED_CONTRADICTED` opens for **any** intent state of a linked latest recording; §3 is updated. Accepted as a conservative extension: it still requires the latest succeeded linked recording and the exact shared positive predicate, and changes no intent / version / effect / link. Regression T-C10 covers a linked booking moved to `reconciliation_required` through the supported ESCALATE path. |
+| 2 | The drain helper stops a run when the **same SQL-recorded item error** happens twice in that run (`stoppedOnRepeatedError`). The item stays queued with its attempts and audit; this is not a complete drain and carries no latency claim. Accepted. |
+| 3 | `scripts/db-smoke.mjs`: the 4 tables `[SELECT]` in its exact privilege matrix and the table count 18 → 22. Accepted as necessary validation maintenance; no role grant is widened. |
 | 4 | The admin helper is `db/lib/admin.js` → `adminResolveRecordingHold` (the existing admin module). |
 
 ### Helpers
@@ -561,8 +561,16 @@ Its down refuses if any assessment or preflight hold exists. 0011 is complete an
 - `RECORD_FENCE` in **both** claim stages;
 - `listRecordingContradictions` is a thin caller of the page function;
 - `openRecordingVisibilityHold`;
-- `drainRecordingConflictInbox(pool, { by, maxCalls ≤ 100 })`: requires a `pg.Pool`; independent autocommit calls; failed calls count against the bound; no retries; `errors` (DB-recorded item errors) and `failures` (outer, nothing marked) are reported separately;
-- `linkRecordingEvidence(…, { openVisibilityHoldOnConflict })`: an optional **separate** best-effort hold. The original refusal is always returned, with `visibilityHold` beside it; this is not DB-atomic with the link.
+- `drainRecordingConflictInbox(pool, { by, maxCalls ≤ 100 })`: requires a `pg.Pool`; independent autocommit calls; no retries.
+  - SQL-recorded item errors are returned data, accumulated in `errors` under the bound.
+  - A **thrown** call (outer failure) stops the run at once and **re-throws the original error object** unchanged. Bounded partial progress is attached as a non-enumerable `err.drainProgress = { calls, processed, errors }`, and no further query is issued. (Root R1 at `cd77088`; the earlier `failures` accumulation is removed.)
+  - T-H3 covers a first-call failure and a failure after one processed item, with exact query counts and the remaining items untouched;
+- `linkRecordingEvidence(…, { openVisibilityHoldOnConflict })`: an optional **separate** best-effort hold, exactly one attempt, never retried. The original `RECORDING_EVIDENCE_CONFLICT` result is always returned, with `visibilityHold` beside it:
+  - the opener's result;
+  - its known refusal code;
+  - for any other failure of that optional call, `{ ok:false, error:'VISIBILITY_HOLD_CALL_FAILED', code }`, where `code` is a SQLSTATE / errno only, with no server or connection message.
+
+  Errors of the primary link call are not caught. This is not DB-atomic with the link. (Root R2 at `cd77088`; T-L1 covers success, a known refusal, an outer error, the option disabled, and a primary outer error.)
 
 `lib/booking-db/repo.js`:
 - `DB_SAFETY_CODES` additions;
@@ -584,7 +592,7 @@ Its down refuses if any assessment or preflight hold exists. 0011 is complete an
 
 ### Tests
 
-`test/db/e74b-d1-owner-cases.test.mjs`, 23 tests: T-A1–A3, T-B1–B4, T-P1–P3, T-C1–C9, T-H1–H2, T-D1–D3, T-E1–E2, T-G2–G3. Plus the 0011 round trip in `migrations.test.mjs` (T-G1).
+`test/db/e74b-d1-owner-cases.test.mjs`, 26 tests: T-A1–A3, T-B1–B4, T-P1–P3, T-C1–C10, T-H1–H3, T-L1, T-D1–D3, T-E1–E2, T-G2–G3. Plus the 0011 round trip in `migrations.test.mjs` (T-G1).
 
 **Observed lock behaviour (measured in these tests; not a universal claim):**
 

@@ -82,12 +82,12 @@ async function attempt2Pending() {
   return { c, a1, a2, api, dsh };
 }
 const drainAll = async (pool = db.app) => {
-  let total = { processed: [], errors: [], failures: [], drained: false, stoppedOnRepeatedError: false, calls: 0 };
+  let total = { processed: [], errors: [], drained: false, stoppedOnRepeatedError: false, calls: 0 };
   for (let k = 0; k < 50; k++) {
     const o = await drainRecordingConflictInbox(pool, { by: "test-drain" });
-    total = { processed: [...total.processed, ...o.processed], errors: [...total.errors, ...o.errors], failures: [...total.failures, ...o.failures],
+    total = { processed: [...total.processed, ...o.processed], errors: [...total.errors, ...o.errors],
       drained: o.drained, stoppedOnRepeatedError: o.stoppedOnRepeatedError, calls: total.calls + o.calls };
-    if (o.drained || o.stoppedOnRepeatedError || o.failures.length) return total;
+    if (o.drained || o.stoppedOnRepeatedError) return total;
   }
   return total;
 };
@@ -546,7 +546,7 @@ test("T-C7/C8: a poison item records attempts / last_error durably, stays unproc
   assert.deepEqual([q.outcome, q.attempts], ["contradiction_opened", 2], "error history kept on success");
 });
 
-test("T-H1 (addendum C): the drain helper makes <= maxCalls independent autocommit calls, counts failed calls against the bound, never retries; a held item lock does not block another item", async () => {
+test("T-H1 (addendum C): the drain helper makes <= maxCalls independent autocommit calls, never retries; a held item lock does not block another item", async () => {
   const l = await linked();
   await drainAll();                                                                           // l's own proof item
   const evs = [await evAt(l.c, cnt([l.id])), await evAt(l.c, cnt([l.id])), await evAt(l.c, cnt([l.id]))];
@@ -555,15 +555,8 @@ test("T-H1 (addendum C): the drain helper makes <= maxCalls independent autocomm
   const d2 = await drainRecordingConflictInbox(db.app, { by: "t", maxCalls: 100 });
   assert.deepEqual([d2.processed.length, d2.drained], [1, true]);
   for (const e of evs) assert.equal((await inbox(e)).outcome, "consistent");
-  // outer failures (a login without EXECUTE): counted against the bound, reported separately, nothing marked
+  // an outer (thrown) failure stops the run and propagates: see T-H3
   const x = await evAt(l.c, cnt([l.id]));
-  const report = new pg.Pool({ connectionString: db.reportUrl(), max: 2 });
-  try {
-    const d3 = await drainRecordingConflictInbox(report, { by: "t", maxCalls: 3 });
-    assert.deepEqual([d3.calls, d3.failures.length, d3.processed.length, d3.drained], [3, 3, 0, false]);
-    assert.equal(d3.failures[0].code, "42501");
-  } finally { await report.end(); }
-  assert.equal((await inbox(x)).processed_at, null);
   const single = await asAppClient();
   try { await assert.rejects(drainRecordingConflictInbox(single, { by: "t" }), TypeError, "a single client (possible shared transaction) is refused"); }
   finally { await single.end(); }
@@ -628,8 +621,105 @@ test("T-H2 (addendum C): wrapping several calls in ONE transaction per caller wi
   // the supported contract: independent autocommit calls, even interleaved across intents, never hold two intents' locks
   const more = [await evAt(A.c, cnt([A.id])), await evAt(B.c, cnt([B.id])), await evAt(B.c, cnt([B.id])), await evAt(A.c, cnt([A.id]))];
   const out = await Promise.all([drainAll(), drainAll()]);
-  assert.ok(out.every((o) => o.failures.length === 0 && o.errors.length === 0), JSON.stringify(out.map((o) => o.errors)));
+  assert.ok(out.every((o) => o.errors.length === 0), JSON.stringify(out.map((o) => o.errors)));
   for (const e of [...more, victim]) assert.equal((await inbox(e)).outcome, "consistent");
+});
+
+/** a pg.Pool-shaped wrapper that counts queries and can throw a given error instead of running a chosen query */
+function countingPool(inner, failWhen = () => null) {
+  const p = { calls: [], totalCount: 0, connect: (...a) => inner.connect(...a),
+    query: async (sql, params) => { p.calls.push(sql); const e = failWhen(sql, p.calls.length); if (e) throw e; return inner.query(sql, params); } };
+  return p;
+}
+const pending = async (evs) => Promise.all(evs.map(async (e) => { const q = await inbox(e); return [q.processed_at, q.attempts]; }));
+
+test("T-H3 (root R1): an outer (thrown) failure stops the drain IMMEDIATELY and re-throws the ORIGINAL error — first call, and after one processed item; exact query counts; remaining items untouched; no retry", async () => {
+  const l = await linked();
+  await drainAll();
+  const evs = [await evAt(l.c, cnt([l.id])), await evAt(l.c, cnt([l.id])), await evAt(l.c, cnt([l.id]))];
+  // (a) first call fails (a real server error: a login without EXECUTE)
+  const report = new pg.Pool({ connectionString: db.reportUrl(), max: 1 });
+  try {
+    const rp = countingPool(report);
+    let caught;
+    await assert.rejects(drainRecordingConflictInbox(rp, { by: "t", maxCalls: 3 }), (e) => { caught = e; return true; });
+    assert.equal(caught.code, "42501");
+    assert.ok(caught instanceof Error && /permission denied/.test(caught.message), "original server error, not a wrapper");
+    assert.equal(rp.calls.length, 1, "no second query after the thrown call");
+    assert.deepEqual([caught.drainProgress.calls, caught.drainProgress.processed.length, caught.drainProgress.errors.length], [1, 0, 0]);
+  } finally { await report.end(); }
+  assert.deepEqual(await pending(evs), [[null, 0], [null, 0], [null, 0]], "nothing touched");
+  // (b) one item processed, then the second call throws (synthetic connection error object)
+  const boom = Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+  const ap = countingPool(db.app, (sql, n) => (n === 2 ? boom : null));
+  let caught2;
+  await assert.rejects(drainRecordingConflictInbox(ap, { by: "t", maxCalls: 100 }), (e) => { caught2 = e; return true; });
+  assert.equal(caught2, boom, "the very same error object is propagated");
+  assert.equal(ap.calls.length, 2);
+  assert.deepEqual([caught2.drainProgress.calls, caught2.drainProgress.processed.map((x) => x.evidenceId)], [2, [evs[0]]]);
+  const st = await pending(evs);
+  assert.ok(st[0][0] !== null, "the first item was processed");
+  assert.deepEqual(st.slice(1), [[null, 0], [null, 0]], "remaining items untouched (no attempt recorded)");
+  const rest = await drainRecordingConflictInbox(db.app, { by: "t" });
+  assert.deepEqual(rest.processed.map((x) => x.evidenceId).filter((e) => evs.includes(e)), evs.slice(1));
+});
+
+test("T-L1 (root R2): the optional separate visibility hold after a link conflict never replaces the original refusal — success, known refusal, outer error (bounded code, no message), disabled; a primary link outer error propagates; exactly one hold attempt", async () => {
+  const mk = async () => {
+    const b = await ownerSucceededUnlinked();
+    await dash(b.c, b.c.reservationId, cnt([cid()]), new Date(F.at(35)));
+    return { ...b, proof: await evAt(b.c, obs(b.c, b.id), F.at(40)) };
+  };
+  const isHold = (sql) => sql.includes("open_recording_visibility_hold");
+  const isLink = (sql) => sql.includes("link_recording_evidence");
+  // success (real pool)
+  const a = await mk();
+  const ok = await linkRecordingEvidence(db.app, a.op.id, { evidenceId: a.proof, openVisibilityHoldOnConflict: true });
+  assert.equal(ok.error, "RECORDING_EVIDENCE_CONFLICT");
+  assert.ok(ok.visibilityHold.ok && ok.visibilityHold.holdId === (await holdsOf(a.c.id))[0].id);
+  const b = await mk();
+  // known refusal of the hold call
+  const known = countingPool(db.app, (sql) => (isHold(sql) ? Object.assign(new Error("HOLD_TARGET_STATE: probe"), { code: "23514" }) : null));
+  assert.deepEqual(await linkRecordingEvidence(known, b.op.id, { evidenceId: b.proof, openVisibilityHoldOnConflict: true }),
+    { ok: false, error: "RECORDING_EVIDENCE_CONFLICT", visibilityHold: { ok: false, error: "HOLD_TARGET_STATE" } });
+  assert.equal(known.calls.filter(isHold).length, 1);
+  // outer error of the hold call: caught, bounded, no message / credential leak
+  const outer = countingPool(db.app, (sql) => (isHold(sql) ? Object.assign(new Error("socket hang up postgresql://u:secret@h/db"), { code: "ECONNRESET" }) : null));
+  const r2 = await linkRecordingEvidence(outer, b.op.id, { evidenceId: b.proof, openVisibilityHoldOnConflict: true });
+  assert.deepEqual(r2, { ok: false, error: "RECORDING_EVIDENCE_CONFLICT", visibilityHold: { ok: false, error: "VISIBILITY_HOLD_CALL_FAILED", code: "ECONNRESET" } });
+  assert.doesNotMatch(JSON.stringify(r2), /secret|socket|postgresql/);
+  assert.equal(outer.calls.filter(isHold).length, 1, "exactly one hold attempt, no retry");
+  const weird = countingPool(db.app, (sql) => (isHold(sql) ? Object.assign(new Error("x"), { code: "not a code; secret" }) : null));
+  assert.equal((await linkRecordingEvidence(weird, b.op.id, { evidenceId: b.proof, openVisibilityHoldOnConflict: true })).visibilityHold.code, null);
+  // disabled option: no hold call
+  const off = countingPool(db.app);
+  assert.deepEqual(await linkRecordingEvidence(off, b.op.id, { evidenceId: b.proof }), { ok: false, error: "RECORDING_EVIDENCE_CONFLICT" });
+  assert.equal(off.calls.filter(isHold).length, 0);
+  // primary link outer error: propagated unchanged, no hold attempt
+  const boom = Object.assign(new Error("connection terminated"), { code: "ECONNRESET" });
+  const prim = countingPool(db.app, (sql) => (isLink(sql) ? boom : null));
+  await assert.rejects(linkRecordingEvidence(prim, b.op.id, { evidenceId: b.proof, openVisibilityHoldOnConflict: true }), (e) => e === boom);
+  assert.equal(prim.calls.filter(isHold).length, 0);
+  assert.deepEqual(await holdsOf(b.c.id), [], "none of the failed / refused / disabled variants opened a hold");
+  assert.equal((await row(b.op.id)).settled_evidence_id, null);
+});
+
+test("T-C10 (root flag 2): a linked booking that has moved to reconciliation_required (supported ESCALATE path) — a new contradiction is processed once and opens visibility; state / version / link / effects unchanged", async () => {
+  const l = await linked();
+  F.ok(await applyEvent(db.app, l.c.id, { type: "ESCALATE", code: "TEST_ESCALATION" }, { now: Date.now() }));
+  assert.equal((await facts(l.c.id)).state, "reconciliation_required");
+  await drainAll();
+  const s0 = await snapshot(l.c);
+  const x = await evAt(l.c, cnt([cid()]));
+  await drainAll();
+  const q = await inbox(x);
+  assert.equal(q.outcome, "contradiction_opened");
+  const [h] = await holdsOf(l.c.id);
+  assert.deepEqual([h.reason, h.intent_state_at_hold, h.operation_id], ["LINKED_CONTRADICTED", "reconciliation_required", l.op.id]);
+  assert.deepEqual(await obsOf(h.id), [x]);
+  assert.deepEqual(await snapshot(l.c), s0, "no state / version / op / link / effect change");
+  await drainAll();
+  assert.deepEqual([(await inbox(x)).processed_at, (await obsOf(h.id)).length], [q.processed_at, 1], "processed once");
 });
 
 test("T-D1: visibility holds — SUCCEEDED_UNPROVEN on payment_captured and on an inherited confirmed row, ATTEMPT_GT1 on a genuine pending attempt 2; no state / version / op / effect change", async () => {

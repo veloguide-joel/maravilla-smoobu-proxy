@@ -3,7 +3,7 @@
 > **Current status (as of `abdcf91`):**
 > - **D2 is PRESENT.** Migration 0010 + the evidence-link helpers were accepted offline by root at `d801b43`. The implementation mapping is §12.
 > - **D1 is superseded by `claude/e74b-owner-case-contract.md`** (revision 2 after root's HOLD on `f411105`; design only, not implemented). That document governs §3.11 (later conflict), §4, the D1 rows of §7, the 0011 part of §8, and the D1 tests of §9 / §11. Where the two differ, the owner-case contract wins. In particular, the "linked but later contradicted" durable path is now designed there (trigger-fed inbox), so it is no longer "unresolved" as written in §3.11.
-> - **D1-0011 is implemented offline** on `feature/e7-offline-charge-owner-cases` (from `68f30ca`): mapping in `claude/e74b-owner-case-contract.md` §13. 0012 / preflight is not implemented.
+> - **D1-0011 is implemented offline** on `feature/e7-offline-charge-owner-cases` (from `68f30ca`; helper corrections R1 / R2 after root's HOLD on `cd77088`): mapping in `claude/e74b-owner-case-contract.md` §13. 0012 / preflight is not implemented.
 > - The "PROPOSED ONLY" wording below describes this document's state at revision 3.
 
 - **Branch:** `feature/e7-offline-charge-db-contract`.
