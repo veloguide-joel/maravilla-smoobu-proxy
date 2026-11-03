@@ -164,7 +164,7 @@ test("least privilege: runtime role has no DDL; report role cannot read guest da
   assert.ok((await report.query("SELECT count(*) FROM booking.intents")).rows[0]);
   await assert.rejects(report.query("UPDATE booking.intent_work SET next_action_at = NULL"), /permission denied/);
   const rls = (await db.owner.query("SELECT relname, relrowsecurity FROM pg_class WHERE relnamespace = 'booking'::regnamespace AND relkind = 'r'")).rows;
-  assert.equal(rls.length, 17);
+  assert.equal(rls.length, 18);   // + api_rate_limits (E6, 0006)
   assert.ok(rls.every((r) => r.relrowsecurity), "RLS enabled everywhere");
   const pub = (await db.owner.query("SELECT has_schema_privilege('public', 'booking', 'USAGE') AS u")).rows[0].u;
   assert.equal(pub, false, "PUBLIC has no access to schema booking");

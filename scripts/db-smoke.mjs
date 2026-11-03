@@ -31,12 +31,13 @@ const EXPECTED_TABLE_PRIVS = {
   hostaway_reservation_attempts: [S, I, U], payment_refunds: [S, I, U], stripe_webhook_events: [S, I, U],
   inventory_claims: [S, I], reconciliation_cases: [S, I],
   intent_transitions: [S, I], intent_applied_events: [S, I], payment_ledger: [S, I], intent_guests: [S, I],
-  provider_evidence: [S], reconciliation_resolutions: [S], definite_refusal_codes: [S]
+  provider_evidence: [S], reconciliation_resolutions: [S], definite_refusal_codes: [S],
+  api_rate_limits: []   // E6 (0006): no direct table privilege; only booking.rate_limit_hit()
 };
 const ALL_PRIVS = ["SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"];
 const FUNCS_ALLOWED = ["booking.claim_release_blockers(uuid)", "booking.release_claim_if_safe(uuid,text)",
   "booking.release_completed_stays()", "booking.purge_guest_data(integer,integer)", "booking.settle_operation_from_evidence(uuid,uuid)",
-  "booking.record_provider_evidence(uuid,text,text,text,jsonb,text)"];
+  "booking.record_provider_evidence(uuid,text,text,text,jsonb,text)", "booking.rate_limit_hit(text,integer,integer)"];
 const FUNCS_DENIED = ["booking.admin_resolve_operation(uuid,text,uuid[],text,text,text,timestamptz)",
   "booking.admin_resolve_intent(uuid,text,uuid[],text,text,text,timestamptz)", "booking.admin_close_case(uuid,uuid[],text,text,timestamptz)",
   "booking.admin_record_evidence(uuid,text,text,text,jsonb,timestamptz,text,text)", "booking.admin_acquire_claim(uuid,timestamptz)"];
@@ -147,7 +148,7 @@ async function main() {
         const want = [...(EXPECTED_TABLE_PRIVS[t] || [])].sort().join(","), got = [...(actual[t] || [])].sort().join(",");
         if (want !== got) diffs.push(`${t}: expected ${want || "none"} got ${got || "none"}`);
       }
-      check("table_privilege_matrix_exact", diffs.length === 0 && tables.size === 17, diffs.length ? diffs : `${tables.size} tables`);
+      check("table_privilege_matrix_exact", diffs.length === 0 && tables.size === 18, diffs.length ? diffs : `${tables.size} tables`);
       check("no_delete_or_truncate_anywhere", !privRows.some((r) => r.ok && (r.priv === "DELETE" || r.priv === "TRUNCATE")));
 
       const fn = async (sig) => (await q("SELECT has_function_privilege(current_user, $1, 'EXECUTE') AS ok", [sig]))[0].ok;
@@ -159,8 +160,9 @@ async function main() {
 
       await client.query("SAVEPOINT data");
       try {
-        // Every expected booking table (fixed names from EXPECTED_TABLE_PRIVS): only instance may hold one row.
-        const names = Object.keys(EXPECTED_TABLE_PRIVS).sort();
+        // Every expected booking table the runtime login may read (fixed names from EXPECTED_TABLE_PRIVS): only instance may
+        // hold one row. (api_rate_limits, E6, is not readable by the runtime role at all; the privilege matrix checks it.)
+        const names = Object.keys(EXPECTED_TABLE_PRIVS).filter((t) => EXPECTED_TABLE_PRIVS[t].includes(S)).sort();
         const [c0] = await q(`SELECT ${names.map((t) => `(SELECT count(*) FROM booking.${t})::int AS ${t}`).join(", ")}`);
         const unexpected = names.filter((t) => c0[t] !== (t === "instance" ? 1 : 0));
         check("data_only_instance_row", unexpected.length === 0, unexpected.length ? unexpected : `${names.length} tables`);

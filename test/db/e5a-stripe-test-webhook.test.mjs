@@ -430,3 +430,53 @@ test("interrupted-create recovery refuses a read session that differs in object,
     assert.deepEqual((await createOps(id)).map((o) => o.state), ["succeeded"], code);
   }
 });
+
+test("E6 regression: a second request records the session while the creator is between completing the create and recording it -> both succeed with the SAME session; one create", async () => {
+  // deterministic interleaving: A creates and completes its outbox row; before A records, B runs to completion
+  // (B takes the interrupted-create recovery path: reads the known session and records it). A must then adopt it.
+  const w = world();
+  const id = await F.withDetails(db.app, { listingId: L(90) });
+  let b = null;
+  const a = await startTestCheckout(db.app, id, { env: ENV_OK, stripe: w.stripe, now: F.at(2),
+    hooks: { beforeRecord: async () => { b = await startTestCheckout(db.app, id, { env: ENV_OK, stripe: w.stripe, now: F.at(2) }); } } });
+  assert.deepEqual([b.ok, b.recovered], [true, true], JSON.stringify(b));
+  assert.equal(a.ok, true, JSON.stringify(a));
+  assert.equal(a.sessionId, b.sessionId);
+  assert.equal(w.creates.length, 1);
+  assert.equal(await F.state(db.app, id), "payment_pending");
+  // the other order: B (recovery) loses the record race to A -> B adopts, no exception
+  const w2 = world();
+  const id2 = await F.withDetails(db.app, { listingId: L(91) });
+  const crash = Object.assign(new Error("killed"), { code: "SIMULATED_CRASH" });
+  await assert.rejects(startTestCheckout(db.app, id2, { env: ENV_OK, stripe: w2.stripe, now: F.at(2), hooks: { beforeRecord: async () => { throw crash; } } }));
+  const [sid] = [...w2.sessions.keys()];
+  const realRetrieve = w2.stripe.checkout.sessions.retrieve;
+  let c2 = null;
+  w2.stripe.checkout.sessions.retrieve = async (x, ...rest) => {
+    const s = await realRetrieve(x, ...rest);
+    if (!c2) c2 = await startTestCheckout(db.app, id2, { env: ENV_OK, stripe: { ...w2.stripe, checkout: { sessions: { ...w2.stripe.checkout.sessions, retrieve: realRetrieve } } }, now: F.at(3) });
+    return s;
+  };
+  const r2 = await startTestCheckout(db.app, id2, { env: ENV_OK, stripe: w2.stripe, now: F.at(3) });
+  assert.deepEqual([c2.ok, c2.sessionId], [true, sid], JSON.stringify(c2));
+  assert.deepEqual([r2.ok, r2.sessionId], [true, sid], JSON.stringify(r2));
+  assert.equal(w2.creates.length, 1);
+  assert.equal(await F.state(db.app, id2), "payment_pending");
+});
+
+test("E6 regression: concurrent startTestCheckout calls for one intent -> exactly one create, no exception, the same session for every success", async () => {
+  const w = world();
+  const realCreate = w.stripe.checkout.sessions.create;
+  w.stripe.checkout.sessions.create = async (...a) => { await new Promise((r) => setTimeout(r, 15)); return realCreate(...a); };
+  const id = await F.withDetails(db.app, { listingId: L(92) });
+  const out = await Promise.all(Array.from({ length: 6 }, () => startTestCheckout(db.app, id, { env: ENV_OK, stripe: w.stripe, now: F.at(2) })));
+  assert.equal(w.creates.length, 1);
+  const ok = out.filter((r) => r.ok);
+  assert.ok(ok.length >= 1);
+  assert.equal(new Set(ok.map((r) => r.sessionId)).size, 1);
+  for (const r of out) assert.ok(r.ok || r.error === "CHECKOUT_CREATE_IN_PROGRESS", JSON.stringify(r));
+  assert.equal(await F.state(db.app, id), "payment_pending");
+  const again = await startTestCheckout(db.app, id, { env: ENV_OK, stripe: w.stripe, now: F.at(3) });
+  assert.deepEqual([again.ok, again.sessionId], [true, ok[0].sessionId]);
+  assert.equal(w.creates.length, 1);
+});

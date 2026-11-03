@@ -65,6 +65,8 @@ const EXPECTED_API_FILES = Object.freeze([
   "api/booking/calendar.js",
   "api/booking/listings.js",
   "api/booking/quote.js",
+  "api/checkout/intent-step.js",
+  "api/checkout/intents.js",
   "api/checkout/stripe-webhook.js",
   "api/health.js",
   "api/hostaway/calendar.js",
@@ -93,6 +95,8 @@ test("the api/ directory contains exactly the expected files", () => {
 // the TEST-only webhook wrapper after its gate. Everything else keeps the original E1 rules.
 const E5A_CHECKOUT_CREATE_FILE = "lib/checkout/stripe-test-mode.js";
 const E5A_SDK_LOADER_FILE = "lib/checkout/stripe-webhook-http.js";
+// E6 (offline, gated TEST intent API): the second and last SDK loader; it never names Checkout creation itself.
+const E6_SDK_LOADER_FILE = "lib/checkout/intent-api-http.js";
 
 test("no deployed code can create Stripe sessions, write the database or call Smoobu", () => {
   const files = [...listFiles(join(ROOT, "api")), ...listFiles(join(ROOT, "lib"))]
@@ -100,7 +104,7 @@ test("no deployed code can create Stripe sessions, write the database or call Sm
   for (const f of files) {
     const src = readFileSync(f, "utf8");
     if (rel(f) !== E5A_CHECKOUT_CREATE_FILE) assert.equal(/checkout\.sessions\.create/.test(src), false, `${rel(f)} contains Checkout Session creation`);
-    if (rel(f) !== E5A_SDK_LOADER_FILE) assert.equal(/import\(\s*["']stripe["']\s*\)/.test(src), false, `${rel(f)} loads the Stripe SDK`);
+    if (![E5A_SDK_LOADER_FILE, E6_SDK_LOADER_FILE].includes(rel(f))) assert.equal(/import\s*\(\s*["']stripe["']\s*\)/.test(src), false, `${rel(f)} loads the Stripe SDK`);
   }
   const forbidden = [
     [/from\s+["']stripe["']|require\(\s*["']stripe["']\s*\)/, "stripe import"],

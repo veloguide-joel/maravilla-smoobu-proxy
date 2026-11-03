@@ -11,7 +11,15 @@ import { importClosure } from "./helpers/import-closure.mjs";
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const walk = (d) => (existsSync(join(ROOT, d)) ? readdirSync(join(ROOT, d)).flatMap((n) => (statSync(join(ROOT, d, n)).isDirectory() ? walk(`${d}/${n}`) : [`${d}/${n}`])) : []);
 const MOVED = ["codec", "config", "operations", "pool", "repo", "webhooks"];
+const BOOKING_DB_FILES = [...MOVED, "intent-access"].sort();          // + E6 bearer-token lookup and shared rate limits
 const WEBHOOK = "api/checkout/stripe-webhook.js";
+const INTENT_ROUTES = ["api/checkout/intents.js", "api/checkout/intent-step.js"];
+// E6 intent API closure (identical for both routes apart from the entry file); everything after the HTTP layer is lazy.
+const INTENT_CLOSURE_STATIC = ["lib/checkout/intent-api-http.js", "lib/checkout/stripe-test-mode.js", "lib/checkout/stripe-webhook-http.js"];
+const INTENT_CLOSURE_DYNAMIC = ["lib/bookability.js", "lib/booking-db/codec.js", "lib/booking-db/config.js", "lib/booking-db/intent-access.js",
+  "lib/booking-db/operations.js", "lib/booking-db/pool.js", "lib/booking-db/repo.js", "lib/booking-db/webhooks.js", "lib/checkout/final-price.js",
+  "lib/checkout/intent-api-core.js", "lib/checkout/intent-state.js", "lib/checkout/server-pricer.js", "lib/checkout/stripe-test-webhook.js",
+  "lib/direct-policy.js", "lib/direct-pricing.js", "lib/hostaway-calendar.js", "lib/hostaway.js", "lib/public-api.js", "lib/quote-public.js"];
 
 const WEBHOOK_CLOSURE = Object.freeze([
   "api/checkout/stripe-webhook.js",
@@ -49,6 +57,21 @@ test("webhook closure (static + literal dynamic) is exactly the runtime set unde
   assert.match(readFileSync(join(ROOT, "lib/booking-db/operations.js"), "utf8"), /await import\("\.\/repo\.js"\)/);
 });
 
+test("E6 intent routes: exact closure (static HTTP layer; DB, core, pricer, Hostaway client and SDK only lazy); same exclusions", () => {
+  for (const r of INTENT_ROUTES) {
+    const c = importClosure(ROOT, r);
+    const want = Object.fromEntries([[r, "static"], ...INTENT_CLOSURE_STATIC.map((f) => [f, "static"]), ...INTENT_CLOSURE_DYNAMIC.map((f) => [f, "dynamic"])]);
+    assert.deepEqual(Object.fromEntries([...c.files].sort()), Object.fromEntries(Object.entries(want).sort()), r);
+    assert.deepEqual([...c.packages].sort(), ["node:crypto", "pg", "stripe"], r);
+    assert.deepEqual(c.nonLiteralDynamic, [], r);
+    for (const f of c.files.keys()) for (const re of EXCLUDED) assert.doesNotMatch(f, re, `${r}: ${f}`);
+    for (const f of c.files.keys()) {
+      const src = readFileSync(join(ROOT, f), "utf8");
+      assert.doesNotMatch(src, /from\s+["'](node:)?fs(\/promises)?["']|import\s*\(\s*["'](node:)?fs/, f);
+    }
+  }
+});
+
 test("no runtime module in the closure reads files or migrations", () => {
   for (const f of WEBHOOK_CLOSURE) {
     const src = readFileSync(join(ROOT, f), "utf8");
@@ -58,7 +81,7 @@ test("no runtime module in the closure reads files or migrations", () => {
 });
 
 test("every other api/ file keeps its exact base closure: no DB, payment or Stripe reachability gained", () => {
-  const apiFiles = walk("api").filter((f) => f.endsWith(".js") && f !== WEBHOOK).sort();
+  const apiFiles = walk("api").filter((f) => f.endsWith(".js") && f !== WEBHOOK && !INTENT_ROUTES.includes(f)).sort();
   assert.deepEqual(apiFiles, Object.keys(OTHER_API).sort(), "api/ file set");
   for (const f of apiFiles) {
     const c = importClosure(ROOT, f);
@@ -81,7 +104,7 @@ test("db/lib shims: identical export names and identical function/object identit
     assert.equal(code, `export * from "../../lib/booking-db/${m}.js";`, `${m} shim is a pure re-export`);
   }
   assert.deepEqual(walk("db/lib").sort(), ["admin", "codec", "config", "index", "migrate", "operations", "pool", "repo", "webhooks"].map((n) => `db/lib/${n}.js`));
-  assert.deepEqual(walk("lib/booking-db").sort(), MOVED.map((n) => `lib/booking-db/${n}.js`));
+  assert.deepEqual(walk("lib/booking-db").sort(), BOOKING_DB_FILES.map((n) => `lib/booking-db/${n}.js`));
   // the public DB surface (db/lib/index.js: migrations + admin + runtime) still exports everything it did
   const idx = await import(pathToFileURL(join(ROOT, "db/lib/index.js")).href);
   for (const n of ["migrateUp", "migrateDown", "loadMigrations", "createBookingPool", "assertEnvironment", "applyEvent", "recordStripeEvent", "claimNextOperation", "DB_CONFIG"]) assert.equal(typeof idx[n] === "undefined", false, n);
@@ -89,11 +112,12 @@ test("db/lib shims: identical export names and identical function/object identit
   assert.equal(idx.applyEvent, repo.applyEvent);
 });
 
-test("only the E5a checkout modules import the booking DB layer; nothing in lib/ imports db/", () => {
+test("only the E5a/E6 checkout modules import the booking DB layer; nothing in lib/ imports db/", () => {
   for (const f of walk("lib").filter((x) => x.endsWith(".js"))) {
     const src = readFileSync(join(ROOT, f), "utf8").replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
     assert.doesNotMatch(src, /["'][./]*db\/(lib|migrations)\//, `${f} imports from db/`);
-    if (/booking-db\//.test(src) && !f.startsWith("lib/booking-db/")) assert.ok(["lib/checkout/stripe-test-webhook.js", "lib/checkout/stripe-webhook-http.js"].includes(f), f);
+    if (/booking-db\//.test(src) && !f.startsWith("lib/booking-db/")) assert.ok(["lib/checkout/stripe-test-webhook.js", "lib/checkout/stripe-webhook-http.js",
+      "lib/checkout/intent-api-core.js", "lib/checkout/intent-api-http.js"].includes(f), f);
   }
 });
 

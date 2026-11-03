@@ -102,7 +102,8 @@ test("external dispatch is disabled: no executor, no send; no route imports the 
   // deployable code (api/ and the lib/ it imports) never references the booking database layer — except the three E5a
   // Stripe TEST-mode files (root-authorized offline slice 2026-11-02), whose route refuses (404) before loading any of it
   // Packaging (2026-11-02): the runtime DB modules now live in lib/booking-db (db/lib keeps re-export shims + migrate/admin).
-  const E5A = new Set(["lib/checkout/stripe-test-mode.js", "lib/checkout/stripe-test-webhook.js", "lib/checkout/stripe-webhook-http.js"]);
+  const E5A = new Set(["lib/checkout/stripe-test-mode.js", "lib/checkout/stripe-test-webhook.js", "lib/checkout/stripe-webhook-http.js",
+    "lib/checkout/intent-api-core.js", "lib/checkout/intent-api-http.js"]);   // + E6 intent API (gated, lazy)
   for (const f of [...walk("api"), ...walk("lib")]) {
     const rf = f.split("\\").join("/");
     if (E5A.has(rf) || rf.startsWith("lib/booking-db/")) continue;
