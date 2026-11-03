@@ -448,3 +448,26 @@ These belong to one later consolidated, owner-approved live package. **USD listi
 - **NO-GO** for the dispatch worker, its adapter, its migration and any live call. Trust, evidence and alert design gaps D1 and D2, plus live gates E1–E7 / P1, remain.
 - **Narrow next step (after root accepts this contract):** a **pure** request / proof / read-assessment module with fake, doc-derived fixtures and tests P1–P14. No DB, worker, migration, adapter or I/O.
 - D1 / D2 are separate reviewed proposals afterwards.
+
+---
+
+## 14. E7.4b-0 pure foundation: mapping note (added with `lib/checkout/offline-charge-proof.js`)
+
+Root accepted revision 2 as the design basis for the **pure foundation only**.
+- D1, D2, E1–E7 / P1 and the `paymentMethod` owner choice stay **open**.
+- The module implements §5–§7 / P1–P14 with **every fact and time as an input**. It never reads a clock, the environment, the network or the DB.
+
+Tightenings made while implementing; where they differ from earlier text, these govern:
+- **Ids:** provider ids must be safe positive JSON **integers**, held internally as canonical decimal strings. String ids and unsafe numbers are refused, with no precision recovery. Intent and op ids are lower-case canonical UUIDs.
+- **Times:** finite positive integers; `observedAt ≤ now`; at most `SNAPSHOT_MAX_AGE_MS` (120 s) old, **inclusive**. Confirming evidence must be strictly after `dispatchedAt`.
+- **`scheduledDate`:** formatted from `recordedPaymentAt`, the **trusted recorded-payment timestamp** (e.g. the DB-stamped `payment_captured` transition). That is **not** proof of Stripe's capture instant. Loading it and proving its provenance belongs to a later runtime slice. Sub-second precision is truncated.
+- **Identity:** every field is required individually, including the booking ref (absent counts as a mismatch). The status must be in `ACCEPTED_ACTIVE_STATUSES = ["new"]` (conservative v1).
+- **Currency:** exact `"USD"`, checked on the raw provider string before any case folding.
+- **Account / client binding:** `accountRef` / `clientSnapshotId` are **worker-supplied labels**. Equal labels do **not** prove the same actual client or credential; that remains trusted worker input (§5.1 limits).
+- **Titles:** exact equality authorizes a match. Any other title carrying the marker loosely is **suspicious**, i.e. a conflict (preflight) or unknown (confirm), never "absent". Loose means a substring, a case change, NFKC look-alikes, zero-width characters or a dash-less UUID.
+- **Request:** exactly the five documented fields, with `status "paid"`; no currency or description.
+- **Create reply:** HTTP **200 or 201** are accepted pending E2 [UNV].
+- **Owner-resolution evidence:** the pure check requires the **full** observed identity plus API source, a succeeded list-read binding, settle time and the dispatch binding.
+  - A count-only fixture fails.
+  - The existing `admin_resolve_operation` does **not** enforce this shape.
+- **Outputs:** every output carries `sendAuthorization: false` where relevant. None authorizes a send.

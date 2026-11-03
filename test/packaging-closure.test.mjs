@@ -130,7 +130,8 @@ test(".vercelignore and public/ containment are unchanged", () => {
 
 test("E7.1/E7.2: no api/ route's import closure reaches the recovery modules, the reservation worker or the Hostaway adapter", () => {
   const OFFLINE_ONLY = ["lib/booking-db/reservation-worker.js", "lib/booking-db/recovery.js", "lib/checkout/recovery-plan.js", "lib/hostaway-reservations.js",
-    "lib/checkout/capture-proof.js", "lib/booking-db/capture-worker.js", "lib/checkout/compensation-proof.js", "lib/booking-db/compensation-worker.js"];   // + E7.3a pure capture proof, E7.3b capture worker, E7.4a-0 pure compensation proof
+    "lib/checkout/capture-proof.js", "lib/booking-db/capture-worker.js", "lib/checkout/compensation-proof.js", "lib/booking-db/compensation-worker.js",
+    "lib/checkout/offline-charge-proof.js"];   // + E7.3a pure capture proof, E7.3b capture worker, E7.4a-0 pure compensation proof, E7.4b-0 pure offline-charge proof
   const routes = walk("api").filter((f) => /\.m?js$/.test(f));
   assert.ok(routes.length >= 10);
   for (const r of routes) {

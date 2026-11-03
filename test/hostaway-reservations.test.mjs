@@ -562,7 +562,8 @@ test("containment: the adapter is pure and unreachable — no imports, network, 
   // from Vercel; no transport, no env), plus (E7.2, root-authorized) the offline reservation worker LIBRARY, which no api/
   // route reaches (asserted below). happy-preflight.mjs names the adapter's PATH only, to hash it for provenance.
   // E7.3b (root-authorized): the offline capture worker LIBRARY imports the adapter for Hostaway READS only (asserted unreachable below)
-  assert.deepEqual(importers.sort(), ["lib/booking-db/capture-worker.js", "lib/booking-db/compensation-worker.js", "lib/booking-db/reservation-worker.js", "scripts/e4-connected/connected-execute.mjs", "scripts/e4-connected/connected-path.mjs", "scripts/e4-connected/connected-precheck.mjs",
+  // E7.4b-0 (root-authorized): the PURE offline-charge proof imports only its pure parsers / amount helpers (no route reaches it; packaging-closure)
+  assert.deepEqual(importers.sort(), ["lib/booking-db/capture-worker.js", "lib/booking-db/compensation-worker.js", "lib/booking-db/reservation-worker.js", "lib/checkout/offline-charge-proof.js", "scripts/e4-connected/connected-execute.mjs", "scripts/e4-connected/connected-path.mjs", "scripts/e4-connected/connected-precheck.mjs",
     "scripts/e4-connected/connected-recover.mjs", "scripts/e4-write-runner/happy-path.mjs", "scripts/e4-write-runner/happy-preflight.mjs",
     "scripts/e4-write-runner/runner.mjs"], "nothing deployable references the adapter");
   assert.doesNotMatch(readFileSync(join(ROOT, "scripts/e4-write-runner/happy-preflight.mjs"), "utf8"), /^import[^\n]*hostaway-reservations/m);
