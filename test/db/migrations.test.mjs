@@ -18,19 +18,19 @@ const tables = async () => (await client.query("SELECT count(*)::int AS n FROM i
 test("migration files are paired, ordered and contain no credentials", () => {
   const m = loadMigrations();
   assert.deepEqual(m.map((x) => `${x.version}_${x.name}`), ["1_booking_core", "2_roles_grants", "3_safety_corrections", "4_capture_recovery",
-    "5_db_clock_checkout_create", "6_api_rate_limits"]);
+    "5_db_clock_checkout_create", "6_api_rate_limits", "7_capture_claim_fence"]);
   for (const x of m) for (const sql of [x.up, x.down]) {
     assert.doesNotMatch(sql, /PASSWORD\s+'|ENCRYPTED\s+PASSWORD|sk_(test|live)_|whsec_|postgres(ql)?:\/\//i);
   }
 });
 
 test("up applies everything once; a second up is a no-op (repeatable)", async () => {
-  assert.deepEqual(await migrateUp(client, { env: "test" }), [1, 2, 3, 4, 5, 6]);
+  assert.deepEqual(await migrateUp(client, { env: "test" }), [1, 2, 3, 4, 5, 6, 7]);
   assert.equal(await tables(), 18);
   assert.deepEqual(await migrateUp(client, { env: "test" }), []);
   assert.deepEqual(await migrateUp(client, { env: "test" }), []);
   const s = await migrationStatus(client, { env: "test" });
-  assert.deepEqual(s, { applied: [1, 2, 3, 4, 5, 6], pending: [], environment: "test" });
+  assert.deepEqual(s, { applied: [1, 2, 3, 4, 5, 6, 7], pending: [], environment: "test" });
 });
 
 test("down then up restores an identical schema (repeatable round trip)", async () => {
@@ -39,11 +39,11 @@ test("down then up restores an identical schema (repeatable round trip)", async 
   const constraints = async () => (await client.query(`SELECT conrelid::regclass::text AS t, conname, pg_get_constraintdef(oid) AS d FROM pg_constraint
                                                        WHERE connamespace = 'booking'::regnamespace ORDER BY 1, 2`)).rows;
   const before1 = await snapshot(); const c1 = await constraints();
-  assert.deepEqual(await migrateDown(client, { env: "test", to: 1 }), [6, 5, 4, 3, 2]);
+  assert.deepEqual(await migrateDown(client, { env: "test", to: 1 }), [7, 6, 5, 4, 3, 2]);
   assert.equal((await client.query("SELECT count(*)::int AS n FROM pg_roles WHERE rolname LIKE 'mv_booking_%'")).rows[0].n, 0);
   assert.deepEqual(await migrateDown(client, { env: "test" }), [1]);
   assert.equal((await client.query("SELECT to_regnamespace('booking') AS s")).rows[0].s, null);
-  assert.deepEqual(await migrateUp(client, { env: "test" }), [1, 2, 3, 4, 5, 6]);
+  assert.deepEqual(await migrateUp(client, { env: "test" }), [1, 2, 3, 4, 5, 6, 7]);
   assert.deepEqual(await snapshot(), before1);
   // constraint names/definitions identical after the round trip
   assert.deepEqual((await constraints()).map((r) => `${r.t}|${r.conname}|${r.d}`), c1.map((r) => `${r.t}|${r.conname}|${r.d}`));
@@ -60,6 +60,7 @@ test("E2B.2: 0005 down restores the 0004 functions, grants, constraints and inde
       UNION ALL SELECT 'trg|' || tgrelid::regclass::text || '|' || tgname FROM pg_trigger
         WHERE NOT tgisinternal AND tgrelid::regclass::text LIKE 'booking.%'
       ORDER BY 1`)).rows.map((r) => r.o);
+  assert.deepEqual(await migrateDown(client, { env: "test", to: 6 }), [7]);              // E7.1: 0007 first
   const at6 = await objects();
   assert.deepEqual(await migrateDown(client, { env: "test", to: 5 }), [6]);              // E6: 0006 first
   const at5 = await objects();
@@ -81,8 +82,9 @@ test("E2B.2: 0005 down restores the 0004 functions, grants, constraints and inde
   } finally { await c2.end(); fresh.stop(); }
   assert.deepEqual(await migrateUp(client, { env: "test", to: 5 }), [5]);
   assert.deepEqual(await objects(), at5, "re-applying 0005 is identical");
-  assert.deepEqual(await migrateUp(client, { env: "test" }), [6]);
+  assert.deepEqual(await migrateUp(client, { env: "test", to: 6 }), [6]);
   assert.deepEqual(await objects(), at6, "re-applying 0006 is identical");
+  assert.deepEqual(await migrateUp(client, { env: "test" }), [7]);
 });
 
 test("E6: 0006 down restores the 0005 schema exactly (fresh cluster at 5); up re-applies identically; runtime role can only call the function", async () => {
@@ -96,6 +98,7 @@ test("E6: 0006 down restores the 0005 schema exactly (fresh cluster at 5); up re
       UNION ALL SELECT 'tbl|' || c.relname || '|' || c.relrowsecurity || '|' || coalesce(array_to_string(c.relacl, ','), '')
         FROM pg_class c WHERE c.relnamespace = 'booking'::regnamespace AND c.relkind = 'r'
       ORDER BY 1`)).rows.map((r) => r.o);
+  assert.deepEqual(await migrateDown(client, { env: "test", to: 6 }), [7]);
   const at6 = await objects(client);
   assert.ok(at6.some((o) => o.startsWith("tbl|api_rate_limits|true|")), "RLS on");
   assert.ok(!at6.some((o) => o.startsWith("tbl|api_rate_limits|") && o.includes("mv_booking_app")), "no direct table privilege for the runtime role");
@@ -108,8 +111,31 @@ test("E6: 0006 down restores the 0005 schema exactly (fresh cluster at 5); up re
   await c2.connect();
   try { await migrateUp(c2, { env: "test", to: 5 }); assert.deepEqual(at5, await objects(c2), "rollback of 0006 leaves exactly the 0005 schema"); }
   finally { await c2.end(); fresh.stop(); }
-  assert.deepEqual(await migrateUp(client, { env: "test" }), [6]);
+  assert.deepEqual(await migrateUp(client, { env: "test", to: 6 }), [6]);
   assert.deepEqual(await objects(client), at6);
+  assert.deepEqual(await migrateUp(client, { env: "test" }), [7]);
+});
+
+test("E7.1: 0007 down restores the 0006 schema exactly (fresh cluster at 6); up re-applies identically; fence trigger present", async () => {
+  const objects = async (c) => (await c.query(`
+      SELECT 'fn|' || p.oid::regprocedure::text || '|' || md5(pg_get_functiondef(p.oid)) || '|' || coalesce(array_to_string(p.proacl, ','), '') AS o
+        FROM pg_proc p WHERE p.pronamespace = 'booking'::regnamespace
+      UNION ALL SELECT 'trg|' || tgrelid::regclass::text || '|' || tgname || '|' || pg_get_triggerdef(oid) FROM pg_trigger
+        WHERE NOT tgisinternal AND tgrelid::regclass::text LIKE 'booking.%'
+      ORDER BY 1`)).rows.map((r) => r.o);
+  const at7 = await objects(client);
+  assert.ok(at7.some((o) => o.includes("external_operations_capture_claim_fence")));
+  const fn = at7.find((o) => o.startsWith("fn|booking.capture_claim_fence()|"));
+  assert.ok(fn && !/(^|,)=X\//.test(fn.split("|")[3]), "not executable by PUBLIC");
+  assert.deepEqual(await migrateDown(client, { env: "test", to: 6 }), [7]);
+  const at6 = await objects(client);
+  const fresh = await startPostgres();
+  const c2 = new pg.Client({ connectionString: fresh.adminUrl });
+  await c2.connect();
+  try { await migrateUp(c2, { env: "test", to: 6 }); assert.deepEqual(at6, await objects(c2), "rollback of 0007 leaves exactly the 0006 schema"); }
+  finally { await c2.end(); fresh.stop(); }
+  assert.deepEqual(await migrateUp(client, { env: "test" }), [7]);
+  assert.deepEqual(await objects(client), at7);
 });
 
 test("a changed migration file is refused (checksum drift)", async () => {
@@ -134,7 +160,7 @@ test("CLI: works on loopback; refuses DATABASE_URL, remote hosts and missing var
     encoding: "utf8", env: { PATH: process.env.PATH, ...env } });
   const okRun = cli(["status", "--env", "test", "--url-env", "MV_TEST_DB"], { MV_TEST_DB: db.adminUrl });
   assert.equal(okRun.status, 0, okRun.stderr);
-  assert.deepEqual(JSON.parse(okRun.stdout).applied, [1, 2, 3, 4, 5, 6]);
+  assert.deepEqual(JSON.parse(okRun.stdout).applied, [1, 2, 3, 4, 5, 6, 7]);
   const legacy = cli(["status", "--env", "test", "--url-env", "DATABASE_URL"], { DATABASE_URL: db.adminUrl });
   assert.notEqual(legacy.status, 0);
   assert.match(legacy.stderr, /retired legacy variable/);
