@@ -8,7 +8,7 @@ import { randomUUID } from "node:crypto";
 import { startMigratedDatabase } from "./harness.mjs";
 import * as F from "./fixtures.mjs";
 import { applyEvent, loadIntent } from "../../db/lib/repo.js";
-import { claimNextOperation, completeOperation, recoverExpiredOperations } from "../../db/lib/operations.js";
+import { claimNextOperation, completeOperation, recoverExpiredOperations, linkRecordingEvidence } from "../../db/lib/operations.js";
 import { adminResolveOperation } from "../../db/lib/admin.js";
 import { isConfirmedPaid } from "../../lib/checkout/intent-state.js";
 
@@ -69,6 +69,15 @@ test("owner resolution A — the charge WAS recorded (found in Hostaway): eviden
   const ev = await F.readEvidence(db.app, c.id, "hostaway_offline_charges", String(c.reservationId), "listed", charges([880001]), 30);
   F.ok(await adminResolveOperation(db.reconciler, { operationId: op.id, decision: "succeeded", evidenceIds: [ev], resultRef: 880001,
     resolver: "owner", justification: "CHARGE_FOUND_IN_HOSTAWAY", at: F.at(60) }));
+  // E7.4b-D2: the owner's count-only resolution stands (succeeded, resolution kept) but is NOT full proof: the paid intent stays
+  // payment_captured (public "confirmed") until full API proof (>= 15 min after dispatch) is linked; nothing is reversed or escalated.
+  assert.equal((await applyEvent(db.app, c.id, { type: "OFFLINE_CHARGE_RECORDED", chargeId: 880001 }, { now: F.at(60), actor: "admin" })).error, "OFFLINE_CHARGE_PROOF_NOT_LINKED");
+  assert.equal(await F.state(db.app, c.id), "payment_captured");
+  const listingId = (await db.app.query("SELECT listing_id FROM booking.intents WHERE id = $1", [c.id])).rows[0].listing_id;
+  const full = await F.chargeListEvidence(db.app, c, F.recordingObserved({ ...c, listingId }, "880001"), F.at(40));
+  assert.deepEqual(await linkRecordingEvidence(db.app, op.id, { evidenceId: full }), { ok: true, state: "linked" });
+  const linked = (await ochOps(c.id))[0];
+  assert.deepEqual([linked.state, linked.result_ref, linked.settled_evidence_id, !!linked.resolution_id], ["succeeded", "880001", full, true], "owner resolution intact");
   F.ok(await applyEvent(db.app, c.id, { type: "OFFLINE_CHARGE_RECORDED", chargeId: 880001 }, { now: F.at(60), actor: "admin" }));
   assert.equal(await F.state(db.app, c.id), "confirmed");
   assert.equal(await F.count(db.app, "SELECT count(*) AS n FROM booking.payment_ledger WHERE intent_id = $1 AND entry = 'offline_charge_recorded'", [c.id]), 1);

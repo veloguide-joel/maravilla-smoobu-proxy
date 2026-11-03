@@ -5,7 +5,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   createIntentRecord, applyEvent, collectGuestDetails, beginPayStep, recordCheckoutSession, loadIntent, recordHostawayCreateResult
 } from "../../db/lib/repo.js";
-import { claimNextOperation, completeOperation, requestRead, recordProviderEvidence } from "../../db/lib/operations.js";
+import { claimNextOperation, completeOperation, requestRead, recordProviderEvidence, completeRecordingWithEvidence } from "../../db/lib/operations.js";
 import { adminRecordEvidence } from "../../db/lib/admin.js";
 
 export const T0 = Date.UTC(2026, 9, 21, 15, 0, 0);
@@ -111,13 +111,38 @@ export async function captured(pool, stay = {}) {
   const c = ok(await applyEvent(pool, r.id, { type: "CAPTURE_SUCCEEDED", id: `evt_cap_${r.piId}`, amountMinor: 576000, currency: "mxn" }, { now: at(8), actor: "webhook" }), "capture");
   return { ...r, ochOpId: c.operations.find((o) => o.opType === "hostaway.record_offline_charge").id };
 }
+/** E7.4b-D2: full confirming-evidence `observed` (offline-charge-proof EVIDENCE_OBSERVED_KEYS) for a recording of intent `c` ({ id, reservationId, listingId }). */
+export const recordingObserved = (c, chargeId, o = {}) => ({ amountMinor: 576000, chargeId: String(chargeId), currency: "MXN", executorAccountRef: "acct-test-1",
+  listingMapId: c.listingId, marker: `mvoch1-${c.id}`, matchingChargeCount: 1, matchingChargeIds: [String(chargeId)], paymentMethod: "credit_card",
+  paymentProvider: "offline", readCount: 1, reservationId: String(c.reservationId), status: "paid", title: `maraVilla payment mvoch1-${c.id}`, type: "charge", ...o });
+/**
+ * E7.4b-D2: a mocked charge-list read for the reservation, completed at caller time `t`, with evidence `observed`. -> evidence id.
+ * (0010 compares proof times with the DATABASE clock, so recording-proof fixtures use real caller times, not T0-relative ones.)
+ */
+export async function chargeListEvidence(pool, c, observed, t = Date.now()) {
+  const readId = await requestRead(pool, c.id, "hostaway.list_offline_charges", String(c.reservationId), { now: t });
+  assert.ok(await claimNextOperation(pool, { workerId: "w-read", now: t, opId: readId }), "charge-list read claimable");
+  ok(await completeOperation(pool, readId, { workerId: "w-read", now: t, outcome: { status: "succeeded" } }), "charge-list read");
+  return ok(await recordProviderEvidence(pool, { readOpId: readId, kind: "hostaway_offline_charges", externalRef: String(c.reservationId), status: "listed", observed }),
+    "charge-list evidence").id;
+}
+/** E7.4b-D2: claim the initial recording under a held work lease at real time; -> { op, t } (op in_flight, dispatched at t). */
+export async function claimRecording(pool, c, t = Date.now(), workerId = "w1") {
+  await pool.query("UPDATE booking.intent_work SET work_worker_id = $2, work_lease_until = $3 WHERE intent_id = $1", [c.id, workerId, new Date(t + 10 * MIN)]);
+  const op = await claimNextOperation(pool, { workerId, now: t, intentId: c.id, opTypes: ["hostaway.record_offline_charge"], leaseMs: 10 * MIN });
+  assert.ok(op, "recording claimable");
+  return { op, t };
+}
 export async function confirmed(pool, stay = {}) {
   const c = await captured(pool, stay);
-  const chargeId = nextReservationId() + 500000;
-  const op = await claimOp(pool, c.id, "hostaway.record_offline_charge", at(9));
-  ok(await completeOperation(pool, op.id, { workerId: "w1", now: at(9), outcome: { status: "succeeded", resultRef: chargeId } }), "och op");
-  ok(await applyEvent(pool, c.id, { type: "OFFLINE_CHARGE_RECORDED", chargeId }, { now: at(9), actor: "worker" }), "confirmed");
-  return { ...c, chargeId };
+  const chargeId = String(nextReservationId() + 500000);
+  const { op, t } = await claimRecording(pool, c);
+  const { version, listing_id: listingId } = (await pool.query("SELECT version, listing_id FROM booking.intents WHERE id = $1", [c.id])).rows[0];
+  const ev = await chargeListEvidence(pool, c, recordingObserved({ ...c, listingId }, chargeId), t + 1);
+  ok(await completeRecordingWithEvidence(pool, op.id, { workerId: "w1", evidenceId: ev, resultRef: chargeId, expectedVersion: version }), "och op (linked proof)");
+  await pool.query("UPDATE booking.intent_work SET work_worker_id = NULL, work_lease_until = NULL WHERE intent_id = $1", [c.id]);
+  ok(await applyEvent(pool, c.id, { type: "OFFLINE_CHARGE_RECORDED", chargeId }, { now: t + 2, actor: "worker" }), "confirmed");
+  return { ...c, chargeId, recordingOpId: op.id, proofEvidenceId: ev };
 }
 
 export const state = async (pool, id) => (await loadIntent(pool, id)).status;

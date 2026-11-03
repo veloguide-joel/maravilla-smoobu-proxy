@@ -633,3 +633,60 @@ Precondition (up): no open `OFFLINE_CHARGE_HOLD_%` cases. Down: precondition no 
 D1 scenarios wait for 0011: the T12 hold part, T15, T17–T25, and the hold part of T14.
 
 Implementation is still HOLD.
+
+---
+
+## 12. E7.4b-D2 implementation mapping (migration 0010; root addendum A–D)
+
+**Status.** Implemented **offline** on `feature/e7-offline-charge-db-proof`, for disposable local PostgreSQL only. D1 / 0011 (holds, assessments, claim fence), the worker, the adapter and the runtime entrypoints are **not** implemented.
+
+### Implemented objects
+
+| Object | Where | Notes |
+|---|---|---|
+| `recording_lifecycle_guard()` + trigger `zz0_recording_lifecycle_guard` | 0010 up | SECURITY INVOKER, recordings only. Covers §3.1 / §3.1a. Validates `NEW`. Runs before 0008's `zz_` trigger. |
+| `recording_proof_refusal(…, p_mode, p_decision_at)` | 0010 up | **VOLATILE** (deviation from R3 "STABLE"; see A-2). Reads no clock. Private. |
+| `recording_conflict_refusal(intent, dispatched_at, result_ref)` | 0010 up | VOLATILE, private. Positive-contradiction predicate (A). |
+| `complete_recording_with_evidence(op, worker, evidence, result_ref, expected_version)` | 0010 up | app EXECUTE. Lock order: intent SHARE → work SHARE → op UPDATE → advisory, **then** `clock_timestamp()`. |
+| `link_recording_evidence(op, evidence)` | 0010 up | app EXECUTE. Lock order: intent SHARE → op UPDATE → advisory → `clock_timestamp()`. No worker / lease / version. `owner_historical` (≥ 15 min, no max age). Same link → `already_linked`. |
+| `recording_finalisation_guard()` + `zz0_intents_recording_finalisation` | 0010 up | SECURITY DEFINER; gates `payment_captured → confirmed` for every writer. |
+| `recording_latest_id`, `recording_attempt_no` | 0010 up | Private helpers. Latest = attempt number from the immutable key, then `created_at`, then `id`. |
+| `record_provider_evidence`, `admin_record_evidence` | 0010 up / down | Same signatures and grants. The advisory lock is added **after the INSERT**, for kind `hostaway_offline_charges` only (B). Down restores the 0003 bodies verbatim. |
+| `completeRecordingWithEvidence`, `linkRecordingEvidence`, `listRecordingContradictions` | `lib/booking-db/operations.js` | Typed inputs; `{ ok, state }` / `{ ok:false, error }`; unknown DB errors throw. |
+| `completeOperation(succeeded)` on a recording | operations.js | Unlocked `op_type` read before any transaction → `RECORDING_SUCCESS_REQUIRES_EVIDENCE`. |
+| Late result on recordings | operations.js | The first late result is kept; a repeat records nothing and still returns `LEASE_LOST`. |
+| `DB_SAFETY_CODES` + `OFFLINE_CHARGE_RECORDED` mirror | `lib/booking-db/repo.js` | Deterministic latest; `OFFLINE_CHARGE_PROOF_NOT_LINKED` before reaching the DB. |
+
+### Addendum decisions
+
+- **A: positive contradiction** (`recording_conflict_refusal`; same predicate in the read-only scan). Evidence for the intent observed **after** dispatch contradicts `result_ref` only when it positively shows something else:
+  - **Full shape** (has the `marker` key) for **this** marker: count ≥ 2; one id ≠ `result_ref`; or the same id with any **present** full field incompatible.
+  - **Count-only shape** (legacy / dashboard; no marker key): count ≥ 2, or one id ≠ `result_ref`. It proves only the id set.
+  - **Count 0** (either shape) is absence or lag, **never** a contradiction.
+  - A full-shape row for **another** marker is ignored.
+  - No marker or full-field fact is inferred from absent fields.
+  - Incomplete or malformed proof stays ineligible: the proof validator demands the exact typed key set.
+- **A-2: VOLATILE, not STABLE.** A STABLE function reuses its caller statement's snapshot. VOLATILE gives every statement inside the function a fresh READ COMMITTED snapshot after the locks. The validator still reads no clock; the decision instant is an argument.
+- **B: writers.** Both writers take the advisory lock **after** their INSERT. The INSERT's foreign key already share-locks the intent row, so every party's order is intent row → advisory, with no cycle with finalisation.
+  - **Observed:** an evidence INSERT's FK share lock makes the finalisation UPDATE of that intent wait on the writer's transaction (`transactionid` lock). The trigger's conflict SELECT, a new statement in a VOLATILE function, then sees the committed evidence. Tests cover writer-first and finalisation-first, for both writers.
+  - For **completion and link** the advisory lock **is** the serialization. Tests show the call waiting on an `advisory` lock while a writer holds an uncommitted contradiction, then refusing after the commit.
+- **C: post-finalisation visibility.** `listRecordingContradictions({ after, limit ≤ 500 })` is read-only and keyset-paged on `(evidence observed_at, evidence id)`. It has **no** case writer and does **no** reversal, resend or escalation. A durable owner case for "linked but later contradicted" remains a **prerequisite before any dispatch-worker authorization**.
+- **D: scope.** No D1 objects or placeholders exist in 0010.
+  - T27 scope: the completion and link paths create no outbox rows. Successful finalisation creates exactly E3's `guest.notify` row in `pending` (queued, never dispatched). Refusals change nothing.
+
+### Behaviour changes to existing tests (intended)
+
+- `F.confirmed()` now reaches `confirmed` through the evidence-linked path: real-time caller clocks, a mocked charge-list read, `completeRecordingWithEvidence`.
+- `intents.test.mjs`: the generic `completeOperation(succeeded)` on a recording is now refused; the payment is recorded through linked proof.
+- `offline-charge.test.mjs` "owner resolution A": a count-only owner resolution stays `succeeded`-unproven and the intent stays `payment_captured`. It finalises only after full API proof ≥ 15 min after dispatch is linked; the owner's resolution is left intact.
+- `migrations.test.mjs`: migration lists extended to 10. The 0009 privilege test now measures 0009 itself. A new 0010 round-trip test compares the full schema, function md5s, ACLs and the writer bodies against a fresh cluster at 9.
+
+### Trust limits (unchanged)
+
+The DB does **not** attest:
+- the real account behind `executorAccountRef`;
+- that `paymentMethod` is the configured owner choice (the DB checks the approved set);
+- the provenance of API reads;
+- caller-written times (`dispatched_at`, read `completed_at`, `lease_until`).
+
+**Still open:** D1; the durable later-conflict owner case; live gates E1–E7 / P1; the owner `paymentMethod` choice.

@@ -492,3 +492,8 @@ Additional rule in the same correction:
 ## 15. Pointer: D1 / D2 design
 
 The D1 (durable case-only recording holds) and D2 (atomic, immutable success ↔ full-evidence link) designs are in `claude/e74b-db-evidence-case-contract.md` (revision 3: D2 first; post-lock decision instant; 2-minute freshness parity) (DESIGN ONLY; every migration, function and helper change there is PROPOSED). The worker, adapter and dispatch remain on HOLD.
+
+
+## 16. Pointer: D2 implemented offline
+
+Migration 0010 (D2: success ↔ full-proof link, finalisation gate, positive-contradiction rule) is implemented offline. The mapping and addendum A–D decisions are in `claude/e74b-db-evidence-case-contract.md` §12. D1, the worker, the adapter and dispatch are **not** implemented.

@@ -7,7 +7,7 @@ import * as F from "./fixtures.mjs";
 import { applyEvent, loadIntent, loadIntentRow, beginPayStep } from "../../db/lib/repo.js";
 import { rowToIntent, intentToRow } from "../../db/lib/codec.js";
 import { STATES } from "../../lib/checkout/intent-state.js";
-import { completeOperation } from "../../db/lib/operations.js";
+import { completeOperation, completeRecordingWithEvidence } from "../../db/lib/operations.js";
 import { applyResolution } from "../../db/lib/repo.js";
 import { adminResolveIntent } from "../../db/lib/admin.js";
 
@@ -186,17 +186,24 @@ test("outbox completion is required before E3 records a Hostaway payment as reco
   const c = await F.captured(db.app, { from: "2027-03-15", to: "2027-03-18" });
   const r = await applyEvent(db.app, c.id, { type: "OFFLINE_CHARGE_RECORDED", chargeId: 77 }, { now: F.at(9) });
   assert.equal(r.error, "OFFLINE_CHARGE_NOT_VERIFIED");
-  const op = await F.claimOp(db.app, c.id, "hostaway.record_offline_charge", F.at(9));
-  F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(9), outcome: { status: "succeeded", resultRef: 77 } }));
-  assert.equal((await applyEvent(db.app, c.id, { type: "OFFLINE_CHARGE_RECORDED", chargeId: 78 }, { now: F.at(9) })).error, "OFFLINE_CHARGE_NOT_VERIFIED");
-  F.ok(await applyEvent(db.app, c.id, { type: "OFFLINE_CHARGE_RECORDED", chargeId: 77 }, { now: F.at(9) }));
+  // E7.4b-D2: the generic completion cannot mark a recording succeeded; only full linked proof can
+  const { op, t } = await F.claimRecording(db.app, c);
+  assert.deepEqual(await completeOperation(db.app, op.id, { workerId: "w1", now: t, outcome: { status: "succeeded", resultRef: 77 } }),
+    { ok: false, error: "RECORDING_SUCCESS_REQUIRES_EVIDENCE" });
+  const { version, listing_id: listingId } = (await db.app.query("SELECT version, listing_id FROM booking.intents WHERE id = $1", [c.id])).rows[0];
+  const ev = await F.chargeListEvidence(db.app, c, F.recordingObserved({ ...c, listingId }, "77"), t + 1);
+  F.ok(await completeRecordingWithEvidence(db.app, op.id, { workerId: "w1", evidenceId: ev, resultRef: "77", expectedVersion: version }));
+  assert.equal((await applyEvent(db.app, c.id, { type: "OFFLINE_CHARGE_RECORDED", chargeId: 78 }, { now: t + 2 })).error, "OFFLINE_CHARGE_NOT_VERIFIED");
+  F.ok(await applyEvent(db.app, c.id, { type: "OFFLINE_CHARGE_RECORDED", chargeId: 77 }, { now: t + 2 }));
 });
 
 test("a provider reference already booked on another intent aborts the transition (ledger conflict)", async () => {
   const first = await F.confirmed(db.app, { from: "2027-03-20", to: "2027-03-23" });
   const c = await F.captured(db.app, { from: "2027-03-25", to: "2027-03-28" });
-  const op = await F.claimOp(db.app, c.id, "hostaway.record_offline_charge", F.at(9));
-  F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(9), outcome: { status: "succeeded", resultRef: first.chargeId } }));
-  await assert.rejects(applyEvent(db.app, c.id, { type: "OFFLINE_CHARGE_RECORDED", chargeId: first.chargeId }, { now: F.at(9) }), (e) => e.code === "LEDGER_REFERENCE_CONFLICT");
+  const { op, t } = await F.claimRecording(db.app, c);
+  const { version, listing_id: listingId } = (await db.app.query("SELECT version, listing_id FROM booking.intents WHERE id = $1", [c.id])).rows[0];
+  const ev = await F.chargeListEvidence(db.app, c, F.recordingObserved({ ...c, listingId }, first.chargeId), t + 1);
+  F.ok(await completeRecordingWithEvidence(db.app, op.id, { workerId: "w1", evidenceId: ev, resultRef: first.chargeId, expectedVersion: version }));
+  await assert.rejects(applyEvent(db.app, c.id, { type: "OFFLINE_CHARGE_RECORDED", chargeId: first.chargeId }, { now: t + 2 }), (e) => e.code === "LEDGER_REFERENCE_CONFLICT");
   assert.equal(await F.state(db.app, c.id), "payment_captured", "nothing committed");
 });
