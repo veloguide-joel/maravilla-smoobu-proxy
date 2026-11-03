@@ -506,18 +506,45 @@ test("root (6): supersedeUnclaimableCreates retires only never-sent, unclaimable
   assert.equal((await ops(sent.id, "hostaway.create_reservation"))[0].state, "in_flight");
 });
 
-test("M27: the in-transaction settled-evidence re-check is live: settled_evidence_id is runtime-mutable today, and a change is refused", async () => {
+test("M27 / E7.1a: settled evidence cannot be swapped (0008), and applyRecoveryPlan's own in-transaction check is kept as defence in depth", async () => {
   const r = await F.reserved(db.app, { listingId: L(74) });
   const { op } = await F.runOp(db.app, r.id, CAP, 8, { status: "outcome_unknown", errorCode: "TIMEOUT" });
   F.ok((await recoverOne(op.id, 9)).res);
   await fakeRead(r.id, PIREAD, 11, { kind: "payment_intent", ref: r.piId, status: "requires_capture", observed: piObserved(r, "requires_capture") });
   const other = await F.piStatus(db.app, r.id, r.piId, "requires_capture", piObserved(r, "requires_capture"), 12);
+  const swapTo = async (plan) => (plan.settle === other
+    ? (await db.app.query("SELECT id FROM booking.provider_evidence WHERE intent_id = $1 AND id <> $2 LIMIT 1", [r.id, other])).rows[0].id : other);
+  const TRG = "zz_external_operations_settled_evidence_immutable";
+  // (a) with 0008: the swap itself is refused by the database for the runtime role
   const plan = planRecovery({ ...(await loadRecoveryFacts(db.app, op.id)), now: F.at(13) });
   assert.equal(plan.event.type, "RECONCILED_STILL_AUTHORIZED");
-  const res = await applyRecoveryPlan(db.app, plan, { now: F.at(13), hooks: { afterSettle: async () => {
-    const swap = plan.settle === other ? (await db.app.query("SELECT id FROM booking.provider_evidence WHERE intent_id = $1 AND id <> $2 LIMIT 1", [r.id, other])).rows[0].id : other;
-    await db.app.query("UPDATE booking.external_operations SET settled_evidence_id = $2 WHERE id = $1", [op.id, swap]);
+  let refused = null;
+  const resA = await applyRecoveryPlan(db.app, plan, { now: F.at(13), hooks: { afterSettle: async () => {
+    refused = await db.app.query("UPDATE booking.external_operations SET settled_evidence_id = $2 WHERE id = $1", [op.id, await swapTo(plan)]).then(() => null, (e) => e.message);
   } } });
-  assert.deepEqual([res.ok, res.error], [false, "STALE_PLAN"]);
-  assert.equal(await transitions(r.id, "RECONCILED_STILL_AUTHORIZED"), 0);
+  assert.match(String(refused), /SETTLED_EVIDENCE_IMMUTABLE/);
+  F.ok(resA);
+  assert.equal(await transitions(r.id, "RECONCILED_STILL_AUTHORIZED"), 1);
+  // (b) defence in depth: on a database WITHOUT the 0008 guard (owner disables only that trigger, for this case), the
+  //     planner-side in-transaction check still refuses a plan whose cited evidence was swapped
+  const r2 = await F.reserved(db.app, { listingId: L(75) });
+  const { op: op2 } = await F.runOp(db.app, r2.id, CAP, 8, { status: "outcome_unknown", errorCode: "TIMEOUT" });
+  F.ok((await recoverOne(op2.id, 9)).res);
+  await fakeRead(r2.id, PIREAD, 11, { kind: "payment_intent", ref: r2.piId, status: "requires_capture", observed: piObserved(r2, "requires_capture") });
+  const other2 = await F.piStatus(db.app, r2.id, r2.piId, "requires_capture", piObserved(r2, "requires_capture"), 12);
+  const plan2 = planRecovery({ ...(await loadRecoveryFacts(db.app, op2.id)), now: F.at(13) });
+  const swap2 = plan2.settle === other2
+    ? (await db.app.query("SELECT id FROM booking.provider_evidence WHERE intent_id = $1 AND id <> $2 LIMIT 1", [r2.id, other2])).rows[0].id : other2;
+  let resB;
+  try {
+    resB = await applyRecoveryPlan(db.app, plan2, { now: F.at(13), hooks: { afterSettle: async () => {
+      await db.owner.query(`ALTER TABLE booking.external_operations DISABLE TRIGGER ${TRG}`);
+      await db.app.query("UPDATE booking.external_operations SET settled_evidence_id = $2 WHERE id = $1", [op2.id, swap2]);
+    } } });
+  } finally {
+    await db.owner.query(`ALTER TABLE booking.external_operations ENABLE TRIGGER ${TRG}`);
+  }
+  assert.deepEqual([resB.ok, resB.error], [false, "STALE_PLAN"]);
+  assert.equal(await transitions(r2.id, "RECONCILED_STILL_AUTHORIZED"), 0);
+  assert.equal((await db.owner.query("SELECT tgenabled FROM pg_trigger WHERE tgname = $1", [TRG])).rows[0].tgenabled, "O", "guard re-enabled");
 });
