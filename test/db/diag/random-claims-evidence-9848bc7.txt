@@ -1,0 +1,367 @@
+# concurrency.test.mjs '12 random concurrent claims' — diagnostic evidence
+# source SHA 9848bc71d0c6e06a333994c554e0d8ee216902cd (lib/booking-db unchanged; diagnostic = test/db/diag/random-claims-diagnostic.mjs)
+# local disposable PG, fake data, no providers. Each run: fresh migrated DB, N iterations of the exact 12-claim scenario on a fresh listing.
+
+## FAILURE capture (diag-par3, 4 parallel processes, failed at iteration 0)
+{
+ "FAILURE": {
+  "iteration": 0,
+  "listingId": 760000,
+  "overlaps": 0,
+  "outcomes": [
+   [
+    0,
+    "4946d6f1",
+    "ok"
+   ],
+   [
+    1,
+    "bbf1fca6",
+    "DATES_CLAIMED"
+   ],
+   [
+    2,
+    "b6a051d7",
+    "THROWN:40P01:deadlock detected"
+   ],
+   [
+    3,
+    "32fb6d8d",
+    "DATES_CLAIMED"
+   ],
+   [
+    4,
+    "a56a6ad3",
+    "ok"
+   ],
+   [
+    5,
+    "1fbcc74a",
+    "DATES_CLAIMED"
+   ],
+   [
+    6,
+    "cf314d42",
+    "ok"
+   ],
+   [
+    7,
+    "bbe56cb3",
+    "DATES_CLAIMED"
+   ],
+   [
+    8,
+    "a0bdadb4",
+    "THROWN:40P01:deadlock detected"
+   ],
+   [
+    9,
+    "e8c9e2b1",
+    "DATES_CLAIMED"
+   ],
+   [
+    10,
+    "5b81df58",
+    "ok"
+   ],
+   [
+    11,
+    "83764923",
+    "ok"
+   ]
+  ],
+  "errorsByTx": [
+   {
+    "tx": 3,
+    "intent": "32fb6d8d",
+    "code": "23P01",
+    "msg": "conflicting key value violates exclusion constraint \"inventory_no_overlap\"",
+    "detail": "Key conflicts with existing key.",
+    "sql": "INSERT INTO booking.inventory_claims (intent_id, listing_id, stay, kind, claimed_at, revie"
+   },
+   {
+    "tx": 10,
+    "intent": "e8c9e2b1",
+    "code": "23P01",
+    "msg": "conflicting key value violates exclusion constraint \"inventory_no_overlap\"",
+    "detail": "Key conflicts with existing key.",
+    "sql": "INSERT INTO booking.inventory_claims (intent_id, listing_id, stay, kind, claimed_at, revie"
+   },
+   {
+    "tx": 9,
+    "intent": "bbe56cb3",
+    "code": "23P01",
+    "msg": "conflicting key value violates exclusion constraint \"inventory_no_overlap\"",
+    "detail": "Key conflicts with existing key.",
+    "sql": "INSERT INTO booking.inventory_claims (intent_id, listing_id, stay, kind, claimed_at, revie"
+   },
+   {
+    "tx": 2,
+    "intent": "bbf1fca6",
+    "code": "23P01",
+    "msg": "conflicting key value violates exclusion constraint \"inventory_no_overlap\"",
+    "detail": "Key conflicts with existing key.",
+    "sql": "INSERT INTO booking.inventory_claims (intent_id, listing_id, stay, kind, claimed_at, revie"
+   },
+   {
+    "tx": 4,
+    "intent": "b6a051d7",
+    "code": "40P01",
+    "msg": "deadlock detected",
+    "detail": "Process 438 waits for ShareLock on transaction 783; blocked by process 441.\nProcess 441 waits for ShareLock on transaction 782; blocked by process 438.",
+    "sql": "INSERT INTO booking.inventory_claims (intent_id, listing_id, stay, kind, claimed_at, revie"
+   },
+   {
+    "tx": 7,
+    "intent": "a0bdadb4",
+    "code": "40P01",
+    "msg": "deadlock detected",
+    "detail": "Process 444 waits for ShareLock on transaction 783; blocked by process 441.\nProcess 441 waits for ShareLock on transaction 789; blocked by process 444.",
+    "sql": "INSERT INTO booking.inventory_claims (intent_id, listing_id, stay, kind, claimed_at, revie"
+   },
+   {
+    "tx": 12,
+    "intent": "83764923",
+    "code": "40P01",
+    "msg": "deadlock detected",
+    "detail": "Process 447 waits for ShareLock on transaction 783; blocked by process 441.\nProcess 441 waits for ShareLock on transaction 791; blocked by process 447.",
+    "sql": "INSERT INTO booking.inventory_claims (intent_id, listing_id, stay, kind, claimed_at, revie"
+   },
+   {
+    "tx": 13,
+    "intent": "b6a051d7",
+    "code": "40P01",
+    "msg": "deadlock detected",
+    "detail": "Process 438 waits for ShareLock on transaction 783; blocked by process 441.\nProcess 441 waits for ShareLock on transaction 793; blocked by process 438.",
+    "sql": "INSERT INTO booking.inventory_claims (intent_id, listing_id, stay, kind, claimed_at, revie"
+   },
+   {
+    "tx": 14,
+    "intent": "a0bdadb4",
+    "code": "40P01",
+    "msg": "deadlock detected",
+    "detail": "Process 444 waits for ShareLock on transaction 783; blocked by process 441.\nProcess 441 waits for ShareLock on transaction 794; blocked by process 444.",
+    "sql": "INSERT INTO booking.inventory_claims (intent_id, listing_id, stay, kind, claimed_at, revie"
+   },
+   {
+    "tx": 15,
+    "intent": "83764923",
+    "code": "40P01",
+    "msg": "deadlock detected",
+    "detail": "Process 447 waits for ShareLock on transaction 783; blocked by process 441.\nProcess 441 waits for ShareLock on transaction 795; blocked by process 447.",
+    "sql": "INSERT INTO booking.inventory_claims (intent_id, listing_id, stay, kind, claimed_at, revie"
+   },
+   {
+    "tx": 16,
+    "intent": "b6a051d7",
+    "code": "40P01",
+    "msg": "deadlock detected",
+    "detail": "Process 438 waits for ShareLock on transaction 783; blocked by process 441.\nProcess 441 waits for ShareLock on transaction 796; blocked by process 438.",
+    "sql": "INSERT INTO booking.inventory_claims (intent_id, listing_id, stay, kind, claimed_at, revie"
+   },
+   {
+    "tx": 18,
+    "intent": "83764923",
+    "code": "40P01",
+    "msg": "deadlock detected",
+    "detail": "Process 447 waits for ShareLock on transaction 783; blocked by process 441.\nProcess 441 waits for ShareLock on transaction 798; blocked by process 447.",
+    "sql": "INSERT INTO booking.inventory_claims (intent_id, listing_id, stay, kind, claimed_at, revie"
+   },
+   {
+    "tx": 17,
+    "intent": "a0bdadb4",
+    "code": "40P01",
+    "msg": "deadlock detected",
+    "detail": "Process 444 waits for ShareLock on transaction 783; blocked by process 441.\nProcess 441 waits for ShareLock on transaction 797; blocked by process 444.",
+    "sql": "INSERT INTO booking.inventory_claims (intent_id, listing_id, stay, kind, claimed_at, revie"
+   },
+   {
+    "tx": 19,
+    "intent": "b6a051d7",
+    "code": "40P01",
+    "msg": "deadlock detected",
+    "detail": "Process 438 waits for ShareLock on transaction 783; blocked by process 441.\nProcess 441 waits for ShareLock on transaction 799; blocked by process 438.",
+    "sql": "INSERT INTO booking.inventory_claims (intent_id, listing_id, stay, kind, claimed_at, revie"
+   },
+   {
+    "tx": 21,
+    "intent": "a0bdadb4",
+    "code": "40P01",
+    "msg": "deadlock detected",
+    "detail": "Process 444 waits for ShareLock on transaction 783; blocked by process 441.\nProcess 441 waits for ShareLock on transaction 801; blocked by process 444.",
+    "sql": "INSERT INTO booking.inventory_claims (intent_id, listing_id, stay, kind, claimed_at, revie"
+   },
+   {
+    "tx": 5,
+    "intent": "1fbcc74a",
+    "code": "40P01",
+    "msg": "deadlock detected",
+    "detail": "Process 441 waits for ShareLock on transaction 800; blocked by process 447.\nProcess 447 waits for ShareLock on transaction 783; blocked by process 441.",
+    "sql": "INSERT INTO booking.inventory_claims (intent_id, listing_id, stay, kind, claimed_at, revie"
+   },
+   {
+    "tx": 22,
+    "intent": "1fbcc74a",
+    "code": "23P01",
+    "msg": "conflicting key value violates exclusion constraint \"inventory_no_overlap\"",
+    "detail": "Key conflicts with existing key.",
+    "sql": "INSERT INTO booking.inventory_claims (intent_id, listing_id, stay, kind, claimed_at, revie"
+   }
+  ],
+  "claims": [
+   {
+    "intent": "4946d6f1",
+    "stay": "[2027-08-01,2027-08-03)",
+    "released_at": null
+   },
+   {
+    "intent": "cf314d42",
+    "stay": "[2027-08-03,2027-08-07)",
+    "released_at": null
+   },
+   {
+    "intent": "a56a6ad3",
+    "stay": "[2027-08-09,2027-08-11)",
+    "released_at": null
+   },
+   {
+    "intent": "5b81df58",
+    "stay": "[2027-08-11,2027-08-15)",
+    "released_at": null
+   },
+   {
+    "intent": "83764923",
+    "stay": "[2027-08-18,2027-08-23)",
+    "released_at": null
+   }
+  ],
+  "attempts": [
+   {
+    "intent": "4946d6f1",
+    "attempt": 1,
+    "status": "creating"
+   },
+   {
+    "intent": "5b81df58",
+    "attempt": 1,
+    "status": "creating"
+   },
+   {
+    "intent": "83764923",
+    "attempt": 1,
+    "status": "creating"
+   },
+   {
+    "intent": "a56a6ad3",
+    "attempt": 1,
+    "status": "creating"
+   },
+   {
+    "intent": "cf314d42",
+    "attempt": 1,
+    "status": "creating"
+   }
+  ],
+  "outbox": [
+   {
+    "intent": "4946d6f1",
+    "op_type": "stripe.create_checkout_session",
+    "state": "pending"
+   },
+   {
+    "intent": "5b81df58",
+    "op_type": "stripe.create_checkout_session",
+    "state": "pending"
+   },
+   {
+    "intent": "83764923",
+    "op_type": "stripe.create_checkout_session",
+    "state": "pending"
+   },
+   {
+    "intent": "a56a6ad3",
+    "op_type": "stripe.create_checkout_session",
+    "state": "pending"
+   },
+   {
+    "intent": "cf314d42",
+    "op_type": "stripe.create_checkout_session",
+    "state": "pending"
+   }
+  ],
+  "intents": [
+   {
+    "intent": "1fbcc74a",
+    "state": "details_collected",
+    "version": 2
+   },
+   {
+    "intent": "32fb6d8d",
+    "state": "details_collected",
+    "version": 2
+   },
+   {
+    "intent": "4946d6f1",
+    "state": "details_collected",
+    "version": 2
+   },
+   {
+    "intent": "5b81df58",
+    "state": "details_collected",
+    "version": 2
+   },
+   {
+    "intent": "83764923",
+    "state": "details_collected",
+    "version": 2
+   },
+   {
+    "intent": "a0bdadb4",
+    "state": "details_collected",
+    "version": 2
+   },
+   {
+    "intent": "a56a6ad3",
+    "state": "details_collected",
+    "version": 2
+   },
+   {
+    "intent": "b6a051d7",
+    "state": "details_collected",
+    "version": 2
+   },
+   {
+    "intent": "bbe56cb3",
+    "state": "details_collected",
+    "version": 2
+   },
+   {
+    "intent": "bbf1fca6",
+    "state": "details_collected",
+    "version": 2
+   },
+   {
+    "intent": "cf314d42",
+    "state": "details_collected",
+    "version": 2
+   },
+   {
+    "intent": "e8c9e2b1",
+    "state": "details_collected",
+    "version": 2
+   }
+  ]
+ }
+}
+{"SUMMARY":{"label":"par3","iterations":1,"failures":1,"casMaxRetries":3,"codesSeen":{"23P01":5,"40P01":12},"maxErrorsPerIntent":4}}
+
+## SUMMARIES
+{"SUMMARY":{"label":"par1","iterations":100,"failures":0,"casMaxRetries":3,"codesSeen":{"23P01":730,"40P01":35},"maxErrorsPerIntent":1}}
+{"SUMMARY":{"label":"par2","iterations":100,"failures":0,"casMaxRetries":3,"codesSeen":{"23P01":738,"40P01":36},"maxErrorsPerIntent":3}}
+{"SUMMARY":{"label":"par3","iterations":1,"failures":1,"casMaxRetries":3,"codesSeen":{"23P01":5,"40P01":12},"maxErrorsPerIntent":4}}
+{"SUMMARY":{"label":"par4","iterations":100,"failures":0,"casMaxRetries":3,"codesSeen":{"23P01":738,"40P01":40},"maxErrorsPerIntent":1}}
+{"SUMMARY":{"label":"sim1","simulateListingLock":true,"iterations":100,"failures":0,"casMaxRetries":3,"codesSeen":{"23P01":729},"maxErrorsPerIntent":0}}
+{"SUMMARY":{"label":"sim2","simulateListingLock":true,"iterations":100,"failures":0,"casMaxRetries":3,"codesSeen":{"23P01":727},"maxErrorsPerIntent":0}}
+{"SUMMARY":{"label":"sim3","simulateListingLock":true,"iterations":100,"failures":0,"casMaxRetries":3,"codesSeen":{"23P01":728},"maxErrorsPerIntent":0}}
+{"SUMMARY":{"label":"sim4","simulateListingLock":true,"iterations":100,"failures":0,"casMaxRetries":3,"codesSeen":{"23P01":725},"maxErrorsPerIntent":0}}
+{"SUMMARY":{"label":"solo","iterations":100,"failures":0,"casMaxRetries":3,"codesSeen":{"23P01":739,"40P01":35},"maxErrorsPerIntent":1}}
