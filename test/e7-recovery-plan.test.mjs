@@ -43,20 +43,21 @@ function base(upTo) {
 const op = (opType, state, extra = {}) => ({ id: "op-1", opType, state, dispatchedAt: at(10), payload: {}, resultRef: null, errorCode: null, ...extra });
 const capOp = (state, attempt = 1) => op(OP.CAPTURE, state, { payload: { paymentIntentId: PI, attempt, amountMinor: 90000 } });
 const piObs = (status, over = {}, chargeOver = {}) => ({
-  proofVersion: "pi-proof-v1", paymentIntentId: PI, accountVerified: true, livemode: false, metadataIntentId: "int-1", metadataAttemptId: ATT,
+  proofVersion: "pi-proof-v2", object: "payment_intent", paymentIntentId: PI, accountVerified: true, livemode: false, metadataIntentId: "int-1", metadataAttemptId: ATT,
   captureMethod: "manual", status, amountMinor: 90000, amountReceivedMinor: status === "succeeded" ? 90000 : 0,
   amountCapturableMinor: status === "requires_capture" ? 90000 : 0, currency: "USD",
-  latestCharge: { id: "ch_1", paymentIntent: PI, captured: status === "succeeded", amountCapturedMinor: status === "succeeded" ? 90000 : 0,
-    amountRefundedMinor: 0, livemode: false, ...chargeOver }, ...over
+  latestCharge: { object: "charge", id: "ch_1", paymentIntent: PI, status: "succeeded", captured: status === "succeeded", amountMinor: 90000,
+    amountCapturedMinor: status === "succeeded" ? 90000 : 0, amountRefundedMinor: 0, currency: "USD", livemode: false, ...chargeOver }, ...over
 });
 let evn = 0;
-const piEv = (status, over, chargeOver, m = 13) => ({ id: `ev-${++evn}`, kind: "payment_intent", readOpType: "stripe.retrieve_payment_intent", externalRef: PI,
+const piEv = (status, over, chargeOver, m = 13) => ({ id: `ev-${++evn}`, kind: "payment_intent", readOpType: "stripe.retrieve_payment_intent", requestRef: PI, externalRef: PI,
   status: over && over.status ? over.status : status, observed: piObs(status, over, chargeOver), observedAt: at(m) });
-const byId = (status, over = {}, m = 13) => ({ id: `ev-${++evn}`, kind: "hostaway_reservation", readOpType: "hostaway.retrieve_reservation", externalRef: RID, status,
+const byId = (status, over = {}, m = 13, extRef = RID) => ({ id: `ev-${++evn}`, kind: "hostaway_reservation", readOpType: "hostaway.retrieve_reservation", requestRef: RID, externalRef: extRef, status,
   observed: { reservationId: RID, listingId: 603566, from: "2026-12-20", to: "2026-12-24", totalMinor: 90000, currency: "USD", ...over }, observedAt: at(m) });
 const byRef = (status = "found_active", over = {}, m = 13) => ({ id: `ev-${++evn}`, kind: "hostaway_reservation", readOpType: "hostaway.lookup_reservation",
-  externalRef: over.reservationId ?? RID, status,
-  observed: { bookingRef: "MV-ABC123", matchCount: 1, reservationId: RID, listingId: 603566, from: "2026-12-20", to: "2026-12-24", totalMinor: 90000, ...over }, observedAt: at(m) });
+  requestRef: "MV-ABC123", externalRef: over.reservationId ?? RID, status,
+  observed: { bookingRef: "MV-ABC123", matchCount: 1, reservationId: RID, listingId: 603566, from: "2026-12-20", to: "2026-12-24", totalMinor: 90000, currency: "USD", ...over },
+  observedAt: at(m) });
 const plan = (intent, o, evidence = [], extra = {}) => planRecovery({ intent, op: o, evidence, appliedEventIds: [], paymentAttemptId: ATT, now: at(20), ...extra });
 
 test("every planned event is legal in the current state (checked with E3) and carries a deterministic id", () => {
@@ -96,17 +97,18 @@ test("create: reservation_pending -> unknown / definite / needs reads / proven; 
   // evidence not observed >= 2 min after dispatch is not fresh: ignored
   const early = at(10) + FRESH_AFTER_DISPATCH_MS - 1;
   assert.equal(plan(i, op(OP.CREATE, "succeeded"), [{ ...byRef(), observedAt: early }, byId("found_active")]).kind, "needs_fresh_read");
-  // missing currency in the by-id read: never filled in from the intent -> escalate identity mismatch
+  // missing currency in the by-id read: never filled in from the intent -> not proven (no reservation event)
   const noCur = byId("found_active"); delete noCur.observed.currency;
   assert.deepEqual([plan(i, op(OP.CREATE, "succeeded"), [byRef(), noCur]).event.type, plan(i, op(OP.CREATE, "succeeded"), [byRef(), noCur]).event.code],
-    ["ESCALATE", "RESERVATION_IDENTITY_MISMATCH"]);
+    ["RESERVATION_OUTCOME_UNKNOWN", "RESERVATION_NOT_PROVEN"]);
   // identity mismatches
   for (const over of [{ listingId: 1 }, { from: "2026-12-21" }, { to: "2026-12-25" }, { totalMinor: 89999 }, { currency: "MXN" }, { reservationId: "7002" }]) {
     assert.equal(plan(i, op(OP.CREATE, "succeeded"), [byRef(), byId("found_active", over)]).event.type, "ESCALATE", JSON.stringify(over));
   }
   // lookup not proving one same-id match -> unknown (pending); duplicates -> escalate
   assert.equal(plan(i, op(OP.CREATE, "succeeded"), [byRef("not_found")]).event.type, "RESERVATION_OUTCOME_UNKNOWN");
-  assert.equal(plan(i, op(OP.CREATE, "succeeded"), [byRef("found_active", { bookingRef: "MV-OTHER1" })]).event.type, "RESERVATION_OUTCOME_UNKNOWN");
+  // a lookup answered for another booking ref contradicts the request (the database refuses to record it): escalate
+  assert.equal(plan(i, op(OP.CREATE, "succeeded"), [byRef("found_active", { bookingRef: "MV-OTHER1" })]).event.code, "RESERVATION_IDENTITY_MISMATCH");
   assert.deepEqual(plan(i, op(OP.CREATE, "succeeded"), [byRef("found_active", { matchCount: 2 })]).event.code, "DUPLICATE_BOOKING_REF");
   assert.equal(plan(i, op(OP.CREATE, "succeeded"), [byRef("found_active", { reservationId: "7002" }), byId("found_active")]).kind, "needs_fresh_read",
     "the by-id read must be for the id the lookup returned");
@@ -242,11 +244,116 @@ test("PLANNED_EVENT_REJECTED: an event E3 refuses is never returned as an event"
 test("paymentIntentProofObservation copies provider values, never invents them", () => {
   const pi = { id: PI, object: "payment_intent", livemode: false, capture_method: "manual", status: "succeeded", amount: 90000, amount_received: 90000,
     amount_capturable: 0, currency: "usd", metadata: { mv_intent_id: "int-1", mv_payment_attempt_id: ATT, other: "x" },
-    latest_charge: { id: "ch_1", payment_intent: PI, captured: true, amount_captured: 90000, amount_refunded: 0, livemode: false, billing_details: { email: "a@b.c" } } };
+    latest_charge: { object: "charge", id: "ch_1", payment_intent: PI, status: "succeeded", captured: true, amount: 90000, amount_captured: 90000,
+      amount_refunded: 0, currency: "usd", livemode: false, billing_details: { email: "a@b.c" } } };
   const o = paymentIntentProofObservation(pi, { accountVerified: true });
   assert.deepEqual(o, piObs("succeeded"));
   assert.ok(!JSON.stringify(o).includes("a@b.c"), "no customer data");
   const bare = paymentIntentProofObservation({ id: PI }, {});
-  assert.deepEqual([bare.accountVerified, bare.livemode, bare.amountReceivedMinor, bare.currency, bare.latestCharge], [false, null, null, null, null]);
-  assert.equal(piCapturedProof({ id: "e", kind: "payment_intent", externalRef: PI, status: "succeeded", observed: bare }, base("capture_unknown"), ATT), false);
+  assert.deepEqual([bare.object, bare.accountVerified, bare.livemode, bare.amountReceivedMinor, bare.currency, bare.latestCharge], [null, false, null, null, null, null]);
+  // an UNEXPANDED latest_charge keeps only its real id; nothing else is filled in, so it can never prove a capture
+  const unexpanded = paymentIntentProofObservation({ ...pi, latest_charge: "ch_1" }, { accountVerified: true });
+  assert.deepEqual(unexpanded.latestCharge, { object: null, id: "ch_1", paymentIntent: null, status: null, captured: null, amountMinor: null,
+    amountCapturedMinor: null, amountRefundedMinor: null, currency: null, livemode: null });
+  const i = base("capture_unknown");
+  const evRow = (observed) => ({ id: "e", kind: "payment_intent", readOpType: "stripe.retrieve_payment_intent", requestRef: PI, externalRef: PI, status: "succeeded", observed });
+  assert.equal(piCapturedProof(evRow(o), i, ATT), true);
+  assert.equal(piCapturedProof(evRow(unexpanded), i, ATT), false);
+  assert.equal(piCapturedProof(evRow(bare), i, ATT), false);
+  // mistyped provider values stay null (not coerced)
+  const odd = paymentIntentProofObservation({ ...pi, amount_received: "90000", livemode: "false", latest_charge: { ...pi.latest_charge, id: 7, captured: "true" } }, { accountVerified: true });
+  assert.deepEqual([odd.amountReceivedMinor, odd.livemode, odd.latestCharge.id, odd.latestCharge.captured], [null, null, "7", null]);
+  assert.equal(piCapturedProof(evRow(odd), i, ATT), false);
+});
+
+test("root (1): an inconclusive read is followed by a read with its ORIGINAL request selector, never a returned entity id", () => {
+  const i = base("reservation_unknown");
+  const o = op(OP.CREATE, "succeeded");
+  const lk = byRef(); const cancelled = byId("cancelled");
+  const p1 = plan(i, o, [lk, cancelled]);
+  assert.deepEqual([p1.event.type, p1.event.id], ["RECONCILIATION_INCONCLUSIVE", RECOVERY_EVENT_ID.inconclusive("op-1", cancelled.id)]);
+  assert.deepEqual(plan(i, o, [lk, cancelled], { appliedEventIds: [p1.event.id] }).read, { opType: "hostaway.retrieve_reservation", ref: RID });
+  // a not_found lookup whose recorded externalRef is some provider value: the follow-up lookup still uses the booking ref
+  const nf = { ...byRef("not_found", { matchCount: 0 }), externalRef: "7001" };
+  const p2 = plan(i, o, [nf]);
+  assert.equal(p2.event.type, "RECONCILIATION_INCONCLUSIVE");
+  assert.deepEqual(plan(i, o, [nf], { appliedEventIds: [p2.event.id] }).read, { opType: "hostaway.lookup_reservation", ref: "MV-ABC123" });
+  // evidence requested with ANOTHER selector is not evidence for this question
+  assert.equal(plan(i, o, [{ ...lk, requestRef: "MV-OTHER1" }]).kind, "needs_fresh_read");
+  assert.equal(plan(i, o, [lk, { ...byId("found_active"), requestRef: "7002" }]).kind, "needs_fresh_read");
+  assert.equal(plan(base("capture_unknown"), capOp("outcome_unknown"), [{ ...piEv("succeeded"), requestRef: "pi_test_other" }]).kind, "needs_fresh_read");
+  // a PaymentIntent inconclusive follows up with the PaymentIntent id
+  const proc = piEv("processing");
+  const p3 = plan(base("capture_unknown"), capOp("outcome_unknown"), [proc]);
+  assert.deepEqual(plan(base("capture_unknown"), capOp("outcome_unknown"), [proc], { appliedEventIds: [p3.event.id] }).read, { opType: "stripe.retrieve_payment_intent", ref: PI });
+});
+
+test("root (2): both reservation proofs must carry the full, consistent identity; known provider ids must agree", () => {
+  for (const st of ["reservation_pending", "reservation_unknown"]) {
+    const i = base(st); const o = op(OP.CREATE, "succeeded");
+    const good = plan(i, o, [byRef(), byId("found_active")]);
+    assert.equal(good.kind, "event", st);
+    assert.notEqual(good.event.type, "ESCALATE");
+    // contradictory lookup identity, even with a valid by-id read
+    for (const over of [{ listingId: 999 }, { from: "2026-12-21" }, { to: "2026-12-25" }, { totalMinor: 1 }, { currency: "MXN" }]) {
+      const r = plan(i, o, [byRef("found_active", over), byId("found_active")]);
+      assert.deepEqual([r.event.type, r.event.code], ["ESCALATE", "RESERVATION_IDENTITY_MISMATCH"], `${st} ${JSON.stringify(over)}`);
+    }
+    // lookup externalRef contradicting its observed reservation id
+    assert.equal(plan(i, o, [{ ...byRef(), externalRef: "7002" }, byId("found_active")]).event.code, "RESERVATION_IDENTITY_MISMATCH");
+    // by-id externalRef / observed id contradicting
+    assert.equal(plan(i, o, [byRef(), byId("found_active", { reservationId: "9999" })]).event.code, "RESERVATION_IDENTITY_MISMATCH");
+    assert.equal(plan(i, o, [byRef(), byId("found_active", {}, 13, "9999")]).event.code, "RESERVATION_IDENTITY_MISMATCH");
+    // known provider-returned ids that disagree with the proven id
+    const conflict = plan(i, op(OP.CREATE, "succeeded", { resultRef: "9999" }), [byRef(), byId("found_active")]);
+    assert.deepEqual([conflict.event.type, conflict.event.code], ["ESCALATE", "RESERVATION_ID_CONFLICT"], st);
+    assert.equal(plan(i, o, [byRef(), byId("found_active")], { knownReservationIds: ["9999"] }).event.code, "RESERVATION_ID_CONFLICT");
+    assert.equal(plan(i, op(OP.CREATE, "succeeded", { resultRef: RID }), [byRef(), byId("found_active")], { knownReservationIds: [RID] }).event.type, good.event.type);
+    // missing fields on either proof: never a reservation event (not proven), never invented
+    for (const k of ["reservationId", "listingId", "from", "to", "totalMinor", "currency"]) {
+      const lk = byRef(); delete lk.observed[k];
+      const bi = byId("found_active"); delete bi.observed[k];
+      for (const evs of [[lk, byId("found_active")], [byRef(), bi]]) {
+        const r = plan(i, o, evs);
+        assert.ok(!["RESERVATION_SUCCEEDED", "RECONCILED_RESERVATION_FOUND"].includes(r.event?.type), `${st} missing ${k}`);
+      }
+    }
+    // the requested booking ref is never provider proof: no lookup evidence -> a read, whatever the op or attempts row says
+    assert.equal(plan(i, op(OP.CREATE, "succeeded", { resultRef: RID }), [byId("found_active")], { knownReservationIds: [RID] }).kind, "needs_fresh_read");
+  }
+});
+
+test("root (3): a cancellation (or still-active) result needs the same fully identified reservation", () => {
+  const cf = base("capture_failed");
+  const c = (st) => op(OP.CANCEL, st, { payload: { reservationId: RID, attempt: 1 } });
+  for (const st of ["succeeded", "outcome_unknown"]) {
+    assert.equal(plan(cf, c(st), [byId("cancelled", { reservationId: "9999" })]).event.code, "CANCEL_IDENTITY_MISMATCH", st);
+    assert.equal(plan(cf, c(st), [byId("cancelled", { listingId: 999 })]).event.code, "CANCEL_IDENTITY_MISMATCH", st);
+    assert.equal(plan(cf, c(st), [byId("cancelled", { from: "2027-01-01" })]).event.code, "CANCEL_IDENTITY_MISMATCH", st);
+    for (const k of ["reservationId", "listingId", "from", "to", "totalMinor", "currency"]) {
+      const e = byId("cancelled"); delete e.observed[k];
+      const r = plan(cf, c(st), [e]);
+      assert.equal(r.event?.type === "RESERVATION_CANCELLED" || r.settle !== undefined, false, `${st} missing ${k}`);
+      assert.equal(r.event.type, "RECONCILIATION_INCONCLUSIVE");
+      assert.deepEqual(plan(cf, c(st), [e], { appliedEventIds: [r.event.id] }).read, { opType: "hostaway.retrieve_reservation", ref: RID });
+    }
+  }
+  assert.equal(plan(cf, c("outcome_unknown"), [byId("found_active", { totalMinor: 1 })]).event.code, "CANCEL_IDENTITY_MISMATCH");
+  const ok = plan(cf, c("outcome_unknown"), [byId("cancelled")]);
+  assert.deepEqual([ok.event.type, typeof ok.settle], ["RESERVATION_CANCELLED", "string"]);
+});
+
+test("root (4): a captured outcome needs a real, canonical Charge bound to this PaymentIntent", () => {
+  const i = base("capture_unknown"); const o = capOp("outcome_unknown");
+  assert.equal(plan(i, o, [piEv("succeeded")]).event.type, "RECONCILED_CAPTURE_SUCCEEDED");
+  const bad = [
+    [{}, { id: null }], [{}, { id: "" }], [{}, { id: "x_1" }], [{}, { id: "ch_" }], [{}, { object: null }], [{}, { object: "refund" }],
+    [{}, { status: "pending" }], [{}, { status: null }], [{}, { amountMinor: 1 }], [{}, { amountMinor: null }], [{}, { currency: "MXN" }],
+    [{}, { currency: null }], [{}, { paymentIntent: null }], [{ object: null }], [{ object: "setup_intent" }]
+  ];
+  for (const [over, ch] of bad) {
+    const r = plan(i, o, [piEv("succeeded", over, ch)]);
+    assert.deepEqual([r.event.type, r.event.code, r.settle], ["ESCALATE", "CAPTURE_PROOF_MISMATCH", undefined], JSON.stringify([over, ch]));
+  }
+  assert.equal(plan(i, o, [piEv("succeeded", {}, { id: "py_123" })]).event.type, "RECONCILED_CAPTURE_SUCCEEDED");
 });

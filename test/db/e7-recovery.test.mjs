@@ -6,8 +6,8 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { startMigratedDatabase } from "./harness.mjs";
 import * as F from "./fixtures.mjs";
-import { applyEvent, loadIntent } from "../../lib/booking-db/repo.js";
-import { claimNextOperation, completeOperation, recoverExpiredOperations, recordProviderEvidence, requestRead, settleOperationFromEvidence, reportUnknownOutcome } from "../../lib/booking-db/operations.js";
+import { applyEvent, loadIntent, recordHostawayCreateResult } from "../../lib/booking-db/repo.js";
+import { claimNextOperation, completeOperation, recoverExpiredOperations, recordProviderEvidence, requestRead, settleOperationFromEvidence, reportUnknownOutcome, supersedeUnclaimableCreates } from "../../lib/booking-db/operations.js";
 import {
   findMissedOutcomes, loadRecoveryFacts, requestRecoveryRead, findOrphanReads, reissueOrphanRead, applyRecoveryPlan, escalateOperatorPlan,
   MAX_RECOVERY_READS, RECOVERY_MAX_BATCH
@@ -26,11 +26,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** Fake Stripe PaymentIntent read result (proof observation shape), bound to the intent and its payment attempt. */
 const piObserved = (r, status, over = {}) => ({
-  proofVersion: "pi-proof-v1", paymentIntentId: r.piId, accountVerified: true, livemode: false, metadataIntentId: r.id, metadataAttemptId: r.attemptId,
-  captureMethod: "manual", status, amountMinor: 576000, amountReceivedMinor: status === "succeeded" ? 576000 : 0,
+  proofVersion: "pi-proof-v2", object: "payment_intent", paymentIntentId: r.piId, accountVerified: true, livemode: false, metadataIntentId: r.id,
+  metadataAttemptId: r.attemptId, captureMethod: "manual", status, amountMinor: 576000, amountReceivedMinor: status === "succeeded" ? 576000 : 0,
   amountCapturableMinor: status === "requires_capture" ? 576000 : 0, currency: "MXN",
-  latestCharge: { id: `ch_${r.id.slice(0, 6)}`, paymentIntent: r.piId, captured: status === "succeeded", amountCapturedMinor: status === "succeeded" ? 576000 : 0,
-    amountRefundedMinor: 0, livemode: false }, ...over
+  latestCharge: { object: "charge", id: `ch_${r.id.slice(0, 8)}`, paymentIntent: r.piId, status: "succeeded", captured: status === "succeeded", amountMinor: 576000,
+    amountCapturedMinor: status === "succeeded" ? 576000 : 0, amountRefundedMinor: 0, currency: "MXN", livemode: false }, ...over
 });
 /** Fake worker: claim one pending read for the intent, complete it, record evidence (optionally crash before evidence). */
 async function fakeRead(intentId, opType, minutes, { kind, ref, status, observed, crashBeforeEvidence = false } = {}) {
@@ -238,7 +238,7 @@ test("crash after create claim: unknown, never a second create; reconciled only 
   const rid = "990020";
   const stay = { listingId: L(20), from: "2026-12-20", to: "2026-12-24", totalMinor: 576000 };
   await fakeRead(d.id, "hostaway.lookup_reservation", 10, { kind: "hostaway_reservation", ref: rid, status: "found_active",
-    observed: { bookingRef: intent.ref, matchCount: 1, reservationId: rid, ...stay } });
+    observed: { bookingRef: intent.ref, matchCount: 1, reservationId: rid, currency: "MXN", ...stay } });
   const s2 = await recoverOne(op.id, 11);
   assert.deepEqual(s2.plan.read, { opType: "hostaway.retrieve_reservation", ref: rid });
   F.ok(s2.res);
@@ -364,4 +364,160 @@ test("finder: bounded, keyset-paginated, excludes handled ops and intents that n
   // handled by its outcome event -> excluded even though the row is still outcome_unknown
   F.ok((await recoverOne(ids[1], 101)).res); // CAPTURE_OUTCOME_UNKNOWN: still awaited (capture_unknown)
   assert.ok((await findMissedOutcomes(db.app, { now: F.at(104) })).rows.some((x) => x.opId === ids[1]));
+});
+
+// ---------------------------------------------------------------------------------------------
+// root corrections (2026-11-02 review of 1053f81)
+
+test("root (1): after an inconclusive lookup, the recovery read uses the booking ref, never a provider-returned id (actual payload)", async () => {
+  const d = await F.dispatched(db.app, { listingId: L(50) });
+  const op = await F.claimOp(db.app, d.id, "hostaway.create_reservation", F.at(6));
+  await recoverExpiredOperations(db.app, { now: F.at(8) });
+  F.ok((await recoverOne(op.id, 9)).res);                      // RESERVATION_OUTCOME_UNKNOWN -> E3 queues a lookup by ref
+  const intent = await loadIntent(db.app, d.id);
+  // fake lookup: not found, recorded with some provider value as externalRef
+  await fakeRead(d.id, "hostaway.lookup_reservation", 10, { kind: "hostaway_reservation", ref: "7001", status: "not_found",
+    observed: { bookingRef: intent.ref, matchCount: 0 } });
+  const s1 = await recoverOne(op.id, 11);
+  assert.equal(s1.plan.event.type, "RECONCILIATION_INCONCLUSIVE");
+  F.ok(s1.res);
+  // E3 queued another lookup; the planner reuses it (its payload is the booking ref)
+  const s2 = await recoverOne(op.id, 12);
+  assert.deepEqual([s2.plan.read, s2.res.reused], [{ opType: "hostaway.lookup_reservation", ref: intent.ref }, true]);
+  // that read completes WITHOUT evidence (crash): the planner asks again and requestRecoveryRead INSERTS a new read
+  // every queued lookup (E3's own, all with the booking ref) completes WITHOUT evidence (crash)
+  for (let c; (c = await claimNextOperation(db.app, { workerId: "w-read", now: F.at(13), intentId: d.id, opTypes: ["hostaway.lookup_reservation"] }));) {
+    assert.deepEqual(c.payload, { ref: intent.ref });
+    F.ok(await completeOperation(db.app, c.id, { workerId: "w-read", now: F.at(13), outcome: { status: "succeeded", resultRef: "7001" } }));
+  }
+  const s3 = await recoverOne(op.id, 14);
+  assert.equal(s3.res.reused, false);
+  const row = (await db.app.query("SELECT payload, idempotency_key FROM booking.external_operations WHERE id = $1", [s3.res.readOpId])).rows[0];
+  assert.deepEqual(row.payload, { ref: intent.ref });
+  assert.equal(row.idempotency_key, `rr:${op.id}:hostaway.lookup_reservation:${intent.ref}:1`);
+  assert.equal(await F.count(db.app, "SELECT count(*) AS n FROM booking.external_operations WHERE intent_id = $1 AND op_type = 'hostaway.lookup_reservation' AND payload ->> 'ref' <> $2",
+    [d.id, intent.ref]), 0, "no lookup was ever requested by a returned id");
+});
+
+test("root (2): a provider-returned id already persisted for the create (attempts row) that differs from the proven id -> ESCALATE conflict", async () => {
+  const d = await F.dispatched(db.app, { listingId: L(51) });
+  const op = await F.claimOp(db.app, d.id, "hostaway.create_reservation", F.at(6));
+  const stay = { listingId: L(51), from: "2026-12-20", to: "2026-12-24", totalMinor: 576000 };
+  await recordHostawayCreateResult(db.app, d.id, { httpStatus: 201, reservation: { reservationId: "9999", ...stay } }, { now: F.at(7) });
+  F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(7), outcome: { status: "succeeded" } }));   // no resultRef
+  const intent = await loadIntent(db.app, d.id);
+  await requestRead(db.app, d.id, "hostaway.lookup_reservation", intent.ref, { now: F.at(10) });
+  await fakeRead(d.id, "hostaway.lookup_reservation", 10, { kind: "hostaway_reservation", ref: "7001", status: "found_active",
+    observed: { bookingRef: intent.ref, matchCount: 1, reservationId: "7001", currency: "MXN", ...stay } });
+  const facts = await loadRecoveryFacts(db.app, op.id);
+  assert.deepEqual(facts.knownReservationIds, ["9999"]);
+  const p = planRecovery({ ...facts, now: F.at(11) });
+  assert.deepEqual([p.event.type, p.event.code], ["ESCALATE", "RESERVATION_ID_CONFLICT"]);
+  F.ok(await applyRecoveryPlan(db.app, p, { now: F.at(11) }));
+  assert.equal(await F.state(db.app, d.id), "reconciliation_required");
+});
+
+test("root (5): equal-timestamp orphan reads of one selector never supersede each other; exactly one is re-issued", async () => {
+  const r = await F.reserved(db.app, { listingId: L(52) });
+  const ids = [await requestRead(db.app, r.id, PIREAD, r.piId, { now: F.at(20) }), await requestRead(db.app, r.id, PIREAD, r.piId, { now: F.at(20) })];
+  for (const id of ids) {
+    const c = await claimNextOperation(db.app, { workerId: "w", now: F.at(20), opId: id });
+    F.ok(await completeOperation(db.app, c.id, { workerId: "w", now: F.at(20), outcome: { status: "succeeded" } }));
+  }
+  assert.equal(await F.count(db.app, "SELECT count(DISTINCT created_at) AS n FROM booking.external_operations WHERE id = ANY($1)", [ids]), 1, "identical timestamps");
+  const last = [...ids].sort().at(-1);
+  const found = (await findOrphanReads(db.app, { now: F.at(30) })).filter((o) => ids.includes(o.readOpId)).map((o) => o.readOpId);
+  assert.deepEqual(found, [last], "exactly the last in (created_at, id) order");
+  const first = ids.find((x) => x !== last);
+  assert.equal((await reissueOrphanRead(db.app, first, { now: F.at(30) })).error, "NOT_AN_ORPHAN");
+  const re = await Promise.all([reissueOrphanRead(db.app, last, { now: F.at(20), graceMs: 0 }), reissueOrphanRead(db.app, last, { now: F.at(20), graceMs: 0 })]);  // same instant as the orphans
+  assert.equal(re.filter((x) => x.ok).length, 1);
+  assert.equal((await findOrphanReads(db.app, { now: F.at(30) })).filter((o) => ids.includes(o.readOpId)).length, 0, "re-issued: none left, even at an equal timestamp");
+  assert.equal((await ops(r.id, PIREAD)).length, 3);
+});
+
+test("root (5): a re-issued read supersedes its orphan even when a skewed worker clock stamps it EARLIER", async () => {
+  const r = await F.reserved(db.app, { listingId: L(55) });
+  const id = await requestRead(db.app, r.id, PIREAD, r.piId, { now: F.at(20) });
+  const c = await claimNextOperation(db.app, { workerId: "w", now: F.at(20), opId: id });
+  F.ok(await completeOperation(db.app, c.id, { workerId: "w", now: F.at(20), outcome: { status: "succeeded" } }));
+  // a re-issuer whose clock runs 1 min behind (negative grace stands in for the skew): its read is stamped at(19)
+  const re = await reissueOrphanRead(db.app, id, { now: F.at(19), graceMs: -2 * F.MIN });
+  F.ok(re);
+  assert.ok((await ops(r.id, PIREAD)).find((o) => o.id === re.readOpId).created_at < (await ops(r.id, PIREAD)).find((o) => o.id === id).created_at);
+  assert.equal((await findOrphanReads(db.app, { now: F.at(30) })).some((o) => o.readOpId === id), false, "never re-issued twice");
+  assert.equal((await reissueOrphanRead(db.app, id, { now: F.at(30) })).error, "NOT_AN_ORPHAN");
+});
+
+test("root (6): a claim never locks another intent's rows; a paused transition on intent B does not block a claim on intent A", async () => {
+  const a = await F.reserved(db.app, { listingId: L(53) });
+  const b = await F.dispatched(db.app, { listingId: L(54) });                // B: pending create, E3 lease expires at(8)
+  let release; const paused = new Promise((r) => { release = r; });
+  let claimed = null; let claimMs = null;
+  const tB = applyEvent(db.app, b.id, { type: "RECOVER_INTERRUPTED" }, { now: F.at(10), hooks: { beforeCommit: async () => {
+    // B holds its intent row and has superseded its create row (uncommitted)
+    const t0 = Date.now();
+    claimed = await claimNextOperation(db.app, { workerId: "wa", now: F.at(10) , intentId: a.id });
+    claimMs = Date.now() - t0;
+    release();
+  } } });
+  await paused;
+  F.ok(await tB);
+  assert.ok(claimed && claimed.intent_id === a.id, "A's operation claimed while B was mid-transaction");
+  assert.ok(claimMs < 2000, `claim not blocked by B (${claimMs} ms)`);
+  assert.equal((await ops(b.id, "hostaway.create_reservation"))[0].state, "superseded");
+});
+
+test("root (6): claim vs transition on the SAME intent with an expired pending create: no deadlock in either order", async () => {
+  for (let k = 0; k < 8; k++) {
+    const d = await F.dispatched(db.app, { listingId: L(60 + k) });         // pending lookup read + pending create, lease expires at(8)
+    const [c, t] = await Promise.allSettled([
+      claimNextOperation(db.app, { workerId: `w${k}`, now: F.at(10), intentId: d.id }),
+      applyEvent(db.app, d.id, { type: "RECOVER_INTERRUPTED" }, { now: F.at(10) })
+    ]);
+    assert.equal(c.status, "fulfilled", String(c.reason));
+    assert.equal(t.status, "fulfilled", String(t.reason));
+    F.ok(t.value);
+    assert.notEqual(c.value?.op_type, "hostaway.create_reservation", "an expired create is never claimed");
+    assert.equal((await ops(d.id, "hostaway.create_reservation"))[0].state, "superseded");
+  }
+  // deterministic order: the transition holds the intent; the claim waits on the intent lock (intent first), then proceeds
+  const d = await F.dispatched(db.app, { listingId: L(70) });
+  let claimP;
+  F.ok(await applyEvent(db.app, d.id, { type: "RECOVER_INTERRUPTED" }, { now: F.at(10), hooks: { beforeCommit: async () => {
+    claimP = claimNextOperation(db.app, { workerId: "wz", now: F.at(10), intentId: d.id });
+    assert.equal(await waitForLockWaiter(), true);
+  } } }));
+  const c = await claimP;
+  assert.ok(c === null || c.op_type === "hostaway.lookup_reservation");
+});
+
+test("root (6): supersedeUnclaimableCreates retires only never-sent, unclaimable creates (intent first, bounded)", async () => {
+  const stale = await F.dispatched(db.app, { listingId: L(71) });           // lease until at(8)
+  const live = await F.dispatched(db.app, { listingId: L(72) });
+  assert.deepEqual((await supersedeUnclaimableCreates(db.app, { now: F.at(7) })).filter((x) => [stale.createOpId, live.createOpId].includes(x)), []);
+  const done = await supersedeUnclaimableCreates(db.app, { now: F.at(9) });
+  assert.ok(done.includes(stale.createOpId) && done.includes(live.createOpId));
+  assert.deepEqual((await supersedeUnclaimableCreates(db.app, { now: F.at(9) })).filter((x) => [stale.createOpId, live.createOpId].includes(x)), []);
+  // a CLAIMED (possibly sent) create is never superseded
+  const sent = await F.dispatched(db.app, { listingId: L(73) });
+  await F.claimOp(db.app, sent.id, "hostaway.create_reservation", F.at(6));
+  await supersedeUnclaimableCreates(db.app, { now: F.at(30) });
+  assert.equal((await ops(sent.id, "hostaway.create_reservation"))[0].state, "in_flight");
+});
+
+test("M27: the in-transaction settled-evidence re-check is live: settled_evidence_id is runtime-mutable today, and a change is refused", async () => {
+  const r = await F.reserved(db.app, { listingId: L(74) });
+  const { op } = await F.runOp(db.app, r.id, CAP, 8, { status: "outcome_unknown", errorCode: "TIMEOUT" });
+  F.ok((await recoverOne(op.id, 9)).res);
+  await fakeRead(r.id, PIREAD, 11, { kind: "payment_intent", ref: r.piId, status: "requires_capture", observed: piObserved(r, "requires_capture") });
+  const other = await F.piStatus(db.app, r.id, r.piId, "requires_capture", piObserved(r, "requires_capture"), 12);
+  const plan = planRecovery({ ...(await loadRecoveryFacts(db.app, op.id)), now: F.at(13) });
+  assert.equal(plan.event.type, "RECONCILED_STILL_AUTHORIZED");
+  const res = await applyRecoveryPlan(db.app, plan, { now: F.at(13), hooks: { afterSettle: async () => {
+    const swap = plan.settle === other ? (await db.app.query("SELECT id FROM booking.provider_evidence WHERE intent_id = $1 AND id <> $2 LIMIT 1", [r.id, other])).rows[0].id : other;
+    await db.app.query("UPDATE booking.external_operations SET settled_evidence_id = $2 WHERE id = $1", [op.id, swap]);
+  } } });
+  assert.deepEqual([res.ok, res.error], [false, "STALE_PLAN"]);
+  assert.equal(await transitions(r.id, "RECONCILED_STILL_AUTHORIZED"), 0);
 });
