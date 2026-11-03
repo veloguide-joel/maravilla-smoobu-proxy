@@ -486,3 +486,9 @@ Additional rule in the same correction:
 - **List money:** `type` must be `charge` / `preAuth` / `refund`.
 - A refund needs an exact **non-positive** amount; every other row an exact non-negative amount.
 - Malformed money makes the read untrusted. It is never treated as absence.
+
+---
+
+## 15. Pointer: D1 / D2 design
+
+The D1 (durable case-only recording holds) and D2 (atomic, immutable success ↔ full-evidence link) designs are in `claude/e74b-db-evidence-case-contract.md` (DESIGN ONLY; every migration, function and helper change there is PROPOSED). The worker, adapter and dispatch remain on HOLD.
