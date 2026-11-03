@@ -125,7 +125,7 @@ The gate classifies the intent's COMPLETE capture history: every `stripe.capture
 - **Money:** the §3.1 PaymentIntent proof of zero money received (Z/P still-authorized or canceled; D canceled only), on every initial cancel.
 - **Protected ids:** the historical ids 70636076 / 71045356 / 71072615 / 71081885 are refused at every path.
 - **Row:** the single current cancel row: pending, never dispatched, attempt 1, payload rid = the intent's immutable reservation id (0001 guard).
-- **Stay date (proposed, root to confirm, B4):** `from` must be strictly after today in the listing time zone, otherwise owner case. The guest may already be in the house.
+- **Stay date (ACCEPTED by root, B4; rule in §6):** `from` must be strictly after the local date of the fresh clock, in the listing's explicit, trusted IANA time zone, otherwise owner case (no UTC or server fallback). The guest may already be in the house.
 - **Request (fixed, the E4 live-verified shape):** `PUT /v1/reservations/{rid}/statuses/cancelled`, body exactly `{cancelledBy: "host"}`. The pure builder is added in E7.4a. No other path.
 - **Ordering:** the cancel runs only after §3.1 holds. It may run before or after the void leg; both legs are independent but share the gate.
 
@@ -200,7 +200,11 @@ The gate classifies the intent's COMPLETE capture history: every `stripe.capture
     - a GET guest-charges LIST is documented, with `limit` defaulting to 100 (maximum 500) and filtering by reservationIds (marked fixed 2026-10-02).
     
     Public docs only: no completeness, dedupe or live proof, and no implementation authority. Which method value correctly represents a Stripe-collected payment is an owner/root decision, never assumed.
-  - **Still unproven:** whether description/title persist and can carry a dedupe marker; the allowed `paymentMethod` values (do NOT assume `cash` for Stripe bookkeeping); list filtering, paging and completeness for a reservation; the reply shapes; dedupe semantics.
+  - **Still unproven (public docs are documentation, not a live contract):**
+    - whether description/title persist and can carry a dedupe marker;
+    - whether the documented `paymentMethod` values are accepted live, and WHICH one appropriately represents a Stripe-collected payment (never assume `cash`);
+    - whether list filtering and paging are complete for a reservation (a single-charge GET proves nothing about absence);
+    - the reply shapes and the dedupe semantics.
   - No endpoint is called and no format is invented. The owner read-only shape check remains a later gate.
 - **B2: decided.** No automatic resend (§5).
 - **B3: decided** as to the Stripe contract (§3.2). The adapter is not built: it comes in the pure foundation (§11), with no SDK and no client. The Hostaway cancel shape is live-verified only through the E4 runner (`PUT /v1/reservations/{rid}/statuses/cancelled`, body `{cancelledBy: "host"}`).
@@ -264,3 +268,49 @@ The gate classifies the intent's COMPLETE capture history: every `stripe.capture
   - validators refuse extra keys and parameters;
   - the packaging OFFLINE_ONLY list and no route closure;
   - targeted mutations.
+
+## 12. Handoff for the next slice: E7.4a DB worker (handoff only; NOT authorization to implement)
+
+- **Base:** `a49b8d93fb0246238b8d27dcc7ccc1c2495ff390` (`feature/e7-compensation-proof`, E7.4a-0, root KEPT offline only), with this contract at its latest commit on `feature/e7-compensation-contract`.
+- **Proposed branch:** `feature/e7-cancel-void-worker`, from the base.
+
+**Bounded first slice (proposed files):**
+- `lib/booking-db/compensation-worker.js` (new);
+- `test/db/e74a-compensation-worker.test.mjs` (new, fake Stripe/Hostaway, the existing disposable local PG);
+- allowlist updates in the packaging / importer tests;
+- possibly an export-only addition in an accepted worker (as in E7.3b).
+
+No E3, planner, schema or migration change. Scope: `reservation_failed` (void) and `capture_failed` (void + cancel) only. E7.4b stays a stub.
+
+**Reuse as-is:**
+- `compensation-proof.js`: the classifier; canceled / still-authorized proofs; reservation proof; arrival gate; branded eligibilities; builders (with CURRENT `now` / `notBefore`); validators.
+- E7.3b patterns: the gate, `startBounded`, `claimWork` / `releaseWork`, `scopeFence`, `escalateRecovery`-style fenced owner cases, the pre-send check with fresh rows and a fresh clock after the reads, late-result-as-evidence, crash recovery via the accepted planner.
+- `recoverExpiredOperations` with `intentStates` on the claimed intent.
+- `findMissedOutcomes`, `findOrphanReads`, `requestRecoveryRead`, `reissueOrphanRead`, scoped by op types / listings / intent / states before every LIMIT.
+
+**Needs worker-local fenced handling (not the shared helpers as they stand):**
+- **Void and cancel claims:** E3 rows have no 0007-style fence. The worker claims by exact opId and re-checks, under the claim / immediately before the send: the state, the leg still open, the history class, the fresh PI proof (cancel: Z/P still-authorized or canceled, D canceled only; void: Z/P still-authorized), the reservation proof, the arrival gate, version, leases and protected ids.
+- **Success:** never a completed row → event without the confirming immutable proof. Void: a confirming PI read with the strict canceled proof, BEFORE the row is completed (I4). Cancel: a confirming by-id read (+ ref lookup) with status `cancelled`. Then an in-transaction check of the current version, state, leg, scope, op state and exact evidence ids.
+- **Already-gone authorization (§3.1 linkage):** `RECONCILED_AUTHORIZATION_GONE`, id `cw4-authgone:{intent}:{evidence}`, fenced on the evidence + version + state + leg. No capture row is touched.
+- **Uncertain void/cancel:** unknown → reads only. INTERCEPT the planner's RECONCILED_STILL_AUTHORIZED / RECONCILED_RESERVATION_STILL_ACTIVE into a fenced owner case. NEVER a resend (same or new key) or a new attempt.
+- **Pending audit rows of legs that are already gone** (e.g. a never-sent void row after `RECONCILED_AUTHORIZATION_GONE`) must never be executed: not by this worker, and not by any other scope. This needs a required fencing / claim test, and any other sender's claim path is a review item.
+- **Captured PI** (in any read) → fenced owner case. Never cancel, void or refund.
+
+**First meaningful integration tests:**
+1. happy `reservation_failed` void → confirming read → `authorization_released`;
+2. `capture_failed` void + cancel → `cancelled` only with BOTH legs;
+3. Z/P/D/M with PI evidence variants (incl. another actor's capture → owner case, zero writes);
+4. a reply alone insufficient; unknown → intercept → owner case under repeated delivery (zero resends);
+5. the pending audit row of an already-gone leg never claimed or sent (incl. by a second worker / other scope);
+6. leases / version / leg / evidence fences, each independently; cross-phase races (another actor settles a leg or captures during reads / between decision and event / before maintenance);
+7. the arrival gate at the claim and at the pre-send check (local midnight);
+8. crash windows; the late callback; hang bounds; > 100 noise rows; out-of-scope snapshots;
+9. no route closure.
+
+**Remaining gates (not Claude's to pass):**
+- live Stripe cancel behaviour from `requires_capture`, and the real canceled-charge refund fields (R-REFUND);
+- Hostaway live cancel reply/read shapes beyond the E4 runs;
+- platform / deploy validation;
+- the owner read-only shape checks;
+- B1 (offline-charge) facts for E7.4b;
+- the I7 escalation-path change, if ever wanted.
