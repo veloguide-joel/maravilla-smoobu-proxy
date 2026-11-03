@@ -376,19 +376,149 @@ test("pending audit row of an already-settled leg: never claimed / sent by this 
   assert.equal(w.voids.length, 0);
 });
 
-test("SHARED CLAIM GAP (root review item): generic claimNextOperation can still claim the never-sent void audit row of a settled leg", { todo: "needs a shared void/cancel claim fence in operations.js (proposed, not made in this slice)" }, async () => {
+// ---- shared void / cancel claim fence (operations.js claim SQL + migration 0009), every claim path ----
+const voidRowOf = async (id) => (await opsOf(id, OPS.VOID))[0];
+const opSnap = async (id) => (await db.app.query("SELECT id, op_type, state, attempts, dispatched_at, lease_worker_id, updated_at FROM booking.external_operations WHERE intent_id = $1 ORDER BY id", [id])).rows;
+/** Unfiltered (by type) generic sender: claims everything claimable for the intent; returns the claimed ids. */
+async function drainClaims(id, now, workerId = "generic-sender") {
+  const got = [];
+  for (let k = 0; k < 20; k++) {
+    const op = await claimNextOperation(db.app, { workerId, now, intentId: id });
+    if (!op) break;
+    got.push(op);
+  }
+  return got;
+}
+const directClaim = (opId, now) => db.app.query(
+  `UPDATE booking.external_operations SET state = 'in_flight', lease_worker_id = 'direct-sql', lease_until = $2, attempts = attempts + 1, dispatched_at = $3, updated_at = $3
+    WHERE id = $1`, [opId, new Date(now + 60 * MIN), new Date(now)]).then(() => "UPDATED", (e) => e.message);
+
+test("shared claim fence: the never-sent void row of a SETTLED authorization leg is unclaimable by every claim path (capture_failed open cancel leg, and after cancelled)", async () => {
   const w = world();
   const a = await captureFailed(w, 9, "D");
   w.pis.get(a.piId).status = "canceled";
   const h = harness(w, [9]);
-  await h.until(a.id, (st) => st === "cancelled", { max: 10 });
-  const v = (await opsOf(a.id, OPS.VOID))[0];
-  // the invariant root asked for: an already-gone authorization's pending void row must be unclaimable by ANY sender
-  const generic = await claimNextOperation(db.app, { workerId: "other-scope", now: h.clk.t, opTypes: [OPS.VOID], intentId: a.id });
-  const any = await claimNextOperation(db.app, { workerId: "other-scope-2", now: h.clk.t, opId: v.id });
-  assert.equal(generic, null, "generic void claim must be refused after the authorization leg settled");
-  assert.equal(any, null);
+  await h.step({ intentId: a.id });                                   // authorization leg settled from strict canceled evidence (no void)
+  assert.deepEqual(await legs(a.id), [false, true]);
+  const v = await voidRowOf(a.id);
+  const cap0 = await snapCapture(a.id);
+  const t = h.clk.t;
+  // (still capture_failed, cancel leg open) every path refuses the void; the open cancel leg stays claimable by type
+  assert.equal(await claimNextOperation(db.app, { workerId: "other-scope", now: t, opTypes: [OPS.VOID], intentId: a.id }), null, "type-filtered");
+  // type-filtered across ALL intents: it may legitimately take another intent's OPEN void (earlier tests' rows), never this one
+  for (let k = 0; k < 20; k++) {
+    const any = await claimNextOperation(db.app, { workerId: "other-scope", now: t, opTypes: [OPS.VOID] });
+    if (!any) break;
+    assert.notEqual(any.id, v.id, "type-filtered, any intent");
+  }
+  assert.equal(await claimNextOperation(db.app, { workerId: "other-scope", now: t, opId: v.id }), null, "exact opId");
+  assert.equal(await claimNextOperation(db.app, { workerId: "other-scope", now: t, opId: v.id, opTypes: [OPS.VOID] }), null, "exact opId + type");
+  assert.match(await directClaim(v.id, t), /^VOID_CLAIM_FENCED/, "direct runtime UPDATE refused by 0009");
+  assert.deepEqual(await voidRowOf(a.id), v, "void row still pending, never claimed / dispatched");
+  // the worker completes the cancel leg -> cancelled; then the unfiltered generic sender runs over the intent
+  await h.step({ intentId: a.id });
+  assert.equal(await state(a.id), "cancelled");
+  const claimed = await drainClaims(a.id, h.clk.t + MIN);
+  assert.ok(!claimed.some((o) => o.id === v.id), `unfiltered generic sender never takes the void: ${claimed.map((o) => o.op_type)}`);
+  assert.ok(!claimed.some((o) => [OPS.VOID, OPS.CANCEL, OPS.CAPTURE].includes(o.op_type)), "no provider write claimed");
+  assert.equal(await claimNextOperation(db.app, { workerId: "other-scope", now: h.clk.t + MIN, opId: v.id }), null);
+  assert.match(await directClaim(v.id, h.clk.t + MIN), /^VOID_CLAIM_FENCED/);
+  const v2 = await voidRowOf(a.id);
+  assert.deepEqual([v2.state, v2.attempts, v2.dispatched_at, v2.lease_worker_id], ["pending", 0, null, null]);
+  assert.deepEqual(await snapCapture(a.id), cap0, "capture rows unchanged");
+  assert.equal(w.voids.length, 0);
 });
+
+test("shared claim fence: transitions OUT of cleanup (owner case / authorization released) make pending void AND cancel rows unclaimable; open legs stay claimable", async () => {
+  // valid open legs: both claimable through the generic path (positive control; rows are then abandoned in this throwaway DB)
+  const w = world();
+  const ok1 = await captureFailed(w, 19, "P");
+  const t = F.at(20);
+  const gv = await claimNextOperation(db.app, { workerId: "generic", now: t, opTypes: [OPS.VOID], intentId: ok1.id });
+  const gc = await claimNextOperation(db.app, { workerId: "generic", now: t, opTypes: [OPS.CANCEL], intentId: ok1.id });
+  assert.ok(gv && gc, "open authorization and reservation legs are claimable");
+  const rf = await reservationFailed(w, 19);
+  assert.ok(await claimNextOperation(db.app, { workerId: "generic", now: t, opTypes: [OPS.VOID], intentId: rf.id }), "reservation_failed open authorization leg");
+  // escalated (outside cleanup) with BOTH rows pending
+  const b = await captureFailed(w, 19, "P");
+  F.ok(await applyEvent(db.app, b.id, { type: "ESCALATE", id: "owner-case", code: "OWNER_REVIEW" }, { now: t, actor: "reconciler" }));
+  const s0 = await opSnap(b.id);
+  const bv = await voidRowOf(b.id); const bc = (await opsOf(b.id, OPS.CANCEL))[0];
+  for (const [label, args] of [["unfiltered", { intentId: b.id }], ["void type", { opTypes: [OPS.VOID], intentId: b.id }], ["cancel type", { opTypes: [OPS.CANCEL], intentId: b.id }],
+    ["exact void", { opId: bv.id }], ["exact cancel", { opId: bc.id }]]) {
+    const r = await claimNextOperation(db.app, { workerId: "other-scope", now: t, ...args });
+    assert.ok(!r || ![OPS.VOID, OPS.CANCEL].includes(r.op_type), label);
+  }
+  assert.match(await directClaim(bv.id, t), /^VOID_CLAIM_FENCED/);
+  assert.match(await directClaim(bc.id, t), /^CANCEL_CLAIM_FENCED/);
+  for (const id of [bv.id, bc.id]) assert.deepEqual((await opSnap(b.id)).find((o) => o.id === id), s0.find((o) => o.id === id), "pending, unchanged");
+  // authorization released (reservation_failed -> authorization_released by the worker): no further void claim
+  const c = await reservationFailed(w, 19);
+  const hc = harness(w, [19]);
+  await hc.step({ intentId: c.id });
+  assert.equal(await state(c.id), "authorization_released");
+  assert.equal(await claimNextOperation(db.app, { workerId: "other-scope", now: hc.clk.t, opTypes: [OPS.VOID], intentId: c.id }), null);
+});
+
+test("shared claim fence vs a concurrent intent transition: a transition committing first refuses the claim; a claim holding the intent lock first wins and the transition waits", async () => {
+  const w = world();
+  // (a) the transition holds the intent row (uncommitted) while a claim starts: the claim re-checks after the intent lock -> refused
+  const a = await captureFailed(w, 20, "P");
+  const t = F.at(20);
+  let claimP = null;
+  F.ok(await applyEvent(db.app, a.id, { type: "ESCALATE", id: "race-escalate", code: "OWNER_REVIEW" }, { now: t, actor: "reconciler", hooks: { beforeCommit: async () => {
+    claimP = claimNextOperation(db.app, { workerId: "racer", now: t, opTypes: [OPS.VOID], intentId: a.id });
+    await new Promise((res) => setTimeout(res, 150));               // the claim found its candidate and now waits on the intent lock
+  } } }));
+  assert.equal(await claimP, null, "refused after the transition committed");
+  assert.equal((await voidRowOf(a.id)).state, "pending");
+  // (b) the claim share-locks the intent first: it commits (open leg), the transition waits and then applies
+  const b = await captureFailed(w, 20, "P");
+  let evP = null;
+  const op = await claimNextOperation(db.app, { workerId: "racer", now: t, opTypes: [OPS.VOID], intentId: b.id, hooks: { afterIntentLock: async () => {
+    evP = applyEvent(db.app, b.id, { type: "ESCALATE", id: "race-escalate-b", code: "OWNER_REVIEW" }, { now: t, actor: "reconciler" });
+    await new Promise((res) => setTimeout(res, 150));
+  } } });
+  assert.ok(op && op.op_type === OPS.VOID, "claim committed first");
+  F.ok(await evP);
+  assert.equal(await state(b.id), "reconciliation_required");
+});
+
+test("M history (two capture attempts, lawfully via E3 + the accepted planner) -> owner case on the cleanup leg, zero writes", async () => {
+  const w = world();
+  const stay = { listingId: L(21), ...nextStay() };
+  const r = await F.reserved(db.app, stay);
+  const a = await attach(w, r.id, { reservationId: String(r.reservationId), n: 21, stay });
+  const p = w.pis.get(a.piId);
+  const v3 = (status) => paymentIntentProofObservationV3(w.piObj({ ...p, status }), { accountVerified: true });
+  const planApply = async (opId, now) => {
+    const facts = await (await import("../../lib/booking-db/recovery.js")).loadRecoveryFacts(db.app, opId);
+    const plan = (await import("../../lib/checkout/recovery-plan.js")).planRecovery({ ...facts, now });
+    return { plan, r: await (await import("../../lib/booking-db/recovery.js")).applyRecoveryPlan(db.app, plan, { now }) };
+  };
+  // attempt 1: unknown -> still authorized -> E3 emits attempt 2 (a generic reconciler; NOT this worker's policy)
+  const c1 = (await F.runOp(db.app, r.id, OPS.CAPTURE, 8, { status: "outcome_unknown", errorCode: "TIMEOUT" })).op;
+  F.ok(await applyEvent(db.app, r.id, { type: "CAPTURE_OUTCOME_UNKNOWN", id: `op-unknown:${c1.id}`, code: "TIMEOUT" }, { now: F.at(8) }));
+  await F.piStatus(db.app, r.id, a.piId, "requires_capture", v3("requires_capture"), 12);
+  const s1 = await planApply(c1.id, F.at(13));
+  assert.equal(s1.plan.event.type, "RECONCILED_STILL_AUTHORIZED"); F.ok(s1.r);
+  // attempt 2: unknown -> the authorization is gone -> capture_failed with capture_attempts 2 (history M)
+  const c2 = (await F.runOp(db.app, r.id, OPS.CAPTURE, 14, { status: "outcome_unknown", errorCode: "TIMEOUT" })).op;
+  F.ok(await applyEvent(db.app, r.id, { type: "CAPTURE_OUTCOME_UNKNOWN", id: `op-unknown:${c2.id}`, code: "TIMEOUT" }, { now: F.at(14) }));
+  await F.piStatus(db.app, r.id, a.piId, "canceled", v3("canceled"), 18);
+  const s2 = await planApply(c2.id, F.at(19));
+  assert.equal(s2.plan.event.type, "RECONCILED_AUTHORIZATION_GONE"); F.ok(s2.r);
+  const i = await loadIntent(db.app, r.id);
+  assert.deepEqual([i.status, i.counters.captureAttempts], ["capture_failed", 2]);
+  const cap0 = await snapCapture(r.id);
+  p.status = "canceled";
+  const h = harness(w, [21], { start: F.at(30) });
+  await h.step({ intentId: r.id });
+  assert.equal(await reasonOf(r.id), "CAPTURE_HISTORY_MULTIPLE");
+  assert.equal(w.voids.length + w.cancels.length, 0);
+  assert.deepEqual(await snapCapture(r.id), cap0);
+});
+
 
 test("pre-send fences, each independently -> no send; no event after a lost lease", async () => {
   const need = CLEANUP_DEFAULT_TIMEOUTS.writeCallMs + CLEANUP_LIMITS.sendMarginMs;
