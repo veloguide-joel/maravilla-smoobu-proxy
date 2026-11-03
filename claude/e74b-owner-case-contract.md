@@ -1,13 +1,18 @@
-# E7.4b-D1: durable owner-case contract for Hostaway payment recordings (DESIGN ONLY)
+# E7.4b-D1: durable owner-case contract for Hostaway payment recordings (DESIGN ONLY), revision 2
 
-**Branch and base.** `feature/e7-offline-charge-owner-case-contract`, cut from exact `abdcf91`.
-- Migration 0010 is **PRESENT**: root accepted it offline at `d801b43`.
-- **This document governs D1.** It consolidates and supersedes the still-proposed D1 parts of `claude/e74b-db-evidence-case-contract.md`: §3.11 (later conflict), §4, the D1 rows of §7, the 0011 part of §8, and the D1 tests of §9 / §11.
+**Branch.** `feature/e7-offline-charge-owner-case-contract`.
+- Revision 1: `f411105`, cut from `abdcf91`.
+- **Revision 2** answers root's HOLD on `f411105`. It records root choices O1–O7 and corrections 1–7; the resolution map is §12.
+
+**Base and scope.**
+- Migration 0010 is **PRESENT** (accepted offline at `d801b43`).
+- The pure offline-charge proof foundation (`lib/checkout/offline-charge-proof.js`) is **accepted** (`4f6b27f`). What is *not* implemented is persisting worker preflight assessments and mapping them to the database (§6).
+- This document governs D1. It supersedes the D1 parts of `claude/e74b-db-evidence-case-contract.md` (see the pointer there).
 
 **Nothing here is implemented, applied or authorized.**
-- No executable migration, helper, worker or adapter change is made.
-- Dispatch, live gates and the owner `paymentMethod` choice stay blocked.
-- There is no automatic resend, no automated attempt > 1, and no ESCALATE, cancel, void, refund or real notification.
+- No executable 0011 / 0012, helper, worker, adapter or 0010 change.
+- No automatic resend, no automated attempt > 1, and no ESCALATE, cancel, void, refund or real notification.
+- Live gates, dispatch and the owner `paymentMethod` choice stay blocked.
 
 **Labels.**
 - **[PRESENT]**: code at `abdcf91`, cited as path:line.
@@ -17,381 +22,497 @@
 
 ---
 
+## 0. Root choices recorded (HOLD on f411105)
+
+| # | Choice |
+|---|---|
+| O1 | **0011** = visibility holds + evidence inbox + base claim fence + reserved-case binding. **0012** = preflight assessments / holds. |
+| O2 | **No `close_acknowledged`.** `keep_visible` (no release, no closure) and `link_full_proof` (`SUCCEEDED_UNPROVEN` only) are the only 0011 owner decisions. Acknowledging has no purge side effect. Override / manual finalisation stay [OUTSIDE]. |
+| O3 | One shared SQL per-evidence core with an **explicit reference**, a private count wrapper, and a narrow granted read-only page function. Exact 0010 parity, result shape and cursor. |
+| O4 | `SUCCEEDED_UNPROVEN` may be opened immediately (DB-derived). A racing open can move a later link to owner-only (§5.2). No age delay. |
+| O5 | App maintenance may call the bounded DB-only processor. Schedules and live invocation stay [OUTSIDE]. No provider action. |
+| O6 | Keep **both** the op-hold check and the fail-closed "no open reserved case for the intent" check in the fence. Legitimate same-kind collisions are handled (§4.5), not declared impossible. |
+| O7 | The raw UNIQUE reservation-id conflict stays tracked [OUTSIDE]; no runtime work. |
+
+---
+
 ## 1. Present baseline (inspected at abdcf91)
 
 | Fact | Where |
 |---|---|
-| **Cases.** `reconciliation_cases`: one **open** case per `(intent_id, kind)` (unique partial index); no delete. Resolution values: `confirmed`, `released`, `cancelled`, `refunded`, `recorded`, `no_action`. | `db/migrations/0001_booking_core.up.sql:536–551` |
-| **App case grants.** The app has SELECT / INSERT on cases; UPDATE was revoked; non-privileged UPDATE is refused. **⇒ the app can INSERT any case kind.** | 0002:23–27, 0003:675, 0003:462–470 |
-| `openCase` uses `ON CONFLICT (intent_id, kind) WHERE status='open' DO NOTHING`, which drops silently. It is used by `markUnknown` for `OFFLINE_CHARGE_OUTCOME_UNKNOWN` (case `opened_by = 'op:<id>'`). | `lib/booking-db/operations.js:22–34`, 267–289 |
-| `admin_close_case` refuses `opened_by LIKE 'op:%'`; otherwise it resolves `no_action` with a resolution row. | 0003:640–656 |
-| Owner resolutions: `reconciliation_resolutions`, append-only. | 0003:104–123 |
-| An open case blocks guest-data purge. | 0001:604 |
-| At most **one** open recording per intent (`pending`, `in_flight`, `outcome_unknown`, `escalated`). | 0001:396–397 |
-| A new recording only after earlier ones are owner-resolved or catalogued failed. | 0004:74–112 |
-| E3 queues attempt `n+1` after `OFFLINE_CHARGE_FAILED`, up to `maxOfflineChargeAttempts`. | `lib/checkout/intent-state.js:598–603`; key `och:<intent>:<n>` at `lib/booking-db/repo.js:105` |
-| **No recording claim fence.** `claimNextOperation` claims any pending recording, attempt 2 included (the D2 tests claim attempt 2). It sets `dispatched_at` and `lease_until` from the **caller** clock. | `operations.js:74–108`; fences only for capture / create / void / cancel (0007, 0009) |
+| **Cases.** `reconciliation_cases`: one **open** case per `(intent_id, kind)`; `kind` must satisfy `is_code`; no delete. | 0001:536–551 |
+| App case grants: INSERT stays; UPDATE revoked; non-privileged UPDATE refused. | 0002:23–27, 0003:675, 0003:462–470 |
+| **Privileged paths that resolve cases today:** | |
+| – `intents_safety_guard` resolves **all open cases of the intent** when it leaves `reconciliation_required` (fires for `admin_resolve_intent`, 0003:603) | 0004:114, 0004:178–181 |
+| – `admin_resolve_operation` resolves `opened_by = 'op:'||op` | 0005:380 |
+| – `settle_operation_from_evidence` resolves `opened_by = 'op:'||op` | 0005:286 |
+| – `admin_close_case` resolves any case except `op:%` | 0003:640–656 |
+| Open cases block guest-data purge, and appear as `OPEN_CASE:<kind>` in `claim_release_blockers`. | 0005:145, 0005:62–64 |
+| **Resolutions.** `reconciliation_resolutions`: `decision` enum; `operation_id` NOT NULL **iff** `operation_succeeded` / `_failed`; `case_id` NOT NULL **iff** `case_closed`; `cardinality(evidence_ids) ≥ 1`. | 0003:104–123 |
+| One open recording per intent (`pending`, `in_flight`, `outcome_unknown`, `escalated`). Several *terminal* recordings may exist. | 0001:396–397 |
+| Attempt `n+1` is queued after `OFFLINE_CHARGE_FAILED`. | `lib/checkout/intent-state.js:598–603`; key `och:<intent>:<n>` at `lib/booking-db/repo.js:105` |
+| **No recording claim fence.** `claimNextOperation` sets `dispatched_at` / `lease_until` from the caller clock. | `lib/booking-db/operations.js:74–108` |
 | `applyEvent` locks the intent `FOR NO KEY UPDATE` first. | `repo.js:350` |
-| **Evidence.** `provider_evidence`: append-only; `created_at DEFAULT now()` (**transaction start**, not commit order); `observed_at` = read `completed_at` (caller) or the owner-supplied time. The app has no INSERT; writes go only through `record_provider_evidence` / `admin_record_evidence`. Offline-charge evidence always has `matchingChargeCount` + `matchingChargeIds`. | 0003:52–76, 0003:92–97; 0010:354–404 |
-| **0010 (PRESENT):** | |
-| – conflict predicate `recording_conflict_refusal(intent, dispatched_at, result_ref, reference)`: reservation-scoped; method / account compared to the reference | 0010:117–162 |
-| – `complete_recording_with_evidence` (initial attempt only) | 0010:250–288 |
-| – `link_recording_evidence` | 0010:293–322 |
-| – finalisation trigger | 0010:332–350 |
-| – lifecycle guard | 0010:166–247 |
-| – writers take the advisory key `(hashtext('booking.recording_evidence'), hashtext(intent))` after their INSERT | 0010:386–387, 402–403 |
-| 0010 read-only scan `listRecordingContradictions`: lossless cursor `{observedAtExact, evidenceId, opId}`, latest linked recording only, ≤ 500 rows. | `operations.js:171–224` |
-| `admin_resolve_operation` (recording `succeeded` accepts dashboard count-1 evidence ≥ 15 min; never sets a link). It locks the op, then reads the intent unlocked. | 0005:296–384 (recording branch 327–339) |
+| `provider_evidence.created_at DEFAULT now()` = **transaction start**. Writes only through `record_provider_evidence` / `admin_record_evidence`, which INSERT and then take the advisory key. | 0003:52–76, 0003:67; 0010:354–404 (advisory at 386–387, 402–403) |
+| **0010:** | |
+| – `recording_conflict_refusal(intent, dispatched_at, result_ref, reference)` | 0010:131–162; row condition 141–159 |
+| – completion (reference = **candidate** `p_evidence`) | 0010:279 |
+| – link (reference = **candidate**) | 0010:316 |
+| – finalisation (reference = linked) | 0010:343 |
+| – lossless scan | `operations.js:171–224` |
 
 ---
 
-## 2. Design choices (summary)
+## 2. Design in brief
 
-1. **One op-bound "hold" record plus one case.** A hold is the op-bound identity. The case is the existing `(intent, kind)` owner-visibility identity.
-   - Holds never change intent state, op state or `dispatched_at`, and never queue effects.
-2. **Five hold reasons.** Three are derived **entirely from database facts**: `ATTEMPT_GT1`, `SUCCEEDED_UNPROVEN`, `LINKED_CONTRADICTED`. Only the preflight reasons depend on trusted worker classification.
-3. **Later conflicts use a durable ingest inbox, not a forward cursor.**
-   - An `AFTER INSERT` trigger on offline-charge evidence enqueues the evidence id in the **same transaction**.
-   - A bounded processor drains the inbox with `SKIP LOCKED`.
-   - So no evidence is missed, whatever its `observed_at` or `created_at`, including late-inserted historical dashboard evidence.
-4. **One predicate.** 0011 factors the 0010 predicate into a per-row function. The 0010 count function, the inbox processor and the scan all use it. Nothing forks.
-5. **Owner resolution is truthful.** Acknowledging or closing never makes contradictory evidence disappear and never unblocks finalisation. Override or manual finalisation is [OUTSIDE].
-6. **Staging.**
-   - **0011** = visibility holds (DB-derived) + inbox + base claim fence + reserved-kind guard.
-   - **0012** = preflight assessments + preflight holds + the fresh-eligible requirement on the fence.
-   - 0011 has no trusted worker input. It closes the open prerequisite and the attempt-2 claim gap.
+1. **Op-bound holds plus bound cases.** A hold is the op-level identity. A case is the `(intent, kind)` owner-visibility identity. One case may carry **several** holds of the same reason (§4.5).
+   - Holds never change intent state, op state, `dispatched_at`, public status or effects.
+2. **Reasons.**
+   - **0011** (all derived from database facts): `ATTEMPT_GT1`, `SUCCEEDED_UNPROVEN`, `LINKED_CONTRADICTED`.
+   - **0012**: `PREFLIGHT_*`.
+3. **Later contradictions use a trigger-fed inbox**, drained one item per top-level transaction (§5.3).
+4. **One per-evidence predicate with an explicit reference**, shared by completion, link, finalisation, inbox and page (§5.1).
+5. **Owner decisions live in a dedicated hold-decision table.** `reconciliation_resolutions` is not reused, so no provider evidence is invented (§7).
 
 ---
 
-## 3. Hold reasons and targets [PROPOSED]
+## 3. Hold reasons [PROPOSED]
 
-| Reason (case kind = `OFFLINE_CHARGE_HOLD_<reason>`) | Target row when opened (latest recording of the intent) | Intent state | Opened by | Stage |
+| Reason → case kind `OFFLINE_CHARGE_HOLD_<reason>` | Target op when opened | Intent | Opened by | Stage |
 |---|---|---|---|---|
-| `ATTEMPT_GT1` | `pending`, key attempt > 1, `dispatched_at` NULL | `payment_captured` | `open_recording_visibility_hold` (DB-derived) | 0011 |
-| `SUCCEEDED_UNPROVEN` | `succeeded`, `settled_evidence_id` NULL, `result_ref` set | `payment_captured` or `confirmed` (inherited; visibility only) | `open_recording_visibility_hold` | 0011 |
-| `LINKED_CONTRADICTED` | `succeeded`, linked; at least one evidence row for which `recording_evidence_contradicts(op, e)` is true | `payment_captured` or `confirmed` | inbox processor only | 0011 |
-| `PREFLIGHT_EXHAUSTED` | `pending`, key `:1`, `attempts = 0`, `dispatched_at` NULL; ≥ 3 non-eligible preflight assessments in the current epoch | `payment_captured` | `open_recording_preflight_hold` (worker) | 0012 |
-| `PREFLIGHT_CONFLICT_MARKER` / `_LOOKALIKE` / `_SAME_AMOUNT` | same row + a cited current-epoch assessment with that outcome | `payment_captured` | `open_recording_preflight_hold` | 0012 |
+| `ATTEMPT_GT1` | latest recording; `pending`; key attempt > 1; `dispatched_at` NULL | `payment_captured` | `open_recording_visibility_hold` | 0011 |
+| `SUCCEEDED_UNPROVEN` | latest; `succeeded`; `result_ref` set; link NULL | `payment_captured` or `confirmed` | `open_recording_visibility_hold` | 0011 |
+| `LINKED_CONTRADICTED` | latest; `succeeded`; linked; the inbox item's evidence contradicts it | `payment_captured` or `confirmed` | inbox processor only | 0011 |
+| `PREFLIGHT_EXHAUSTED`, `PREFLIGHT_CONFLICT_MARKER` / `_LOOKALIKE` / `_SAME_AMOUNT` | latest; `pending`; key `:1`; `attempts 0`; undispatched | `payment_captured` | `open_recording_preflight_hold` (worker) | 0012 |
 
-**Not holds.**
-- **A dispatched send whose outcome is unknown** (`in_flight` past its lease, `outcome_unknown`, `escalated`) stays on the existing owner-only path: `OFFLINE_CHARGE_OUTCOME_UNKNOWN` case → `admin_resolve_operation`.
-- D1 never fakes `dispatched_at` or `outcome_unknown` to raise an alert.
-- If the owner resolves `succeeded` from count-only or dashboard evidence, the row becomes eligible for `SUCCEEDED_UNPROVEN`.
+**Dispatched unknown sends** stay on the existing owner-only path (`OFFLINE_CHARGE_OUTCOME_UNKNOWN` → `admin_resolve_operation`). Nothing fakes `dispatched_at` or `outcome_unknown`.
 
 ---
 
-## 4. Objects, guards and grants [PROPOSED]
+## 4. Tables, guards, grants (0011 unless marked) [PROPOSED]
 
-Every new table:
-- has RLS enabled with **no app / admin write policy** (writes only inside schema-owner SECURITY DEFINER functions);
-- has SELECT policies for `mv_booking_app`, `mv_booking_admin` and `mv_booking_report`;
-- has `reject_change` on DELETE / TRUNCATE.
+**Common rules.**
+- RLS enabled; **SELECT-only** policies for `mv_booking_app`, `mv_booking_admin`, `mv_booking_report`. No write policy or grant for any role; writes happen only inside schema-owner SECURITY DEFINER functions.
+- `reject_change` on DELETE and TRUNCATE.
+- Guard triggers are SECURITY INVOKER and use `is_privileged()` only as "inside a schema-owner function".
+- Binding (constraint) triggers are SECURITY DEFINER, owned by the schema owner and `REVOKE ALL FROM PUBLIC`. They read the protected tables without any app grant.
 
-### 4.1 `booking.recording_holds`
+### 4.1 `recording_holds`
 
-| Column | Notes |
+| Column | Rule |
 |---|---|
-| `id uuid PK` | pre-allocated by the opening function |
-| `operation_id uuid NOT NULL → external_operations`, `intent_id uuid NOT NULL → intents` | the intent must equal the op's intent (guard) |
-| `reason text NOT NULL` | CHECK in the §3 set |
-| `case_id uuid NOT NULL UNIQUE → reconciliation_cases` | immediate FK; the case is inserted first |
-| `op_state_at_hold`, `op_key_at_hold`, `intent_state_at_hold`, `intent_version_at_hold` | snapshot at `v_t` |
-| `epoch int NOT NULL` | 0011 reasons: 0 |
-| `assessment_id uuid NULL → recording_assessments` | 0012 preflight conflict reasons only |
-| `created_at timestamptz NOT NULL` | the function's post-lock `v_t` |
-| `created_by text NOT NULL` | worker label or `'inbox'` [TRUST label] |
-| `released_at`, `release_decision`, `release_resolution_id → reconciliation_resolutions` | NULL → value **once** |
+| `id uuid PK` | pre-allocated |
+| `operation_id → external_operations`, `intent_id → intents` | `intent_id` = the op's intent (guard) |
+| `reason` | CHECK: 0011 set; 0012 widens the CHECK |
+| `case_id → reconciliation_cases NOT NULL` | **not unique**: several holds may share one case (§4.5) |
+| `op_state_at_hold`, `op_key_at_hold`, `intent_state_at_hold`, `intent_version_at_hold` | snapshot |
+| `epoch int NOT NULL DEFAULT 0` | |
+| `created_at` | = `v_t` |
+| `created_by` | [TRUST label] |
+| `released_at`, `release_decision_id → recording_hold_decisions` | set together, NULL → value once |
 
-Constraints and guard:
-- `UNIQUE (operation_id) WHERE released_at IS NULL` (one active hold per op).
-- Guard (BEFORE UPDATE, INVOKER): every identity column frozen; release columns NULL → non-NULL once, only when `is_privileged()`. **Never un-released.**
+Constraints:
+- `UNIQUE (operation_id) WHERE released_at IS NULL`.
+- Identity columns frozen.
+- **There is no `assessment_id` column in 0011.** 0012 adds it with its FK, once `recording_assessments` exists.
 
-### 4.2 `booking.recording_hold_observations` (append-only)
+### 4.2 `recording_hold_observations` (append-only contradictions only)
 
-- Columns: `id`, `hold_id → recording_holds`, `evidence_id → provider_evidence`, `observed_kind` (`contradiction` | `acknowledged`), `resolution_id` NULL, `recorded_at` (`v_t`).
-- `UNIQUE (hold_id, evidence_id) WHERE observed_kind = 'contradiction'`.
-- One row per contradictory evidence row per hold. New contradictions append here; nothing overwrites case `evidence`.
+- Columns: `id`, `hold_id → recording_holds NOT NULL`, `evidence_id → provider_evidence NOT NULL`, `recorded_at = v_t`.
+- `UNIQUE (hold_id, evidence_id)`.
+- Acknowledgements are **not** observations; they are decisions (§4.3).
 
-### 4.3 `booking.recording_conflict_inbox`
+### 4.3 `recording_hold_decisions` (append-only owner decisions)
 
-- Columns: `seq bigint GENERATED ALWAYS AS IDENTITY`, `evidence_id uuid PK → provider_evidence`, `intent_id`, `enqueued_at` (`clock_timestamp()` in the trigger), `processed_at` NULL, `outcome` NULL, `hold_id` NULL, `attempts int DEFAULT 0`, `last_error text`.
-- `outcome` ∈ `not_latest_linked`, `consistent`, `contradiction_opened`, `contradiction_appended`, `contradiction_duplicate`.
-- Guard: only `processed_at`, `outcome`, `hold_id`, `attempts`, `last_error` may change, privileged only; `processed_at` is set once.
-- **Trigger:** `zz1_evidence_enqueue_offline_charge`, `AFTER INSERT ON provider_evidence FOR EACH ROW WHEN (NEW.kind = 'hostaway_offline_charges')`, SECURITY DEFINER. It inserts the inbox row.
-  - Both evidence writers are already schema-owner functions (0010:354–404), so the enqueue is atomic with the evidence: either both commit or neither does.
+| Column | Rule |
+|---|---|
+| `id`, `hold_id NOT NULL`, `operation_id NOT NULL`, `case_id NOT NULL`, `intent_id NOT NULL` | must equal the hold's (guard) |
+| `decision` | 0011: `keep_visible`, `link_full_proof`; 0012 adds `release_for_initial_send`, `recorded_manually` |
+| `evidence_ids uuid[] NOT NULL DEFAULT '{}'` | **may be empty.** Every cited id must belong to the intent (`cited_evidence`, 0003:522) |
+| `linked_evidence_id` | NOT NULL **iff** `decision = 'link_full_proof'` |
+| `assessment_id` | 0012 only; NOT NULL iff `release_for_initial_send` |
+| `resolver`, `justification_code` (`is_code`), `resolver_session_user` | |
+| `decided_at` | owner `p_at` [TRUST] |
+| `recorded_at` | `v_t` |
 
-### 4.4 `booking.recording_assessments` (0012)
+`reconciliation_resolutions` (0003:104–123) is **unchanged**. No enum or CHECK change, and no provider evidence is invented for `ATTEMPT_GT1` / `keep_visible`.
 
-The columns and rules are in §6.
+### 4.4 `recording_conflict_inbox`
 
-### 4.5 Reserved case kinds (0011)
+| Column | Rule |
+|---|---|
+| `seq bigint GENERATED ALWAYS AS IDENTITY` | |
+| `evidence_id uuid PK → provider_evidence`, `intent_id` | |
+| `enqueued_at` | `clock_timestamp()` in the trigger |
+| `attempts int NOT NULL DEFAULT 0`, `last_error text`, `last_attempt_at` | |
+| `processed_at`, `outcome`, `hold_id` | |
 
-- `OFFLINE_CHARGE_HOLD_%` is **reserved**. The broad app INSERT grant (0002:23–27) stays.
-- **BEFORE INSERT trigger** on cases: a reserved kind requires `is_privileged()` and `opened_by = 'recording-hold:' || id`.
-- **DEFERRABLE INITIALLY DEFERRED constraint trigger** on cases, AFTER INSERT: at commit, a reserved-kind case must be referenced by exactly one `recording_holds.case_id`.
-  - `is_privileged()` is also true inside *other* granted owner functions (contract §1.2), so the deferred binding is what actually proves the hold function wrote it.
-- `admin_close_case` (CREATE OR REPLACE): refuse `opened_by LIKE 'recording-hold:%'` → `HOLD_CASE_USE_ADMIN_RESOLVE_RECORDING_HOLD`.
-- `openCase`, and its silent `ON CONFLICT DO NOTHING`, is **unchanged**. No D1 function uses it.
+**Mutation rules** (guard, privileged only):
+- (a) While `processed_at IS NULL`: `attempts` may change only to `attempts + 1`, together with `last_error` and `last_attempt_at`.
+- (b) `processed_at`, `outcome` and `hold_id` change NULL → value **together, once**, and the row is then fully frozen.
+- (c) Nothing else changes.
+
+Outcomes: `not_latest_linked`, `consistent`, `contradiction_opened`, `contradiction_joined_case`, `contradiction_appended`, `contradiction_duplicate`.
+
+**Enqueue trigger** `zz1_evidence_enqueue`: `AFTER INSERT ON provider_evidence FOR EACH ROW WHEN (NEW.kind = 'hostaway_offline_charges')`, SECURITY DEFINER.
+- It runs inside the writer's INSERT statement, i.e. **before** the writer's advisory lock (0010:386–387, 402–403).
+- It takes no lock beyond the new inbox row and the FK key-share locks (evidence row, intent).
+
+### 4.5 Reserved cases: identity, binding, collisions
+
+**Identity.** A hold case has `kind = 'OFFLINE_CHARGE_HOLD_'||reason` and `opened_by = 'recording-hold:'||<case.id>`, i.e. the **case** id. Each hold binds through `hold.case_id = case.id`.
+
+**INSERT guard** (BEFORE INSERT on cases, INVOKER). A reserved kind (`OFFLINE_CHARGE_HOLD_%`) requires `is_privileged()` and `opened_by = 'recording-hold:'||NEW.id`. The broad app INSERT grant stays; app inserts of reserved kinds are refused.
+
+**Deferred two-way binding** (DEFERRABLE INITIALLY DEFERRED constraint triggers AFTER INSERT OR UPDATE on **both** `reconciliation_cases` and `recording_holds`). At commit, for every touched reserved-kind case `c`:
+- every hold with `case_id = c.id` has `intent_id = c.intent_id` and `'OFFLINE_CHARGE_HOLD_'||reason = c.kind`;
+- `c.opened_by = 'recording-hold:'||c.id`;
+- **`c.status = 'open'` iff at least one bound hold is active.**
+
+For every touched hold, its case is reserved-kind and satisfies the above. Any violation raises and the whole transaction rolls back. So **no privileged function can resolve or repurpose a hold case** without releasing every bound hold in the same transaction, and only `admin_resolve_recording_hold` releases holds.
+
+**Case UPDATE guard** (BEFORE UPDATE on cases, INVOKER). On a reserved-kind case, `id`, `intent_id`, `kind`, `opened_by`, `opened_at` and `evidence` are frozen; only status and resolution columns may change.
+
+**Existing paths that touch cases (0011 changes):**
+
+| Path | Today | 0011 |
+|---|---|---|
+| `intents_safety_guard` bulk resolve on leaving `reconciliation_required` (0004:178–181) | resolves every open case of the intent | CREATE OR REPLACE with `AND kind NOT LIKE 'OFFLINE_CHARGE_HOLD_%'`. The hold case stays **open and visible**; the owner's intent resolution is not blocked. Without this change, the deferred binding would make `admin_resolve_intent` fail closed for any intent with an active hold. |
+| `admin_close_case` (0003:640–656) | closes any non-`op:%` case | CREATE OR REPLACE: refuse `opened_by LIKE 'recording-hold:%'` (`HOLD_CASE_USE_ADMIN_RESOLVE_RECORDING_HOLD`) before any write |
+| `admin_resolve_operation` (0005:380), `settle_operation_from_evidence` (0005:286) | resolve `opened_by = 'op:'||op` | unchanged; these cannot match `recording-hold:` cases, and the deferred binding is the backstop |
+
+**Same-kind collision (legitimate).** Example: op 2 keeps an active `ATTEMPT_GT1` hold (no release exists in 0011) after the owner moves it on, and op 3 later becomes pending attempt > 1. Its hold would need the same `(intent, kind)` open case.
+- Rule: under the locks of §9, the opener locks the existing open reserved case of that kind `FOR UPDATE`.
+- If present, the new hold **joins** it (`hold.case_id = existing case`); the processor outcome is `contradiction_joined_case`.
+- The case row is not modified (its `evidence` stays the first op's snapshot). Every joined hold is visible in `recording_holds`.
+- Only if none exists is a new case inserted.
+- No `ON CONFLICT DO NOTHING`, no overwrite and no silent loss. A unique violation can still occur if an *unbound* case of that kind appeared (impossible after the INSERT guard; possible from pre-0011 data). It raises `CASE_KIND_OCCUPIED` and rolls back. The 0011 up precondition refuses if any reserved-kind case exists.
+
+**Side effects accepted and documented.** An open hold case keeps blocking guest-data purge (0005:145) and appears in `claim_release_blockers` (0005:62–64). With O2, `keep_visible` never closes it.
 
 ### 4.6 Grants
 
 | Function | App | Admin |
 |---|---|---|
-| `open_recording_visibility_hold` (0011) | EXECUTE | EXECUTE |
-| `process_recording_conflict_inbox` (0011) | EXECUTE | EXECUTE |
-| `admin_resolve_recording_hold` (0011) | — | EXECUTE |
+| `open_recording_visibility_hold` | EXECUTE | EXECUTE |
+| `process_recording_conflict_inbox_one` | EXECUTE | EXECUTE |
+| `recording_contradictions_page` (read-only) | EXECUTE | EXECUTE |
+| `admin_resolve_recording_hold` | — | EXECUTE |
 | `record_recording_assessment`, `open_recording_preflight_hold` (0012) | EXECUTE | — |
-| private helpers (`recording_evidence_contradicts`, the fence, the guards) | — | — |
+| private: `recording_evidence_contradicts`, the count wrapper, the fence, guards, binding triggers | — | — |
 
-All functions have `REVOKE ALL FROM PUBLIC`. There is no general app case writer.
+`REVOKE ALL FROM PUBLIC` on all of them. There is no general app case writer.
 
 ---
 
 ## 5. Functions (0011) [PROPOSED]
 
-Every function follows the same uniform lock order (§9):
+### 5.1 Shared predicate with an explicit reference (correction 1)
 
-> intent → (intent_work) → recording op → advisory evidence key → hold rows → case
+```
+booking.recording_evidence_contradicts(p_intent uuid, p_dispatched_at timestamptz, p_result_ref text,
+                                       p_reference uuid, p_evidence uuid) RETURNS boolean   -- VOLATILE, SD, private
+```
 
-It samples `v_t := clock_timestamp()` **after the last lock** and uses only `v_t` for time decisions. Refusals raise with no partial write: one transaction, case and hold inserted together or not at all.
+- It is the 0010 row condition (0010:141–159) applied to the single evidence row `p_evidence`:
+  - same intent, kind, `external_ref` = the reservation;
+  - `observed_at > p_dispatched_at`, `id <> p_reference`, count ≥ 1, marker rule;
+  - the id / count / present-field comparisons, with `paymentMethod` / `executorAccountRef` compared against `p_reference.observed`.
+- Input handling: the wrapper first checks its inputs exactly as 0010 does (0010:136–138) and **returns** `'CONFLICT_CHECK_INPUT'` (not a raise), preserving 0010's result. The core is only called with validated inputs; called directly with a NULL or missing reference / intent, it raises `CONFLICT_CHECK_INPUT`.
+- **`recording_conflict_refusal(p_intent, p_dispatched_at, p_result_ref, p_reference)`** (0011 CREATE OR REPLACE; same signature, same result) = `'POSITIVE_CONTRADICTION'` if `EXISTS` evidence of the intent for which the core is true, else NULL. Its input-error behaviour stays as in 0010.
 
-### 5.1 Shared predicate (no fork)
+**Call map** (the reference is always explicit):
 
-`recording_evidence_contradicts(p_op uuid, p_evidence uuid) RETURNS boolean` (VOLATILE, SD, private):
-- the exact 0010 per-row condition (0010:141–159), with reference = the op's `settled_evidence_id`;
-- `dispatched_at` and `result_ref` taken from the op row.
+| Caller | `p_dispatched_at` | `p_result_ref` | `p_reference` |
+|---|---|---|---|
+| `complete_recording_with_evidence` (0010:279, unchanged call) | `o.dispatched_at` | `p_result_ref` | **candidate** `p_evidence` (row not yet linked) |
+| `link_recording_evidence` (0010:316, unchanged call) | `o.dispatched_at` | `o.result_ref` | **candidate** `p_evidence` |
+| finalisation trigger (0010:343, unchanged call) | `o.dispatched_at` | `o.result_ref` | `o.settled_evidence_id` |
+| inbox processor | latest op `dispatched_at` | `result_ref` | `o.settled_evidence_id` (linked only), evidence = the inbox item |
+| `recording_contradictions_page` | `o.dispatched_at` | `o.result_ref` | `o.settled_evidence_id` |
 
-`recording_conflict_refusal` is redefined (same signature and result) as a count over the same row condition, with an explicit reference argument.
-- An equivalence test pins identical results on the 0010 test fixtures.
-- The JS scan (`operations.js:182–224`) is replaced by a granted read-only SQL function, `recording_contradictions_page(after…, limit)`, built on the same predicate. Same lossless cursor and result shape. This is a helper change in the same stage.
+`recording_contradictions_page(p_after_exact text, p_after_evidence uuid, p_after_op uuid, p_limit int)` returns the current JS result shape:
+- columns `opId`, `intentId`, `resultRef`, `evidenceId`, `source`, `observedAt` (ms), `observedAtExact`, plus `next`;
+- the same lossless keyset `(observed_at, evidence id, op id)`, the same latest-linked restriction, limit 1…500;
+- cursor validation in SQL, mirroring `operations.js:182–188`.
+
+`listRecordingContradictions` becomes a thin caller (a helper change in the same stage). The executable 0010 file is not modified.
 
 ### 5.2 `open_recording_visibility_hold(p_op uuid, p_reason text, p_by text) RETURNS uuid`
 
-`p_reason` ∈ {`ATTEMPT_GT1`, `SUCCEEDED_UNPROVEN`}. There is no worker lease, version or caller time: the result is derived from facts and touches nothing but the hold and case.
-
+`p_reason` ∈ {`ATTEMPT_GT1`, `SUCCEEDED_UNPROVEN`}. No lease, version or caller time.
 1. Pre-allocate `hold_id` and `case_id`.
-2. Locks: intent `FOR SHARE` → op `FOR UPDATE` → advisory → active hold for op `FOR UPDATE` → `v_t`.
-3. Checks:
-   - op is a recording, and is `recording_latest_id(intent)`;
-   - `ATTEMPT_GT1`: `pending`, key attempt > 1, `dispatched_at` NULL, intent `payment_captured`;
-   - `SUCCEEDED_UNPROVEN`: `succeeded`, `result_ref` set, link NULL, intent ∈ {`payment_captured`, `confirmed`}.
-4. **Idempotence:** an active hold for op with the same reason → return its id (no write). A different reason → `HOLD_ALREADY_ACTIVE`.
-5. INSERT the case (`kind 'OFFLINE_CHARGE_HOLD_'||reason`, `opened_by 'recording-hold:'||hold_id`, `opened_at v_t`; evidence `{operationId, reason, opKey, opState, intentVersion}`), then INSERT the hold. A unique violation on the open case → **raise `CASE_KIND_OCCUPIED`**; the transaction rolls back (never `DO NOTHING`).
-   - This is impossible by design: reserved kinds are only written here, one open recording per intent (0001:396), and one active hold per op.
+2. Locks: intent `FOR SHARE` → op `FOR UPDATE` → advisory → active hold of op `FOR UPDATE` → existing open case `(intent, kind)` `FOR UPDATE` → **`v_t`**.
+3. Checks (§3), including `recording_latest_id`.
+4. Idempotence: an active hold of op with the same reason → return its id. A different reason → `HOLD_ALREADY_ACTIVE`.
+5. Write: join the existing case or INSERT a new case; then INSERT the hold. The deferred binding is checked at commit.
 
-### 5.3 `process_recording_conflict_inbox(p_by text, p_limit int) RETURNS jsonb`
+**O4 race (documented).** `SUCCEEDED_UNPROVEN` opened while an automated link is in progress:
+- link first → the opener sees the link and refuses (`HOLD_TARGET_LINKED`);
+- opener first → the link is refused (`RECORDING_HOLD_ACTIVE`), and only the owner's `link_full_proof` can link afterwards.
 
-`p_limit` is clamped to 1…100. It returns counts per outcome. It loops over `SELECT … FROM recording_conflict_inbox WHERE processed_at IS NULL ORDER BY attempts, seq FOR UPDATE SKIP LOCKED LIMIT p_limit`. **Each row runs in its own subtransaction** (plpgsql `BEGIN … EXCEPTION`):
+### 5.3 Inbox processing: one item per top-level transaction (correction 5)
 
-1. Locks: intent `FOR SHARE` → latest recording `FOR SHARE` → advisory → active hold for op `FOR UPDATE` → `v_t`.
-2. If the latest recording is not `succeeded` + linked → `not_latest_linked`.
-   - Such evidence is still judged by 0010 at completion, link or finalisation, because it is committed before its inbox row is visible.
-3. Else, if `NOT recording_evidence_contradicts(op, e)` → `consistent`.
-4. Else, contradiction:
-   - an active `LINKED_CONTRADICTED` hold for op → append an observation (`contradiction_appended`; a unique hit → `contradiction_duplicate`, no new row);
-   - an active hold with another reason → impossible for a linked row; raise `HOLD_STATE_UNEXPECTED` (row error, see below);
-   - none → pre-allocate ids; case first, hold, first observation → `contradiction_opened`.
-5. Set `processed_at = v_t`, `outcome`, `hold_id`.
-6. **Row error:** the subtransaction rolls back; `attempts + 1` and `last_error = SQLSTATE` are written. The row stays **unprocessed**. It is never dropped, and it is retried in later calls, ordered behind fresh rows.
+```
+booking.process_recording_conflict_inbox_one(p_by text) RETURNS jsonb   -- {evidenceId, outcome} | {evidenceId, error} | null
+```
 
-**Delivery semantics.**
-- Effects happen at least once (the row is marked in the same transaction as its effects).
-- Re-processing is idempotent (observation uniqueness, one active hold per op).
-- No exactly-once *observation* is claimed.
+**One call = one statement = one top-level transaction** (the caller uses autocommit). It touches **at most one** inbox item. Batching is done by the app helper, as ≤ 100 **independent** calls; no PL/pgSQL loop holds locks across items.
 
-### 5.4 Finalisation, link, completion and fence additions (0011)
+1. `SELECT … FROM recording_conflict_inbox WHERE processed_at IS NULL ORDER BY attempts, seq LIMIT 1 FOR UPDATE SKIP LOCKED`. Nothing → return `null`.
+2. `BEGIN … EXCEPTION WHEN OTHERS` block (a subtransaction). Inside it, the locks are taken in §9 order:
+   - intent `FOR SHARE` → latest recording `FOR SHARE` → advisory → active hold of op `FOR UPDATE` → existing open case `FOR UPDATE` → `v_t`;
+   - then decide (step 3) and write the hold / case / observation and the inbox `processed_at`, `outcome`, `hold_id`.
+3. Decision, using the §5.1 core with the linked reference:
+   - the latest recording is not `succeeded` + linked → `not_latest_linked`;
+   - the core is false → `consistent`;
+   - the core is true and an active `LINKED_CONTRADICTED` hold exists → append an observation (`contradiction_appended`; already present → `contradiction_duplicate`);
+   - no such hold → join the open case or insert one, insert the hold and its first observation (`contradiction_opened` / `contradiction_joined_case`).
+4. On any error inside the block (incl. 40P01, unique violations, raised refusals):
+   - PostgreSQL rolls back the subtransaction **and releases the locks it acquired**;
+   - the function then updates only the inbox row: `attempts + 1`, `last_error = SQLSTATE`, `last_attempt_at`;
+   - it returns `{error}`. The item stays **unprocessed**.
+5. Errors **outside** the block (the initial SELECT, or the attempt-accounting UPDATE) abort the whole call: nothing is recorded or marked. The helper treats that as a failed call and continues with its bound.
 
-- **Finalisation trigger** (0010:332–350, CREATE OR REPLACE): additionally refuse if an **active hold** exists on the latest recording → `RECORDING_HOLD_ACTIVE`. Defence in depth: for `SUCCEEDED_UNPROVEN` and `LINKED_CONTRADICTED`, 0010 already refuses.
-- **`link_recording_evidence`:** refuse while a hold is active (`RECORDING_HOLD_ACTIVE`). Only the owner's `link_full_proof` (§7) can attach proof to a held row.
-- **`complete_recording_with_evidence`:** refuse while a hold is active. A held op is `pending`, so it is not reachable anyway.
-- **Recording claim fence** `recording_claim_fence()`: SECURITY DEFINER trigger, `BEFORE UPDATE … WHEN (OLD.state='pending' AND NEW.state='in_flight' AND NEW.op_type='hostaway.record_offline_charge')`. This is the **only** gate for every claim path: helper generic / `opId` / `intentId`, and direct app UPDATE. Under intent `FOR SHARE` it refuses unless:
-  - the intent is `payment_captured` and `captured_minor = final_total_minor`;
-  - payload `reservationId` = `hostaway_reservation_id`, and payload `amountMinor` = `captured_minor`;
-  - key `och:<intent>:1`, `OLD.attempts = 0`, `OLD.dispatched_at IS NULL`, and intent `offline_charge_attempts = 0`;
-  - the op is `recording_latest_id`;
-  - there is **no active hold** for the op, and **no open `OFFLINE_CHARGE_HOLD_%` case** for the intent (fail closed);
-  - 0012 adds: a fresh eligible preflight assessment (§6).
-- `claimNextOperation` gets a mirroring `RECORD_FENCE` SQL fragment in its candidate and re-check queries, so fenced rows are skipped instead of raising. This is a helper change in the same stage.
+**Why this cannot cycle (inferred; tested in T-H2).**
+- The only lock held across the block is the single inbox row, which no other party waits for (`SKIP LOCKED`; the trigger only inserts new rows).
+- Inside the block, one transaction locks objects of **one intent**, in the uniform §9 order.
+- The A→B vs B→A batch deadlock is therefore impossible, because no transaction ever holds locks of two intents.
+- Contention with link, finalisation and writers is in §9. Any residual 40P01 is caught by step 4 and retried by a later call.
+
+**Fairness and latency.**
+- `ORDER BY attempts, seq` serves fresh items before repeatedly failing ones.
+- A failing item is never dropped. It stays visible with `attempts`, `last_error` and `last_attempt_at`, and the backlog (`processed_at IS NULL`) is queryable.
+- Under sustained inflow, a high-attempt item can wait indefinitely behind fresh items; this is visible, not hidden.
+- **No alert latency is guaranteed.** Processing happens only when something calls it, and no schedule exists ([OUTSIDE]).
+
+### 5.4 Fence and "no active hold" additions (0011)
+
+- **`recording_claim_fence()`**: SECURITY DEFINER; `BEFORE UPDATE … WHEN (OLD.state='pending' AND NEW.state='in_flight' AND NEW.op_type='hostaway.record_offline_charge')`. It is the single gate for helper generic / `opId` / `intentId` claims and direct app UPDATEs. Under intent `FOR SHARE` it requires:
+  - intent `payment_captured`, `captured_minor = final_total_minor`;
+  - payload `reservationId` / `amountMinor` bound to the intent;
+  - key `:1`, `OLD.attempts = 0`, `OLD.dispatched_at IS NULL`, `offline_charge_attempts = 0`, latest recording;
+  - **no active hold for the op and no open reserved case for the intent** (O6).
+  - `claimNextOperation` gets a mirroring SQL fragment, so fenced rows are skipped.
+- **No active hold on the latest recording** is additionally required by:
+  - the finalisation trigger (CREATE OR REPLACE of 0010:332–347; same 0010 checks first);
+  - `link_recording_evidence`;
+  - `complete_recording_with_evidence`.
+  
+  These are 0011 replacements, not 0010 edits.
 
 ---
 
-## 6. Assessments (0012) [PROPOSED]
+## 6. Assessments and preflight (0012) [PROPOSED] (correction 2)
 
-`recording_assessments` columns:
-- `id`, `operation_id`, `intent_id`, `phase` (`preflight` only in 0012), `outcome`, `code`;
-- `identity_read_op`, `list_read_op`, `identity_evidence`, `list_evidence`;
-- `epoch`, `intent_version`, `worker`, `module_version`, `recorded_at = v_t`.
+**Status.** Pure classification is accepted (`4f6b27f`). Persisting it (the worker's mapping of the pure result to these rows) is **not implemented** and is the 0012 dependency.
 
-**One read opportunity is counted once:**
-- `UNIQUE (identity_read_op) WHERE NOT NULL`;
-- `UNIQUE (list_read_op) WHERE NOT NULL`.
+**Table `recording_assessments`.**
+- Columns: `id`, `operation_id`, `intent_id`, `phase` (`preflight` | `release_review`), `hold_id` (NOT NULL **iff** `release_review`), `outcome`, `code`, `identity_read_op`, `list_read_op`, `identity_evidence`, `list_evidence`, `epoch`, `intent_version`, `worker`, `module_version`, `recorded_at = v_t`.
+- `UNIQUE (identity_read_op)` / `UNIQUE (list_read_op)` where not NULL: each read is counted once, in either phase.
+- 0012 also adds `recording_holds.assessment_id` and `recording_hold_decisions.assessment_id` with their FKs.
 
-So repeating without a new read is refused. An incomplete read counts as a read: it cites the read with no evidence.
+**Outcome bindings** (both phases):
 
-| Outcome | Required bindings | DB consistency check |
+| Outcome | Required | DB consistency check |
 |---|---|---|
-| `eligible` | identity read `hostaway.retrieve_reservation` `succeeded` + its `hostaway_reservation` evidence; list read `hostaway.list_offline_charges` `succeeded` + its evidence; both evidence `observed_at` in `[v_t − 2 min, v_t]` | list evidence `matchingChargeCount = 0`; identity evidence `external_ref` = reservation |
-| `conflict_marker` | list read `succeeded` + evidence | `matchingChargeCount ≥ 1` |
-| `conflict_lookalike`, `conflict_same_amount` | list read `succeeded` + evidence | none possible [TRUST classification] |
-| `incomplete` | list read terminal, **no** list evidence | read is terminal |
-| `identity_refused` | identity read terminal; no list read | read is terminal |
+| `eligible` | identity read `hostaway.retrieve_reservation` `succeeded` + its evidence (`external_ref` = reservation); list read `hostaway.list_offline_charges` `succeeded` + its evidence; both `observed_at` in `[v_t − 2 min, v_t]` | list `matchingChargeCount = 0` |
+| `conflict_marker` | list read + evidence | count ≥ 1 |
+| `conflict_lookalike`, `conflict_same_amount` | list read + evidence | [TRUST] |
+| `incomplete` | list read terminal, no list evidence | terminal |
+| `identity_refused` | identity read terminal, no list read | terminal |
 
-**Every read must be:**
-- on the same intent, of the right op type;
-- `created_at` ≥ the recording's `created_at`, and ≥ the current epoch start (the latest release `released_at`, else the recording's `created_at`);
-- terminal;
-- cited evidence must have `read_operation_id` = that read.
+**Every cited read must be:**
+- on the same intent, of the right type, terminal; cited evidence `read_operation_id` = that read;
+- `created_at` ≥ the recording's `created_at`;
+- for `preflight`: ≥ the **current epoch start** (the last release decision's `recorded_at`, else the recording's `created_at`);
+- for `release_review`: > the cited hold's `created_at`.
 
-**`record_recording_assessment(p_op, p_worker, p_phase, p_outcome, p_code, p_identity_read, p_list_read, p_identity_evidence, p_list_evidence, p_expected_version, p_module_version)`**
-- Locks: intent `FOR SHARE` → `intent_work FOR SHARE` → op `FOR SHARE` → the cited read rows `FOR SHARE` → `v_t`.
-- Checks:
-  - intent `payment_captured`, and `version = p_expected_version`;
-  - `work_worker_id = p_worker` and `work_lease_until ≥ v_t`;
-  - op `pending`, undispatched, key `:1`, `attempts 0`, latest, **no active hold**.
-- **[TRUST]:** the classification, the client and account provenance, and `module_version`.
+**`record_recording_assessment(p_op, p_worker, p_phase, p_hold, …, p_expected_version, p_module_version)`**
+- Locks: intent SHARE → work SHARE → op SHARE → (`release_review`: hold SHARE) → read rows SHARE → `v_t`.
+- Common checks: intent `payment_captured`, `version = p_expected_version`, live work lease of `p_worker` at `v_t`; op `pending`, undispatched, key `:1`, `attempts 0`, latest.
+- `preflight`: **no active hold** for the op.
+- `release_review`: `p_hold` is the op's **active `PREFLIGHT_*` hold**. A `release_review` assessment can never qualify a claim (the fence ignores that phase) or count towards exhaustion.
 
 **Epochs.**
-- `epoch` = the number of released preflight holds for the op, computed under the op lock.
-- Exhaustion counts non-eligible preflight assessments **in the current epoch** only (≥ 3).
+- `epoch` = the number of released `PREFLIGHT_*` holds of the op.
+- Exhaustion counts non-eligible `preflight` assessments **of the current epoch only**, so an old epoch never re-trips after a release.
 
-**Fence addition (0012).** The claim also requires the op's latest assessment (by `recorded_at`, then `id`) in the current epoch to be `eligible`, with both evidence `observed_at` in `[v_t − 2 min, v_t]` at the fence's `v_t`.
-- A worker cannot skip preflight by not recording it.
-- Attempt 1 is claimed at most once (`attempts = 0`), so no assessment is reused across claims.
+**0012 fence addition.** The op's latest `preflight` assessment of the **current** epoch is `eligible`, with both evidence rows `observed_at` within `[v_t − 2 min, v_t]` at the fence's `v_t`.
+- After a release, the old-epoch `release_review` does **not** carry forward. A new `preflight` eligible assessment, with reads created after the release, is required (no carry-forward rule).
 
-**`open_recording_preflight_hold(p_op, p_worker, p_reason, p_expected_version, p_assessment)`**
-- Same as §5.2, plus the work lease and version checks at `v_t`.
-- `EXHAUSTED`: current-epoch count ≥ 3.
-- Conflict reasons: the cited assessment is for this op, in the current epoch, with the matching outcome, and recorded after the latest release.
+**`open_recording_preflight_hold`**: §5.2 plus lease and version checks; exhaustion count ≥ 3, or a cited current-epoch `preflight` assessment of the matching conflict outcome.
+
+**Owner `release_for_initial_send`.**
+- It requires an `eligible` `release_review` assessment bound to **this hold**, at `intent_version = hold.intent_version_at_hold = current version`, with both evidence rows `observed_at` in `[v_t − 2 min, v_t]` at the owner function's `v_t`.
+- It releases the hold, starting a new epoch. It does not claim.
+
+`recorded_manually` (`PREFLIGHT_*`, `ATTEMPT_GT1`) is 0012, and moves op `pending → superseded` (0004:45–72).
 
 ---
 
-## 7. Owner resolution (0011; preflight decisions 0012) [PROPOSED]
+## 7. Owner decisions (correction 4)
 
-`admin_resolve_recording_hold(p_hold, p_decision, p_evidence uuid[], p_assessment uuid, p_resolver, p_justification, p_at)`:
+`admin_resolve_recording_hold(p_hold, p_decision, p_evidence uuid[], p_linked_evidence uuid, p_assessment uuid, p_resolver, p_justification, p_at)`:
 - admin only;
-- locks: intent `FOR SHARE` → op `FOR UPDATE` → advisory → hold `FOR UPDATE` → case `FOR UPDATE` → `v_t`;
-- always inserts a `reconciliation_resolutions` row citing evidence (needs a decision value `recording_hold`, added to the 0003:107–108 CHECK by 0011);
-- `p_at` is the owner-asserted decision time [TRUST]; `v_t` is stored for ordering.
+- locks: intent SHARE → op UPDATE → advisory → hold UPDATE → case UPDATE → `v_t`;
+- always inserts **one** `recording_hold_decisions` row.
 
-| Decision | Allowed reasons | Hold / case | Truthful effect |
-|---|---|---|---|
-| `keep_visible` | all | hold **active**, case **open**; adds an `acknowledged` observation | nothing unblocked; later contradictions keep appending |
-| `close_acknowledged` | `LINKED_CONTRADICTED`, `SUCCEEDED_UNPROVEN`, `ATTEMPT_GT1` | hold released (`acknowledged`); case resolved `no_action` | **unblocks nothing.** The 0010 predicate still refuses finalisation (the evidence is immutable); an unlinked row still cannot finalise. A *new* contradiction opens a new hold and case. |
-| `link_full_proof` | `SUCCEEDED_UNPROVEN` | released; case resolved `recorded` | attaches the link through the 0010 validator (`owner_historical`) and the predicate in the same transaction. Finalisation is then E3's normal event. |
-| `release_for_initial_send` (0012) | `PREFLIGHT_*` | released; case resolved `no_action`; **new epoch** | `p_assessment` must be preflight `eligible`, for this op, at `intent_version = hold.intent_version_at_hold = current version`; reads created after `hold.created_at`; both evidence `observed_at` in `[v_t − 2 min, v_t]`. It does not claim; the fence still decides. |
-| `recorded_manually` (0012) | `PREFLIGHT_*`, `ATTEMPT_GT1` | released; case resolved `recorded` | op `pending → superseded` (an existing move, 0004:45–72). The intent stays `payment_captured`. |
+| Decision | Reasons | Hold / case | Record | Effect |
+|---|---|---|---|---|
+| `keep_visible` | all | hold **active**, case **open**; nothing released | `evidence_ids` may be **empty** (e.g. `ATTEMPT_GT1`); any cited ids are validated | acknowledgement only; later contradictions keep appending; finalisation / claim stay blocked; no purge effect |
+| `link_full_proof` | `SUCCEEDED_UNPROVEN` | this hold released; the case is resolved `recorded` only if it has no other active bound hold | `linked_evidence_id` = the proof; `evidence_ids` ⊇ {it} | attaches the link via the 0010 validator (`owner_historical`) and the §5.1 core with the **candidate** reference. Refused if contradicted or < 15 min. |
 
-Never offered: `ATTEMPT_GT1` release for sending; any decision on `LINKED_CONTRADICTED` that reverses or repoints the link or changes intent state.
+0012 adds `release_for_initial_send` and `recorded_manually` (§6).
 
-**[OUTSIDE]:**
-- an owner override of the contradiction guard;
-- owner manual finalisation (after `recorded_manually` or `close_acknowledged`);
-- any refund, cancel or notification.
+[OUTSIDE]: closing or acknowledging a contradiction so as to allow finalisation; manual finalisation; overriding the guard; refund, cancel or notify.
 
 ---
 
-## 8. Later-conflict detection: why an inbox, and what it does not promise
+## 8. Detection guarantees, exactly (correction 7)
 
-- **Why not a forward cursor.** A forward `observed_at` cursor misses historical owner evidence inserted later with an old `observed_at`. A `created_at` cursor misses rows from long transactions, because `created_at` is the **transaction start** (0003:67), not commit order.
-  - The trigger-fed inbox avoids both: every offline-charge evidence row gets its inbox row in the same transaction, and the processor selects unprocessed rows, not a range.
-- **Ordering with the link.**
-  - Evidence committed **before** a link is seen by the link's post-advisory predicate (0010), so it refuses.
-  - Evidence committed **after** the link is enqueued, and judged against the immutable linked proof.
-  - There is no gap in which a linked row's contradiction is never judged (inferred from the 0010 lock order; to be tested in T-C5).
-- **Backfill.** 0011 up enqueues every existing offline-charge evidence row (plain INSERT … SELECT in the migration, on a disposable local DB only). The first drains therefore cover rows linked under 0010.
-- **Cross-check.** `recording_contradictions_page` (the reused lossless 0010 cursor) stays a read-only audit query. A finding without a `LINKED_CONTRADICTED` hold observation is a defect signal for the owner, not a writer.
-- **Scope and backlog.**
-  - The processor is unscoped by listing: it is DB-only and touches only holds, cases and observations.
-  - Bounded at 100 rows per call; concurrent callers are safe (SKIP LOCKED).
-  - Backlog = `count(*) WHERE processed_at IS NULL` (owner-visible). Failing rows persist with `attempts` and `last_error`.
-  - Restart or crash: the uncommitted row rolls back and is redone.
-  - **No schedule is created.** Running it live is [OUTSIDE].
-- **Time.**
-  - `processed_at` and hold `created_at` = `v_t`.
-  - Evidence `observed_at` remains caller- or owner-supplied [TRUST].
-  - The window test `observed_at > dispatched_at` compares two caller-written times, as in 0010.
+**Proposed DB guarantee.**
+- Every offline-charge evidence row committed after 0011 gets an inbox row in its own transaction (trigger atomicity).
+- Once that row is processed, a contradiction against the **then-latest linked** recording opens or joins a `LINKED_CONTRADICTED` hold.
+- Old `observed_at` or `created_at` values do not matter: the processor selects rows, not a cursor range.
+
+**Not a later-conflict hold, but safely blocked.**
+- Evidence committed **before** a link is judged by 0010's post-advisory predicate at completion or link time (candidate reference). A contradiction **refuses** the completion or link.
+  - If its inbox item was processed earlier, the outcome is `not_latest_linked`. That is correct: the row is blocked, not linked.
+- Visibility for blocked rows:
+  - Refused **completion**: the op stays `in_flight` until its lease expires, then becomes `outcome_unknown` with the existing owner case (`operations.js:267–289`).
+  - Refused **link** on an owner-resolved row: the row stays `succeeded` unlinked (finalisation blocked). It gets `SUCCEEDED_UNPROVEN` visibility **only if** a caller invokes `open_recording_visibility_hold`.
+  - The proposed helper rule is that the link helper does so on `RECORDING_EVIDENCE_CONFLICT`. That is a **helper-level** behaviour, not a DB guarantee.
+
+**Backfill.**
+- 0011 up enqueues every existing offline-charge evidence row (INSERT … SELECT; disposable local DB).
+- Completeness relies on the migration's single transaction (PROPOSED; tested in T-C9).
+
+**Cross-check.** `recording_contradictions_page` remains a read-only audit. A finding with no `LINKED_CONTRADICTED` observation signals a defect.
+
+**Not promised.**
+- Exactly-once observation: processing is at least once and idempotent.
+- Any processing latency or schedule.
 
 ---
 
 ## 9. Lock order and contention
 
-| Path | Order | Contention outcome |
-|---|---|---|
-| `claimNextOperation` + fence | intent SHARE → op UPDATE SKIP LOCKED → (trigger) intent SHARE (held), holds / cases / assessments read → `v_t` | serialized; a fenced row is skipped by the mirrored fragment |
-| direct app `UPDATE … in_flight` | op UPDATE → (trigger) intent SHARE | vs `applyEvent` (intent NO KEY UPDATE → op): a possible **40P01** on one side. Bounded and retryable, never a bypass (the accepted 0007 / 0009 stance). |
-| `complete_recording_with_evidence`, `link_recording_evidence` (0010) | intent SHARE → (work SHARE) → op UPDATE → advisory → `v_t`, + hold read | serialized with the D1 functions via op and advisory |
-| `open_recording_visibility_hold`, `open_recording_preflight_hold` | intent SHARE → (work SHARE) → op UPDATE → advisory → hold → case INSERT | same order as link; the loser waits, then re-checks and refuses or returns the existing hold |
-| `process_recording_conflict_inbox` | inbox UPDATE SKIP LOCKED → intent SHARE → op SHARE → advisory → hold → case | inbox rows are touched only by the trigger INSERT and this function; no cycle |
-| `admin_resolve_recording_hold` | intent SHARE → op UPDATE → advisory → hold → case | uniform order (an advisory-before-hold violation would cycle with the processor) |
-| evidence writers (0010) | read op UPDATE → evidence INSERT → inbox INSERT (trigger) → advisory | no recording op lock, so no inversion |
-| finalisation (`applyEvent`) | intent NO KEY UPDATE → (trigger) advisory → hold read | D1 functions holding intent SHARE make it wait, or wait for it; no cycle |
-| `admin_resolve_operation` | op UPDATE → intent unlocked | acts only on `outcome_unknown` / `escalated` rows; holds never target these |
-| `admin_close_case` | case FOR UPDATE → raise for reserved kinds | takes no further lock |
-| `recoverExpiredOperations` | op UPDATE SKIP LOCKED → `openCase` | recordings → `outcome_unknown` (the existing path); never touches holds |
+**Uniform order for D1 functions.** Objects of **one** intent only:
 
-- **Race outcomes:**
-  - Hold vs claim on the same row: hold first → the claim is fenced (skipped, or refused by the trigger); claim first → the hold waits, then sees `in_flight` and returns `HOLD_TARGET_NOT_PENDING`.
-  - Two openers: the second waits, then returns the same hold id.
-  - Link vs visibility hold: link first → `SUCCEEDED_UNPROVEN` refused (linked); hold first → the link is refused (`RECORDING_HOLD_ACTIVE`).
-- Every refusal is a raise inside one transaction, so there is no partial write.
-- **Observed vs inferred:** all of the above is inferred from the source. The tests must observe the actual waits (`pg_locks`) and must not claim lock-mode universality.
+> intent → (intent_work) → recording op → advisory evidence key → hold → reserved case → `v_t`
+
+The writes (case / hold / observation / decision / inbox) follow. A reserved-case unique-index wait could only come from another transaction holding the same advisory key, so none is expected after `v_t` (inferred).
+
+| Path | Order | Outcome |
+|---|---|---|
+| claim helper + fence | intent SHARE → op UPDATE SKIP LOCKED → (trigger) holds / cases read | serialized; fenced rows skipped |
+| direct app `UPDATE … in_flight` | op UPDATE → (trigger) intent SHARE | vs `applyEvent` (intent NO KEY UPDATE → op): possible **40P01**, bounded and retryable, never a bypass |
+| completion / link (0010 + 0011 hold read) | intent SHARE → (work) → op UPDATE → advisory | vs D1 openers: op lock serializes; the loser re-checks and refuses |
+| visibility / preflight opener | intent SHARE → (work) → op UPDATE → advisory → hold → case | as above |
+| inbox processor (one item) | inbox row UPDATE (SKIP LOCKED) → intent SHARE → op SHARE → advisory → hold → case | vs link: waits on op, or link waits; vs finalisation: intent SHARE vs NO KEY UPDATE, one waits; vs a writer of the same intent: the writer waits on the advisory key held by the processor (or vice versa); the processor never waits for the writer's read-op row |
+| evidence writer | read op UPDATE → evidence INSERT → **inbox INSERT (trigger)** → advisory | the inbox INSERT takes only new-row and FK key-share locks |
+| finalisation | intent NO KEY UPDATE → (trigger) advisory → hold read | serialized with share-lockers |
+| `admin_resolve_recording_hold` | intent SHARE → op UPDATE → advisory → hold → case | uniform |
+| `admin_close_case` | case FOR UPDATE → raise (reserved) | no further lock |
+| `admin_resolve_intent` → `intents_safety_guard` | intent FOR UPDATE → resolutions → cases (non-reserved only after 0011) | reserved cases untouched |
+
+- **Time.** `v_t = clock_timestamp()` after the last potentially blocking lock, for hold / decision / observation / processed times and all freshness checks. `p_at` / `decided_at` are owner-asserted [TRUST]; `dispatched_at` and `observed_at` remain caller-written [TRUST].
+- Every refusal is a raise inside one transaction (or subtransaction for inbox items): no partial write.
+- Lock waits stated here are **inferred**. Tests must observe actual waits (`pg_locks`) and not claim universality.
 
 ---
 
-## 10. Planned tests (PLANNED; not written or run)
+## 10. Exact 0011 change map
 
-Full TAP logs are kept for every run.
+**0011 up**, one transaction. Precondition: no reserved-kind case exists; else RAISE.
+1. Tables §4.1–§4.4 with guards, RLS (SELECT policies for app, admin, report), no write grants.
+2. Case INSERT / UPDATE guards; deferred binding triggers on cases and holds (SD, private).
+3. `recording_evidence_contradicts`; CREATE OR REPLACE `recording_conflict_refusal` (same signature).
+4. `open_recording_visibility_hold`, `process_recording_conflict_inbox_one`, `recording_contradictions_page`, `admin_resolve_recording_hold` (0011 decisions only).
+5. CREATE OR REPLACE: `complete_recording_with_evidence`, `link_recording_evidence`, `recording_finalisation_guard` (+ no active hold); `intents_safety_guard` (exclude reserved kinds from the bulk resolve); `admin_close_case` (refuse hold cases).
+6. `recording_claim_fence` + trigger.
+7. Enqueue trigger; backfill INSERT … SELECT.
+8. Grants (§4.6).
+
+**0011 down.** Refuse (RAISE) if any hold, observation or decision exists, or any inbox row has `attempts > 0` or `processed_at` set. Processing history and failures are kept, not silently dropped.
+- Otherwise drop in reverse order and restore the replaced 0003 / 0004 / 0010 bodies verbatim.
+
+**0012** adds:
+- `recording_assessments`;
+- `assessment_id` columns and FKs;
+- the reason / decision CHECK widening;
+- the preflight functions and the fence's eligible requirement.
+
+Its down refuses if any assessment or preflight hold exists. 0011 is complete and testable without 0012.
+
+**Helpers (same stages):**
+- `RECORD_FENCE` in `claimNextOperation`;
+- `listRecordingContradictions` → page function;
+- an inbox-drain helper (≤ 100 independent calls);
+- link helper → visibility opener on conflict;
+- `DB_SAFETY_CODES` additions.
+
+---
+
+## 11. Planned tests (PLANNED; not written or run; full TAP retained)
 
 | # | Scenario | Expect |
 |---|---|---|
-| T-A1 | app INSERT / UPDATE / DELETE on holds, observations, inbox, assessments | refused (RLS / grants / guards) |
-| T-A2 | app INSERT of an `OFFLINE_CHARGE_HOLD_%` case (any `opened_by`); privileged INSERT without a hold row (inside an unrelated owner function context) | refused at insert / at commit (deferred binding) |
-| T-A3 | `admin_close_case` on a hold case | refused |
-| T-A4 | hold identity / release tamper (owner role direct UPDATE: un-release, re-release, change reason) | refused |
-| T-B1 | every claim path with an active hold or an open reserved case: helper generic / `opId` / `intentId` / direct UPDATE | skipped or `RECORDING_CLAIM_FENCED` |
-| T-B2 | the fence refuses attempt 2 pending, `attempts > 0`, dispatched, not latest, amount / reservation mismatch, intent not `payment_captured` | refused; attempt 1 healthy → allowed (0011) |
-| T-B3 | direct UPDATE claim vs `applyEvent` contention | 40P01 or serialized; never a bypass |
-| T-B4 | active hold + `link_recording_evidence` / completion / finalisation | `RECORDING_HOLD_ACTIVE`; state unchanged |
-| T-C1 | contradiction after link (API and dashboard; same reservation) | inbox → hold + case + observation; link and state unchanged |
-| T-C2 | evidence for another reservation; same id; count 0; another marker; method / account labels different vs equal | not / not / not / not / contradiction vs consistent; equal to the 0010 predicate (equivalence) |
-| T-C3 | a second and third contradiction while the case is open; the same evidence re-processed | appended once each; duplicate → no row |
-| T-C4 | historical dashboard evidence inserted **later** with an old `observed_at` (before earlier-processed rows); microsecond `observed_at` ties | processed (inbox, not cursor) |
-| T-C5 | evidence writer vs link vs processor, both orders, observed waits | link refused, or link stands + contradiction opened; never missed |
-| T-C6 | crash mid-processing (exception in the hook / connection killed) | rolled back; reprocessed; no duplicate hold or observation |
-| T-C7 | poison row | `attempts` / `last_error` recorded, row kept, others processed |
-| T-C8 | concurrent processors | SKIP LOCKED; each row's effects once |
-| T-C9 | backfill on up with existing linked contradicted rows (incl. already `confirmed`) | holds opened by the first drains; visibility only |
-| T-C10 | scan cross-check (`recording_contradictions_page`) agrees with holds | no orphan finding |
-| T-D1 | `SUCCEEDED_UNPROVEN` on `payment_captured` and on inherited `confirmed`; `ATTEMPT_GT1` | hold + case; no state / version / effect change |
-| T-D2 | duplicate openers, different reason, collision with a pre-existing reserved case inserted by the schema owner | same id / `HOLD_ALREADY_ACTIVE` / `CASE_KIND_OCCUPIED` + rollback |
-| T-E1 | `keep_visible` | hold and case stay; new contradictions append |
-| T-E2 | `close_acknowledged` on `LINKED_CONTRADICTED` | case resolved; finalisation still refused; a new contradiction opens a new hold |
-| T-E3 | `link_full_proof` (valid; < 15 min; contradicted) | linked + released / refused / refused |
-| T-F1 (0012) | duplicate assessment, same read twice, disallowed outcome combinations, eligible with count ≠ 0, stale reads, wrong lease / version / worker | refused |
-| T-F2 (0012) | 3 non-eligible → `EXHAUSTED`; release with a fresh eligible assessment → new epoch; identity or list evidence > 2 min, reads before the hold, another op / version | accepted / refused |
-| T-F3 (0012) | claim without a fresh eligible assessment / with one aged past 2 min while waiting on the fence lock | refused at `v_t` |
-| T-G1 | 0011 down with holds / observations / assessments | RAISE (audit kept); empty → OK; inbox dropped (derivable) |
-| T-G2 | scoped effects: every hold / processor / owner path leaves intent state, version, public status, `dispatched_at` and op state unchanged (except the documented `link_full_proof` / `recorded_manually` moves); no ESCALATE / notify / void / cancel / refund rows | asserted |
+| T-A1 | app writes to holds / observations / decisions / inbox / assessments | refused |
+| T-A2 | app INSERT of a reserved case; privileged insert without a hold; a hold bound to a case of another intent / kind / opened_by | refused (insert guard / deferred binding) |
+| T-A3 | **unrelated owner resolution**: `admin_close_case` on a hold case; `admin_resolve_intent` on an intent with an active hold; `admin_resolve_operation` / `settle_operation_from_evidence` on the same intent | refused / succeeds with the hold case still **open** / unaffected |
+| T-A4 | owner-role direct UPDATE: un-release, re-release, change reason, case resolved while a hold is active | refused (guard / deferred binding) |
+| T-A5 | deferred binding privileges: the binding trigger reads protected tables while the app has no grant | works; app SELECT-only |
+| T-B1 | every claim path with an active hold or an open reserved case | skipped / `RECORDING_CLAIM_FENCED` |
+| T-B2 | fence: attempt 2, `attempts > 0`, dispatched, not latest, amount / reservation mismatch, intent state | refused; healthy attempt 1 allowed |
+| T-B3 | direct UPDATE claim vs `applyEvent` | 40P01 or serialized; no bypass |
+| T-B4 | active hold + link / completion / finalisation | `RECORDING_HOLD_ACTIVE` |
+| T-P1 | **predicate parity, candidate-unlinked context**: completion and link with candidate references whose method / account differ from earlier rows; the 0010 fixtures | identical to 0010 |
+| T-P2 | predicate parity, linked context (finalisation, page, inbox) | identical to 0010 and to each other |
+| T-P3 | page function vs the 0010 JS scan: shape, microsecond cursor, validation, cap | identical |
+| T-C1 | contradiction after link (API / dashboard, same reservation) | hold + case + observation; link and state unchanged |
+| T-C2 | other reservation, count 0, other marker, equal labels | `consistent` |
+| T-C3 | more contradictions while the case is open; reprocessing the same evidence | appended once / duplicate |
+| T-C4 | historical dashboard evidence inserted later with an old `observed_at`; microsecond ties | processed |
+| T-C5 | writer vs link vs processor, both orders, observed waits | link refused (blocked; `not_latest_linked`), or link stands + contradiction opened |
+| T-C6 | crash / connection kill mid-item | rolled back; reprocessed; no duplicates |
+| T-C7 | poison item | `attempts` / `last_error` / `last_attempt_at`; stays unprocessed; others proceed; ordering by attempts |
+| T-C8 | outer-statement error (simulated) | nothing marked or recorded |
+| T-C9 | backfill with existing linked contradicted rows (incl. `confirmed`) | holds opened by the drain; visibility only |
+| T-H1 | one item per transaction: a helper's 100 calls are independent; locks released per call | asserted via `pg_locks` between calls |
+| T-H2 | **two processors on interleaved intents** (A, B vs B, A) | no deadlock (single-intent transactions); injected 40P01 caught → attempts + 1, item retried |
+| T-D1 | `SUCCEEDED_UNPROVEN` (`payment_captured` / inherited `confirmed`), `ATTEMPT_GT1` | hold + case; no state / version / effect change |
+| T-D2 | duplicate openers; different reason; the O4 race with a link (both orders) | same id / `HOLD_ALREADY_ACTIVE` / §5.2 outcomes |
+| T-D3 | **operation-history same-kind collision** (op 2 `ATTEMPT_GT1` hold active, op 3 pending attempt > 1) | op 3's hold joins the open case; both visible; claim fenced; nothing overwritten |
+| T-E1 | `keep_visible` with **no provider evidence** (`ATTEMPT_GT1`) and with cited evidence | decision row; hold and case stay; no purge or claim-release change |
+| T-E2 | `link_full_proof` valid / < 15 min / contradicted / with a second active hold on the same case | linked + released / refused / refused / case stays open |
+| T-F1 (0012) | assessment bindings, duplicates, stale reads, lease / version / worker | refused |
+| T-F2 (0012) | **held eligible**: `release_review` while the `PREFLIGHT_*` hold is active; release; new epoch | release accepted |
+| T-F3 (0012) | the old-epoch `release_review` does not satisfy the new-epoch fence; a new `preflight` eligible does | refused / allowed |
+| T-F4 (0012) | exhaustion counts only the current epoch; `release_review` never counts | asserted |
+| T-G1 | **0011 up without 0012**; the full 0011 suite passes; 0012 objects absent | OK |
+| T-G2 | 0011 down with holds / observations / decisions / processed or attempted inbox rows | RAISE; untouched backfill only → OK |
+| T-G3 | scoped effects: no intent state / version / public / `dispatched_at` / op-state change outside `link_full_proof` (and 0012 `recorded_manually`); no ESCALATE / notify / void / cancel / refund rows; no provider call | asserted |
 
 ---
 
-## 11. Stages, open decisions and dependencies
+## 12. Resolution map (root HOLD on f411105)
 
-**Stage D1-0011 (smallest; recommended first).** §4.1–4.3, §4.5–4.6, §5, §7 (`keep_visible`, `close_acknowledged`, `link_full_proof`), and the helper mirror for the fence and the scan function. Tests T-A*, T-B1–B4, T-C*, T-D*, T-E*, T-G*.
+| # | Root item | Where |
+|---|---|---|
+| O1–O7 | choices recorded | §0 |
+| 1 | explicit-reference core; candidate vs linked; call map; parity tests | §5.1, T-P1–P3 |
+| 2 | `release_review` phase under an active hold; no carry-forward; current-epoch counters; pure module accepted at `4f6b27f` vs persistence not implemented | §6, T-F2–F4 |
+| 3 | case-id identity; two-way deferred binding incl. UPDATE / resolve; `intents_safety_guard` bulk resolve; `admin_close_case`; same-kind collision joins the case | §4.5, T-A2–A5, T-D3 |
+| 4 | dedicated `recording_hold_decisions`; no change to `reconciliation_resolutions`; empty evidence allowed; observations are contradictions only | §4.2, §4.3, §7, T-E1 |
+| 5 | one item per top-level transaction; subtransaction lock release; error accounting; outer errors mark nothing; fairness; inbox-first-then-advisory for writers | §5.3, §9, T-H1–H2, T-C7–C8 |
+| 6 | no `assessment_id` in 0011; exact up / down map; RLS / grants; binding-trigger context; down keeps processing history; inbox mutation rules | §4.1, §4.4, §10, T-G1–G2 |
+| 7 | blocked-before-link vs `LINKED_CONTRADICTED`; helper-level `SUCCEEDED_UNPROVEN` after a refused link; backfill / trigger / processing PROPOSED; no latency claim | §8 |
 
-**Stage D1-0012.** Assessments, preflight holds, the fence's fresh-eligible requirement, `release_for_initial_send` and `recorded_manually`. Tests T-F*.
-- It depends on the worker's pure preflight classification module, which is not yet accepted.
-
-**Open decisions for root:**
-
-| # | Decision |
-|---|---|
-| O1 | The two-migration split vs a single 0011 |
-| O2 | Whether `close_acknowledged` is offered at all (it ends the case, so guest-data purge may proceed, 0001:604), or `keep_visible` only |
-| O3 | Replace the JS scan with the SQL page function (recommended: removes the restated predicate) vs keep both with an equivalence test |
-| O4 | Whether the app may open `SUCCEEDED_UNPROVEN` holds immediately or only after a minimum age (it blocks automated link until the owner acts) |
-| O5 | The inbox processor's caller (app maintenance vs admin only) and any future schedule ([OUTSIDE] now) |
-| O6 | The fence's "no open reserved case for the intent" fail-closed rule vs op-only |
-| O7 | Typed handling of a raw UNIQUE reservation-id conflict (abdcf91 note): **not** in D1 |
-
-**Still open and unchanged:** live gates E1–E7 / P1; the owner `paymentMethod` choice; dispatch-worker authorization; the e74a-claim-listing-lock guard failure (release-readiness item).
+**Still open:**
+- the e74a-claim-listing-lock guard failure (release-readiness item; keep full TAP logs);
+- live gates E1–E7 / P1;
+- the owner `paymentMethod` choice;
+- dispatch-worker authorization;
+- O7.
