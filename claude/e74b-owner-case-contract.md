@@ -218,7 +218,7 @@ booking.recording_evidence_contradicts(p_intent uuid, p_dispatched_at timestampt
   - same intent, kind, `external_ref` = the reservation;
   - `observed_at > p_dispatched_at`, `id <> p_reference`, count ≥ 1, marker rule;
   - the id / count / present-field comparisons, with `paymentMethod` / `executorAccountRef` compared against `p_reference.observed`.
-- Input handling: the wrapper first checks its inputs exactly as 0010 does (0010:136–138) and **returns** `'CONFLICT_CHECK_INPUT'` (not a raise), preserving 0010's result. The core is only called with validated inputs; called directly with a NULL or missing reference / intent, it raises `CONFLICT_CHECK_INPUT`.
+- Input handling: the wrapper first checks its inputs exactly as 0010 does (0010:135–138) and **returns** `'CONFLICT_CHECK_INPUT'` (not a raise), preserving 0010's result. The core is only called with validated inputs; called directly with a NULL or missing reference / intent, it raises `CONFLICT_CHECK_INPUT`.
 - **`recording_conflict_refusal(p_intent, p_dispatched_at, p_result_ref, p_reference)`** (0011 CREATE OR REPLACE; same signature, same result) = `'POSITIVE_CONTRADICTION'` if `EXISTS` evidence of the intent for which the core is true, else NULL. Its input-error behaviour stays as in 0010.
 
 **Call map** (the reference is always explicit):
