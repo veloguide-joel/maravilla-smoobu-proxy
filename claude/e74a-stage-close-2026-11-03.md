@@ -1,6 +1,6 @@
-# E7.4a stage close: review record (2026-11-03)
+# E7.4a stage close: review record (2026-11-03; updated for 386df8a)
 
-Branch `feature/e7-cancel-void-worker`. Offline only: no merge, rebase, deployment, live provider call or new credential. E7.4b stays BLOCKED, and this document does not authorize it.
+Branch `feature/e7-cancel-void-worker`. Offline only: no merge, rebase, deployment, live provider call or new credential. E7.4b stays BLOCKED, and this document does not authorize it. Stage completion is root's call; nothing here declares it.
 
 ## 1. Commit ancestry (linear; each commit's parent is the row above it)
 
@@ -13,7 +13,10 @@ Branch `feature/e7-cancel-void-worker`. Offline only: no merge, rebase, deployme
 | 4 | `c1ce4811f9ba6d652480de1c370d1c4fcf49c8b4` | reservation worker uses the scoped re-issue + bound exhaustion | sound on review; HOLD for maintenance gap → 5 |
 | 5 | `24f6ba5e8302be4a43cf67effd5bb513d8f43ab4` | reservation-worker maintenance `intentStates: WORK_STATES` | **ACCEPTED OFFLINE** |
 | 6 | `9848bc71d0c6e06a333994c554e0d8ee216902cd` | `requestRecoveryRead` intent-first `FOR NO KEY UPDATE` serialization | **ACCEPTED OFFLINE** (scope: the proven competing-`requestRecoveryRead` race only) |
-| 7 | this commit | test-only diagnostic + evidence for `concurrency.test.mjs` "12 random concurrent claims" + this record | awaiting root |
+| 7 | `8eea6ab2cebfa1e335fe294d5e3a293d0112a972` | test-only diagnostic + evidence for `concurrency.test.mjs` "12 random concurrent claims" + this record | **accepted as OFFLINE DIAGNOSIS/EVIDENCE** (not stage/release completion) |
+| 8 | `4c22ec6f4db95dc9142d62f818c174d8f1e6fb9a` | raw 24f6ba5 `requestRecoveryRead` old-failure output (evidence only) | accepted with 7 (diagnosis/evidence) |
+| 9 | `386df8a08e88b327f781da1d35f1d17d83aeeb7d` | `beginPayStepOnce`: per-listing `pg_advisory_xact_lock` immediately before the claim insert + `test/db/e74a-claim-listing-lock.test.mjs` | awaiting root |
+| 10 | the commit after 386df8a (doc/evidence only) | this update + `test/db/diag/claim-listing-lock-evidence-386df8a.txt` | awaiting root |
 
 ## 2. Verification: who verified what
 
@@ -24,7 +27,8 @@ Branch `feature/e7-cancel-void-worker`. Offline only: no merge, rebase, deployme
 | 24f6ba5 | source review, acceptance | 3/3; 2 fail on c1ce481 |
 | 9848bc7 | exact commit/source/test review; `node --check` of recovery.js and the new serialization test | forced test 3/3 (old code fails 2/3 with 2 pending reads); e7-recovery 24/24 ×3; `npm test` 650/650; `npm run test:db` 268/268 (one run) |
 | full PostgreSQL / unit suites, all commits | not run by root | all suite counts above |
-| this commit (diagnostic) | — | §3 |
+| 8eea6ab..4c22ec6 (diagnostic) | fetched the diagnostic, captured SQLSTATE/rows, this doc and current `beginPayStep`; compared 9848bc7..4c22ec6 (exactly 2 commits, test/doc/evidence only, no lib/db change); `node --check` diagnostic | stress counts (solo 100; 4×100 parallel; 4×100 simulated lock) |
+| 386df8a (claim lock) | — (awaiting review) | §4a: guard old-fail / new-pass; focused 5/5; concurrency.test.mjs 8/8; `npm test` 650/650; `npm run test:db` 273/273 (one run each); post-fix diagnostic 4×100 without simulation: 0 failures, 0 deadlocks |
 
 ## 3. Diagnosis of the `concurrency.test.mjs` "12 random concurrent claims" failure
 
@@ -44,7 +48,7 @@ Branch `feature/e7-cancel-void-worker`. Offline only: no merge, rebase, deployme
   - Retry counts: `b6a051d7` and `a0bdadb4` each hit 40P01 4 times (initial try + `casMaxRetries` = 3), so they exhausted and threw. `83764923` failed 3 times and succeeded on its 4th try. 783 was finally the victim once, retried and got 23P01 → `DATES_CLAIMED`.
   - **Invariant held:** 0 overlapping active claims. The 5 `ok` intents each have exactly one claim, one `creating` attempt and one pending `stripe.create_checkout_session`. The 2 thrown intents left no rows (rolled back). All 12 intents remain `details_collected` v2.
 
-## 4. Fix proposal (NOT implemented; production repo.js is outside this phase)
+## 4. Fix proposal (as proposed at 8eea6ab; IMPLEMENTED at 386df8a after root authorization, see §4a)
 
 **Minimal fix:** in `beginPayStepOnce`, after the intent `FOR UPDATE` and immediately before the claim insert, take a per-listing transaction advisory lock:
 
@@ -60,16 +64,34 @@ SELECT pg_advisory_xact_lock(hashtext('booking.inventory_claims'), $listing_id::
 - **Rejected alternatives:** raising `casMaxRetries` or adding backoff only lowers the probability; relaxing the test hides a real 500 path.
 - **Proposed regression:** the diagnostic's parallel scenario, bounded, plus a deterministic check that the lock is taken before the insert.
 
+## 4a. Implementation at 386df8a (Claude-reported; awaiting root review)
+
+- **Diff:** `lib/booking-db/repo.js` +4 lines (3 comment, 1 statement), only inside `beginPayStepOnce`'s no-existing-claim branch, immediately before `INSERT INTO booking.inventory_claims`:
+  ```js
+  await c.query("SELECT pg_advisory_xact_lock(hashtext('booking.inventory_claims'), $1::int)", [row.listing_id]);
+  ```
+  - `row.listing_id` comes from the intent row locked `FOR UPDATE` just above, and is `integer NOT NULL` in schema 0001, so the cast is exact.
+  - The lock lasts for the transaction only. No provider work runs inside it: the Stripe create is only queued.
+  - Unchanged: the retry loop and budget (`casMaxRetries` = 3), return/error semantics, exclusion constraint, attempt/outbox idempotency, every other flow.
+- **Advisory keyspace check:** the only other advisory lock in lib/db/scripts is the migration runner's single-bigint `pg_advisory_xact_lock(7302215001)`. The two-int4 form is a separate keyspace in `pg_locks` (`objsubid` 2 vs 1), so the two cannot collide. No other code takes this key.
+- **Lock order:** intent row, then the listing advisory lock. The holder of the listing lock waits only on the exclusion check, i.e. on uncommitted claims, and those can come only from another checkout holding the same listing lock (impossible) or from `admin_acquire_claim`.
+- **Regression** (`test/db/e74a-claim-listing-lock.test.mjs`), 5 tests:
+  - The guard identifies the SPECIFIC waiter: an ungranted `pg_locks` advisory row with this listing's key (`classid` = hashtext key, `objid` = listing, `objsubid` = 2), from an app-pool backend whose current statement is the helper's lock call, while no claim exists.
+  - The other four cover: another listing proceeds while a lock is held; 12 competing same-listing calls each return ok or `DATES_CLAIMED` with no overlaps, and refused calls leave no claim/attempt/outbox; adjacent stays both succeed; same-intent repeated calls reuse one attempt and op.
+  - **Old source** (4c22ec6 repo.js): guard FAILS, "helper must wait on listing 996001's advisory lock (completed without waiting: true)", actual 0 vs expected 1. The other 4 pass, since they are behavioural and already held before the fix. **New source:** 5/5.
+- **Post-fix bounded contention check:** the unchanged diagnostic, no simulated lock, 4 parallel × 100 iterations gave 0 failures and 0 deadlocks (40P01). Before the fix: 35–40 deadlocks per 100 and 1 captured failure.
+- Evidence: `test/db/diag/claim-listing-lock-evidence-386df8a.txt`.
+
 ## 5. Open residuals
 
-1. The `beginPayStep` deadlock retry exhaustion (§3): a runtime defect; the fix is proposed and awaiting root decision.
+1. The `beginPayStep` deadlock retry exhaustion (§3) is addressed for checkout-vs-checkout at 386df8a, awaiting root review. **Mixed-producer residual:** `booking.admin_acquire_claim` (0003, owner-only) still inserts claims without the listing lock, so a concurrent owner acquire and checkout on overlapping nights can still deadlock-abort (40P01), or one waits briefly. Safety is unchanged (the exclusion constraint still prevents overlaps). Covering it needs a migration and is not proposed. 386df8a does NOT claim global deadlock-freedom for claim inserts.
 2. 9848bc7's scope is the competing `requestRecoveryRead` race only. It is **not** global uniqueness: `requestRead` and other read producers take only FK `KEY SHARE`, which is compatible with the lock.
 3. Fake providers only; no platform validation; R-REFUND unverified; B5 limitation retained; the non-constructible pending-cancel / settled-reservation fixture.
 4. The raw old-failure evidence is kept (feature branch evidence files and local `e2c-out/evidence/`). The project upload of the raw 24f6ba5 failure text was refused for capacity, and its key fields are in the ledger.
 
 ## 6. Next-stage recommendation
 
-- **First:** a root decision on §4. If approved, a bounded repo.js change and regression as a separate commit.
+- **First:** root review of 386df8a (§4a). Stage completion is root's decision.
 - **E7.4b (offline-charge bookkeeping) stays BLOCKED.** Needed before any implementation, with no new credentials or live calls:
   - **B1 evidence (owner-supplied or decided).** The public Hostaway docs list `POST /v1/guestPayments/charges/{reservationId}`, a guest-charges LIST (limit 100 by default, 500 max, reservationIds filter) and the `paymentMethod` values. Still unproven:
     - live acceptance of the request shape;

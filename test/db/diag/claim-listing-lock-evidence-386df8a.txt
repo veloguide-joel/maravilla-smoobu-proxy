@@ -1,0 +1,55 @@
+# beginPayStep per-listing claim lock: old-fail / new-pass proof + post-fix contention check
+# fix commit 386df8a08e88b327f781da1d35f1d17d83aeeb7d (parent 4c22ec6); local disposable PG; no providers
+
+## NEW source (386df8a): node --test test/db/e74a-claim-listing-lock.test.mjs
+ok 1 - guard: the helper waits on THIS listing's advisory lock before inserting its claim, then completes once it is released
+ok 2 - another listing proceeds while a listing's lock is held
+ok 3 - competing same-listing calls: each ok or DATES_CLAIMED, no overlaps, refused calls leave no claim/attempt/outbox
+ok 4 - adjacent stays (check-out day = next check-in) both succeed concurrently
+ok 5 - same intent, repeated (concurrent) calls reuse the one unresolved attempt and its single outbox row
+# tests 5
+# pass 5
+# fail 0
+
+## OLD source (repo.js of 4c22ec6, same test file)
+not ok 1 - guard: the helper waits on THIS listing's advisory lock before inserting its claim, then completes once it is released
+  ---
+  duration_ms: 354.111684
+  type: 'test'
+  location: '/tmp/claude-0/-home-claude/a7d35434-b00b-5a4f-8b85-a70138a9a3fb/scratchpad/deps/e74w-wt/test/db/e74a-claim-listing-lock.test.mjs:50:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    helper must wait on listing 996001's advisory lock (completed without waiting: true)
+    
+    0 !== 1
+    
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: 1
+  actual: 0
+  operator: 'strictEqual'
+  ...
+# Subtest: another listing proceeds while a listing's lock is held
+ok 2 - another listing proceeds while a listing's lock is held
+ok 2 - another listing proceeds while a listing's lock is held
+ok 3 - competing same-listing calls: each ok or DATES_CLAIMED, no overlaps, refused calls leave no claim/attempt/outbox
+ok 4 - adjacent stays (check-out day = next check-in) both succeed concurrently
+ok 5 - same intent, repeated (concurrent) calls reuse the one unresolved attempt and its single outbox row
+# tests 5
+# pass 4
+# fail 1
+
+## Post-fix bounded contention (diagnostic WITHOUT simulated lock, 4 parallel x 100)
+{"SUMMARY":{"label":"post1","simulateListingLock":false,"iterations":100,"failures":0,"casMaxRetries":3,"codesSeen":{"23P01":722},"maxErrorsPerIntent":0}}
+{"SUMMARY":{"label":"post2","simulateListingLock":false,"iterations":100,"failures":0,"casMaxRetries":3,"codesSeen":{"23P01":724},"maxErrorsPerIntent":0}}
+{"SUMMARY":{"label":"post3","simulateListingLock":false,"iterations":100,"failures":0,"casMaxRetries":3,"codesSeen":{"23P01":721},"maxErrorsPerIntent":0}}
+{"SUMMARY":{"label":"post4","simulateListingLock":false,"iterations":100,"failures":0,"casMaxRetries":3,"codesSeen":{"23P01":728},"maxErrorsPerIntent":0}}
+
+## Suites on 386df8a (one run each)
+node --test test/db/concurrency.test.mjs: pass 8 fail 0
+npm test: # tests 650
+npm test: # pass 650
+npm test: # fail 0
+npm run test:db: # tests 273
+npm run test:db: # pass 273
+npm run test:db: # fail 0
