@@ -15,7 +15,7 @@ DROP FUNCTION booking.recording_finalisation_guard();
 DROP FUNCTION booking.link_recording_evidence(uuid, uuid);
 DROP FUNCTION booking.complete_recording_with_evidence(uuid, text, uuid, text, integer);
 DROP FUNCTION booking.recording_lifecycle_guard();
-DROP FUNCTION booking.recording_conflict_refusal(uuid, timestamptz, text);
+DROP FUNCTION booking.recording_conflict_refusal(uuid, timestamptz, text, uuid);
 DROP FUNCTION booking.recording_proof_refusal(uuid, jsonb, text, timestamptz, timestamptz, uuid, text, timestamptz);
 DROP FUNCTION booking.recording_latest_id(uuid);
 DROP FUNCTION booking.recording_attempt_no(text);

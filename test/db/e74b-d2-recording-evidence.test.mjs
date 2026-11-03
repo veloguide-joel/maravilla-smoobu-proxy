@@ -314,7 +314,7 @@ test("owner count-only / dashboard resolution stays succeeded-unproven; >= 15 mi
   assert.deepEqual([(await row(op3.id)).late_result_status, (await row(op3.id)).late_result_ref], ["outcome_unknown", null], "first late result kept");
 });
 
-test("inherited already-confirmed unlinked row: link allowed, state unchanged; latest selection: only attempt 1 completes / links", async () => {
+test("inherited already-confirmed unlinked row: link allowed, state unchanged", async () => {
   const c = await capturedIntent();
   const op = await claimNextOperation(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
   F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(9.2), outcome: { status: "outcome_unknown" } }));
@@ -331,7 +331,9 @@ test("inherited already-confirmed unlinked row: link allowed, state unchanged; l
   const ev = await evAt(c, obs(c, "880201"), F.at(40));
   assert.deepEqual(await linkRecordingEvidence(db.app, op.id, { evidenceId: ev }), { ok: true, state: "linked" });
   assert.equal((await facts(c.id)).state, "confirmed");
-  // latest selection: attempt 1 owner-failed, E3 queues attempt 2; attempt 2 cannot complete through the initial-attempt function
+});
+
+test("policy: automated completion is initial-attempt only; maintenance LINK is allowed on the latest owner-succeeded attempt 2 (no send, no new attempt); a failed attempt is not linkable", async () => {
   const c2 = await capturedIntent();
   const a1 = await claimNextOperation(db.app, { workerId: "w1", now: F.at(9), intentId: c2.id, opTypes: OCH });
   F.ok(await completeOperation(db.app, a1.id, { workerId: "w1", now: F.at(9.2), outcome: { status: "outcome_unknown" } }));
@@ -340,12 +342,29 @@ test("inherited already-confirmed unlinked row: link allowed, state unchanged; l
   F.ok(await adminResolveOperation(db.reconciler, { operationId: a1.id, decision: "failed_definite", evidenceIds: [api, dsh], resolver: "owner",
     justification: "NO_CHARGE_IN_HOSTAWAY", at: F.at(60) }));
   F.ok(await applyEvent(db.app, c2.id, { type: "OFFLINE_CHARGE_FAILED" }, { now: F.at(61) }));
+  // attempt 2 (queued by E3) is claimed here by the TEST as an owner-controlled fixture: no provider is called anywhere
+  const t2 = Date.now() - 30 * MIN;
   await db.app.query("UPDATE booking.intent_work SET work_worker_id = 'w1', work_lease_until = $2 WHERE intent_id = $1", [c2.id, new Date(Date.now() + 10 * MIN)]);
-  const a2 = await claimNextOperation(db.app, { workerId: "w1", now: Date.now(), intentId: c2.id, opTypes: OCH, leaseMs: 10 * MIN });
+  const a2 = await claimNextOperation(db.app, { workerId: "w1", now: t2, intentId: c2.id, opTypes: OCH, leaseMs: 60 * MIN });
   assert.ok(a2 && a2.idempotency_key.endsWith(":2"));
-  const ev2 = await evAt({ ...c2, listingId: c2.listingId }, obs(c2, "880202"));
-  assert.equal((await complete(c2, a2, ev2, "880202")).error, "RECORDING_STATE", "only the initial attempt completes here");
+  const ev2 = await evAt(c2, obs(c2, "880202"));
+  assert.equal((await complete(c2, a2, ev2, "880202")).error, "RECORDING_STATE", "automated completion: initial attempt only");
   assert.equal((await linkRecordingEvidence(db.app, a1.id, { evidenceId: ev2 })).error, "RECORDING_STATE", "a failed attempt is not linkable");
+  assert.equal((await linkRecordingEvidence(db.app, a2.id, { evidenceId: ev2 })).error, "RECORDING_STATE", "an in-flight attempt is not linkable");
+  F.ok(await completeOperation(db.app, a2.id, { workerId: "w1", now: Date.now(), outcome: { status: "outcome_unknown" } }));
+  const dash2 = (await db.reconciler.query("SELECT booking.admin_record_evidence($1,'hostaway_offline_charges',$2,'listed',$3,$4,'owner','dash-a2') AS id",
+    [c2.id, String(c2.reservationId), { matchingChargeCount: 1, matchingChargeIds: ["880202"] }, new Date(Date.now() - 1000)])).rows[0].id;
+  F.ok(await adminResolveOperation(db.reconciler, { operationId: a2.id, decision: "succeeded", evidenceIds: [dash2], resultRef: 880202, resolver: "owner",
+    justification: "CHARGE_FOUND_IN_HOSTAWAY", at: Date.now() }));
+  const recs = async () => (await db.app.query("SELECT idempotency_key, state FROM booking.external_operations WHERE intent_id = $1 AND op_type = 'hostaway.record_offline_charge' ORDER BY idempotency_key", [c2.id])).rows;
+  const r0 = await recs(); const e0 = await effects(c2.id); const t0 = await transitions(c2.id);
+  assert.deepEqual(r0.map((x) => x.state), ["failed_definite", "succeeded"]);
+  assert.deepEqual(await linkRecordingEvidence(db.app, a2.id, { evidenceId: ev2 }), { ok: true, state: "linked" }, "latest owner-succeeded attempt 2: >= 15 min proof links");
+  assert.deepEqual([await recs(), await effects(c2.id), await transitions(c2.id)], [r0, e0, t0], "maintenance link: no send, no new attempt, no effect, no transition");
+  assert.equal((await row(a2.id)).settled_evidence_id, ev2);
+  F.ok(await applyEvent(db.app, c2.id, { type: "OFFLINE_CHARGE_RECORDED", chargeId: "880202" }, { now: Date.now() }));
+  assert.equal((await facts(c2.id)).state, "confirmed");
+  assert.deepEqual(await recs(), r0, "still exactly two recording rows; no attempt 3");
 });
 
 test("finalisation is gated in the DB: a direct UPDATE on an owner-resolved UNLINKED row is refused by the trigger itself", async () => {
@@ -424,7 +443,7 @@ for (const writer of ["api", "dashboard"]) {
   });
 }
 
-test("read-only contradiction scan pages > limit findings with a stable (observed_at, id) cursor", async () => {
+test("read-only contradiction scan pages > limit findings with a stable (observed_at exact, evidence id, op id) cursor", async () => {
   const { c, op, t } = await claimed();
   F.ok(await complete(c, op, await evAt(c, obs(c, "990070"), t + 5), "990070"));
   for (let k = 0; k < 5; k++) await evAt(c, { matchingChargeCount: 1, matchingChargeIds: [String(990071 + k)] });
@@ -485,3 +504,274 @@ for (const [who, writer] of [["completion", "api"], ["completion", "dashboard"],
     assert.deepEqual(res, { ok: false, error: "RECORDING_EVIDENCE_CONFLICT" });
   });
 }
+
+// ============================== root HOLD on 4242a34: corrections ==============================
+const cntOnly = (ids) => ({ matchingChargeCount: ids.length, matchingChargeIds: ids.map(String) });
+const dashAt = async (c, ref, observed, at, reference = "dash") => (await db.reconciler.query(
+  "SELECT booking.admin_record_evidence($1,'hostaway_offline_charges',$2,'listed',$3,$4::timestamptz,'owner',$5) AS id", [c.id, String(ref), observed, at, reference])).rows[0].id;
+async function apiOtherRef(c, ref, observed, t = Date.now()) {                                  // an API list read for ANOTHER reservation, same intent
+  const rid = await requestRead(db.app, c.id, "hostaway.list_offline_charges", String(ref), { now: t });
+  assert.ok(await claimNextOperation(db.app, { workerId: "w-read", now: t, opId: rid }));
+  F.ok(await completeOperation(db.app, rid, { workerId: "w-read", now: t, outcome: { status: "succeeded" } }));
+  return F.ok(await recordProviderEvidence(db.app, { readOpId: rid, kind: "hostaway_offline_charges", externalRef: String(ref), status: "listed", observed })).id;
+}
+async function scanAll(limit) {
+  const all = []; let after = null; let pages = 0;
+  do {
+    const p = await listRecordingContradictions(db.app, { after, limit });
+    assert.ok(p.rows.length <= limit);
+    all.push(...p.rows); after = p.next; pages += 1;
+    assert.ok(pages < 5000, "scan terminates");
+  } while (after);
+  return { all, pages };
+}
+async function ownerSucceededUnlinked(chargeId) {                                              // dispatched at F.at(9), owner-resolved succeeded, no link
+  const c = await capturedIntent();
+  const op = await claimNextOperation(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
+  F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(9.2), outcome: { status: "outcome_unknown" } }));
+  const ev0 = await F.readEvidence(db.app, c.id, "hostaway_offline_charges", String(c.reservationId), "listed", cntOnly([chargeId]), 30);
+  F.ok(await adminResolveOperation(db.reconciler, { operationId: op.id, decision: "succeeded", evidenceIds: [ev0], resultRef: Number(chargeId), resolver: "owner",
+    justification: "CHARGE_FOUND_IN_HOSTAWAY", at: F.at(60) }));
+  return { c, op };
+}
+const waitingLockTypes = async () => (await db.owner.query("SELECT DISTINCT locktype FROM pg_locks WHERE NOT granted ORDER BY 1")).rows.map((x) => x.locktype);
+const caseCount = async (id) => Number((await db.app.query("SELECT count(*) AS n FROM booking.reconciliation_cases WHERE intent_id = $1", [id])).rows[0].n);
+
+test("lossless cursor (real PG): microsecond observed_at within ONE millisecond, equal timestamps with different ids; page sizes 1/2/3 return each row exactly once, in order, then a terminal next", async () => {
+  const { c, op, t } = await claimed();
+  F.ok(await complete(c, op, await evAt(c, obs(c, "992001"), t + 5), "992001"));
+  const ms = (k) => new Date(t + 1000 + k).toISOString().slice(0, 23);                        // 'YYYY-MM-DDTHH:MM:SS.mmm'
+  const exacts = [`${ms(0)}100Z`, `${ms(0)}200Z`, `${ms(0)}900Z`, `${ms(1)}000Z`, `${ms(1)}000Z`, `${ms(1)}000Z`, `${ms(2)}000500Z`.replace(/(\.\d{3})000500Z$/, "$1500Z")];
+  const mine = [];
+  for (const [k, x] of exacts.entries()) mine.push({ exact: x, id: await dashAt(c, c.reservationId, cntOnly([String(992100 + k)]), x, `us-${k}`) });
+  const stored = (await db.owner.query(`SELECT id, to_char(observed_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS x FROM booking.provider_evidence WHERE id = ANY($1)`,
+    [mine.map((m) => m.id)])).rows;
+  for (const m of mine) assert.equal(stored.find((s) => s.id === m.id).x, m.exact, "the database kept microsecond precision");
+  const expected = [...mine].sort((a, b) => (a.exact < b.exact ? -1 : a.exact > b.exact ? 1 : a.id < b.id ? -1 : 1)).map((m) => m.id);
+  for (const limit of [1, 2, 3]) {
+    const { all, pages } = await scanAll(limit);
+    const keys = all.map((x) => `${x.evidenceId}/${x.opId}`);
+    assert.equal(new Set(keys).size, keys.length, `limit ${limit}: no row twice anywhere in the scan`);
+    const got = all.filter((x) => x.intentId === c.id);
+    assert.deepEqual(got.map((x) => x.evidenceId), expected, `limit ${limit}: each of mine exactly once, in (exact time, id) order`);
+    for (const x of got) {
+      assert.equal(x.observedAtExact, mine.find((m) => m.id === x.evidenceId).exact, "cursor text is the exact stored value");
+      assert.equal(x.observedAt, Date.parse(x.observedAtExact.slice(0, 23) + "Z"), "display ms is separate (truncated)");
+    }
+    assert.ok(pages >= Math.ceil(all.length / limit), `limit ${limit}: > limit pages`);
+  }
+  // the 4242a34 failure mode: a millisecond cursor would re-select the .000200 row; the exact cursor resumes strictly after it
+  const first = await listRecordingContradictions(db.app, { after: { observedAtExact: exacts[0], evidenceId: mine[0].id, opId: op.id }, limit: 1 });
+  assert.equal(first.rows[0].evidenceId, expected[1]);
+  assert.ok(first.next && first.next.observedAtExact === exacts[1]);
+});
+
+test("scan input validation: after must be a complete well-formed cursor; limit is capped at RECORDING_CONTRADICTION_SCAN_MAX", async () => {
+  const u = "00000000-0000-4000-8000-000000000000";
+  const good = { observedAtExact: "2099-01-01T00:00:00.000100Z", evidenceId: u, opId: u };
+  assert.deepEqual((await listRecordingContradictions(db.app, { after: good, limit: 5 })).rows, [], "a well-formed cursor past every row is accepted: empty page");
+  for (const bad of [{}, { ...good, opId: undefined }, { observedAtExact: good.observedAtExact, evidenceId: u }, { ...good, extra: 1 },
+    { ...good, observedAtExact: "2026-11-03T20:00:00.000Z" }, { ...good, observedAtExact: 1762200000000 }, { ...good, observedAtExact: "2026-11-03 20:00:00.000100+00" },
+    { ...good, evidenceId: "x" }, { ...good, opId: "0000000a-0000-4000-8000-00000000000b".toUpperCase() }, "cursor", 5, [good]]) {
+    await assert.rejects(listRecordingContradictions(db.app, { after: bad, limit: 5 }), TypeError, JSON.stringify(bad));
+  }
+  // cap: 505 contradictions on one linked recording; a huge limit returns 500 and a next
+  const { c, op, t } = await claimed();
+  F.ok(await complete(c, op, await evAt(c, obs(c, "992501"), t + 5), "992501"));
+  await db.reconciler.query(`SELECT booking.admin_record_evidence($1,'hostaway_offline_charges',$2,'listed',
+      jsonb_build_object('matchingChargeCount',1,'matchingChargeIds',jsonb_build_array((993000 + g)::text)), $3::timestamptz + make_interval(secs => g / 1000000.0), 'owner', 'cap')
+    FROM generate_series(1, 505) g`, [c.id, String(c.reservationId), new Date(t + 1000)]);
+  const big = await listRecordingContradictions(db.app, { after: null, limit: 1e9 });
+  assert.equal(big.rows.length, 500);
+  assert.ok(big.next);
+  for (const lim of [0, -3, 1.5, "7", NaN]) assert.ok((await listRecordingContradictions(db.app, { limit: lim })).rows.length <= 500);
+  const { all } = await scanAll(500);
+  assert.equal(all.filter((x) => x.intentId === c.id).length, 505, "full set reachable across pages");
+});
+
+test("reservation scope: count-only other id under ANOTHER reservation (same intent; API and dashboard) never blocks completion / link / finalisation and is not scanned; the same reservation still blocks", async () => {
+  const otherRef = (c) => `9${c.reservationId}`;
+  // completion + finalisation
+  const { c, op, t } = await claimed();
+  const foreign = [await apiOtherRef(c, otherRef(c), cntOnly(["992601"]), t + 1), await dashAt(c, otherRef(c), cntOnly(["992602"]), new Date(t + 2))];
+  assert.deepEqual((await db.owner.query("SELECT array_agg(external_ref ORDER BY external_ref) AS r FROM booking.provider_evidence WHERE id = ANY($1)", [foreign])).rows[0].r,
+    [otherRef(c), otherRef(c)], "persisted under the other reservation");
+  assert.deepEqual(await complete(c, op, await evAt(c, obs(c, "992600"), t + 5), "992600"), { ok: true, state: "succeeded" });
+  foreign.push(await apiOtherRef(c, otherRef(c), cntOnly(["992603", "992604"])), await dashAt(c, otherRef(c), cntOnly(["992605"]), new Date()));
+  F.ok(await applyEvent(db.app, c.id, { type: "OFFLINE_CHARGE_RECORDED", chargeId: "992600" }, { now: Date.now() }));
+  assert.equal((await facts(c.id)).state, "confirmed");
+  let { all } = await scanAll(100);
+  assert.equal(all.filter((x) => foreign.includes(x.evidenceId)).length, 0, "another reservation's rows are not this recording's contradictions");
+  const same = await evAt(c, cntOnly(["992606"]));                                              // positive control on the SAME reservation
+  ({ all } = await scanAll(100));
+  assert.deepEqual(all.filter((x) => x.intentId === c.id).map((x) => x.evidenceId), [same]);
+  // link
+  const { c: c3, op: op3 } = await ownerSucceededUnlinked("992610");
+  await apiOtherRef(c3, otherRef(c3), cntOnly(["992611"])); await dashAt(c3, otherRef(c3), cntOnly(["992612"]), new Date());
+  assert.deepEqual(await linkRecordingEvidence(db.app, op3.id, { evidenceId: await evAt(c3, obs(c3, "992610"), F.at(40)) }), { ok: true, state: "linked" });
+  // same reservation, other id: completion and link both still refuse
+  const { c: c2, op: op2, t: t2 } = await claimed();
+  await apiOtherRef(c2, otherRef(c2), cntOnly(["992621"]), t2 + 1);
+  await dashAt(c2, c2.reservationId, cntOnly(["992622"]), new Date(t2 + 2));
+  assert.equal((await complete(c2, op2, await evAt(c2, obs(c2, "992620"), t2 + 5), "992620")).error, "RECORDING_EVIDENCE_CONFLICT");
+  const { c: c4, op: op4 } = await ownerSucceededUnlinked("992630");
+  await dashAt(c4, c4.reservationId, cntOnly(["992631"]), new Date());
+  assert.equal((await linkRecordingEvidence(db.app, op4.id, { evidenceId: await evAt(c4, obs(c4, "992630"), F.at(40)) })).error, "RECORDING_EVIDENCE_CONFLICT");
+});
+
+test("paymentMethod / executorAccountRef: a same-id full proof with another approved method or another well-formed account label conflicts (reference = candidate before linking, linked proof after); check and scan agree", async () => {
+  const runComplete = async (prior, id) => {
+    const { c, op, t } = await claimed();
+    await evAt(c, obs(c, id, prior), t + 1);
+    return complete(c, op, await evAt(c, obs(c, id), t + 5), id);
+  };
+  assert.deepEqual(await runComplete({}, "992700"), { ok: true, state: "succeeded" }, "control: an identical earlier full proof is consistent");
+  assert.equal((await runComplete({ paymentMethod: "other" }, "992701")).error, "RECORDING_EVIDENCE_CONFLICT", "method differs from the candidate");
+  assert.equal((await runComplete({ executorAccountRef: "acct-test-2" }, "992702")).error, "RECORDING_EVIDENCE_CONFLICT", "account label differs from the candidate");
+  // the candidate is the reference: the same earlier 'other' row is consistent with an 'other' candidate
+  {
+    const { c, op, t } = await claimed();
+    await evAt(c, obs(c, "992703", { paymentMethod: "other" }), t + 1);
+    assert.deepEqual(await complete(c, op, await evAt(c, obs(c, "992703", { paymentMethod: "other" }), t + 5), "992703"), { ok: true, state: "succeeded" });
+  }
+  // link: reference = the candidate proof
+  {
+    const { c, op } = await ownerSucceededUnlinked("992704");
+    await evAt(c, obs(c, "992704", { executorAccountRef: "acct-test-2" }), F.at(35));
+    assert.equal((await linkRecordingEvidence(db.app, op.id, { evidenceId: await evAt(c, obs(c, "992704"), F.at(40)) })).error, "RECORDING_EVIDENCE_CONFLICT");
+    // (that refused candidate is now itself a stored full row with the other label, so this intent stays conflicted either way)
+    assert.equal((await linkRecordingEvidence(db.app, op.id, { evidenceId: await evAt(c, obs(c, "992704", { executorAccountRef: "acct-test-2" }), F.at(41)) })).error,
+      "RECORDING_EVIDENCE_CONFLICT");
+    const { c: cb, op: opb } = await ownerSucceededUnlinked("992707");
+    await evAt(cb, obs(cb, "992707", { executorAccountRef: "acct-test-2" }), F.at(35));
+    assert.deepEqual(await linkRecordingEvidence(db.app, opb.id, { evidenceId: await evAt(cb, obs(cb, "992707", { executorAccountRef: "acct-test-2" }), F.at(40)) }),
+      { ok: true, state: "linked" }, "consistent with a candidate carrying that label (equal labels prove nothing about the credential)");
+  }
+  // after linking: reference = the linked proof; finalisation (DB check) and the scan flag the same rows
+  const { c, op, t } = await claimed();
+  F.ok(await complete(c, op, await evAt(c, obs(c, "992705"), t + 5), "992705"));
+  const m = await evAt(c, obs(c, "992705", { paymentMethod: "other" }));
+  const a = await evAt(c, obs(c, "992705", { executorAccountRef: "acct-test-2" }));
+  await evAt(c, obs(c, "992705"));                                                             // identical: not a finding
+  await evAt(c, cntOnly(["992705"]));                                                          // count-only same id lacks the fields: not a finding
+  const { all } = await scanAll(50);
+  assert.deepEqual(all.filter((x) => x.intentId === c.id).map((x) => x.evidenceId).sort(), [m, a].sort());
+  const r = await applyEvent(db.app, c.id, { type: "OFFLINE_CHARGE_RECORDED", chargeId: "992705" }, { now: Date.now() });
+  assert.deepEqual([r.ok, r.error], [false, "RECORDING_EVIDENCE_CONFLICT"]);
+  // and with only the consistent rows, both agree there is nothing
+  const { c: c2, op: op2, t: t2 } = await claimed();
+  F.ok(await complete(c2, op2, await evAt(c2, obs(c2, "992706"), t2 + 5), "992706"));
+  await evAt(c2, obs(c2, "992706")); await evAt(c2, cntOnly(["992706"]));
+  assert.equal((await scanAll(50)).all.filter((x) => x.intentId === c2.id).length, 0);
+  F.ok(await applyEvent(db.app, c2.id, { type: "OFFLINE_CHARGE_RECORDED", chargeId: "992706" }, { now: Date.now() }));
+});
+
+/** a pool whose withTx transactions pause just before COMMIT until released */
+function commitGatedPool(pool) {
+  let release; const gate = new Promise((r) => { release = r; });
+  let reached; const atCommit = new Promise((r) => { reached = r; });
+  return { release, atCommit, pool: { connect: async () => {
+    const cl = await pool.connect();
+    return { query: async (sql, p) => { if (sql === "COMMIT") { reached(); await gate; } return cl.query(sql, p); }, release: (...x) => cl.release(...x) };
+  } } };
+}
+
+test("completion vs recoverExpiredOperations, order A (completion uncommitted first): maintenance does not wait (SKIP LOCKED, observed: no lock waiter) and skips; completion commits linked; nothing marked unknown", async () => {
+  const { c, op } = await claimed({ leaseMs: 10 * MIN });
+  const ev = await evAt(c, obs(c, "992801"));
+  const v = await version(c);
+  const cl = await asAppClient();
+  let rec;
+  try {
+    await cl.query("BEGIN");
+    assert.equal((await cl.query("SELECT booking.complete_recording_with_evidence($1,'w1',$2,'992801',$3) AS r", [op.id, ev, v])).rows[0].r, "succeeded");
+    const p = recoverExpiredOperations(db.app, { now: Date.now() + 60 * MIN, intentId: c.id }).then((x) => { rec = x; });
+    const r = await Promise.race([p.then(() => "returned"), sleep(3000).then(() => "BLOCKED")]);
+    assert.equal(r, "returned", "maintenance returned while the completion was still uncommitted");
+    assert.deepEqual(rec, [], "the locked row was skipped, not marked outcome_unknown");
+    await cl.query("COMMIT");
+  } finally { await cl.end(); }
+  assert.deepEqual(await recoverExpiredOperations(db.app, { now: Date.now() + 60 * MIN, intentId: c.id }), [], "after commit: succeeded, not in flight");
+  const r = await row(op.id);
+  assert.deepEqual([r.state, r.settled_evidence_id, r.result_ref], ["succeeded", ev, "992801"]);
+  assert.equal(await caseCount(c.id), 0, "no unknown-outcome case");
+});
+
+test("completion vs recoverExpiredOperations, order B (maintenance holds the marked row uncommitted): completion WAITS (observed row lock), then refuses on the committed state; no link, no resend, no new attempt", async () => {
+  const { c, op } = await claimed({ leaseMs: 10 * MIN });
+  const ev = await evAt(c, obs(c, "992802"));
+  const v = await version(c);
+  const e0 = await effects(c.id);
+  const g = commitGatedPool(db.app);
+  const mp = recoverExpiredOperations(g.pool, { now: Date.now() + 60 * MIN, intentId: c.id });
+  await g.atCommit;                                                                              // marked outcome_unknown, not yet committed
+  let res;
+  const cp = completeRecordingWithEvidence(db.app, op.id, { workerId: "w1", evidenceId: ev, resultRef: "992802", expectedVersion: v }).then((x) => { res = x; });
+  await waitForLockWaiters(1);
+  const waits = await waitingLockTypes();
+  assert.ok(waits.includes("transactionid") || waits.includes("tuple"), `observed wait: ${waits}`);
+  assert.equal(res, undefined, "still waiting");
+  g.release();
+  assert.deepEqual((await mp).map((x) => x.state), ["outcome_unknown"]);
+  await cp;
+  assert.deepEqual(res, { ok: false, error: "RECORDING_STATE" });
+  const r = await row(op.id);
+  assert.deepEqual([r.state, r.settled_evidence_id, r.result_ref], ["outcome_unknown", null, null], "maintenance's truth stands; no partial success");
+  assert.equal(await effects(c.id), e0, "no resend, no new attempt");
+  assert.equal(await caseCount(c.id), 1, "the owner case maintenance opened (its own documented effect)");
+});
+
+test("duplicate concurrent completion: the second WAITS on the first's row lock, then refuses; no repoint, exactly one truth; Promise.all variant: exactly one success", async () => {
+  {
+    const { c, op } = await claimed();
+    const ev = await evAt(c, obs(c, "992901")); const ev2 = await evAt(c, obs(c, "992901"));
+    const v = await version(c); const e0 = await effects(c.id);
+    const cl = await asAppClient();
+    const res = [];
+    try {
+      await cl.query("BEGIN");
+      assert.equal((await cl.query("SELECT booking.complete_recording_with_evidence($1,'w1',$2,'992901',$3) AS r", [op.id, ev, v])).rows[0].r, "succeeded");
+      const ps = [ev, ev2].map((e, k) => completeRecordingWithEvidence(db.app, op.id, { workerId: "w1", evidenceId: e, resultRef: "992901", expectedVersion: v }).then((x) => { res[k] = x; }));
+      await waitForLockWaiters(2);
+      const waits = await waitingLockTypes();
+      assert.ok(waits.includes("transactionid") || waits.includes("tuple"), `observed wait: ${waits}`);
+      await cl.query("COMMIT");
+      await Promise.all(ps);
+    } finally { await cl.end(); }
+    assert.deepEqual(res, [{ ok: false, error: "RECORDING_STATE" }, { ok: false, error: "RECORDING_STATE" }], "same and different evidence: losing calls are refused, not 'ok'");
+    const r = await row(op.id);
+    assert.deepEqual([r.state, r.settled_evidence_id], ["succeeded", ev], "no repoint");
+    assert.equal(await effects(c.id), e0);
+  }
+  {
+    const { c, op } = await claimed();
+    const ev = await evAt(c, obs(c, "992902"));
+    const v = await version(c);
+    const out = await Promise.all([0, 1, 2].map(() => completeRecordingWithEvidence(db.app, op.id, { workerId: "w1", evidenceId: ev, resultRef: "992902", expectedVersion: v })));
+    assert.equal(out.filter((x) => x.ok).length, 1);
+    assert.ok(out.filter((x) => !x.ok).every((x) => x.error === "RECORDING_STATE"));
+    assert.equal((await row(op.id)).settled_evidence_id, ev);
+  }
+});
+
+test("duplicate concurrent link: callers WAIT on the first link, then same evidence -> already_linked, different -> RECORDING_ALREADY_LINKED_DIFFERENT; no repoint, no effects", async () => {
+  const { c, op } = await ownerSucceededUnlinked("992910");
+  const full = await evAt(c, obs(c, "992910"), F.at(40)); const full2 = await evAt(c, obs(c, "992910"), F.at(41));
+  const e0 = await effects(c.id); const t0 = await transitions(c.id);
+  const cl = await asAppClient();
+  const res = [];
+  try {
+    await cl.query("BEGIN");
+    assert.equal((await cl.query("SELECT booking.link_recording_evidence($1,$2) AS r", [op.id, full])).rows[0].r, "linked");
+    const ps = [full, full2].map((e, k) => linkRecordingEvidence(db.app, op.id, { evidenceId: e }).then((x) => { res[k] = x; }));
+    await waitForLockWaiters(2);
+    const waits = await waitingLockTypes();
+    assert.ok(waits.includes("transactionid") || waits.includes("tuple"), `observed wait: ${waits}`);
+    await cl.query("COMMIT");
+    await Promise.all(ps);
+  } finally { await cl.end(); }
+  assert.deepEqual(res, [{ ok: true, state: "already_linked" }, { ok: false, error: "RECORDING_ALREADY_LINKED_DIFFERENT" }]);
+  assert.deepEqual([(await row(op.id)).settled_evidence_id, await effects(c.id), await transitions(c.id)], [full, e0, t0]);
+  const out = await Promise.all([full2, full2].map((e) => linkRecordingEvidence(db.app, op.id, { evidenceId: e })));
+  assert.ok(out.every((x) => x.error === "RECORDING_ALREADY_LINKED_DIFFERENT"));
+});

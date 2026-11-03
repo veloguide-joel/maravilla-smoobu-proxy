@@ -115,24 +115,31 @@ END $$;
 REVOKE ALL ON FUNCTION booking.recording_proof_refusal(uuid, jsonb, text, timestamptz, timestamptz, uuid, text, timestamptz) FROM PUBLIC;
 
 -- ---------------------------------------------------------------------------------------------
--- positive-contradiction check (addendum A). An evidence row of this intent observed AFTER the recording was dispatched
--- contradicts result_ref only if it POSITIVELY shows something else:
---   full API shape (has the marker key) for THIS marker: >= 2 matching ids; one id <> result_ref; or the same id with any
---     incompatible full field (amount, currency, status, type, provider, title, listing, reservation);
---   count-only shape (no marker key: legacy / dashboard evidence): >= 2 matching ids, or one id <> result_ref.
---     It proves only the id set; no marker or full-field fact is inferred from absent fields.
---   matchingChargeCount 0 (either shape) is absence / provider lag, NOT a contradiction.
---   a full-shape row for ANOTHER marker is about another recording and is ignored.
--- VOLATILE: called after the advisory evidence lock so its SELECT sees rows committed while waiting.
-CREATE FUNCTION booking.recording_conflict_refusal(p_intent uuid, p_dispatched_at timestamptz, p_result_ref text) RETURNS text
+-- positive-contradiction check (addendum A; root review of 4242a34 items 2 + 3). An evidence row contradicts the recording only if
+-- it is about THE SAME booking and POSITIVELY shows something else:
+--   scope: same intent, kind hostaway_offline_charges, external_ref = the intent's Hostaway reservation id (API evidence: the
+--     read's selector, bound by record_provider_evidence; dashboard evidence: the owner-supplied reference), observed AFTER the
+--     recording was dispatched, and not the reference proof itself;
+--   full API shape (has the marker key) for THIS marker: >= 2 matching ids; one id <> result_ref; or any PRESENT full field
+--     incompatible with the intent facts, or (paymentMethod / executorAccountRef) with the reference proof's value;
+--   count-only shape (no marker key: legacy / dashboard): >= 2 matching ids, or one id <> result_ref (it proves only the id set);
+--   matchingChargeCount 0 is absence / provider lag, never a contradiction; a full-shape row for ANOTHER marker is ignored.
+-- Trust limit: a different executorAccountRef label is a detectable conflict; equal labels do not prove the same credential.
+-- A different paymentMethod is detectable against the stored proof; the DB cannot attest the owner's configured value.
+-- p_reference = the proof being linked (completion / link) or the linked proof (finalisation / scan).
+-- VOLATILE: called after the advisory evidence lock, so each statement sees rows committed while waiting.
+CREATE FUNCTION booking.recording_conflict_refusal(p_intent uuid, p_dispatched_at timestamptz, p_result_ref text, p_reference uuid) RETURNS text
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
-DECLARE i booking.intents%ROWTYPE; marker text; n integer;
+DECLARE i booking.intents%ROWTYPE; ref_obs jsonb; marker text; n integer;
 BEGIN
-  IF p_dispatched_at IS NULL OR p_result_ref IS NULL THEN RETURN 'CONFLICT_CHECK_INPUT'; END IF;
+  IF p_dispatched_at IS NULL OR p_result_ref IS NULL OR p_reference IS NULL THEN RETURN 'CONFLICT_CHECK_INPUT'; END IF;
   SELECT * INTO i FROM booking.intents WHERE id = p_intent;
+  SELECT observed INTO ref_obs FROM booking.provider_evidence WHERE id = p_reference AND intent_id = p_intent;
+  IF i.id IS NULL OR i.hostaway_reservation_id IS NULL OR ref_obs IS NULL THEN RETURN 'CONFLICT_CHECK_INPUT'; END IF;
   marker := 'mvoch1-' || p_intent::text;
   SELECT count(*) INTO n FROM booking.provider_evidence e
-   WHERE e.intent_id = p_intent AND e.kind = 'hostaway_offline_charges' AND e.observed_at > p_dispatched_at
+   WHERE e.intent_id = p_intent AND e.kind = 'hostaway_offline_charges' AND e.external_ref = i.hostaway_reservation_id
+     AND e.observed_at > p_dispatched_at AND e.id <> p_reference
      AND ((e.observed ->> 'matchingChargeCount')::integer >= 1)
      AND (NOT (e.observed ? 'marker') OR (e.observed ->> 'marker') = marker)
      AND (
@@ -147,10 +154,12 @@ BEGIN
            OR (e.observed ? 'title' AND (e.observed ->> 'title') IS DISTINCT FROM 'maraVilla payment ' || marker)
            OR (e.observed ? 'listingMapId' AND (e.observed ->> 'listingMapId') IS DISTINCT FROM i.listing_id::text)
            OR (e.observed ? 'reservationId' AND (e.observed ->> 'reservationId') IS DISTINCT FROM i.hostaway_reservation_id)
-           OR (e.observed ? 'chargeId' AND (e.observed ->> 'chargeId') IS DISTINCT FROM p_result_ref))));
+           OR (e.observed ? 'chargeId' AND (e.observed ->> 'chargeId') IS DISTINCT FROM p_result_ref)
+           OR (e.observed ? 'paymentMethod' AND (e.observed ->> 'paymentMethod') IS DISTINCT FROM (ref_obs ->> 'paymentMethod'))
+           OR (e.observed ? 'executorAccountRef' AND (e.observed ->> 'executorAccountRef') IS DISTINCT FROM (ref_obs ->> 'executorAccountRef')))));
   RETURN CASE WHEN n > 0 THEN 'POSITIVE_CONTRADICTION' END;
 END $$;
-REVOKE ALL ON FUNCTION booking.recording_conflict_refusal(uuid, timestamptz, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION booking.recording_conflict_refusal(uuid, timestamptz, text, uuid) FROM PUBLIC;
 
 -- ---------------------------------------------------------------------------------------------
 -- lifecycle guard: SECURITY INVOKER (is_privileged() then means "inside a schema-owner function"); recording rows only.
@@ -267,7 +276,7 @@ BEGIN
   END IF;
   r := booking.recording_proof_refusal(v_intent, o.payload, p_result_ref, o.dispatched_at, o.created_at, p_evidence, 'worker_fresh', v_t);
   IF r IS NOT NULL THEN RAISE EXCEPTION 'RECORDING_PROOF_REFUSED: %', r USING ERRCODE = 'check_violation'; END IF;
-  r := booking.recording_conflict_refusal(v_intent, o.dispatched_at, p_result_ref);
+  r := booking.recording_conflict_refusal(v_intent, o.dispatched_at, p_result_ref, p_evidence);
   IF r IS NOT NULL THEN RAISE EXCEPTION 'RECORDING_EVIDENCE_CONFLICT: %', r USING ERRCODE = 'check_violation'; END IF;
   UPDATE booking.external_operations
      SET state = 'succeeded', result_ref = p_result_ref, settled_evidence_id = p_evidence, completed_at = v_t,
@@ -304,7 +313,7 @@ BEGIN
   END IF;
   r := booking.recording_proof_refusal(v_intent, o.payload, o.result_ref, o.dispatched_at, o.created_at, p_evidence, 'owner_historical', v_t);
   IF r IS NOT NULL THEN RAISE EXCEPTION 'RECORDING_PROOF_REFUSED: %', r USING ERRCODE = 'check_violation'; END IF;
-  r := booking.recording_conflict_refusal(v_intent, o.dispatched_at, o.result_ref);
+  r := booking.recording_conflict_refusal(v_intent, o.dispatched_at, o.result_ref, p_evidence);
   IF r IS NOT NULL THEN RAISE EXCEPTION 'RECORDING_EVIDENCE_CONFLICT: %', r USING ERRCODE = 'check_violation'; END IF;
   UPDATE booking.external_operations SET settled_evidence_id = p_evidence, updated_at = v_t WHERE id = p_op;
   RETURN 'linked';
@@ -316,8 +325,10 @@ GRANT EXECUTE ON FUNCTION booking.link_recording_evidence(uuid, uuid) TO mv_book
 -- finalisation: payment_captured -> confirmed only with linked full proof and no positive contradiction. SECURITY DEFINER
 -- (a validity rule for every writer, like 0007/0009). The conflict SELECT runs as a NEW statement of this VOLATILE function,
 -- i.e. in a fresh READ COMMITTED snapshot taken after every wait (the row lock of this UPDATE, then the advisory lock), so
--- evidence committed while waiting is seen. Observed at 0010: an evidence INSERT's foreign key share-locks the intent row and
--- this UPDATE waits on it, so the advisory lock is defence in depth here; it is the serialisation for link / completion.
+-- evidence committed while waiting is seen. OBSERVED in the 0010 tests (not a general claim): applyEvent's intents UPDATE waited
+-- on a concurrent evidence writer's transaction (pg_locks: transactionid / ShareLock), i.e. the writer's row-level lock on the
+-- intent; that wait depends on the actual UPDATE lock strength. The advisory lock is therefore kept here as the explicit
+-- serialisation; for completion and link it is the observed serialisation (pg_locks: advisory).
 CREATE FUNCTION booking.recording_finalisation_guard() RETURNS trigger
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
 DECLARE o booking.external_operations%ROWTYPE; r text;
@@ -329,7 +340,7 @@ BEGIN
       USING ERRCODE = 'check_violation';
   END IF;
   PERFORM pg_advisory_xact_lock(hashtext('booking.recording_evidence'), hashtext(NEW.id::text));
-  r := booking.recording_conflict_refusal(NEW.id, o.dispatched_at, o.result_ref);
+  r := booking.recording_conflict_refusal(NEW.id, o.dispatched_at, o.result_ref, o.settled_evidence_id);
   IF r IS NOT NULL THEN RAISE EXCEPTION 'RECORDING_EVIDENCE_CONFLICT: %', r USING ERRCODE = 'check_violation'; END IF;
   RETURN NEW;
 END $$;

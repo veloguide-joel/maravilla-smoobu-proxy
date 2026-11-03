@@ -646,9 +646,9 @@ Implementation is still HOLD.
 |---|---|---|
 | `recording_lifecycle_guard()` + trigger `zz0_recording_lifecycle_guard` | 0010 up | SECURITY INVOKER, recordings only. Covers §3.1 / §3.1a. Validates `NEW`. Runs before 0008's `zz_` trigger. |
 | `recording_proof_refusal(…, p_mode, p_decision_at)` | 0010 up | **VOLATILE** (deviation from R3 "STABLE"; see A-2). Reads no clock. Private. |
-| `recording_conflict_refusal(intent, dispatched_at, result_ref)` | 0010 up | VOLATILE, private. Positive-contradiction predicate (A). |
+| `recording_conflict_refusal(intent, dispatched_at, result_ref, reference)` | 0010 up | VOLATILE, private. Positive-contradiction predicate (A), scoped to the intent's reservation; `reference` = the candidate proof (completion, link) or the linked proof (finalisation). |
 | `complete_recording_with_evidence(op, worker, evidence, result_ref, expected_version)` | 0010 up | app EXECUTE. Lock order: intent SHARE → work SHARE → op UPDATE → advisory, **then** `clock_timestamp()`. |
-| `link_recording_evidence(op, evidence)` | 0010 up | app EXECUTE. Lock order: intent SHARE → op UPDATE → advisory → `clock_timestamp()`. No worker / lease / version. `owner_historical` (≥ 15 min, no max age). Same link → `already_linked`. |
+| `link_recording_evidence(op, evidence)` | 0010 up | app EXECUTE. Lock order: intent SHARE → op UPDATE → advisory → `clock_timestamp()`. No worker / lease / version. `owner_historical` (≥ 15 min, no max age). Same link → `already_linked`. **Does not require key `:1`:** any deterministic-latest `succeeded` recording with a result (e.g. an owner-succeeded attempt 2) can be linked. |
 | `recording_finalisation_guard()` + `zz0_intents_recording_finalisation` | 0010 up | SECURITY DEFINER; gates `payment_captured → confirmed` for every writer. |
 | `recording_latest_id`, `recording_attempt_no` | 0010 up | Private helpers. Latest = attempt number from the immutable key, then `created_at`, then `id`. |
 | `record_provider_evidence`, `admin_record_evidence` | 0010 up / down | Same signatures and grants. The advisory lock is added **after the INSERT**, for kind `hostaway_offline_charges` only (B). Down restores the 0003 bodies verbatim. |
@@ -659,20 +659,30 @@ Implementation is still HOLD.
 
 ### Addendum decisions
 
-- **A: positive contradiction** (`recording_conflict_refusal`; same predicate in the read-only scan). Evidence for the intent observed **after** dispatch contradicts `result_ref` only when it positively shows something else:
-  - **Full shape** (has the `marker` key) for **this** marker: count ≥ 2; one id ≠ `result_ref`; or the same id with any **present** full field incompatible.
+- **Policy (corrected wording).** Automated completion (`complete_recording_with_evidence`) is **initial-attempt only** (key `:1`). Maintenance linking is allowed on the **latest owner-succeeded** row whatever its attempt number; it sends nothing, creates no attempt, effect or transition (tested on attempt 2).
+- **A: positive contradiction** (`recording_conflict_refusal`; same predicate in the read-only scan). **Scope:** same intent, kind `hostaway_offline_charges`, **`external_ref` = the intent's Hostaway reservation id** (API rows carry the read's bound reservation; dashboard rows the attested one), observed after dispatch, not the reference row. A count-only other id recorded under **another** reservation for the same intent is out of scope. Within scope, evidence contradicts `result_ref` only when it positively shows something else:
+  - **Full shape** (has the `marker` key) for **this** marker: count ≥ 2; one id ≠ `result_ref`; or the same id with any **present** full field incompatible: amount, currency, status, type, provider, title, listing, reservation, charge id against the intent / result; **`paymentMethod` and `executorAccountRef` against the reference proof** (the candidate before linking, the linked proof after).
   - **Count-only shape** (legacy / dashboard; no marker key): count ≥ 2, or one id ≠ `result_ref`. It proves only the id set.
   - **Count 0** (either shape) is absence or lag, **never** a contradiction.
   - A full-shape row for **another** marker is ignored.
   - No marker or full-field fact is inferred from absent fields.
   - Incomplete or malformed proof stays ineligible: the proof validator demands the exact typed key set.
 - **A-2: VOLATILE, not STABLE.** A STABLE function reuses its caller statement's snapshot. VOLATILE gives every statement inside the function a fresh READ COMMITTED snapshot after the locks. The validator still reads no clock; the decision instant is an argument.
-- **B: writers.** Both writers take the advisory lock **after** their INSERT. The INSERT's foreign key already share-locks the intent row, so every party's order is intent row → advisory, with no cycle with finalisation.
-  - **Observed:** an evidence INSERT's FK share lock makes the finalisation UPDATE of that intent wait on the writer's transaction (`transactionid` lock). The trigger's conflict SELECT, a new statement in a VOLATILE function, then sees the committed evidence. Tests cover writer-first and finalisation-first, for both writers.
+- **B: writers.** Both writers take the advisory lock **after** their INSERT, so no party takes the advisory lock before the intent-row locks it then needs (no cycle with finalisation observed or expected).
+  - **Observed in these tests (not a universal claim):** `applyEvent`'s finalisation UPDATE of the intent waited on a writer's open transaction (`pg_locks`: `transactionid` / ShareLock). That an FK key-share lock conflicts with the UPDATE depends on the UPDATE's actual lock strength (a no-key UPDATE would not conflict), so 0010 does not rely on it: the advisory lock taken in the finalisation trigger is the explicit serialization. The trigger's conflict SELECT, a new statement in a VOLATILE function, then sees the committed evidence. Tests cover writer-first and finalisation-first, for both writers.
   - For **completion and link** the advisory lock **is** the serialization. Tests show the call waiting on an `advisory` lock while a writer holds an uncommitted contradiction, then refusing after the commit.
-- **C: post-finalisation visibility.** `listRecordingContradictions({ after, limit ≤ 500 })` is read-only and keyset-paged on `(evidence observed_at, evidence id)`. It has **no** case writer and does **no** reversal, resend or escalation. A durable owner case for "linked but later contradicted" remains a **prerequisite before any dispatch-worker authorization**.
+- **C: post-finalisation visibility.** `listRecordingContradictions({ after, limit ≤ 500 })` is read-only and restricted to the deterministic latest linked recording per intent. It is keyset-paged on `(evidence observed_at at full microsecond precision, evidence id, recording id)`: the cursor `{ observedAtExact: 'YYYY-MM-DDTHH:MM:SS.ffffffZ', evidenceId, opId }` is produced by SQL `to_char(… US …)` and round-tripped unchanged; `observedAt` (ms) is display only. `after` must be exactly such a cursor (TypeError otherwise); `limit` is clamped to 1…500. It has **no** case writer and does **no** reversal, resend or escalation. A durable owner case for "linked but later contradicted" remains a **prerequisite before any dispatch-worker authorization**.
 - **D: scope.** No D1 objects or placeholders exist in 0010.
   - T27 scope: the completion and link paths create no outbox rows. Successful finalisation creates exactly E3's `guest.notify` row in `pending` (queued, never dispatched). Refusals change nothing.
+
+### Root HOLD on 4242a34: correction tests (real local PG, app + admin roles)
+
+- **Lossless cursor:** microsecond times within one millisecond and equal times with different ids; page sizes 1 / 2 / 3; every row once, in order, terminal `next`; malformed cursors rejected; 505 findings with a huge limit → 500 + `next`, all 505 reachable.
+- **Reservation scope:** another reservation's count-only other id (API and dashboard, same intent) blocks neither completion, link nor finalisation and is not scanned; the same reservation's other id still blocks completion and link and is scanned.
+- **Method / account:** a same-id full proof with `paymentMethod 'other'` or `executorAccountRef 'acct-test-2'` conflicts in completion, link and finalisation, and appears in the scan; identical and count-only same-id rows do not.
+- **Maintenance races** with the real `recoverExpiredOperations`: (A) completion uncommitted first → maintenance does **not** wait (`FOR UPDATE SKIP LOCKED`; no lock waiter observed), skips the row; completion commits linked, no case. (B) maintenance's mark uncommitted first → completion **waits** (observed `transactionid`/`tuple` lock), then returns `RECORDING_STATE`; row stays `outcome_unknown`, unlinked; no resend or new attempt.
+- **Duplicates:** concurrent completions wait on the first's row lock, then `RECORDING_STATE` (same or different evidence), no repoint; three-way `Promise.all` → exactly one success. Concurrent links wait, then `already_linked` (same evidence) / `RECORDING_ALREADY_LINKED_DIFFERENT` (other), no repoint, no effects.
+- **Mutation check:** removing the reservation scope (SQL or scan), the method or account comparison, the microsecond cursor or the op-id tie-break each fails a test (7/7 killed).
 
 ### Behaviour changes to existing tests (intended)
 
@@ -684,8 +694,8 @@ Implementation is still HOLD.
 ### Trust limits (unchanged)
 
 The DB does **not** attest:
-- the real account behind `executorAccountRef`;
-- that `paymentMethod` is the configured owner choice (the DB checks the approved set);
+- the real account behind `executorAccountRef` (a different label is a detectable conflict; equal labels do not prove the same credential);
+- that `paymentMethod` is the configured owner choice (the DB checks the approved set; a mismatch with the stored proof is detectable);
 - the provenance of API reads;
 - caller-written times (`dispatched_at`, read `completed_at`, `lease_until`).
 
