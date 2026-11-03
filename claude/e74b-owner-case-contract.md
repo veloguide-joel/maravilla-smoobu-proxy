@@ -2,7 +2,8 @@
 
 > **Current status (as of `34f0314`):**
 > - **0011 is PRESENT and accepted offline** (`cd77088` + the R1 / R2 helper corrections at `34f0314`). §13 maps the implementation.
-> - **0012 (preflight assessments, preflight holds, the eligible-assessment claim fence, owner release) is PROPOSED** in `claude/e74b-preflight-assessment-contract.md`. It is not implemented.
+> - **Preflight is PROPOSED, split into two migrations** (`claude/e74b-preflight-assessment-contract.md`, revision 2; root D9): **0012** = assessments + claim fence + conflict / exhaustion latch (epoch 0 only, no holds, no release); **0013** = `PREFLIGHT_*` holds + `release_review` + `admin_release_preflight_hold`. Neither is implemented.
+> - **Superseded here by that contract:** every "0012" reference in §0–§12 that concerns preflight holds, `assessment_id` columns, `release_for_initial_send`, the wider reason / decision CHECKs or T-F2–T-F4 now means **0013**; the claim-fence addition means 0012 **plus** the conflict latch (any conflict in the current epoch blocks, not only the latest row). `recorded_manually` is **not** in 0012 / 0013 ([OUTSIDE], preflight contract §8.5). The preflight contract wins where they differ.
 > - **Historical baseline.** §0–§12 below are the accepted design text written *before* 0011 existed. Statements such as "Nothing here is implemented" and the "no recording claim fence" baseline in §1 describe `abdcf91` (the design baseline), **not** the current code. Where §0–§12 differ from §13, §13 describes the code.
 
 **Branch.** `feature/e7-offline-charge-owner-case-contract`.
@@ -575,7 +576,7 @@ Its down refuses if any assessment or preflight hold exists. 0011 is complete an
   - SQL-recorded item errors are returned data, accumulated in `errors` under the bound.
   - A **thrown** call (outer failure) stops the run at once and **re-throws the original error object** unchanged. Bounded partial progress is attached as a non-enumerable `err.drainProgress = { calls, processed, errors }`, and no further query is issued. (Root R1 at `cd77088`; the earlier `failures` accumulation is removed.)
   - **Precision (root, at the `34f0314` review).** A server-rejected statement marks nothing. A connection lost around `COMMIT` leaves that call's processing outcome **unknown** to the caller (it may have committed), so `drainProgress` covers only calls whose replies arrived. Safe follow-up is a read-only inspection of the inbox row; there is no exactly-once transport guarantee and no automatic retry.
-  - The code comment at `lib/booking-db/operations.js:254` and the SQL comment at `db/migrations/0011_recording_owner_cases.up.sql:653` still use the categorical "marked nothing" wording. They are outside this docs-only task; correct them in the next code slice.
+  - **Erratum (root R6 at the `44ca7df` review).** The SQL comment at `db/migrations/0011_recording_owner_cases.up.sql:653` and the code comment at `lib/booking-db/operations.js:254` still use the categorical "marked nothing" wording; read them with the precision above. Migrations 0001–0011 are **never edited**, not even comments, so the 0011 comment stays as an erratum. The `operations.js` comment may be corrected in the next permitted helper edit (e.g. the 0012 JS change). See the preflight contract §12.
   - T-H3 covers a first-call failure and a failure after one processed item, with exact query counts and the remaining items untouched;
 - `linkRecordingEvidence(…, { openVisibilityHoldOnConflict })`: an optional **separate** best-effort hold, exactly one attempt, never retried. The original `RECORDING_EVIDENCE_CONFLICT` result is always returned, with `visibilityHold` beside it:
   - the opener's result;

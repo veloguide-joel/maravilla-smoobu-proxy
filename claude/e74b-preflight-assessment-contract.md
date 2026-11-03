@@ -1,31 +1,57 @@
-# E7.4b-D1-0012: preflight assessment persistence and initial-recording claim fence (IMPLEMENTATION CONTRACT, DOCS ONLY)
+# E7.4b-D1 preflight: assessment persistence (migration 0012) and preflight holds + owner release (migration 0013), revision 2 (IMPLEMENTATION CONTRACT, DOCS ONLY)
 
-**Branch.** `feature/e7-offline-charge-preflight-contract`, cut from exact `34f0314`.
+**Branch.** `feature/e7-offline-charge-preflight-contract`.
+- Revision 1: `44ca7df`, from `34f0314`.
+- **Revision 2** answers root's HOLD on `44ca7df`: decisions D1–D9 and corrections R1–R6. The resolution map is §13. This revision **replaces** revision 1 entirely.
 
 **Status.**
-- **PRESENT and accepted:** migration 0011 plus the R1 / R2 helper corrections (`cd77088` + `34f0314`); 0010 (`d801b43`); the pure proof module `lib/checkout/offline-charge-proof.js` (`4f6b27f`, unchanged since).
-- **PROPOSED (this document):** migration 0012 and its helpers. Nothing here is implemented. Migrations 0001–0011 stay unchanged on disk; 0012 would be a standalone additive / replacement migration.
-- **Still blocked:** no worker, adapter, route, UI or schedule; no automatic resend; no automated attempt > 1; no redispatch of any ambiguous write; no ESCALATE, notification, refund, cancel or void; no `paymentMethod` choice assumed; all live gates stay closed.
+- **PRESENT and accepted:** 0010 (`d801b43`); 0011 + R1 / R2 helpers (`cd77088` + `34f0314`); the pure module `lib/checkout/offline-charge-proof.js` (`4f6b27f`, unchanged).
+- **PROPOSED (this document):** two separate executable migrations, **0012** (slice A: assessments + claim fence + conflict / exhaustion latch) and **0013** (slice B: preflight holds + owner release). Each is independently reviewable and reversible to its predecessor when audit-free. An accepted / applied 0012 is never amended into 0013.
+- Migrations 0001–0011 stay byte-identical on disk; historical comment errata are in §12.
 
 **Labels.**
 - **[PRESENT]** code at `34f0314`, cited as path:line.
-- **[PROPOSED]** this design.
+- **[PROPOSED-0012]** / **[PROPOSED-0013]** this design, per migration.
 - **[TRUST]** input the database cannot attest.
-- **[OUTSIDE]** not authorized by this task.
-- **[DECIDE]** an open choice for root (§10).
+- **[OUTSIDE]** not authorized.
+
+**Boundaries.**
+- Nothing here is implemented.
+- **No fence, assessment or release authorizes a provider send by itself.**
+- The worker, adapter, routes, UI and schedules stay [OUTSIDE].
+- No automatic resend, no automated attempt > 1, no redispatch of any ambiguous write.
+- No ESCALATE, notification, refund, cancel or void.
+- No `paymentMethod` choice is assumed; every live gate stays closed.
 
 ---
 
-## 1. What 0012 adds, in one paragraph
+## 0. Root decisions recorded (HOLD on 44ca7df)
 
-Today the 0011 fence (`db/migrations/0011_recording_owner_cases.up.sql:553–581`) lets the never-dispatched initial recording be claimed with **no** preflight evidence at all. 0012 makes that claim depend on a **persisted, DB-bound, fresh, eligible preflight assessment**: one positive identity read and one complete charge-list read, both API evidence of exactly this intent / reservation, fresh at the database clock **at the claim**, in the current epoch, recorded by the claiming worker under its live work lease.
+| # | Decision |
+|---|---|
+| D1 | Fact / config / context / binding / input-timing refusals stay worker-local, are never persisted, and never count. The exact code families are in §4.1. |
+| D2 | Only `incomplete` and `identity_refused` count, with a threshold of 3 per current epoch. **A conflict blocks immediately and persistently** (§5.4 latch), not merely until the next assessment. |
+| D3 | The assessing worker is the claimant, with a live work lease checked **under a lock** at the decision clock (§7.2). |
+| D4 | A separate `admin_release_preflight_hold` (0013). The `admin_resolve_recording_hold` signature (0011:753) is unchanged. |
+| D5 | Yes in principle: a **separate reviewed completion binding before any worker integration**. It covers both the confirming proof's `executorAccountRef` and its `paymentMethod` against the claim assessment's config snapshot. This does **not** select the owner's payment method. It is not part of 0012 / 0013. |
+| D6 | The DB checks currency **equality with the intent** only. The USD-only live policy stays in the unchanged pure module / worker ([TRUST]); the DB does not claim to prove every pure config policy. Existing MXN test history is not live authorization. |
+| D7 | `incomplete` **requires** a positive identity read; the alternative is removed. |
+| D8 | A release after an intent version change is refused strictly; the hold stays visible. No new hold can be opened in that case: one active hold per op, frozen identity, and no other release path in this stage. |
+| D9 | Split into **0012** (A) then **0013** (B): distinct versions, separate down gates, no amendment. |
 
-Three further pieces:
-- conflict and exhaustion outcomes open owner-visible `PREFLIGHT_*` holds (reusing the 0011 hold / case machinery);
-- the owner may release such a hold for the initial send **only** with a fresh `release_review` assessment taken under that hold;
-- a release starts a new epoch, and nothing carries forward.
+---
 
-**Neither an assessment nor a release dispatches, confirms or authorizes a send by itself.** The fence still decides at claim time.
+## 1. What changes, in brief
+
+**0012 (A).**
+- **Gate.** The initial recording can be claimed only with a persisted, DB-bound, fresh, eligible preflight assessment, recorded by the claiming worker, at the current intent version.
+- **Latch.** A conflict or exhaustion recorded in the current epoch latches the op as **blocked**, regardless of any later eligible row, until (only in 0013) an owner release starts a new epoch.
+- **Scope.** 0012 has no holds and no release, so a latched op stays blocked. It is visible through read-only tables and `recording_claim_ready` (§6.4).
+
+**0013 (B).**
+- Conflict / exhaustion get durable owner-visible `PREFLIGHT_*` holds (the 0011 machinery).
+- The owner may release such a hold only with a fresh `release_review` assessment taken under that same active hold.
+- A release starts a new epoch, with no carry-forward. It never claims, sends or confirms.
 
 ---
 
@@ -33,386 +59,467 @@ Three further pieces:
 
 | Fact | Where |
 |---|---|
-| Pure preflight: `assessIdentitySnapshot`, `assessChargeList`, `qualifyPreflight` produce a frozen branded eligibility with `sendAuthorization: false` and the full context; brands are a process-local `WeakSet` | `lib/checkout/offline-charge-proof.js:54–57`, 200–232, 244–288, 309–332 |
-| Freshness 2 min, inclusive; observed in the future is refused | `offline-charge-proof.js:36`, 87–94 |
-| Context = every intent field + every config field | `offline-charge-proof.js:179–184`; config keys 122–136; intent keys 139–156 |
-| Initial recording only, `pending`, `attempts 0`, undispatched, payload bound | `offline-charge-proof.js:158–170` |
-| Request built PRE-CLAIM from the eligibility; carried observations re-checked for freshness | `offline-charge-proof.js:359–374` |
-| Reads: `requestRead` writes the read row with **caller** `created_at` / `next_attempt_at` | `lib/booking-db/operations.js` (`requestRead`) |
-| API evidence via `record_provider_evidence`: the read must be succeeded and of the right type, `external_ref` = the read selector, `observed_at := read.completed_at` (caller time); `created_at DEFAULT now()` (writer **transaction start**, DB clock) | 0010:354–390; 0003:52–76 (`created_at` 0003:67) |
-| Evidence shapes: `hostaway_reservation` `found_active` needs `listingId` / `from` / `to` / `totalMinor`; `hostaway_offline_charges` needs `listed` + `matchingChargeCount` / `matchingChargeIds` | 0003:85–97 |
-| Latest recording; attempt number from the immutable key | 0010:24–37 |
-| 0011 holds / decisions / observations / inbox; reserved cases; two-way deferred binding; claim fence; visibility opener; inbox processor; page function; owner decisions | 0011:23–89, 93–217, 222–297, 553–581, 586–637, 654–720, 722–751, 753–832 |
-| JS fence mirror in **both** claim stages | `lib/booking-db/operations.js:75–84`, 97, 107 |
-| R1 drain re-throws an outer error; R2 optional link hold never replaces the refusal | `operations.js:217–232`, 245, 259–286 |
+| **Pure identity / list / qualify functions.** Brands are a process-local `WeakSet`; eligibility carries `sendAuthorization: false`. | `lib/checkout/offline-charge-proof.js:54–57`, 200–232, 244–288, 309–332 |
+| Freshness 2 min inclusive; future refused; input-timing codes `MAX_AGE_INVALID`, `NOW_INVALID`, `OBSERVED_AT_INVALID`, `OBSERVED_IN_FUTURE`, `STALE` | `offline-charge-proof.js:36`, 87–94 |
+| Config keys / codes; approved methods (no default); USD only; direct channel 2000 | `offline-charge-proof.js:32–33`, 122–136; `lib/hostaway-reservations.js:41` |
+| Intent facts / codes; initial-recording facts / codes | `offline-charge-proof.js:139–156`, 158–170 |
+| Envelope codes `MALFORMED_ENVELOPE`, `FAIL_ENVELOPE`; normalization codes | `lib/hostaway-reservations.js:274–325` |
+| Request built PRE-CLAIM with carried freshness re-checked | `offline-charge-proof.js:359–374` |
+| `requestRead` writes read rows with **caller** `created_at` | `lib/booking-db/operations.js` (`requestRead`) |
+| API evidence: `observed_at := read.completed_at` (caller); `created_at DEFAULT now()` = writer **transaction start** (DB) | 0010:354–390; 0003:67 |
+| Evidence shapes (`found_active` keys; offline-charge count / ids equality) | 0003:85–97 |
+| `intent_transitions.recorded_at := statement_timestamp()` (DB-stamped) | 0005:24–30; table 0001:207–221 |
+| Work leases: `claimIntentWork` (`FOR UPDATE OF w SKIP LOCKED`, then UPDATE); `applyEvent` locks the intent `FOR NO KEY UPDATE`, then updates `intent_work.next_action_at`; existing workers already re-check their lease under `intent_work FOR SHARE` (precedent) | `lib/booking-db/repo.js:642–653`, 358, 271; `capture-worker.js:105–106`; `compensation-worker.js:115–116` |
+| Claim helper: intent `FOR SHARE` (101) → op `FOR UPDATE SKIP LOCKED` (108); **no** `intent_work` lock today | `operations.js:88–108` |
+| Latest recording / attempt number | 0010:24–37 |
+| 0011 claim fence; holds / decisions / binding; owner decisions | 0011:553–581, 23–60, 93–143, 222–297, 753–832 |
+| 0011 constraint names (measured on a throwaway local cluster at 34f0314) | `recording_holds_reason_check`, `recording_holds_epoch_check`, `recording_holds_check`; `recording_hold_decisions_decision_check`, `recording_hold_decisions_check`, `recording_hold_decisions_check1` |
+| JS fence mirror in both claim stages | `operations.js:75–84`, 97, 107 |
+| R1 / R2 helpers | `operations.js:217–232`, 245, 259–286 |
 
 ---
 
-## 3. Objects [PROPOSED 0012]
+## 3. Migration 0012 (slice A) [PROPOSED-0012]
 
-### 3.1 New table `booking.recording_assessments` (append-only; RLS SELECT-only for app / admin / report; no write grant)
+### 3.1 `booking.recording_assessment_codes` (reference data; seeded by 0012 and immutable)
 
-| Column | Rule |
+- Columns: `outcome text`, `code text`, `evidence_rule text`, `PRIMARY KEY (outcome, code)`.
+- Seeded with exactly the persistable codes of §4.1.
+- `evidence_rule` ∈:
+  - `none`: no evidence row may exist for the read;
+  - `found_active_mismatch`: evidence `found_active` must exist, and the code's mismatch is **re-derived** (§4.2);
+  - `not_found_or_cancelled`: evidence with that status.
+- SELECT for app / admin / report; **no write grant**; `reject_change` on UPDATE / DELETE / TRUNCATE.
+
+### 3.2 `booking.recording_assessments` (append-only; RLS SELECT-only for app / admin / report; no write grant)
+
+| Column | Rule (0012) |
 |---|---|
 | `id uuid PK` | |
 | `seq bigint GENERATED ALWAYS AS IDENTITY UNIQUE` | deterministic order |
-| `operation_id → external_operations NOT NULL`, `intent_id → intents NOT NULL` | guard: the op is a recording of that intent |
-| `phase text` | `preflight` \| `release_review` |
-| `hold_id → recording_holds` | NOT NULL **iff** `phase = 'release_review'` |
-| `epoch integer NOT NULL` | `>= 0` |
-| `outcome text` | `eligible` \| `conflict_marker` \| `conflict_lookalike` \| `conflict_same_amount` \| `incomplete` \| `identity_refused` |
-| `code text` | the pure module's code (`is_code`), e.g. `LIST_COUNT_INVALID`; NULL iff `eligible` |
-| `identity_read_op → external_operations`, `list_read_op → external_operations` | `UNIQUE` each (where not NULL) |
-| `identity_evidence → provider_evidence`, `list_evidence → provider_evidence` | |
-| `intent_version integer NOT NULL` | |
-| `worker text NOT NULL` | |
-| `module_version text NOT NULL` | = `OFFLINE_CHARGE_PROOF_VERSION` |
-| `client_label text`, `account_ref text` | [TRUST labels]; checked equal to both evidence rows |
-| `cfg_payment_method`, `cfg_currency`, `cfg_channel_id`, `cfg_ref_field_id`, `cfg_listing_id` | [TRUST] the worker's configuration snapshot, stored for audit and the later binding (§4.4) |
-| `recorded_at timestamptz NOT NULL` | DB `v_t` |
+| `operation_id → external_operations`, `intent_id → intents` | the op is the intent's recording (guard) |
+| `phase text` | `CONSTRAINT recording_assessments_phase_check CHECK (phase = 'preflight')` (0013 widens) |
+| `epoch integer` | `CONSTRAINT recording_assessments_epoch_check CHECK (epoch = 0)` (0013 widens) |
+| `outcome text` | `eligible`, `conflict_marker`, `conflict_lookalike`, `conflict_same_amount`, `incomplete`, `identity_refused` |
+| `code text` | NULL iff `eligible`; for conflicts the pure code (`PRIOR_RECORDING_MARKER_PRESENT` / `MARKER_LOOKALIKE_CONFLICT` / `SAME_AMOUNT_PAID_UNMARKED_CONFLICT`); otherwise `FOREIGN KEY (outcome, code) → recording_assessment_codes` |
+| `identity_read_op`, `list_read_op → external_operations` | `UNIQUE` each where not NULL |
+| `identity_evidence`, `list_evidence → provider_evidence` | per-outcome nullability (§4.2), as CHECKs |
+| `intent_version integer` | |
+| `worker text` | |
+| `module_version text` | `CHECK (module_version IN ('offline-charge-proof-v1'))`; the allowlist widens only by migration |
+| `cfg jsonb` | §4.4 exact keys |
+| `client_label text`, `account_ref text` | label regex `^[A-Za-z0-9._:-]{1,64}$` |
+| `recorded_at timestamptz` | DB `v_t` |
 
-**Outcome / binding CHECKs**, with read / evidence nullability fixed per outcome (§4.2).
+No `hold_id` column and no FK to absent objects in 0012.
 
-### 3.2 New table `booking.recording_claim_assessments` (append-only)
+### 3.3 `booking.recording_claim_assessments` (append-only)
 
-- Columns: `operation_id PK → external_operations`, `assessment_id → recording_assessments NOT NULL`, `claimed_at` (fence `v_t`), `worker`.
-- It is written by the fence trigger in the claim's own UPDATE transaction, so there is a durable record of **which** eligible assessment qualified the one claim of the initial attempt.
+- Columns: `operation_id PK → external_operations`, `assessment_id → recording_assessments`, `worker`, `claimed_at` (fence `v_t`).
+- Inserted by the fence **inside the claim UPDATE's transaction**.
 
-### 3.3 Replacements of 0011 objects (each restored byte-exact by 0012 down)
+### 3.4 Functions (0012)
 
-| 0011 object (line) | 0012 change |
+| Function | Security / volatility / grant | Behaviour |
+|---|---|---|
+| `record_recording_assessment(p_op uuid, p_worker text, p_outcome text, p_code text, p_identity_read uuid, p_list_read uuid, p_identity_evidence uuid, p_list_evidence uuid, p_expected_version integer, p_module_version text, p_client_label text, p_account_ref text, p_cfg jsonb) RETURNS uuid` | SD, VOLATILE, fixed `search_path`; app EXECUTE | §4–§5; refusals `ASSESSMENT_*` (23514); **phase is fixed to `preflight`**, so the signature stays stable when 0013 adds a separate review function |
+| `recording_claim_ready(p_op uuid) RETURNS boolean` | SD, **VOLATILE** (reads `clock_timestamp()`; each inner statement takes a fresh READ COMMITTED snapshot); read-only; takes no locks; app + admin EXECUTE | the fence predicate minus the claimant / lease equality (§6.4). **Advisory only**: the trigger is authoritative |
+| `recording_preflight_block(p_op uuid) RETURNS text` | SD, VOLATILE, private | `CONFLICT_LATCHED` / `EXHAUSTED` / NULL for the current epoch (§5.4) |
+| `recording_claim_fence()` | CREATE OR REPLACE of 0011:553–578 (SD, VOLATILE, unchanged security and `search_path`) | the 0011 body verbatim first, then §6.3 |
+
+**JS (0012):**
+- `RECORD_FENCE` (`operations.js:75–84`) gains `AND booking.recording_claim_ready(o.id)`, used unchanged in **both** stages (97, 107).
+- The claim helper adds `SELECT 1 FROM booking.intent_work WHERE intent_id = $1 FOR SHARE` between its intent lock and its op lock (§7.2).
+- New `recordRecordingAssessment` → `{ ok, id } | { ok:false, error }`.
+- `DB_SAFETY_CODES` additions. **No retries; R1 / R2 unchanged.**
+
+### 3.5 0012 down
+
+1. **Refuse** if any `recording_assessments` or `recording_claim_assessments` row exists.
+2. Restore `recording_claim_fence` **verbatim from the 0011 file** (generator, as for 0011).
+3. Drop the 0012 functions, tables and seed data.
+
+**Round trip:** equal to a fresh cluster at 11 (bodies md5, ACLs, security, `search_path`, triggers, columns, grants, policies, constraints). The JS helper change is reverted by code, not by SQL.
+
+---
+
+## 4. Pure result → assessment row (exact)
+
+### 4.1 Code families (mutually exclusive)
+
+**Worker-local, NEVER persisted (D1):**
+- unprefixed fact codes from `configRefusal` (122–136): `CONFIG_REQUIRED`, `PAYMENT_METHOD_UNSET`, `CONFIG_SHAPE`, `PAYMENT_METHOD_NOT_APPROVED`, `CURRENCY_NOT_APPROVED`, `CHANNEL_NOT_DIRECT`, `ACCOUNT_REF_INVALID`, `CONFIG_IDS_INVALID`, `ADAPTER_CONFIG_*`;
+- unprefixed fact codes from `intentRefusal` (141–156) and `recordingOpRefusal` (160–170);
+- input shape / label / binding: `IDENTITY_SNAPSHOT_SHAPE`, `IDENTITY_ACCOUNT_REF_MISMATCH`, `IDENTITY_CLIENT_LABEL_INVALID`, `LIST_READ_SHAPE`, `LIST_ACCOUNT_REF_MISMATCH`, `LIST_CLIENT_LABEL_INVALID`, `LIST_REQUEST_NOT_CANONICAL`;
+- input timing: `IDENTITY_` / `LIST_` + {`MAX_AGE_INVALID`, `NOW_INVALID`, `OBSERVED_AT_INVALID`, `OBSERVED_IN_FUTURE`, `STALE`};
+- `qualifyPreflight` refusals: `POSITIVE_IDENTITY_REQUIRED`, `COMPLETE_LIST_REQUIRED`, `RESERVATION_BINDING_MISMATCH`, `ACCOUNT_REF_BINDING_MISMATCH`, `CLIENT_LABEL_BINDING_MISMATCH`, `IDENTITY_CONTEXT_CHANGED`, `LIST_CONTEXT_CHANGED`, and the freshness codes at 319–321.
+
+**Persistable `identity_refused`** (provider-response observations from `assessIdentitySnapshot`, 208–225):
+
+| Code | `evidence_rule` |
 |---|---|
-| `recording_holds.reason` CHECK (0011:27) | + `PREFLIGHT_EXHAUSTED`, `PREFLIGHT_CONFLICT_MARKER`, `PREFLIGHT_CONFLICT_LOOKALIKE`, `PREFLIGHT_CONFLICT_SAME_AMOUNT` |
-| `recording_holds.epoch` CHECK `epoch = 0` (0011:33) | `epoch >= 0`, plus `CHECK (reason LIKE 'PREFLIGHT\_%' OR epoch = 0)` |
-| *(new column)* `recording_holds.assessment_id → recording_assessments` | NOT NULL **iff** `reason LIKE 'PREFLIGHT\_%'` (conflict: the conflict assessment; exhausted: the third counted one) |
-| `recording_hold_decisions.decision` CHECK (0011:49) | + `release_for_initial_send` |
-| *(new column)* `recording_hold_decisions.assessment_id` | NOT NULL **iff** `release_for_initial_send` |
-| decisions CHECK (0011:57) | unchanged (`link_full_proof` iff `linked_evidence_id`) |
-| `recording_holds_guard` release binding (0011:93–120, the decision test at 0011:115) | a release cites its own decision, which is `link_full_proof` (reason `SUCCEEDED_UNPROVEN`) **or** `release_for_initial_send` (reason `PREFLIGHT_*`) |
-| `recording_hold_decisions_guard` (0011:123–143, the reason test at 0011:134) | + `release_for_initial_send` only for `PREFLIGHT_*` holds, citing a `release_review` assessment bound to **this** hold |
-| `reserved_case_guard` kinds (0011:230) | + the four `OFFLINE_CHARGE_HOLD_PREFLIGHT_*` kinds |
-| `reserved_case_binding_verify` (0011:254–282: resolution at 274, release decision at 279) | the case resolution follows its **last** release: `recorded` after `link_full_proof`, `no_action` after `release_for_initial_send`; a released hold cites either decision matching its reason. **The ≥ 1-hold / open-iff-active / intent+kind rules are unchanged.** |
-| `recording_claim_fence` (0011:553–581) | the existing checks first and unchanged (state / exact capture, payload, key `:1`, `attempts 0`, undispatched, `offline_charge_attempts 0`, latest, no active hold, no open reserved case); then §5.3 |
-| JS `RECORD_FENCE` (`operations.js:75–84`, used at 97 **and** 107) | + `AND booking.recording_claim_ready(o.id)` (a granted read-only function; §5.4) in **both** stages; the trigger stays authoritative |
-| `admin_resolve_recording_hold` (0011:753; signature `(uuid, text, uuid[], uuid, text, text, timestamptz)`) | **not replaced** [DECIDE D4: recommended]. `keep_visible` already works for every reason; release goes through a NEW admin function (§6), so existing callers and the R1 / R2 helpers are untouched |
+| `IDENTITY_HTTP_STATUS` | `none`, or `not_found_or_cancelled` for a 404 the worker recorded as `not_found` |
+| `IDENTITY_MALFORMED_ENVELOPE`, `IDENTITY_FAIL_ENVELOPE`, `IDENTITY_RESULT_NOT_OBJECT`, `IDENTITY_NOT_NORMALIZABLE` | `none` |
+| `IDENTITY_` + each normalizer code (`MALFORMED_RESERVATION`, `RESERVATION_ID_INVALID`, `RESERVATION_ID_INCONSISTENT`, `LISTING_ID_INVALID`, `CHANNEL_ID_INVALID`, `DATES_INVALID`, `AMOUNT_NOT_EXACT`, `CURRENCY_INVALID`, `STATUS_INVALID`, `CUSTOM_FIELDS_MALFORMED`, `REF_FIELD_DUPLICATED`, `REF_VALUE_INVALID`) | `none` |
+| `IDENTITY_CURRENCY_MISMATCH`, `IDENTITY_RESERVATION_ID_MISMATCH`, `IDENTITY_LISTING_MISMATCH`, `IDENTITY_CHANNEL_MISMATCH`, `IDENTITY_ARRIVAL_MISMATCH`, `IDENTITY_DEPARTURE_MISMATCH`, `IDENTITY_TOTAL_MISMATCH`, `IDENTITY_REF_MISMATCH`, `IDENTITY_STATUS_NOT_ACTIVE` | `found_active_mismatch`, or `none` |
 
-**Unchanged and preserved:**
-- the 0010 / 0011 contradiction core and wrapper;
-- completion, link and finalisation (incl. the no-active-hold checks);
-- `intents_safety_guard`, `admin_close_case`, the inbox, processor and page function;
-- `open_recording_visibility_hold` (its reason list stays `ATTEMPT_GT1` / `SUCCEEDED_UNPROVEN`);
-- all existing audit rows: every 0011 hold has `epoch 0`, a non-preflight reason and no `assessment_id`, so the replaced CHECKs accept them.
+**Persistable `incomplete`** (from `assessChargeList`, 255–279), always `none`:
+- `LIST_HTTP_STATUS`, `LIST_MALFORMED_ENVELOPE`, `LIST_FAIL_ENVELOPE`, `LIST_RESULT_NOT_ARRAY`;
+- `LIST_COUNT_INVALID`, `LIST_COUNT_LENGTH_MISMATCH`;
+- `LIST_ROW_MALFORMED`, `LIST_ROW_ID_INVALID`, `LIST_DUPLICATE_ID`, `LIST_FOREIGN_RESERVATION_ROW`, `LIST_FOREIGN_LISTING_ROW`;
+- `LIST_ROW_TYPE_INVALID`, `LIST_ROW_TITLE_INVALID`, `LIST_ROW_CURRENCY_INVALID`, `LIST_ROW_STATUS_INVALID`, `LIST_ROW_PAYMENTPROVIDER_INVALID`, `LIST_ROW_PAYMENTMETHOD_INVALID` (from `k.toUpperCase()` at 274);
+- `LIST_ROW_TYPE_UNKNOWN`, `LIST_ROW_AMOUNT_INVALID`, `LIST_ROW_AMOUNT_NOT_EXACT`.
 
-### 3.4 Functions [PROPOSED]
+**Persistable for any outcome, only when no provider response exists:** `READ_NOT_COMPLETED`, meaning the cited read is `escalated` (no response after its retries).
 
-| Function | Grant | Result / errors |
+**Rules.**
+- Any code not seeded cannot be persisted: the composite FK refuses it, so an arbitrary `p_code` can never count.
+- If the pure module gains a code, only a reviewed migration may add it.
+
+### 4.2 Outcome-specific read / evidence rules (DB-checked)
+
+| Outcome | Identity read / evidence | List read / evidence |
 |---|---|---|
-| `record_recording_assessment(p_op uuid, p_worker text, p_phase text, p_hold uuid, p_outcome text, p_code text, p_identity_read uuid, p_list_read uuid, p_identity_evidence uuid, p_list_evidence uuid, p_expected_version integer, p_module_version text, p_client_label text, p_account_ref text, p_cfg jsonb) RETURNS uuid` | app | assessment id; `ASSESSMENT_*` refusals (23514) through `dbSafetyCode` |
-| `open_recording_preflight_hold(p_op uuid, p_worker text, p_reason text, p_assessment uuid, p_expected_version integer) RETURNS uuid` | app | hold id (idempotent); `HOLD_*` refusals |
-| `admin_release_preflight_hold(p_hold uuid, p_assessment uuid, p_evidence uuid[], p_resolver text, p_justification text, p_at timestamptz) RETURNS uuid` | admin | decision id; `HOLD_*` / `ASSESSMENT_*` refusals |
-| `recording_claim_ready(p_op uuid) RETURNS boolean` | app + admin (read-only, SD, `STABLE`; no write) | used by the JS mirror; the fence re-evaluates inside the trigger at its own `v_t` |
-| `recording_preflight_epoch(p_op uuid) RETURNS integer` | private | the number of released `PREFLIGHT_*` holds of the op |
+| `eligible`, `conflict_*` | read `hostaway.retrieve_reservation`, **succeeded**; evidence `hostaway_reservation` / `found_active` of exactly that read; all identity fields **equal** to the intent (§4.3) | read `hostaway.list_offline_charges`, **succeeded**; evidence `hostaway_offline_charges` / `listed` of exactly that read, preflight list shape (§4.3) |
+| `incomplete` (D7) | as eligible: a positive, matching identity | read cited; `succeeded` with code ≠ `READ_NOT_COMPLETED`, or `escalated` with `READ_NOT_COMPLETED`; **no evidence row may exist for that read** (`evidence_rule = 'none'`) |
+| `identity_refused` | read cited; per the code's `evidence_rule` (below) | NULL (no list read is counted) |
 
-**JS helpers [PROPOSED]** (in `lib/booking-db/operations.js`, `db/lib/admin.js`):
-- `recordRecordingAssessment`, `openRecordingPreflightHold` → `{ ok:true, id } | { ok:false, error }`;
-- `adminReleasePreflightHold`;
-- `RECORD_FENCE` + `recording_claim_ready`;
-- `DB_SAFETY_CODES` additions.
+**`identity_refused` evidence rules:**
+- `none`: `NOT EXISTS (provider_evidence WHERE read_operation_id = read)`.
+- `not_found_or_cancelled`: that read's evidence has status `not_found` / `cancelled`.
+- `found_active_mismatch`: that read's evidence is `found_active`, and the DB **re-derives** the code. For example `IDENTITY_TOTAL_MISMATCH` ⇒ `observed.totalMinor ≠ intents.final_total_minor`; `IDENTITY_STATUS_NOT_ACTIVE` ⇒ `observed.status ≠ 'new'`; likewise listing, arrival, departure, reference (`bookingRef ≠ intents.ref`), currency, channel, reservation id.
+  - A real refused observation is therefore **retained as real evidence without qualifying**: `found_active` with mismatching fields never satisfies `eligible`, whose rules require equality.
 
-**No helper retries, and R1 / R2 behaviour is unchanged.**
+**No fabrication.**
+- Malformed / unparseable provider responses cannot be persisted as evidence: `provider_evidence` stores ids / amounts / statuses only, so the raw JSON is not retained. They are cited by read id + code only.
+- A list evidence row for a page the worker found incomplete is a worker defect [TRUST]. The DB refuses to count such a read as `incomplete` (`ASSESSMENT_EVIDENCE_PRESENT`), and the read is refused as `eligible` unless the preflight list shape is complete (§4.3).
+
+### 4.3 DB-checkable bindings
+
+**Every cited read:**
+- `intent_id` = op intent; the right `op_type`; `retry_class = 'read'`;
+- `payload = {"reservationId": intents.hostaway_reservation_id}` exactly (a canonical id);
+- used by no other assessment (`UNIQUE`, in either column, across phases).
+
+**Every cited evidence row:** `read_operation_id` = the cited read; `intent_id` = op intent; `source = 'hostaway_api'`; `external_ref = hostaway_reservation_id`.
+
+**Identity evidence `observed`** for eligible / conflict / incomplete. Required keys: `reservationId`, `listingId`, `channelId`, `from`, `to`, `totalMinor`, `currency`, `status`, `bookingRef`, `executorAccountRef`, `clientSnapshotId`. It must equal, respectively:
+- `external_ref`, `intents.listing_id`, `2000`, the stay dates, `final_total_minor`, `intents.currency`, `'new'`, `intents.ref`, `account_ref`, `client_label`.
+
+**List evidence `observed`** (preflight shape, count-only, so no `marker` key). Required keys and ranges:
+- `matchingChargeCount` integer 0…500, `= jsonb_array_length(matchingChargeIds)`; `matchingChargeIds` distinct canonical-id strings;
+- `lookalikeCount` and `sameAmountPaidCount` integers 0…500;
+- `rowCount` integer 0…500, `≥ matchingChargeCount + lookalikeCount + sameAmountPaidCount`;
+- `readCount = 1`, `requestLimit = 500`, `complete = true`;
+- `executorAccountRef = account_ref`, `clientSnapshotId = client_label`.
+
+**Outcome consistency:**
+- `eligible` ⇒ the three counts are 0;
+- `conflict_marker` ⇒ `matchingChargeCount ≥ 1`;
+- `conflict_lookalike` ⇒ `matchingChargeCount = 0 AND lookalikeCount ≥ 1`;
+- `conflict_same_amount` ⇒ `matchingChargeCount = 0 AND lookalikeCount = 0 AND sameAmountPaidCount ≥ 1`.
+
+This mirrors the pure precedence (324–326).
+
+**Op:** `pending`; key `och:<intent>:1`; `attempts = 0`; `dispatched_at IS NULL`; latest; no active hold (0011 `recording_active_hold_id`).
+
+**Intent and lease:** `payment_captured`; `captured_minor = final_total_minor`; `offline_charge_attempts = 0`; `version = p_expected_version`; `intent_work.work_worker_id = p_worker AND work_lease_until ≥ v_t`, read under `FOR SHARE` (§7.2).
+
+**Block state:** `recording_preflight_block(op)` IS NULL, i.e. not latched (§5.4).
+
+### 4.4 `p_cfg` (exact)
+
+- Exactly the keys `accountRef`, `channelId`, `currency`, `listingId`, `paymentMethod`, `refFieldId` (the pure `CONFIG_KEYS`, 122), with JSON types:
+  - `accountRef`: string, label regex, **= `p_account_ref`**;
+  - `channelId`: number = 2000;
+  - `currency`: string = `intents.currency`;
+  - `listingId`: number = `intents.listing_id`;
+  - `paymentMethod`: string ∈ {`credit_card`, `other`}, required, **no default**;
+  - `refFieldId`: integer 1…2147483647.
+- The DB enforces this **internal consistency of the persisted snapshot**. It cannot know the operational config values or the USD policy (D6) [TRUST].
+
+### 4.5 What stays [TRUST]
+
+- **Classification.** That the outcome is the true pure classification of the actual response. The DB re-derives identity mismatches and count consistency, never the raw JSON.
+- **Provenance and timing.** That reads were executed against Hostaway with the stated request (limit 500, single page); that labels name the real client / credential / account; that `observed_at` / read `completed_at` / `updated_at` are true times.
+- **In-memory results.** Process-local brands and in-memory results are not DB attestation.
 
 ---
 
-## 4. Mapping the pure result to an assessment row
+## 5. Freshness, floors, epochs, latch
 
-### 4.1 Which pure results are persisted
+### 5.1 Decision clock
 
-| Pure call → result | Persisted `outcome` / `code` | Counts toward exhaustion? |
-|---|---|---|
-| `qualifyPreflight` ok (`offline-charge-proof.js:327–331`) | `eligible` / NULL | — |
-| `qualifyPreflight` → `PRIOR_RECORDING_MARKER_PRESENT` (324, `case_only`) | `conflict_marker` | no: opens `PREFLIGHT_CONFLICT_MARKER` at once |
-| → `MARKER_LOOKALIKE_CONFLICT` (325) | `conflict_lookalike` | no: opens `PREFLIGHT_CONFLICT_LOOKALIKE` |
-| → `SAME_AMOUNT_PAID_UNMARKED_CONFLICT` (326) | `conflict_same_amount` | no: opens `PREFLIGHT_CONFLICT_SAME_AMOUNT` |
-| `assessChargeList` refusal `LIST_*` (247–283), or a list read that did not succeed | `incomplete` / that code (or `LIST_READ_NOT_SUCCEEDED`) | **yes** |
-| `assessIdentitySnapshot` refusal `IDENTITY_*` (203–225), or an identity read that did not succeed | `identity_refused` / that code (or `IDENTITY_READ_NOT_SUCCEEDED`) | **yes** |
-| fact / context / binding refusals: `configRefusal` codes (`PAYMENT_METHOD_UNSET` …), `intentRefusal`, `recordingOpRefusal`, `*_BINDING_MISMATCH`, `*_CONTEXT_CHANGED`, `qualifyPreflight` freshness `IDENTITY_*` / `LIST_*` at 320–321 | **not persisted** (the worker stops locally) | no |
+Every 0012 / 0013 function and the fence sample `v_t := clock_timestamp()` **after their last potentially blocking lock**, and use only `v_t`.
 
-The last row is [DECIDE D1, recommended]. These describe the worker's own inputs or a race, not the provider. Persisting them would let a misconfiguration exhaust the epoch.
+### 5.2 Freshness (inclusive, no future), per existing row
 
-**Exhaustion** [DECIDE D2, recommended]:
-- Three counted outcomes (`incomplete` / `identity_refused`) of the **current epoch, `phase = 'preflight'`**.
-- After that, `record_recording_assessment` refuses further preflight rows in that epoch (`ASSESSMENT_EPOCH_EXHAUSTED`), the fence refuses, and the worker may only open `PREFLIGHT_EXHAUSTED`.
-- `release_review` rows never count.
+**At assessment:**
+- **for each evidence row that exists:** `v_t − 2 min ≤ observed_at ≤ v_t`;
+- **for a cited read without evidence** (refusal rows): `succeeded` reads use `completed_at`, and `escalated` reads use `updated_at`, with the same window. Both are caller-written [TRUST]; the DB refuses only implausible values.
 
-### 4.2 Required reads and evidence per outcome (DB-checked)
+**At claim** (the qualifying eligible row) **and at release** (0013, its `release_review` row): both evidence rows again at that function's `v_t`.
 
-| Outcome | identity read / evidence | list read / evidence |
-|---|---|---|
-| `eligible` | read `hostaway.retrieve_reservation`, `succeeded`; evidence kind `hostaway_reservation`, status `found_active`, `read_operation_id` = that read | read `hostaway.list_offline_charges`, `succeeded`; evidence `hostaway_offline_charges` / `listed`, `read_operation_id` = that read |
-| `conflict_*` | as eligible (a positive identity is required by `qualifyPreflight` before partitioning) | as eligible |
-| `incomplete` | as eligible (positive identity), **or** NULL if the list was attempted first [DECIDE D7: recommended "as eligible"] | read cited, terminal (`succeeded` or `escalated`); **no evidence row for that read may exist** (`NOT EXISTS provider_evidence WHERE read_operation_id = list_read_op`) |
-| `identity_refused` | read cited, terminal; no evidence for it, or evidence that is not `found_active` | NULL (no list read is counted) |
+### 5.3 Floors (DB-assigned lower bounds; never used alone)
 
-No evidence is invented for failed or incomplete reads.
-- A failed read is cited by id only.
-- Evidence recorded for that read later can never be used: the read is already counted (`UNIQUE`).
+| Floor | Rule |
+|---|---|
+| **Initial / current version** | each cited evidence `created_at` (writer transaction start, DB clock) > the `recorded_at` (DB `statement_timestamp()`) of the `intent_transitions` row with `(intent_id, version_after = p_expected_version)`. The evidence write began after the current intent version was recorded; in the first epoch this also places it after the recording was created (the same E3 transition). |
+| **After hold** (0013 `release_review`) | evidence `created_at` > `hold.created_at`. |
+| **After release** (0013 new epoch) | evidence `created_at` > the release decision's `recorded_at`. |
 
-### 4.3 DB-checkable bindings (checked in `record_recording_assessment`, and again for eligible rows in the fence)
+For evidence-less refusal rows, the only floors are once-only read counting and the caller-time freshness: no DB-stamped instant exists for a read without evidence [TRUST]. All floors are *anti-replay* bounds; none proves when the provider call happened.
 
-**Every cited read row:**
-- `intent_id = p_op.intent_id`; the right `op_type`; `retry_class = 'read'`;
-- payload `reservationId = intents.hostaway_reservation_id` (identity via `payload ->> 'reservationId'`, list the same);
-- not cited by any other assessment (`UNIQUE`);
-- not the read of the recording's completion proof (that read must be after dispatch; 0010 `EVIDENCE_READ_BEFORE_SEND`, 0010:72–74).
+### 5.4 Epoch, latest, latch
 
-**Every cited evidence row:**
-- `intent_id` matches; source `hostaway_api`; `external_ref = hostaway_reservation_id`.
-
-**Identity `observed`, DB-compared with the intent:**
-- `listingId = listing_id`, `from` / `to` = the stay, `totalMinor = final_total_minor`;
-- `currency = intents.currency`, `bookingRef = intents.ref`, `channelId = 2000`, `status = 'new'`;
-- `reservationId = external_ref`.
-
-**List `observed`** [PROPOSED preflight keys, still the count-only shape, so no `marker` key]:
-- `matchingChargeCount` / `matchingChargeIds` (exact-title rows), `lookalikeCount`, `sameAmountPaidCount`, `rowCount`, `readCount = 1`, `executorAccountRef`, `clientSnapshotId`;
-- consistency: `eligible` ⇒ all three counts 0; `conflict_marker` ⇒ `matchingChargeCount ≥ 1`; `conflict_lookalike` ⇒ `lookalikeCount ≥ 1`; `conflict_same_amount` ⇒ `sameAmountPaidCount ≥ 1`.
-
-**Labels:** `client_label` = both evidence rows' `clientSnapshotId`, and `account_ref` = both rows' `executorAccountRef` (label equality only).
-
-**Op:**
-- `pending`, key `och:<intent>:1`, `attempts = 0`, `dispatched_at IS NULL`, latest;
-- `preflight`: **no active hold**; `release_review`: its `p_hold` is the op's active `PREFLIGHT_*` hold.
-
-**Intent and lease:**
-- `payment_captured`, `captured_minor = final_total_minor`, `offline_charge_attempts = 0`, `version = p_expected_version`;
-- `intent_work.work_worker_id = p_worker` and `work_lease_until ≥ v_t`.
-
-**`recordedPaymentAt`** (pure input, 139–154) should be the DB-stamped transition into `payment_captured`; the assessment does not need to persist it (it only feeds the request). Its correctness at request-build time stays worker-side [TRUST].
-
-### 4.4 What remains [TRUST], honestly
-
-- **Classification.** That the outcome is the correct pure classification of the actual provider response. The DB cross-checks the counts the worker reports; it never sees the raw JSON.
-- **Provenance.** That the reads were really executed against Hostaway; that labels name the real client / credential / account; that `observed_at` (= read `completed_at`, caller time) is the real observation time.
-- **Brands.** The process-local brands (`WeakSet`, 54–57) and an in-memory `ok: true` are **not** DB attestation. The DB accepts only its own bound rows.
-- **Configuration.** `paymentMethod` / `currency` / `refFieldId` / `accountRef` are stored and compared for equality between rows, but **the DB cannot know the configured values**. Changing config between assessment and request build is detected only by the pure module's context equality in the same process (`buildOfflineChargeRequest`, 359–374).
-- **Proposed binding** [DECIDE D5, recommended, later slice]: completion's confirming proof `executorAccountRef` = the claim assessment's `account_ref`.
-- **Currency policy.** The pure module approves USD only (33); the DB checks equality with `intents.currency`, not USD [DECIDE D6].
+- **Epoch.** 0012: always 0. 0013: the count of the op's released `PREFLIGHT_*` holds. Every rule uses **only the current epoch**.
+- **Latest qualifying row.** The max `seq` among the current epoch's `phase = 'preflight'` rows.
+- **Latch.** `recording_preflight_block(op)` is computed from **the existence** of rows, never from the latest row (R1):
+  - `CONFLICT_LATCHED` if **any** current-epoch `preflight` row has a `conflict_*` outcome;
+  - `EXHAUSTED` if ≥ 3 current-epoch `preflight` rows have `incomplete` / `identity_refused`;
+  - otherwise NULL.
+- **Effects of the latch:**
+  - `record_recording_assessment` **refuses further preflight rows** once latched (`ASSESSMENT_EPOCH_CONFLICTED` / `ASSESSMENT_EPOCH_EXHAUSTED`).
+  - The fence **and** `recording_claim_ready` refuse independently of whether any hold-opening helper ran.
+  - A newer zero-match list can never erase the history: rows are append-only, and later rows are refused.
+- **Clearing.** Only an authorized 0013 release starts a new epoch. Nothing clears automatically.
 
 ---
 
-## 5. Freshness, epochs, claim
+## 6. Claim (0012)
 
-### 5.1 Clocks
+### 6.1 Linearization point
 
-- Every 0012 function samples `v_t := clock_timestamp()` **after its last potentially blocking lock**, and uses only `v_t` for leases and freshness. This includes the fence trigger and the admin release.
-- **Freshness is checked on both evidence rows**, inclusive, with no future: `v_t − 2 min ≤ observed_at ≤ v_t`. It is checked three times:
-  1. at assessment (`record_recording_assessment`);
-  2. again at claim (the fence, for the qualifying eligible row);
-  3. again at owner release (for its `release_review` row).
-- **What is caller time.** `observed_at` is the caller's read completion time [TRUST]; the DB only refuses implausible values against its own clock.
+The claim's UPDATE of the op row (`pending → in_flight`), evaluated inside `recording_claim_fence` at its `v_t`, while holding:
+- intent `FOR SHARE`;
+- `intent_work` `FOR SHARE`;
+- the op row lock.
 
-### 5.2 Ordering floors ("after the hold", "after the release")
+All three are held, together with the claim-audit INSERT, **until COMMIT**.
 
-- `provider_evidence.created_at` (`DEFAULT now()`, 0003:67) is the evidence writer's **transaction start** on the DB clock: a DB-assigned **lower bound**, not the commit time and not the provider read time. The read row's own `created_at` is caller-written (`requestRead`) and is **not** used as a floor.
-- Floors used:
-  - `release_review`: both evidence `created_at > hold.created_at` (the hold function's `v_t`);
-  - a new-epoch `preflight`: both evidence `created_at > the release decision's recorded_at` (`v_t`).
-- **Never relied on alone.** Each floor is combined with the 2-minute freshness at the deciding instant and the once-only read use. The floor rules out *replaying* evidence that existed before the hold or release; it cannot prove the provider call happened after it [TRUST].
+### 6.2 Snapshots
 
-### 5.3 Fence addition (in `recording_claim_fence`, after the unchanged 0011 checks)
+After each wait, every subsequent plpgsql statement takes a fresh READ COMMITTED snapshot (VOLATILE functions), so committed assessments, holds and leases are seen.
 
-- **The qualifying assessment.** `a` is the op's latest (max `seq`) `preflight` assessment of the **current epoch**, and:
-  - `a.outcome = 'eligible'`;
-  - `a.intent_version = intents.version`: any intent transition since the assessment invalidates it;
-  - `a.worker = NEW.lease_worker_id`, and that worker holds `intent_work` with `work_lease_until ≥ v_t` [DECIDE D3, recommended];
-  - both evidence rows fresh at the fence's `v_t` (§5.1);
-  - the epoch is not exhausted.
-- **Audit.** It inserts `recording_claim_assessments (op, a.id, v_t, worker)`.
-- **No automated attempt > 1.** Keys other than `:1` stay fenced by the unchanged 0011 rule, and an ambiguous write is never redispatched: `attempts 0` / `dispatched_at IS NULL` are unchanged.
+### 6.3 Fence addition (after the unchanged 0011 checks)
 
-### 5.4 `recording_claim_ready(op)` and the JS mirror
+1. Take `intent_work` `FOR SHARE` (a no-op re-lock on the helper path); then `v_t`.
+2. `recording_preflight_block(NEW.id)` IS NULL.
+3. `a` = the latest current-epoch `preflight` row, with:
+   - `a.outcome = 'eligible'`;
+   - `a.intent_version = intents.version`;
+   - `a.cfg ->> 'listingId' = intents.listing_id` and `a.cfg ->> 'currency' = intents.currency`, re-checked;
+   - both evidence rows still fresh at `v_t` (§5.2);
+   - `a.worker = NEW.lease_worker_id = intent_work.work_worker_id` and `work_lease_until ≥ v_t` (D3).
+4. INSERT `recording_claim_assessments (NEW.id, a.id, NEW.lease_worker_id, v_t)`.
 
-- It is the same predicate as the fence minus the lease-worker equality (the claimant is not known before the claim), evaluated at `clock_timestamp()`.
-- The mirror only **skips**. A row that passes the mirror and fails the trigger (for example, evidence ageing between the two statements) raises `RECORDING_CLAIM_FENCED` inside the claim transaction. That transaction rolls back with no claim, and the helper surfaces it; there is no retry.
+**Only this initial recording row is ever claimed, at most once** (`attempts 0` / undispatched / key `:1`, unchanged). A successful claim is a DB state change, **not** a send authorization.
 
-### 5.5 Epochs
+### 6.4 `recording_claim_ready` and the mirror
 
-- `epoch(op)` = the count of released `PREFLIGHT_*` holds of the op (computed under the op lock). The exhaustion count, the latest-assessment selection and the fence all use **only the current epoch**.
-- `release_for_initial_send` releases the hold and thereby starts epoch `n + 1`.
-  - The old epoch's `release_review` (and any old preflight) **does not qualify** the new-epoch fence.
-  - A new `preflight` eligible assessment, with evidence whose `created_at` > the release `recorded_at`, is required. Nothing carries forward.
+- It evaluates steps 2–3 without the claimant equality, at its own `clock_timestamp()`, without locks.
+- A row the mirror passes but the trigger refuses (ageing, lease or version change in between) raises `RECORDING_CLAIM_FENCED` in the claim transaction. That transaction rolls back, and the helper surfaces it; **no retry**.
 
 ---
 
-## 6. Preflight holds and owner release
+## 7. Locks and races
 
-### 6.1 `open_recording_preflight_hold`
+### 7.1 Order (one intent)
 
-- **Locks:** intent SHARE → `intent_work` SHARE → op UPDATE → advisory evidence key → active hold of op UPDATE → open same-kind case UPDATE → `v_t`.
-- **Checks:**
-  - the work lease of `p_worker` at `v_t` and the version;
-  - op `pending` / `:1` / `attempts 0` / undispatched / latest;
-  - `PREFLIGHT_CONFLICT_*` cites a current-epoch `preflight` assessment of this op with the matching outcome;
-  - `PREFLIGHT_EXHAUSTED` cites the third counted current-epoch assessment.
-- **Idempotent** for the same reason; a different active reason → `HOLD_ALREADY_ACTIVE`.
-- **Case:** joins an open same-kind case or inserts a new one (0011 rules: `opened_by = 'recording-hold:'||case.id`, two-way deferred binding, ≥ 1 hold per case, open iff an active hold).
-  - A legitimate same-kind collision (history with another op) joins the case. It is never `DO NOTHING`, never an overwrite.
-- **Effect.** No state, version, op or effect change. While the hold is active the fence refuses: both the op hold and, fail-closed, any open reserved case of the intent (0011:572–575).
+> intent (SHARE; NO KEY UPDATE for `applyEvent`) → `intent_work` (SHARE; UPDATE for lease writers) → recording op (SHARE / UPDATE) → cited read rows (SHARE) → active hold (0013: SHARE / UPDATE) → advisory evidence key → reserved case (UPDATE) → `clock_timestamp()`
 
-### 6.2 `admin_release_preflight_hold(p_hold, p_assessment, p_evidence[], resolver, justification, at)` (admin only)
+### 7.2 Paths
 
-- **Locks:** intent SHARE → op UPDATE → advisory → hold UPDATE → case UPDATE → `v_t`.
-- **The hold:** active, reason `PREFLIGHT_*`.
-- **The op:** still `pending` / `:1` / `attempts 0` / undispatched / latest.
-- **The intent:** `payment_captured`, and `version = hold.intent_version_at_hold = assessment.intent_version`. If the version changed since the hold, the release is refused (`HOLD_CONTEXT_CHANGED`); the owner must keep it visible, or obtain a new review after a new hold is opened in the new context [DECIDE D8].
-- **`p_assessment`:** `phase = 'release_review'`, `hold_id = p_hold`, `outcome = 'eligible'`, both evidence rows fresh at `v_t` and created after the hold (§5.2). Cited evidence is validated (`cited_evidence`); it may be empty besides the assessment's own two rows.
-- **Writes** a `recording_hold_decisions` row (`release_for_initial_send`, `assessment_id`), sets `released_at` / `release_decision_id`, and resolves the case `no_action` **only when no other bound hold stays active**. A same-assessment replay on the released hold returns the earlier decision id; anything else on a released hold → `HOLD_NOT_ACTIVE`.
-- **What a release is not.** It is **not** a claim, a send or a confirmation. An unrelated open reserved case on the intent still fences. The new epoch requires a new preflight (§5.5), and the claim must still pass every fence check.
-
-### 6.3 What the DB guarantees, and what it cannot
-
-**Guaranteed (proposed):**
-- No claim of the initial recording without a current-epoch, current-version, fresh eligible assessment by the claiming worker.
-- No claim while any hold or open reserved case exists.
-- One claim ever: `attempts 0` / undispatched / key `:1`.
-- Every decision and assessment is append-only.
-
-**Not guaranteed:**
-- **Provider-side read / write race.** Between the preflight reads and the POST, the provider state can change (an owner or another system records a charge). The 2-minute window narrows this but cannot close it.
-- **Detection afterwards.** The confirming read and the 0011 inbox / `LINKED_CONTRADICTED` path detect a duplicate **afterwards**. Nothing reverses or retries.
-- **Context changes after the claim** (configuration, label meaning) are the worker's responsibility.
-
-### 6.4 [OUTSIDE] isolated
-
-These are not part of 0012 and not authorized. 0012 must not add placeholders for them:
-- `recorded_manually` (op `pending → superseded`);
-- owner manual finalisation;
-- any contradiction override;
-- `ATTEMPT_GT1` release.
-
-`keep_visible` (0011) already applies to `PREFLIGHT_*` holds unchanged.
-
----
-
-## 7. Lock order and contention
-
-**Uniform order (one intent only):**
-
-> intent (SHARE, or NO KEY UPDATE for `applyEvent`) → `intent_work` (SHARE) → recording op (SHARE / UPDATE) → read rows (SHARE) → advisory evidence key `(hashtext('booking.recording_evidence'), hashtext(intent))` → hold (UPDATE) → reserved case (UPDATE) → `clock_timestamp()`
-
-| Path | Locks (actual strength) | Contention outcome |
+| Path | Locks, in order (actual strength) | Notes |
 |---|---|---|
-| `record_recording_assessment` | intent `FOR SHARE` → work `FOR SHARE` → op `FOR SHARE` → reads `FOR SHARE` → advisory → `v_t` | vs claim (op `FOR UPDATE SKIP LOCKED`): the helper skips while the assessment holds op SHARE; a direct UPDATE waits, then the fence sees the committed assessment. Claim first: the assessment waits on op SHARE, then sees `in_flight` → `ASSESSMENT_TARGET_STATE` |
-| claim helper + fence | intent `FOR SHARE` → op `FOR UPDATE SKIP LOCKED` → (trigger) intent `FOR SHARE`, reads of assessments / evidence / holds / cases (no lock; immutable or read-only) → `v_t` → claim-audit INSERT | serialized with the openers via the op lock |
-| direct app `UPDATE … in_flight` | op row lock → (trigger) intent `FOR SHARE` | vs `applyEvent` (intent `FOR NO KEY UPDATE` → op): a possible **40P01** on one side (observed for 0011 in T-B3). Bounded and retryable by the caller; never a bypass; no automatic retry in our helpers |
-| `open_recording_preflight_hold` / `open_recording_visibility_hold` | intent SHARE → (work SHARE) → op UPDATE → advisory → hold → case | vs claim: op lock; hold first → claim fenced; claim first → `HOLD_TARGET_STATE` |
-| `admin_release_preflight_hold` | intent SHARE → op UPDATE → advisory → hold → case | vs a new preflight of the same op: op lock (UPDATE vs SHARE) serializes; vs claim: op lock |
-| evidence writers (0010 + 0011 trigger) | read op UPDATE → evidence INSERT → **inbox INSERT** → advisory | they never lock the recording op; no inversion |
-| inbox processor (0011, one item per call) | inbox row SKIP LOCKED → intent SHARE → op SHARE → advisory → hold / case | preflight evidence → `not_latest_linked` (the op is pending); unchanged |
-| finalisation | intent NO KEY UPDATE → (trigger) advisory | unchanged |
+| claim helper (0012 change) | intent `FOR SHARE` → **`intent_work FOR SHARE`** → op `FOR UPDATE SKIP LOCKED` → (trigger) intent `FOR SHARE`, `intent_work FOR SHARE` (re-lock), reads → `v_t` → claim-audit INSERT | serialized |
+| direct app `UPDATE … in_flight` (authoritative trigger) | **op row first** → (trigger) intent `FOR SHARE` → `intent_work FOR SHARE` | the unavoidable op-first inversion: the direct UPDATE waits on the intent while holding the op; if the intent holder then waits on that op row, a **40P01** results. Whether `applyEvent`'s path (intent NO KEY UPDATE, repo.js:358 → … → `intent_work` UPDATE, 271) ever touches the op row is **to be measured** (A-15), not asserted. Bounded; never a bypass; no automatic retry |
+| `record_recording_assessment` | intent `FOR SHARE` → `intent_work FOR SHARE` → op `FOR SHARE` → reads `FOR SHARE` → advisory → `v_t` | |
+| `claimIntentWork` (lease writer) | `intent_work FOR UPDATE SKIP LOCKED` → UPDATE | vs claim / assessment (holding work SHARE): the writer **skips**; if the writer is first (uncommitted), the claim / assessment waits on work SHARE, then reads the new lease → refuse (`RECORDING_CLAIM_FENCED` / `ASSESSMENT_WORK_LEASE_LOST`) |
+| `applyEvent` | intent `FOR NO KEY UPDATE` (repo.js:358) → intent-row trigger work → `intent_work` UPDATE (271) | vs claim helper / assessment: serialized at the intent lock (SHARE conflicts with NO KEY UPDATE); a claim that already holds work SHARE makes `applyEvent` wait at its `intent_work` UPDATE only if it got the intent first, which the shared intent→work order prevents |
+| 0013 `record_release_review_assessment` | intent SHARE → work SHARE → op SHARE → **hold `FOR SHARE`** → reads SHARE → advisory → `v_t` | |
+| 0013 `admin_release_preflight_hold` | intent SHARE → op `FOR UPDATE` → **hold `FOR UPDATE`** → advisory → case `FOR UPDATE` → `v_t` | vs review: op lock serializes (SHARE vs UPDATE). Release first → the review waits, re-reads the hold → released → `HOLD_NOT_ACTIVE`. Review first → the release waits, then sees the committed review |
+| 0013 `open_recording_preflight_hold` | intent SHARE → work SHARE → op `FOR UPDATE` → hold `FOR UPDATE` → advisory → case `FOR UPDATE` → `v_t` | vs claim: op lock |
+| evidence writers + inbox trigger (0010 / 0011) | read op UPDATE → evidence INSERT → **inbox INSERT** → advisory | never the recording op |
+| inbox processor (0011) | inbox row SKIP LOCKED → intent SHARE → op SHARE → advisory | preflight evidence → `not_latest_linked` |
 
-**Race outcomes:**
+### 7.3 Races (both orders)
 
 | Race | Outcome |
 |---|---|
-| Simultaneous assessment vs claim | above: one waits or skips; the loser re-checks and refuses. No claim on an uncommitted assessment |
-| Hold vs claim | the op lock decides; hold first → claim fenced (skip / raise); claim first → hold refused |
-| Stale lease after waiting | every check is at the post-wait `v_t` (the 0010 T-28 pattern): an assessment or claim whose work lease expired while waiting is refused |
-| Duplicate assessment (same read twice) | `UNIQUE` violation → `ASSESSMENT_READ_ALREADY_COUNTED` (mapped); a duplicate concurrent call: the second waits on advisory, then hits the unique read |
-| Duplicate release | second → same decision id (replay) or `HOLD_NOT_ACTIVE` |
-| Old-epoch replay | refused by the epoch and the evidence `created_at` floor; old reads are already counted |
-| `release_review` vs new epoch | a `release_review` needs the hold **active**; after the release it is refused (`HOLD_NOT_ACTIVE`); a review never qualifies the fence |
-| Inbox items before / after the link | preflight evidence is processed as `not_latest_linked`; completion-proof contradictions after the link follow 0011 unchanged |
+| Assessment vs claim | assessment first: the claim helper skips (op SHARE vs UPDATE SKIP LOCKED), a direct claim waits, then sees it. Claim first: the assessment waits, then sees `in_flight` → `ASSESSMENT_TARGET_STATE` |
+| Conflict A then eligible B (R1) | B is refused (latched); and if B somehow exists (e.g. A and B concurrent), the fence still refuses because A exists |
+| Concurrent assessments for one op | serialized by op SHARE + advisory; `UNIQUE` reads refuse reuse; a latch set by the first is seen by the second's fresh snapshot after the wait |
+| Lease reassignment / expiry | see `claimIntentWork` above; expiry while waiting → refused at the post-wait `v_t` |
+| `release_review` vs release; duplicate release; old-epoch replay | §7.2; the replayed release returns the earlier decision id; old reads are already counted and fail the floors |
+| Delayed / crashed hold opener (0013) | the latch already blocks the claim; any worker holding the work lease can later open the matching hold, citing the **earliest** current-epoch conflict (or the third counted failure). Idempotent |
+| Inbox before / after link | 0011 unchanged |
 
-**SQL role privileges:**
-- app: EXECUTE `record_recording_assessment`, `open_recording_preflight_hold`, `recording_claim_ready`;
-- admin: EXECUTE `admin_release_preflight_hold`, `recording_claim_ready`;
-- tables: SELECT-only for all three roles;
-- private: the epoch helper, the guards, the fence.
-
-**Not claimed:** universal deadlock freedom. Each path takes one intent's locks in the order above. The direct-UPDATE inversion is the one known 40P01 shape; tests must observe actual waits (`pg_locks`).
+**Not claimed:** universal deadlock freedom. Tests must observe actual waits (`pg_locks`).
 
 ---
 
-## 8. Up / down
+## 8. Migration 0013 (slice B) [PROPOSED-0013]
 
-**0012 up**, one transaction:
-1. **Precondition:** no `OFFLINE_CHARGE_HOLD_PREFLIGHT_*` case exists.
-2. Create `recording_assessments` and `recording_claim_assessments`, with guards, RLS SELECT policies, `reject_change`.
-3. `ALTER TABLE` to add the two `assessment_id` columns and FKs.
-4. Drop and re-add the four named CHECK constraints with the widened definitions.
-5. CREATE OR REPLACE: `recording_holds_guard`, `recording_hold_decisions_guard`, `reserved_case_guard`, `reserved_case_binding_verify`, `recording_claim_fence`.
-6. Create the new functions; grants.
+### 8.1 Table and column changes
 
-**0012 down:**
-1. **Refuse** if any assessment, claim-assessment row, `PREFLIGHT_*` hold or `release_for_initial_send` decision exists (no audit loss).
-2. Otherwise restore the five 0011 function bodies **verbatim from the 0011 file** (generator, as for 0011).
-3. Restore the four CHECKs with the original names and definitions; drop the two columns, the two tables and the new functions.
+| Change | Detail |
+|---|---|
+| `recording_assessments` | **add** `hold_id uuid → recording_holds`; replace `recording_assessments_phase_check` with `phase IN ('preflight','release_review')`; add `recording_assessments_hold_check` (`(phase = 'release_review') = (hold_id IS NOT NULL)`); replace `recording_assessments_epoch_check` with `epoch >= 0` |
+| `recording_holds` | replace `recording_holds_reason_check` (+ `PREFLIGHT_EXHAUSTED`, `PREFLIGHT_CONFLICT_MARKER`, `PREFLIGHT_CONFLICT_LOOKALIKE`, `PREFLIGHT_CONFLICT_SAME_AMOUNT`); replace `recording_holds_epoch_check` with `epoch >= 0 AND (reason LIKE 'PREFLIGHT\_%' OR epoch = 0)`; **add** `assessment_id → recording_assessments`, plus `recording_holds_assessment_check` (`(reason LIKE 'PREFLIGHT\_%') = (assessment_id IS NOT NULL)`) |
+| `recording_hold_decisions` | replace `recording_hold_decisions_decision_check` (+ `release_for_initial_send`); **add** `assessment_id → recording_assessments`, plus `recording_hold_decisions_assessment_check` (`(decision = 'release_for_initial_send') = (assessment_id IS NOT NULL)`); `recording_hold_decisions_check` / `_check1` unchanged |
 
-**Round trip measured like 0011.** Bodies (md5), ACLs, security, `search_path`, triggers, columns, grants, policies and constraints must equal a fresh cluster at 11. Migrations 0001–0011 are byte-identical.
+All existing 0011 / 0012 rows satisfy the replaced CHECKs: `epoch 0`, non-preflight reasons, no preflight decisions, `phase = 'preflight'` with `hold_id` NULL.
+
+### 8.2 Function replacements (CREATE OR REPLACE; security / volatility / `search_path` unchanged)
+
+| Function | 0013 change |
+|---|---|
+| `recording_holds_guard` (0011:93–120, INVOKER) | a release cites its own decision: `link_full_proof` for `SUCCEEDED_UNPROVEN`, or `release_for_initial_send` for `PREFLIGHT_*` (the test at 0011:115 widened) |
+| `recording_hold_decisions_guard` (0011:123–143, INVOKER) | + `release_for_initial_send` only for `PREFLIGHT_*` holds, citing a `release_review` assessment with `hold_id` = the hold (the test at 0011:134 widened) |
+| `reserved_case_guard` (0011:222–247, INVOKER) | + the four `OFFLINE_CHARGE_HOLD_PREFLIGHT_*` kinds (0011:230) |
+| `reserved_case_binding_verify` (0011:254–282, SD) | the resolution follows the **last** release: `recorded` after `link_full_proof`, `no_action` after `release_for_initial_send` (0011:274); a released hold cites a decision matching its reason (0011:279). **≥ 1 hold per reserved case, open iff an active hold, intent / kind match: unchanged** |
+| `recording_preflight_block`, `recording_claim_ready`, `recording_claim_fence` (0012 bodies) | the epoch becomes `recording_preflight_epoch(op)`; otherwise unchanged |
+
+### 8.3 New functions
+
+| Function | Grant | Behaviour |
+|---|---|---|
+| `recording_preflight_epoch(p_op) RETURNS integer` | private, VOLATILE | |
+| `record_release_review_assessment(p_hold uuid, p_worker text, p_outcome text, p_code text, p_identity_read uuid, p_list_read uuid, p_identity_evidence uuid, p_list_evidence uuid, p_expected_version integer, p_module_version text, p_client_label text, p_account_ref text, p_cfg jsonb) RETURNS uuid` | app | §4 rules, `phase = 'release_review'`, the hold active (`FOR SHARE`) and `PREFLIGHT_*`, the floor after the hold. **Never counts toward exhaustion and never qualifies a claim** (the latch and fence read only `phase = 'preflight'`) |
+| `open_recording_preflight_hold(p_op uuid, p_worker text, p_reason text, p_assessment uuid) RETURNS uuid` | app | live work lease of `p_worker` at `v_t`; the op is the latched initial recording; `p_assessment` = the earliest current-epoch conflict of the matching outcome, or the third counted failure (`EXHAUSTED`). Idempotent for the same reason; a different active reason → `HOLD_ALREADY_ACTIVE`. Joins an open same-kind case (0011 rules); never `DO NOTHING`. **No intent-version equality** (visibility after interruption); `intent_version_at_hold` = the current version |
+| `admin_release_preflight_hold(p_hold uuid, p_assessment uuid, p_evidence uuid[], p_resolver text, p_justification text, p_at timestamptz) RETURNS uuid` | admin | below |
+
+**`admin_release_preflight_hold` checks:**
+- the hold is active and `PREFLIGHT_*`;
+- op `pending` / `:1` / `attempts 0` / undispatched / latest;
+- intent `payment_captured` with `version = hold.intent_version_at_hold = review.intent_version` (D8: strict; otherwise `HOLD_CONTEXT_CHANGED`, and the hold stays visible);
+- the review: `phase = 'release_review'`, `hold_id = p_hold`, `outcome = 'eligible'`, both evidence rows fresh at `v_t`, created after the hold.
+
+**`admin_release_preflight_hold` effects:**
+- a decision row (`release_for_initial_send`, `assessment_id`), then the hold is released;
+- the case is resolved `no_action` only when no other bound hold stays active;
+- a same-review replay on the released hold → the earlier id; otherwise `HOLD_NOT_ACTIVE`.
+
+**What a release does not do:** it never claims, sends or confirms. The next claim needs a **new** preflight with **new** reads in the new epoch (§5.3 floor after release). An unrelated open reserved case on the intent still fences (0011:572–575).
+
+### 8.4 0013 down
+
+1. **Refuse** if any `PREFLIGHT_*` hold, `release_for_initial_send` decision, `release_review` assessment, or non-NULL `assessment_id` / `hold_id` exists.
+2. Restore the four 0011 function bodies and the three 0012 bodies **verbatim from their files**.
+3. Restore the replaced CHECKs with their exact names and definitions; drop the added columns / constraints and the 0013 functions.
+
+**Round trip:** equal to a fresh cluster at 12.
+
+### 8.5 [OUTSIDE], isolated
+
+`recorded_manually`, manual finalisation, overrides, and `ATTEMPT_GT1` release are **not** in 0012 / 0013, with no placeholders. `keep_visible` (0011) already applies to `PREFLIGHT_*` holds.
 
 ---
 
-## 9. Planned local-PG tests (PLANNED; full TAP retained; nothing run for this docs task)
+## 9. Guarantees, precisely
+
+**Proposed DB guarantees:**
+- The **initial recording row** of an intent is claimed at most once, only with a current-epoch, current-version, fresh, eligible assessment recorded by the claimant under its live lease.
+- No claim while the epoch is conflict- or exhaustion-latched, while any hold is active, or while any open reserved case exists.
+- Assessments, decisions and claim-audit rows are append-only.
+
+**Not guaranteed:**
+- That the provider send is authorized: a claim is not send authorization.
+- That the provider state stays unchanged between the preflight reads and the POST: the read / write race is unavoidable, and the 2-minute window only narrows it.
+- **Detecting a later duplicate** requires (a) relevant evidence actually inserted (a confirming read or owner evidence) **and** (b) the 0011 processor actually being invoked. There is no schedule, no latency bound and no provenance guarantee.
+- Exactly-once transport: a connection lost around COMMIT leaves an outcome unknown to the caller (see the owner-case contract §5.3 step 5).
+
+---
+
+## 10. Planned local-PG tests (PLANNED; full TAP retained)
+
+**0012 (A):**
 
 | # | Scenario | Expect |
 |---|---|---|
-| P-A1 | app / admin / report direct writes to both new tables; owner DELETE / UPDATE / TRUNCATE | refused |
-| P-A2 | assessment bindings: foreign intent read, wrong read type, read of another reservation, payload mismatch, evidence of another read, dashboard evidence, unsucceeded read cited as eligible, incomplete with existing evidence, reused read (both columns, across phases), the completion-proof read | refused |
-| P-A3 | identity `observed` mismatches (listing, dates, total, currency, `bookingRef`, channel, status) and list-count inconsistency per outcome | refused |
-| P-A4 | op not pending / `attempts > 0` / dispatched / `:2` / not latest / held; intent version stale; foreign / expired work lease (incl. expiry **while waiting** on each lock) | refused at the post-wait `v_t` |
-| P-F1 | freshness at exactly `v_t − 2 min` / `v_t` / `v_t + 1 µs`; ageing between assessment and claim | accepted / accepted / refused; claim refused |
-| P-F2 | fence: no assessment; latest not eligible; eligible but older than a later non-eligible one; version changed after the assessment; other worker; exhausted epoch | refused (both JS stages skip; direct UPDATE raises) |
-| P-F3 | the happy path: eligible → claim → claim-audit row → completion / link / finalisation unchanged (0010 tests) | as 0010 |
-| P-E1 | exhaustion: 3 counted outcomes → further preflight refused, the fence refuses, `EXHAUSTED` hold opens; conflict outcomes do not count; `release_review` never counts | asserted |
-| P-H1 | conflict holds (each kind) cite their assessment; duplicate opener; different reason; same-kind collision joins the case; binding probes (≥ 1 hold, open iff active, resolution by last release) | 0011-style |
-| P-R1 | release: `release_review` under the active hold, fresh, created after the hold → released; new epoch | accepted |
-| P-R2 | release refused: review of another hold / op, stale review, review evidence created before the hold, version changed, wrong reason, `ATTEMPT_GT1` hold, an app caller | refused |
-| P-R3 | after release: the old review / old preflight does not qualify; a new preflight with new reads does; replay of the release; `release_review` after the release | asserted |
-| P-R4 | release does not claim or dispatch; an unrelated open reserved case still fences | asserted |
-| P-L1 | locks: assessment vs claim, hold vs claim, release vs preflight (both orders, observed waits); direct UPDATE inversion (40P01 or serialized; never a bypass) | asserted with `pg_locks` |
-| P-G1 | 0012 down → equals a fresh cluster at 11; up again identical; down refuses with any assessment / preflight hold / release | asserted |
-| P-G2 | regressions kept: all 0010 / 0011 suites, predicate / page parity, the microsecond cursor, the owner-history fixtures, inbox error / R1 / R2 tests | unchanged |
+| A-1 | direct writes to the three new tables (app / admin / report; owner DELETE / UPDATE / TRUNCATE); seed-table writes | refused |
+| A-2 | every §4.1 worker-local code as `p_code`; an unseeded code; a seeded code under the wrong outcome | refused (FK) |
+| A-3 | each identity mismatch code with matching / non-matching `found_active` evidence (re-derivation); `none`-rule codes with evidence present; `READ_NOT_COMPLETED` on a succeeded read | accepted / refused exactly per §4.2 |
+| A-4 | list shape: counts out of range, ids length ≠ count, duplicate ids, `rowCount` too small, missing labels, `complete ≠ true`, `requestLimit ≠ 500`; outcome-count inconsistency | refused |
+| A-5 | `p_cfg`: missing / extra key, wrong types, `paymentMethod` NULL / unapproved, channel ≠ 2000, listing / currency ≠ intent, `accountRef ≠ account_ref`, unknown `module_version` | refused |
+| A-6 | read reuse (both columns), foreign intent / reservation / payload, wrong read type, dashboard evidence, evidence of another read | refused |
+| A-7 | freshness at `v_t − 2 min` / `v_t` / `v_t + 1 µs`, for evidence rows and for evidence-less refusal reads (`completed_at` / `updated_at`) | accepted / accepted / refused |
+| A-8 | floor: evidence written before the current version's transition; after a version bump | refused |
+| A-9 | **R1:** conflict A, then fresh eligible B | B refused (`ASSESSMENT_EPOCH_CONFLICTED`); fence and mirror refuse |
+| A-10 | **R1:** conflict and eligible concurrently (observed waits) | the second is refused, or the fence refuses; never a claim |
+| A-11 | **R1:** a crashed / delayed opener (0012 has none) | blocked; visible via the tables / `recording_claim_ready = false` |
+| A-12 | exhaustion: 3 counted rows → further preflight refused, fence refuses; conflicts are not counted; worker-local codes are never persisted | asserted |
+| A-13 | fence: latest not eligible; version changed; other worker; lease expired **while waiting** on the work lock; lease reassigned (both orders vs `claimIntentWork`); evidence aged between assessment and claim | refused at the post-wait `v_t` |
+| A-14 | happy path: claim + claim-audit row; then completion / link / finalisation (0010 suites unchanged) | as 0010 |
+| A-15 | assessment vs claim, both orders; direct UPDATE inversion vs `applyEvent` | observed waits; 40P01 or serialized; never a bypass |
+| A-16 | **slice A alone:** 0012 applied without 0013; every A test passes; down 0012 → a fresh cluster at 11; down refuses with any assessment / claim-audit row | asserted |
+
+**0013 (B):**
+
+| # | Scenario | Expect |
+|---|---|---|
+| B-1 | preflight holds cite the earliest conflict / the third failure; the opener after a crash (another worker); idempotent; different reason; same-kind case join; binding probes (≥ 1 hold, open iff active, resolution follows the last release) | 0011-style |
+| B-2 | `release_review` only under the active `PREFLIGHT_*` hold, its floor and freshness; it never counts or qualifies a claim | asserted |
+| B-3 | release: happy path; version changed (D8); stale review; review of another hold; wrong reason; app caller; replay; review vs release (both orders, observed) | asserted |
+| B-4 | after release: the old review / old preflight cannot qualify; the conflict history is still present but in the old epoch; a new preflight with new reads qualifies; release never claims; an unrelated reserved case still fences | asserted |
+| B-5 | down 0013 → a fresh cluster at 12; down refuses with any preflight hold / release / review | asserted |
+
+**Regressions kept:**
+- every 0010 / 0011 suite;
+- predicate / page parity and the microsecond cursor;
+- the owner-history fixtures;
+- inbox error / R1 / R2;
+- T-C10.
 
 **Fault-injection targets:**
-- the eligible requirement in the fence and in `recording_claim_ready`;
-- the version equality;
-- the worker / lease binding;
-- the fence-time freshness;
-- the epoch filter;
-- the exhaustion count;
-- unique-read counting;
-- the `created_at` floors;
-- the review-bound-to-hold rule;
-- the release freshness;
+- the latch (conflict existence, not latest), in the fence **and** the mirror;
+- exhaustion count and outcome set;
+- the code-allowlist FK and per-code evidence rule; identity re-derivation; list count consistency;
+- `p_cfg` checks;
+- the floors (version transition / hold / release); freshness at claim / release;
+- the work-lock read and the worker equality;
+- version equality;
+- unique read counting;
+- the review-bound-to-hold rule; review exclusion from the latch / fence;
 - last-hold case resolution;
-- the JS mirror (both stages);
-- the claim-audit insert.
+- the claim-audit insert;
+- the JS mirror in both stages.
 
 ---
 
-## 10. Implementation slices and open decisions
+## 11. Slices, dependencies, blockers
 
-**Recommended slices:**
-1. **0012a:** `recording_assessments` + `record_recording_assessment` + `recording_claim_ready` + fence addition + claim audit + JS mirror. Safe alone: a claim then needs an eligible assessment, and non-eligible outcomes simply never qualify.
-2. **0012b:** preflight holds + `admin_release_preflight_hold` + the five replaced 0011 objects / CHECKs.
-3. **Later and separate:** the worker / adapter integration and D5 (account-label binding at completion).
+1. **0012 (A):** §3 + the JS changes (§3.4). It depends only on 0011.
+2. **0013 (B):** §8. It depends on 0012.
+3. **Separate, before any worker:** the D5 completion binding (account label + payment method vs the claim assessment's config).
 
-| # | Open decision | Recommendation |
-|---|---|---|
-| D1 | Persist fact / context / binding refusals? | No (worker-local; they must not exhaust the epoch) |
-| D2 | Exhaustion counts only `incomplete` / `identity_refused`; after 3 the epoch refuses more preflight | Yes |
-| D3 | Claimant = assessing worker with a live work lease at the fence | Yes |
-| D4 | A new admin release function instead of widening `admin_resolve_recording_hold` | New function (signature compatibility, R1 / R2 untouched) |
-| D5 | Bind the completion proof's `executorAccountRef` to the claim assessment's `account_ref` | Yes, but in a separate reviewed replacement of the 0010 completion function |
-| D6 | DB enforcement of the USD policy | No in 0012 (config policy stays worker-side; equality with `intents.currency` only) |
-| D7 | `incomplete` requires a positive identity read | Yes |
-| D8 | A release after an intent version change | Refuse; the owner keeps it visible |
-| D9 | Slice split 0012a / 0012b vs one 0012 | Split |
-
-**Blockers before the worker:**
-- the D5 binding;
-- live-unverified provider shapes (pure module header, `offline-charge-proof.js:17`);
-- the `paymentMethod` owner choice;
+**Blockers before worker integration:**
+- D5;
+- live-unverified provider shapes (`offline-charge-proof.js:17`);
+- the owner `paymentMethod` choice;
 - all live gates;
-- the unexplained e74a guard failure (release-readiness).
+- the unexplained e74a guard failure (release-readiness item).
+
+---
+
+## 12. Errata for historical comments (0001–0011 are not edited)
+
+| Location | Erratum |
+|---|---|
+| `db/migrations/0011_recording_owner_cases.up.sql:653` ("An error outside the block (or at COMMIT) marks nothing") | A server-rejected statement / rolled-back transaction marks nothing. A transport loss around COMMIT can leave the outcome unknown to the caller. The file is **not** edited. |
+| `lib/booking-db/operations.js:254` ("the database marked nothing for it") | Same erratum. It may be corrected in the next permitted helper edit (e.g. the 0012 JS change). |
+
+---
+
+## 13. Resolution map (root HOLD on 44ca7df)
+
+| # | Item | Where |
+|---|---|---|
+| D1–D9 | decisions recorded and applied | §0; §4.1 (D1, D7); §5.4 (D2); §6.3 / §7.2 (D3); §8.3 (D4, D8); §0 / §11 (D5); §4.4 (D6); §3 / §8 (D9) |
+| R1 | conflict / exhaustion **latch** by existence in the current epoch; further preflight refused; fence + mirror independent of the opener; crash / delay, conflict→eligible, concurrent, slice-A traces | §5.4, §6.3–§6.4, §7.3, §8.3; tests A-9–A-12, A-16, B-1 |
+| R2 | exact code families; seeded code allowlist (composite FK); per-code evidence rules incl. retained real `found_active` mismatches; `incomplete` without evidence; evidence-less freshness timestamps | §3.1, §4.1–§4.2, §5.2; tests A-2–A-3, A-7 |
+| R3 | exact `p_cfg` keys / types / cross-checks; module allowlist; list / identity shapes and ranges; labels; the initial / version floor; claim-time snapshot comparisons | §3.2, §4.3–§4.4, §5.3, §6.3; tests A-4–A-8, A-13 |
+| R4 | helper intent → work → op; trigger work lock; direct-UPDATE inversion; linearization point; lease reassignment / expiry both orders; review / release hold locking and re-check | §6.1–§6.2, §7; tests A-13, A-15, B-3 |
+| R5 | exact 0012 vs 0013 objects, constraint names, columns, functions, volatility (`recording_claim_ready` VOLATILE), grants, separate down gates, no phantom FKs | §3, §8; tests A-16, B-5 |
+| R6 | initial-row-only claim wording; no send authorization; conditional later-duplicate detection; transport-ambiguous COMMIT; errata, not edits | §6.3, §9, §12 |
