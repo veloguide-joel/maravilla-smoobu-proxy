@@ -50,3 +50,12 @@ export async function adminAcquireClaim(adminPool, { intentId, at }) {
 export function adminCloseCase(adminPool, { caseId, evidenceIds, resolver, justification, at }) {
   return call(adminPool, "SELECT booking.admin_close_case($1,$2,$3,$4,$5) AS id", [caseId, evidenceIds, resolver, justification, new Date(at)]);
 }
+
+/**
+ * E7.4b-D1 (0011): owner decision on a recording hold ('keep_visible' | 'link_full_proof'), via
+ * booking.admin_resolve_recording_hold (admin only). keep_visible may cite no evidence. -> { ok:true, id } | { ok:false, error }
+ */
+export function adminResolveRecordingHold(adminPool, { holdId, decision, evidenceIds = [], linkedEvidenceId = null, resolver, justification, at }) {
+  return call(adminPool, "SELECT booking.admin_resolve_recording_hold($1,$2,$3,$4,$5,$6,$7) AS id",
+    [holdId, decision, evidenceIds, linkedEvidenceId, resolver, justification, new Date(at)]);
+}

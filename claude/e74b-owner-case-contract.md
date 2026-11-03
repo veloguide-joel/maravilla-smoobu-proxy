@@ -516,3 +516,97 @@ Its down refuses if any assessment or preflight hold exists. 0011 is complete an
 - the owner `paymentMethod` choice;
 - dispatch-worker authorization;
 - O7.
+
+---
+
+## 13. E7.4b-D1-0011 implementation mapping (root acceptance of `68f30ca` + addendum A–D)
+
+**Status.** Implemented **offline** on `feature/e7-offline-charge-owner-cases`, for disposable local PostgreSQL only.
+- 0012 (assessments / preflight), the worker, the adapter, entrypoints and any schedule are **not** implemented.
+- Where this section and §0–§12 differ, this section describes the code.
+
+### Objects (`db/migrations/0011_recording_owner_cases.{up,down}.sql`)
+
+| Object | Notes |
+|---|---|
+| **Tables** `recording_holds`, `recording_hold_decisions`, `recording_hold_observations`, `recording_conflict_inbox` | RLS on; SELECT-only for `mv_booking_app` / `_admin` / `_report`; no write grant to any role; `reject_change` on DELETE / TRUNCATE (UPDATE too for decisions / observations); INVOKER guards (`*_guard`) on INSERT / UPDATE. No `assessment_id` column / FK and no preflight reason (0012). |
+| **Inbox constraints** (addendum B) | `processed_at` iff `outcome`; `hold_id` NOT NULL **iff** a contradiction outcome; `attempts = 0` iff `last_error` / `last_attempt_at` NULL. Guard: an error attempt changes only `attempts + 1`, `last_error` and `last_attempt_at`; success sets `processed_at` / `outcome` / `hold_id` once and freezes the row. A contradiction outcome must cite the hold that observed that evidence. |
+| `reserved_case_guard` (INVOKER, cases INSERT / UPDATE) | Reserved `OFFLINE_CHARGE_HOLD_*` kinds: only privileged INSERT, only the three 0011 kinds, opened `open`, `opened_by = 'recording-hold:'||<case id>`. On UPDATE, identity (`id`, `intent_id`, `kind`, `opened_by`, `opened_at`, `evidence`) is frozen, a normal kind cannot become reserved, and a resolved hold case is final. |
+| `reserved_case_binding_verify` / `_check` (SD, private) + DEFERRABLE INITIALLY DEFERRED constraint triggers on **cases and holds** (addendum A) | At COMMIT, for every touched reserved case: **≥ 1 bound hold** (open *or* resolved); every bound hold matches intent and kind; open **iff** some bound hold is active; resolved only as `recorded`; every released hold cites its own `link_full_proof` decision (same hold / case / op). |
+| `recording_evidence_contradicts(intent, dispatched_at, result_ref, reference, evidence)` (SD, private) | The 0010 row condition (0010:141–159), copied verbatim from the 0010 file by the generator and bound to one row. Inputs are validated; it **raises** `CONFLICT_CHECK_INPUT`. |
+| `recording_conflict_refusal` (CREATE OR REPLACE; same signature) | Count over the core. 0010's input handling is kept: it **returns** `'CONFLICT_CHECK_INPUT'`. Completion / link (candidate reference), finalisation (linked) and the admin `link_full_proof` (candidate) all call it. |
+| `complete_recording_with_evidence`, `link_recording_evidence`, `recording_finalisation_guard` (CREATE OR REPLACE) | The 0010 bodies verbatim + one `-- 0011` "no active hold" check (`RECORDING_HOLD_ACTIVE`). In the link it comes **after** the read-only `already_linked` return (a replay never mutates) and before the proof check; in finalisation, after the advisory lock. |
+| `intents_safety_guard` (CREATE OR REPLACE of the 0004 body) | One change: the bulk resolution on leaving `reconciliation_required` adds `AND NOT starts_with(kind, 'OFFLINE_CHARGE_HOLD_')`. |
+| `admin_close_case` (CREATE OR REPLACE of the 0003 body) | Refuses hold cases (`HOLD_CASE_USE_ADMIN_RESOLVE_RECORDING_HOLD`) before any write. |
+| `recording_claim_fence` (SD trigger, `pending → in_flight` recordings) | The §5.4 conditions, incl. **no active hold and no open reserved case** (O6). |
+| `open_recording_visibility_hold(op, reason, by)` (app + admin) | `ATTEMPT_GT1` / `SUCCEEDED_UNPROVEN`. Lock order intent SHARE → op UPDATE → advisory → active hold → open same-kind case, then `v_t`. Idempotent; joins an open same-kind case. |
+| `recording_inbox_enqueue` + `zz1_evidence_enqueue` (AFTER INSERT, offline kind) | Enqueues inside the writer's INSERT (before the writer's advisory lock). Backfill: `INSERT … SELECT` at the end of up (same transaction). |
+| `process_recording_conflict_inbox_one(by)` (app + admin) | §5.3; one item; subtransaction; error accounting. |
+| `recording_contradictions_page(after_exact, after_evidence, after_op, limit)` (app + admin; read-only) | The JS caller keeps its validation / clamp / `next` (`lib/booking-db/operations.js`). The SQL also validates the cursor (`RECORDING_SCAN_CURSOR_INVALID`). It additionally requires `result_ref` / `dispatched_at` NOT NULL on the linked row; a linked row always has both, so the rows are unchanged (T-P3 parity). |
+| `admin_resolve_recording_hold(hold, decision, evidence[], linked_evidence, resolver, justification, at)` (admin only) | `keep_visible`: evidence may be empty; an identical resubmission returns the earlier id. `link_full_proof` (`SUCCEEDED_UNPROVEN` only): proof validator (`owner_historical`) at `v_t` + candidate-reference conflict check; decision + link + release + (last-hold) case resolution in one transaction; does not call `link_recording_evidence`; no bypass input. A same-proof replay on the released hold returns the earlier decision id. The case `resolved_at` is `v_t` (DB time). |
+| Down | Precondition: no hold / observation / decision, and no inbox item with `attempts > 0` or `processed_at`. Then the replaced 0010 / 0004 / 0003 bodies are restored verbatim. Measured: the schema equals a fresh cluster at 10 (bodies, ACLs, triggers, columns, grants, policies, constraints). |
+
+### Deviations from R2 (implementation choices; flagged for root)
+
+| # | Deviation |
+|---|---|
+| 1 | `LINKED_CONTRADICTED` opens for **any** intent state of a linked latest recording (R2 table: `payment_captured` / `confirmed`). Visibility only, never a state change; it avoids a poison item if an intent later moved on. |
+| 2 | The drain helper stops a run when the **same item errors twice** in that run (`stoppedOnRepeatedError`); the item stays queued with its attempts. This prevents one poison item from consuming the whole call bound. |
+| 3 | `scripts/db-smoke.mjs` (outside the allowed-file list) needed the 4 tables `[SELECT]` in its exact privilege matrix and the table count 18 → 22. Validation tooling only, no runtime behaviour. |
+| 4 | The admin helper is `db/lib/admin.js` → `adminResolveRecordingHold` (the existing admin module). |
+
+### Helpers
+
+`lib/booking-db/operations.js`:
+- `RECORD_FENCE` in **both** claim stages;
+- `listRecordingContradictions` is a thin caller of the page function;
+- `openRecordingVisibilityHold`;
+- `drainRecordingConflictInbox(pool, { by, maxCalls ≤ 100 })`: requires a `pg.Pool`; independent autocommit calls; failed calls count against the bound; no retries; `errors` (DB-recorded item errors) and `failures` (outer, nothing marked) are reported separately;
+- `linkRecordingEvidence(…, { openVisibilityHoldOnConflict })`: an optional **separate** best-effort hold. The original refusal is always returned, with `visibilityHold` beside it; this is not DB-atomic with the link.
+
+`lib/booking-db/repo.js`:
+- `DB_SAFETY_CODES` additions;
+- the `OFFLINE_CHARGE_RECORDED` mirror returns `RECORDING_HOLD_ACTIVE`.
+
+### Caller contract (addendum C)
+
+`process_recording_conflict_inbox_one` is a top-level transaction **only in autocommit**. The database cannot stop a caller from wrapping several calls in one `BEGIN`. Locks then accumulate, and T-H2 shows the resulting A,B / B,A 40P01, which is caught in the item's subtransaction and recorded as an attempt. The supported helper uses a real pool.
+
+### Existing tests adapted (and why)
+
+| File | Change |
+|---|---|
+| `offline-charge.test.mjs` "definite failure … bounded retry" | Attempts 2–3 can no longer be claimed automatically (fenced). They are settled as **owner-managed history** via `F.ownerManagedHistory` (schema owner, triggers bypassed, labelled TEST SETUP). The test still proves E3 creates a new single-attempt row each time. |
+| `e74b-d2` "policy … attempt 2" | Attempt 2 is written as inherited / owner-managed in-flight history instead of dispatched through the fenced path; the fence refusal is asserted first. |
+| `e74b-d2` downgrade test | 0011 rolls back first (that file holds no owner-hold audit), then 0010 refuses; 0011 is re-applied. |
+| `migrations.test.mjs` | Lists extended to 11; table count 22; new 0011 round-trip test. |
+| `guests` / `intents` table counts | 22. |
+
+### Tests
+
+`test/db/e74b-d1-owner-cases.test.mjs`, 23 tests: T-A1–A3, T-B1–B4, T-P1–P3, T-C1–C9, T-H1–H2, T-D1–D3, T-E1–E2, T-G2–G3. Plus the 0011 round trip in `migrations.test.mjs` (T-G1).
+
+**Observed lock behaviour (measured in these tests; not a universal claim):**
+
+| Test | Observed |
+|---|---|
+| T-C5 / T-D2 | a waiter on `transactionid` / `tuple` (op row lock) |
+| T-H1 | a same-intent processor waits on `advisory` only; another intent's item is processed without waiting (SKIP LOCKED) |
+| T-H2 | the explicit-transaction A,B / B,A interleaving produced a 40P01 that was caught and recorded (`attempts 1`, `last_error 40P01…`); autocommit drains in parallel had no error |
+| T-B3 | the direct-UPDATE inversion produced one 40P01 (`["ok","40P01:deadlock detected"]` in both runs); the fenced row never went `in_flight` |
+
+**Fault injection** (each protection removed in turn, then the focused tests re-run): 15 of 15 detected. These are the ≥1-hold rule, the open-iff-active rule, the guard exclusion, the `admin_close_case` refusal, the fence hold check, the whole fence attempt rule, the link hold check, the core method comparison, the enqueue trigger, `SKIP LOCKED`, the `link_full_proof` conflict check, last-hold case resolution, `keep_visible` idempotence, and the JS mirror in both stages.
+
+Two partial mutations survived, each because a second, independent check also refuses:
+- the fence key / attempts clause alone (`offline_charge_attempts` still refuses);
+- the JS mirror in one stage only (the re-check stage still skips).
+
+### Residual limits
+
+- **Not guaranteed:**
+  - no processing latency is guaranteed, and nothing is scheduled;
+  - an item that fails repeatedly waits behind fresh ones indefinitely (visible through `attempts` / `last_error`);
+  - visibility for a link refused **before** linking depends on a helper calling the opener; it is not a DB guarantee.
+- **Not attested:** classification / client / account provenance stays [TRUST].
+- **Not built:** owner release or close of `ATTEMPT_GT1` / `LINKED_CONTRADICTED` does not exist (O2). Their cases stay open and keep blocking guest-data purge and claim release.
+- **Still open:** O7, 0012, the worker, live gates, the `paymentMethod` choice, and the unexplained e74a guard failure.

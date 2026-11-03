@@ -12,7 +12,7 @@ import { applyEvent, loadIntent } from "../../db/lib/repo.js";
 import { claimNextOperation, completeOperation, completeRecordingWithEvidence, linkRecordingEvidence, recoverExpiredOperations,
   listRecordingContradictions, requestRead, recordProviderEvidence } from "../../db/lib/operations.js";
 import { adminResolveOperation } from "../../db/lib/admin.js";
-import { migrateDown } from "../../db/lib/migrate.js";
+import { migrateDown, migrateUp } from "../../db/lib/migrate.js";
 
 let db;
 before(async () => { db = await startMigratedDatabase(); });
@@ -342,10 +342,14 @@ test("policy: automated completion is initial-attempt only; maintenance LINK is 
   F.ok(await adminResolveOperation(db.reconciler, { operationId: a1.id, decision: "failed_definite", evidenceIds: [api, dsh], resolver: "owner",
     justification: "NO_CHARGE_IN_HOSTAWAY", at: F.at(60) }));
   F.ok(await applyEvent(db.app, c2.id, { type: "OFFLINE_CHARGE_FAILED" }, { now: F.at(61) }));
-  // attempt 2 (queued by E3) is claimed here by the TEST as an owner-controlled fixture: no provider is called anywhere
+  // attempt 2 (queued by E3): the automatic claim path is fenced since 0011, so the test writes it as genuinely owner-managed /
+  // inherited HISTORY (schema owner, triggers bypassed): in flight since t2 under w1's lease. No provider is called anywhere.
   const t2 = Date.now() - 30 * MIN;
   await db.app.query("UPDATE booking.intent_work SET work_worker_id = 'w1', work_lease_until = $2 WHERE intent_id = $1", [c2.id, new Date(Date.now() + 10 * MIN)]);
-  const a2 = await claimNextOperation(db.app, { workerId: "w1", now: t2, intentId: c2.id, opTypes: OCH, leaseMs: 60 * MIN });
+  assert.equal(await claimNextOperation(db.app, { workerId: "w1", now: t2, intentId: c2.id, opTypes: OCH, leaseMs: 60 * MIN }), null, "attempt 2 is fenced (0011)");
+  const a2 = (await F.ownerManagedHistory(db.owner, `UPDATE booking.external_operations SET state = 'in_flight', attempts = 1, dispatched_at = $2,
+      lease_worker_id = 'w1', lease_until = $3, updated_at = $2 WHERE intent_id = $1 AND op_type = 'hostaway.record_offline_charge' AND state = 'pending'
+      RETURNING *`, [c2.id, new Date(t2), new Date(t2 + 60 * MIN)])).rows[0];
   assert.ok(a2 && a2.idempotency_key.endsWith(":2"));
   const ev2 = await evAt(c2, obs(c2, "880202"));
   assert.equal((await complete(c2, a2, ev2, "880202")).error, "RECORDING_STATE", "automated completion: initial attempt only");
@@ -457,8 +461,11 @@ test("read-only contradiction scan pages > limit findings with a stable (observe
 
 test("downgrade refuses while recordings are linked or progressed (no silent re-enable of unproven finalisation)", async () => {
   const o = await asOwnerClient();
-  try { await assert.rejects(migrateDown(o, { env: "test", to: 9 }), /DOWNGRADE_REFUSED_RECORDINGS_PROGRESSED/); }
-  finally { await o.end(); }
+  try {
+    // E7.4b-D1: 0011 (latest) rolls back first (this file holds no owner-hold audit), then 0010 refuses; re-apply 0011 after
+    await assert.rejects(migrateDown(o, { env: "test", to: 9 }), /DOWNGRADE_REFUSED_RECORDINGS_PROGRESSED/);
+    assert.deepEqual(await migrateUp(o, { env: "test" }), [11]);
+  } finally { await o.end(); }
   assert.ok((await db.owner.query("SELECT to_regprocedure('booking.complete_recording_with_evidence(uuid,text,uuid,text,integer)') AS f")).rows[0].f, "0010 still applied");
 });
 

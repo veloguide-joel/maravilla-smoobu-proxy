@@ -115,9 +115,18 @@ test("definite failure (catalogued response) follows E3's bounded retry; each re
   await db.owner.query("INSERT INTO booking.definite_refusal_codes (op_type, code, note) VALUES ('hostaway.record_offline_charge', 'VALIDATION_ERROR', 'test stand-in for E4 catalogue') ON CONFLICT DO NOTHING");
   const c = await F.captured(db.app, { listingId: 750006 });
   for (let n = 1; n <= 3; n++) {
-    const op = await claimNextOperation(db.app, { workerId: "w1", now: F.at(9 + n), intentId: c.id, opTypes: OCH });
-    assert.ok(op, `attempt ${n}`);
-    F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(9 + n), outcome: { status: "failed_definite", errorCode: "VALIDATION_ERROR" } }));
+    if (n === 1) {
+      const op = await claimNextOperation(db.app, { workerId: "w1", now: F.at(9 + n), intentId: c.id, opTypes: OCH });
+      assert.ok(op, `attempt ${n}`);
+      F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(9 + n), outcome: { status: "failed_definite", errorCode: "VALIDATION_ERROR" } }));
+    } else {
+      // E7.4b-D1 (0011): an automated claim of attempt > 1 is fenced; the retry row E3 queued is settled here as owner-managed
+      // HISTORY (test setup as the schema owner, triggers bypassed) — it is never dispatched by the automatic path.
+      assert.equal(await claimNextOperation(db.app, { workerId: "w1", now: F.at(9 + n), intentId: c.id, opTypes: OCH }), null, `attempt ${n} fenced`);
+      await F.ownerManagedHistory(db.owner, `UPDATE booking.external_operations SET state = 'failed_definite', attempts = 1, dispatched_at = $2,
+          completed_at = $2, error_code = 'VALIDATION_ERROR', updated_at = $2 WHERE intent_id = $1 AND op_type = 'hostaway.record_offline_charge' AND state = 'pending'`,
+        [c.id, new Date(F.at(9 + n))]);
+    }
     F.ok(await applyEvent(db.app, c.id, { type: "OFFLINE_CHARGE_FAILED" }, { now: F.at(9 + n) }));
   }
   const ops = await ochOps(c.id);

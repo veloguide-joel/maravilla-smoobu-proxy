@@ -1,0 +1,842 @@
+-- 0011_recording_owner_cases (up) — Stage E7.4b-D1 (offline). DISPOSABLE LOCAL test databases only.
+-- Durable, case-only OWNER HOLDS for Hostaway payment recordings (claude/e74b-owner-case-contract.md, revision 2 + root addendum A–D):
+--   * recording_holds / recording_hold_observations / recording_hold_decisions / recording_conflict_inbox: append-only audit,
+--     RLS SELECT-only for app / admin / report, no write privilege for any role (writes only inside schema-owner functions);
+--   * DB-derived reasons only: ATTEMPT_GT1, SUCCEEDED_UNPROVEN, LINKED_CONTRADICTED (no preflight: that is 0012);
+--   * reserved case kinds OFFLINE_CHARGE_HOLD_* bound to holds in BOTH directions (deferred), never closed by other paths;
+--   * a trigger-fed evidence inbox drained one item per top-level transaction (no forward cursor);
+--   * one per-evidence contradiction core with an EXPLICIT reference (candidate before linking, linked proof after);
+--   * a recording claim fence for every claim path (attempt 2 included) and "no active hold" checks on completion / link /
+--     finalisation. Holds never change intent / version / public / op state / dispatched_at and queue no effects.
+-- Replaced functions (0003 / 0004 / 0010) are copied verbatim with small marked "-- 0011" insertions; the down migration
+-- restores the originals exactly.
+
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM booking.reconciliation_cases WHERE starts_with(kind, 'OFFLINE_CHARGE_HOLD_')) THEN
+    RAISE EXCEPTION 'MIGRATION_0011_PRECONDITION: reserved OFFLINE_CHARGE_HOLD_* cases already exist' USING ERRCODE = 'check_violation';
+  END IF;
+END $$;
+
+-- ---------------------------------------------------------------------------------------------
+-- tables
+CREATE TABLE booking.recording_holds (
+  id                     uuid PRIMARY KEY,
+  operation_id           uuid NOT NULL REFERENCES booking.external_operations (id),
+  intent_id              uuid NOT NULL REFERENCES booking.intents (id),
+  reason                 text NOT NULL CHECK (reason IN ('ATTEMPT_GT1', 'SUCCEEDED_UNPROVEN', 'LINKED_CONTRADICTED')),
+  case_id                uuid NOT NULL REFERENCES booking.reconciliation_cases (id),
+  op_state_at_hold       text NOT NULL,
+  op_key_at_hold         text NOT NULL,
+  intent_state_at_hold   text NOT NULL,
+  intent_version_at_hold integer NOT NULL,
+  epoch                  integer NOT NULL DEFAULT 0 CHECK (epoch = 0),
+  created_at             timestamptz NOT NULL,
+  created_by             text NOT NULL CHECK (length(btrim(created_by)) BETWEEN 1 AND 200),
+  released_at            timestamptz,
+  release_decision_id    uuid,
+  CHECK ((released_at IS NULL) = (release_decision_id IS NULL))
+);
+CREATE UNIQUE INDEX recording_holds_one_active ON booking.recording_holds (operation_id) WHERE released_at IS NULL;
+CREATE INDEX recording_holds_case ON booking.recording_holds (case_id);
+
+CREATE TABLE booking.recording_hold_decisions (
+  id                    uuid PRIMARY KEY,
+  hold_id               uuid NOT NULL REFERENCES booking.recording_holds (id),
+  operation_id          uuid NOT NULL REFERENCES booking.external_operations (id),
+  case_id               uuid NOT NULL REFERENCES booking.reconciliation_cases (id),
+  intent_id             uuid NOT NULL REFERENCES booking.intents (id),
+  decision              text NOT NULL CHECK (decision IN ('keep_visible', 'link_full_proof')),
+  evidence_ids          uuid[] NOT NULL DEFAULT '{}',
+  linked_evidence_id    uuid REFERENCES booking.provider_evidence (id),
+  resolver              text NOT NULL CHECK (length(btrim(resolver)) BETWEEN 1 AND 200),
+  justification_code    text NOT NULL CHECK (booking.is_code(justification_code)),
+  resolver_session_user text NOT NULL,
+  decided_at            timestamptz NOT NULL,
+  recorded_at           timestamptz NOT NULL,
+  CHECK ((decision = 'link_full_proof') = (linked_evidence_id IS NOT NULL)),
+  CHECK (linked_evidence_id IS NULL OR linked_evidence_id = ANY (evidence_ids))
+);
+CREATE INDEX recording_hold_decisions_hold ON booking.recording_hold_decisions (hold_id);
+ALTER TABLE booking.recording_holds ADD CONSTRAINT recording_holds_release_decision_fk
+  FOREIGN KEY (release_decision_id) REFERENCES booking.recording_hold_decisions (id);
+
+CREATE TABLE booking.recording_hold_observations (
+  id          uuid PRIMARY KEY,
+  hold_id     uuid NOT NULL REFERENCES booking.recording_holds (id),
+  evidence_id uuid NOT NULL REFERENCES booking.provider_evidence (id),
+  recorded_at timestamptz NOT NULL,
+  UNIQUE (hold_id, evidence_id)
+);
+
+CREATE TABLE booking.recording_conflict_inbox (
+  seq             bigint GENERATED ALWAYS AS IDENTITY UNIQUE,
+  evidence_id     uuid PRIMARY KEY REFERENCES booking.provider_evidence (id),
+  intent_id       uuid NOT NULL REFERENCES booking.intents (id),
+  enqueued_at     timestamptz NOT NULL,
+  attempts        integer NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  last_error      text CHECK (last_error IS NULL OR length(last_error) BETWEEN 1 AND 500),
+  last_attempt_at timestamptz,
+  processed_at    timestamptz,
+  outcome         text CHECK (outcome IN ('not_latest_linked', 'consistent', 'contradiction_opened', 'contradiction_joined_case',
+                                         'contradiction_appended', 'contradiction_duplicate')),
+  hold_id         uuid REFERENCES booking.recording_holds (id),
+  CHECK ((processed_at IS NULL) = (outcome IS NULL)),
+  CHECK (CASE WHEN outcome IN ('contradiction_opened', 'contradiction_joined_case', 'contradiction_appended', 'contradiction_duplicate')
+              THEN hold_id IS NOT NULL ELSE hold_id IS NULL END),
+  CHECK ((attempts = 0) = (last_attempt_at IS NULL) AND (attempts = 0) = (last_error IS NULL))
+);
+CREATE INDEX recording_conflict_inbox_pending ON booking.recording_conflict_inbox (attempts, seq) WHERE processed_at IS NULL;
+
+-- ---------------------------------------------------------------------------------------------
+-- guards (SECURITY INVOKER; is_privileged() = "inside a schema-owner function"; app / admin / report have no write privilege)
+CREATE FUNCTION booking.recording_holds_guard() RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, booking AS $$
+DECLARE o booking.external_operations%ROWTYPE; d booking.recording_hold_decisions%ROWTYPE;
+BEGIN
+  IF NOT booking.is_privileged() THEN
+    RAISE EXCEPTION 'RECORDING_HOLD_IMMUTABLE: holds are written only by the recording hold functions' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  IF TG_OP = 'INSERT' THEN
+    SELECT * INTO o FROM booking.external_operations WHERE id = NEW.operation_id;
+    IF o.op_type IS DISTINCT FROM 'hostaway.record_offline_charge' OR o.intent_id IS DISTINCT FROM NEW.intent_id THEN
+      RAISE EXCEPTION 'RECORDING_HOLD_BINDING: a hold targets a recording of its own intent' USING ERRCODE = 'check_violation';
+    END IF;
+    IF NEW.released_at IS NOT NULL THEN RAISE EXCEPTION 'RECORDING_HOLD_BINDING: a hold is created active' USING ERRCODE = 'check_violation'; END IF;
+    RETURN NEW;
+  END IF;
+  IF (to_jsonb(NEW) - 'released_at' - 'release_decision_id') IS DISTINCT FROM (to_jsonb(OLD) - 'released_at' - 'release_decision_id') THEN
+    RAISE EXCEPTION 'RECORDING_HOLD_IMMUTABLE: hold identity is frozen' USING ERRCODE = 'check_violation';
+  END IF;
+  IF OLD.released_at IS NOT NULL THEN RAISE EXCEPTION 'RECORDING_HOLD_IMMUTABLE: a released hold is final' USING ERRCODE = 'check_violation'; END IF;
+  IF NEW.released_at IS NULL THEN RAISE EXCEPTION 'RECORDING_HOLD_IMMUTABLE: only a release may change a hold' USING ERRCODE = 'check_violation'; END IF;
+  SELECT * INTO d FROM booking.recording_hold_decisions WHERE id = NEW.release_decision_id;
+  IF NOT FOUND OR d.hold_id IS DISTINCT FROM NEW.id OR d.operation_id IS DISTINCT FROM NEW.operation_id OR d.case_id IS DISTINCT FROM NEW.case_id
+     OR d.decision IS DISTINCT FROM 'link_full_proof' THEN
+    RAISE EXCEPTION 'RECORDING_HOLD_BINDING: a release cites this hold''s own releasing owner decision' USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NEW;
+END $$;
+REVOKE ALL ON FUNCTION booking.recording_holds_guard() FROM PUBLIC;
+CREATE TRIGGER recording_holds_guard BEFORE INSERT OR UPDATE ON booking.recording_holds FOR EACH ROW EXECUTE FUNCTION booking.recording_holds_guard();
+
+CREATE FUNCTION booking.recording_hold_decisions_guard() RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, booking AS $$
+DECLARE h booking.recording_holds%ROWTYPE;
+BEGIN
+  IF NOT booking.is_privileged() THEN
+    RAISE EXCEPTION 'RECORDING_HOLD_IMMUTABLE: owner decisions are written only by booking.admin_resolve_recording_hold' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  SELECT * INTO h FROM booking.recording_holds WHERE id = NEW.hold_id;
+  IF NOT FOUND OR h.operation_id IS DISTINCT FROM NEW.operation_id OR h.case_id IS DISTINCT FROM NEW.case_id OR h.intent_id IS DISTINCT FROM NEW.intent_id THEN
+    RAISE EXCEPTION 'RECORDING_HOLD_BINDING: a decision is bound to its hold, operation, case and intent' USING ERRCODE = 'check_violation';
+  END IF;
+  IF NEW.decision = 'link_full_proof' AND h.reason IS DISTINCT FROM 'SUCCEEDED_UNPROVEN' THEN
+    RAISE EXCEPTION 'RECORDING_HOLD_BINDING: link_full_proof applies to SUCCEEDED_UNPROVEN holds only' USING ERRCODE = 'check_violation';
+  END IF;
+  IF EXISTS (SELECT 1 FROM unnest(NEW.evidence_ids) x
+              WHERE NOT EXISTS (SELECT 1 FROM booking.provider_evidence e WHERE e.id = x AND e.intent_id = NEW.intent_id)) THEN
+    RAISE EXCEPTION 'RECORDING_HOLD_BINDING: cited evidence must belong to the intent' USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NEW;
+END $$;
+REVOKE ALL ON FUNCTION booking.recording_hold_decisions_guard() FROM PUBLIC;
+CREATE TRIGGER recording_hold_decisions_guard BEFORE INSERT ON booking.recording_hold_decisions FOR EACH ROW EXECUTE FUNCTION booking.recording_hold_decisions_guard();
+
+CREATE FUNCTION booking.recording_hold_observations_guard() RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, booking AS $$
+DECLARE h booking.recording_holds%ROWTYPE; e booking.provider_evidence%ROWTYPE;
+BEGIN
+  IF NOT booking.is_privileged() THEN
+    RAISE EXCEPTION 'RECORDING_HOLD_IMMUTABLE: observations are written only by the inbox processor' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  SELECT * INTO h FROM booking.recording_holds WHERE id = NEW.hold_id;
+  SELECT * INTO e FROM booking.provider_evidence WHERE id = NEW.evidence_id;
+  IF h.id IS NULL OR h.reason IS DISTINCT FROM 'LINKED_CONTRADICTED' OR e.id IS NULL OR e.intent_id IS DISTINCT FROM h.intent_id
+     OR e.kind IS DISTINCT FROM 'hostaway_offline_charges' THEN
+    RAISE EXCEPTION 'RECORDING_HOLD_BINDING: an observation binds offline-charge evidence of the hold''s intent to a LINKED_CONTRADICTED hold'
+      USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NEW;
+END $$;
+REVOKE ALL ON FUNCTION booking.recording_hold_observations_guard() FROM PUBLIC;
+CREATE TRIGGER recording_hold_observations_guard BEFORE INSERT ON booking.recording_hold_observations FOR EACH ROW EXECUTE FUNCTION booking.recording_hold_observations_guard();
+
+-- inbox mutation rules (root addendum B): enqueue binds the evidence's own intent; an error attempt changes ONLY
+-- attempts (+1 exactly), last_error, last_attempt_at; success sets processed_at + outcome (+ hold_id iff a contradiction
+-- outcome) once, after which the row is frozen.
+CREATE FUNCTION booking.recording_conflict_inbox_guard() RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, booking AS $$
+DECLARE e booking.provider_evidence%ROWTYPE; h booking.recording_holds%ROWTYPE;
+BEGIN
+  IF NOT booking.is_privileged() THEN
+    RAISE EXCEPTION 'RECORDING_INBOX_IMMUTABLE: the inbox is written only by the enqueue trigger and the processor' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  IF TG_OP = 'INSERT' THEN
+    SELECT * INTO e FROM booking.provider_evidence WHERE id = NEW.evidence_id;
+    IF e.id IS NULL OR e.kind IS DISTINCT FROM 'hostaway_offline_charges' OR e.intent_id IS DISTINCT FROM NEW.intent_id
+       OR NEW.attempts <> 0 OR NEW.processed_at IS NOT NULL THEN
+      RAISE EXCEPTION 'RECORDING_INBOX_BINDING: an inbox row is the fresh entry of one offline-charge evidence row of its intent' USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+  END IF;
+  IF OLD.processed_at IS NOT NULL THEN RAISE EXCEPTION 'RECORDING_INBOX_IMMUTABLE: a processed item is frozen' USING ERRCODE = 'check_violation'; END IF;
+  IF NEW.seq IS DISTINCT FROM OLD.seq OR NEW.evidence_id IS DISTINCT FROM OLD.evidence_id OR NEW.intent_id IS DISTINCT FROM OLD.intent_id
+     OR NEW.enqueued_at IS DISTINCT FROM OLD.enqueued_at THEN
+    RAISE EXCEPTION 'RECORDING_INBOX_IMMUTABLE: item identity is frozen' USING ERRCODE = 'check_violation';
+  END IF;
+  IF NEW.processed_at IS NULL THEN                                                           -- error accounting
+    IF NEW.outcome IS NOT NULL OR NEW.hold_id IS NOT NULL OR NEW.attempts IS DISTINCT FROM OLD.attempts + 1
+       OR NEW.last_error IS NULL OR NEW.last_attempt_at IS NULL THEN
+      RAISE EXCEPTION 'RECORDING_INBOX_IMMUTABLE: an error attempt is attempts + 1 with last_error / last_attempt_at only' USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+  END IF;
+  IF NEW.attempts IS DISTINCT FROM OLD.attempts OR NEW.last_error IS DISTINCT FROM OLD.last_error OR NEW.last_attempt_at IS DISTINCT FROM OLD.last_attempt_at THEN
+    RAISE EXCEPTION 'RECORDING_INBOX_IMMUTABLE: success does not rewrite error history' USING ERRCODE = 'check_violation';
+  END IF;
+  IF NEW.hold_id IS NOT NULL THEN
+    SELECT * INTO h FROM booking.recording_holds WHERE id = NEW.hold_id;
+    IF h.intent_id IS DISTINCT FROM NEW.intent_id OR h.reason IS DISTINCT FROM 'LINKED_CONTRADICTED'
+       OR NOT EXISTS (SELECT 1 FROM booking.recording_hold_observations ob WHERE ob.hold_id = NEW.hold_id AND ob.evidence_id = NEW.evidence_id) THEN
+      RAISE EXCEPTION 'RECORDING_INBOX_BINDING: a contradiction outcome cites the hold that observed this evidence' USING ERRCODE = 'check_violation';
+    END IF;
+  END IF;
+  RETURN NEW;
+END $$;
+REVOKE ALL ON FUNCTION booking.recording_conflict_inbox_guard() FROM PUBLIC;
+CREATE TRIGGER recording_conflict_inbox_guard BEFORE INSERT OR UPDATE ON booking.recording_conflict_inbox FOR EACH ROW EXECUTE FUNCTION booking.recording_conflict_inbox_guard();
+
+CREATE TRIGGER recording_holds_no_delete BEFORE DELETE ON booking.recording_holds FOR EACH ROW EXECUTE FUNCTION booking.reject_change();
+CREATE TRIGGER recording_holds_no_truncate BEFORE TRUNCATE ON booking.recording_holds FOR EACH STATEMENT EXECUTE FUNCTION booking.reject_change();
+CREATE TRIGGER recording_hold_decisions_append_only BEFORE UPDATE OR DELETE ON booking.recording_hold_decisions FOR EACH ROW EXECUTE FUNCTION booking.reject_change();
+CREATE TRIGGER recording_hold_decisions_no_truncate BEFORE TRUNCATE ON booking.recording_hold_decisions FOR EACH STATEMENT EXECUTE FUNCTION booking.reject_change();
+CREATE TRIGGER recording_hold_observations_append_only BEFORE UPDATE OR DELETE ON booking.recording_hold_observations FOR EACH ROW EXECUTE FUNCTION booking.reject_change();
+CREATE TRIGGER recording_hold_observations_no_truncate BEFORE TRUNCATE ON booking.recording_hold_observations FOR EACH STATEMENT EXECUTE FUNCTION booking.reject_change();
+CREATE TRIGGER recording_conflict_inbox_no_delete BEFORE DELETE ON booking.recording_conflict_inbox FOR EACH ROW EXECUTE FUNCTION booking.reject_change();
+CREATE TRIGGER recording_conflict_inbox_no_truncate BEFORE TRUNCATE ON booking.recording_conflict_inbox FOR EACH STATEMENT EXECUTE FUNCTION booking.reject_change();
+
+-- ---------------------------------------------------------------------------------------------
+-- reserved case kinds OFFLINE_CHARGE_HOLD_*: INSERT only inside schema-owner code, with opened_by = 'recording-hold:'||case.id;
+-- identity frozen on UPDATE; a resolved reserved case never changes again.
+CREATE FUNCTION booking.reserved_case_guard() RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, booking AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF starts_with(NEW.kind, 'OFFLINE_CHARGE_HOLD_') THEN
+      IF NOT booking.is_privileged() THEN
+        RAISE EXCEPTION 'RESERVED_CASE_KIND: OFFLINE_CHARGE_HOLD_* cases are opened only by the recording hold functions' USING ERRCODE = 'insufficient_privilege';
+      END IF;
+      IF NEW.kind NOT IN ('OFFLINE_CHARGE_HOLD_ATTEMPT_GT1', 'OFFLINE_CHARGE_HOLD_SUCCEEDED_UNPROVEN', 'OFFLINE_CHARGE_HOLD_LINKED_CONTRADICTED')
+         OR NEW.opened_by IS DISTINCT FROM 'recording-hold:' || NEW.id::text OR NEW.status IS DISTINCT FROM 'open' THEN
+        RAISE EXCEPTION 'RESERVED_CASE_BINDING: a hold case is opened open, of a known reason kind, with opened_by recording-hold:<case id>'
+          USING ERRCODE = 'check_violation';
+      END IF;
+    END IF;
+    RETURN NEW;
+  END IF;
+  IF starts_with(OLD.kind, 'OFFLINE_CHARGE_HOLD_') OR starts_with(NEW.kind, 'OFFLINE_CHARGE_HOLD_') THEN
+    IF NEW.id IS DISTINCT FROM OLD.id OR NEW.intent_id IS DISTINCT FROM OLD.intent_id OR NEW.kind IS DISTINCT FROM OLD.kind
+       OR NEW.opened_by IS DISTINCT FROM OLD.opened_by OR NEW.opened_at IS DISTINCT FROM OLD.opened_at OR NEW.evidence IS DISTINCT FROM OLD.evidence THEN
+      RAISE EXCEPTION 'RESERVED_CASE_IMMUTABLE: a hold case''s identity is frozen' USING ERRCODE = 'check_violation';
+    END IF;
+    IF OLD.status = 'resolved' THEN RAISE EXCEPTION 'RESERVED_CASE_IMMUTABLE: a resolved hold case is final' USING ERRCODE = 'check_violation'; END IF;
+  END IF;
+  RETURN NEW;
+END $$;
+REVOKE ALL ON FUNCTION booking.reserved_case_guard() FROM PUBLIC;
+CREATE TRIGGER reserved_case_guard BEFORE INSERT OR UPDATE ON booking.reconciliation_cases FOR EACH ROW EXECUTE FUNCTION booking.reserved_case_guard();
+
+-- deferred two-way binding (root addendum A): EVERY reserved case (open or resolved) has >= 1 bound hold; every bound hold
+-- matches the case's intent and kind; the case is open iff some bound hold is active, resolved ('recorded') only when all
+-- are released; every release cites the hold's own releasing owner decision. Checked at COMMIT for every touched case /
+-- hold. SECURITY DEFINER so it reads the protected tables; no role can execute it directly.
+CREATE FUNCTION booking.reserved_case_binding_verify(p_case uuid) RETURNS void
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE c booking.reconciliation_cases%ROWTYPE; n integer; n_active integer;
+BEGIN
+  SELECT * INTO c FROM booking.reconciliation_cases WHERE id = p_case;
+  IF NOT FOUND OR NOT starts_with(c.kind, 'OFFLINE_CHARGE_HOLD_') THEN
+    RAISE EXCEPTION 'RESERVED_CASE_BINDING: a hold is bound only to a reserved OFFLINE_CHARGE_HOLD_* case' USING ERRCODE = 'check_violation';
+  END IF;
+  IF c.opened_by IS DISTINCT FROM 'recording-hold:' || c.id::text THEN
+    RAISE EXCEPTION 'RESERVED_CASE_BINDING: opened_by must be recording-hold:<case id>' USING ERRCODE = 'check_violation';
+  END IF;
+  SELECT count(*), count(*) FILTER (WHERE released_at IS NULL) INTO n, n_active FROM booking.recording_holds WHERE case_id = c.id;
+  IF n = 0 THEN RAISE EXCEPTION 'RESERVED_CASE_BINDING: a reserved case needs at least one bound hold' USING ERRCODE = 'check_violation'; END IF;
+  IF EXISTS (SELECT 1 FROM booking.recording_holds h WHERE h.case_id = c.id
+              AND (h.intent_id IS DISTINCT FROM c.intent_id OR 'OFFLINE_CHARGE_HOLD_' || h.reason IS DISTINCT FROM c.kind)) THEN
+    RAISE EXCEPTION 'RESERVED_CASE_BINDING: a bound hold must match the case intent and kind' USING ERRCODE = 'check_violation';
+  END IF;
+  IF (c.status = 'open') IS DISTINCT FROM (n_active > 0) THEN
+    RAISE EXCEPTION 'RESERVED_CASE_BINDING: a hold case is open exactly while one of its holds is active' USING ERRCODE = 'check_violation';
+  END IF;
+  IF c.status = 'resolved' AND c.resolution IS DISTINCT FROM 'recorded' THEN
+    RAISE EXCEPTION 'RESERVED_CASE_BINDING: a hold case is resolved only as recorded (link_full_proof)' USING ERRCODE = 'check_violation';
+  END IF;
+  IF EXISTS (SELECT 1 FROM booking.recording_holds h WHERE h.case_id = c.id AND h.released_at IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM booking.recording_hold_decisions d WHERE d.id = h.release_decision_id AND d.hold_id = h.id
+                                AND d.case_id = c.id AND d.operation_id = h.operation_id AND d.decision = 'link_full_proof')) THEN
+    RAISE EXCEPTION 'RESERVED_CASE_BINDING: every released hold cites its own releasing decision' USING ERRCODE = 'check_violation';
+  END IF;
+END $$;
+REVOKE ALL ON FUNCTION booking.reserved_case_binding_verify(uuid) FROM PUBLIC;
+CREATE FUNCTION booking.reserved_case_binding_check() RETURNS trigger
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+BEGIN
+  -- the same function serves both tables: read the case id through to_jsonb (a direct NEW.case_id does not exist on cases)
+  PERFORM booking.reserved_case_binding_verify(CASE WHEN TG_TABLE_NAME = 'reconciliation_cases' THEN (to_jsonb(NEW) ->> 'id')::uuid
+                                                    ELSE (to_jsonb(NEW) ->> 'case_id')::uuid END);
+  RETURN NULL;
+END $$;
+REVOKE ALL ON FUNCTION booking.reserved_case_binding_check() FROM PUBLIC;
+CREATE CONSTRAINT TRIGGER zz_reserved_case_binding AFTER INSERT OR UPDATE ON booking.reconciliation_cases
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (starts_with(NEW.kind, 'OFFLINE_CHARGE_HOLD_')) EXECUTE FUNCTION booking.reserved_case_binding_check();
+CREATE CONSTRAINT TRIGGER zz_recording_hold_binding AFTER INSERT OR UPDATE ON booking.recording_holds
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION booking.reserved_case_binding_check();
+
+-- ---------------------------------------------------------------------------------------------
+-- per-evidence contradiction core with an EXPLICIT reference (contract r2 §5.1). The condition below is the 0010
+-- recording_conflict_refusal row condition (0010:141–159) verbatim, bound to the single row p_evidence.
+CREATE FUNCTION booking.recording_evidence_contradicts(p_intent uuid, p_dispatched_at timestamptz, p_result_ref text, p_reference uuid,
+  p_evidence uuid) RETURNS boolean
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE i booking.intents%ROWTYPE; ref_obs jsonb; marker text; hit boolean;
+BEGIN
+  IF p_intent IS NULL OR p_dispatched_at IS NULL OR p_result_ref IS NULL OR p_reference IS NULL OR p_evidence IS NULL THEN
+    RAISE EXCEPTION 'CONFLICT_CHECK_INPUT' USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+  SELECT * INTO i FROM booking.intents WHERE id = p_intent;
+  SELECT observed INTO ref_obs FROM booking.provider_evidence WHERE id = p_reference AND intent_id = p_intent;
+  IF i.id IS NULL OR i.hostaway_reservation_id IS NULL OR ref_obs IS NULL THEN
+    RAISE EXCEPTION 'CONFLICT_CHECK_INPUT' USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+  marker := 'mvoch1-' || p_intent::text;
+  SELECT EXISTS (SELECT 1 FROM booking.provider_evidence e
+   WHERE e.intent_id = p_intent AND e.kind = 'hostaway_offline_charges' AND e.external_ref = i.hostaway_reservation_id
+     AND e.observed_at > p_dispatched_at AND e.id <> p_reference
+     AND ((e.observed ->> 'matchingChargeCount')::integer >= 1)
+     AND (NOT (e.observed ? 'marker') OR (e.observed ->> 'marker') = marker)
+     AND (
+          (e.observed ->> 'matchingChargeCount')::integer >= 2
+       OR (e.observed -> 'matchingChargeIds' ->> 0) IS DISTINCT FROM p_result_ref
+       OR (e.observed ? 'marker' AND (                                                       -- only fields PRESENT are compared
+              (e.observed ? 'amountMinor' AND (e.observed ->> 'amountMinor') IS DISTINCT FROM i.final_total_minor::text)
+           OR (e.observed ? 'currency' AND (e.observed ->> 'currency') IS DISTINCT FROM i.currency::text)
+           OR (e.observed ? 'status' AND (e.observed ->> 'status') IS DISTINCT FROM 'paid')
+           OR (e.observed ? 'type' AND (e.observed ->> 'type') IS DISTINCT FROM 'charge')
+           OR (e.observed ? 'paymentProvider' AND (e.observed ->> 'paymentProvider') IS DISTINCT FROM 'offline')
+           OR (e.observed ? 'title' AND (e.observed ->> 'title') IS DISTINCT FROM 'maraVilla payment ' || marker)
+           OR (e.observed ? 'listingMapId' AND (e.observed ->> 'listingMapId') IS DISTINCT FROM i.listing_id::text)
+           OR (e.observed ? 'reservationId' AND (e.observed ->> 'reservationId') IS DISTINCT FROM i.hostaway_reservation_id)
+           OR (e.observed ? 'chargeId' AND (e.observed ->> 'chargeId') IS DISTINCT FROM p_result_ref)
+           OR (e.observed ? 'paymentMethod' AND (e.observed ->> 'paymentMethod') IS DISTINCT FROM (ref_obs ->> 'paymentMethod'))
+           OR (e.observed ? 'executorAccountRef' AND (e.observed ->> 'executorAccountRef') IS DISTINCT FROM (ref_obs ->> 'executorAccountRef')))))
+       AND e.id = p_evidence) INTO hit;
+  RETURN hit;
+END $$;
+REVOKE ALL ON FUNCTION booking.recording_evidence_contradicts(uuid, timestamptz, text, uuid, uuid) FROM PUBLIC;
+
+-- the 0010 wrapper, same signature / inputs / result: a count over the core (0010's input handling kept: RETURN, not RAISE)
+CREATE OR REPLACE FUNCTION booking.recording_conflict_refusal(p_intent uuid, p_dispatched_at timestamptz, p_result_ref text, p_reference uuid) RETURNS text
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE i booking.intents%ROWTYPE; ref_obs jsonb; n integer;
+BEGIN
+  IF p_dispatched_at IS NULL OR p_result_ref IS NULL OR p_reference IS NULL THEN RETURN 'CONFLICT_CHECK_INPUT'; END IF;
+  SELECT * INTO i FROM booking.intents WHERE id = p_intent;
+  SELECT observed INTO ref_obs FROM booking.provider_evidence WHERE id = p_reference AND intent_id = p_intent;
+  IF i.id IS NULL OR i.hostaway_reservation_id IS NULL OR ref_obs IS NULL THEN RETURN 'CONFLICT_CHECK_INPUT'; END IF;
+  SELECT count(*) INTO n FROM booking.provider_evidence e
+   WHERE e.intent_id = p_intent AND e.kind = 'hostaway_offline_charges'
+     AND booking.recording_evidence_contradicts(p_intent, p_dispatched_at, p_result_ref, p_reference, e.id);
+  RETURN CASE WHEN n > 0 THEN 'POSITIVE_CONTRADICTION' END;
+END $$;
+
+CREATE FUNCTION booking.recording_active_hold_id(p_op uuid) RETURNS uuid
+LANGUAGE sql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+  SELECT id FROM booking.recording_holds WHERE operation_id = p_op AND released_at IS NULL
+$$;
+REVOKE ALL ON FUNCTION booking.recording_active_hold_id(uuid) FROM PUBLIC;
+
+-- ---------------------------------------------------------------------------------------------
+-- 0010 functions with "no active hold" added (bodies otherwise verbatim; grants kept by CREATE OR REPLACE)
+CREATE OR REPLACE FUNCTION booking.complete_recording_with_evidence(p_op uuid, p_worker text, p_evidence uuid, p_result_ref text, p_expected_version integer)
+RETURNS text
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE v_intent uuid; i booking.intents%ROWTYPE; w booking.intent_work%ROWTYPE; o booking.external_operations%ROWTYPE; v_t timestamptz; r text;
+BEGIN
+  SELECT intent_id INTO v_intent FROM booking.external_operations WHERE id = p_op AND op_type = 'hostaway.record_offline_charge';
+  IF v_intent IS NULL THEN RAISE EXCEPTION 'RECORDING_STATE: not a recording operation' USING ERRCODE = 'check_violation'; END IF;
+  SELECT * INTO i FROM booking.intents WHERE id = v_intent FOR SHARE;
+  SELECT * INTO w FROM booking.intent_work WHERE intent_id = v_intent FOR SHARE;
+  SELECT * INTO o FROM booking.external_operations WHERE id = p_op FOR UPDATE;
+  PERFORM pg_advisory_xact_lock(hashtext('booking.recording_evidence'), hashtext(v_intent::text));
+  v_t := clock_timestamp();                                                                  -- after every potentially blocking lock
+  IF i.state IS DISTINCT FROM 'payment_captured' THEN RAISE EXCEPTION 'RECORDING_STATE: intent is not payment_captured' USING ERRCODE = 'check_violation'; END IF;
+  IF p_expected_version IS NULL OR i.version IS DISTINCT FROM p_expected_version THEN
+    RAISE EXCEPTION 'RECORDING_VERSION_CHANGED' USING ERRCODE = 'check_violation';
+  END IF;
+  IF p_worker IS NULL OR w.work_worker_id IS DISTINCT FROM p_worker OR w.work_lease_until IS NULL OR w.work_lease_until < v_t THEN
+    RAISE EXCEPTION 'RECORDING_WORK_LEASE_LOST' USING ERRCODE = 'check_violation';
+  END IF;
+  IF o.state IS DISTINCT FROM 'in_flight' THEN RAISE EXCEPTION 'RECORDING_STATE: operation is %', o.state USING ERRCODE = 'check_violation'; END IF;
+  IF o.lease_worker_id IS DISTINCT FROM p_worker OR o.lease_until IS NULL OR o.lease_until < v_t THEN
+    RAISE EXCEPTION 'RECORDING_LEASE_LOST' USING ERRCODE = 'check_violation';
+  END IF;
+  IF booking.recording_latest_id(v_intent) IS DISTINCT FROM p_op THEN RAISE EXCEPTION 'RECORDING_NOT_LATEST' USING ERRCODE = 'check_violation'; END IF;
+  IF booking.recording_active_hold_id(p_op) IS NOT NULL THEN                                 -- 0011
+    RAISE EXCEPTION 'RECORDING_HOLD_ACTIVE: an owner hold is active on this recording' USING ERRCODE = 'check_violation';
+  END IF;
+  IF o.idempotency_key IS DISTINCT FROM 'och:' || v_intent::text || ':1' OR o.attempts IS DISTINCT FROM 1 THEN
+    RAISE EXCEPTION 'RECORDING_STATE: only the initial attempt completes through this function' USING ERRCODE = 'check_violation';
+  END IF;
+  r := booking.recording_proof_refusal(v_intent, o.payload, p_result_ref, o.dispatched_at, o.created_at, p_evidence, 'worker_fresh', v_t);
+  IF r IS NOT NULL THEN RAISE EXCEPTION 'RECORDING_PROOF_REFUSED: %', r USING ERRCODE = 'check_violation'; END IF;
+  r := booking.recording_conflict_refusal(v_intent, o.dispatched_at, p_result_ref, p_evidence);
+  IF r IS NOT NULL THEN RAISE EXCEPTION 'RECORDING_EVIDENCE_CONFLICT: %', r USING ERRCODE = 'check_violation'; END IF;
+  UPDATE booking.external_operations
+     SET state = 'succeeded', result_ref = p_result_ref, settled_evidence_id = p_evidence, completed_at = v_t,
+         lease_worker_id = NULL, lease_until = NULL, updated_at = v_t
+   WHERE id = p_op;
+  RETURN 'succeeded';
+END $$;
+
+CREATE OR REPLACE FUNCTION booking.link_recording_evidence(p_op uuid, p_evidence uuid) RETURNS text
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE v_intent uuid; i booking.intents%ROWTYPE; o booking.external_operations%ROWTYPE; v_t timestamptz; r text;
+BEGIN
+  SELECT intent_id INTO v_intent FROM booking.external_operations WHERE id = p_op AND op_type = 'hostaway.record_offline_charge';
+  IF v_intent IS NULL THEN RAISE EXCEPTION 'RECORDING_STATE: not a recording operation' USING ERRCODE = 'check_violation'; END IF;
+  SELECT * INTO i FROM booking.intents WHERE id = v_intent FOR SHARE;
+  SELECT * INTO o FROM booking.external_operations WHERE id = p_op FOR UPDATE;
+  PERFORM pg_advisory_xact_lock(hashtext('booking.recording_evidence'), hashtext(v_intent::text));
+  v_t := clock_timestamp();
+  IF o.state IS DISTINCT FROM 'succeeded' OR o.result_ref IS NULL THEN
+    RAISE EXCEPTION 'RECORDING_STATE: only a succeeded recording with a result can be linked' USING ERRCODE = 'check_violation';
+  END IF;
+  IF i.state IS NULL OR i.state NOT IN ('payment_captured', 'confirmed') THEN
+    RAISE EXCEPTION 'RECORDING_STATE: intent is %', i.state USING ERRCODE = 'check_violation';
+  END IF;
+  IF booking.recording_latest_id(v_intent) IS DISTINCT FROM p_op THEN RAISE EXCEPTION 'RECORDING_NOT_LATEST' USING ERRCODE = 'check_violation'; END IF;
+  IF o.settled_evidence_id IS NOT NULL THEN
+    IF o.settled_evidence_id = p_evidence THEN RETURN 'already_linked'; END IF;
+    RAISE EXCEPTION 'RECORDING_ALREADY_LINKED_DIFFERENT' USING ERRCODE = 'check_violation';
+  END IF;
+  IF booking.recording_active_hold_id(p_op) IS NOT NULL THEN                                 -- 0011
+    RAISE EXCEPTION 'RECORDING_HOLD_ACTIVE: an owner hold is active on this recording' USING ERRCODE = 'check_violation';
+  END IF;
+  r := booking.recording_proof_refusal(v_intent, o.payload, o.result_ref, o.dispatched_at, o.created_at, p_evidence, 'owner_historical', v_t);
+  IF r IS NOT NULL THEN RAISE EXCEPTION 'RECORDING_PROOF_REFUSED: %', r USING ERRCODE = 'check_violation'; END IF;
+  r := booking.recording_conflict_refusal(v_intent, o.dispatched_at, o.result_ref, p_evidence);
+  IF r IS NOT NULL THEN RAISE EXCEPTION 'RECORDING_EVIDENCE_CONFLICT: %', r USING ERRCODE = 'check_violation'; END IF;
+  UPDATE booking.external_operations SET settled_evidence_id = p_evidence, updated_at = v_t WHERE id = p_op;
+  RETURN 'linked';
+END $$;
+
+CREATE OR REPLACE FUNCTION booking.recording_finalisation_guard() RETURNS trigger
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE o booking.external_operations%ROWTYPE; r text;
+BEGIN
+  SELECT * INTO o FROM booking.external_operations WHERE id = booking.recording_latest_id(NEW.id);
+  IF NOT FOUND OR o.state IS DISTINCT FROM 'succeeded' OR o.settled_evidence_id IS NULL OR o.result_ref IS NULL
+     OR o.result_ref IS DISTINCT FROM NEW.offline_charge_id THEN
+    RAISE EXCEPTION 'RECORDING_FINALISATION_UNPROVEN: the latest recording is not succeeded with linked proof for this charge'
+      USING ERRCODE = 'check_violation';
+  END IF;
+  PERFORM pg_advisory_xact_lock(hashtext('booking.recording_evidence'), hashtext(NEW.id::text));
+  IF booking.recording_active_hold_id(o.id) IS NOT NULL THEN                                  -- 0011
+    RAISE EXCEPTION 'RECORDING_HOLD_ACTIVE: an owner hold is active on the latest recording' USING ERRCODE = 'check_violation';
+  END IF;
+  r := booking.recording_conflict_refusal(NEW.id, o.dispatched_at, o.result_ref, o.settled_evidence_id);
+  IF r IS NOT NULL THEN RAISE EXCEPTION 'RECORDING_EVIDENCE_CONFLICT: %', r USING ERRCODE = 'check_violation'; END IF;
+  RETURN NEW;
+END $$;
+
+-- intents_safety_guard (0004, verbatim) with the bulk case resolution excluding owner-hold cases
+CREATE OR REPLACE FUNCTION booking.intents_safety_guard() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE r booking.reconciliation_resolutions%ROWTYPE; want text; sess text;
+BEGIN
+  -- E3.2: each recovery leg of capture_failed is marked settled only on verified facts
+  IF NEW.settlement_reservation_cancelled IS TRUE AND OLD.settlement_reservation_cancelled IS NOT TRUE AND NOT (
+       EXISTS (SELECT 1 FROM booking.external_operations
+                WHERE intent_id = NEW.id AND op_type = 'hostaway.cancel_reservation' AND state = 'succeeded')
+       AND EXISTS (SELECT 1 FROM booking.provider_evidence
+                    WHERE intent_id = NEW.id AND kind = 'hostaway_reservation' AND external_ref = NEW.hostaway_reservation_id
+                      AND status = 'cancelled')) THEN
+    RAISE EXCEPTION 'CANCELLATION_NOT_VERIFIED' USING ERRCODE = 'check_violation';
+  END IF;
+  IF NEW.settlement_authorization_settled IS TRUE AND OLD.settlement_authorization_settled IS NOT TRUE
+     AND NOT booking.authorization_settled_for(NEW.id, NEW.stripe_payment_intent_id) THEN
+    RAISE EXCEPTION 'AUTHORIZATION_NOT_VERIFIED_SETTLED' USING ERRCODE = 'check_violation';
+  END IF;
+  IF (OLD.settlement_reservation_cancelled IS TRUE AND NEW.settlement_reservation_cancelled IS NOT TRUE)
+     OR (OLD.settlement_authorization_settled IS TRUE AND NEW.settlement_authorization_settled IS NOT TRUE) THEN
+    RAISE EXCEPTION 'settlement legs only move forward' USING ERRCODE = 'check_violation';
+  END IF;
+  IF NEW.state IS NOT DISTINCT FROM OLD.state THEN RETURN NEW; END IF;
+
+  -- C6: payment and everything after it require this intent's own active claim
+  IF NEW.state IN ('payment_pending', 'payment_authorized', 'reservation_pending', 'reservation_unknown', 'reservation_failed',
+                   'reservation_confirmed', 'capture_unknown', 'capture_failed', 'payment_captured', 'confirmed')
+     AND NOT EXISTS (SELECT 1 FROM booking.inventory_claims WHERE intent_id = NEW.id AND released_at IS NULL) THEN
+    RAISE EXCEPTION 'CLAIM_REQUIRED: % requires an active date claim', NEW.state USING ERRCODE = 'check_violation';
+  END IF;
+
+  -- C3: a payment attempt ends only on verified checkout expiry (a single declined card is not final)
+  IF NEW.state IN ('payment_failed', 'payment_expired') THEN
+    sess := coalesce(NEW.checkout_session_id, OLD.checkout_session_id);
+    IF sess IS NULL OR NOT EXISTS (SELECT 1 FROM booking.provider_evidence
+                                    WHERE intent_id = NEW.id AND kind = 'checkout_session' AND external_ref = sess AND status = 'expired') THEN
+      RAISE EXCEPTION 'CHECKOUT_EXPIRY_NOT_VERIFIED' USING ERRCODE = 'check_violation';
+    END IF;
+  END IF;
+
+  -- C4: a void is reported only after the void operation succeeded
+  IF OLD.state = 'reservation_failed' AND NEW.state = 'authorization_released'
+     AND NOT booking.authorization_settled_for(NEW.id, NEW.stripe_payment_intent_id) THEN
+    RAISE EXCEPTION 'VOID_NOT_VERIFIED' USING ERRCODE = 'check_violation';
+  END IF;
+
+  -- C5 / E3.2: "cancelled" after a failed capture needs BOTH legs verified (the flags above enforce each leg)
+  IF OLD.state = 'capture_failed' AND NEW.state = 'cancelled'
+     AND NOT (NEW.settlement_reservation_cancelled IS TRUE AND NEW.settlement_authorization_settled IS TRUE) THEN
+    RAISE EXCEPTION 'CANCELLATION_NOT_VERIFIED' USING ERRCODE = 'check_violation';
+  END IF;
+
+  -- C4: leaving reconciliation requires an unconsumed owner resolution for exactly this outcome
+  IF OLD.state = 'reconciliation_required' THEN
+    want := CASE NEW.state WHEN 'confirmed' THEN 'intent_confirmed' WHEN 'authorization_released' THEN 'intent_released'
+                           WHEN 'cancelled' THEN 'intent_cancelled' END;
+    SELECT * INTO r FROM booking.reconciliation_resolutions
+     WHERE intent_id = NEW.id AND decision = want AND consumed_at IS NULL ORDER BY created_at DESC LIMIT 1 FOR UPDATE;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'RESOLUTION_REQUIRED: % from reconciliation_required needs an owner resolution', NEW.state USING ERRCODE = 'check_violation';
+    END IF;
+    IF want = 'intent_confirmed' AND NEW.hostaway_reservation_id IS DISTINCT FROM r.result_ref THEN
+      RAISE EXCEPTION 'RESOLUTION_MISMATCH' USING ERRCODE = 'check_violation';
+    END IF;
+    UPDATE booking.reconciliation_resolutions SET consumed_at = NEW.updated_at, consumed_version = NEW.version WHERE id = r.id;
+    UPDATE booking.reconciliation_cases SET status = 'resolved',
+           resolution = CASE want WHEN 'intent_confirmed' THEN 'confirmed' WHEN 'intent_released' THEN 'released' ELSE 'cancelled' END,
+           resolved_by = r.resolver, resolved_at = NEW.updated_at
+     WHERE intent_id = NEW.id AND status = 'open'
+       AND NOT starts_with(kind, 'OFFLINE_CHARGE_HOLD_');   -- 0011: owner-hold cases stay open (bound to their holds)
+  END IF;
+  RETURN NEW;
+END $$;
+
+-- admin_close_case (0003, verbatim) refusing owner-hold cases
+CREATE OR REPLACE FUNCTION booking.admin_close_case(p_case uuid, p_evidence uuid[], p_resolver text, p_justification text, p_at timestamptz) RETURNS uuid
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE c booking.reconciliation_cases%ROWTYPE; res_id uuid := gen_random_uuid();
+BEGIN
+  SELECT * INTO c FROM booking.reconciliation_cases WHERE id = p_case FOR UPDATE;
+  IF NOT FOUND OR c.status <> 'open' THEN RAISE EXCEPTION 'CASE_NOT_OPEN' USING ERRCODE = 'check_violation'; END IF;
+  IF starts_with(c.kind, 'OFFLINE_CHARGE_HOLD_') OR c.opened_by LIKE 'recording-hold:%' THEN                  -- 0011
+    RAISE EXCEPTION 'HOLD_CASE_USE_ADMIN_RESOLVE_RECORDING_HOLD' USING ERRCODE = 'check_violation';
+  END IF;
+  IF c.opened_by LIKE 'op:%' THEN
+    RAISE EXCEPTION 'OPERATION_CASE_USE_ADMIN_RESOLVE_OPERATION' USING ERRCODE = 'check_violation';
+  END IF;
+  PERFORM booking.cited_evidence(c.intent_id, p_evidence);
+  INSERT INTO booking.reconciliation_resolutions (id, intent_id, decision, case_id, evidence_ids, resolver, justification_code,
+     resolver_session_user, decided_at)
+  VALUES (res_id, c.intent_id, 'case_closed', c.id, p_evidence, p_resolver, p_justification, session_user, p_at);
+  UPDATE booking.reconciliation_cases SET status = 'resolved', resolution = 'no_action', resolved_by = p_resolver, resolved_at = p_at
+   WHERE id = c.id;
+  RETURN res_id;
+END $$;
+
+-- ---------------------------------------------------------------------------------------------
+-- recording claim fence: the single gate for EVERY claim path (helper generic / opId / intentId, direct app UPDATE).
+CREATE FUNCTION booking.recording_claim_fence() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE i booking.intents%ROWTYPE;
+BEGIN
+  SELECT * INTO i FROM booking.intents WHERE id = NEW.intent_id FOR SHARE;
+  IF i.state IS DISTINCT FROM 'payment_captured' OR i.captured_minor IS DISTINCT FROM i.final_total_minor THEN
+    RAISE EXCEPTION 'RECORDING_CLAIM_FENCED: the intent is not payment_captured with an exact capture' USING ERRCODE = 'check_violation';
+  END IF;
+  IF i.hostaway_reservation_id IS NULL OR (NEW.payload ->> 'reservationId') IS DISTINCT FROM i.hostaway_reservation_id
+     OR (NEW.payload ->> 'amountMinor') IS DISTINCT FROM i.captured_minor::text THEN
+    RAISE EXCEPTION 'RECORDING_CLAIM_FENCED: payload is not bound to the intent reservation / captured amount' USING ERRCODE = 'check_violation';
+  END IF;
+  IF NEW.idempotency_key IS DISTINCT FROM 'och:' || NEW.intent_id::text || ':1' OR OLD.attempts IS DISTINCT FROM 0 OR OLD.dispatched_at IS NOT NULL
+     OR i.offline_charge_attempts IS DISTINCT FROM 0 THEN
+    RAISE EXCEPTION 'RECORDING_CLAIM_FENCED: only the never-dispatched initial attempt can be claimed' USING ERRCODE = 'check_violation';
+  END IF;
+  IF booking.recording_latest_id(NEW.intent_id) IS DISTINCT FROM NEW.id THEN
+    RAISE EXCEPTION 'RECORDING_CLAIM_FENCED: not the latest recording' USING ERRCODE = 'check_violation';
+  END IF;
+  IF booking.recording_active_hold_id(NEW.id) IS NOT NULL
+     OR EXISTS (SELECT 1 FROM booking.reconciliation_cases c WHERE c.intent_id = NEW.intent_id AND c.status = 'open' AND starts_with(c.kind, 'OFFLINE_CHARGE_HOLD_')) THEN
+    RAISE EXCEPTION 'RECORDING_CLAIM_FENCED: an owner hold is active for this recording or intent' USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NEW;
+END $$;
+REVOKE ALL ON FUNCTION booking.recording_claim_fence() FROM PUBLIC;
+CREATE TRIGGER external_operations_recording_claim_fence BEFORE UPDATE ON booking.external_operations
+  FOR EACH ROW WHEN (OLD.state = 'pending' AND NEW.state = 'in_flight' AND NEW.op_type = 'hostaway.record_offline_charge')
+  EXECUTE FUNCTION booking.recording_claim_fence();
+
+-- ---------------------------------------------------------------------------------------------
+-- DB-derived visibility holds (ATTEMPT_GT1, SUCCEEDED_UNPROVEN). No worker / lease / version / caller time.
+-- Lock order: intent SHARE -> op UPDATE -> advisory evidence key -> active hold -> open same-kind case, THEN v_t.
+CREATE FUNCTION booking.open_recording_visibility_hold(p_op uuid, p_reason text, p_by text) RETURNS uuid
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE v_intent uuid; i booking.intents%ROWTYPE; o booking.external_operations%ROWTYPE; h booking.recording_holds%ROWTYPE;
+        c booking.reconciliation_cases%ROWTYPE; v_t timestamptz; v_kind text; v_hold uuid := gen_random_uuid(); v_case uuid := gen_random_uuid();
+BEGIN
+  IF p_reason IS NULL OR p_reason NOT IN ('ATTEMPT_GT1', 'SUCCEEDED_UNPROVEN') THEN
+    RAISE EXCEPTION 'HOLD_REASON_INVALID: % is not a visibility hold reason', p_reason USING ERRCODE = 'check_violation';
+  END IF;
+  IF p_by IS NULL OR length(btrim(p_by)) NOT BETWEEN 1 AND 200 THEN RAISE EXCEPTION 'HOLD_BY_INVALID' USING ERRCODE = 'check_violation'; END IF;
+  SELECT intent_id INTO v_intent FROM booking.external_operations WHERE id = p_op AND op_type = 'hostaway.record_offline_charge';
+  IF v_intent IS NULL THEN RAISE EXCEPTION 'HOLD_TARGET_STATE: not a recording operation' USING ERRCODE = 'check_violation'; END IF;
+  SELECT * INTO i FROM booking.intents WHERE id = v_intent FOR SHARE;
+  SELECT * INTO o FROM booking.external_operations WHERE id = p_op FOR UPDATE;
+  PERFORM pg_advisory_xact_lock(hashtext('booking.recording_evidence'), hashtext(v_intent::text));
+  v_kind := 'OFFLINE_CHARGE_HOLD_' || p_reason;
+  SELECT * INTO h FROM booking.recording_holds WHERE operation_id = p_op AND released_at IS NULL FOR UPDATE;
+  SELECT * INTO c FROM booking.reconciliation_cases WHERE intent_id = v_intent AND kind = v_kind AND status = 'open' FOR UPDATE;
+  v_t := clock_timestamp();                                                                  -- after every potentially blocking lock
+  IF h.id IS NOT NULL THEN
+    IF h.reason = p_reason THEN RETURN h.id; END IF;                                        -- idempotent re-open: no write
+    RAISE EXCEPTION 'HOLD_ALREADY_ACTIVE: % hold % is active on this recording', h.reason, h.id USING ERRCODE = 'check_violation';
+  END IF;
+  IF booking.recording_latest_id(v_intent) IS DISTINCT FROM p_op THEN RAISE EXCEPTION 'HOLD_TARGET_NOT_LATEST' USING ERRCODE = 'check_violation'; END IF;
+  IF p_reason = 'ATTEMPT_GT1' THEN
+    IF o.state IS DISTINCT FROM 'pending' OR coalesce(booking.recording_attempt_no(o.idempotency_key), 0) <= 1 OR o.dispatched_at IS NOT NULL
+       OR i.state IS DISTINCT FROM 'payment_captured' THEN
+      RAISE EXCEPTION 'HOLD_TARGET_STATE: ATTEMPT_GT1 needs a never-dispatched pending attempt > 1 of a payment_captured intent'
+        USING ERRCODE = 'check_violation';
+    END IF;
+  ELSE
+    IF o.state IS DISTINCT FROM 'succeeded' OR o.result_ref IS NULL OR i.state NOT IN ('payment_captured', 'confirmed') THEN
+      RAISE EXCEPTION 'HOLD_TARGET_STATE: SUCCEEDED_UNPROVEN needs a succeeded recording with a result (payment_captured / confirmed)'
+        USING ERRCODE = 'check_violation';
+    END IF;
+    IF o.settled_evidence_id IS NOT NULL THEN RAISE EXCEPTION 'HOLD_TARGET_LINKED: the recording already has linked proof' USING ERRCODE = 'check_violation'; END IF;
+  END IF;
+  IF c.id IS NULL THEN
+    INSERT INTO booking.reconciliation_cases (id, intent_id, kind, status, opened_at, opened_by, evidence)
+    VALUES (v_case, v_intent, v_kind, 'open', v_t, 'recording-hold:' || v_case::text,
+            jsonb_build_object('operationId', p_op, 'reason', p_reason, 'opKey', o.idempotency_key, 'opState', o.state, 'intentVersion', i.version));
+  ELSE
+    v_case := c.id;                                                                          -- same-kind case of another op: join it
+  END IF;
+  INSERT INTO booking.recording_holds (id, operation_id, intent_id, reason, case_id, op_state_at_hold, op_key_at_hold, intent_state_at_hold,
+     intent_version_at_hold, created_at, created_by)
+  VALUES (v_hold, p_op, v_intent, p_reason, v_case, o.state, o.idempotency_key, i.state, i.version, v_t, p_by);
+  RETURN v_hold;
+END $$;
+REVOKE ALL ON FUNCTION booking.open_recording_visibility_hold(uuid, text, text) FROM PUBLIC;
+
+-- ---------------------------------------------------------------------------------------------
+-- evidence inbox: every offline-charge evidence row is enqueued IN ITS OWN TRANSACTION (inside the writer's INSERT, i.e.
+-- before the writer's advisory lock).
+CREATE FUNCTION booking.recording_inbox_enqueue() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+BEGIN
+  INSERT INTO booking.recording_conflict_inbox (evidence_id, intent_id, enqueued_at) VALUES (NEW.id, NEW.intent_id, clock_timestamp());
+  RETURN NULL;
+END $$;
+REVOKE ALL ON FUNCTION booking.recording_inbox_enqueue() FROM PUBLIC;
+CREATE TRIGGER zz1_evidence_enqueue AFTER INSERT ON booking.provider_evidence
+  FOR EACH ROW WHEN (NEW.kind = 'hostaway_offline_charges') EXECUTE FUNCTION booking.recording_inbox_enqueue();
+
+-- ONE inbox item per call. Caller contract (root addendum C): call it as its own top-level statement in AUTOCOMMIT; the
+-- database cannot stop a caller from wrapping several calls in one transaction (locks then accumulate; see the contract).
+-- The item row is locked SKIP LOCKED; its processing runs in a subtransaction: on any error the subtransaction (and the locks
+-- it took) is rolled back and only the error accounting (attempts + 1, last_error, last_attempt_at) is written; the item stays
+-- unprocessed. An error outside the block (or at COMMIT) marks nothing.
+CREATE FUNCTION booking.process_recording_conflict_inbox_one(p_by text) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE q booking.recording_conflict_inbox%ROWTYPE; v_op uuid; i booking.intents%ROWTYPE; o booking.external_operations%ROWTYPE;
+        h booking.recording_holds%ROWTYPE; c booking.reconciliation_cases%ROWTYPE; v_t timestamptz; v_out text; v_hold uuid; v_case uuid;
+        st text; msg text;
+BEGIN
+  IF p_by IS NULL OR length(btrim(p_by)) NOT BETWEEN 1 AND 200 THEN RAISE EXCEPTION 'INBOX_BY_INVALID' USING ERRCODE = 'invalid_parameter_value'; END IF;
+  SELECT * INTO q FROM booking.recording_conflict_inbox WHERE processed_at IS NULL ORDER BY attempts, seq LIMIT 1 FOR UPDATE SKIP LOCKED;
+  IF NOT FOUND THEN RETURN NULL; END IF;
+  BEGIN
+    SELECT * INTO i FROM booking.intents WHERE id = q.intent_id FOR SHARE;
+    v_op := booking.recording_latest_id(q.intent_id);
+    IF v_op IS NOT NULL THEN SELECT * INTO o FROM booking.external_operations WHERE id = v_op FOR SHARE; END IF;
+    PERFORM pg_advisory_xact_lock(hashtext('booking.recording_evidence'), hashtext(q.intent_id::text));
+    v_t := clock_timestamp();
+    IF v_op IS NULL OR booking.recording_latest_id(q.intent_id) IS DISTINCT FROM v_op OR o.state IS DISTINCT FROM 'succeeded'
+       OR o.settled_evidence_id IS NULL OR o.result_ref IS NULL THEN
+      v_out := 'not_latest_linked';                                                          -- judged by 0010 at completion / link / finalisation
+    ELSIF NOT booking.recording_evidence_contradicts(q.intent_id, o.dispatched_at, o.result_ref, o.settled_evidence_id, q.evidence_id) THEN
+      v_out := 'consistent';
+    ELSE
+      SELECT * INTO h FROM booking.recording_holds WHERE operation_id = v_op AND released_at IS NULL FOR UPDATE;
+      SELECT * INTO c FROM booking.reconciliation_cases
+       WHERE intent_id = q.intent_id AND kind = 'OFFLINE_CHARGE_HOLD_LINKED_CONTRADICTED' AND status = 'open' FOR UPDATE;
+      v_t := clock_timestamp();
+      IF h.id IS NOT NULL AND h.reason IS DISTINCT FROM 'LINKED_CONTRADICTED' THEN
+        RAISE EXCEPTION 'HOLD_STATE_UNEXPECTED: % hold % is active on a linked recording', h.reason, h.id USING ERRCODE = 'check_violation';
+      END IF;
+      IF h.id IS NOT NULL THEN
+        v_hold := h.id;
+        IF EXISTS (SELECT 1 FROM booking.recording_hold_observations WHERE hold_id = h.id AND evidence_id = q.evidence_id) THEN
+          v_out := 'contradiction_duplicate';
+        ELSE
+          INSERT INTO booking.recording_hold_observations (id, hold_id, evidence_id, recorded_at) VALUES (gen_random_uuid(), h.id, q.evidence_id, v_t);
+          v_out := 'contradiction_appended';
+        END IF;
+      ELSE
+        v_hold := gen_random_uuid();
+        IF c.id IS NULL THEN
+          v_case := gen_random_uuid();
+          INSERT INTO booking.reconciliation_cases (id, intent_id, kind, status, opened_at, opened_by, evidence)
+          VALUES (v_case, q.intent_id, 'OFFLINE_CHARGE_HOLD_LINKED_CONTRADICTED', 'open', v_t, 'recording-hold:' || v_case::text,
+                  jsonb_build_object('operationId', v_op, 'reason', 'LINKED_CONTRADICTED', 'opKey', o.idempotency_key, 'opState', o.state,
+                                     'intentVersion', i.version, 'firstEvidenceId', q.evidence_id));
+          v_out := 'contradiction_opened';
+        ELSE
+          v_case := c.id;
+          v_out := 'contradiction_joined_case';
+        END IF;
+        INSERT INTO booking.recording_holds (id, operation_id, intent_id, reason, case_id, op_state_at_hold, op_key_at_hold, intent_state_at_hold,
+           intent_version_at_hold, created_at, created_by)
+        VALUES (v_hold, v_op, q.intent_id, 'LINKED_CONTRADICTED', v_case, o.state, o.idempotency_key, i.state, i.version, v_t, p_by);
+        INSERT INTO booking.recording_hold_observations (id, hold_id, evidence_id, recorded_at) VALUES (gen_random_uuid(), v_hold, q.evidence_id, v_t);
+      END IF;
+    END IF;
+    UPDATE booking.recording_conflict_inbox SET processed_at = v_t, outcome = v_out, hold_id = v_hold WHERE evidence_id = q.evidence_id;
+    RETURN jsonb_build_object('evidenceId', q.evidence_id, 'outcome', v_out, 'holdId', v_hold);
+  EXCEPTION WHEN OTHERS THEN
+    GET STACKED DIAGNOSTICS st = RETURNED_SQLSTATE, msg = MESSAGE_TEXT;
+    UPDATE booking.recording_conflict_inbox
+       SET attempts = attempts + 1, last_error = left(st || ': ' || msg, 500), last_attempt_at = clock_timestamp()
+     WHERE evidence_id = q.evidence_id;
+    RETURN jsonb_build_object('evidenceId', q.evidence_id, 'error', st, 'message', left(msg, 300));
+  END;
+END $$;
+REVOKE ALL ON FUNCTION booking.process_recording_conflict_inbox_one(text) FROM PUBLIC;
+
+-- read-only contradiction page (replaces the restated JS predicate; same rows, columns, lossless cursor, latest-linked scope)
+CREATE FUNCTION booking.recording_contradictions_page(p_after_exact text, p_after_evidence uuid, p_after_op uuid, p_limit integer)
+RETURNS TABLE (op_id uuid, intent_id uuid, result_ref text, evidence_id uuid, source text, observed_at timestamptz, observed_at_exact text)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+#variable_conflict use_column
+DECLARE n integer;
+BEGIN
+  IF (p_after_exact IS NULL) IS DISTINCT FROM (p_after_evidence IS NULL) OR (p_after_exact IS NULL) IS DISTINCT FROM (p_after_op IS NULL)
+     OR (p_after_exact IS NOT NULL AND p_after_exact !~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$') THEN
+    RAISE EXCEPTION 'RECORDING_SCAN_CURSOR_INVALID' USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+  n := greatest(1, least(500, coalesce(p_limit, 100)));
+  RETURN QUERY
+    SELECT o.id, o.intent_id, o.result_ref, e.id, e.source, e.observed_at,
+           to_char(e.observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+      FROM booking.external_operations o
+      JOIN booking.provider_evidence e ON e.intent_id = o.intent_id AND e.kind = 'hostaway_offline_charges'
+     WHERE o.op_type = 'hostaway.record_offline_charge' AND o.state = 'succeeded' AND o.settled_evidence_id IS NOT NULL AND o.result_ref IS NOT NULL
+       AND o.dispatched_at IS NOT NULL AND o.id = booking.recording_latest_id(o.intent_id)
+       AND booking.recording_evidence_contradicts(o.intent_id, o.dispatched_at, o.result_ref, o.settled_evidence_id, e.id)
+       AND (p_after_exact IS NULL OR (e.observed_at, e.id, o.id) > (p_after_exact::timestamptz, p_after_evidence, p_after_op))
+     ORDER BY e.observed_at, e.id, o.id LIMIT n;
+END $$;
+REVOKE ALL ON FUNCTION booking.recording_contradictions_page(text, uuid, uuid, integer) FROM PUBLIC;
+
+-- ---------------------------------------------------------------------------------------------
+-- owner decisions (admin only). Lock order: intent SHARE -> op UPDATE -> advisory -> hold UPDATE -> case UPDATE, THEN v_t.
+--   keep_visible: acknowledgement only (evidence may be empty); hold stays active, case stays open; identical resubmission is a
+--     read-only no-op returning the earlier decision id.
+--   link_full_proof (SUCCEEDED_UNPROVEN only): validates the exact proof (owner_historical, >= 15 min after dispatch) at v_t and the
+--     candidate-reference contradiction check, attaches the link, records the decision and releases THIS hold in one transaction;
+--     resolves the case only when no other bound hold stays active. Does not call link_recording_evidence and has no bypass input.
+CREATE FUNCTION booking.admin_resolve_recording_hold(p_hold uuid, p_decision text, p_evidence uuid[], p_linked_evidence uuid,
+  p_resolver text, p_justification text, p_at timestamptz) RETURNS uuid
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE h0 booking.recording_holds%ROWTYPE; h booking.recording_holds%ROWTYPE; i booking.intents%ROWTYPE; o booking.external_operations%ROWTYPE;
+        c booking.reconciliation_cases%ROWTYPE; prev booking.recording_hold_decisions%ROWTYPE; v_t timestamptz; v_ev uuid[];
+        d_id uuid := gen_random_uuid(); r text;
+BEGIN
+  IF p_decision IS NULL OR p_decision NOT IN ('keep_visible', 'link_full_proof') THEN
+    RAISE EXCEPTION 'HOLD_DECISION_INVALID: %', p_decision USING ERRCODE = 'check_violation';
+  END IF;
+  IF p_at IS NULL THEN RAISE EXCEPTION 'HOLD_DECISION_INVALID: decision time required' USING ERRCODE = 'check_violation'; END IF;
+  SELECT * INTO h0 FROM booking.recording_holds WHERE id = p_hold;
+  IF NOT FOUND THEN RAISE EXCEPTION 'HOLD_NOT_FOUND' USING ERRCODE = 'check_violation'; END IF;
+  SELECT * INTO i FROM booking.intents WHERE id = h0.intent_id FOR SHARE;
+  SELECT * INTO o FROM booking.external_operations WHERE id = h0.operation_id FOR UPDATE;
+  PERFORM pg_advisory_xact_lock(hashtext('booking.recording_evidence'), hashtext(h0.intent_id::text));
+  SELECT * INTO h FROM booking.recording_holds WHERE id = p_hold FOR UPDATE;
+  SELECT * INTO c FROM booking.reconciliation_cases WHERE id = h.case_id FOR UPDATE;
+  v_t := clock_timestamp();                                                                  -- after every potentially blocking lock
+  v_ev := coalesce(p_evidence, '{}'::uuid[]);
+  IF h.released_at IS NOT NULL THEN
+    SELECT * INTO prev FROM booking.recording_hold_decisions WHERE id = h.release_decision_id;
+    IF p_decision = 'link_full_proof' AND prev.decision = 'link_full_proof' AND prev.linked_evidence_id IS NOT DISTINCT FROM p_linked_evidence THEN
+      RETURN prev.id;                                                                        -- same-proof replay: read-only no-op
+    END IF;
+    RAISE EXCEPTION 'HOLD_NOT_ACTIVE: hold % was released at %', h.id, h.released_at USING ERRCODE = 'check_violation';
+  END IF;
+  IF cardinality(v_ev) > 0 THEN PERFORM booking.cited_evidence(h.intent_id, v_ev); END IF;
+  IF p_decision = 'keep_visible' THEN
+    IF p_linked_evidence IS NOT NULL THEN RAISE EXCEPTION 'HOLD_DECISION_INVALID: keep_visible links nothing' USING ERRCODE = 'check_violation'; END IF;
+    SELECT * INTO prev FROM booking.recording_hold_decisions
+     WHERE hold_id = h.id AND decision = 'keep_visible' AND evidence_ids = v_ev AND resolver = p_resolver AND justification_code = p_justification
+       AND decided_at = p_at
+     ORDER BY recorded_at DESC LIMIT 1;
+    IF FOUND THEN RETURN prev.id; END IF;                                                    -- identical resubmission: no new row
+    INSERT INTO booking.recording_hold_decisions (id, hold_id, operation_id, case_id, intent_id, decision, evidence_ids, resolver, justification_code,
+       resolver_session_user, decided_at, recorded_at)
+    VALUES (d_id, h.id, h.operation_id, h.case_id, h.intent_id, 'keep_visible', v_ev, p_resolver, p_justification, session_user, p_at, v_t);
+    RETURN d_id;
+  END IF;
+  -- link_full_proof
+  IF h.reason IS DISTINCT FROM 'SUCCEEDED_UNPROVEN' THEN
+    RAISE EXCEPTION 'HOLD_DECISION_NOT_ALLOWED: link_full_proof applies to SUCCEEDED_UNPROVEN holds only' USING ERRCODE = 'check_violation';
+  END IF;
+  IF p_linked_evidence IS NULL THEN RAISE EXCEPTION 'HOLD_DECISION_INVALID: link_full_proof needs the proof evidence' USING ERRCODE = 'check_violation'; END IF;
+  IF NOT (p_linked_evidence = ANY (v_ev)) THEN v_ev := v_ev || p_linked_evidence; PERFORM booking.cited_evidence(h.intent_id, v_ev); END IF;
+  IF o.state IS DISTINCT FROM 'succeeded' OR o.result_ref IS NULL OR o.settled_evidence_id IS NOT NULL OR i.state NOT IN ('payment_captured', 'confirmed') THEN
+    RAISE EXCEPTION 'HOLD_TARGET_STATE: link_full_proof needs the held recording succeeded, unlinked, of a payment_captured / confirmed intent'
+      USING ERRCODE = 'check_violation';
+  END IF;
+  IF booking.recording_latest_id(h.intent_id) IS DISTINCT FROM o.id THEN RAISE EXCEPTION 'HOLD_TARGET_NOT_LATEST' USING ERRCODE = 'check_violation'; END IF;
+  r := booking.recording_proof_refusal(h.intent_id, o.payload, o.result_ref, o.dispatched_at, o.created_at, p_linked_evidence, 'owner_historical', v_t);
+  IF r IS NOT NULL THEN RAISE EXCEPTION 'RECORDING_PROOF_REFUSED: %', r USING ERRCODE = 'check_violation'; END IF;
+  r := booking.recording_conflict_refusal(h.intent_id, o.dispatched_at, o.result_ref, p_linked_evidence);   -- candidate reference
+  IF r IS NOT NULL THEN RAISE EXCEPTION 'RECORDING_EVIDENCE_CONFLICT: %', r USING ERRCODE = 'check_violation'; END IF;
+  INSERT INTO booking.recording_hold_decisions (id, hold_id, operation_id, case_id, intent_id, decision, evidence_ids, linked_evidence_id, resolver,
+     justification_code, resolver_session_user, decided_at, recorded_at)
+  VALUES (d_id, h.id, h.operation_id, h.case_id, h.intent_id, 'link_full_proof', v_ev, p_linked_evidence, p_resolver, p_justification, session_user, p_at, v_t);
+  UPDATE booking.external_operations SET settled_evidence_id = p_linked_evidence, updated_at = v_t WHERE id = o.id;
+  UPDATE booking.recording_holds SET released_at = v_t, release_decision_id = d_id WHERE id = h.id;
+  IF NOT EXISTS (SELECT 1 FROM booking.recording_holds WHERE case_id = c.id AND released_at IS NULL) THEN
+    UPDATE booking.reconciliation_cases SET status = 'resolved', resolution = 'recorded', resolved_by = p_resolver, resolved_at = v_t WHERE id = c.id;
+  END IF;
+  RETURN d_id;
+END $$;
+REVOKE ALL ON FUNCTION booking.admin_resolve_recording_hold(uuid, text, uuid[], uuid, text, text, timestamptz) FROM PUBLIC;
+
+-- ---------------------------------------------------------------------------------------------
+-- RLS + privileges: SELECT only, for app / admin / report; no write privilege for any role.
+DO $$
+DECLARE t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['recording_holds', 'recording_hold_decisions', 'recording_hold_observations', 'recording_conflict_inbox'] LOOP
+    EXECUTE format('ALTER TABLE booking.%I ENABLE ROW LEVEL SECURITY', t);
+    EXECUTE format('REVOKE ALL ON booking.%I FROM PUBLIC', t);
+    EXECUTE format('GRANT SELECT ON booking.%I TO mv_booking_app, mv_booking_admin, mv_booking_report', t);
+    EXECUTE format('CREATE POLICY app_ro ON booking.%I FOR SELECT TO mv_booking_app USING (true)', t);
+    EXECUTE format('CREATE POLICY admin_ro ON booking.%I FOR SELECT TO mv_booking_admin USING (true)', t);
+    EXECUTE format('CREATE POLICY report_ro ON booking.%I FOR SELECT TO mv_booking_report USING (true)', t);
+  END LOOP;
+END $$;
+GRANT EXECUTE ON FUNCTION booking.open_recording_visibility_hold(uuid, text, text) TO mv_booking_app, mv_booking_admin;
+GRANT EXECUTE ON FUNCTION booking.process_recording_conflict_inbox_one(text) TO mv_booking_app, mv_booking_admin;
+GRANT EXECUTE ON FUNCTION booking.recording_contradictions_page(text, uuid, uuid, integer) TO mv_booking_app, mv_booking_admin;
+GRANT EXECUTE ON FUNCTION booking.admin_resolve_recording_hold(uuid, text, uuid[], uuid, text, text, timestamptz) TO mv_booking_admin;
+
+-- ---------------------------------------------------------------------------------------------
+-- backfill (atomic with this migration): every existing offline-charge evidence row gets its inbox entry
+INSERT INTO booking.recording_conflict_inbox (evidence_id, intent_id, enqueued_at)
+SELECT e.id, e.intent_id, clock_timestamp() FROM booking.provider_evidence e WHERE e.kind = 'hostaway_offline_charges' ORDER BY e.created_at, e.id;

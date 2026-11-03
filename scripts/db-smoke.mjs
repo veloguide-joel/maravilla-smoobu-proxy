@@ -32,7 +32,9 @@ const EXPECTED_TABLE_PRIVS = {
   inventory_claims: [S, I], reconciliation_cases: [S, I],
   intent_transitions: [S, I], intent_applied_events: [S, I], payment_ledger: [S, I], intent_guests: [S, I],
   provider_evidence: [S], reconciliation_resolutions: [S], definite_refusal_codes: [S],
-  api_rate_limits: []   // E6 (0006): no direct table privilege; only booking.rate_limit_hit()
+  api_rate_limits: [],  // E6 (0006): no direct table privilege; only booking.rate_limit_hit()
+  // E7.4b-D1 (0011): owner-hold audit tables are read-only for the runtime role (writes only inside schema-owner functions)
+  recording_holds: [S], recording_hold_decisions: [S], recording_hold_observations: [S], recording_conflict_inbox: [S]
 };
 const ALL_PRIVS = ["SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"];
 const FUNCS_ALLOWED = ["booking.claim_release_blockers(uuid)", "booking.release_claim_if_safe(uuid,text)",
@@ -148,7 +150,7 @@ async function main() {
         const want = [...(EXPECTED_TABLE_PRIVS[t] || [])].sort().join(","), got = [...(actual[t] || [])].sort().join(",");
         if (want !== got) diffs.push(`${t}: expected ${want || "none"} got ${got || "none"}`);
       }
-      check("table_privilege_matrix_exact", diffs.length === 0 && tables.size === 18, diffs.length ? diffs : `${tables.size} tables`);
+      check("table_privilege_matrix_exact", diffs.length === 0 && tables.size === 22, diffs.length ? diffs : `${tables.size} tables`);
       check("no_delete_or_truncate_anywhere", !privRows.some((r) => r.ok && (r.priv === "DELETE" || r.priv === "TRUNCATE")));
 
       const fn = async (sig) => (await q("SELECT has_function_privilege(current_user, $1, 'EXECUTE') AS ok", [sig]))[0].ok;

@@ -211,3 +211,18 @@ export async function ageIntent(superPool, intentId, days) {
     await c.query("COMMIT");
   } catch (e) { await c.query("ROLLBACK"); throw e; } finally { c.release(); }
 }
+
+/**
+ * E7.4b-D1 (0011) TEST SETUP ONLY: write recording history that the fenced automatic path can no longer produce (e.g. an
+ * attempt > 1 that was sent before 0011, or handled by the owner outside automation). Runs as the SCHEMA OWNER with
+ * session_replication_role = replica, i.e. with every trigger bypassed, in one transaction. Never used by runtime code.
+ */
+export async function ownerManagedHistory(ownerPool, sql, params = []) {
+  const c = await ownerPool.connect();
+  try {
+    await c.query("BEGIN"); await c.query("SET LOCAL session_replication_role = replica");
+    const r = await c.query(sql, params);
+    await c.query("COMMIT");
+    return r;
+  } catch (e) { await c.query("ROLLBACK").catch(() => {}); throw e; } finally { c.release(); }
+}
