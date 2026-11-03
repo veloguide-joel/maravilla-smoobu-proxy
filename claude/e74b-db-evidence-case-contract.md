@@ -1,435 +1,519 @@
-# E7.4b D1 / D2: DB evidence-link and owner-case contract (DESIGN ONLY)
+# E7.4b D1 / D2: DB evidence-link and owner-case contract (DESIGN ONLY), revision 2
 
-- **Branch:** `feature/e7-offline-charge-db-contract`, cut from the accepted head `4f6b27f6ee4b37b44147adc980ec697677abdb09` (E7.4b-0 pure foundation, accepted offline).
-- **This document is a proposal.** Every migration, function, trigger, grant and helper change below is **PROPOSED ONLY**. Nothing here is applied, executable or authorized.
-- **Unchanged and still open:** worker / adapter / dispatch stay on **HOLD**; live gates E1–E7 / P1; the explicit `paymentMethod` owner choice; no automatic resend or attempt > 1.
+- **Branch:** `feature/e7-offline-charge-db-contract`.
+  - Revision 1: `e772987`, cut from the accepted `4f6b27f`.
+  - **Revision 2** answers root's HOLD on `e772987`, items 1–8. The resolution map is in §10.
+- **Every migration, function, trigger, grant and helper change below is PROPOSED ONLY.** Nothing is applied, executable or authorized.
+- Worker / adapter / dispatch stay on **HOLD**. Live gates E1–E7 / P1 stay open. The explicit `paymentMethod` owner choice and owner manual finalisation stay **outside** authorization. There is no automatic resend and no attempt > 1.
 
 Labels used throughout:
-- **[PRESENT]** current behaviour at `4f6b27f`, with exact path:line;
-- **[PROPOSED]** design.
+- **[PRESENT]** current behaviour at `4f6b27f` / `e772987` (no code differs);
+- **[PROPOSED]** design;
+- **[TRUST]** an input the DB cannot attest.
+
+**Root decisions recorded:**
+- **D2 first, then D1.**
+- Owner-linked proof keeps the **≥ 15 min after dispatch** requirement, with no historical maximum age.
 
 ---
 
-## 1. Present behaviour at 4f6b27f (inspected)
+## 1. Present behaviour (inspected; path:line)
 
 ### 1.1 Cases
 
-- **[PRESENT] `booking.reconciliation_cases`** (`db/migrations/0001_booking_core.up.sql:536–551`):
-  - columns `id`, `intent_id`, `kind`, `status open|resolved`, `opened_at`, `opened_by` (free text), `evidence` (jsonb), `resolution`, `resolved_by`, `resolved_at`;
-  - **unique open case per `(intent_id, kind)`** (`reconciliation_one_open_case`, l.549);
-  - no DELETE.
-- **[PRESENT] Grants** (`0002_roles_grants.up.sql:23–27`): `mv_booking_app` has **SELECT, INSERT, UPDATE** on `reconciliation_cases` and **SELECT, INSERT, UPDATE** on `external_operations`.
-  - `0003_safety_corrections.up.sql:675` revokes UPDATE on cases.
-  - `cases_safety_guard` (0003:462–470) refuses every non-privileged case UPDATE.
-- **⇒ The app role can already INSERT any case kind directly.** A general case writer already exists through the table grant. This design does **not** widen it, and it does not rely on cases for fencing (§3.2).
-- **[PRESENT] `openCase`** (`lib/booking-db/operations.js:29–34`) inserts with `ON CONFLICT (intent_id, kind) WHERE status='open' DO NOTHING`.
-  - If an open case of the same kind already exists for the intent, a **second operation's** case is silently dropped.
-  - Today one open recording per intent (0001:396–397) prevents two simultaneous recording cases. This design keeps D1 kinds distinct and makes conflicts **raise**, never silently drop (§3.4).
-- **[PRESENT] `admin_close_case`** (0003:640–656) refuses cases with `opened_by LIKE 'op:%'` (`OPERATION_CASE_USE_ADMIN_RESOLVE_OPERATION`). Other cases it closes with `no_action`.
+- `booking.reconciliation_cases` (0001:536–551): a unique open case per `(intent_id, kind)` (l.549); no DELETE.
+- App grants (0002:23–27): SELECT / INSERT / UPDATE on `reconciliation_cases` and on `external_operations`. UPDATE on cases is revoked (0003:675); `cases_safety_guard` (0003:462–470) refuses non-privileged case UPDATEs.
+- **⇒ The app can INSERT any case directly.** Cases are not a trustworthy fence.
+- `openCase` (operations.js:29–34) uses `ON CONFLICT (intent_id, kind) WHERE status='open' DO NOTHING`, which drops silently.
+- `admin_close_case` (0003:640–656) refuses `opened_by LIKE 'op:%'`.
 
 ### 1.2 Operations
 
-- **[PRESENT] `external_operations_guard`** (0001:399–428):
-  - identity columns are immutable;
-  - allowed moves: `pending → in_flight | superseded | escalated`; `in_flight → succeeded | failed_definite | outcome_unknown | escalated`; for non_idempotent, no `in_flight → pending` and no `outcome_unknown → pending`; `outcome_unknown | escalated → succeeded | failed_definite`.
-- **[PRESENT] `external_operations_safety_guard`** (0004:74–112):
+- **Operation guard.** `external_operations_guard` is **redefined in 0004:45–72**:
+  - it freezes **only** `id`, `intent_id`, `op_type`, `idempotency_key`, `retry_class`, `payload`, `max_attempts`, `created_at`, plus `attempts` (non-decreasing);
+  - it does **not** freeze `result_ref`, `dispatched_at`, `completed_at`, `source_version`, `settled_evidence_id`, `late_result_*`, `error_code`, lease fields or `next_attempt_at`;
+  - moves: `pending → in_flight | superseded | escalated`; `in_flight → succeeded | failed_definite | outcome_unknown | escalated`; `→ pending` only for read / idempotent; `outcome_unknown → succeeded | failed_definite | escalated`; `escalated → succeeded | failed_definite`; nothing leaves `succeeded`.
+  - The trigger is plpgsql, **SECURITY INVOKER**.
+- **Safety guard.** `external_operations_safety_guard` (0004:74–112; INVOKER):
   - `resolution_id` is set by privileged code only;
   - a recording INSERT is refused unless every earlier recording is owner-resolved or catalogued `failed_definite`;
-  - `outcome_unknown | escalated` move only when privileged;
-  - a non_idempotent row reaches `in_flight → failed_definite` only with a catalogued code (the catalogue is empty).
-  - **No rule on `→ succeeded` for recordings.**
-- **[PRESENT] Claim fences:**
-  - `capture_claim_fence` (0007:7–21) and `void_cancel_claim_fence` (0009:11–37) are BEFORE UPDATE triggers on `pending → in_flight`. They `SELECT … FROM intents FOR SHARE` and raise on refusal, so **every** claim path is fenced, including a direct UPDATE.
-  - **There is no recording fence.**
-  - `claimNextOperation` (operations.js:74–108): an unlocked candidate, then intent `FOR SHARE`, then op `FOR UPDATE SKIP LOCKED` with the same fences in SQL; it sets `in_flight`, `attempts + 1`, `dispatched_at`, lease.
-- **[PRESENT] `completeOperationOnce`** (operations.js:149–177):
-  - op `FOR UPDATE` only (no intent lock); the lease is checked against the **caller's** `now`;
-  - `succeeded` sets `result_ref`;
-  - `outcome_unknown` → `markUnknown` (l.179–205); for non_idempotent rows that opens `<KIND>_OUTCOME_UNKNOWN` with `opened_by 'op:<id>'`.
+  - leaving `outcome_unknown | escalated` requires privilege;
+  - non_idempotent `→ failed_definite` requires a catalogued code (the catalogue is empty);
+  - **no rule on recordings `→ succeeded`, and none on `result_ref` / `settled_evidence_id`.**
+- **`is_privileged()`** (0003:15–17) is `current_user = schema owner`. It is **true inside any schema-owner SECURITY DEFINER function, including those the app is granted** (`record_provider_evidence`, `settle_operation_from_evidence`). An INVOKER trigger therefore sees "privileged" whenever the UPDATE runs inside such a function.
+- **Claim fences.** `capture_claim_fence` (0007) and `void_cancel_claim_fence` (0009) are SECURITY DEFINER triggers on `pending → in_flight` that share-lock the intent. There is **no recording fence**.
+- **`claimNextOperation`** (operations.js:74–108) is intent-first (`FOR SHARE`), then op `FOR UPDATE SKIP LOCKED`. It sets `in_flight`, `attempts + 1`, **`dispatched_at = $2` (the caller's `now`)**, and `lease_until = caller now + leaseMs`.
+- **`completeOperationOnce`** (operations.js:149–177) locks the op `FOR UPDATE` only. It checks the lease against the **caller's** `now` and sets `result_ref` and **`completed_at = caller now`**.
 
 ### 1.3 Evidence and settlement
 
-- **[PRESENT] `settled_evidence_id`** (0004:26; FK → `provider_evidence`).
-  - Its only runtime writer is `settle_operation_from_evidence` (0005:239–289), **reconcile_first only**.
-  - It is immutable once set (`0008_settled_evidence_immutable.up.sql`: `zz_` trigger; NULL → id allowed once; clear or repoint refused for every role).
-- **[PRESENT] `provider_evidence`:**
-  - append-only (0003:73–76);
-  - `read_operation_id UNIQUE`, so one evidence row per read (0003:61);
-  - API evidence only via `record_provider_evidence` (0003:474–506), from a **succeeded** read of the matching type, `external_ref` = the read's selector, `observed_at` = the read's `completed_at`;
-  - `validate_evidence` (0005:173–…) requires, for `hostaway_offline_charges`, only `status listed`, `matchingChargeCount` and the ids array.
-- **[PRESENT] `admin_resolve_operation`** (0005:296–384, `mv_booking_admin` only):
-  - for a recording, `succeeded` needs API evidence ≥ dispatch + 15 min with count 1 and id = result. `failed_definite` needs API **and** dashboard count 0.
-  - It sets `state`, `result_ref`, `resolution_id` and resolves the `op:<id>` case.
-  - **It never sets `settled_evidence_id`.** It locks the op `FOR UPDATE` first and reads the intent without a lock.
-- **[PRESENT] E3 success guard** (`lib/booking-db/repo.js:286–290`): `OFFLINE_CHARGE_RECORDED` needs only the latest recording `succeeded` with `result_ref = chargeId`.
-- **[PRESENT] DB:** no intent-row rule ties `payment_captured → confirmed` to evidence (`intents_safety_guard`, 0004:114–…, has no recording rule).
-- **[PRESENT] Work lease:** `booking.intent_work` (0001:252–258): `work_worker_id`, `work_lease_until`, checked by workers in application code.
-- **[PRESENT] `is_privileged()`** (0003:15–17): true only inside schema-owner SECURITY DEFINER functions or for the owner.
+- **`settled_evidence_id`** (0004:26): an FK to `provider_evidence`. Its only runtime writer is `settle_operation_from_evidence` (0005:239–289, reconcile_first only).
+  - 0008 refuses clearing or repointing a **non-null** value on UPDATE, for every role. It does not constrain INSERT, and does not constrain the first NULL → id.
+- **`provider_evidence`:** append-only (0003:73–76); `read_operation_id UNIQUE` (0003:61).
+  - API evidence comes only via `record_provider_evidence` (0003:474–506), from a succeeded read of the matching type, with `external_ref` = the read selector and **`observed_at := read.completed_at` (a caller-supplied time)**.
+  - Dashboard evidence comes via `admin_record_evidence` (0003:508–519), with an owner-supplied `observed_at`.
+- **`admin_resolve_operation`** (0005:296–384, admin only):
+  - **Correction of revision 1:** for a recording, `succeeded` (0005:327–331) requires cited evidence of kind `hostaway_offline_charges` with `external_ref` = reservation, `observed_at ≥ dispatch + 15 min`, count 1 and id = result. **It does not require `source = 'hostaway_api'`**, so matching **dashboard** evidence is accepted.
+  - It sets `state`, `result_ref`, `completed_at`, `resolution_id`, and resolves the `op:<id>` case. **It never sets `settled_evidence_id`.**
+  - It locks the op first and reads the intent without a lock.
+- **E3 success guard** (repo.js:286–290): only `succeeded` + `result_ref`. There is no DB intent rule for `payment_captured → confirmed`.
+- **`intent_work`** (0001:252–258) leases are checked in application code.
 
 ---
 
-## 2. Design principles
+## 2. Principles
 
-1. **Paid truth is never weakened.**
-   - Nothing here changes `payment_captured` / `confirmed` / public "confirmed", sends `ESCALATE`, or creates void / cancel / refund / notify rows.
-   - **No row is ever moved to "possibly sent" just to raise an alert:** `dispatched_at` is untouched, and there is no fake send and no fake `outcome_unknown`.
-2. **Fail closed by construction.** A hold must **block every claim path**, including a generic or direct UPDATE, through a trigger, never only a convention.
-3. **Narrow surfaces.** Each new function serves recordings only. No general case writer is added for the app role. No change applies to other op types.
-4. **Intent-first lock order** everywhere new: `intents` → `intent_work` → `external_operations` → (read-only) `provider_evidence` → new tables → `reconciliation_cases`.
-5. **The DB checks facts; workers are trusted for provenance.** The DB can verify bindings between persisted rows. It **cannot** attest that an external call happened, which real credential served it, or that a pure assessment ran correctly (§5.3).
+1. Paid truth is never weakened.
+   - No ESCALATE, void, cancel, refund or notify.
+   - No `dispatched_at` change to raise an alert; no fake send or unknown result.
+2. Every guarantee is enforced **on the prospective `NEW` row** by INVOKER triggers, for **every** writer (app INSERT / UPDATE, SECURITY DEFINER functions, owner functions), scoped to `op_type = 'hostaway.record_offline_charge'`. Other op types keep their semantics.
+3. **Authorization ≠ validation.**
+   - Authorization guards are SECURITY INVOKER and use `is_privileged()` only to mean "inside a schema-owner function".
+   - **Which** function is enforced by grants (the app may EXECUTE only the named recording functions) plus function-internal checks.
+   - SECURITY DEFINER validators may read rows but never stand in for caller authorization.
+4. The DB attests **persisted bindings**. Times written by callers stay caller times. Provenance, the real account and configured-method agreement stay **[TRUST]**.
 
 ---
 
-## 3. D1: durable case-only hold for recordings
+## 3. D2 (first): recording success lifecycle
 
-### 3.1 Reasons (closed set)
+### 3.1 Recording lifecycle invariants [PROPOSED; INVOKER trigger `zz0_recording_lifecycle_guard`, BEFORE INSERT OR UPDATE, `op_type = 'hostaway.record_offline_charge'`]
 
-| Reason | Target row (state at creation) | Who may create | Blocks |
-|---|---|---|---|
-| `PREFLIGHT_EXHAUSTED` | initial recording, `pending`, `dispatched_at` NULL, `attempts 0`, key `och:{intent}:1` | app (worker) via function | claim |
-| `PREFLIGHT_CONFLICT_MARKER` / `_LOOKALIKE` / `_SAME_AMOUNT` | same | app via function, citing a persisted assessment with that outcome (§3.5) | claim |
-| `ATTEMPT_GT1` | a recording `pending`, key suffix > 1 | app via function (and later by the intrinsic fence, §3.3) | claim (always; no automation resend) |
-| `SUCCEEDED_UNPROVEN` | a recording `succeeded` with `settled_evidence_id` NULL (an owner resolution with count-only evidence, or a legacy row) | app via function | the E7.4b finalisation path (§4.4); never reverses the owner's resolution |
+The trigger runs after the existing guards (name order) and before 0008's `zz_` trigger. It **validates `NEW` field values** and never re-SELECTs the row by `NEW.id`, which would read the OLD tuple in a BEFORE trigger.
 
-### 3.2 Representation [PROPOSED]
+**On INSERT:**
+- `settled_evidence_id`, `result_ref`, `completed_at`, `dispatched_at`, `lease_*`, `late_result_*`, `resolution_id` are all NULL;
+- `attempts = 0`; `state = 'pending'`;
+- the key matches `^och:<intent_id>:[1-9][0-9]*$` with `<intent_id> = NEW.intent_id`.
 
-**New table `booking.recording_holds`** (no app INSERT / UPDATE / DELETE grant; written only through SECURITY DEFINER functions; append-only except for release columns set by the owner function):
+So proof cannot be pre-seeded.
 
-| Column | Meaning |
+**On every UPDATE:**
+
+| Field | Rule |
 |---|---|
-| `id uuid PK` | |
-| `operation_id uuid NOT NULL → external_operations(id)` | target recording |
-| `intent_id uuid NOT NULL` | must equal the operation's intent (checked) |
-| `reason text NOT NULL CHECK (reason IN (…§3.1…))` | |
-| `op_state_at_hold text NOT NULL`, `op_key_at_hold text NOT NULL`, `intent_version_at_hold int NOT NULL`, `source_version int NOT NULL` | immutable binding |
-| `assessment_id uuid NULL → recording_assessments(id)` | required for the conflict reasons |
-| `case_id uuid NOT NULL → reconciliation_cases(id)` | |
-| `created_at timestamptz NOT NULL DEFAULT statement_timestamp()` | DB clock |
-| `released_at`, `release_decision`, `release_resolution_id` | owner function only |
+| `source_version`, `created_at`, key, payload | frozen (the key and payload are already frozen by 0004) |
+| `dispatched_at` | NULL → value **only** with `OLD.state='pending' AND NEW.state='in_flight'`; then frozen |
+| `completed_at` | NULL → value only on a transition **into** `succeeded \| failed_definite`; then frozen |
+| `result_ref` | NULL → value only on a transition into `succeeded`; frozen afterwards (also while staying `succeeded`) |
+| `state → succeeded` | requires `is_privileged()` (inside an owner function, or a granted recording function), **and** either (a) `NEW.settled_evidence_id` is non-null and valid for `NEW` (§3.2), or (b) `NEW.resolution_id IS NOT NULL` (owner resolution; owner-only by 0004) |
+| `settled_evidence_id` NULL → id | requires `is_privileged()`, `NEW.state = 'succeeded'`, and `recording_proof_refusal(NEW…) IS NULL`; never on a non-succeeded row |
+| `late_result_*` | NULL → value only while `NEW.state IN ('outcome_unknown','escalated')` (present use); frozen once set. Today a second late result overwrites the first. For recordings it would be refused instead; the PROPOSED helper keeps returning `LEASE_LOST` (first late evidence kept) |
+| after `succeeded` | every column frozen except `updated_at` |
 
-- Unique **one active hold per operation**: `UNIQUE (operation_id) WHERE released_at IS NULL`.
-- Guard trigger: identity columns are immutable; release only by privileged code; no delete.
+- A direct app UPDATE (`current_user = mv_booking_app`) can therefore never set `succeeded`, attach a link, or relabel `result_ref`, `dispatched_at` or `completed_at` once set.
+- Inside the granted functions, `is_privileged()` is true, so the **function** enforces leases and version (§3.3) and the **trigger** still validates `NEW`.
 
-**Why a table and not the case alone:** the app can already INSERT cases (§1.1), so a case cannot be a trustworthy claim fence. The hold row is the fence; the case is the **visibility**.
-
-**Why not `pending → escalated`** (the existing guard already allows it for the app):
-- it would discard the "never dispatched, still pending" truth;
-- from `escalated` only `→ succeeded | failed_definite` remain, so an owner could never release an attempt-1 row back to automation;
-- `admin_resolve_operation(failed_definite)` would then demand API + dashboard absence for a row that provably was never sent.
-- **Rejected.**
-
-### 3.3 Claim fence [PROPOSED; future migration 0010]
-
-`booking.recording_claim_fence()` is a BEFORE UPDATE trigger, `WHEN (OLD.state='pending' AND NEW.state='in_flight' AND NEW.op_type='hostaway.record_offline_charge')`, SECURITY DEFINER, VOLATILE, `REVOKE … FROM PUBLIC`, like 0007/0009. It raises `RECORDING_CLAIM_FENCED:<reason>` unless **all** of the following hold:
-
-| Check | Kind |
-|---|---|
-| intent `FOR SHARE`: `state = 'payment_captured'`, `captured_minor = final_total_minor` | intrinsic (the §4.1 items of the R2 contract) |
-| `NEW.payload->>'reservationId' = hostaway_reservation_id`; `(NEW.payload->>'amountMinor')::bigint = captured_minor` | intrinsic |
-| key = `'och:'||intent_id||':1'` and `offline_charge_attempts = 0` (initial attempt only) | intrinsic |
-| the row is the latest recording of the intent | intrinsic |
-| `OLD.attempts = 0`, `OLD.dispatched_at IS NULL` | intrinsic |
-| **NOT EXISTS active `recording_holds` for `NEW.id`** | D1 |
-
-Notes:
-- Each check is evaluated in a fresh READ COMMITTED snapshot inside the trigger (VOLATILE plpgsql), so a hold committed before the claim's row lock is granted is seen.
-- `claimNextOperation` gets a matching SQL `RECORD_FENCE` in both stages, to skip fenced rows instead of raising. That is a helper change, **PROPOSED**.
-- Worker-specific checks (scope, work lease, planned version, evidence freshness) stay in the worker (R2 §4.2). The trigger does not pretend to know them.
-
-### 3.4 Hold creation [PROPOSED]
+### 3.2 Proof validator [PROPOSED]
 
 ```
-booking.open_recording_hold(p_op uuid, p_reason text, p_expected_version int,
-                            p_assessment uuid DEFAULT NULL, p_detail jsonb DEFAULT '{}') RETURNS uuid
-  SECURITY DEFINER; EXECUTE granted to mv_booking_app only.
+booking.recording_proof_refusal(p_intent uuid, p_payload jsonb, p_result_ref text, p_dispatched_at timestamptz,
+                                p_created_at timestamptz, p_evidence uuid, p_mode text)
+  RETURNS text   -- NULL = acceptable
+  -- p_mode IN ('worker_fresh', 'owner_historical')
 ```
 
-All-or-nothing, in one transaction:
-1. `SELECT … FROM intents WHERE id = (SELECT intent_id FROM external_operations WHERE id = p_op) FOR SHARE`. The op's `intent_id` is immutable (0001 guard).
-2. `SELECT … FROM external_operations WHERE id = p_op FOR UPDATE`. This waits for any in-progress claim of this row.
+STABLE, SECURITY DEFINER (reads rows only), EXECUTE revoked from PUBLIC; called by the trigger and functions with **`NEW` values**. It returns a refusal unless **all** of the following hold.
+
+**Evidence row `e`:**
+- `kind 'hostaway_offline_charges'`, `source 'hostaway_api'`, `status 'listed'`;
+- `e.intent_id = p_intent`.
+
+**Read binding:**
+- `r = e.read_operation_id`;
+- `r.intent_id = p_intent`, `r.op_type = 'hostaway.list_offline_charges'`, `r.retry_class = 'read'`, `r.state = 'succeeded'`;
+- `r.payload->>'reservationId' = e.external_ref = p_payload->>'reservationId' = intents.hostaway_reservation_id`;
+- `e.observed_at = r.completed_at` (equality, as `record_provider_evidence` sets it).
+
+**Operation window:**
+- `p_dispatched_at IS NOT NULL`;
+- `r.created_at ≥ p_created_at`;
+- `r.dispatched_at ≥ p_dispatched_at` (the read was claimed at or after the recording send);
+- `e.observed_at > p_dispatched_at`.
+
+**No future** (DB clock): `p_dispatched_at ≤ statement_timestamp()` and `e.observed_at ≤ statement_timestamp()`.
+
+**Mode:**
+- `worker_fresh`: `e.observed_at ≥ statement_timestamp() − interval '10 minutes'`. The confirm must be fresh at completion.
+- `owner_historical`: `e.observed_at ≥ p_dispatched_at + interval '15 minutes'`, with **no** maximum age.
+
+**`e.observed`:**
+- has exactly `EVIDENCE_OBSERVED_KEYS` (E7.4b-0);
+- `matchingChargeCount = 1`; `matchingChargeIds = [p_result_ref]`; `chargeId = p_result_ref`, a canonical decimal string;
+- `reservationId` = reservation; `listingMapId = intents.listing_id`;
+- `amountMinor = (p_payload->>'amountMinor')::bigint = intents.captured_minor = intents.final_total_minor`;
+- `currency = intents.currency`;
+- `status 'paid'`, `type 'charge'`, `paymentProvider 'offline'`;
+- `paymentMethod IN ('credit_card','other')` (the approved set);
+- `title = 'maraVilla payment mvoch1-' || p_intent`; `marker = 'mvoch1-' || p_intent`;
+- `readCount` an integer in 1..500.
+
+**Conflict:** no other `hostaway_offline_charges` evidence for `p_intent` observed after `p_dispatched_at` lists this marker with a different charge id. This is **serialized** by §3.5.
+
+**[TRUST]:**
+- that the read happened against Hostaway and `observed` is its true content;
+- that `executorAccountRef` is the same real account and credential;
+- that `paymentMethod` equals the **configured** owner choice;
+- that `dispatched_at` / `completed_at` reflect real times. They are **caller-supplied** (claim and complete use the caller's `now`). The DB checks only their mutual consistency and that none is in the DB-clock future.
+
+### 3.3 Functions [PROPOSED]
+
+**`complete_recording_with_evidence`**
+
+```
+booking.complete_recording_with_evidence(p_op uuid, p_worker text, p_evidence uuid, p_result_ref text, p_expected_version int)
+  RETURNS text      -- SECURITY DEFINER; EXECUTE: mv_booking_app
+```
+
+1. `intents FOR SHARE` (the intent id is looked up first without a lock; it is immutable), then `intent_work FOR SHARE`, then the op `FOR UPDATE`.
+2. Under those locks:
+   - intent `payment_captured`, `version = p_expected_version`;
+   - `work_worker_id = p_worker` and `work_lease_until ≥ statement_timestamp()`;
+   - op `in_flight`, `lease_worker_id = p_worker` and `lease_until ≥ statement_timestamp()`;
+   - the op is the deterministic latest recording (§3.6), key attempt 1, `attempts = 1`;
+   - (D1 era) no active hold.
+   - **[TRUST]** `lease_until` was computed from the caller's clock at claim time.
+3. Take the per-intent recording-evidence lock (§3.5).
+4. `UPDATE … SET state='succeeded', result_ref=p_result_ref, settled_evidence_id=p_evidence, completed_at=statement_timestamp(), lease cleared`. The trigger validates `NEW` in `worker_fresh` mode.
+5. Any refusal raises and the whole transaction rolls back.
+
+**`link_recording_evidence`**
+
+```
+booking.link_recording_evidence(p_op uuid, p_evidence uuid)          -- SECURITY DEFINER; EXECUTE: mv_booking_app
+```
+
+- For a recording already `succeeded` with a NULL link (owner-resolved or inherited).
+- Locks: intent `FOR SHARE` → op `FOR UPDATE` → evidence lock (§3.5).
+- Mode `owner_historical`.
+- Requires `result_ref` non-null (the link binds the **existing** `result_ref`; it never sets one).
+- (D1 era) **refuses while an active hold exists** (§4.6).
+- Sets NULL → id; 0008 then freezes it.
+
+**`completeOperation` routing** [PROPOSED helper]:
+- before taking any lock, `SELECT op_type` (immutable) without a lock;
+- recordings with `succeeded` → call the function (intent-first);
+- recordings with `outcome_unknown` → the existing path (op lock, then the case).
+- So the generic op-first lock is never held when the intent-first function runs.
+
+### 3.4 Finalisation rule [PROPOSED addition to `intents_safety_guard`; INVOKER]
+
+An intent moves `payment_captured → confirmed` only if:
+- the deterministic latest recording (§3.6) is `succeeded`;
+- its `settled_evidence_id IS NOT NULL`;
+- its `result_ref = NEW.offline_charge_id`;
+- (D1 era) no active hold for it.
+
+The `repo.js` event guard mirrors this [PROPOSED helper]. The generic planner (`succeeded` / `resultRef`) can therefore never finalise an unproven row.
+
+### 3.5 Serialising evidence writers [PROPOSED]
+
+A `NOT EXISTS` conflict check alone cannot see a concurrent, uncommitted evidence insert. Both writers therefore take `pg_advisory_xact_lock(hashtext('booking.recording_evidence'), hashtext(intent_id::text))`:
+- `record_provider_evidence` for kind `hostaway_offline_charges` (a **modification**, scoped to that kind);
+- the link and completion functions.
+
+The conflict check then runs after the lock, so a conflicting evidence row either committed before (and is seen, giving a refusal) or waits until the link commits. A later conflicting evidence row cannot change an existing link (0008). That evidence surfaces through D1 (§4) as a conflict for the owner, not as an automatic reversal.
+
+Key space: a distinct first key from the accepted per-listing claim lock (`hashtext('booking.inventory_claims')`).
+
+### 3.6 Deterministic latest recording [PROPOSED]
+
+- "Latest" = the maximum attempt number parsed from the **immutable** `idempotency_key` (`och:<intent>:<n>`), then `created_at`, then `id`.
+- `source_version` is mutable today (0004 guard). It is frozen for recordings by §3.1 but not used for ordering.
+
+### 3.7 D2-only refusal surfacing
+
+There is no hold table in the D2 era. Refusals surface through existing paths only:
+- a completion refusal → the worker calls `completeOperation(outcome_unknown)` → the existing `OFFLINE_CHARGE_OUTCOME_UNKNOWN` case;
+- a link refusal on an owner-resolved row → the row stays `succeeded` without a link, finalisation stays blocked by §3.4, and the owner sees it through the documented read-only query (latest recording `succeeded` with a NULL link).
+
+There is **no** hold function in the D2 era, and no dispatch worker exists in it (still HOLD).
+
+### 3.8 Inherited rows
+
+- **`payment_captured` + succeeded without a link:** blocked from finalisation until linked or owner-handled.
+- **Already `confirmed` + succeeded without a link** (finalised before the migration): §3.4 does not revisit them. Paid and confirmed truth is kept.
+  - `link_recording_evidence` may still attach proof later (`owner_historical`).
+  - D1 adds visibility-only holds for them (§4.1). Nothing reverses the state.
+
+### 3.9 Migration 0010 rollback contract [PROPOSED]
+
+**Down precondition, checked first; RAISE if violated:** no recording row has `settled_evidence_id IS NOT NULL`, and none is in `in_flight | succeeded | outcome_unknown | escalated` (no progress beyond `pending`).
+
+- Only then drop the trigger rules, then the functions, then restore `record_provider_evidence`.
+- So a downgrade can never silently re-enable unproven finalisation after linked or completed recordings exist.
+- Disposable local DBs only; no live rollback.
+
+---
+
+## 4. D1 (second): durable case-only holds
+
+### 4.1 Reasons
+
+| Reason | Target row at creation | Intent states |
+|---|---|---|
+| `PREFLIGHT_EXHAUSTED` | key attempt 1, `pending`, `dispatched_at` NULL, `attempts 0` | `payment_captured` |
+| `PREFLIGHT_CONFLICT_MARKER` / `_LOOKALIKE` / `_SAME_AMOUNT` | same + a cited assessment with that outcome | `payment_captured` |
+| `ATTEMPT_GT1` | key attempt > 1, `pending` | `payment_captured` |
+| `SUCCEEDED_UNPROVEN` | `succeeded`, NULL link | `payment_captured` **or `confirmed`** (inherited; visibility only, §3.8) |
+
+### 4.2 Tables [PROPOSED; no app INSERT / UPDATE / DELETE; RLS deny by default; app + admin SELECT]
+
+**`recording_holds`:**
+- `id` (PK, pre-allocated by the function);
+- `operation_id`, `intent_id`, `reason`;
+- `op_state_at_hold`, `op_key_at_hold`, `intent_version_at_hold`;
+- `assessment_id` (nullable), `case_id NOT NULL → reconciliation_cases(id)`;
+- `epoch int`, `created_at DEFAULT statement_timestamp()`, `created_by_worker text`;
+- `released_at`, `release_decision`, `release_resolution_id`.
+
+Constraints and guard:
+- `UNIQUE (operation_id) WHERE released_at IS NULL`;
+- guard: identity frozen; release columns set NULL → value once, by privileged code only; no delete.
+
+**`recording_assessments`:** see §4.4.
+
+### 4.3 Claim fence [PROPOSED; SECURITY DEFINER trigger on `pending → in_flight` for recordings, like 0007 / 0009]
+
+It refuses unless all of these hold:
+- intent `FOR SHARE` in `payment_captured`, `captured_minor = final_total_minor`;
+- payload reservation = `hostaway_reservation_id`; payload amount = `captured_minor`;
+- key attempt 1 and `offline_charge_attempts = 0`;
+- deterministic latest recording;
+- `OLD.attempts = 0`, `OLD.dispatched_at IS NULL`;
+- **no active hold for the op**, and (fail-closed, §4.5) **no open `OFFLINE_CHARGE_HOLD_%` case for the intent**.
+
+`claimNextOperation` mirrors this as `RECORD_FENCE` in both stages [PROPOSED helper].
+
+Lock behaviour:
+- The **helper path is intent-first and serialized**.
+- A **direct app UPDATE** takes the op row lock first and then the trigger's intent share lock (op → intent). Against `applyEvent` (intent NO KEY UPDATE, then op SHARE in `inTx`), that can deadlock. PostgreSQL aborts one side with **40P01: a bounded, retryable failure, never a fence bypass** (the accepted 0007 stance).
+
+### 4.4 Assessments: identity, deduplication, epochs [PROPOSED]
+
+**`recording_assessments`** columns:
+- `id`, `operation_id`, `intent_id`;
+- `phase`, `outcome`, `code`;
+- `identity_read_op`, `list_read_op`, `identity_evidence`, `list_evidence`;
+- `epoch`, `intent_version`, `worker`, `module_version`, `recorded_at DEFAULT statement_timestamp()`.
+
+**One assessment = one read opportunity:**
+- `UNIQUE (identity_read_op) WHERE identity_read_op IS NOT NULL`;
+- `UNIQUE (list_read_op) WHERE list_read_op IS NOT NULL`.
+- A read row can be counted in **at most one** assessment, so repeating an assessment without a new read is refused (unique violation). An incomplete read is still a read row: it cites `list_read_op` with no `list_evidence`.
+
+**Allowed combinations** (CHECK):
+
+| Phase | Outcome | Required |
+|---|---|---|
+| preflight | `eligible` | both reads `succeeded`; `identity_evidence` (kind `hostaway_reservation`) and `list_evidence` (`hostaway_offline_charges`) of exactly those reads |
+| preflight | `conflict_marker` / `conflict_lookalike` / `conflict_same_amount` | list read `succeeded` + `list_evidence` |
+| preflight | `incomplete` | list read terminal; **no** `list_evidence` |
+| preflight | `identity_refused` | identity read terminal; no list read |
+| confirm | `confirm_ok` | list read `succeeded` + `list_evidence` |
+| confirm | `confirm_zero` / `confirm_multiple` / `confirm_mismatch` | list read `succeeded` + `list_evidence` |
+| confirm | `confirm_incomplete` | list read terminal; no `list_evidence` |
+
+**`record_recording_assessment(p_op, p_worker, p_phase, p_outcome, p_code, p_identity_read, p_list_read, p_identity_evidence, p_list_evidence, p_expected_version, p_module_version)`** (SECURITY DEFINER; app EXECUTE). Locks: intent `FOR SHARE` → `intent_work FOR SHARE` → op `FOR SHARE`. Checks:
+- the version;
+- `work_worker_id = p_worker` with a live work lease (DB clock);
+- reads: same intent, the right types, `created_at ≥` the recording's `created_at`, terminal;
+- for preflight, also `created_at ≥` the current epoch start;
+- preflight only while the op is `pending` and undispatched;
+- confirm only while the op is `in_flight` with `lease_worker_id = p_worker` and a live op lease.
+
+**[TRUST]** that the outcome is the correct pure classification. It is recorded with the module version for audit.
+
+**Epochs and bounds:**
+- `epoch` = the number of **released** PREFLIGHT_* holds for the op at insert time (computed under the op lock).
+- The exhaustion bound counts **only the current epoch**: non-eligible preflight assessments ≥ 3.
+- An owner `release_for_initial_send` starts a new epoch (§4.6), so a lifetime count never re-trips immediately.
+
+### 4.5 Hold creation [PROPOSED]
+
+```
+booking.open_recording_hold(p_op uuid, p_worker text, p_reason text, p_expected_version int,
+                            p_assessment uuid DEFAULT NULL) RETURNS uuid   -- SECURITY DEFINER; EXECUTE: mv_booking_app
+```
+
+**Order (all-or-nothing):**
+1. Pre-allocate `hold_id` and `case_id` (`gen_random_uuid()`).
+2. Locks: intent `FOR SHARE` → `intent_work FOR SHARE` → op `FOR UPDATE`.
 3. Re-check **current** state under the locks:
-   - op type is recording; `intent_id` matches; intent state `payment_captured`; `intent.version = p_expected_version`;
-   - per-reason row state (§3.1):
-     - PREFLIGHT_* rows: still `pending`, `dispatched_at` NULL, `attempts 0`, key `:1`, latest recording;
-     - `ATTEMPT_GT1`: `pending` with key suffix > 1;
-     - `SUCCEEDED_UNPROVEN`: `succeeded` with `settled_evidence_id` NULL;
-   - `PREFLIGHT_EXHAUSTED`: the persisted non-eligible assessment count for this op ≥ `MAX_PREFLIGHT_ATTEMPTS` (§3.5);
-   - conflict reasons: `p_assessment` belongs to this op and intent, phase `preflight`, with the matching outcome;
-   - `p_detail`: a small jsonb of codes and ids only (size-checked; no free text).
-4. **Idempotency:**
-   - an active hold for `p_op` with the **same reason** returns its id (no new rows);
-   - an active hold with a **different reason** raises `HOLD_ALREADY_ACTIVE`.
-5. INSERT the hold, then INSERT the case:
-   - `kind = 'OFFLINE_CHARGE_HOLD_' || p_reason`;
-   - `opened_by = 'recording-hold:' || hold_id`;
-   - `evidence = {operationId, reason, opKey, intentVersion, assessmentId}`.
-6. If an **open case of the same kind** already exists for the intent (necessarily for another hold or an app-inserted fake): **raise** `CASE_KIND_OCCUPIED` (no `ON CONFLICT DO NOTHING`), so it rolls back. D1 kinds never collide with `OFFLINE_CHARGE_OUTCOME_UNKNOWN`, so a hold cannot suppress an unknown case and vice versa.
-7. Any refusal raises and the whole transaction rolls back: no hold, no case.
-
-**Spoofing:** a proposed INSERT guard on `reconciliation_cases` refuses kinds `OFFLINE_CHARGE_HOLD_%` from non-privileged inserts. An app-inserted fake case could not fence anyway (the fence reads `recording_holds`); this only stops misleading visibility.
+   - op type and intent binding;
+   - the intent state allowed for the reason (§4.1), and `version = p_expected_version`;
+   - work lease owned by `p_worker` (DB clock), **except** `SUCCEEDED_UNPROVEN` on a `confirmed` intent, where no work lease exists;
+   - the per-reason row state;
+   - `EXHAUSTED`: the current-epoch count ≥ 3;
+   - conflict reasons: `p_assessment` belongs to this op, current epoch, matching outcome.
+   - **[TRUST]** listing scope config is worker-side; the DB checks only that the intent belongs to the row.
+4. Idempotency:
+   - an active hold for `p_op` with the same reason → return its id;
+   - a different reason → `HOLD_ALREADY_ACTIVE`.
+5. **INSERT the case first**: `id = case_id`, `kind 'OFFLINE_CHARGE_HOLD_'||reason`, `opened_by 'recording-hold:'||hold_id`, evidence `{operationId, reason, opKey, intentVersion, assessmentId, epoch}`. Then **INSERT the hold** with `case_id`. The immediate FK is satisfied.
+6. A **pre-existing open case of the same kind** for the intent → raise `CASE_KIND_OCCUPIED`; the whole transaction rolls back.
+   - This should be impossible by design. Hold kinds can only be inserted by these functions (a cases INSERT guard refuses `OFFLINE_CHARGE_HOLD_%` from non-privileged inserts). A migration precondition requires no such open cases. At most one non-terminal recording exists per intent.
+   - **The claim block is still preserved:** the fence (§4.3) also refuses while **any** open `OFFLINE_CHARGE_HOLD_%` case exists for the intent. The operational outcome is "blocked and visible through the existing case", and the worker reports the raise.
 
 **Race: hold vs claim** (same row):
-- **Claim first.** The claim holds the intent share lock and the op row lock. The hold's step 2 waits. After the claim commits, the hold re-reads `in_flight` → `HOLD_TARGET_NOT_PENDING` → rollback. The worker then has a normal in-flight row, governed by `outcome_unknown` / case.
-- **Hold first.** The hold commits while holding the op row. The claim's stage 2 `SKIP LOCKED` skips it, or after the commit the trigger sees the hold and raises; the claim transaction rolls back. A direct `UPDATE … SET state='in_flight'` is refused by the same trigger.
-- Both take the intent `FOR SHARE` (compatible) before the op row lock. No lock-order inversion; no deadlock between the two.
+- claim first: the hold waits on the op lock, then sees `in_flight` → `HOLD_TARGET_NOT_PENDING`, rollback;
+- hold first: the claim skips (SKIP LOCKED) or the trigger refuses after the hold commits.
 
-**Race: hold vs E3 transition** (`applyEvent` takes intent `FOR NO KEY UPDATE`): the hold waits on, or blocks, the transition. The version re-check refuses a stale hold.
-
-### 3.5 Durable preflight / confirm bounds [PROPOSED]
-
-Raw read-row counts cannot tell *why* a read was not eligible. The worker therefore persists its **classified pure-assessment outcome**.
-
-**`booking.recording_assessments`** (insert-only; no app UPDATE / DELETE; written only through the function below):
-- `id uuid PK`, `operation_id`, `intent_id`;
-- `phase text CHECK (phase IN ('preflight','confirm'))`;
-- `outcome text CHECK (outcome IN ('eligible','incomplete','identity_refused','conflict_marker','conflict_lookalike','conflict_same_amount','confirm_ok','confirm_zero','confirm_multiple','confirm_mismatch','confirm_incomplete'))`;
-- `code text CHECK (booking.is_code(code))`: the pure module's refusal code;
-- `identity_read_op uuid NULL`, `list_read_op uuid NULL`, `evidence_id uuid NULL`;
-- `intent_version int`, `module_version text` (e.g. `offline-charge-proof-v1`);
-- `recorded_at timestamptz DEFAULT statement_timestamp()`.
-
-**Function** `booking.record_recording_assessment(p_op, p_phase, p_outcome, p_code, p_identity_read, p_list_read, p_evidence, p_expected_version, p_module_version) RETURNS uuid`:
-- SECURITY DEFINER; app EXECUTE;
-- locks intent `FOR SHARE`, then op `FOR SHARE`;
-- checks the op is a recording of this intent at `p_expected_version`;
-- cited read ops belong to the intent, have the right types (`hostaway.retrieve_reservation` / `hostaway.list_offline_charges`) and were created after the recording row;
-- `p_evidence`, if given, is `hostaway_offline_charges` evidence of `p_list_read`;
-- phase `preflight` only while the row is `pending` and undispatched; phase `confirm` only while it is `in_flight` under this lease, or after.
-
-**Trust:** the DB verifies these **bindings**. It **cannot** verify that the outcome is the correct classification of the read. That is the worker's trusted pure assessment, recorded with its module version for audit.
-
-**Bounds** (inspectable, durable):
-- preflight: `count(*) WHERE operation_id = op AND phase='preflight' AND outcome <> 'eligible'` ≥ `MAX_PREFLIGHT_ATTEMPTS` (3) → `PREFLIGHT_EXHAUSTED` hold;
-- confirm: the analogous count bounds the confirm reads; exhaustion ends in `outcome_unknown` → the existing unknown case.
-
-### 3.6 Owner resolution of holds [PROPOSED]
+### 4.6 Owner resolution [PROPOSED]
 
 ```
-booking.admin_resolve_recording_hold(p_hold uuid, p_decision text, p_evidence uuid[], p_result_ref text,
-                                     p_resolver text, p_justification text, p_at timestamptz) RETURNS uuid
-  SECURITY DEFINER; EXECUTE mv_booking_admin only.
+booking.admin_resolve_recording_hold(p_hold uuid, p_decision text, p_evidence uuid[], p_assessment uuid,
+                                     p_resolver text, p_justification text, p_at timestamptz)
+  RETURNS uuid      -- SECURITY DEFINER; EXECUTE: mv_booking_admin only
 ```
 
-`admin_close_case` additionally refuses `opened_by LIKE 'recording-hold:%'` (PROPOSED change).
+Also proposed: `admin_close_case` refuses `opened_by LIKE 'recording-hold:%'`.
 
-Locking: intent `FOR SHARE` → op `FOR UPDATE` → hold `FOR UPDATE`. Each decision inserts a `reconciliation_resolutions` row, sets the release columns and resolves the case.
+Locks: intent `FOR SHARE` → op `FOR UPDATE` → hold `FOR UPDATE` → case.
 
-| Decision | Allowed reasons | Effect | Never |
+| Decision | Allowed | Effect on hold / case | Other effect |
 |---|---|---|---|
-| `release_for_initial_send` | PREFLIGHT_* only; row still `pending`, undispatched, key `:1` | hold released → the fence allows the claim again. Requires a fresh **eligible** preflight assessment recorded after the hold. | allowed for `ATTEMPT_GT1` / `SUCCEEDED_UNPROVEN` |
-| `recorded_manually` | PREFLIGHT_*, `ATTEMPT_GT1` | owner states they recorded it in Hostaway, citing API **full-identity** evidence; the row moves `pending → superseded` (an existing allowed move); intent remains `payment_captured` / public confirmed. Finalising to `confirmed` uses a separately reviewed owner path (`admin_resolve_intent`), out of this scope. | resend; `dispatched_at` change |
-| `link_full_proof` | `SUCCEEDED_UNPROVEN` | sets `settled_evidence_id` through the D2 validator (§4.2); the hold is released; the E7.4b finalisation then proceeds | reversal of the owner's earlier resolution |
-| `keep_visible` | any | records the owner's acknowledgement; the hold stays active (claim blocked) | — |
+| `release_for_initial_send` | PREFLIGHT_* only; row `pending`, undispatched, attempt 1 | hold released; case resolved; **new epoch starts** | `p_assessment` must be preflight `eligible` in the **held** epoch, for **this op**, at `intent_version = hold.intent_version_at_hold = current version`, with both reads `created_at > hold.created_at` and `list_evidence.observed_at ≥ statement_timestamp() − 10 min`. Stale reads recorded after the hold are refused. |
+| `recorded_manually` | PREFLIGHT_*, `ATTEMPT_GT1` | released; case resolved `recorded` | row `pending → superseded` (an existing move). The intent stays `payment_captured`. Owner finalisation is **outside authorization**. |
+| `link_full_proof` | `SUCCEEDED_UNPROVEN` | released; case resolved `recorded` | attaches the link through §3.2 (`owner_historical`) in the same transaction |
+| `keep_visible` | any | **hold stays active; case stays open** | inserts only a resolution row (owner acknowledgement) |
 
-**`ATTEMPT_GT1` has no automation decision.** Policy: no automatic resend or new attempt.
+**Hold release gates finalisation as well as claiming:**
+- §3.4 and the claim fence both require no active hold.
+- `link_recording_evidence` (app) **refuses while a hold is active**. While held, only the owner's `link_full_proof` can attach proof.
 
----
+**Serial outcomes, link vs owner resolution** (no "exactly one ever"):
+- owner `admin_resolve_operation(succeeded)` first → the row is `succeeded` without a link → the app link may then attach full proof (intended), unless a `SUCCEEDED_UNPROVEN` hold is active;
+- an app link before the owner → refused (the row is not `succeeded`).
 
-## 4. D2: atomic, immutable success ↔ full-evidence link
-
-### 4.1 Choice: narrowly extend `settled_evidence_id` (not a new link table)
-
-The existing column already gives:
-- the FK to append-only evidence;
-- immutability for **every** role (0008: NULL → id once; clear or repoint refused);
-- recovery code that knows the field.
-
-A dedicated link table would duplicate all of that and add a second source of truth. The extension is **scoped to `op_type = 'hostaway.record_offline_charge'`**:
-- no other op type's semantics change;
-- `settle_operation_from_evidence` stays reconcile_first-only.
-
-### 4.2 Validator [PROPOSED]
-
-`booking.recording_evidence_refusal(p_op uuid, p_evidence uuid, p_result_ref text) RETURNS text` (NULL = acceptable). STABLE, SECURITY DEFINER, not granted to the app directly; used by the trigger and the functions below.
-
-The evidence `e` must satisfy **all** of these, each with its own refusal code:
-- `e.kind = 'hostaway_offline_charges'`, `e.source = 'hostaway_api'`, `e.status = 'listed'`, `e.intent_id = op.intent_id`;
-- `e.read_operation_id` → a read with `op_type = 'hostaway.list_offline_charges'`, `state = 'succeeded'`, `retry_class = 'read'`, created after the recording row;
-- `e.external_ref = op.payload->>'reservationId' = intents.hostaway_reservation_id`;
-- `e.observed_at > op.dispatched_at` (strict). For owner-linked rows: `≥ dispatched_at + 15 min`, consistent with 0005;
-- `observed` has **exactly** the R2 / E7.4b-0 key set (`EVIDENCE_OBSERVED_KEYS`), with:
-  - `matchingChargeCount = 1`, `matchingChargeIds = [p_result_ref]`, `chargeId = p_result_ref` (canonical decimal string);
-  - `reservationId` = reservation; `listingMapId = intents.listing_id`;
-  - `amountMinor = (op.payload->>'amountMinor')::bigint = intents.captured_minor = intents.final_total_minor`;
-  - `currency = intents.currency`;
-  - `status = 'paid'`, `type = 'charge'`, `paymentProvider = 'offline'`;
-  - `paymentMethod IN ('credit_card','other')` (the approved set. The **configured** value is worker config; see §5.3);
-  - `title = 'maraVilla payment mvoch1-' || intent_id`, `marker = 'mvoch1-' || intent_id`;
-  - `readCount` an integer in 1..500; `executorAccountRef` a label (format only).
-- **No other evidence row** for this intent and op window may cite a **different** `chargeId` with this marker. If one does → `EVIDENCE_CONFLICT`, and the result is a hold, not a link.
-
-### 4.3 Atomic completion [PROPOSED]
-
-```
-booking.complete_recording_with_evidence(p_op uuid, p_worker text, p_evidence uuid, p_result_ref text,
-                                         p_expected_version int) RETURNS text   -- 'succeeded'
-  SECURITY DEFINER; EXECUTE mv_booking_app.
-```
-
-All or nothing:
-1. intent `FOR SHARE`, then `intent_work FOR SHARE`, then op `FOR UPDATE`.
-2. Under those locks:
-   - intent `payment_captured`, version = `p_expected_version`;
-   - `intent_work.work_worker_id = p_worker` and `work_lease_until ≥ statement_timestamp()`;
-   - op `in_flight`, `lease_worker_id = p_worker`, `lease_until ≥ statement_timestamp()` (**DB clock**, unlike today's caller clock);
-   - key `:1`, `attempts = 1`.
-3. `recording_evidence_refusal(...) IS NULL`.
-4. `UPDATE … SET state='succeeded', result_ref=p_result_ref, settled_evidence_id=p_evidence, completed_at=e.observed_at, lease cleared`.
-5. Any refusal raises, so nothing changes. The worker then calls `completeOperation(outcome_unknown)` → the existing unknown case (never a retry).
-
-**Trigger rule** (PROPOSED addition to `external_operations_safety_guard`, or a new `zz0_recording_success_guard` that runs before 0008's `zz_` trigger). For `op_type = 'hostaway.record_offline_charge'`:
-- `OLD.state <> 'succeeded' AND NEW.state = 'succeeded' AND NOT is_privileged()` → **refuse** (`RECORDING_SUCCESS_REQUIRES_FUNCTION`). The supported app path cannot create succeeded-without-link: a direct UPDATE, or the generic `completeOperation(succeeded)`, is refused.
-- `OLD.settled_evidence_id IS NULL AND NEW.settled_evidence_id IS NOT NULL` → `recording_evidence_refusal(NEW.id, NEW.settled_evidence_id, NEW.result_ref)` must be NULL, for every role.
-- The privileged owner path (`admin_resolve_operation`) may still set `succeeded` **without** a link. The owner's resolution stands, and the row is treated as `SUCCEEDED_UNPROVEN` (§4.4).
-
-**`completeOperation` change** (PROPOSED helper): for recordings, `succeeded` routes to the function. `outcome_unknown` is unchanged.
-
-### 4.4 Finalisation and recovery [PROPOSED]
-
-- **DB rule** (PROPOSED `intents_safety_guard` addition): an intent may move `payment_captured → confirmed` only if
-  - the latest recording is `succeeded`;
-  - `settled_evidence_id IS NOT NULL`;
-  - `result_ref = NEW.offline_charge_id`.
-
-  This makes the generic planner's `OFFLINE_CHARGE_RECORDED` (which trusts `succeeded` / `resultRef`) **unable** to finalise unproven rows. The `repo.js` event guard mirrors it (PROPOSED helper).
-- **E7.4b recovery** (worker, later):
-  - for `succeeded` + link: apply `OFFLINE_CHARGE_RECORDED` through the R2 §6.2 `inTx` fence. It re-reads the **same** `settled_evidence_id` row and the full binding, plus the planned version and the work lease;
-  - for `succeeded` without a link: try `booking.link_recording_evidence(p_op, p_evidence)` (app EXECUTE; same validator; NULL → id only; `state` unchanged; owner-resolved rows also need ≥ 15 min).
-    - Success → finalise as above.
-    - Refusal, or no qualifying evidence → `open_recording_hold(SUCCEEDED_UNPROVEN)`. The case is visible and the owner's resolution is **not** reversed.
-- **Paid state:** in no branch is it escalated. There is no provider write and no generic-planner finalisation.
-- **Inherited rows** (`succeeded` without a link from before the migration): the same path; finalisation is blocked by the DB rule until linked or owner-handled.
-- **Unknown dispatched recordings** stay owner-only (`admin_resolve_operation`). They are never auto-retried, and never settled by `settle_operation_from_evidence`.
+**`ATTEMPT_GT1`:** no automation release, ever.
 
 ---
 
-## 5. Locks, races and trust
+## 5. Locks: summary
 
-### 5.1 Lock order
-
-| Path | Order | Note |
+| Path | Order | Contention outcome |
 |---|---|---|
-| `claimNextOperation` (+ fences) | intent SHARE → op UPDATE (SKIP LOCKED) | present |
-| `open_recording_hold` | intent SHARE → op UPDATE → hold / case INSERT | proposed |
-| `record_recording_assessment` | intent SHARE → op SHARE → INSERT | proposed |
-| `complete_recording_with_evidence` / `link_recording_evidence` | intent SHARE → intent_work SHARE → op UPDATE → evidence (read) | proposed |
-| `admin_resolve_recording_hold` | intent SHARE → op UPDATE → hold UPDATE → case UPDATE | proposed |
-| `applyEvent` (`inTx`) | intent NO KEY UPDATE → op SHARE / evidence read | present + proposed `inTx` |
-| `admin_resolve_operation` | op UPDATE → intent (plain read, no lock) | **present (op first)** |
-| `completeOperation(outcome_unknown)` / `markUnknown` | op UPDATE → case INSERT | present |
+| `claimNextOperation` + fence | intent SHARE → op UPDATE (SKIP LOCKED) | serialized |
+| direct app `UPDATE … in_flight` | op UPDATE → (trigger) intent SHARE | vs `applyEvent`: possible 40P01 (bounded, retryable, no bypass) |
+| complete / link / hold / assessment functions | intent SHARE → intent_work SHARE → op → advisory evidence lock → tables | serialized among themselves and with the helper claim |
+| `record_provider_evidence` (offline kind) | read op UPDATE → advisory evidence lock | the advisory lock serializes with link / complete only. Read rows are distinct from recording rows, so there is no op-lock inversion. |
+| `applyEvent` (`inTx`) | intent NO KEY UPDATE → op SHARE | serialized with the share-lockers (waits) |
+| `admin_resolve_operation` | op UPDATE → intent (no lock) | no deadlock with the share-lockers; the proposed INVOKER trigger reads the intent **without** a lock on this path |
+| `completeOperation(outcome_unknown)` / `markUnknown` | op UPDATE → case INSERT | unchanged |
+| `recoverExpiredOperations` | (phase-guarded) intent SHARE → op | vs completion: the op lock serializes; the loser sees a changed state and refuses |
 
-**`admin_resolve_operation` is op-first.** It holds the op row and reads the intent without a lock, so it cannot deadlock with the share-lockers.
-
-The proposed guard trigger must also read the intent **without** a lock on the privileged path. If a future change made it lock the intent, `admin_resolve_operation` vs `applyEvent` could deadlock. PostgreSQL then aborts one side with 40P01, a **retryable failure, never a fence bypass** (the same accepted stance as 0007).
-
-### 5.2 Races
-
-| Race | Outcome |
-|---|---|
-| hold vs claim | §3.4: whichever commits first wins; the loser re-checks under locks and rolls back. |
-| claim vs E3 transition | the fence trigger share-locks the intent: either the transition commits first (claim refused: `payment_captured` / version mismatch) or it waits. |
-| completion vs lease expiry (`recoverExpiredOperations` → `markUnknown`) | both take the op `FOR UPDATE`. If maintenance wins: the row is `outcome_unknown` and the completion's state check refuses → owner path. If completion wins: maintenance's `in_flight` filter skips the row. |
-| completion vs E3 transition | the completion holds the intent SHARE; the transition waits, or the completion's version check refuses. |
-| link vs owner `admin_resolve_operation` | op `FOR UPDATE` serialises them. The link requires `state = succeeded`; the owner requires `outcome_unknown | escalated`. Exactly one applies. |
-| two holds, same op | the op `FOR UPDATE` serialises; same reason → idempotent; other reason → `HOLD_ALREADY_ACTIVE`. |
-| duplicate completion | the second call sees `succeeded` → `NOT_IN_FLIGHT` raise (no change); 0008 forbids repointing. |
-| evidence for another op / intent / reservation | validator refusal. `read_operation_id UNIQUE` prevents reusing one read for two rows' evidence. |
-
-### 5.3 What the DB can and cannot attest
-
-| DB-verifiable (persisted rows) | Worker / pure-proof trust (not DB-attestable) |
-|---|---|
-| evidence kind / source / status; read op type, state and timing; `external_ref`; the intent and op binding | that the read was really executed against Hostaway, and its response is what was recorded |
-| observed amount = payload = captured = total; currency = intent; listing; title / marker string equality; count = 1; id = result | that `executorAccountRef` / client labels correspond to the same real credential and account (labels only) |
-| method ∈ approved set | that the method equals the **configured** owner choice (config is outside the DB) |
-| `observed_at` vs `dispatched_at` (DB times); lease and version by the DB clock | snapshot completeness of the provider list; correct classification of an assessment outcome |
+**Post-wait lease expiry:** every function re-checks leases with `statement_timestamp()` **after** acquiring its locks, so a lease that expired while waiting is refused.
 
 ---
 
-## 6. Phase / owner-case decision table
+## 6. DB-attested vs trusted
 
-| Phase / fact | Row | Action | Case kind | Public |
+| DB-attested (persisted bindings; DB clock where stated) | [TRUST] |
+|---|---|
+| evidence kind / source / status; read type / state / intent / selector; `observed_at = read.completed_at` (equality) | that the read ran against Hostaway, and `observed` is its true content |
+| operation window: read created / dispatched ≥ recording; observed > dispatched | that the caller-supplied `dispatched_at` / `completed_at` / `lease_until` reflect real time (only consistency and no-future-vs-DB-clock are checked) |
+| amount = payload = captured = total; currency; listing; exact title / marker; count 1; ids = result | that `executorAccountRef` / client labels are the same real credential and account |
+| method ∈ approved set | that the method equals the configured owner choice |
+| lease ownership and version under locks (DB clock compared with stored caller-computed leases) | the pure assessment's classification (stored with its module version) |
+
+---
+
+## 7. Phase / owner-case table
+
+| Situation | Row | D2-only era | D1 era | Public |
 |---|---|---|---|---|
-| preflight not eligible (< bound) | pending | record assessment; retry later | — | confirmed |
-| preflight bound reached | pending | `open_recording_hold(PREFLIGHT_EXHAUSTED)` | `OFFLINE_CHARGE_HOLD_PREFLIGHT_EXHAUSTED` | confirmed |
-| preflight conflict (marker / look-alike / same amount) | pending | hold (`CONFLICT_*`) with the assessment | `…_HOLD_PREFLIGHT_CONFLICT_*` | confirmed |
-| attempt > 1 pending | pending | hold (`ATTEMPT_GT1`); never claimable | `…_HOLD_ATTEMPT_GT1` | confirmed |
-| claimed; pre-send fence, send, reply or confirm fails | in_flight | `completeOperation(outcome_unknown)` (existing) | `OFFLINE_CHARGE_OUTCOME_UNKNOWN` (`op:<id>`) | confirmed |
-| confirm OK | in_flight | `complete_recording_with_evidence` → `RECORDED` | — | confirmed |
-| owner resolved succeeded, count-only | succeeded, no link | try link → else hold `SUCCEEDED_UNPROVEN` | `…_HOLD_SUCCEEDED_UNPROVEN` | confirmed |
-| owner resolved failed_definite | failed_definite → E3 queues `:2` | hold `ATTEMPT_GT1` | `…_HOLD_ATTEMPT_GT1` | confirmed |
+| preflight non-eligible < 3 (epoch) | pending | — (no worker) | record assessment | confirmed |
+| preflight bound / conflict | pending | — | hold PREFLIGHT_* | confirmed |
+| attempt > 1 | pending | — | hold ATTEMPT_GT1 (claim already fenced) | confirmed |
+| claimed, any failure | in_flight | `outcome_unknown` + existing case | same | confirmed |
+| confirm OK | in_flight | `complete_recording_with_evidence` → `RECORDED` | same, plus no active hold | confirmed |
+| owner-resolved count-only / dashboard | succeeded, no link | finalisation blocked; owner sees it through a read-only query | link or hold `SUCCEEDED_UNPROVEN` | confirmed |
+| inherited, already confirmed, no link | succeeded | unchanged | visibility hold `SUCCEEDED_UNPROVEN` (no state change) | confirmed |
 
 ---
 
-## 7. Proposed change map, dependency and rollback order (NOT applied)
+## 8. Change map and rollback [PROPOSED; not applied]
 
-**Migration `0010_recording_evidence_link` (D2), up:**
-1. `recording_evidence_refusal()`;
-2. `complete_recording_with_evidence()`, `link_recording_evidence()`;
-3. the recording success rule (guard addition or a `zz0_` trigger);
-4. the `intents_safety_guard` finalisation rule;
-5. grants: app EXECUTE on 2; `REVOKE … FROM PUBLIC` on all.
+**Migration 0010 (D2), up:**
+1. `recording_proof_refusal`;
+2. `zz0_recording_lifecycle_guard` (INVOKER);
+3. `complete_recording_with_evidence`, `link_recording_evidence`;
+4. the `record_provider_evidence` advisory lock for kind `hostaway_offline_charges`;
+5. the `intents_safety_guard` finalisation rule;
+6. app EXECUTE on 3 only; `REVOKE FROM PUBLIC` on all.
 
-Down: the reverse order (drop triggers / rules → functions). No table or data change.
+Down: §3.9 precondition, then the reverse order.
 
-**Migration `0011_recording_holds` (D1), up:**
-1. tables `recording_assessments`, `recording_holds` + guards + RLS (deny by default; app SELECT; admin SELECT);
-2. `record_recording_assessment()`, `open_recording_hold()`, `admin_resolve_recording_hold()`;
-3. `recording_claim_fence()` + trigger;
-4. the `reconciliation_cases` INSERT guard for `OFFLINE_CHARGE_HOLD_%`;
-5. `admin_close_case` refusal for `recording-hold:%`;
-6. grants.
+**Migration 0011 (D1), up:**
+1. the tables + guards + RLS;
+2. `record_recording_assessment`, `open_recording_hold`, `admin_resolve_recording_hold`;
+3. the claim fence;
+4. the cases INSERT guard;
+5. `admin_close_case` refusal;
+6. the finalisation and link "no active hold" additions;
+7. grants.
 
-Down: drop the trigger / guards → functions → tables. Disposable local DBs only; a down step with rows present refuses rather than discarding audit data.
+Precondition (up): no open `OFFLINE_CHARGE_HOLD_%` cases. Down: precondition no holds and no assessments; else RAISE.
 
-**Helpers (PROPOSED):**
-- `operations.js`: `RECORD_FENCE` in both `claimNextOperation` stages; recording success routed to the function;
-- `repo.js`: the event-guard mirror;
-- E7.4b worker (later): calls only these functions.
-
-**Dependency:** D1's `link_full_proof` decision uses D2's validator, so **D2 first, then D1**. The dispatch worker needs **both**, plus live gates E1–E7 / P1.
+**Helpers:**
+- `completeOperation` routing (op_type looked up before locks);
+- `RECORD_FENCE` in the claim helper;
+- the `repo.js` finalisation mirror.
 
 ---
 
-## 8. Test matrix (disposable local PG, fake providers, for each later slice)
+## 9. Planned test matrix (PLANNED; not implemented or run)
 
-| # | Case | Expect |
+| # | Scenario | Expect |
 |---|---|---|
-| T1 | app role direct `UPDATE … SET state='succeeded'` on a recording (with or without `settled_evidence_id`) | refused |
-| T2 | `completeOperation(succeeded)` on a recording | refused (routed or raised); no state change |
-| T3 | `complete_recording_with_evidence` happy path | succeeded + link in one commit; 0008 forbids a later clear or repoint |
-| T4 | each validator field wrong individually (kind, source, status, read type / state / time, reservation, listing, amount vs payload / captured / total, currency, status, type, provider, method outside the set, title, marker, count ≠ 1, ids ≠ [result], extra / missing keys, `chargeId` ≠ result) | refused; nothing changed |
-| T5 | evidence from another intent / op / reservation; evidence observed ≤ dispatch; one read reused for two ops | refused |
-| T6 | stale version / lost op lease / lost work lease / expired (DB clock) at completion | refused, rolled back → the worker's `outcome_unknown` |
-| T7 | concurrent completion vs `recoverExpiredOperations` | exactly one wins; no succeeded-without-link |
-| T8 | `payment_captured → confirmed` via `applyEvent` without a link (generic planner) | refused by the DB |
-| T9 | owner `admin_resolve_operation(succeeded)` count-only → later link with full evidence | link OK → confirmed; with count-only evidence → `SUCCEEDED_UNPROVEN` hold, resolution intact |
-| T10 | every claim path (`claimNextOperation` generic, by `opId`, by intent; direct UPDATE) with an active hold | refused / skipped |
-| T11 | concurrent hold vs claim (observed lock wait, both orders) | §3.4 outcomes; never both |
-| T12 | duplicate `open_recording_hold` same reason / other reason | idempotent / `HOLD_ALREADY_ACTIVE` |
-| T13 | hold when an open case of the same kind exists (app-inserted fake) | `CASE_KIND_OCCUPIED`; rollback |
-| T14 | app INSERT of `OFFLINE_CHARGE_HOLD_%` case; app INSERT / UPDATE on `recording_holds` / `recording_assessments` | refused |
-| T15 | `admin_close_case` on a hold case | refused |
-| T16 | `release_for_initial_send` on `ATTEMPT_GT1` / `SUCCEEDED_UNPROVEN`; without a fresh eligible assessment | refused |
-| T17 | an unknown case of a different op stays visible when a hold opens (no suppression) | both open |
-| T18 | assessment binding: wrong op / intent / read types / reads before the recording row / confirm phase on a pending row | refused |
-| T19 | bound: 2 non-eligible preflights → `PREFLIGHT_EXHAUSTED` refused; 3 → accepted | exact |
-| T20 | every test: intent state / version / public status unchanged by D1 / D2; no ESCALATE, notify, void, cancel or refund rows; `dispatched_at` untouched for holds | asserted |
-| T21 | migrations up → down → up on a disposable DB; down refuses when holds or links exist | exact |
+| T1 | app INSERT of a recording with `settled_evidence_id` / `result_ref` / `completed_at` / `dispatched_at` pre-set | refused (pre-seed) |
+| T2 | app UPDATE on a pending recording setting `settled_evidence_id` | refused |
+| T3 | linked row: app UPDATE of `result_ref` / `completed_at` / `dispatched_at` / `source_version` / `late_result_*` (same state) | refused |
+| T4 | the trigger validates `NEW`: an UPDATE changing `result_ref` and attaching a link in one statement is validated against NEW (a test where OLD would pass and NEW fails, and vice versa) | NEW governs |
+| T5 | app direct UPDATE `→ succeeded` with a valid link; inside an unrelated granted SD function (`record_provider_evidence` context) | refused / not reachable |
+| T6 | `completeOperation(succeeded)` for a recording | routed; no generic success |
+| T7 | `complete_recording_with_evidence` happy path; each §3.2 field wrong individually; another intent / op / reservation; one read reused | succeeded + link atomically / refused, nothing changed |
+| T8 | future evidence (`observed_at > statement_timestamp()`), future `dispatched_at`, `observed_at ≤ dispatched_at`, stale for `worker_fresh` (> 10 min), owner proof < 15 min | refused; owner proof years old: accepted |
+| T9 | `observed_at ≠ read.completed_at` (crafted); read created before the recording | refused |
+| T10 | post-wait lease expiry (the lock is held, the lease expires while waiting) | refused under the DB clock |
+| T11 | concurrent conflicting evidence insert vs link (observed advisory-lock wait, both orders) | conflict seen → refused, or link first then conflict surfaced later; never a silent link |
+| T12 | `payment_captured → confirmed` without a link / with a mismatched id / with an active hold | refused by the DB |
+| T13 | owner `admin_resolve_operation(succeeded)` with **dashboard** count-1 evidence, then app link with full API proof ≥ 15 min / count-only | linked → finalise / stays unlinked (D1: hold) |
+| T14 | already-confirmed legacy row without a link | no state change; D1 visibility hold allowed; link allowed |
+| T15 | every claim path with an active hold: helper generic / `opId` / intent / direct UPDATE | refused or skipped |
+| T16 | direct UPDATE claim vs `applyEvent` contention | 40P01 on one side; the fence never bypassed |
+| T17 | concurrent hold vs claim (both orders, observed lock waits) | §4.5 outcomes |
+| T18 | hold-before-case FK: function order (case first) succeeds; a simulated reversed order fails | as designed |
+| T19 | `CASE_KIND_OCCUPIED` (a fake pre-existing case inserted as the owner) | raise; the claim stays fenced by the intent-level case check |
+| T20 | duplicate assessment (same read twice); repeat without a new read; disallowed phase / outcome combinations | refused |
+| T21 | epoch: 3 non-eligible → hold; release with a fresh eligible assessment → new epoch, count 0; release citing stale reads (created before the hold) or another op / version | accepted / refused |
+| T22 | `keep_visible` | hold active, case open, claim still fenced |
+| T23 | active hold + app `link_recording_evidence` / finalise | refused; only `link_full_proof` attaches |
+| T24 | `ATTEMPT_GT1` `release_for_initial_send` | refused |
+| T25 | app INSERT of an `OFFLINE_CHARGE_HOLD_%` case; app writes to the hold / assessment tables; `admin_close_case` on a hold case | refused |
+| T26 | 0010 down with linked or progressed recordings; 0011 down with holds | RAISE; empty → reverse order OK |
+| T27 | every test: no public-state change, no ESCALATE / notify / void / cancel / refund rows; `dispatched_at` untouched by holds | asserted |
 
 ---
 
-## 9. Unresolved choices (for root)
+## 10. Resolution map (root HOLD on e772987)
 
-1. **D2 first** (recommended): the smallest change that makes success fail-closed. It adds no tables, only functions and triggers.
-2. The `recorded_manually` owner decision: finalising the intent to `confirmed` needs a separately reviewed owner path (`admin_resolve_intent` extension or a new function). Left open.
-3. Whether `link_recording_evidence` for owner-resolved rows should also require the 15-minute settle. The proposal requires it, for consistency with 0005.
-4. `paymentMethod`: the DB checks the approved **set** only. The exact configured value stays worker trust until the owner decides (open).
-5. Whether to persist an account ref with the reservation create (R2 §5.1). Not proposed here.
+| # | Item | Where |
+|---|---|---|
+| 1 | Full lifecycle invariants (INSERT pre-seed, every UPDATE, relabel); NEW-row validation; INVOKER authorization; SD validators read only | §1.2, §2, §3.1–§3.3 |
+| 2 | Caller-supplied times corrected; non-null dispatch; no future vs the DB clock; worker-fresh vs owner-historical; read intent / selector / completion-time equality; operation window; trust limits | §1.2, §1.3, §3.2, §6 |
+| 3 | Assessment uniqueness per read; allowed combinations; worker / lease / version checks; epochs and reset; fresh release evidence bound to held op / version / epoch | §4.4, §4.6 |
+| 4 | Pre-allocated ids, case first; `keep_visible` stays active; D1 lease / version / scope limits; occupied-kind outcome with the claim block preserved | §4.5, §4.6 |
+| 5 | Hold gates finalisation and app link; honest serial link-vs-owner outcomes; already-confirmed inherited rows | §3.4, §3.8, §4.1, §4.6 |
+| 6 | Direct UPDATE inversion → bounded 40P01; routing before locks; deterministic latest; advisory serialization of evidence writers; D2-only surfacing | §3.3, §3.5–§3.7, §4.3, §5 |
+| 7 | Rollback preconditions (no silent re-enable) | §3.9, §8 |
+| 8 | Admin succeeded accepts dashboard evidence (present) vs the stricter proposed API link; D2 first; ≥ 15 min owner proof | §1.3, header |
 
-**Minimal next implementation slice (after root review): D2 only.**
-- Migration 0010 (validator, `complete_recording_with_evidence`, `link_recording_evidence`, the success-requires-link rule, the finalisation rule);
-- the `completeOperation` routing helper and the `repo.js` mirror;
-- tests T1–T9, T20, T21.
+**Unresolved and outside authorization:**
+- owner manual finalisation after `recorded_manually`;
+- the configured `paymentMethod`;
+- persisting an account ref at create;
+- live gates E1–E7 / P1.
 
-No worker, adapter, holds or dispatch.
+**Minimal next slice after re-review: D2 only.** That is migration 0010, the `completeOperation` routing helper, the `repo.js` mirror, and tests T1–T13, T26 (0010 part) and T27.
