@@ -1,64 +1,63 @@
-# E7.4b offline-charge bookkeeping: evidence + contract (PREPARATION ONLY)
+# E7.4b offline-charge bookkeeping: evidence + contract (PREPARATION ONLY), revision 2
 
 - **Branch:** `feature/e7-offline-charge-contract`, cut from the accepted head `7270d6ac266f5cf44e19b87d47d2852f9e8f2d6c`. Docs only.
 - **This document authorizes nothing.** No runtime code, live call, credential, migration, merge or deployment.
-- **Status:** written by Claude on 2026-11-03 for root review. No implementation starts before root accepts this contract.
-- **The historical contract is unchanged.** `claude/e7-compensation-worker-contract.md` (§7 / §8 / I7 / B1) is a record of what was known when it was written. Where this document differs, this document is the newer reading of the **current** code and the **current** official docs. The older text is not rewritten.
+- **Revision 2** (2026-11-03) answers root's HOLD on `132202a`, items 1–7; §11 maps each item to where it is addressed.
+- **Implementation stays on HOLD** until root re-reviews.
+- **The historical contract is unchanged.** `claude/e7-compensation-worker-contract.md` is a record of what was known when it was written. This document is the newer reading of the **current** code and **current** official docs, and does not rewrite it.
 
 Labels used throughout:
-- **[DOC]** documented contract text;
-- **[EX]** documented example only;
+- **[DOC]** official documentation text;
+- **[EX]** a documented example only;
 - **[INF]** inference;
-- **[UNV]** account/live behaviour not verified;
-- **[CODE]** verified at `7270d6a` by reading the source.
+- **[UNV]** account or live behaviour not verified;
+- **[CODE]** verified by reading the source at `7270d6a`.
+
+**Standing session policies applied here** (already decided; not reopened):
+- No automatic resend or new attempt after any ambiguous dispatch.
+- All **future** listings and test or approval packages use **USD**.
+- No notification, charge or refund executor exists in this worker's scope.
 
 ---
 
-## 1. What E7.4b is for (scope)
+## 1. Purpose and scope
 
-After the Stripe capture succeeds, E3 is in `payment_captured`, which `publicStatus()` maps to **"confirmed"**. The only remaining job is **bookkeeping**: tell Hostaway that this reservation was paid outside Hostaway, so the reservation's balance and the owner's reports reflect it.
+After the Stripe capture succeeds, E3 is in `payment_captured`, which `publicStatus()` maps to **"confirmed"**. E7.4b only **records the payment in Hostaway** (bookkeeping).
 
 - **Success:** `OFFLINE_CHARGE_RECORDED` → `confirmed`. Public status stays "confirmed".
-- **Any uncertainty:** a **case-only owner alert**. The booking stays paid and publicly confirmed.
-  - Nothing is cancelled, voided, refunded or retried because of bookkeeping uncertainty.
-  - The intent is never moved to `reconciliation_required` (public "under_review") by this path.
+- **Any uncertainty:** a **case-only owner alert**. The booking stays paid and publicly "confirmed".
+  - No cancel, void, refund, resend or new attempt.
+  - The intent is never moved to `reconciliation_required` / "under_review" by this path.
 
 ---
 
-## 2. Current code at 7270d6a (independently inspected) [CODE]
+## 2. Current code at 7270d6a [CODE]
 
-| Path | What the code does today | Consequence for E7.4b |
+| Path | Behaviour today | Consequence |
 |---|---|---|
-| E3 `CAPTURE_SUCCEEDED` / `RECONCILED_CAPTURE_SUCCEEDED` (`intent-state.js` ~531/550) | → `payment_captured` with effect `hostaway.record_offline_charge {reservationId, amountMinor: capturedMinor}` | The recording row is queued by E3 at capture time; E7.4b only executes it. |
-| `repo.js` effect mapping (l.104) | Row: `retry_class = non_idempotent`, key `och:{intentId}:{offlineChargeAttempts+1}`, payload `{reservationId, amountMinor}` | The payload has **no currency and no marker**. The worker derives both from the intent, as fixed facts. |
-| DB `external_operations_one_open_offline_charge` (0001) | At most one recording row per intent in pending / in_flight / outcome_unknown / escalated | One open recording per intent is enforced in the DB. |
-| DB insert guard (0003/0004) | A new recording row is refused unless every earlier one is `failed_definite` **with** an owner resolution or a catalogued definite refusal code | A second attempt is impossible while an earlier one is unresolved. |
-| `definite_refusal_codes` (0003) | **Empty**. The 0004 guard refuses `in_flight → failed_definite` for non_idempotent rows without a catalogued code | Today **every** non-success of a recording is `outcome_unknown`. `OFFLINE_CHARGE_FAILED` (and the E3 retry and exhaustion loop) is **unreachable** without an owner resolution. E7.4b must not add codes. |
-| `operations.js markUnknown` (non_idempotent branch) | Row → `outcome_unknown` + `openCase(OFFLINE_CHARGE_OUTCOME_UNKNOWN, opened_by 'op:<id>')`. **The intent is not touched.** | This **is** the existing case-only path. Both `completeOperation(outcome_unknown)` and lease-expiry maintenance (`recoverExpiredOperations` → `markUnknown`) reach it. |
-| `recovery.js` AWAITING (offline branch) | Selects a recording only if the intent is `payment_captured`, the row is the latest recording, and NOT (`outcome_unknown` with an open `op:<id>` case) | While the owner case is open, `findMissedOutcomes` never returns the row, so no planner or operator action follows. |
-| `recovery-plan.js planOfflineCharge` | `succeeded` + resultRef → `OFFLINE_CHARGE_RECORDED`; `succeeded` without resultRef → operator `OFFLINE_CHARGE_ID_MISSING`; `failed_definite` → `OFFLINE_CHARGE_FAILED`; otherwise operator `OFFLINE_CHARGE_OUTCOME_UNKNOWN` | Operator plans are dangerous only if a caller **escalates** them (next row). |
-| `escalateOperatorPlan` (recovery.js) | Applies E3 `ESCALATE` → `reconciliation_required` (public **under_review**) | **I7 gap.** Today **no caller** runs `findMissedOutcomes` over recordings: the reservation, capture and compensation workers scope it to CREATE / CAPTURE / VOID+CANCEL. The gap is latent; E7.4b must not open it. |
-| E3 `OFFLINE_CHARGE_FAILED` | Counter +1, re-queues a recording; at `maxOfflineChargeAttempts` (10) → `escalate("OFFLINE_CHARGE_UNRECORDED")` | Unreachable today (see the definite-codes row). If it were reached, it would escalate a paid booking, so E7.4b never produces it. |
-| E3 `ESCALATE` in `payment_captured` | Allowed (ROUTES l.135) → `reconciliation_required`, alert.owner | Only an explicit reconciler or owner action reaches it. E7.4b never sends it. |
-| `applyEvent` guards (repo.js ~280–290) | `RECORDED` needs the latest recording `succeeded` with `result_ref == chargeId`. `FAILED` needs it `failed_definite`. | Success is evidence-bound in the DB. |
-| `settle_operation_from_evidence` (0005) | Accepts **reconcile_first only** | An unknown recording **cannot** be settled automatically by the runtime. |
-| `admin_resolve_operation` (0005, owner role) | Recording `succeeded`: API evidence `hostaway_offline_charges`, ≥15 min after dispatch, `matchingChargeCount = 1`, id = result. `failed_definite`: count 0 from **both** an API read and an owner dashboard check, both ≥15 min after. It resolves the `op:<id>` case. | The existing owner path settles unknowns with evidence. No new DB entry point is needed. |
-| `record_provider_evidence` + `validate_evidence` | Only from a **succeeded `hostaway.list_offline_charges` read**, `external_ref` = the read's reservationId, `status 'listed'`, `observed.matchingChargeCount` = `len(matchingChargeIds)` | The DB cannot tell a complete read from an incomplete one. The worker must not record evidence from an incomplete read (§6). |
-| `claimNextOperation` fences | CAPTURE (0007), VOID / CANCEL (0009). **No fence for `record_offline_charge`** | A generic or opId claim could take a recording in any intent state. The implementation slice needs a paid-state recording fence (§5.1). |
-| `publicStatus` | `payment_captured` and `confirmed` → "confirmed"; `reconciliation_required` → "under_review" | A case-only alert keeps the guest-visible status "confirmed". |
-
-**Conclusion:** the existing case-only path (`markUnknown` → `OFFLINE_CHARGE_OUTCOME_UNKNOWN`, intent untouched, then owner `admin_resolve_operation`) can be reused as is.
-- **No new DB, helper, planner or E3 code** is needed for the bookkeeping alert.
-- The I7 risk is purely a **routing rule** for the future worker: never call `escalateOperatorPlan` or send `ESCALATE` for a recording, and never produce `OFFLINE_CHARGE_FAILED`.
-- That is ordinary internal routing, **not** an owner decision.
-- The only DB change the later implementation needs is the claim fence in §5.1.
+| E3 `CAPTURE_SUCCEEDED` / `RECONCILED_CAPTURE_SUCCEEDED` | → `payment_captured` with effect `hostaway.record_offline_charge {reservationId, amountMinor: capturedMinor}` | E3 queues the recording row; E7.4b only executes it. |
+| `repo.js` effect mapping (l.104) | `non_idempotent`, key `och:{intentId}:{offlineChargeAttempts+1}`, payload `{reservationId, amountMinor}` | No currency and no marker in the payload. Both are derived from immutable intent facts (§5). |
+| DB unique `one_open_offline_charge` (0001) | At most one recording per intent in pending / in_flight / outcome_unknown / escalated | Intrinsic. |
+| DB insert guard (0003/0004) | A new recording is refused unless every earlier one is `failed_definite` with an owner resolution or a catalogued definite code | Intrinsic. |
+| `definite_refusal_codes` | **Empty**. The guard refuses `in_flight → failed_definite` for non_idempotent rows without a code | Every non-success is `outcome_unknown`. `OFFLINE_CHARGE_FAILED` and E3 exhaustion are unreachable except after an owner resolution. |
+| `markUnknown` (non_idempotent) | Row → `outcome_unknown` + `openCase(OFFLINE_CHARGE_OUTCOME_UNKNOWN, opened_by 'op:<id>')`. Intent untouched. | The existing case-only path, reached by `completeOperation(outcome_unknown)` and by lease-expiry maintenance. **Reusable as is.** |
+| `recovery.js` AWAITING (offline branch) | Hides an `outcome_unknown` recording while its `op:<id>` case is open | No planner action while the case is open. |
+| `planOfflineCharge` | `succeeded` + resultRef → `OFFLINE_CHARGE_RECORDED`, **trusting `succeeded`/`resultRef` alone**; otherwise operator codes or `OFFLINE_CHARGE_FAILED` | The generic planner is **not** sufficient for E7.4b success (§6.3). |
+| `escalateOperatorPlan` | E3 `ESCALATE` → "under_review" | I7 risk. Latent today: no worker scans recordings. E7.4b never calls it for recordings. |
+| `applyEvent` guard for `OFFLINE_CHARGE_RECORDED` (repo.js ~286) | Requires the latest recording `succeeded` **and** `result_ref = chargeId`. **Nothing else.** | **Correction of revision 1:** success is **not** evidence-bound in the DB. The DB checks only state and result_ref. Full binding is a worker transaction fence (§6.2), plus a proposed persisted link (§9, D2). |
+| `applyEvent` `inTx` / `afterLoad` hooks | `inTx` runs inside the event transaction after the intent UPDATE. The compensation worker uses it to check `before.version`/`status` against the plan. | Lets the success event re-check evidence, lease and planned version atomically, without a new DB entry point. |
+| `settle_operation_from_evidence` (0005) | reconcile_first only; it is the only runtime writer of `settled_evidence_id` (immutable per 0008) | A recording cannot be settled by the runtime, and has no persisted link to its evidence today. |
+| `admin_resolve_operation` (0005, owner role) | succeeded: cited `hostaway_offline_charges` evidence, `observed_at ≥ dispatch + 15 min`, `matchingChargeCount = 1`, id = result. failed: API and dashboard count 0. | It proves **count and id only**. It does **not** prove the full identity required by this contract (§6.4). |
+| `record_provider_evidence` / `validate_evidence` | Evidence only from a succeeded `hostaway.list_offline_charges` read; `external_ref` = the read's reservationId; status `listed`; count = len(ids) | The DB cannot distinguish complete from incomplete, or right-account from wrong-account reads. The worker gates what it records (§7). |
+| `claimNextOperation` | Sets `state in_flight`, `attempts + 1`, `dispatched_at = now` at **claim** (operations.js l.97). Fences exist for CAPTURE / VOID / CANCEL only. | A claim is "possibly sent" from that moment. There is no recording fence today (§4.1). |
+| `publicStatus` | `payment_captured` / `confirmed` → "confirmed"; `reconciliation_required` → "under_review" | A case-only alert keeps the guest-visible status. |
 
 ---
 
-## 3. B1: official public documentation (no credentials)
+## 3. Official documentation (B1), read 2026-11-03 without credentials
 
-**Sources, read 2026-11-03.** The API reference is a client-rendered page; it was read in a browser without signing in.
-- API reference: `https://api.hostaway.com/documentation`, sections:
+**Sources.**
+- **API reference:** `https://api.hostaway.com/documentation`, a client-rendered page read in a browser without signing in. Sections:
   - `#guest-charge-object`
   - `#guest-charge-transaction-object`
   - `#get-guest-charges-list`
@@ -67,316 +66,385 @@ After the Stripe capture succeeds, E3 is in `payment_captured`, which `publicSta
   - `#update-offline-charge`
   - `#refund-offline-charge`
   - `#get-auto-payment-rules`
-  - `#authentication`, plus the Introduction (standard response) and the Changelog.
-- Support: "Processing Payments Manually (Online & Offline Charges)", https://support.hostaway.com/hc/en-us/articles/360007411294-Guest-Payments-Taking-Payments-Manually.
-- Support: "Automating Guest Payments (General Rules)", https://support.hostaway.com/hc/en-us/articles/360036454133-Guest-Payments-Auto-payments.
-- Neither support article shows an updated date in its fetched text.
+  - `#authentication` / "Working with authorization token", plus the Introduction (standard response) and the Changelog.
+- **Support (canonical pages, opened in a browser on 2026-11-03):**
+  - **S1** "Automating Guest Payments (General Rules)", https://support.hostaway.com/hc/en-us/articles/360036454133-Automating-Guest-Payments-General-Rules. Updated **2026-10-30T10:03:53Z**. Section 4, "External Charges & API Integrations".
+  - **S2** "How Auto-payments Work with API Reservations and Offline Charges", https://support.hostaway.com/hc/en-us/articles/54050957523739-How-Auto-payments-Work-with-API-Reservations-and-Offline-Charges. Updated **2026-08-06T09:24:00Z**. Linked from S1 §5.
+  - **S3** "Processing Payments Manually (Online & Offline Charges)", https://support.hostaway.com/hc/en-us/articles/360007411294-Processing-Payments-Manually-Online-Offline-Charges. Updated **2026-09-24T08:24:50Z**.
 
 ### 3.1 Create offline charge, `#create-offline-charge`
 
-- **[DOC]** `POST https://api.hostaway.com/v1/guestPayments/charges/{reservationId}`, with a charge object in the body.
-  - Every field except `description` is mandatory: `title`, `amount`, `paymentMethod`, `status`, **`scheduledDate`**.
+- **[DOC]** `POST /v1/guestPayments/charges/{reservationId}`. Every field except `description` is mandatory: `title`, `amount`, `paymentMethod`, `status`, `scheduledDate`.
   - `status` ∈ {`awaiting`, `paid`}.
-  - `paymentMethod` ∈ {`credit_card`, `vcc`, `cash`, `paypal`, `venmo`, `bank_transfer`, `bank_check`, `ota`, `other`}. **`credit_card_online` is not accepted here.**
-- **[DOC + EX]** The response is "Created charge object or error response".
-  - The documented example response includes: `id`, `listingMapId`, `reservationId`, `autopaymentId: null`, `type: "charge"`, `title`, `description`, `currency: "USD"`, `paymentMethod`, `amount`, `capturedAmount: 0`, `status: "paid"`, `paymentProvider: "offline"`, `scheduledDate`, `chargeDate`, `isManual`, `transactions: []`.
-  - So the response shape **is documented by example**. The earlier blanket "response undocumented" claim is withdrawn.
-- **[EX inconsistency]** The example request sends `"description": "optional field"`, but the example response shows `"description": null`. **The marker must not depend on `description` persisting** (§4.4).
-- **[DOC]** `scheduledDate` is a datetime ("YYYY-MM-DD HH:MM:SS" in the example). The Introduction says all time values are UTC.
-- **[INF]** For a record with status `paid`, the capture instant in UTC is the natural value.
-- **[DOC] Currency.** The request has **no currency field**. The charge object reports `currency`.
-  - **[INF]** The currency is taken from the reservation (or account). E7.4b **must not invent a currency input.** It sends none and verifies the response currency against `intent.price.currency`.
-- **[DOC] Monetary units.** `amount` is a float ("Amount of charge"). The example uses major units (100; the reservation example `totalPrice: 267`).
-  - **[INF]** Major units with 2 decimals for MXN/USD, the same convention our accepted reservation adapter already uses (`minorToAmount` / `amountToMinor`, at most 2 fraction digits, exact round trip).
-  - **[UNV]** Exact echo of non-integer amounts live.
-- **[DOC] Auth.** `#authentication` and the "Working with authorization token" section use `Authorization: Bearer <token>` for all endpoints.
-  - **[EX inconsistency]** The create, update and refund cURL examples show a header `jwt;` instead; the list and get examples show Bearer.
-  - **[INF]** Bearer is the documented scheme; `jwt;` looks like an example artefact.
-  - **[UNV]** Whether the create endpoint accepts Bearer live (§8, E1).
+  - `paymentMethod` ∈ {`credit_card`, `vcc`, `cash`, `paypal`, `venmo`, `bank_transfer`, `bank_check`, `ota`, `other`}; `credit_card_online` is not accepted.
+- **[DOC/EX]** The response is "Created charge object or error response".
+  - The example contains `id`, `listingMapId`, `reservationId`, `type "charge"`, `title`, `description`, `currency`, `paymentMethod`, `amount`, `status "paid"`, `paymentProvider "offline"`, `scheduledDate`, `chargeDate`, `isManual`, `transactions []`.
+  - The response is **documented by example**.
+- **[EX inconsistency]** The request sends a description, but the example response shows `"description": null`. The marker relies on `title` only.
+- **[DOC]** There is no currency input. The object reports `currency`. **[INF]** It comes from the reservation; we verify it, never send it.
+- **[DOC]** `amount` is a float. **[EX]** Major units. **[INF]** 2-decimal currencies (USD) use the existing `minorToAmount` / `amountToMinor` exact conversion.
+- **[DOC]** Times are UTC (Introduction). `scheduledDate` format in the example: `YYYY-MM-DD HH:MM:SS`.
+- **[DOC] Auth:** `Authorization: Bearer <token>`.
+  - **[EX inconsistency]** The create, update and refund examples show `jwt;`.
+  - **[UNV]** Live acceptance of Bearer on create (E1).
 
-### 3.2 Charge vs transaction objects
+### 3.2 Charges vs transactions
 
-- **[DOC]** A **guest charge** (`#guest-charge-object`) is the per-reservation ledger item. It has `type` charge / preAuth / refund, `paymentProvider` stripe / braintree / authorizeNet / **offline**, `paymentMethod`, `status`, `isManual` and a `transactions` array.
-- **[DOC]** A **guest charge transaction** (`#guest-charge-transaction-object`) is a provider payment record. Its `paymentProvider` is stripe / braintree / authorizeNet, it has `balanceTransactionId`, and it exists for online charges.
-- **[EX]** An offline charge has `transactions: []`.
-- **Rule:** E7.4b matches **charges only, never transactions**.
+- **[DOC]** A guest **charge** (type charge / preAuth / refund; provider stripe / braintree / authorizeNet / **offline**) is the ledger item.
+- A guest charge **transaction** is a provider payment record (`balanceTransactionId`).
+- **[EX]** Offline charges have `transactions []`.
+- E7.4b matches **charges only**.
 
 ### 3.3 Get guest charges list, `#get-guest-charges-list`
 
-- **[DOC] Query parameters**
-  - `reservationId` (single int) and `reservationIds` (int list) combine as **AND**. Ids from another account match nothing and look identical to non-existent ids.
-  - `statuses[]` and `types[]` are **bracket-only**: a single value without brackets **is ignored**.
-  - `paymentMethods` (list).
-  - `limit`: default 100, **cap 500**.
-  - `offset`, `sortBy` / `sortOrder`.
-  - Date pairs may span at most 60 days.
-- **[DOC] Response:** `count` = total matching, ignoring limit and offset.
-- **[DOC] Default order:** without `sortBy`, upcoming charges come first ascending, then past charges descending (**not** newest-first). `sortBy=chargeDate&sortOrder=desc` is suggested for history.
-- **[DOC] Changelog 2026-10-02:** `reservationIds` "now filters". Before, it was **silently ignored** and returned the account's whole charge history with HTTP 200. Malformed ids now fail with 400.
-  - **[INF]** Old behaviour shows that filters can fail silently. A worker must **verify every returned row's `reservationId`** and must not trust the filter.
-- **[EX] Envelope:** the list example envelope shows `status`, `result`, `count`, `offset`. The Introduction's standard envelope also lists `limit`, `page`, `totalPages`.
-- **[UNV]** List ordering stability under concurrent writes, read-after-write lag after a create, and whether `count` is exact under concurrent inserts.
+- **[DOC] Filters:** `reservationId` (single) and `reservationIds` (list) combine as AND. "Ids belonging to another account match nothing. A real id from another account and an id that exists nowhere are indistinguishable in the response."
+- **[DOC]** `statuses[]` / `types[]` are bracket-only; a single value without brackets is ignored.
+- **[DOC]** `limit` defaults to 100, cap 500. `count` = total matching, ignoring limit and offset.
+- **[DOC]** Without `sortBy`, the order is "not newest-first": upcoming charges ascending, then past descending.
+- **[DOC] Changelog 2026-10-02:** `reservationIds` was previously **silently ignored** and returned the whole account with HTTP 200. **[INF]** Filters can fail silently, so every returned row is verified.
+- **[DOC]** `listingMapId` on a charge is copied at creation and is not updated after a listing move.
+- **[UNV]** Snapshot consistency, read-after-write lag, `count` exactness under concurrent writes.
 
-### 3.4 No recording operation can collect money
+### 3.4 Recording cannot collect money
 
-- **[DOC]** Create offline charge accepts only offline methods; `credit_card_online` is excluded.
-- **[EX]** The response shows `paymentProvider: "offline"` and `transactions: []`.
-- **[DOC]** The refund endpoint states that offline charges and their refunds are records of money moved **outside** Hostaway.
-- **Support (Processing Payments Manually), [DOC-support]:** offline methods are ones where "you have locally managed the transactions". `Due` offline charges are marked `Paid` manually.
-- **[INF]** Creating an offline charge with `status: "paid"` records a payment and does not move money.
-- **E7.4b rule:** always `status: "paid"`, never `awaiting`.
-  - An `awaiting` record would show a due balance.
-  - E7.4b never calls Update or Refund offline charge.
+- **S3 [DOC-support]:** offline charges "are records for your accounting and reporting only". The table states money is not moved through Hostaway for "CC (Offline)" and other offline methods.
+- **S3 caution:** a **Due** charge offers "Charge Now to process it online".
+- **Rule:** E7.4b sends **`status: "paid"` only**, never `awaiting`, and never calls Update, Refund or Charge Now.
 
-### 3.5 Auto-payment interaction: duplicate-collection risk (integration prerequisite)
+### 3.5 Auto-payments: duplicate-collection risk. **Correction of revision 1.**
 
-- **[DOC-support] Automating Guest Payments:** auto-payment templates schedule charges **per channel and listing** for **new** reservations. Amounts can be "the remaining unpaid balance of the reservation". Templates exist for "Hostaway Direct and/or Booking Engine".
-  - The article also says: if a reservation is created via the Public API **with offline charges on it**, "our system will not automatically generate any charges".
-- **[CODE]** Our reservation create (`hostaway-reservations.js`) uses `channelId 2000` (direct) and sends **no** offline charge. The recording happens later, after capture.
-- **[INF] Risk:** if an auto-payment template applies to channel 2000 or our listings, Hostaway may schedule charges for our API-created reservation in the window before recording, or on a remaining-balance basis.
-  - An online auto-charge would need a guest card on the reservation; we send none [UNV].
-  - The guest-facing balance or payment link could still show money due before the recording exists [UNV].
-- **[DOC]** `remainingBalance` on the Reservation object is the "difference between reservation total price and amount already paid by guest" (with `includePayments=1`). **[INF]** A paid offline record reduces it.
-- **Prerequisite, before any live recording:** the owner confirms that **no auto-payment template applies** to the direct channel / our listings, or removes that scope.
-  - Evidence route: documented read-only `GET /v1/guestPayments/autoPayment`, or a dashboard check.
-  - **No account or config change is made now.**
+Revision 1 cited an older text, fetched on 2026-11-03 with a web-fetch tool from the legacy URL slug `…/360036454133-Guest-Payments-Auto-payments`. That text said that a Public-API reservation created "with offline charges on it" gets no automatic charges.
+- **It is superseded and withdrawn.** The canonical pages contradict it.
+- The fetch tool's copy appears stale or cached [INF]. The same article id now serves S1.
+
+**Current canonical text:**
+- **S1 §4 [DOC-support]:** reservations created via the Public API **with an auto-payment template assigned "will always generate their scheduled payment calendar"**.
+  - The system skips creation only when it detects charges already generated **by a template**.
+  - Offline charges added by an API partner or OTA payments "do not block the process"; their amounts are subtracted and the **remaining balance** is scheduled.
+- **S2 [DOC-support]:** the engine does not treat external offline charges as a reason to skip the schedule.
+  - Remaining balance = total minus external charges. It is 0 only if external charges cover 100%.
+  - The schedule is recalculated on reservation modification.
+  - S2 also warns that Hostaway "will still schedule its own automated collections for any remaining unpaid amount".
+- **S1 §2:** templates are selected **per channel** (e.g. Hostaway Direct, Booking Engine) **and listing**, with an option to apply to new listings automatically.
+
+**Consequences:**
+- Adding our offline record **does not protect** against auto-collection. No protection is inferred from it.
+- If a template applies to our channel (`2000`, direct [CODE]) or listing, Hostaway may schedule or attempt collections (e.g. "at reservation creation") **before** our record exists. It could also act on any shortfall afterwards, e.g. an amount, currency or price mismatch.
+- **Live prerequisite (P1):** verified absence of any auto-payment template covering the direct channel and our listings, through the documented read-only `GET /v1/guestPayments/autoPayment` (E6) and/or an owner dashboard check, before any live recording.
+- **No support message and no account or config change is authorized or made.**
 
 ---
 
-## 4. Contract design (for a later, separately authorized implementation)
+## 4. Fences
 
-### 4.1 Fences, checked in the claim transaction, intent first
+### 4.1 Intrinsic DB fences, enforced on every claim path (a later migration, like 0007/0009)
 
-A recording row may be claimed only if **all** of these hold at claim time:
-1. The intent is `payment_captured` (paid state), and its `captured_minor = final_total_minor` (the DB already enforces `captured_exact`).
-2. The intent is in the configured scope (listing allow-list; optional intentId) and `hostaway_reservation_id` = `payload.reservationId`.
-3. The row is the **latest** recording, and its key attempt = `offlineChargeAttempts + 1` = **1**. E7.4b dispatches **only attempt 1** (§4.2).
-4. The row is `pending` and was never dispatched (`dispatched_at IS NULL`).
-5. The worker holds the intent work lease (`intent_work`), as the other E7 workers do.
-6. The intent version decided at plan time is re-checked inside the claim (version fence).
+Only facts the database can know without worker configuration:
+1. The intent state is `payment_captured`, and `captured_minor = final_total_minor` (the latter already enforced by `captured_exact`).
+2. The row is the **latest** recording of its intent, with key `och:{intent}:1` and attempt 1 (`offline_charge_attempts = 0`).
+3. `payload.reservationId = intents.hostaway_reservation_id`, and `payload.amountMinor = captured_minor = final_total_minor`.
+4. Pending → in_flight only from `attempts = 0` and `dispatched_at IS NULL`.
 
-Lock order is intent FOR SHARE, then the row FOR UPDATE, as in `claimNextOperation`. No lock is held across provider I/O.
+The migration **cannot** enforce worker-specific items (listing scope, work lease, planned version, evidence freshness, executor config). Those are §4.2.
 
-### 4.2 At most one non-idempotent dispatch; no resend
+### 4.2 Worker-enforced checks (configurable)
 
-- Exactly **one** POST per intent, ever, by automation.
-- After a claim, any of the following leads to `completeOperation(outcome_unknown)`, i.e. `markUnknown` → case. **Never a resend, never a new attempt row.**
-  - a send whose outcome is not proven;
-  - a timeout, network error or 5xx;
-  - a malformed or mismatched reply;
-  - a confirming read that disagrees.
-- Lease expiry reaches the same state through `recoverExpiredOperations`.
-- The worker **never** claims a recording with attempt > 1, including one E3 might queue after an owner-resolved `failed_definite`.
-  - Such a row stays pending for the owner. Recording again after a verified absence is the owner's manual action (§7, Q2).
+- Listing allow-list and optional intent scope.
+- The intent work lease (`intent_work`) owned by this worker, with remaining lease time.
+- The planned intent version and status, re-checked under the intent lock (the compensation-worker `before.version` pattern).
+- Preflight account and reservation verification (§5.1) and complete-read assessment (§7), both fresh.
+- Explicit configuration: `paymentMethod` (§5.3), executors, environment gates (§8).
 
-### 4.3 Preflight (BEFORE the claim; the row is still pending)
+### 4.3 Pre-send fence (after the claim, on a fresh clock)
 
-[CODE] `claimNextOperation` sets `dispatched_at` at claim time (operations.js l.97), and no API returns a claimed row to pending. So the preflight runs **before** the claim, under the intent work lease, while the recording row is still `pending` and undispatched.
+The claim commits `in_flight`, `attempts = 1`, `dispatched_at`. **From then on, the row is "possibly sent".** Immediately before the POST, using `clock()` read **now** rather than the plan time, **all** of the following must hold:
+1. The recording lease is still owned by this worker, with at least `minSendMarginMs` left (≥ the bounded call timeout plus the confirm-read budget). The intent work lease is still owned, with margin.
+2. A fresh re-read of the intent shows `payment_captured`, the planned version and an in-scope listing.
+3. The row is the exact claimed row, with this worker as `lease_worker_id`, `state in_flight`, `attempts = 1`, `och:{intent}:1`, attempt 1.
+   - Before the claim the worker observed `attempts = 0` and `dispatched_at` NULL.
+4. `payload.reservationId = hostaway_reservation_id` and `payload.amountMinor = captured_minor = final_total_minor` (re-read).
+5. The preflight evidence (§5.1, §5.2) is bound to this reservation and client and is younger than `preflightMaxAgeMs`.
+6. The request body was built **before** the claim from immutable facts and frozen: marker, title, amount, method, `scheduledDate`, no currency field. The fence compares it to the facts re-read in steps 2 and 4.
 
-Run a **complete** list read for the reservation (§6). Then:
-- **Complete, zero charges carrying our marker:** proceed to dispatch.
-- **Any charge with our marker:** do **not** dispatch → `outcome_unknown` → case. A prior recording exists; the owner reconciles.
-- **Any paid charge of the same amount without our marker** (for example, the owner already recorded it by hand): do **not** dispatch → case.
-- **Incomplete or untrusted read:** do not claim. The row stays pending and undispatched; retry the preflight later, bounded.
-  - After N failed preflights → case-only alert (§5 item 5).
+Then:
+- The final decision and the provider call happen with **no `await` between them** other than the call itself.
+- The call is bounded by `sendTimeoutMs`, and there is a per-step budget.
+- If any check fails, nothing is sent. The row is still **possibly sent by definition**, so it goes to `completeOperation(outcome_unknown)` → `markUnknown` → case. No retry, no new attempt.
+  - The error code (e.g. `PRESEND_FENCE_<reason>`) is **diagnostic only**. It is never evidence of "not sent".
 
-**Crash window:** the preflight does not remove the window between the POST and its recorded result. That window is covered only by `outcome_unknown` + case.
+---
 
-### 4.4 Request binding and marker
+## 5. Request, identity and preflight
 
-- **Body:**
-  - `title` = `"maraVilla direct payment " + marker`, with `marker = "mv-och:" + intentId + ":1"`. The title is the only documented, example-persisted text field.
-  - `description` = same marker. Optional, and **not relied upon** (the example shows it as null).
-  - `amount` = `minorToAmount(capturedMinor)`.
-  - `paymentMethod` = owner choice (§7, Q1).
-  - `status: "paid"`.
-  - `scheduledDate` = the capture instant in UTC.
-- No currency field.
-- Title length limit [UNV]: the marker is ≤ 60 characters and the title ≤ 100 characters as a conservative cap.
+### 5.1 Account / reservation identity (item 1)
 
-### 4.5 Reply validation (success candidate)
+**Problem.** A syntactically complete zero-row list is **not** proof of anything. A wrong-account token reads a foreign reservation id as "nothing" [DOC §3.3].
 
-The reply must satisfy all of the following:
-- `status: "success"`;
-- `result.id` is a positive integer;
-- `result.reservationId` = our reservation;
-- `type = "charge"`;
-- `paymentProvider = "offline"`;
-- `status = "paid"`;
-- `amountToMinor(result.amount) = capturedMinor` exactly;
-- `result.currency.toUpperCase() = intent.price.currency`;
-- `paymentMethod` = the configured value;
-- `title` contains the marker.
+**Documented capabilities.** The docs offer **no account-identity endpoint** for an access token in the sections read. None is invented here.
 
-Any failure → `outcome_unknown` (case). **A reply alone is not success** (next section).
+**Trust contract (explicit configured client + positive read):**
+- **Provenance and binding.** One injected executor instance is constructed from one configured credential reference, `{accountRef, credentialRef}`.
+  - It serves **all three** calls of one attempt: the identity read, the preflight list and the create.
+  - The executor exposes its configured `accountRef`.
+  - [CODE] Today **no account ref is persisted** with a reservation create. The worker therefore refuses unless its `accountRef` equals the reservation worker's configured `accountRef`, a configuration-level binding that is weaker than a persisted one.
+  - Persisting the ref at create time would need a later reviewed change (noted, not proposed now).
+- **Positive identity read.** The same executor runs the documented "Retrieve a reservation" (`GET /v1/reservations/{id}`). It must return **exactly** our reservation:
+  - id;
+  - the configured `listingMapId`;
+  - `channelId 2000`;
+  - arrival / departure = intent stay;
+  - the booking-ref custom field = intent ref;
+  - `totalPrice` → minor = `final_total_minor`;
+  - `currency` = intent currency;
+  - status active (not cancelled).
+- **What it proves:** the client can read **our** reservation now, a positive fact, unlike an empty list.
+- **Freshness:** taken in the same worker step, `observedAt ≥ now − preflightMaxAgeMs` (proposed 120 s), and before the claim.
+- **Refusal:** any mismatch, missing field, non-success or a stale or different client means no claim. The attempt counts toward the preflight bound (§5.4).
+- **Distinction.** The **prior accepted create identity** (E3's evidence-verified `hostaway_reservation_id`) proves the reservation was created. It does **not** prove that the **current** client reads and writes that account. Only the positive identity read under the same executor does.
+- **Limitations:**
+  - **[UNV]** whether one token can read reservations of one account and write charges to another;
+  - **[UNV]** that Retrieve a reservation is account-scoped like the charges list;
+  - a positive read proves read access, not write authorization.
+  - Live gate **E7** (§10) validates these.
 
-### 4.6 Confirming read (still under the recording lease)
+### 5.2 Preflight list (qualified result, BEFORE the claim)
 
-1. Queue and execute a `hostaway.list_offline_charges` read for the reservation.
-2. Require a **complete** read (§6).
-3. Exactly **one** charge must carry the marker, and it must match the reply's `id`, amount, currency, `status paid`, `type charge` and `paymentProvider offline`.
-4. Only then:
-   - record evidence (`matchingChargeCount 1`, `matchingChargeIds [id]`, plus amount, currency, status and marker in `observed`);
-   - `completeOperation(succeeded, resultRef = id)`;
-   - apply `OFFLINE_CHARGE_RECORDED {chargeId: id}`, which the `applyEvent` guard checks against `result_ref`;
-   - → `confirmed`.
+The preflight list runs only after a passing §5.1 identity read, under the same executor. Its result is a **qualified preflight result**, never proof about any write:
 
-| Read outcome | Action |
+| Complete read (§7) | Our exact marker | Same-amount paid charge without marker | Result |
+|---|---|---|---|
+| yes | absent | absent | **eligible to claim** (qualified: "no marker seen by this client at this time") |
+| yes | present (any count) | — | **do not send** → case-only (prior recording exists) |
+| yes | absent | present | **conservative conflict** → do not send → case-only. Not proof of duplicate identity. |
+| no / untrusted | — | — | not eligible. Counts toward the preflight bound. |
+
+"Complete absence" is **only** a precondition for the single first send. It is never used to settle an unknown write (§6.4).
+
+### 5.3 Request binding (frozen before the claim)
+
+- **Marker** = `mvoch1-` + the intent UUID in lower-case canonical form (36 chars). ASCII only, 43 chars, fixed.
+- **Title** = exactly `"maraVilla payment " + marker` (61 chars). Equality is **exact string equality** after JSON decoding. No `contains`, no case folding, no trimming.
+- **Description:** omitted. It is not relied on.
+- **Amount** = `minorToAmount(capturedMinor)`. It must round-trip `amountToMinor(amount) = capturedMinor` exactly before sending.
+- **paymentMethod:** an explicit config value, required.
+  - Absent, or not in the approved set {`credit_card`, `other`}, → **fail closed**; the worker refuses to start.
+  - No default. `credit_card` stays the recommendation for the later consolidated owner decision (§10).
+- **status:** `"paid"`.
+- **scheduledDate:** the **DB-stamped** `intent_transitions.recorded_at` (0005 trigger, statement clock) of the transition that entered `payment_captured` (`CAPTURE_SUCCEEDED` / `RECONCILED_CAPTURE_SUCCEEDED`), formatted in UTC as `YYYY-MM-DD HH:MM:SS`.
+  - It is never `now()`, and never caller-supplied.
+  - If that transition row is missing, refuse.
+- **Currency:** no currency field. The **expected** currency = `intent.price.currency`.
+  - Future packages are **USD** (policy). The worker refuses if the intent currency is not in the configured set (USD for future packages).
+  - The response currency must equal it **exactly** (`"USD"`).
+
+### 5.4 Durable bounds
+
+These come from durable rows only, with no in-memory counters:
+- **Preflight failures** = the number of `hostaway.list_offline_charges` read rows for the intent created after the recording row's `created_at` that did not yield a complete, eligible result, plus failed identity reads (`hostaway.retrieve_reservation` rows in the same window).
+  - Bound `MAX_PREFLIGHT_ATTEMPTS = 3`, then a case-only alert.
+- **Confirm-read exhaustion:** the confirming read gets at most `MAX_CONFIRM_READS = 3` attempts inside the send step's budget. Then `outcome_unknown` → case.
+- **Read-row retry class:** `read`, `max_attempts 10` (existing), bounded by the step budget above.
+
+**Design blocker D1.** A case-only alert for a recording that was **never claimed** (preflight exhausted or conflict) has no existing entry point.
+- `markUnknown` / `openCase` run only inside `completeOperation` for a **claimed** row.
+- Claiming just to open a case stamps `dispatched_at` and makes the row "possibly sent", which loses the real "not sent" truth.
+- **Proposal:** a reviewed helper/DB function `open_recording_case(opId, kind, evidence)` for a **pending, undispatched** recording. It opens a non-escalating case (`OFFLINE_CHARGE_NOT_SENT_<reason>`), leaves the row pending (claimable later only by owner action), and never changes the intent.
+- **Until D1 is accepted, the dispatch worker is blocked.**
+
+---
+
+## 6. Success, recovery and owner resolution (item 3)
+
+### 6.1 Reply validation (necessary, not sufficient)
+
+- Envelope `status = "success"`.
+- `result.id`: a JSON integer that is `Number.isSafeInteger` and > 0. Stored as a decimal string. **Reject** non-integers, strings with leading zeros, and unsafe magnitudes.
+- `result.reservationId` (safe integer) = our id, compared as a decimal string.
+- `result.listingMapId` = the configured listing.
+- `type = "charge"`, `paymentProvider = "offline"`, `status = "paid"`, `paymentMethod` = the configured value.
+- `title` = the exact frozen title.
+- `currency` = the expected value exactly.
+- `amount`: a finite number with `amountToMinor(amount) = capturedMinor`.
+- **Any failure** → `outcome_unknown` → case.
+
+### 6.2 Confirming evidence BEFORE completion; the success-event fence
+
+1. Still under the recording lease and before `completeOperation`, run a **complete** list read (§7) under the same executor.
+2. Record **immutable** evidence via `record_provider_evidence`: `status listed`, `matchingChargeCount 1`, `matchingChargeIds [id]`, and `observed` carrying
+   - `chargeId`, `reservationId`, `listingMapId`, `amountMinor`, `currency`, `status`, `type`, `paymentProvider`, `paymentMethod`, `title`, `marker`;
+   - `readCount` and `executorAccountRef`.
+3. Only if exactly one row has the exact title and it equals the reply in every field, call `completeOperation(succeeded, resultRef = chargeId)`.
+4. **Success event:** `applyEvent(OFFLINE_CHARGE_RECORDED {chargeId})` with an `inTx` fence that, inside the event transaction:
+   - re-reads the recording row `FOR SHARE`: `state succeeded`, `result_ref = chargeId`, latest recording, attempt 1;
+   - re-reads the **exact evidence id** captured in step 2: its `read_operation_id` is a succeeded `hostaway.list_offline_charges` row, `external_ref` = reservation, `observed_at ≥ dispatched_at`, and every observed field equals the expected full identity;
+   - checks that `before.version` / `status` equal the planned values (`payment_captured`);
+   - checks that the intent work lease is still owned by this worker.
+5. Any mismatch → throw (rollback). No event is applied. The row stays succeeded-but-unconfirmed (§6.3).
+
+### 6.3 Recovery when `succeeded` exists without the event
+
+- **Never** through the generic `planRecovery` → `planOfflineCharge`, which trusts `succeeded` / `resultRef` alone.
+- The E7.4b recovery pass, scoped to recordings and `payment_captured`:
+  - independently locates the **persisted bound evidence**: exactly one evidence row satisfying the full §6.2 predicate for this row's `result_ref`, observed after `dispatched_at`;
+  - then applies the event through the same `inTx` fence.
+- Zero qualifying evidence rows, more than one, or any mismatch → **no event, no provider write, no escalation**. It needs a case-only alert for a **succeeded** row, which has no existing entry point (`markUnknown` handles only in-flight rows).
+- **Design proposal D2:**
+  - (a) persist the evidence link on success (`settled_evidence_id` for non_idempotent recordings, set atomically with `completeOperation`; immutable per 0008); and
+  - (b) a non-escalating case opener for "succeeded but unproven".
+- **Until D2 is accepted, the dispatch worker is blocked.** Deriving evidence without a persisted link is documented above as a fallback but not proposed as sufficient.
+
+### 6.4 Owner-resolved unknowns
+
+- `admin_resolve_operation(succeeded)` proves only `matchingChargeCount = 1`, the id and the time [CODE]. **It does not prove the full identity of this contract.**
+- E7.4b recovery applies `OFFLINE_CHARGE_RECORDED` after an owner resolution **only if** the resolution's cited evidence is:
+  - an API source (`hostaway_api`) from a succeeded list read;
+  - `observed_at ≥ dispatch + 15 min`;
+  - carrying the full §6.2 observed fields, all matching.
+- Otherwise it stops **case-only**: the owner's resolution stands and no event is applied by automation. Visibility needs the D2(b) opener.
+- **Zero, incomplete or mismatched evidence:** no provider write, no escalation of the paid state, case only.
+
+---
+
+## 7. Complete-read assessment (item 6)
+
+A list read is **complete and trusted for this assessment** only if **all** of these hold:
+- HTTP 200, a JSON object, `status === "success"`, `result` an array.
+- `count`: an integer, `0 ≤ count ≤ 500`; otherwise refuse (no speculation about why).
+- Request: `reservationId=<id>` (singular), `limit=500`, no offset, no status or type filters.
+- `result.length === count`.
+- Every row:
+  - `id` and `reservationId` are safe positive JSON integers;
+  - `reservationId` = ours (as a decimal string);
+  - `listingMapId` = ours;
+  - it has `type`, `title`, `amount`, `currency`, `status`, `paymentProvider` with the expected JSON types.
+- Ids are unique; **duplicates mean refuse**.
+- The read ran under the same executor that passed §5.1, within the step budget.
+
+**Limits.** These checks prove internal consistency of one page only. They do **not** prove:
+- snapshot consistency;
+- account correctness (that is §5.1);
+- absence of read-after-write lag.
+
+An incomplete or untrusted read:
+- records **no evidence**;
+- never infers absence;
+- counts toward its bound (§5.4).
+
+Live gate **E4** (§10) validates lag and count behaviour.
+
+---
+
+## 8. Executor and environment safety
+
+- Production refusal: the worker refuses unless the environment gate is explicitly enabled (as with the E7 workers). In tests, **fake executors only**.
+- The executor set is exactly `{retrieveReservation, listCharges, createOfflineCharge}`. **No** update, refund, Charge-Now, auto-payment write, notification, Stripe or charge executor exists.
+- `guest.notify` effects are not dispatched by this worker.
+- The protected E4 ids (70636076 / 71045356 / 71072615 / 71081885) are refused with the existing `isProtectedReservationId` [CODE reservation-worker.js l.71; compensation-proof.js l.24]. That means no read, no claim, no send.
+
+---
+
+## 9. Crash windows and visibility
+
+| Point | Persisted state | Outcome |
+|---|---|---|
+| Before the claim (identity / preflight) | pending, undispatched | Re-run later within the bound. Exhaustion or conflict → D1 case (blocked until D1). |
+| After the claim, pre-send fence fails | in_flight, possibly sent | `outcome_unknown` → case (diagnostic code only) |
+| After the POST, before validation, or a timeout | in_flight | `outcome_unknown` → case; lease expiry gives the same |
+| During the confirming read | in_flight (+ maybe evidence) | `outcome_unknown` → case. Evidence helps the owner. |
+| After `succeeded`, before the event | succeeded | E7.4b recovery with bound evidence (§6.3); unproven → D2 case |
+| After the event | `confirmed` | done |
+
+**Attempt > 1 (item 5).** E3 queues `och:{intent}:2` after an owner-resolved `failed_definite`.
+- The intrinsic fence (§4.1 item 2) makes it **unclaimable**.
+- It must not sit silently pending. It needs **durable case-only visibility** via the same D1 opener (`OFFLINE_CHARGE_ATTEMPT_GT1_MANUAL`), without claiming it.
+- **This is a design blocker, not an owner question.** No automatic resend or new attempt is already decided policy.
+
+---
+
+## 10. Remaining live evidence and prerequisites
+
+These belong to one later consolidated, owner-approved live package. **USD listing; non-protected test reservation; not requested now.**
+
+| # | Evidence |
 |---|---|
-| Complete, exactly 1 match, all fields match the reply | success, as above |
-| Complete, **0** matches (the reply said created) | `outcome_unknown` → case. Possible lag [UNV]; never treated as absence. |
-| Complete, ≥2 matches | `outcome_unknown` → case (duplicate) |
-| Complete, 1 match but with a different id, amount, currency or status | `outcome_unknown` → case (mismatch) |
-| Incomplete or untrusted | `outcome_unknown` → case. **No evidence row is recorded from an incomplete read.** |
+| E1 | Create accepts `Authorization: Bearer` |
+| E2 | The live create reply matches §6.1 (id type, listingMapId, title persisted exactly, description behaviour) |
+| E3 | USD amount echo for 2-decimal values; currency = reservation currency |
+| E4 | List-by-`reservationId` read-after-write lag; `count` exactness |
+| E5 | Title length limit; exact title round-trip |
+| E6 / P1 | No auto-payment template covers channel 2000 or our listings (`GET /v1/guestPayments/autoPayment`, read-only), and/or an owner dashboard check; `remainingBalance` after recording |
+| E7 | One credential's read and write account binding; Retrieve-a-reservation account scoping (§5.1 limits) |
 
-If the lease expires before completion, `recoverExpiredOperations` produces `outcome_unknown` → case.
+**Owner decision, deferred to that package:** `paymentMethod`. Recommend `credit_card`, which S3 labels as "CC (Offline)"; the alternative is `other`. Joel is not being asked now.
 
-### 4.7 Account / binding verification
+---
 
-- The reservation id comes only from the intent's DB-recorded Hostaway reservation id (set from an evidence-verified create). Never from a request or the guest.
-- Every returned charge must carry that `reservationId` and the intent's `listingMapId` [DOC: listingMapId is copied at charge creation and not updated after a listing move]. Treat a listing mismatch as untrusted.
-- Ids from another account match nothing [DOC], so a wrong-account token reads as "zero matches". **This is why zero matches is never proof of absence by automation.**
-- The protected E4 ids (70636076 / 71045356 / 71072615 / 71081885) are refused with the existing `isProtectedReservationId` guard [CODE: reservation-worker.js l.71, compensation-proof.js l.24].
+## 11. Root HOLD items → where addressed
 
-### 4.8 Crash windows
+1. **Identity and authorization:** §5.1, §5.2, §7 limits.
+2. **Pre-send fence; intrinsic vs worker checks:** §4.1–§4.3.
+3. **Success not DB-evidence-bound; the event fence; recovery; owner resolution:** §2, §6.2–§6.4, D2.
+4. **Auto-payment evidence correction:** §3.5 (S1 / S2 / S3 with dates; the legacy fetch is withdrawn).
+5. **USD, no attempt-2 invitation, attempt > 1 visibility, fail-closed method:** policies header, §5.3, §9, D1.
+6. **Strictness, timestamp, bounds, executors, diagnostic codes:** §4.3, §5.3, §5.4, §6.1, §7, §8.
+7. **Narrow next step and extended matrix:** §12, §13.
 
-| Crash point | Persisted state | Result |
+---
+
+## 12. Test matrix (for the later pure module and, separately, the worker)
+
+**Pure request / proof / read-assessment module.** Fake fixtures, explicitly labelled doc-derived.
+
+| # | Case | Expected |
 |---|---|---|
-| Before claim (including during preflight) | pending, undispatched | Later preflight + claim; nothing was sent |
-| After claim, before POST | in_flight, `dispatched_at` set at claim [CODE operations.js l.97] | Lease expiry → `outcome_unknown` → case. Conservative: the send may or may not have happened. |
-| After POST, before reply validation | in_flight | Same → case |
-| After reply, during the confirming read | in_flight + possibly a succeeded read | Same → case. Evidence already recorded helps the owner resolve (`admin_resolve_operation` succeeded with API count 1). |
-| After `completeOperation(succeeded)`, before `RECORDED` | row succeeded | A future scoped recovery pass (recordings only, paid state only): `planOfflineCharge` → `OFFLINE_CHARGE_RECORDED`. **Never escalate on operator plans.** |
-| After `RECORDED` | `confirmed` | Done |
+| P1 | Marker / title builder: exact format, ASCII, lower-case UUID, length | exact |
+| P2 | Title equality: an exact match passes; substring, prefix/suffix, case change, whitespace, unicode look-alike | refuse |
+| P3 | Ids: safe integers pass; float, string, leading zero, negative, zero, > 2^53, missing | refuse |
+| P4 | count: non-integer, negative, > 500, ≠ length; duplicate ids | incomplete |
+| P5 | Foreign `reservationId` or `listingMapId` row (silent-filter failure) | untrusted |
+| P6 | Currency exact `"USD"`; `"usd"`, `"MXN"`, missing → mismatch. Amount round-trip x.x0, x.05, large, non-finite | exact / refuse |
+| P7 | `scheduledDate` from a supplied DB-stamped transition time; missing transition → refuse; never `now` | exact |
+| P8 | Unset or unapproved `paymentMethod` | fail closed |
+| P9 | Identity read: every field mismatched individually; cancelled status; stale `observedAt`; different executor `accountRef` | refuse |
+| P10 | **Wrong account: an empty list with a valid envelope but no positive identity read** | not eligible |
+| P11 | Preflight table: marker present / same-amount unmarked paid charge / complete-absent | per §5.2 |
+| P12 | Reply validation: each §6.1 field broken individually | unknown |
+| P13 | Confirm assessment: 0 / 2 / 1-mismatched / incomplete / exact-1 | per §6.2 |
+| P14 | Owner-resolution evidence: count-1 evidence lacking the full fields / dashboard source / too early | stop case-only |
 
-### 4.9 Exhaustion preserves paid truth
+**Worker (blocked until D1, D2 and the live gates; listed for completeness).**
 
-- E3's `OFFLINE_CHARGE_UNRECORDED` (10 failed_definite) is unreachable while `definite_refusal_codes` is empty. E7.4b adds no codes.
-- Bounded preflight failures and read exhaustion end in a **case-only** alert, never `ESCALATE`.
-- The intent stays `payment_captured` and public "confirmed".
-
----
-
-## 5. Changes the later implementation slice would need (proposal only)
-
-1. **DB claim fence for `hostaway.record_offline_charge`**, like 0007 / 0009. A migration enforces §4.1 items 1–4 on every claim path. This is the only schema change.
-2. **A new worker module** (offline-charge worker) with an injected Hostaway executor (fake in tests), scoped recovery (recordings only, `payment_captured` only), and maintenance phase-guarded with `intentStates: ['payment_captured']`.
-3. **An adapter** for create / list with doc-labelled request and response validation, Bearer auth (pending E1), and amount conversion via the existing helpers.
-4. **No E3, planner, recovery-helper or admin-function change.**
-   - The worker intercepts operator plans for recordings (no `escalateOperatorPlan`).
-   - The case-only alert reuses `markUnknown`.
-5. **Open design point:** a case-only alert for an **undispatched** row whose preflight is exhausted. `markUnknown` applies only to claimed rows.
-   - Options:
-     - (a) claim, then immediately `completeOperation(outcome_unknown, errorCode "PREFLIGHT_NOT_SENT")` without sending. The case evidence carries `errorCode`. Note that the claim stamps `dispatched_at` even though nothing was sent, so "not sent" lives only in the error code and the worker's own record.
-     - (b) leave the row pending and rely on monitoring.
-   - **Recommendation:** (a). It reuses existing entry points and yields a durable owner case. The owner's later `failed_definite` resolution still needs the API + dashboard absence evidence.
-   - The same route covers the preflight "marker found / same-amount paid charge found" outcomes in §4.3.
-
----
-
-## 6. Complete-read definition (shared by preflight, confirm and evidence)
-
-A list read is **complete and trusted** only if **all** of these hold:
-- HTTP 200 and `status = "success"`;
-- `result` is an array and `count` is an integer;
-- request: `reservationId=<id>` (singular, documented), `limit=500`, no offset, no status or type filters (filter client-side);
-- `count ≤ 500` and `result.length = count` (a single page holds every matching row);
-- every row has `reservationId` = ours and `listingMapId` = ours;
-- ids are unique positive integers (no duplicates);
-- every row has the documented fields used for matching (`id`, `type`, `title`, `amount`, `currency`, `status`, `paymentProvider`).
-
-Anything else is **incomplete or untrusted**:
-- record no evidence;
-- never infer absence;
-- the read row is completed as a read failure (retryable, bounded by the read retry class).
-
-`count > 500` → untrusted (it cannot happen for one stay [INF]; the cap exists anyway). Paging with offset is not used, because the default order is not stable newest-first [DOC] and concurrent inserts could shift pages [UNV].
-
-**Absence by automation:** a complete zero-match read is recorded as evidence **only** for the owner. The DB's `failed_definite` resolution additionally requires an owner dashboard check [CODE 0005]. Automation never declares a recording failed.
-
----
-
-## 7. Owner questions (only those genuinely needed)
-
-- **Q1. `paymentMethod` for a Stripe-collected payment** (this affects how payments appear in the owner's Hostaway reports).
-  - Options: `credit_card` (offline card) or `other`. Not `credit_card_online`: it is not accepted by the endpoint and implies Hostaway's own processor.
-  - **Recommendation: `credit_card`.** The guest paid by card; the processor was external (Stripe, outside Hostaway).
-  - Choose `other` if the owner's finance reports should not mix these with locally swiped cards.
-- **Q2. After the owner proves a recording absent** (`admin_resolve_operation` failed_definite), E3 queues attempt 2.
-  - **Recommendation:** automation never sends attempt > 1. The owner records manually in the dashboard and resolves.
-  - Confirm, or authorize automatic attempt 2 **only** after an owner-verified absence.
-- **Q3 (prerequisite, not a design choice):** confirm that no auto-payment template covers the direct channel (2000) / our listings (§3.5), before any live recording.
-
-The following are **internal routing, not owner decisions**:
-- case-only alert vs escalation;
-- no retry on ambiguity;
-- the marker format;
-- the complete-read rules.
-
----
-
-## 8. Remaining evidence (live / account), for a later consolidated live approval package; not requested now
-
-| # | Evidence | Why |
+| # | Case | Expected |
 |---|---|---|
-| E1 | Create offline charge accepts `Authorization: Bearer` (the docs show `jwt;` in examples) | Auth scheme for the write |
-| E2 | Live create reply shape matches the doc example (`id`, `reservationId`, `currency`, `status`, `paymentProvider offline`, title persisted, description persisted or not) | Reply validation §4.5 |
-| E3 | Amount echo for 2-decimal values; currency = reservation currency (MXN) | Exact money binding |
-| E4 | List by `reservationId` returns the new charge immediately (read-after-write lag), `count` exact | Confirming read §4.6 |
-| E5 | Title length limit / marker persistence | Marker §4.4 |
-| E6 | Auto-payment templates in scope for channel 2000 / listings (`GET /v1/guestPayments/autoPayment`, read-only), and reservation `remainingBalance` after recording | Duplicate-collection prerequisite §3.5 |
-
-Each item would be gathered in one owner-approved, bounded live step on a non-protected test reservation. That step is not requested here.
-
----
-
-## 9. Test matrix for the later implementation (fake provider + disposable local PG)
-
-| # | Scenario | Expected |
-|---|---|---|
-| T1 | Happy path: complete preflight with 0 matches; valid reply; confirming read with exactly 1 match | row succeeded, evidence count 1, `OFFLINE_CHARGE_RECORDED` → confirmed; exactly 1 POST |
-| T2 | Fence: intent not `payment_captured` (each other state, including `reconciliation_required`) | not claimed, 0 POST |
-| T3 | Fence: reservation id mismatch / listing out of scope / attempt > 1 / row already dispatched | not claimed, 0 POST |
-| T4 | Version fence: concurrent ESCALATE commits between plan and claim (observed lock wait) | not claimed |
-| T5 | Preflight finds our marker / a same-amount paid charge | no POST; case-only (claim + `outcome_unknown` with error code `PREFLIGHT_NOT_SENT`, §5 item 5); intent `payment_captured` |
-| T6 | Preflight incomplete (`count` ≠ length, foreign `reservationId` row, duplicate ids, `count > 500`, non-success envelope) | no claim, no POST, no evidence, row stays pending; after the bound → case-only (`PREFLIGHT_NOT_SENT`) |
-| T7 | POST timeout / 5xx / network error | `outcome_unknown` + `OFFLINE_CHARGE_OUTCOME_UNKNOWN` case; intent unchanged ("confirmed"); no 2nd POST on any later step |
-| T8 | Reply mismatch: amount, currency, type, provider, status, missing id, missing marker | case; no RECORDED |
-| T9 | Confirming read: 0 / ≥2 / 1-mismatched / incomplete | case; evidence only for complete reads; no RECORDED |
-| T10 | Crash after claim and after POST (lease expiry via phase-guarded maintenance) | case; no resend |
-| T11 | Crash after succeeded, before RECORDED → scoped recovery | RECORDED once; operator plans (`ID_MISSING` / `OUTCOME_UNKNOWN`) **never** escalate |
-| T12 | Owner resolves unknown as succeeded (existing admin function, API evidence count 1) | recovery applies RECORDED → confirmed |
-| T13 | Owner resolves failed_definite → E3 queues attempt 2 | worker does not claim it (pending Q2) |
-| T14 | `publicStatus` remains "confirmed" through every case path; no ESCALATE / void / cancel / refund rows created | asserted per test |
-| T15 | Protected reservation ids | refused, 0 POST |
-| T16 | Amount conversion edge cases (x.x0, x.05, large) round-trip exactly | exact |
-| T17 | Request body: no currency field, `status "paid"`, the configured `paymentMethod`, UTC `scheduledDate`, marker in the title | asserted on the fake |
+| W1 | Happy path (USD) | 1 POST; evidence; succeeded; `RECORDED` via the fence → confirmed |
+| W2 | Intrinsic fence on every claim path: wrong state, attempt > 1, payload reservation or amount changed, already dispatched | not claimable |
+| W3 | Stale preflight (age > max) at the pre-send fence; expired recording lease; expired work lease; a concurrent version change between claim and send (observed lock wait) | 0 POST; `outcome_unknown` + case; no retry |
+| W4 | `amountMinor` changed in the payload after the plan | intrinsic refuse / pre-send refuse |
+| W5 | Event lease or version lost between completion and event | no event; recovery path |
+| W6 | Forged or missing confirming evidence; evidence for another reservation or charge; `observed_at` before dispatch | no event; D2 case |
+| W7 | Succeeded row with only `resultRef` (no full evidence), presented to recovery | no event; never via the generic planner |
+| W8 | Owner resolution with insufficient fields | no event; case-only |
+| W9 | Attempt-2 row after an owner `failed_definite` | not claimed; D1 visible case |
+| W10 | Timeouts / 5xx / malformed reply | unknown + case; exactly 1 POST ever |
+| W11 | Protected ids | 0 calls |
+| W12 | `publicStatus` "confirmed" throughout; no ESCALATE / void / cancel / refund / notify rows | asserted |
 
 ---
 
-## 10. Go / no-go
+## 13. Go / no-go
 
-| Blocker | Resolved by docs? | Remaining |
-|---|---|---|
-| B1 endpoint + body fields | **Yes [DOC]**: path, mandatory fields (incl. `scheduledDate`), status / paymentMethod values | live echo E2 / E3 |
-| B1 response shape | **Documented by example [EX]** (`id`, `reservationId`, `currency`, `status`, `paymentProvider offline`) | live confirmation E2 |
-| B1 currency | **Yes**: no currency input; verify the response currency [DOC + INF] | E3 |
-| B1 units / precision | Float major units [DOC / EX]; the existing 2-decimal conversion | E3 |
-| B1 auth | Bearer documented; examples inconsistent | E1 |
-| B1 list / filter / pagination | **Yes [DOC]**: `reservationId` filter, `count`, `limit` cap 500, order rules, past silent-filter bug | read-after-write E4; complete-read rule §6 handles the rest |
-| B1 marker persistence | Title persists in the example; description unclear | E5 |
-| No money collection by recording | **Yes [DOC + INF]**: offline-only methods, provider offline, status paid | — |
-| Duplicate-collection (auto-payments) | Risk identified [DOC-support + INF] | **Q3 / E6, prerequisite** |
-| I7 bookkeeping escalation | **Resolved by design**: reuse `markUnknown` case-only; the worker never escalates recordings | — (internal routing) |
-| paymentMethod label | — | **Owner Q1** (recommend `credit_card`) |
-| Attempt > 1 policy | — | **Owner Q2** (recommend: never automatic) |
+| Item | Status |
+|---|---|
+| Docs: create fields, response example, list filters, `count`, order, no money movement | **resolved [DOC/EX]** |
+| Auto-payment interaction | **corrected**: an offline record does not prevent schedules; P1 / E6 is a **live prerequisite** |
+| Identity / authorization | **contract defined** (§5.1); live gate E7 |
+| Pre-send fence; intrinsic vs worker split | **defined** (§4) |
+| Success binding / recovery / owner resolution | **defined**; **D2 blocker** (persisted evidence link + succeeded-unproven case) |
+| Never-claimed and attempt > 1 visibility | **D1 blocker** (pending-row case opener) |
+| `paymentMethod` | config fail-closed; owner decision deferred to the live package (recommend `credit_card`) |
+| Currency | USD for future packages; exact match |
 
-**Verdict: GO for a minimal offline implementation slice. NO-GO for any live recording.** The implementation slice requires separate root authorization; the live recording requires Q1–Q3 and E1–E6 in one consolidated owner-approved live package.
-
-**Minimal next implementation slice** (offline, fake provider, disposable PG):
-- migration: the recording claim fence (§5.1);
-- the offline-charge worker + adapter with doc-labelled validation;
-- the complete-read helper;
-- tests T1–T17.
-
-It has no live calls and no E3, planner or admin changes. `paymentMethod` is a config value, defaulting to `credit_card` pending Q1.
+**Verdict.**
+- **NO-GO** for the dispatch worker, its adapter, its migration and any live call. Trust, evidence and alert design gaps D1 and D2, plus live gates E1–E7 / P1, remain.
+- **Narrow next step (after root accepts this contract):** a **pure** request / proof / read-assessment module with fake, doc-derived fixtures and tests P1–P14. No DB, worker, migration, adapter or I/O.
+- D1 / D2 are separate reviewed proposals afterwards.
