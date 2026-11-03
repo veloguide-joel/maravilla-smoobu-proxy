@@ -1,5 +1,10 @@
 # E7.4b-D1: durable owner-case contract for Hostaway payment recordings (DESIGN ONLY), revision 2
 
+> **Current status (as of `34f0314`):**
+> - **0011 is PRESENT and accepted offline** (`cd77088` + the R1 / R2 helper corrections at `34f0314`). §13 maps the implementation.
+> - **0012 (preflight assessments, preflight holds, the eligible-assessment claim fence, owner release) is PROPOSED** in `claude/e74b-preflight-assessment-contract.md`. It is not implemented.
+> - **Historical baseline.** §0–§12 below are the accepted design text written *before* 0011 existed. Statements such as "Nothing here is implemented" and the "no recording claim fence" baseline in §1 describe `abdcf91` (the design baseline), **not** the current code. Where §0–§12 differ from §13, §13 describes the code.
+
 **Branch.** `feature/e7-offline-charge-owner-case-contract`.
 - Revision 1: `f411105`, cut from `abdcf91`.
 - **Revision 2** answers root's HOLD on `f411105`. It records root choices O1–O7 and corrections 1–7; the resolution map is §12.
@@ -272,7 +277,12 @@ booking.process_recording_conflict_inbox_one(p_by text) RETURNS jsonb   -- {evid
    - PostgreSQL rolls back the subtransaction **and releases the locks it acquired**;
    - the function then updates only the inbox row: `attempts + 1`, `last_error = SQLSTATE`, `last_attempt_at`;
    - it returns `{error}`. The item stays **unprocessed**.
-5. Errors **outside** the block (the initial SELECT, or the attempt-accounting UPDATE) abort the whole call: nothing is recorded or marked. The drain helper then **stops immediately** and re-throws the original error, with no further query and no retry (root R1 at `cd77088`).
+5. Errors **outside** the block (the initial SELECT, or the attempt-accounting UPDATE) abort the statement.
+   - **A rejected statement or rolled-back transaction marks nothing.**
+   - But a thrown *transport* error (connection loss around `COMMIT`, e.g. `ECONNRESET`) can leave the outcome **unknown to the caller**: the server may have committed the item's processing before the reply was lost.
+   - The drain helper **stops immediately** and re-throws the original error, with no further query and no retry (root R1 at `cd77088`).
+   - The caller may later inspect `recording_conflict_inbox` read-only (`processed_at`, `outcome`, `attempts`, `last_error` of the item) to learn what happened.
+   - **There is no exactly-once transport guarantee**, and there is never an automatic retry.
 
 **Why this cannot cycle (inferred; tested in T-H2).**
 - The only lock held across the block is the single inbox row, which no other party waits for (`SKIP LOCKED`; the trigger only inserts new rows).
@@ -478,7 +488,7 @@ Its down refuses if any assessment or preflight hold exists. 0011 is complete an
 | T-C5 | writer vs link vs processor, both orders, observed waits | link refused (blocked; `not_latest_linked`), or link stands + contradiction opened |
 | T-C6 | crash / connection kill mid-item | rolled back; reprocessed; no duplicates |
 | T-C7 | poison item | `attempts` / `last_error` / `last_attempt_at`; stays unprocessed; others proceed; ordering by attempts |
-| T-C8 | outer-statement error (simulated) | nothing marked or recorded |
+| T-C8 | outer-statement error (simulated; server-rejected) | nothing marked or recorded (a transport loss around COMMIT would instead leave the outcome unknown to the caller; see §5.3 step 5) |
 | T-C9 | backfill with existing linked contradicted rows (incl. `confirmed`) | holds opened by the drain; visibility only |
 | T-H1 | one item per transaction: a helper's 100 calls are independent; locks released per call | asserted via `pg_locks` between calls |
 | T-H2 | **two processors on interleaved intents** (A, B vs B, A) | no deadlock (single-intent transactions); injected 40P01 caught → attempts + 1, item retried |
@@ -564,6 +574,8 @@ Its down refuses if any assessment or preflight hold exists. 0011 is complete an
 - `drainRecordingConflictInbox(pool, { by, maxCalls ≤ 100 })`: requires a `pg.Pool`; independent autocommit calls; no retries.
   - SQL-recorded item errors are returned data, accumulated in `errors` under the bound.
   - A **thrown** call (outer failure) stops the run at once and **re-throws the original error object** unchanged. Bounded partial progress is attached as a non-enumerable `err.drainProgress = { calls, processed, errors }`, and no further query is issued. (Root R1 at `cd77088`; the earlier `failures` accumulation is removed.)
+  - **Precision (root, at the `34f0314` review).** A server-rejected statement marks nothing. A connection lost around `COMMIT` leaves that call's processing outcome **unknown** to the caller (it may have committed), so `drainProgress` covers only calls whose replies arrived. Safe follow-up is a read-only inspection of the inbox row; there is no exactly-once transport guarantee and no automatic retry.
+  - The code comment at `lib/booking-db/operations.js:254` and the SQL comment at `db/migrations/0011_recording_owner_cases.up.sql:653` still use the categorical "marked nothing" wording. They are outside this docs-only task; correct them in the next code slice.
   - T-H3 covers a first-call failure and a failure after one processed item, with exact query counts and the remaining items untouched;
 - `linkRecordingEvidence(…, { openVisibilityHoldOnConflict })`: an optional **separate** best-effort hold, exactly one attempt, never retried. The original `RECORDING_EVIDENCE_CONFLICT` result is always returned, with `visibilityHold` beside it:
   - the opener's result;
