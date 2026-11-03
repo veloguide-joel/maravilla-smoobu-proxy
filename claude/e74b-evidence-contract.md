@@ -471,3 +471,18 @@ Tightenings made while implementing; where they differ from earlier text, these 
   - A count-only fixture fails.
   - The existing `admin_resolve_operation` does **not** enforce this shape.
 - **Outputs:** every output carries `sendAuthorization: false` where relevant. None authorizes a send.
+
+**Correction after root HOLD on `42ee156`** (pure scope only):
+
+| Finding | Fix |
+|---|---|
+| Replay of branded results across contexts | Identity, list, eligibility and reply-candidate results carry a frozen **full context**: every intent fact plus every configuration field (`accountRef`, channel, currency, listing, `paymentMethod`, `refFieldId`). Each later step requires exact equality with the current facts. |
+| Candidate / eligibility replay | The eligibility carries the **initial recording identity** (op id, type, key, payload reservation and amount). Post-claim steps compare against it without requiring the row to still be pending. A candidate is bound to its exact eligibility object and to the reply's full returned identity. |
+| Reply assessment ignored method / path / query | It validates the whole request (method, path, query, extras) and requires it to equal the eligibility's frozen request. |
+| Owner evidence had no time check | It requires an explicit `now`: `dispatchedAt ≤ now` and `observedAt ≤ now`. The settle period (≥ dispatch + 15 min) is kept. There is no maximum age for immutable owner evidence. |
+| Freshness could be disabled | `maxAgeMs` must be a safe non-negative integer. |
+
+Additional rule in the same correction:
+- **List money:** `type` must be `charge` / `preAuth` / `refund`.
+- A refund needs an exact **non-positive** amount; every other row an exact non-negative amount.
+- Malformed money makes the read untrusted. It is never treated as absence.

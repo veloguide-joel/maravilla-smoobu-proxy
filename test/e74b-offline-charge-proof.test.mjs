@@ -104,7 +104,15 @@ test("P4/P5 list assessment: malformed counts, duplicates, foreign rows -> incom
   assert.equal(bad([], { extra: 1 }), "LIST_READ_SHAPE");
   // a refund row (negative amount) is a valid row with no exact positive amount
   const r = listOk([row({ id: 9, type: "refund", amount: -10, status: "succeeded" })]);
-  assert.equal(r.ok, true); assert.equal(r.rows[0].amountMinor, null);
+  assert.equal(r.ok, true); assert.equal(r.rows[0].amountMinor, -1000);
+  // malformed money is untrusted (never "absent"): non-round-trippable paid charges, negative charges, positive refunds, unknown types
+  assert.equal(bad([row({ amount: 1234.567 })]), "LIST_ROW_AMOUNT_NOT_EXACT");
+  assert.equal(bad([row({ amount: -10 })]), "LIST_ROW_AMOUNT_NOT_EXACT");
+  assert.equal(bad([row({ type: "refund", amount: 10 })]), "LIST_ROW_AMOUNT_NOT_EXACT");
+  assert.equal(bad([row({ type: "refund", amount: -10.001 })]), "LIST_ROW_AMOUNT_NOT_EXACT");
+  assert.equal(bad([row({ amount: 1e21 })]), "LIST_ROW_AMOUNT_NOT_EXACT");
+  assert.equal(bad([row({ amount: Infinity })]), "LIST_ROW_AMOUNT_INVALID");
+  assert.equal(bad([row({ type: "deposit" })]), "LIST_ROW_TYPE_UNKNOWN");
 });
 
 test("freshness: inclusive max age, future / invalid / missing times refused", () => {
@@ -212,7 +220,8 @@ test("P11 preflight table: marker present / look-alike / same-amount unmarked pa
   assert.equal(q([row({ title: TITLE.toUpperCase() })]).code, "MARKER_LOOKALIKE_CONFLICT");
   assert.equal(q([row({ amount: 1234.56 })]).code, "SAME_AMOUNT_PAID_UNMARKED_CONFLICT");
   assert.equal(q([row({ amount: 1234.56, status: "awaiting" })]).ok, true);                        // not paid: no conflict
-  assert.equal(q([row({ amount: 1234.56, type: "refund" })]).ok, true);
+  assert.equal(q([row({ amount: -1234.56, type: "refund", status: "succeeded" })]).ok, true);      // lawful refund row: no conflict
+  assert.equal(q([row({ amount: 1234.56, type: "refund" })]).code, "COMPLETE_LIST_REQUIRED");          // positive refund = malformed money
   assert.equal(q([row()]).ok, true);
   const inc = P.qualifyPreflight({ identity: identityOk(), list: P.assessChargeList({ read: list([row(), row()]), intent: intent(), config: cfg(), now: NOW }),
     intent: intent(), recordingOp: op(), config: cfg(), now: NOW });
@@ -243,7 +252,9 @@ test("request: frozen, built only from a branded eligibility; exact five fields;
   const B = (o) => P.buildOfflineChargeRequest({ eligibility: e, intent: intent(), recordingOp: op(), config: cfg(), now: NOW, ...o });
   assert.equal(B({ eligibility: { ...e } }).code, "ELIGIBILITY_REQUIRED");
   assert.equal(B({ eligibility: JSON.parse(JSON.stringify(e)) }).code, "ELIGIBILITY_REQUIRED");
-  assert.throws(() => { e.snapshot.capturedMinor = 1; });
+  assert.throws(() => { e.context.capturedMinor = 1; });
+  assert.throws(() => { e.request.body.amount = 1; });
+  assert.throws(() => { e.recording.payloadAmountMinor = 1; });
   assert.equal(B({ intent: intent({ version: 8 }) }).code, "ELIGIBILITY_SNAPSHOT_CHANGED");
   assert.equal(B({ config: cfg({ paymentMethod: "other" }) }).code, "ELIGIBILITY_SNAPSHOT_CHANGED");
   assert.equal(B({ intent: intent({ recordedPaymentAt: RECORDED + 1000 }) }).code, "ELIGIBILITY_SNAPSHOT_CHANGED");
@@ -269,8 +280,9 @@ test("request: frozen, built only from a branded eligibility; exact five fields;
 });
 
 test("P12 reply alone is a CANDIDATE (insufficient); every field broken individually -> unknown case", () => {
-  const b = built();
-  const A = (r, o = {}) => P.assessCreateReply({ reply: r, request: b.request, intent: intent(), config: cfg(), ...o });
+  const e = eligible();
+  const b = P.buildOfflineChargeRequest({ eligibility: e, intent: intent(), recordingOp: op(), config: cfg(), now: NOW });
+  const A = (r, o = {}) => P.assessCreateReply({ reply: r, request: b.request, eligibility: e, intent: intent(), config: cfg(), ...o });
   const c = A(reply());
   assert.equal(c.ok, true); assert.equal(c.sufficient, false); assert.equal(c.chargeId, "777");
   assert.equal(A({ httpStatus: 201, json: reply().json }).ok, true);
@@ -283,12 +295,13 @@ test("P12 reply alone is a CANDIDATE (insufficient); every field broken individu
   }
   assert.equal(A({ httpStatus: 500, json: reply().json }).code, "REPLY_HTTP_STATUS");
   assert.equal(A({ httpStatus: 200, json: { status: "fail", result: "x" } }).code, "REPLY_FAIL_ENVELOPE");
-  assert.equal(A(reply(), { request: { ...b.request, body: { ...b.request.body, amount: 1 } } }).code, "REQUEST_NOT_BOUND");
+  assert.equal(A(reply(), { request: { ...b.request, body: { ...b.request.body, amount: 1 } } }).code, "REQUEST_NOT_BOUND_BODY_AMOUNT");
 });
 
 test("P13 confirming read: exact-1 equal to the candidate after dispatch; zero / multiple / look-alike / mismatch / incomplete distinct", () => {
-  const b = built(); const e = eligible();
-  const cand = P.assessCreateReply({ reply: reply(), request: b.request, intent: intent(), config: cfg() });
+  const e = eligible();
+  const b = P.buildOfflineChargeRequest({ eligibility: e, intent: intent(), recordingOp: op(), config: cfg(), now: NOW });
+  const cand = P.assessCreateReply({ reply: reply(), request: b.request, eligibility: e, intent: intent(), config: cfg() });
   const DISPATCH = NOW - 2000;
   const C = (rows, o = {}, lo = {}) => P.assessConfirmingRead({ candidate: cand, eligibility: e, intent: intent(), config: cfg(), dispatchedAt: DISPATCH, now: NOW,
     list: P.assessChargeList({ read: list(rows, lo), intent: intent(), config: cfg(), now: NOW }), ...o });
@@ -321,7 +334,7 @@ test("P14 owner-resolution evidence: full observed identity + API / read / time 
     title: TITLE, type: "charge" } };
   const ev = (o = {}, ob = {}) => ({ source: "hostaway_api", kind: "hostaway_offline_charges", status: "listed", externalRef: "88000001",
     readOpType: "hostaway.list_offline_charges", readOpState: "succeeded", observedAt: DISPATCH + P.OWNER_RESOLUTION_SETTLE_MS, observed: { ...full, ...ob }, ...o });
-  const R = (e, o = {}) => P.assessOwnerResolutionEvidence({ evidence: e, intent: intent(), config: cfg(), dispatchedAt: DISPATCH, resultRef: "777", ...o });
+  const R = (e, o = {}) => P.assessOwnerResolutionEvidence({ evidence: e, intent: intent(), config: cfg(), dispatchedAt: DISPATCH, resultRef: "777", now: NOW, ...o });
   assert.deepEqual(R(ev()), { ok: true, chargeId: "777" });
   const countOnly = ev({}, {}); countOnly.observed = { matchingChargeCount: 1, matchingChargeIds: ["777"] };
   assert.deepEqual([R(countOnly).code, R(countOnly).disposition], ["EVIDENCE_OBSERVED_FIELDS_INCOMPLETE", "case_only"]);
@@ -350,4 +363,132 @@ test("policy: only the initial attempt; protected ids; constants", () => {
   for (const id of PROTECTED_HOSTAWAY_RESERVATION_IDS) assert.equal(P.intentRefusal(intent({ reservationId: id }), cfg()), "PROTECTED_RESERVATION_ID");
   assert.equal(P.recordingOpRefusal(op({ idempotencyKey: `och:${INTENT_ID}:2` }), intent()), "NOT_INITIAL_ATTEMPT");
   assert.equal(P.recordingOpRefusal(op({ idempotencyKey: `och:${OTHER_INTENT}:1` }), intent()), "NOT_INITIAL_ATTEMPT");
+});
+
+// =============================================================================================
+// root HOLD on 42ee156: cross-context replay regressions (each failed at 42ee156: root probe {true,true,true,true})
+
+const CHANGES = Object.freeze({
+  amount: [{ capturedMinor: 223456, finalTotalMinor: 223456 }, {}],
+  from: [{ from: "2027-02-09" }, {}],
+  to: [{ to: "2027-02-15" }, {}],
+  ref: [{ ref: "MV-XYZ999" }, {}],
+  version: [{ version: 8 }, {}],
+  recordedPaymentAt: [{ recordedPaymentAt: RECORDED + 1000 }, {}],
+  intentId: [{ intentId: OTHER_INTENT }, {}],
+  paymentMethod: [{}, { paymentMethod: "other" }],
+  accountRef: [{}, { accountRef: "acct-test-2" }],
+  refFieldId: [{}, { refFieldId: 777008 }]
+});
+const opFor = (it) => op({ idempotencyKey: `och:${it.intentId}:1`, payload: { reservationId: it.reservationId, amountMinor: it.capturedMinor } });
+
+test("HOLD-1 identity / list replay: branded results minted for one context are refused for EVERY changed intent / config field", () => {
+  const id0 = identityOk(); const l0 = listOk([row()]);
+  assert.equal(id0.context.capturedMinor, 123456); assert.ok(Object.isFrozen(id0.context) && Object.isFrozen(id0.observed));
+  for (const [name, [io, co]] of Object.entries(CHANGES)) {
+    const it = intent(io); const c = cfg(co);
+    const r = P.qualifyPreflight({ identity: id0, list: l0, intent: it, recordingOp: opFor(it), config: c, now: NOW });
+    assert.equal(r.ok, false, name);
+    assert.ok(["IDENTITY_CONTEXT_CHANGED", "ACCOUNT_REF_BINDING_MISMATCH"].includes(r.code), `${name}: ${r.code}`);
+    // a list minted for the old context with an identity minted for the NEW context is refused too
+    const snapNew = snap({ accountRef: c.accountRef }, { totalPrice: it.capturedMinor / 100, arrivalDate: it.from, departureDate: it.to,
+      customFieldValues: [{ customFieldId: c.refFieldId, value: it.ref }] });
+    const idNew = P.assessIdentitySnapshot({ snapshot: snapNew, intent: it, config: c, now: NOW });
+    assert.equal(idNew.ok, true, `${name}: ${idNew.code}`);
+    const r2 = P.qualifyPreflight({ identity: idNew, list: l0, intent: it, recordingOp: opFor(it), config: c, now: NOW });
+    assert.ok(["LIST_CONTEXT_CHANGED", "ACCOUNT_REF_BINDING_MISMATCH"].includes(r2.code), `${name}: ${r2.code}`);
+  }
+  // root's exact repro: old identity / list, new stay + amount + version, same reservation
+  const changed = intent({ capturedMinor: 223456, finalTotalMinor: 223456, from: "2027-03-10", to: "2027-03-14", version: 8 });
+  assert.equal(P.qualifyPreflight({ identity: id0, list: l0, intent: changed, recordingOp: opFor(changed), config: cfg(), now: NOW }).code, "IDENTITY_CONTEXT_CHANGED");
+});
+
+test("HOLD-2 candidate + eligibility replay: a confirm for changed facts is refused for EVERY changed field; cross-eligibility refused", () => {
+  const e = eligible();
+  const b = P.buildOfflineChargeRequest({ eligibility: e, intent: intent(), recordingOp: op(), config: cfg(), now: NOW });
+  const cand = P.assessCreateReply({ reply: reply(), request: b.request, eligibility: e, intent: intent(), config: cfg() });
+  assert.equal(cand.ok, true); assert.ok(Object.isFrozen(cand.returned) && cand.eligibility === e);
+  for (const [name, [io, co]] of Object.entries(CHANGES)) {
+    const it = intent(io); const c = cfg(co);
+    const l = P.assessChargeList({ read: list([row({ id: 777, title: P.offlineChargeTitle(it.intentId) ?? TITLE, amount: it.capturedMinor / 100,
+      paymentMethod: c.paymentMethod })], { observedAt: NOW, accountRef: c.accountRef }), intent: it, config: c, now: NOW });
+    const r = P.assessConfirmingRead({ candidate: cand, eligibility: e, list: l, intent: it, config: c, dispatchedAt: NOW - 1, now: NOW });
+    assert.equal(r.ok, false, name);
+    assert.equal(r.disposition, "unknown_case", name);
+    // a reply assessed under changed facts with the OLD eligibility is refused as well
+    assert.equal(P.assessCreateReply({ reply: reply(), request: b.request, eligibility: e, intent: it, config: c }).ok, false, `${name} reply`);
+  }
+  // root's exact repro
+  const changed = intent({ capturedMinor: 223456, finalTotalMinor: 223456, from: "2027-03-10", to: "2027-03-14", version: 8 });
+  const cl = P.assessChargeList({ read: list([row({ id: 777, title: TITLE, amount: 2234.56 })], { observedAt: NOW }), intent: changed, config: cfg(), now: NOW });
+  assert.equal(P.assessConfirmingRead({ candidate: cand, eligibility: e, list: cl, intent: changed, config: cfg(), dispatchedAt: NOW - 1, now: NOW }).code, "CONFIRM_CONTEXT_CHANGED");
+  // a DIFFERENT (but valid) eligibility for the same facts cannot be paired with this candidate
+  const e2 = eligible();
+  const l = P.assessChargeList({ read: list([row({ id: 777, title: TITLE, amount: 1234.56 })], { observedAt: NOW }), intent: intent(), config: cfg(), now: NOW });
+  assert.equal(P.assessConfirmingRead({ candidate: cand, eligibility: e2, list: l, intent: intent(), config: cfg(), dispatchedAt: NOW - 1, now: NOW }).code, "CANDIDATE_ELIGIBILITY_MISMATCH");
+  assert.equal(P.assessConfirmingRead({ candidate: cand, eligibility: e, list: l, intent: intent(), config: cfg(), dispatchedAt: NOW - 1, now: NOW }).ok, true);
+  // post-claim: the recording row is NOT an input; its initial identity travels in the eligibility
+  assert.deepEqual({ ...e.recording }, { opId: OP_ID, opType: "hostaway.record_offline_charge", idempotencyKey: `och:${INTENT_ID}:1`, payloadReservationId: "88000001", payloadAmountMinor: 123456 });
+  // a reply with an eligibility that is not branded
+  assert.equal(P.assessCreateReply({ reply: reply(), request: b.request, eligibility: { ...e }, intent: intent(), config: cfg() }).code, "ELIGIBILITY_REQUIRED");
+});
+
+test("HOLD-3 reply assessment validates the WHOLE request (method / path / query / extras) -> unknown case", () => {
+  const e = eligible();
+  const b = P.buildOfflineChargeRequest({ eligibility: e, intent: intent(), recordingOp: op(), config: cfg(), now: NOW });
+  const A = (req) => P.assessCreateReply({ reply: reply(), request: req, eligibility: e, intent: intent(), config: cfg() });
+  for (const [req, code] of [[{ ...b.request, method: "DELETE", path: "/wrong", query: { unexpected: true } }, "REQUEST_NOT_BOUND_METHOD"],
+    [{ ...b.request, method: "PUT" }, "REQUEST_NOT_BOUND_METHOD"], [{ ...b.request, path: "/wrong" }, "REQUEST_NOT_BOUND_PATH"],
+    [{ ...b.request, path: "/v1/guestPayments/charges/88000002" }, "REQUEST_NOT_BOUND_PATH"], [{ ...b.request, query: { unexpected: true } }, "REQUEST_NOT_BOUND_QUERY_NOT_EMPTY"],
+    [{ ...b.request, headers: {} }, "REQUEST_NOT_BOUND_REQUEST_SHAPE"], [{ ...b.request, body: { ...b.request.body, currency: "USD" } }, "REQUEST_NOT_BOUND_BODY_SHAPE"],
+    [{ ...b.request, body: { ...b.request.body, status: "awaiting" } }, "REQUEST_NOT_BOUND_BODY_STATUS"], [null, "REQUEST_NOT_BOUND_REQUEST_SHAPE"]]) {
+    const r = A(req);
+    assert.deepEqual([r.ok, r.code, r.disposition], [false, code, "unknown_case"], code);
+  }
+  assert.equal(A(b.request).ok, true);
+  assert.equal(A({ ...b.request }).ok, true);                                                      // a structurally equal copy is fine (validated by value)
+});
+
+test("HOLD-4 owner evidence: explicit now; future / missing / invalid times refused; boundaries inclusive; no max age", () => {
+  const DISPATCH = NOW - 20 * 60 * 1000;
+  const full = { amountMinor: 123456, chargeId: "777", currency: "USD", executorAccountRef: "acct-test-1", listingMapId: 990001, marker: `mvoch1-${INTENT_ID}`,
+    matchingChargeCount: 1, matchingChargeIds: ["777"], paymentMethod: "credit_card", paymentProvider: "offline", readCount: 1, reservationId: "88000001", status: "paid",
+    title: TITLE, type: "charge" };
+  const ev = (observedAt) => ({ source: "hostaway_api", kind: "hostaway_offline_charges", status: "listed", externalRef: "88000001",
+    readOpType: "hostaway.list_offline_charges", readOpState: "succeeded", observedAt, observed: full });
+  const R = (observedAt, o = {}) => P.assessOwnerResolutionEvidence({ evidence: ev(observedAt), intent: intent(), config: cfg(), dispatchedAt: DISPATCH, resultRef: "777", now: NOW, ...o });
+  assert.equal(R(NOW + 86400000, { dispatchedAt: NOW - 1 }).code, "EVIDENCE_IN_FUTURE");          // root's repro
+  assert.equal(R(NOW + 1).code, "EVIDENCE_IN_FUTURE");
+  assert.equal(R(NOW).ok, true);                                                                  // observedAt == now
+  assert.equal(R(DISPATCH + P.OWNER_RESOLUTION_SETTLE_MS).ok, true);                              // settle boundary inclusive
+  assert.equal(R(DISPATCH + P.OWNER_RESOLUTION_SETTLE_MS - 1).code, "EVIDENCE_TOO_EARLY");
+  assert.equal(R(NOW, { dispatchedAt: NOW + 1 }).code, "DISPATCH_IN_FUTURE");
+  for (const n of [undefined, null, 0, -1, 1.5, NaN, Infinity, "1"]) assert.equal(R(NOW, { now: n }).code, "NOW_INVALID", String(n));
+  // historical immutable evidence: no artificial maximum age
+  assert.equal(R(DISPATCH + P.OWNER_RESOLUTION_SETTLE_MS, { now: NOW + 365 * 86400000 }).ok, true);
+});
+
+test("freshness maxAge must be a safe non-negative integer (never disables freshness)", () => {
+  for (const m of [NaN, Infinity, -1, 1.5, "120000", null]) assert.equal(P.freshnessRefusal(NOW - 1, NOW, m), "MAX_AGE_INVALID", String(m));
+  assert.equal(P.freshnessRefusal(NOW, NOW, 0), null);
+  assert.equal(P.freshnessRefusal(NOW - 1, NOW, 0), "STALE");
+  assert.equal(P.freshnessRefusal(NOW - 1, NOW, undefined), null);                                // default applies
+});
+
+test("branded results are deeply immutable", () => {
+  const id = identityOk(); const l = listOk([row()]); const e = eligible();
+  for (const o of [id, id.context, id.observed, l, l.rows, l.rows[0], l.context, e, e.context, e.recording, e.request, e.request.body, e.request.query]) assert.ok(Object.isFrozen(o));
+});
+
+test("HOLD-2b confirm: a complete list minted under ANOTHER context is refused even when eligibility / candidate match", () => {
+  const e = eligible();
+  const b = P.buildOfflineChargeRequest({ eligibility: e, intent: intent(), recordingOp: op(), config: cfg(), now: NOW });
+  const cand = P.assessCreateReply({ reply: reply(), request: b.request, eligibility: e, intent: intent(), config: cfg() });
+  const good = [row({ id: 777, title: TITLE, amount: 1234.56 })];
+  for (const [name, io] of [["version", { version: 8 }], ["ref", { ref: "MV-XYZ999" }], ["recordedPaymentAt", { recordedPaymentAt: RECORDED + 1 }]]) {
+    const other = P.assessChargeList({ read: list(good, { observedAt: NOW }), intent: intent(io), config: cfg(), now: NOW });
+    assert.equal(other.ok, true, name);
+    const r = P.assessConfirmingRead({ candidate: cand, eligibility: e, list: other, intent: intent(), config: cfg(), dispatchedAt: NOW - 1, now: NOW });
+    assert.deepEqual([r.code, r.disposition], ["CONFIRM_LIST_CONTEXT_CHANGED", "unknown_case"], name);
+  }
 });
