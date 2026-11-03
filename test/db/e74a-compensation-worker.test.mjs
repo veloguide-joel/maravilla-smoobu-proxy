@@ -460,27 +460,72 @@ test("shared claim fence: transitions OUT of cleanup (owner case / authorization
   assert.equal(await claimNextOperation(db.app, { workerId: "other-scope", now: hc.clk.t, opTypes: [OPS.VOID], intentId: c.id }), null);
 });
 
-test("shared claim fence vs a concurrent intent transition: a transition committing first refuses the claim; a claim holding the intent lock first wins and the transition waits", async () => {
+/** Poll pg_stat_activity until at least n OTHER backends wait on a lock (bounded): proof that the competitor reached its lock. */
+async function waitForLockWaiters(n = 1, timeoutMs = 5000) {
+  const t0 = Date.now();
+  for (;;) {
+    const r = await db.owner.query(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'
+                                      AND pid <> pg_backend_pid()`);
+    if (r.rows[0].n >= n) return;
+    if (Date.now() - t0 > timeoutMs) throw new Error(`no lock waiter observed within ${timeoutMs} ms`);
+    await new Promise((res) => setTimeout(res, 10));
+  }
+}
+
+test("shared claim fence vs a concurrent intent transition (overlap PROVEN by an observed lock wait): transition first -> claim refused; claim first -> transition waits", async () => {
   const w = world();
-  // (a) the transition holds the intent row (uncommitted) while a claim starts: the claim re-checks after the intent lock -> refused
+  // (a) the transition holds the intent row (uncommitted); the claim finds its candidate, then BLOCKS on the intent share lock
   const a = await captureFailed(w, 20, "P");
   const t = F.at(20);
   let claimP = null;
   F.ok(await applyEvent(db.app, a.id, { type: "ESCALATE", id: "race-escalate", code: "OWNER_REVIEW" }, { now: t, actor: "reconciler", hooks: { beforeCommit: async () => {
     claimP = claimNextOperation(db.app, { workerId: "racer", now: t, opTypes: [OPS.VOID], intentId: a.id });
-    await new Promise((res) => setTimeout(res, 150));               // the claim found its candidate and now waits on the intent lock
+    await waitForLockWaiters(1);
   } } }));
-  assert.equal(await claimP, null, "refused after the transition committed");
+  assert.equal(await claimP, null, "re-checked after the intent lock: refused");
   assert.equal((await voidRowOf(a.id)).state, "pending");
-  // (b) the claim share-locks the intent first: it commits (open leg), the transition waits and then applies
+  // (b) the claim share-locks the intent first (open leg): the transition BLOCKS, the claim commits, then the transition applies
   const b = await captureFailed(w, 20, "P");
   let evP = null;
   const op = await claimNextOperation(db.app, { workerId: "racer", now: t, opTypes: [OPS.VOID], intentId: b.id, hooks: { afterIntentLock: async () => {
     evP = applyEvent(db.app, b.id, { type: "ESCALATE", id: "race-escalate-b", code: "OWNER_REVIEW" }, { now: t, actor: "reconciler" });
-    await new Promise((res) => setTimeout(res, 150));
+    await waitForLockWaiters(1);
   } } });
-  assert.ok(op && op.op_type === OPS.VOID, "claim committed first");
+  assert.ok(op && op.op_type === OPS.VOID, "valid open-leg claim committed first");
   F.ok(await evP);
+  assert.equal(await state(b.id), "reconciliation_required");
+});
+
+test("0009 guard: a DIRECT runtime UPDATE racing a transition is refused once the transition commits (or aborted as a deadlock victim, never a bypass); open leg allowed", async () => {
+  const w = world();
+  const t = F.at(20);
+  // (a) the transition holds the intent; the direct UPDATE locks the op row, its trigger then BLOCKS on the intent share lock
+  const a = await captureFailed(w, 22, "P");
+  const v = await voidRowOf(a.id);
+  let upP = null;
+  F.ok(await applyEvent(db.app, a.id, { type: "ESCALATE", id: "direct-race", code: "OWNER_REVIEW" }, { now: t, actor: "reconciler", hooks: { beforeCommit: async () => {
+    upP = directClaim(v.id, t);
+    await waitForLockWaiters(1);
+  } } }));
+  const msg = await upP;
+  assert.ok(/^VOID_CLAIM_FENCED/.test(msg) || /deadlock detected/.test(msg), `refused: ${msg}`);
+  const v1 = await voidRowOf(a.id);
+  assert.deepEqual([v1.state, v1.attempts, v1.dispatched_at], ["pending", 0, null], "never in flight");
+  // (b) a direct UPDATE inside an open transaction while the leg is OPEN is allowed (trigger share-locks the intent);
+  //     a concurrent transition waits for it, then applies
+  const b = await captureFailed(w, 22, "P");
+  const vb = await voidRowOf(b.id);
+  const client = await db.app.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(`UPDATE booking.external_operations SET state = 'in_flight', lease_worker_id = 'direct-sql', lease_until = $2, attempts = attempts + 1,
+                          dispatched_at = $3, updated_at = $3 WHERE id = $1`, [vb.id, new Date(t + 60 * MIN), new Date(t)]);
+    const evP = applyEvent(db.app, b.id, { type: "ESCALATE", id: "direct-race-b", code: "OWNER_REVIEW" }, { now: t, actor: "reconciler" });
+    await waitForLockWaiters(1);
+    await client.query("COMMIT");
+    F.ok(await evP);
+  } finally { client.release(); }
+  assert.equal((await voidRowOf(b.id)).state, "in_flight", "the open-leg direct claim committed");
   assert.equal(await state(b.id), "reconciliation_required");
 });
 
