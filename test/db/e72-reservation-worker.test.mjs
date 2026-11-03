@@ -5,8 +5,9 @@ import assert from "node:assert/strict";
 import { startMigratedDatabase } from "./harness.mjs";
 import * as F from "./fixtures.mjs";
 import { applyEvent, loadIntent, createIntentRecord, collectGuestDetails, beginPayStep, recordCheckoutSession } from "../../lib/booking-db/repo.js";
-import { claimNextOperation, completeOperation, recoverExpiredOperations } from "../../lib/booking-db/operations.js";
-import { runOrchestratorStep, reservationWorkerGate, LIMITS } from "../../lib/booking-db/reservation-worker.js";
+import { claimNextOperation, completeOperation, recoverExpiredOperations, requestRead } from "../../lib/booking-db/operations.js";
+import { reissueOrphanRead } from "../../lib/booking-db/recovery.js";
+import { runOrchestratorStep, reservationWorkerGate, LIMITS, PROTECTED_HOSTAWAY_RESERVATION_IDS, isProtectedReservationId, DEFAULT_TIMEOUTS, _internal } from "../../lib/booking-db/reservation-worker.js";
 import { priceStay } from "../../lib/checkout/server-pricer.js";
 import { readDirectPolicyFromEnv } from "../../lib/direct-policy.js";
 import { todayInTimeZone } from "../../lib/public-api.js";
@@ -26,13 +27,15 @@ const STAY = { from: "2026-12-20", to: "2026-12-24", guests: 2 };
 // ---------- fake Hostaway world (pricing reads, reservation reads, create) ----------
 function world({ currency = "MXN", blocked = new Set(), nightly = 1600 } = {}) {
   const w = { calls: [], reservations: [], nextId: 700000 + Math.floor(Math.random() * 1000) * 100, createMode: "ok", lookupMode: "ok", retrieveMode: "ok",
-    pricingMode: "ok", onCreate: null, onPricing: null, nightly, currency };
+    pricingMode: "ok", onCreate: null, onPricing: null, nightly, currency, signals: [] };
+  const hang = (signal) => { w.signals.push(signal); return new Promise(() => {}); };
   const days = (from, to) => { const out = []; for (let d = from; d <= to; d = addDays(d, 1)) out.push({ date: d, status: blocked.has(d) ? "booked" : "available", isAvailable: blocked.has(d) ? 0 : 1, minimumStay: 1, maximumStay: 90, closedOnArrival: 0, closedOnDeparture: 0 }); return out; };
   const full = (r) => ({ id: r.id, listingMapId: r.listingMapId, channelId: 2000, arrivalDate: r.arrivalDate, departureDate: r.departureDate, totalPrice: r.totalPrice,
     currency: r.currency, status: r.status, customFieldValues: [{ customFieldId: REF_FIELD, value: r.ref }] });
   w.pricing = {
     get: async (path, opts = {}) => {
       w.calls.push(`GET ${path}`);
+      if (w.pricingMode === "hang") return hang(opts.signal);
       if (w.onPricing) await w.onPricing();
       if (w.pricingMode === "down") return { status: 503, json: null };
       const m = /^\/listings\/(\d+)(\/calendar)?$/.exec(path); const id = Number(m[1]);
@@ -48,24 +51,27 @@ function world({ currency = "MXN", blocked = new Set(), nightly = 1600 } = {}) {
   };
   w.executors = {
     pricing: w.pricing,
-    lookupPage: async (req) => {
+    lookupPage: async (req, o = {}) => {
       w.calls.push(`LOOKUP ${req.query.listingId}${req.query.afterId ? ` after ${req.query.afterId}` : ""}`);
+      if (w.lookupMode === "hang") return hang(o.signal);
       if (w.lookupMode === "error") return { httpStatus: 500, json: null };
       if (req.query.afterId) return { httpStatus: 200, json: { status: "success", result: [] } };
       const items = w.reservations.filter((r) => r.listingMapId === req.query.listingId && r.arrivalDate === req.query.arrivalStartDate).map(full);
       if (w.lookupMode === "noCurrency") for (const i of items) delete i.currency;
       return { httpStatus: 200, json: { status: "success", result: items } };
     },
-    retrieveReservation: async (req) => {
+    retrieveReservation: async (req, o = {}) => {
       w.calls.push(`RETRIEVE ${req.path}`);
+      if (w.retrieveMode === "hang") return hang(o.signal);
       const id = Number(/\/reservations\/(\d+)$/.exec(req.path)[1]);
       const r = w.reservations.find((x) => x.id === id);
       if (!r) return { httpStatus: 404, json: { status: "fail" } };
       if (w.retrieveMode === "malformed") return { httpStatus: 200, json: { status: "success", result: { id: "x" } } };
       return { httpStatus: 200, json: { status: "success", result: full(r) } };
     },
-    createReservation: async (req) => {
+    createReservation: async (req, o = {}) => {
       w.calls.push(`CREATE ${req.body.customFieldValues[0].value}`);
+      w.signals.push(o.signal);
       assert.equal(req.method, "POST"); assert.deepEqual(req.query, {}, "no query (never forceOverbooking)");
       assert.ok(!JSON.stringify(req).toLowerCase().includes("forceoverbooking"));
       if (w.onCreate) await w.onCreate(req);
@@ -83,6 +89,7 @@ function world({ currency = "MXN", blocked = new Set(), nightly = 1600 } = {}) {
         case "malformed": store(); return { httpStatus: 201, json: { status: "success", result: "nope" } };
         case "timeoutCreated": store(); throw new Error("timeout");
         case "timeout": throw new Error("timeout");
+        case "late": return new Promise((resolve) => { w.releaseLate = () => resolve({ httpStatus: 201, json: { status: "success", result: full(store()) } }); });
         default: throw new Error(`mode ${w.createMode}`);
       }
     }
@@ -313,8 +320,9 @@ test("authorization deadline: passed before start / crossed during pricing / cro
   const dc = (await loadIntent(db.app, c.id)).payment.authorizationDeadline;
   h.clk.t = dc - 60 * 1000;                                            // start: E3 lease until dc + 60 s
   await h.step({ intentId: c.id });
-  h.clk.t = dc - 30 * 1000;                                            // enough time to dispatch (margin 15 s)
-  const r = await h.step({ intentId: c.id, hooks: { afterClaim: async () => { h.clk.t = dc - 10 * 1000; } } });   // op lease still valid
+  h.clk.t = dc - 50 * 1000;                                            // room for call (20 s) + margin (15 s) at dispatch
+  // after the claim only the DEADLINE runs short (op/work leases 40 s left, E3 lease 90 s)
+  const r = await h.step({ intentId: c.id, hooks: { afterClaim: async () => { h.clk.t = dc - 30 * 1000; } } });
   assert.deepEqual(r.actions, ["RESERVATION_DISPATCHED", "CREATE_CLAIMED", "SEND_ABORTED:DEADLINE", "RESERVATION_OUTCOME_UNKNOWN:SEND_ABORTED_DEADLINE"]);
   assert.equal(r.sends, 0);
   assert.equal(w.count("CREATE"), 0);
@@ -396,17 +404,18 @@ test("send margins: too little authorization time to dispatch -> escalate withou
   const da = (await loadIntent(db.app, a.id)).payment.authorizationDeadline;
   const h = harness(w, [L(36), L(37)], { start: da - 60 * 1000 });
   await h.step({ intentId: a.id });
-  h.clk.t = da - 10 * 1000;                                            // < sendMarginMs left
+  h.clk.t = da - 30 * 1000;                                            // > margin (15 s) but < call (20 s) + margin
   const s = await h.step({ intentId: a.id });
   assert.equal(s.actions.at(-1), "ESCALATE:AUTHORIZATION_DEADLINE_PASSED");
-  assert.equal((await opsOf(a.id, "hostaway.create_reservation")).length, 0, "nothing dispatched");
+  assert.equal((await opsOf(a.id, "hostaway.create_reservation")).length, 0, "nothing dispatched or claimed");
   const b = await authorizedIntent(w, L(37));
   h.clk.t = F.at(10);
   await h.step({ intentId: b.id });
   const until = (await loadIntent(db.app, b.id)).lease.until;
-  h.clk.t = until - 50 * 1000;                                          // claim here: operation lease runs to until + 10 s
-  const r = await h.step({ intentId: b.id, hooks: { afterClaim: async () => { h.clk.t = until - 10 * 1000; } } });   // E3 lease < margin
-  assert.deepEqual(r.actions.slice(-2), ["SEND_ABORTED:LEASE", "RESERVATION_OUTCOME_UNKNOWN:SEND_ABORTED_LEASE"]);
+  h.clk.t = until - 50 * 1000;                                          // claim here: operation and work leases run to until + 10 s
+  // after the claim only the E3 lease runs short (30 s < call 20 s + margin 15 s); op/work leases still have 40 s
+  const r = await h.step({ intentId: b.id, hooks: { afterClaim: async () => { h.clk.t = until - 30 * 1000; } } });
+  assert.deepEqual(r.actions.slice(-2), ["SEND_ABORTED:E3_LEASE_TOO_SHORT", "RESERVATION_OUTCOME_UNKNOWN:SEND_ABORTED_E3_LEASE_TOO_SHORT"]);
   assert.equal(w.count("CREATE"), 0);
 });
 
@@ -560,4 +569,275 @@ test("scope: the worker's recovery pass never acts on capture rows (reservation 
   for (let k = 0; k < 4; k++) { h.clk.t += 5 * MIN; await h.step({ intentId: a.id }); }
   assert.equal((await loadIntent(db.app, a.id)).status, "reservation_confirmed", "no CAPTURE_OUTCOME_UNKNOWN (or any capture recovery) from this worker");
   assert.equal(await F.count(db.app, "SELECT count(*) AS n FROM booking.intent_transitions WHERE intent_id = $1 AND event_type LIKE 'CAPTURE%'", [a.id]), 0);
+});
+
+
+// =============================================================================================
+// root review of 8df0b43 — corrections
+
+test("root (1): pre-send verification — expired/short operation lease (E3 lease fine), row already recovered, work lease stolen -> ZERO sends", async () => {
+  const w = world();
+  const ids = [L(80), L(81), L(82), L(83)];
+  const h = harness(w, ids);
+  // (a) root's exact case: op lease 60 s, clock after the claim = claim + 61 s; E3 lease and deadline far away
+  const a = await authorizedIntent(w, ids[0]);
+  await h.step({ intentId: a.id });
+  let r = await h.step({ intentId: a.id, hooks: { afterClaim: async (op) => { h.clk.t = new Date(op.lease_until).getTime() + 1000; } } });
+  assert.equal(r.sends, 0);
+  assert.ok(r.actions.includes("SEND_ABORTED:OPERATION_LEASE_TOO_SHORT"), JSON.stringify(r.actions));
+  // (b) still a few seconds of op lease, but less than call + margin (E3 lease 2 min): no send
+  const b = await authorizedIntent(w, ids[1]);
+  h.clk.t = F.at(10); await h.step({ intentId: b.id });
+  r = await h.step({ intentId: b.id, hooks: { afterClaim: async (op) => { h.clk.t = new Date(op.lease_until).getTime() - 30 * 1000; } } });
+  assert.deepEqual([r.sends, r.actions.includes("SEND_ABORTED:OPERATION_LEASE_TOO_SHORT")], [0, true]);
+  // (c) the row was already recovered as unknown by someone else while this worker's clock still looks fine
+  const c = await authorizedIntent(w, ids[2]);
+  h.clk.t = F.at(10); await h.step({ intentId: c.id });
+  r = await h.step({ intentId: c.id, hooks: { afterClaim: async (op) => { await recoverExpiredOperations(db.app, { now: new Date(op.lease_until).getTime() + 1 }); } } });
+  assert.deepEqual([r.sends, r.actions.includes("SEND_ABORTED:OPERATION_NOT_HELD")], [0, true]);
+  assert.ok(r.actions.some((x) => x.startsWith("LEASE_LOST")), "no event from this worker");
+  assert.equal(await F.count(db.app, "SELECT count(*) AS n FROM booking.intent_transitions WHERE intent_id = $1 AND event_type = 'RESERVATION_OUTCOME_UNKNOWN' AND actor = 'worker'", [c.id]), 0);
+  // (d) the intent's work lease was taken over between claim and send
+  const d = await authorizedIntent(w, ids[3]);
+  h.clk.t = F.at(10); await h.step({ intentId: d.id });
+  r = await h.step({ intentId: d.id, hooks: { afterClaim: async () => { await db.app.query("UPDATE booking.intent_work SET work_worker_id = 'thief' WHERE intent_id = $1", [d.id]); } } });
+  assert.deepEqual([r.sends, r.actions.includes("SEND_ABORTED:WORK_LEASE_NOT_HELD")], [0, true]);
+  assert.equal(await F.count(db.app, "SELECT count(*) AS n FROM booking.intent_transitions WHERE intent_id = $1 AND event_type = 'RESERVATION_OUTCOME_UNKNOWN'", [d.id]), 0, "the fenced event is refused");
+  assert.equal((await opsOf(d.id, "hostaway.create_reservation"))[0].state, "outcome_unknown", "claimed => possibly sent => unknown");
+  assert.equal(w.count("CREATE"), 0, "zero sends in all four cases");
+});
+
+test("root (2): every provider call is bounded — hanging pricing / lookup / retrieve wait boundedly; a timed-out create is UNKNOWN and its late result is only late evidence", async () => {
+  const T = { pricingCallMs: 30, readCallMs: 30, createCallMs: 40, stepBudgetMs: 2000 };
+  const w = world();
+  const ids = [L(84), L(85), L(86)];
+  const h = harness(w, ids);
+  // pricing hangs: aborted, step returns, no event
+  const a = await authorizedIntent(w, ids[0]);
+  w.pricingMode = "hang";
+  const t0 = Date.now();
+  let r = await h.step({ intentId: a.id, timeouts: T });
+  assert.ok(Date.now() - t0 < 1500);
+  assert.equal(r.actions.at(-1), "WAIT:LISTING_UNAVAILABLE");
+  assert.ok(w.signals.length >= 1 && w.signals.every((sg) => sg.aborted), "the executor's AbortSignal was aborted");
+  assert.equal((await loadIntent(db.app, a.id)).status, "payment_authorized");
+  w.pricingMode = "ok"; w.signals.length = 0;
+  // lookup hangs: the read is retried later (bounded), nothing dispatched
+  h.clk.t += LIMITS.waitMs; await h.step({ intentId: a.id, timeouts: T });
+  w.lookupMode = "hang";
+  r = await h.step({ intentId: a.id, timeouts: T });
+  assert.equal(r.actions.at(-1), "WAIT:LOOKUP_ERROR");
+  assert.equal((await opsOf(a.id, "hostaway.create_reservation")).length, 0);
+  w.lookupMode = "ok";
+  // create hangs, then completes LATE at the provider
+  const b = await authorizedIntent(w, ids[1]);
+  h.clk.t = F.at(10);
+  await h.step({ intentId: b.id, timeouts: T });
+  w.createMode = "late";
+  r = await h.step({ intentId: b.id, timeouts: T });
+  assert.deepEqual(r.actions.slice(-1), ["RESERVATION_OUTCOME_UNKNOWN:CREATE_TIMEOUT"]);
+  assert.equal(r.sends, 1);
+  assert.equal(w.signals.at(-1).aborted, true);
+  w.releaseLate();
+  await r.late;
+  const op = (await opsOf(b.id, "hostaway.create_reservation"))[0];
+  assert.deepEqual([op.state, op.late_result_status, op.late_result_ref], ["outcome_unknown", "succeeded", String(w.reservations.at(-1).id)]);
+  const att = (await db.app.query("SELECT http_status, hostaway_reservation_id FROM booking.hostaway_reservation_attempts WHERE intent_id = $1", [b.id])).rows[0];
+  assert.deepEqual([att.http_status, att.hostaway_reservation_id], [201, String(w.reservations.at(-1).id)]);
+  assert.equal(await F.count(db.app, "SELECT count(*) AS n FROM booking.intent_transitions WHERE intent_id = $1 AND event_type = 'RESERVATION_SUCCEEDED'", [b.id]), 0, "no event from a late result");
+  w.createMode = "ok";
+  await h.until(b.id, (st) => st === "reservation_confirmed", { max: 30, advanceMs: 60 * 1000, extra: { timeouts: T } });
+  assert.equal(w.count("CREATE"), 1, "exactly one create ever (b's timed-out one; never retried; a never dispatched)");
+  // retrieve hangs: bounded read retry, never a conclusion
+  const c = await authorizedIntent(w, ids[2]);
+  h.clk.t = F.at(10);
+  await h.step({ intentId: c.id, timeouts: T });
+  w.createMode = "refNotEchoed"; w.retrieveMode = "hang";
+  await h.step({ intentId: c.id, timeouts: T });
+  for (let k = 0; k < 6; k++) { h.clk.t += 60 * 1000; await h.step({ intentId: c.id, timeouts: T }); }
+  assert.notEqual((await loadIntent(db.app, c.id)).status, "reservation_confirmed");
+  assert.equal(await F.count(db.app, `SELECT count(*) AS n FROM booking.provider_evidence e JOIN booking.external_operations o ON o.id = e.read_operation_id
+     WHERE e.intent_id = $1 AND o.op_type = 'hostaway.retrieve_reservation'`, [c.id]), 0);
+  // caller timeouts may only SHORTEN the defaults
+  const r2 = await h.step({ intentId: c.id, timeouts: { createCallMs: 10 ** 9 } });
+  assert.notEqual(r2.status, "refused");
+});
+
+test("root (3): >100 unrelated unresolved rows (other listing) never starve this worker's create recovery or reservation orphans", async () => {
+  const other = L(90);
+  // 105 unrelated capture rows whose outcome is unknown (awaiting recovery), all OLDER than the target
+  for (let k = 0; k < 105; k++) {
+    const r = await F.reserved(db.app, { listingId: other, from: addDays("2027-01-01", 5 * k), to: addDays("2027-01-01", 5 * k + 4) });
+    await F.runOp(db.app, r.id, "stripe.capture_payment_intent", 8, { status: "outcome_unknown", errorCode: "TIMEOUT" });
+  }
+  // 105 unrelated orphan PI reads (distinct selectors), also older
+  const host = await F.reserved(db.app, { listingId: other, from: "2029-06-01", to: "2029-06-05" });     // after the 105 stays above
+  for (let k = 0; k < 105; k++) {
+    const id = await requestRead(db.app, host.id, "stripe.retrieve_payment_intent", `pi_test_noise_${k}`, { now: F.at(8) });
+    const c = await claimNextOperation(db.app, { workerId: "noise", now: F.at(8), opId: id });
+    F.ok(await completeOperation(db.app, c.id, { workerId: "noise", now: F.at(8), outcome: { status: "succeeded" } }));
+  }
+  const unrelated = await db.app.query("SELECT id, state, updated_at FROM booking.external_operations WHERE intent_id IN (SELECT id FROM booking.intents WHERE listing_id = $1) ORDER BY id", [other]);
+  // target: a create whose completion was recorded but whose event was lost (crash) — recovery must reach it
+  const w = world();
+  const t = await authorizedIntent(w, L(91));
+  const h = harness(w, [L(91)]);
+  await h.step({ intentId: t.id });
+  await assert.rejects(h.step({ intentId: t.id, hooks: { afterComplete: async () => { throw new Error("crash"); } } }), /crash/);
+  // UNSCOPED steps (no intentId): only the configured listing is visible to the worker
+  for (let k = 0; k < 30 && (await loadIntent(db.app, t.id)).status !== "reservation_confirmed"; k++) { h.clk.t += 60 * 1000; await h.step(); }
+  assert.equal((await loadIntent(db.app, t.id)).status, "reservation_confirmed");
+  const after = await db.app.query("SELECT id, state, updated_at FROM booking.external_operations WHERE intent_id IN (SELECT id FROM booking.intents WHERE listing_id = $1) ORDER BY id", [other]);
+  assert.deepEqual(after.rows, unrelated.rows, "no unrelated row was touched");
+  // a reservation-phase orphan behind the 105 unrelated orphans is re-issued
+  const t2 = await authorizedIntent(w, L(92));
+  const h2 = harness(w, [L(92)], { start: h.clk.t });
+  await h2.step({ intentId: t2.id });                                       // reservation_pending, lookup queued
+  const lk = (await opsOf(t2.id, "hostaway.lookup_reservation"))[0];
+  const c = await claimNextOperation(db.app, { workerId: "w-crash", now: h2.clk.t, opId: lk.id });
+  F.ok(await completeOperation(db.app, c.id, { workerId: "w-crash", now: h2.clk.t, outcome: { status: "succeeded" } }));   // crash before evidence
+  h2.clk.t += 3 * MIN;
+  const s = await h2.step();
+  assert.ok(s.actions.includes("RECOVERY:REISSUE"), JSON.stringify(s.actions));
+});
+
+test("root (4): scoped maintenance/claims — unrelated intents and operation types are untouched, unconfigured intents never escalated", async () => {
+  const other = L(93);
+  // unrelated: expired in-flight capture and void rows, an expired E3 reservation lease, an authorized intent — all on an unconfigured listing
+  const cap = await F.reserved(db.app, { listingId: other, from: "2027-02-01", to: "2027-02-04" });
+  await claimNextOperation(db.app, { workerId: "x", now: F.at(8), intentId: cap.id, opTypes: ["stripe.capture_payment_intent"] });
+  const vd = await F.reserved(db.app, { listingId: other, from: "2027-03-01", to: "2027-03-04" });
+  await F.runOp(db.app, vd.id, "stripe.capture_payment_intent", 8, { status: "failed_definite", errorCode: "CARD_DECLINED" });
+  F.ok(await applyEvent(db.app, vd.id, { type: "CAPTURE_FAILED", definite: true, code: "CARD_DECLINED" }, { now: F.at(8) }));
+  await claimNextOperation(db.app, { workerId: "x", now: F.at(9), intentId: vd.id, opTypes: ["stripe.void_payment_intent"] });
+  const pend = await F.dispatched(db.app, { listingId: other, from: "2027-04-01", to: "2027-04-04" });
+  const w = world();
+  const auth = await authorizedIntent(w, other, { from: "2027-05-01", to: "2027-05-05", guests: 2 });
+  const snap = async () => ({
+    ops: (await db.app.query("SELECT id, state, error_code, updated_at FROM booking.external_operations WHERE intent_id = ANY($1) ORDER BY id", [[cap.id, vd.id, pend.id, auth.id]])).rows,
+    intents: (await db.app.query("SELECT id, state, version FROM booking.intents WHERE id = ANY($1) ORDER BY id", [[cap.id, vd.id, pend.id, auth.id]])).rows,
+    work: (await db.app.query("SELECT intent_id, work_worker_id, next_action_at FROM booking.intent_work WHERE intent_id = ANY($1) ORDER BY intent_id", [[cap.id, vd.id, pend.id, auth.id]])).rows
+  });
+  const before0 = await snap();
+  // a configured target, worked with AND without intentId scoping, far in the future (every unrelated lease long expired)
+  const t = await authorizedIntent(w, L(94));
+  const h = harness(w, [L(94)], { start: F.at(600) });
+  await h.until(t.id, (st) => st === "reservation_confirmed", { max: 5 });
+  for (let k = 0; k < 4; k++) { h.clk.t += 10 * MIN; await h.step(); }
+  assert.deepEqual(await snap(), before0, "unconfigured / unrelated rows unchanged by scoped steps");
+  // the old global defaults are unchanged: an UNSCOPED helper call still recovers them
+  const g = await recoverExpiredOperations(db.app, { now: F.at(10 ** 4) });
+  assert.ok(g.some((x) => x.opType === "stripe.capture_payment_intent"));
+});
+
+test("root (5): orphan re-issue exhaustion becomes a durable owner case (scope + current state checked), not silent rescheduling", async () => {
+  const w = world();
+  const a = await authorizedIntent(w, L(95));
+  const h = harness(w, [L(95)]);
+  await h.step({ intentId: a.id });                                          // reservation_pending + lookup queued
+  let readId = (await opsOf(a.id, "hostaway.lookup_reservation"))[0].id;
+  let t = h.clk.t;
+  for (let depth = 0; depth <= 3; depth++) {
+    const c = await claimNextOperation(db.app, { workerId: "w-crash", now: t, opId: readId });
+    F.ok(await completeOperation(db.app, c.id, { workerId: "w-crash", now: t, outcome: { status: "succeeded" } }));   // never any evidence
+    t += 3 * MIN;
+    if (depth === 3) break;
+    const re = await reissueOrphanRead(db.app, readId, { now: t });
+    F.ok(re); readId = re.readOpId;
+  }
+  h.clk.t = t;
+  const s = await h.step({ intentId: a.id });
+  assert.ok(s.actions.includes("RECOVERY:REISSUE!REISSUE_DEPTH_EXHAUSTED"));
+  assert.ok(s.actions.includes("RECOVERY:ESCALATE:READ_REISSUE_EXHAUSTED"), JSON.stringify(s.actions));
+  const i = await loadIntent(db.app, a.id);
+  assert.deepEqual([i.status, i.reasonCode], ["reconciliation_required", "READ_REISSUE_EXHAUSTED"]);
+  assert.equal(await F.count(db.app, "SELECT count(*) AS n FROM booking.reconciliation_cases WHERE intent_id = $1 AND status = 'open'", [a.id]), 1);
+  assert.equal(w.count("CREATE"), 0);
+});
+
+test("root (6): protected historical reservation ids are never adopted, confirmed or captured (full reply / missing ref / recovery known id / read evidence)", async () => {
+  assert.deepEqual([...PROTECTED_HOSTAWAY_RESERVATION_IDS], ["70636076", "71045356", "71072615", "71081885"]);
+  assert.ok(Object.isFrozen(PROTECTED_HOSTAWAY_RESERVATION_IDS));
+  assert.throws(() => { PROTECTED_HOSTAWAY_RESERVATION_IDS.push("1"); });
+  assert.equal(isProtectedReservationId(71081885), true);
+  const cases = [["ok", 71081885, "full reply"], ["refNotEchoed", 70636076, "missing ref"], ["crashAfterRecord", 71045356, "recovery known id"],
+    ["createdThen503", 71072615, "read evidence"]];
+  for (const [mode, pid, label] of cases) {
+    const w = world();
+    w.nextId = pid;
+    const id = L(96 + cases.findIndex((c) => c[2] === label));
+    const a = await authorizedIntent(w, id);
+    const h = harness(w, [id]);
+    await h.step({ intentId: a.id });
+    if (mode === "crashAfterRecord") {
+      await assert.rejects(h.step({ intentId: a.id, hooks: { afterRecord: async () => { throw new Error("crash"); } } }), /crash/);
+    } else {
+      w.createMode = mode;
+      await h.step({ intentId: a.id });
+    }
+    await h.until(a.id, (st) => st === "reconciliation_required" || st === "reservation_confirmed", { max: 30, advanceMs: 60 * 1000 });
+    const i = await loadIntent(db.app, a.id);
+    assert.deepEqual([i.status, i.reasonCode], ["reconciliation_required", "PROTECTED_RESERVATION_ID"], label);
+    assert.equal(i.reservation, null, `${label}: never adopted`);
+    assert.equal((await opsOf(a.id, "stripe.capture_payment_intent")).length, 0, `${label}: no capture queued`);
+    assert.equal(w.count("CREATE"), 1, label);
+  }
+});
+
+test("root (1/2): work lease running short, step budget exhausted, late result racing the unknown settlement; timeouts only shorten", async () => {
+  const w = world();
+  const ids = [L(100), L(101), L(102)];
+  const h = harness(w, ids);
+  // (e) the work lease is still this worker's but too short for the bounded call (operation lease untouched)
+  const a = await authorizedIntent(w, ids[0]);
+  await h.step({ intentId: a.id });
+  let r = await h.step({ intentId: a.id, hooks: { afterClaim: async () => {
+    await db.app.query("UPDATE booking.intent_work SET work_lease_until = $2 WHERE intent_id = $1", [a.id, new Date(h.clk.t + 20 * 1000)]); } } });
+  assert.deepEqual([r.sends, r.actions.includes("SEND_ABORTED:WORK_LEASE_TOO_SHORT")], [0, true]);
+  // (f) the real-time step budget is nearly spent at the send (deterministic monotonic source)
+  const b = await authorizedIntent(w, ids[1]);
+  h.clk.t = F.at(10); await h.step({ intentId: b.id });
+  const m = { t: 0 };
+  r = await h.step({ intentId: b.id, monotonic: () => m.t, hooks: { afterClaim: async () => { m.t = DEFAULT_TIMEOUTS.stepBudgetMs - 1000; } } });
+  assert.deepEqual([r.sends, r.actions.includes("SEND_ABORTED:STEP_BUDGET")], [0, true]);
+  // (g) the provider answers right after the timeout, WHILE the unknown settlement runs: the result is late evidence only
+  const c = await authorizedIntent(w, ids[2]);
+  h.clk.t = F.at(10); await h.step({ intentId: c.id, timeouts: { createCallMs: 30 } });
+  w.createMode = "late";
+  r = await h.step({ intentId: c.id, timeouts: { createCallMs: 30 }, hooks: { beforeSettleUnknown: async () => {
+    // the provider's answer arrives while the unknown settlement has not yet touched the row: give a late handler every chance
+    w.releaseLate(); await new Promise((res) => setTimeout(res, 150)); } } });
+  await r.late;
+  const op = (await opsOf(c.id, "hostaway.create_reservation"))[0];
+  assert.deepEqual([op.state, op.late_result_status], ["outcome_unknown", "succeeded"], "never completed as succeeded by the late result");
+  assert.equal(await F.count(db.app, "SELECT count(*) AS n FROM booking.intent_transitions WHERE intent_id = $1 AND event_type = 'RESERVATION_SUCCEEDED'", [c.id]), 0);
+  // caller timeouts can only shorten the fixed defaults
+  assert.deepEqual(_internal.resolveTimeouts({ createCallMs: 10 ** 9, readCallMs: 5, pricingCallMs: -1, stepBudgetMs: "x" }),
+    { pricingCallMs: DEFAULT_TIMEOUTS.pricingCallMs, readCallMs: 5, createCallMs: DEFAULT_TIMEOUTS.createCallMs, stepBudgetMs: DEFAULT_TIMEOUTS.stepBudgetMs });
+});
+
+test("root (5): an exhausted re-issue never escalates an intent that left the reservation phase meanwhile (in-transaction state check)", async () => {
+  const w = world();
+  const a = await authorizedIntent(w, L(103));
+  const h = harness(w, [L(103)]);
+  await h.step({ intentId: a.id });
+  let readId = (await opsOf(a.id, "hostaway.lookup_reservation"))[0].id;
+  let t = h.clk.t;
+  for (let depth = 0; depth <= 3; depth++) {
+    const c = await claimNextOperation(db.app, { workerId: "w-crash", now: t, opId: readId });
+    F.ok(await completeOperation(db.app, c.id, { workerId: "w-crash", now: t, outcome: { status: "succeeded" } }));
+    t += 3 * MIN;
+    if (depth === 3) break;
+    const re = await reissueOrphanRead(db.app, readId, { now: t }); F.ok(re); readId = re.readOpId;
+  }
+  h.clk.t = t;
+  const s = await h.step({ intentId: a.id, hooks: { afterReissueExhausted: async () => {
+    // meanwhile another actor moves the intent out of the reservation phase (still a state where ESCALATE is legal)
+    const cur = await loadIntent(db.app, a.id);
+    assert.equal(cur.status, "payment_authorized");   // the expired E3 lease was recovered by the scoped maintenance
+    F.ok(await applyEvent(db.app, a.id, { type: "RESERVATION_STARTED", id: "other-actor", workerId: "other", recheck: { bookable: true, priceSame: false } }, { now: h.clk.t }));
+  } } });
+  assert.ok(s.actions.includes("RECOVERY:ESCALATE!OUT_OF_SCOPE"), JSON.stringify(s.actions));
+  const i = await loadIntent(db.app, a.id);
+  assert.deepEqual([i.status, i.reasonCode], ["reservation_failed", "PRICE_CHANGED"], "not escalated by the stale exhaustion");
 });
