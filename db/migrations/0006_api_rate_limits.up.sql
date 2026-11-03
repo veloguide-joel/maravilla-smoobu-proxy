@@ -4,7 +4,11 @@
 --     "<scope>:<64 hex>" keys computed by the app as HMAC(salt, ip|token-hash): no IP address or token is stored.
 --   * booking.rate_limit_hit(bucket, window_seconds, limit) -> true while the bucket is within its limit. The only write
 --     path; the runtime role has no direct table privilege.
+--   * Expiry: every call also deletes at most 100 CLOSED windows of ANY bucket older than 25 hours (retention > the 24 h
+--     maximum window, so no open window is ever touched), oldest first, skipping rows another session holds (SKIP LOCKED).
+--     One-use buckets (random tokens, single addresses) therefore never accumulate. Indexed on window_start.
 --   * A unique index on intents.access_token_hash: the intent API finds an intent only by the SHA-256 of its bearer token.
+-- Unreleased: applied only to disposable local test databases so far; amended in place before any persistent use.
 
 CREATE TABLE booking.api_rate_limits (
   bucket        text        NOT NULL CHECK (bucket ~ '^[a-z_]{1,32}:[0-9a-f]{64}$'),
@@ -12,6 +16,7 @@ CREATE TABLE booking.api_rate_limits (
   hits          integer     NOT NULL CHECK (hits >= 1),
   PRIMARY KEY (bucket, window_start)
 );
+CREATE INDEX api_rate_limits_window_start_idx ON booking.api_rate_limits (window_start);
 ALTER TABLE booking.api_rate_limits ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON booking.api_rate_limits FROM PUBLIC;
 
@@ -29,6 +34,12 @@ BEGIN
     ON CONFLICT (bucket, window_start) DO UPDATE SET hits = r.hits + 1
     RETURNING r.hits INTO n;
   DELETE FROM booking.api_rate_limits WHERE bucket = p_bucket AND window_start < w;   -- older windows of this bucket
+  -- bounded global expiry of closed windows (any bucket), concurrency-safe
+  DELETE FROM booking.api_rate_limits r USING (
+      SELECT bucket, window_start FROM booking.api_rate_limits
+       WHERE window_start < statement_timestamp() - interval '25 hours'
+       ORDER BY window_start LIMIT 100 FOR UPDATE SKIP LOCKED) old
+   WHERE r.bucket = old.bucket AND r.window_start = old.window_start;
   RETURN n <= p_limit;
 END $$;
 REVOKE ALL ON FUNCTION booking.rate_limit_hit(text, integer, integer) FROM PUBLIC;

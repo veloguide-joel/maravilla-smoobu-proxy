@@ -16,7 +16,8 @@ after(async () => { await pool2.end(); await db.close(); });
 
 const ORIGIN = "https://preview.example.invalid";
 const ENV = Object.freeze({ ...ENV_OK, MV_CHECKOUT_TEST_API: "enabled", MV_CHECKOUT_ALLOWED_ORIGIN: ORIGIN,
-  MV_CHECKOUT_TEST_LISTINGS: "603566:MXN,606998:USD", MV_RATE_LIMIT_SALT: "s".repeat(40), MV_CHECKOUT_TERMS_VERSION: "terms-2026-11" });
+  MV_CHECKOUT_TEST_LISTINGS: "603566:MXN,606998:USD", MV_RATE_LIMIT_SALT: "s".repeat(40), MV_CHECKOUT_TERMS_VERSION: "terms-2026-11",
+  MV_CLIENT_ADDRESS_SOURCE: "x-real-ip" });     // most tests model the (future, platform-validated) trusted adapter
 const ACCT = ENV.STRIPE_TEST_ACCOUNT_ID;
 const NOW0 = Date.UTC(2026, 10, 2, 20, 0, 0);
 const GUEST = { firstName: "Zanabria", lastName: "Quintessa", email: "zq.e6.guest@example.test", phone: "+52 322 555 0199" };
@@ -67,7 +68,7 @@ function stripeFake() {
 }
 
 // ---------- HTTP plumbing ----------
-function makeHandlers({ env = ENV, hostaway = hostawayFake(), stripe = stripeFake(), clock = { now: NOW0 }, pool = db.app, logs = [] } = {}) {
+function makeHandlers({ env = ENV, hostaway = hostawayFake(), stripe = stripeFake(), clock = { now: NOW0 }, pool = db.app, logs = [], limits } = {}) {
   const spies = { createPool: 0, loadCore: 0, loadAccess: 0, createStripe: 0, createHostaway: 0 };
   const errors = [];
   const deps = {
@@ -78,7 +79,7 @@ function makeHandlers({ env = ENV, hostaway = hostawayFake(), stripe = stripeFak
     createHostaway: () => { spies.createHostaway++; return hostaway; },
     loadStripe: async () => { throw new Error("SDK must not load in tests"); },
     loadHostaway: async () => { throw new Error("real Hostaway must not load in tests"); },
-    now: () => clock.now, log: (c) => logs.push(c), onError: (e) => { errors.push(e); }
+    now: () => clock.now, log: (c) => logs.push(c), onError: (e) => { errors.push(e); }, ...(limits ? { limits } : {})
   };
   return { spies, logs, errors, hostaway, stripe, clock,
     intents: createIntentApiHandler({ route: "intents", env, deps }), step: createIntentApiHandler({ route: "step", env, deps }) };
@@ -87,7 +88,9 @@ function call(handler, { method = "POST", url = "/api/checkout/intents", body, t
   const raw = body === undefined ? "" : typeof body === "string" ? body : JSON.stringify(body);
   const req = Readable.from(raw ? [Buffer.from(raw)] : []);
   req.method = method; req.url = url;
-  req.headers = { ...(origin !== null ? { origin } : {}), "x-forwarded-for": ip, ...(method === "POST" ? { "content-type": "application/json" } : {}),
+  // x-real-ip carries the modelled trusted address; x-forwarded-for always carries caller-controlled junk that must be ignored
+  req.headers = { ...(origin !== null ? { origin } : {}), ...(ip !== null ? { "x-real-ip": ip } : {}), "x-forwarded-for": `spoof-${++seq}, 10.0.0.1`,
+    ...(method === "POST" ? { "content-type": "application/json" } : {}),
     ...(token ? { authorization: `Bearer ${token}` } : {}), ...headers };
   const res = { statusCode: 0, headers: {}, body: null, setHeader(k, v) { this.headers[k.toLowerCase()] = v; }, end(b) { this.raw = b || ""; this.body = b ? JSON.parse(b) : null; } };
   return handler(req, res).then(() => res);
@@ -387,4 +390,76 @@ test("reusableSessionUrl (direct): a session whose own expiry has passed is neve
   // a different intent id or a non-test id is never bound
   assert.equal(await reusableSessionUrl(db.app, h.stripe.stripe, "00000000-0000-4000-8000-000000000000", sid, exp - 1000), null);
   assert.equal(await reusableSessionUrl(db.app, h.stripe.stripe, id, "cs_live_X", exp - 1000), null);
+});
+
+test("client-address policy 'none' (the default): spoofed X-Forwarded-For / X-Real-IP never mint buckets; all unattributed traffic shares ONE limit across workers", async () => {
+  const env = { ...ENV, MV_CLIENT_ADDRESS_SOURCE: undefined };
+  const limits = { unattributed: [600, 6], createUnattributed: [600, 3] };
+  const w1 = makeHandlers({ env, limits, pool: db.app }); const w2 = makeHandlers({ env, limits, pool: pool2 });
+  // fresh salt so this test's shared buckets are its own
+  const env2 = { ...env, MV_RATE_LIMIT_SALT: "n".repeat(40) };
+  const a1 = makeHandlers({ env: env2, limits, pool: db.app }); const a2 = makeHandlers({ env: env2, limits, pool: pool2 });
+  const out = [];
+  for (let i = 0; i < 5; i++) {
+    const r = await call((i % 2 ? a2 : a1).intents, { body: STAY(), ip: `198.18.0.${i + 1}`, headers: { "x-forwarded-for": `bucket-${i}`, "x-real-ip": `203.0.113.${i + 1}` } });
+    out.push(r.statusCode);
+  }
+  assert.deepEqual(out, [201, 201, 201, 429, 429], "3 creates for ALL unattributed callers together, whatever the headers say");
+  const more = [];
+  for (let i = 0; i < 3; i++) more.push((await call((i % 2 ? a2 : a1).intents, { method: "GET", token: Buffer.alloc(32, i + 1).toString("base64url"), headers: { "x-real-ip": `198.51.100.${i + 9}` } })).statusCode);
+  assert.deepEqual(more, [401, 429, 429], "the shared all-actions limit (6) is reached across both workers");
+  // origin is still checked first, and token limits still apply under this policy (separate salt => separate buckets)
+  assert.equal((await call(w1.intents, { body: STAY(), origin: "https://evil.example" })).statusCode, 403);
+  void w2;
+});
+
+test("client-address policy 'x-real-ip': only one canonical IPv4/IPv6 value counts; X-Forwarded-For ignored; malformed -> shared bucket; IPv6 normalised", async () => {
+  const limits = { createPerAddress: [600, 2], createUnattributed: [600, 1] };
+  const env = { ...ENV, MV_RATE_LIMIT_SALT: "r".repeat(40) };
+  const h1 = makeHandlers({ env, limits }); const h2 = makeHandlers({ env, limits, pool: pool2 });
+  const creates = async (hdrs) => (await call(h1.intents, { body: STAY(), ip: null, headers: hdrs })).statusCode;
+  // IPv6 spellings of one address share a bucket (2 allowed), across workers
+  assert.equal(await creates({ "x-real-ip": "2001:DB8::1" }), 201);
+  assert.equal((await call(h2.intents, { body: STAY(), ip: null, headers: { "x-real-ip": "2001:db8:0:0:0:0:0:1" } })).statusCode, 201);
+  assert.equal(await creates({ "x-real-ip": "2001:0db8::0001" }), 429);
+  // IPv4-mapped IPv6 is the IPv4 address
+  assert.equal(await creates({ "x-real-ip": "192.0.2.50" }), 201);
+  assert.equal(await creates({ "x-real-ip": "::ffff:192.0.2.50" }), 201);
+  assert.equal(await creates({ "x-real-ip": "::ffff:c000:0232" }), 429);
+  // X-Forwarded-For never changes the bucket
+  assert.equal(await creates({ "x-real-ip": "192.0.2.60", "x-forwarded-for": "1.1.1.1" }), 201);
+  assert.equal(await creates({ "x-real-ip": "192.0.2.60", "x-forwarded-for": "2.2.2.2" }), 201);
+  assert.equal(await creates({ "x-real-ip": "192.0.2.60", "x-forwarded-for": "3.3.3.3" }), 429);
+  // malformed / multi-hop / ported / zoned / missing values all fall into ONE shared bucket (1 allowed here)
+  const bad = [{ "x-real-ip": "arbitrary-bucket-name" }, { "x-real-ip": "192.0.2.70, 192.0.2.71" }, { "x-real-ip": "192.0.2.70:443" },
+    { "x-real-ip": "fe80::1%eth0" }, { "x-real-ip": "[2001:db8::2]" }, { "x-real-ip": "01.2.3.4" }, { "x-real-ip": " 192.0.2.72" }, {}];
+  const codes = []; for (const hd of bad) codes.push(await creates(hd));
+  assert.deepEqual(codes, [201, ...Array(bad.length - 1).fill(429)]);
+});
+
+test("0006 expiry: one-use buckets older than 25 h are removed (bounded, oldest first); open windows and recent counters are kept; concurrent calls are safe", async () => {
+  const hex = (i) => i.toString(16).padStart(64, "0");
+  await db.owner.query("DELETE FROM booking.api_rate_limits");
+  // 250 stale one-use rows (closed long ago), 5 recent rows, and a 24 h window that opened 23 h ago (still open)
+  await db.owner.query(`INSERT INTO booking.api_rate_limits (bucket, window_start, hits)
+    SELECT 'tok:' || lpad(to_hex(g), 64, '0'), statement_timestamp() - interval '26 hours' - make_interval(secs => g), 1 FROM generate_series(1, 250) g`);
+  await db.owner.query(`INSERT INTO booking.api_rate_limits (bucket, window_start, hits)
+    SELECT 'ip:' || lpad(to_hex(g), 64, '0'), statement_timestamp() - interval '5 minutes', 3 FROM generate_series(1, 5) g`);
+  await db.owner.query("INSERT INTO booking.api_rate_limits (bucket, window_start, hits) VALUES ($1, statement_timestamp() - interval '23 hours', 7)", [`create_all:${hex(77)}`]);
+  const count = async (sql) => Number((await db.owner.query(sql)).rows[0].n);
+  const stale = "SELECT count(*) AS n FROM booking.api_rate_limits WHERE window_start < statement_timestamp() - interval '25 hours'";
+  assert.equal(await count(stale), 250);
+  await db.app.query("SELECT booking.rate_limit_hit($1, 600, 10)", [`ip:${hex(9001)}`]);
+  assert.equal(await count(stale), 150, "at most 100 removed per call, oldest first");
+  assert.equal(await count("SELECT count(*) AS n FROM booking.api_rate_limits WHERE bucket LIKE 'tok:%' AND window_start < statement_timestamp() - interval '26 hours 151 seconds'"), 0, "the oldest went first");
+  // concurrency: 12 callers on separate connections, each on its own bucket
+  await Promise.all(Array.from({ length: 12 }, (_, i) => (i % 2 ? pool2 : db.app).query("SELECT booking.rate_limit_hit($1, 600, 10)", [`ip:${hex(9100 + i)}`])));
+  assert.equal(await count(stale), 0);
+  assert.equal(await count("SELECT count(*) AS n FROM booking.api_rate_limits WHERE bucket LIKE 'ip:%' AND hits = 3"), 5, "recent counters kept");
+  assert.equal(await count(`SELECT count(*) AS n FROM booking.api_rate_limits WHERE bucket = 'create_all:${hex(77)}' AND hits = 7`), 1, "an open 24 h window is kept");
+  assert.equal(await count("SELECT count(*) AS n FROM booking.api_rate_limits WHERE bucket LIKE 'ip:%' AND hits = 1"), 13);
+  const plan = (await db.owner.query("EXPLAIN SELECT 1 FROM booking.api_rate_limits WHERE window_start < now() - interval '25 hours' ORDER BY window_start LIMIT 100")).rows.map((r) => r["QUERY PLAN"]).join(" ");
+  assert.ok((await db.owner.query("SELECT 1 FROM pg_indexes WHERE schemaname = 'booking' AND indexname = 'api_rate_limits_window_start_idx'")).rowCount === 1, plan);
+  await assert.rejects(db.app.query("SELECT count(*) FROM booking.api_rate_limits"), /permission denied/);
+  await assert.rejects(db.app.query("DELETE FROM booking.api_rate_limits"), /permission denied/);
 });

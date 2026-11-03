@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
 import { createHash } from "node:crypto";
-import { intentApiGate, parseTestListings, tokenHashFromHeader, clientAddress, createIntentApiHandler } from "../lib/checkout/intent-api-http.js";
+import { intentApiGate, parseTestListings, tokenHashFromHeader, clientAddress, canonicalAddress, createIntentApiHandler } from "../lib/checkout/intent-api-http.js";
 import { ENV_OK } from "./e5a-fixtures.mjs";
 
 const ORIGIN = "https://preview.example.invalid";
@@ -40,11 +40,26 @@ test("bearer tokens: only canonical 43-char base64url (256-bit) values in the Au
   }
 });
 
-test("client address for rate limiting: first X-Forwarded-For entry, else X-Real-IP, else socket (platform behaviour UNVERIFIED)", () => {
-  assert.equal(clientAddress({ headers: { "x-forwarded-for": "203.0.113.5, 10.0.0.1" } }), "203.0.113.5");
-  assert.equal(clientAddress({ headers: { "x-real-ip": "203.0.113.6" } }), "203.0.113.6");
-  assert.equal(clientAddress({ headers: {}, socket: { remoteAddress: "127.0.0.1" } }), "127.0.0.1");
-  assert.equal(clientAddress({ headers: {} }), "unknown");
+test("client address policy: default 'none' trusts no header; 'x-real-ip' trusts only one canonical IP literal; XFF never read", () => {
+  const req = (h) => ({ headers: h, socket: { remoteAddress: "127.0.0.1" } });
+  for (const src of [undefined, "none"]) {
+    for (const h of [{ "x-forwarded-for": "arbitrary-bucket-name" }, { "x-real-ip": "192.0.2.1" }, { "x-forwarded-for": "192.0.2.1" }, {}]) {
+      assert.deepEqual(clientAddress(req(h), src), { trusted: false }, JSON.stringify(h));
+    }
+  }
+  assert.deepEqual(clientAddress(req({ "x-real-ip": "192.0.2.1", "x-forwarded-for": "198.51.100.1" }), "x-real-ip"), { trusted: true, address: "192.0.2.1" });
+  assert.deepEqual(clientAddress(req({ "x-forwarded-for": "198.51.100.1" }), "x-real-ip"), { trusted: false });
+  assert.deepEqual(clientAddress(req({ "x-real-ip": "arbitrary-bucket-name" }), "x-real-ip"), { trusted: false });
+  assert.deepEqual(clientAddress(req({ "x-real-ip": ["192.0.2.1"] }), "x-real-ip"), { trusted: false });
+  assert.deepEqual(clientAddress(req({}), "anything-else"), { trusted: false });
+  const table = [["192.0.2.1", "192.0.2.1"], ["2001:DB8::1", "2001:db8::1"], ["2001:db8:0:0:0:0:0:1", "2001:db8::1"], ["2001:0db8::0001", "2001:db8::1"],
+    ["::ffff:192.0.2.1", "192.0.2.1"], ["::FFFF:c000:0201", "192.0.2.1"], ["::1", "::1"],
+    ["01.2.3.4", null], ["1.2.3.4, 5.6.7.8", null], ["1.2.3.4:80", null], ["fe80::1%eth0", null], ["[::1]", null], [" 1.2.3.4", null], ["1.2.3.4 ", null],
+    ["", null], ["256.1.1.1", null], ["1.2.3", null], ["x".repeat(46), null], [null, null], [12, null]];
+  for (const [i, o] of table) assert.equal(canonicalAddress(i), o, String(i));
+  assert.deepEqual(intentApiGate({ ...ENV, MV_CLIENT_ADDRESS_SOURCE: "x-forwarded-for" }), { ok: false, code: "CLIENT_ADDRESS_SOURCE_INVALID" });
+  assert.equal(intentApiGate(ENV).config.addressSource, "none");
+  assert.equal(intentApiGate({ ...ENV, MV_CLIENT_ADDRESS_SOURCE: "x-real-ip" }).config.addressSource, "x-real-ip");
 });
 
 function spyDeps() {

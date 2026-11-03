@@ -62,7 +62,7 @@ test("E6 intent routes: exact closure (static HTTP layer; DB, core, pricer, Host
     const c = importClosure(ROOT, r);
     const want = Object.fromEntries([[r, "static"], ...INTENT_CLOSURE_STATIC.map((f) => [f, "static"]), ...INTENT_CLOSURE_DYNAMIC.map((f) => [f, "dynamic"])]);
     assert.deepEqual(Object.fromEntries([...c.files].sort()), Object.fromEntries(Object.entries(want).sort()), r);
-    assert.deepEqual([...c.packages].sort(), ["node:crypto", "pg", "stripe"], r);
+    assert.deepEqual([...c.packages].sort(), ["node:crypto", "node:net", "pg", "stripe"], r);   // node:net: isIP for the trusted-address policy
     assert.deepEqual(c.nonLiteralDynamic, [], r);
     for (const f of c.files.keys()) for (const re of EXCLUDED) assert.doesNotMatch(f, re, `${r}: ${f}`);
     for (const f of c.files.keys()) {
