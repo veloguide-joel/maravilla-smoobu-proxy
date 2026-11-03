@@ -55,6 +55,7 @@ const rawPI = (over = {}, chOver = {}) => ({
   latest_charge: { object: "charge", id: "ch_1", payment_intent: PI, status: "succeeded", paid: true, captured: false, amount: 90000, amount_captured: 0,
     amount_refunded: 0, currency: "usd", livemode: false, payment_method_details: { card: { capture_before: CB_LONG / 1000 } }, ...chOver },
   ...over });
+const SHORT_CB = (over = {}, chOver = {}) => rawPI(over, { payment_method_details: { card: { capture_before: CB_SHORT / 1000 } }, ...chOver });
 const canceledRaw = (over = {}, chOver = {}) => rawPI({ status: "canceled", amount_capturable: 0, ...over }, chOver);
 const piEv = (raw, over = {}) => { const observed = paymentIntentProofObservationV3(raw, { accountVerified: true });
   return { id: "ev-pi-1", kind: "payment_intent", readOpType: "stripe.retrieve_payment_intent", requestRef: PI, externalRef: PI, status: observed.status,
@@ -69,7 +70,7 @@ const TZ = "America/Mazatlan";
 
 const voidIn = (over = {}) => ({ evidence: piEv(rawPI()), intent: reservationFailed(), paymentAttemptId: ATT, voidOp: voidOp(), captureRows: [], now: NOW, notBefore: NOT_BEFORE, ...over });
 const cancelIn = (over = {}) => ({ intent: captureFailed1(), paymentAttemptId: ATT, cancelOp: cancelOp(), captureRows: [capRow()], byId: byIdEv(), byRef: null,
-  canceledPiEvidence: null, timeZone: TZ, now: NOW, notBefore: NOT_BEFORE, ...over });
+  piEvidence: piEv(rawPI()), timeZone: TZ, now: NOW, notBefore: NOT_BEFORE, ...over });
 
 // =============================================================================================
 test("protected ids: exact fixed list, equal to the worker's export (no booking-db import in the pure runtime closure)", () => {
@@ -228,14 +229,15 @@ test("void eligibility: positive controls (reservation_failed Z; capture_failed 
 test("void builder: pre-claim only, unissued / stale / changed-snapshot refused (incl. CURRENT op unknown, history, leg changed); exact empty-params request", () => {
   const base = voidIn({ intent: captureFailed1(), captureRows: [capRow()] });
   const e = C.voidSendEligibility(base);
-  const b = (over = {}) => C.buildVoidRequest({ intent: base.intent, voidOp: base.voidOp, captureRows: base.captureRows, eligibility: e, paymentAttemptId: ATT, ...over });
+  const b = (over = {}) => C.buildVoidRequest({ intent: base.intent, voidOp: base.voidOp, captureRows: base.captureRows, eligibility: e, paymentAttemptId: ATT,
+    now: NOW, notBefore: NOT_BEFORE, ...over });
   const ok = b();
   assert.equal(ok.ok, true, ok.code);
   assert.deepEqual(ok.request, { paymentIntentId: PI, params: {}, options: { idempotencyKey: voidKey("int-1", PI, 1) } });
   assert.ok(Object.isFrozen(ok.request) && Object.isFrozen(ok.request.params));
   assert.equal(b({ eligibility: { ...e } }).code, "ELIGIBILITY_REQUIRED", "a copy is not issued");
   assert.equal(b({ eligibility: C.cancelSendEligibility(cancelIn()) }).code, "ELIGIBILITY_REQUIRED", "a cancel eligibility is not a void eligibility");
-  assert.equal(C.buildVoidRequest({ ...base, eligibility: e, extra: 1 }).code, "UNEXPECTED_INPUT");
+  assert.equal(b({ extra: 1 }).code, "UNEXPECTED_INPUT");
   assert.equal(b({ voidOp: voidOp({ state: "outcome_unknown", attempts: 1, dispatchedAt: at(9) }) }).code, "VOID_OPERATION_ALREADY_CLAIMED_OR_SENT", "CURRENT op became unknown");
   assert.equal(b({ voidOp: voidOp({ state: "in_flight", attempts: 1, dispatchedAt: at(9) }) }).code, "VOID_OPERATION_ALREADY_CLAIMED_OR_SENT", "no pretend-pending after claim");
   assert.equal(b({ voidOp: voidOp({ id: "op-void-2" }) }).code, "ELIGIBILITY_STALE");
@@ -259,17 +261,16 @@ test("void builder: pre-claim only, unissued / stale / changed-snapshot refused 
 test("reservation proof + cancel eligibility: positive controls (P, Z, D with canceled proof, ref by lookup); every guard broken individually", () => {
   const e = C.cancelSendEligibility(cancelIn());
   assert.equal(e.ok, true, e.code); assert.deepEqual([...e.reservationEvidenceIds], ["ev-res-1"]); assert.equal(e.snapshot.localDate, "2026-12-19");
-  assert.equal(C.cancelSendEligibility(cancelIn({ intent: captureFailed0(), captureRows: [] })).ok, true, "Z");
-  const d = C.cancelSendEligibility(cancelIn({ captureRows: [SENT("outcome_unknown", NOW - 10 * MIN)], canceledPiEvidence: piEv(canceledRaw()) }));
-  assert.equal(d.ok, true, d.code); assert.equal(d.canceledPiEvidence.id, "ev-pi-1");
+  assert.equal(C.cancelSendEligibility(cancelIn({ intent: captureFailed0(), captureRows: [], piEvidence: piEv(SHORT_CB()) })).ok, true, "Z");
+  const d = C.cancelSendEligibility(cancelIn({ captureRows: [SENT("outcome_unknown", NOW - 10 * MIN)], piEvidence: piEv(canceledRaw()) }));
+  assert.equal(d.ok, true, d.code); assert.deepEqual({ ...d.piEvidence }, { id: "ev-pi-1", observedAt: NOW - MIN, proof: "canceled" });
   const lk = C.cancelSendEligibility(cancelIn({ byId: byIdEv({ bookingRef: undefined }), byRef: byRefEv() }));
   assert.equal(lk.ok, true, lk.code); assert.deepEqual([...lk.reservationEvidenceIds], ["ev-res-1", "ev-res-2"]);
   const cases = [
-    [{ captureRows: [SENT()] }, "CAPTURE_SENT_REQUIRES_CANCELED_PROOF"],
-    [{ captureRows: [SENT("failed_definite", NOW - 10 * MIN)] }, "CAPTURE_SENT_REQUIRES_CANCELED_PROOF"],     // no error-label route
-    [{ captureRows: [SENT("outcome_unknown", NOW - 10 * MIN)], canceledPiEvidence: piEv(rawPI()) }, "CANCELED_PROOF_NOT_CANCELED"],
-    [{ captureRows: [SENT("outcome_unknown", NOW - 2 * MIN)], canceledPiEvidence: piEv(canceledRaw()) }, "CANCELED_PROOF_EVIDENCE_TOO_SOON_AFTER_DISPATCH"],
-    [{ canceledPiEvidence: piEv(rawPI({ status: "requires_payment_method", amount_capturable: 0 })) }, "CANCELED_PROOF_NOT_CANCELED"],
+    [{ captureRows: [SENT()] }, "CANCELED_PROOF_NOT_CANCELED"],                         // D: still-authorized is never enough
+    [{ captureRows: [SENT("failed_definite", NOW - 10 * MIN)] }, "CANCELED_PROOF_NOT_CANCELED"],      // no error-label route
+    [{ captureRows: [SENT("outcome_unknown", NOW - 2 * MIN)], piEvidence: piEv(canceledRaw()) }, "CANCELED_PROOF_EVIDENCE_TOO_SOON_AFTER_DISPATCH"],
+    [{ piEvidence: piEv(rawPI({ status: "requires_payment_method", amount_capturable: 0 })) }, "PI_PROOF_NOT_REQUIRES_CAPTURE"],
     [{ intent: { ...captureFailed1(), counters: { ...captureFailed1().counters, captureAttempts: 2 } }, captureRows: [SENT()] }, "CAPTURE_HISTORY_M_BLOCKS_CANCEL"],
     [{ captureRows: [capRow({ attempts: 1 })] }, "HISTORY_CAPTURE_ROW_DISPATCH_INCONSISTENT"],
     [{ intent: reservationFailed(), captureRows: [] }, "NOT_CAPTURE_FAILED"],
@@ -311,7 +312,7 @@ test("cancel builder: pre-claim only, stale cached eligibility refused (CURRENT 
   const base = cancelIn();
   const e = C.cancelSendEligibility(base);
   const b = (over = {}) => C.buildCancelRequest({ intent: base.intent, cancelOp: base.cancelOp, captureRows: base.captureRows, eligibility: e, paymentAttemptId: ATT,
-    timeZone: TZ, now: NOW, ...over });
+    timeZone: TZ, now: NOW, notBefore: NOT_BEFORE, ...over });
   const ok = b();
   assert.equal(ok.ok, true, ok.code);
   assert.deepEqual(ok.request, { method: "PUT", path: "/v1/reservations/7001/statuses/cancelled", query: {}, body: { cancelledBy: "host" } });
@@ -321,8 +322,17 @@ test("cancel builder: pre-claim only, stale cached eligibility refused (CURRENT 
   assert.equal(b({ captureRows: [SENT()] }).code, "ELIGIBILITY_SNAPSHOT_CHANGED", "history changed P -> D");
   assert.equal(b({ intent: { ...base.intent, settlement: { ...base.intent.settlement, authorizationSettled: true } } }).code, "ELIGIBILITY_SNAPSHOT_CHANGED");
   assert.equal(b({ intent: { ...base.intent, version: base.intent.version + 1 } }).code, "ELIGIBILITY_STALE");
-  assert.equal(b({ now: NOW + 3 * 3600e3 }).code, "ARRIVAL_NOT_IN_FUTURE", "local date reached arrival");
-  assert.equal(b({ now: NOW - 2 * 24 * 3600e3 }).code, "ELIGIBILITY_SNAPSHOT_CHANGED", "local date decision changed");
+  assert.equal(b({ now: NOW + 3 * 3600e3 }).code, "CARRIED_EVIDENCE_STALE", "hours later: carried evidence stale first");
+  // local midnight crossings WITHIN the 5-minute window (America/Mazatlan = UTC-7 in December)
+  const nearMidnight = (localDay, minutesBefore) => Date.UTC(2026, 11, localDay + 1, 7, 0) - minutesBefore * MIN;   // local 00:00 of localDay+1
+  for (const [t0, code] of [[nearMidnight(18, 2), "ELIGIBILITY_SNAPSHOT_CHANGED"], [nearMidnight(19, 2), "ARRIVAL_NOT_IN_FUTURE"]]) {
+    const bi = cancelIn({ now: t0, notBefore: t0 - 60 * MIN, byId: byIdEv({}, { observedAt: t0 - MIN }), piEvidence: piEv(rawPI(), { observedAt: t0 - MIN }) });
+    const be = C.cancelSendEligibility(bi);
+    assert.equal(be.ok, true, be.code);
+    const r = C.buildCancelRequest({ intent: bi.intent, cancelOp: bi.cancelOp, captureRows: bi.captureRows, eligibility: be, paymentAttemptId: ATT, timeZone: TZ,
+      now: t0 + 3 * MIN, notBefore: t0 - 60 * MIN });
+    assert.equal(r.code, code, "local date changed / arrival reached");
+  }
   assert.equal(b({ timeZone: "America/Chihuahua" }).code, "ELIGIBILITY_SNAPSHOT_CHANGED", "zone changed");
   assert.equal(b({ extra: 1 }).code, "UNEXPECTED_INPUT");
   const v = (req) => C.validateCancelRequest(req, { intent: base.intent, cancelOp: base.cancelOp });
@@ -333,4 +343,74 @@ test("cancel builder: pre-claim only, stale cached eligibility refused (CURRENT 
   assert.equal(v({ ...ok.request, body: { cancelledBy: "guest" } }).code, "BODY");
   assert.equal(v({ ...ok.request, body: { cancelledBy: "host", refund: true } }).code, "BODY", "no refund path");
   assert.equal(v({ ...ok.request, headers: {} }).code, "REQUEST_SHAPE");
+});
+
+// ---------------------------------------------------------------------------------------------
+// root HOLD on ddbf685: PI proof on EVERY cancel; builders re-check carried freshness at the CURRENT time
+
+test("cancel requires fresh fully bound PI proof of zero money received in EVERY history (Z/P: still-authorized or canceled; D: canceled only)", () => {
+  // Z/P still-authorized positive, also AFTER the capture deadline (no deadline-ahead requirement)
+  assert.equal(C.cancelSendEligibility(cancelIn()).piEvidence.proof, "still_authorized");
+  const cf0 = captureFailed0();
+  const z = C.cancelSendEligibility(cancelIn({ intent: cf0, captureRows: [], piEvidence: piEv(rawPI({}, { payment_method_details: { card: { capture_before: CB_SHORT / 1000 } } })) }));
+  assert.equal(z.ok, true, z.code); assert.ok(NOW > cf0.payment.captureBefore);
+  // Z/P/D canceled positive
+  for (const [intent, rows] of [[cf0, []], [captureFailed1(), [capRow()]], [captureFailed1(), [SENT("outcome_unknown", NOW - 10 * MIN)]]]) {
+    const r = C.cancelSendEligibility(cancelIn({ intent, captureRows: rows, piEvidence: piEv(canceledRaw()) }));
+    assert.equal(r.ok, true, r.code); assert.equal(r.piEvidence.proof, "canceled");
+  }
+  // refusals BEFORE issuing (Z and P alike)
+  for (const [intent, rows, raw] of [[cf0, [], SHORT_CB], [captureFailed1(), [capRow()], rawPI]]) {
+    const cases = [
+      [{ piEvidence: undefined }, "PI_EVIDENCE_REQUIRED"], [{ piEvidence: null }, "PI_EVIDENCE_REQUIRED"],
+      [{ paymentAttemptId: null }, "PAYMENT_ATTEMPT_REQUIRED"], [{ paymentAttemptId: undefined }, "PAYMENT_ATTEMPT_REQUIRED"], [{ paymentAttemptId: "" }, "PAYMENT_ATTEMPT_REQUIRED"],
+      [{ paymentAttemptId: "other-attempt" }, "PI_PROOF_PAYMENT_INTENT_IDENTITY"],
+      [{ piEvidence: piEv(raw({ status: "succeeded", amount_received: 90000, amount_capturable: 0 }, { captured: true, amount_captured: 90000 })) }, "PI_CAPTURED_OWNER_CASE"],
+      [{ piEvidence: piEv(raw({ status: "processing", amount_capturable: 0 })) }, "PI_PROOF_NOT_REQUIRES_CAPTURE"],
+      [{ piEvidence: piEv(raw({ amount_received: 100 })) }, "PI_PROOF_AMOUNT_RECEIVED_NOT_ZERO"],
+      [{ piEvidence: piEv(raw({ amount_capturable: 100 })) }, "PI_PROOF_AMOUNT_CAPTURABLE_NOT_FULL"],
+      [{ piEvidence: piEv(raw({}, { captured: true })) }, "PI_PROOF_CHARGE_ALREADY_CAPTURED"],
+      [{ piEvidence: piEv(raw({ id: "pi_test_other" })) }, "PI_PROOF_PAYMENT_INTENT_IDENTITY"],
+      [{ piEvidence: piEv(raw({ currency: "mxn" })) }, "PI_PROOF_PAYMENT_INTENT_IDENTITY"],
+      [{ piEvidence: piEv(raw(), { observedAt: NOW - 6 * MIN }) }, "PI_PROOF_EVIDENCE_STALE"],
+      [{ piEvidence: piEv(raw(), { observedAt: NOW + 1 }) }, "PI_PROOF_EVIDENCE_IN_FUTURE"],
+      [{ piEvidence: piEv(raw(), { kind: "hostaway_reservation" }) }, "PI_EVIDENCE_REQUIRED"]
+    ];
+      [{ piEvidence: piEv(raw({}, { payment_method_details: { card: { capture_before: 5 } } })) }, "PI_PROOF_CAPTURE_BEFORE_MISMATCH"],
+    assert.equal(C.cancelSendEligibility(cancelIn({ intent, captureRows: rows, piEvidence: piEv(raw()) })).ok, true, "positive control for this history");
+    for (const [over, code] of cases) assert.equal(C.cancelSendEligibility(cancelIn({ intent, captureRows: rows, piEvidence: piEv(raw()), ...over })).code, code, `${rows.length} ${code}`);
+  }
+  // void: null / empty payment attempt refused
+  for (const pa of [null, undefined, ""]) assert.equal(C.voidSendEligibility(voidIn({ paymentAttemptId: pa })).code, "PAYMENT_ATTEMPT_REQUIRED");
+});
+
+test("pre-claim builders re-check every CARRIED observation time at the CURRENT time (5 min boundary, clock before observation, state entry)", () => {
+  // cancel: reservation evidence at NOW - 1 min and PI evidence at NOW - 2 min
+  const ci = cancelIn({ piEvidence: piEv(rawPI(), { observedAt: NOW - 2 * MIN }) });
+  const ce = C.cancelSendEligibility(ci);
+  assert.equal(ce.ok, true, ce.code);
+  const cb = (now, over = {}) => C.buildCancelRequest({ intent: ci.intent, cancelOp: ci.cancelOp, captureRows: ci.captureRows, eligibility: ce, paymentAttemptId: ATT,
+    timeZone: TZ, now, notBefore: NOT_BEFORE, ...over });
+  assert.equal(cb(NOW).ok, true, "valid immediately");
+  assert.equal(cb(NOW + 3 * MIN).ok, true, "PI evidence exactly 5 min old: still fresh");
+  assert.equal(cb(NOW + 3 * MIN + 1).code, "CARRIED_EVIDENCE_STALE", "PI evidence > 5 min");
+  assert.equal(cb(NOW + 6 * MIN).code, "CARRIED_EVIDENCE_STALE", "root repro: same local date, 7-minute-old reservation evidence");
+  assert.equal(C.localDateInZone(NOW + 6 * MIN, TZ), C.localDateInZone(NOW, TZ));
+  assert.equal(cb(NOW - 2 * MIN - 1).code, "CARRIED_EVIDENCE_IN_FUTURE", "clock before an observation");
+  assert.equal(cb(NOW, { notBefore: NOT_BEFORE + 1 }).code, "STATE_ENTRY_CHANGED");
+  assert.equal(cb(NOW, { notBefore: undefined }).code, "STATE_ENTRY_CHANGED");
+  assert.equal(cb(undefined).code, "CARRIED_FRESHNESS_INPUT_INVALID");
+  // void
+  const vi = voidIn({ evidence: piEv(rawPI(), { observedAt: NOW - MIN }) });
+  const ve = C.voidSendEligibility(vi);
+  const vb = (now, over = {}) => C.buildVoidRequest({ intent: vi.intent, voidOp: vi.voidOp, captureRows: vi.captureRows, eligibility: ve, paymentAttemptId: ATT,
+    now, notBefore: NOT_BEFORE, ...over });
+  assert.equal(vb(NOW).ok, true);
+  assert.equal(vb(NOW + 4 * MIN).ok, true, "exactly 5 min");
+  assert.equal(vb(NOW + 4 * MIN + 1).code, "CARRIED_EVIDENCE_STALE");
+  assert.equal(vb(NOW - MIN - 1).code, "CARRIED_EVIDENCE_IN_FUTURE");
+  assert.equal(vb(NOW, { notBefore: NOT_BEFORE - 1 }).code, "STATE_ENTRY_CHANGED");
+  assert.equal(vb(NaN).code, "CARRIED_FRESHNESS_INPUT_INVALID");
+  // carried data is the eligibility's own immutable values (frozen; never rewritten)
+  assert.ok(Object.isFrozen(ce.piEvidence) && Object.isFrozen(ce.reservationObservedAts));
 });
