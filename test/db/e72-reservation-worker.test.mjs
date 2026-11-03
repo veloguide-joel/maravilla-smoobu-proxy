@@ -25,8 +25,12 @@ const addDays = (d, n) => new Date(Date.parse(`${d}T00:00:00Z`) + n * 86400000).
 const STAY = { from: "2026-12-20", to: "2026-12-24", guests: 2 };
 
 // ---------- fake Hostaway world (pricing reads, reservation reads, create) ----------
+// Provider reservation ids are unique per world: each world gets its own disjoint block of 1000 ids (deterministic). A random
+// base (one of 1000 buckets of 100 ids, drawn per world) let two worlds in this file mint the SAME Hostaway id, which the UNIQUE
+// hostaway_reservation_id columns then refused (see claude/e7-db-suite-reliability.md).
+let nextWorldIdBlock = 700000;
 function world({ currency = "MXN", blocked = new Set(), nightly = 1600 } = {}) {
-  const w = { calls: [], reservations: [], nextId: 700000 + Math.floor(Math.random() * 1000) * 100, createMode: "ok", lookupMode: "ok", retrieveMode: "ok",
+  const w = { calls: [], reservations: [], nextId: (nextWorldIdBlock += 1000), createMode: "ok", lookupMode: "ok", retrieveMode: "ok",
     pricingMode: "ok", onCreate: null, onPricing: null, nightly, currency, signals: [] };
   const hang = (signal) => { w.signals.push(signal); return new Promise(() => {}); };
   const days = (from, to) => { const out = []; for (let d = from; d <= to; d = addDays(d, 1)) out.push({ date: d, status: blocked.has(d) ? "booked" : "available", isAvailable: blocked.has(d) ? 0 : 1, minimumStay: 1, maximumStay: 90, closedOnArrival: 0, closedOnDeparture: 0 }); return out; };
