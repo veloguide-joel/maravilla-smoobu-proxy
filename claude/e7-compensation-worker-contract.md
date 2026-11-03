@@ -97,6 +97,12 @@ The gate classifies the intent's COMPLETE capture history: every `stripe.capture
     - The pending void row (never dispatched) stays as audit and is never sent once the leg is settled.
   - **Cancel leg:** may proceed. The canceled-evidence id is part of the cancel plan's snapshot and is re-checked in the pre-send check and in the `RESERVATION_CANCELLED` event transaction (same conditions).
 - **In class Z / P with the PI `requires_capture`:** the void (§3.2) is the only way to settle the authorization, and the cancel may proceed under the same gate.
+- **Design correction (root HOLD on ddbf685): no outbox fact proves zero money.** Classes Z and P prove only that OUR outbox never sent a capture. They do not prove the provider has not captured (e.g. another actor). Therefore EVERY initial void AND EVERY initial Hostaway cancel also requires fresh, fully bound v3 PaymentIntent evidence proving zero money received:
+  - **Z / P:** the strict still-authorized proof (`stillAuthorizedV3Refusal`, which does NOT require the capture deadline to be ahead, so a release after it stays valid) OR the strict canceled proof;
+  - **D:** the canceled proof only;
+  - **M / malformed:** refused.
+  
+  A captured PaymentIntent → owner case (never cancel, void or refund). Unknown, processing, partial, absent or mismatched PI evidence refuses BEFORE any eligibility is issued. A bound, non-empty completed payment attempt id is required. Account / read provenance remains the worker's responsibility; the pure layer still checks the full proof shape and bindings.
 
 ### 3.2 Void (reservation_failed / capture_failed)
 
@@ -116,6 +122,7 @@ The gate classifies the intent's COMPLETE capture history: every `stripe.capture
 ### 3.3 Hostaway cancel (capture_failed only)
 
 - **Identity:** a fresh by-id read with the full identity INCLUDING the ref (by-ref fallback when not echoed), the exact listing, dates, amount and currency, status `new`. Anything else (incl. `modified`) → owner case.
+- **Money:** the §3.1 PaymentIntent proof of zero money received (Z/P still-authorized or canceled; D canceled only), on every initial cancel.
 - **Protected ids:** the historical ids 70636076 / 71045356 / 71072615 / 71081885 are refused at every path.
 - **Row:** the single current cancel row: pending, never dispatched, attempt 1, payload rid = the intent's immutable reservation id (0001 guard).
 - **Stay date (proposed, root to confirm, B4):** `from` must be strictly after today in the listing time zone, otherwise owner case. The guest may already be in the house.
@@ -188,6 +195,11 @@ The gate classifies the intent's COMPLETE capture history: every `stripe.capture
     - a "Create offline charge" section documents `POST /v1/guestPayments/charges/{reservationId}` with the fields title, description, amount, paymentMethod, status and scheduledDate (examples include `cash` and `paid`);
     - `GET /guestPayments/charges/{guestChargeId}` is a single-charge read, NOT proof that a charge is absent from the list;
     - the same doc confirms the cancel `PUT .../statuses/cancelled` with a host/guest body.
+  - **Further public-doc facts (root, 2026-11-03):**
+    - the allowed offline `paymentMethod` values are listed: credit_card, vcc, cash, paypal, venmo, bank_transfer, bank_check, ota, other;
+    - a GET guest-charges LIST is documented, with `limit` defaulting to 100 (maximum 500) and filtering by reservationIds (marked fixed 2026-10-02).
+    
+    Public docs only: no completeness, dedupe or live proof, and no implementation authority. Which method value correctly represents a Stripe-collected payment is an owner/root decision, never assumed.
   - **Still unproven:** whether description/title persist and can carry a dedupe marker; the allowed `paymentMethod` values (do NOT assume `cash` for Stripe bookkeeping); list filtering, paging and completeness for a reservation; the reply shapes; dedupe semantics.
   - No endpoint is called and no format is invented. The owner read-only shape check remains a later gate.
 - **B2: decided.** No automatic resend (§5).
@@ -239,9 +251,10 @@ The gate classifies the intent's COMPLETE capture history: every `stripe.capture
   - `captureHistoryClass({ intent, captureRows })` → Z | P | D | M (§3.1), with frozen reasons;
   - `piCanceledProofV3(ev, intent, paymentAttemptId, { latestCaptureDispatchedAt, now })`;
   - `voidSendEligibility(...)`: a strict still-authorized v3 proof + class Z/P + the single pending, never-dispatched void row (attempt 1, `voidKey`) → a frozen branded eligibility with a proof snapshot;
-  - `buildVoidRequest` / `validateVoidRequest` → `{ paymentIntentId, params: {}, options: { idempotencyKey } }`, pre-claim only, with snapshot equality;
+  - `buildVoidRequest` / `validateVoidRequest` → `{ paymentIntentId, params: {}, options: { idempotencyKey } }`, pre-claim only, with snapshot equality. The builder takes the CURRENT `now` and the state-entry `notBefore`: every carried immutable observation time is re-checked (≤ 5 min, not future, not before state entry; never rewritten) and `notBefore` must equal the eligibility's;
   - `localDateInZone(now, timeZone)` + `arrivalStrictlyFuture(intent, timeZone, now)`, with no fallback;
   - `cancelSendEligibility(...)`: full reservation identity incl. ref (by-id, or by-id + by-ref evidence), status `new` only, protected ids refused, the arrival gate, class Z/P or the linked canceled proof, and the single pending, never-dispatched cancel row → a branded eligibility + snapshot;
+  - the cancel builder applies the same CURRENT-time freshness to EVERY carried observation time (reservation and PaymentIntent) and binds `notBefore`;
   - `buildCancelRequest` / `validateCancelRequest` → `{ method: "PUT", path: "/v1/reservations/{rid}/statuses/cancelled", query: {}, body: { cancelledBy: "host" } }`.
 - **Tests:**
   - every identity, money, status and history guard broken in turn;
