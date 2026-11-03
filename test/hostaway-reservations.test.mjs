@@ -559,9 +559,16 @@ test("containment: the adapter is pure and unreachable — no imports, network, 
   };
   for (const d of ["api", "lib", "db", "scripts"]) walk(d);
   // The only importers are the offline E4 write runner and the offline connected-test runner under scripts/ (excluded
-  // from Vercel; no transport, no env). happy-preflight.mjs names the adapter's PATH only, to hash it for provenance.
-  assert.deepEqual(importers.sort(), ["scripts/e4-connected/connected-execute.mjs", "scripts/e4-connected/connected-path.mjs", "scripts/e4-connected/connected-precheck.mjs",
+  // from Vercel; no transport, no env), plus (E7.2, root-authorized) the offline reservation worker LIBRARY, which no api/
+  // route reaches (asserted below). happy-preflight.mjs names the adapter's PATH only, to hash it for provenance.
+  assert.deepEqual(importers.sort(), ["lib/booking-db/reservation-worker.js", "scripts/e4-connected/connected-execute.mjs", "scripts/e4-connected/connected-path.mjs", "scripts/e4-connected/connected-precheck.mjs",
     "scripts/e4-connected/connected-recover.mjs", "scripts/e4-write-runner/happy-path.mjs", "scripts/e4-write-runner/happy-preflight.mjs",
     "scripts/e4-write-runner/runner.mjs"], "nothing deployable references the adapter");
   assert.doesNotMatch(readFileSync(join(ROOT, "scripts/e4-write-runner/happy-preflight.mjs"), "utf8"), /^import[^\n]*hostaway-reservations/m);
+  // nothing under api/ references the worker or the adapter
+  const apiRefs = [];
+  const walkApi = (dir) => { for (const e of readdirSync(join(ROOT, dir), { withFileTypes: true })) { const p = `${dir}/${e.name}`;
+    if (e.isDirectory()) walkApi(p); else if (/reservation-worker|hostaway-reservations/.test(readFileSync(join(ROOT, p), "utf8"))) apiRefs.push(p); } };
+  walkApi("api");
+  assert.deepEqual(apiRefs, []);
 });

@@ -11,7 +11,7 @@ import { importClosure } from "./helpers/import-closure.mjs";
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const walk = (d) => (existsSync(join(ROOT, d)) ? readdirSync(join(ROOT, d)).flatMap((n) => (statSync(join(ROOT, d, n)).isDirectory() ? walk(`${d}/${n}`) : [`${d}/${n}`])) : []);
 const MOVED = ["codec", "config", "operations", "pool", "repo", "webhooks"];
-const BOOKING_DB_FILES = [...MOVED, "intent-access", "recovery"].sort(); // + E6 bearer-token lookup and shared rate limits; + E7.1 recovery (not route-reachable)
+const BOOKING_DB_FILES = [...MOVED, "intent-access", "recovery", "reservation-worker"].sort(); // + E6 bearer-token lookup and shared rate limits; + E7.1 recovery (not route-reachable)
 const WEBHOOK = "api/checkout/stripe-webhook.js";
 const INTENT_ROUTES = ["api/checkout/intents.js", "api/checkout/intent-step.js"];
 // E6 intent API closure (identical for both routes apart from the entry file); everything after the HTTP layer is lazy.
@@ -126,4 +126,15 @@ test(".vercelignore and public/ containment are unchanged", () => {
     "# C8: never upload internal-only trees to Vercel (defence in depth; outputDirectory \"public\" already keeps\n# everything else out of static serving). NEVER list api/ or lib/: API functions bundle their lib/ imports.\n/db\n/test\n/scripts\n");
   assert.deepEqual(readdirSync(join(ROOT, "public")), ["robots.txt"]);
   assert.deepEqual(JSON.parse(readFileSync(join(ROOT, "vercel.json"), "utf8")), { outputDirectory: "public" });
+});
+
+test("E7.1/E7.2: no api/ route's import closure reaches the recovery modules, the reservation worker or the Hostaway adapter", () => {
+  const OFFLINE_ONLY = ["lib/booking-db/reservation-worker.js", "lib/booking-db/recovery.js", "lib/checkout/recovery-plan.js", "lib/hostaway-reservations.js"];
+  const routes = walk("api").filter((f) => /\.m?js$/.test(f));
+  assert.ok(routes.length >= 10);
+  for (const r of routes) {
+    const c = importClosure(ROOT, r);
+    for (const f of OFFLINE_ONLY) assert.equal(c.files.has(f), false, `${r} reaches ${f}`);
+    assert.deepEqual(c.nonLiteralDynamic, [], r);
+  }
 });

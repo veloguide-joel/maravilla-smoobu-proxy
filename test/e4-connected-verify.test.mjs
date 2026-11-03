@@ -576,11 +576,12 @@ test("adapter: customFieldRefShape and assessRefNotEchoed are pure, explicit and
   assert.ok(Object.isFrozen(as(res)));
   assert.deepEqual(A.ACCEPTED_CREATE_STATUSES, ["new"]);                // the accepted status set is NOT broadened
   for (const s of A.REF_ECHO_ABSENT_SHAPES) assert.ok(A.REF_ECHO_SHAPES.includes(s));
-  // used only by the core runner (and defined in the adapter)
+  // used only by the core runner and (E7.2, root-authorized) the offline reservation worker library (and defined in the adapter);
+  // the worker is reachable from no api/ route (test/packaging-closure.test.mjs pins every route closure exactly)
   const walk = (p) => readdirSync(join(ROOT, p), { withFileTypes: true }).flatMap((e) => e.isDirectory() ? (e.name === "node_modules" ? [] : walk(join(p, e.name))) : [join(p, e.name)]);
   const files = [...walk("api"), ...walk("lib"), ...walk("scripts"), ...walk("public")];
   assert.deepEqual(files.filter((f) => readFileSync(join(ROOT, f), "utf8").includes("assessRefNotEchoed")).sort(),
-    ["lib/hostaway-reservations.js", "scripts/e4-connected/connected-path.mjs"]);
+    ["lib/booking-db/reservation-worker.js", "lib/hostaway-reservations.js", "scripts/e4-connected/connected-path.mjs"]);
 });
 
 test("launcher summary: createVerification is an explicit allowlist; unknown values become OTHER; never raw values", () => {
