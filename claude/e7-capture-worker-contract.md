@@ -143,6 +143,11 @@ If the money turns out to have been captured after a failure (`capture_failed` +
 
 ## 6. Retry and idempotency
 
+> **SUPERSEDED for E7.3 by §11 (root amendment, 2026-11-02).** The automatic new-key capture retry described below,
+> driven by a still-authorized snapshot after an uncertain send, is NOT adopted. It is kept only as the record of the
+> earlier proposal.
+
+
 **A new attempt is allowed only when ALL of these hold:**
 1. The intent is `capture_unknown`, and the previous row is `outcome_unknown`.
 2. A PI read observed at least 2 min after that row's `dispatched_at` passes `piStillAuthorizedProofV3`.
@@ -220,3 +225,45 @@ This is NOT exactly-once provider delivery, and must never be described as such.
 - No implementation, executor, schema, migration or E3 change.
 - No void, cancel, refund, offline-charge or notification execution.
 - No credentials, provider calls, hosted DB, env flags, installs, merge, deploy, activation, owner checkout or E4 journal changes.
+
+
+## 11. Amendment — capture retry restriction (root, 2026-11-02 America/Mazatlan; official docs checked 2026-11-03 UTC)
+
+**Sources** (official Stripe documentation, as checked by root):
+- https://docs.stripe.com/api/payment_intents/capture:
+  - capture is allowed only from `requires_capture`;
+  - `amount_to_capture` must be ≤ the original amount;
+  - `final_capture` defaults to true;
+  - a successful capture returns `succeeded`;
+  - a PaymentIntent that is not capturable returns an error.
+- https://docs.stripe.com/api/idempotent_requests:
+  - in API v1, the same key with the same parameters replays the cached result (a 500 included);
+  - keys are retained for at least 24 h;
+  - a fresh key does NOT deduplicate an earlier request.
+- https://docs.stripe.com/error-low-level:
+  - network errors are retried with the same key and the same parameters inside the window;
+  - a 409 for the same key can mean that the original request is still executing;
+  - a 500 is indeterminate;
+  - do NOT use a new key until the original outcome is resolved.
+
+**Consequences for E7.3 (binding):**
+1. **No automatic new-key retry.** E7.3 has no automatic new-key capture retry after an uncertain capture send (timeout, lost reply, 5xx, 409, 429, a malformed reply, a lost lease, a crash after the claim).
+   - A still-authorized snapshot, even two or more minutes after the send, does NOT establish that the original request has stopped executing, and the docs give no such guarantee.
+   - Stripe's single/full manual capture behaviour is NOT a substitute for resolving the original request.
+2. **Read reconciliation** may still PROVE `captured` (the accepted full PI + Charge captured proof) or `canceled` (the accepted gone proof).
+   - A still-authorized observation for an unresolved original uncertain capture becomes a DURABLE OPERATOR DECISION (ESCALATE with a case).
+   - It never leads to `RECONCILED_STILL_AUTHORIZED` or a new capture write.
+3. **No shared change.** E3 events and the shared E7.1 planner stay unchanged. The later E7.3 worker must BLOCK `RECONCILED_STILL_AUTHORIZED` for an uncertain capture, unless separately reviewed, definitive no-execution evidence exists (none is defined today).
+4. **Capture-proof eligibility** (`initialCaptureSendEligibility`, E7.3a) is issued ONLY for the initial planned send:
+   - attempt 1, the row pending and never dispatched;
+   - NO other capture row for the intent;
+   - `reservation_confirmed`;
+   - a strict v3 still-authorized proof.
+   It is a data gate, not a naming convention: it cannot be produced for any retry, and a capture request can be built only from an eligibility object minted for that exact operation and intent version.
+5. **Not adopted:** re-sending the SAME key with the SAME parameters to resolve a network error is documented by Stripe, but it is not adopted here. It would need its own review (whether a once-only row may be re-sent, the replay window and cached-500 semantics).
+6. **Entry gates retained** (root, 2026-11-02 21:25):
+   - (1) a full captured proof is evidence of money captured even after the deadline; the deadline only blocks NEW sends;
+   - (2) `capture_failed` is out of this worker's scope; captured-during-cancellation is an existing E3 invariant;
+   - (3) multicapture stays disabled (`final_capture: true` is always sent); per-attempt idempotency is not deduplication across attempts.
+
+**Not built in E7.3a:** worker, executor, DB, schema, E3 and planner changes. The protected historical reservation ids remain a worker-level rule for the later slice.
