@@ -266,4 +266,22 @@ This is NOT exactly-once provider delivery, and must never be described as such.
    - (2) `capture_failed` is out of this worker's scope; captured-during-cancellation is an existing E3 invariant;
    - (3) multicapture stays disabled (`final_capture: true` is always sent); per-attempt idempotency is not deduplication across attempts.
 
+**E7.3a correction (root review of 5e334b0, 2026-11-02):**
+- `buildCaptureRequest` is PRE-CLAIM construction only. It re-checks the CURRENT state:
+  - the intent is `reservation_confirmed` at attempt 1;
+  - the row is pending and never dispatched;
+  - the row's PaymentIntent, attempt, amount and key are correct.
+- **Snapshot binding:** the eligibility is bound to a frozen snapshot of the proof-relevant values, and the builder requires every one to be equal:
+  - intent id, version, state and capture attempts;
+  - op id, state, dispatchedAt, PaymentIntent, attempt, amount and idempotency key;
+  - price amount and currency, authorized amount and currency;
+  - `captureBefore`, `authorizationDeadline` and the payment attempt id.
+- **Effect:** a cached eligibility can no longer build a request for a row that became uncertain (including before the unknown event bumped the intent version), for a claimed or dispatched row, for a non-confirmed intent, or for changed money, key or binding values.
+- **`validateCaptureRequest`** is a shape and identity validator only. It is NOT send authorization.
+- **Worker responsibilities** (no current pure API can prove them; the worker's own DB claim, lease, evidence and deadline fences remain mandatory):
+  - the cited evidence row is persisted and fresh (trusted timestamps exist only in the database);
+  - the payment attempt id is the one the database binds to this PaymentIntent;
+  - the row is still claimable, leased and within the deadline at the moment of the send.
+- **Evidence id:** eligibility refuses a missing evidence id instead of reporting it as null. A present id only names the row the caller read; it is not proof of persistence.
+
 **Not built in E7.3a:** worker, executor, DB, schema, E3 and planner changes. The protected historical reservation ids remain a worker-level rule for the later slice.

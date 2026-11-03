@@ -118,7 +118,7 @@ test("account / request-selector / evidence / payment-attempt bindings", () => {
     [{ evidence: evOf(good, { status: "succeeded" }) }, "PAYMENT_INTENT_IDENTITY"],
     [{ paymentAttemptId: "other-attempt" }, "PAYMENT_INTENT_IDENTITY"],
     [{ paymentAttemptId: null }, "PAYMENT_INTENT_IDENTITY"],
-    [{ evidence: null }, "V3_OBSERVATION_REQUIRED"]
+    [{ evidence: null }, "EVIDENCE_ID_REQUIRED"]
   ];
   for (const [over, code] of bad) assert.equal(elig(over).code, code, JSON.stringify(Object.keys(over)));
   // the stored capture deadline, not a recomputed one, is the reference
@@ -170,32 +170,35 @@ test("eligibility can NEVER serve as permission to retry an uncertain capture (e
   }
   // a forged eligibility object (same fields, not minted here) cannot build a request
   const e = elig();
-  assert.equal(buildCaptureRequest({ intent: i, captureOp: { ...OP(), state: "in_flight" }, eligibility: { ...e } }).code, "ELIGIBILITY_REQUIRED");
+  assert.equal(buildCaptureRequest({ intent: i, captureOp: OP(), eligibility: { ...e }, paymentAttemptId: ATT }).code, "ELIGIBILITY_REQUIRED");
+  assert.equal(elig({ evidence: { ...evOf(v3()), id: undefined } }).code, "EVIDENCE_ID_REQUIRED", "no evidence id -> never reported as persisted evidence");
+  assert.equal(elig({ evidence: { ...evOf(v3()), id: "" } }).code, "EVIDENCE_ID_REQUIRED");
 });
 
 test("capture request: exact full amount, final_capture true, expand latest_charge, the row's own key; nothing else", () => {
   const i = confirmed();
   const e = elig();
-  const claimed = { ...OP(), state: "in_flight", dispatchedAt: at(9) };
-  const r = buildCaptureRequest({ intent: i, captureOp: claimed, eligibility: e });
+  const pending = OP();
+  const r = buildCaptureRequest({ intent: i, captureOp: pending, eligibility: e, paymentAttemptId: ATT });
   assert.equal(r.ok, true, r.code);
   assert.deepEqual(JSON.parse(JSON.stringify(r.request)), { paymentIntentId: PI, params: { amount_to_capture: 90000, final_capture: true, expand: ["latest_charge"] },
     options: { idempotencyKey: `cap:int-1:${PI}` } });
   assert.ok(Object.isFrozen(r.request) && Object.isFrozen(r.request.params) && Object.isFrozen(r.request.params.expand));
-  assert.equal(validateCaptureRequest(r.request, { intent: i, captureOp: claimed }).ok, true);
+  assert.equal(validateCaptureRequest(r.request, { intent: i, captureOp: pending }).ok, true);
   // caller parameters are not accepted at all
-  assert.equal(buildCaptureRequest({ intent: i, captureOp: claimed, eligibility: e, params: { amount_to_capture: 1 } }).code, "UNEXPECTED_INPUT");
-  assert.equal(buildCaptureRequest({ intent: i, captureOp: claimed }).code, "UNEXPECTED_INPUT");
+  assert.equal(buildCaptureRequest({ intent: i, captureOp: pending, eligibility: e, paymentAttemptId: ATT, params: { amount_to_capture: 1 } }).code, "UNEXPECTED_INPUT");
+  assert.equal(buildCaptureRequest({ intent: i, captureOp: pending, eligibility: e }).code, "UNEXPECTED_INPUT");
+  assert.equal(buildCaptureRequest({ intent: i, captureOp: pending }).code, "UNEXPECTED_INPUT");
   assert.equal(buildCaptureRequest().code, "UNEXPECTED_INPUT");
 });
 
 test("capture request builder refuses stale / wrong attempt / PI / key / amount / other operation", () => {
   const i = confirmed();
   const e = elig();
-  const op = { ...OP(), state: "in_flight" };
-  const b = (over) => buildCaptureRequest({ intent: i, captureOp: op, eligibility: e, ...over });
+  const op = OP();
+  const b = (over) => buildCaptureRequest({ intent: i, captureOp: op, eligibility: e, paymentAttemptId: ATT, ...over });
   assert.equal(b({ intent: { ...i, version: i.version + 1 } }).code, "ELIGIBILITY_STALE");
-  assert.equal(b({ intent: { ...i, id: "int-2" } }).code, "ELIGIBILITY_STALE");
+  assert.equal(b({ intent: { ...i, id: "int-2" } }).code, "OPERATION_IDEMPOTENCY_KEY", "the row's key binds the intent id (checked first)");
   assert.equal(b({ captureOp: { ...op, id: "op-cap-x" } }).code, "ELIGIBILITY_NOT_FOR_THIS_OPERATION");
   assert.equal(b({ captureOp: { ...op, opType: "stripe.void_payment_intent" } }).code, "NOT_A_CAPTURE_OPERATION");
   assert.equal(b({ captureOp: { ...op, payload: { ...op.payload, paymentIntentId: "pi_test_other" } } }).code, "OPERATION_PAYMENT_INTENT");
@@ -205,12 +208,13 @@ test("capture request builder refuses stale / wrong attempt / PI / key / amount 
   assert.equal(b({ captureOp: { ...op, payload: { ...op.payload, extra: 1 } } }).code, "OPERATION_PAYLOAD_SHAPE");
   assert.equal(b({ captureOp: { ...op, payload: undefined } }).code, "OPERATION_PAYLOAD_SHAPE");
   assert.equal(b({ intent: { ...i, price: { ...i.price, finalTotalMinor: 1 } } }).code, "OPERATION_AMOUNT");
+  assert.equal(b({ paymentAttemptId: "other-attempt" }).code, "ELIGIBILITY_SNAPSHOT_CHANGED");
 });
 
 test("validateCaptureRequest refuses partial / multicapture / extra parameters / wrong key or PI", () => {
   const i = confirmed();
-  const op = { ...OP(), state: "in_flight" };
-  const good = buildCaptureRequest({ intent: i, captureOp: op, eligibility: elig() }).request;
+  const op = OP();
+  const good = buildCaptureRequest({ intent: i, captureOp: op, eligibility: elig(), paymentAttemptId: ATT }).request;
   const plain = JSON.parse(JSON.stringify(good));
   const v = (req) => validateCaptureRequest(req, { intent: i, captureOp: op }).code;
   assert.equal(v({ ...plain, params: { ...plain.params, amount_to_capture: 89999 } }), "PARTIAL_OR_WRONG_AMOUNT");
@@ -236,4 +240,42 @@ test("purity / containment: no I/O, env, clock, network or SDK in the module", a
   for (const re of [/process\./, /fetch\s*\(/, /Date\.now|new Date\(/, /setTimeout|setInterval/, /require\s*\(/, /from\s+"(?!\.\/(recovery-plan|intent-state)\.js")/, /import\s*\(/, /["']stripe["']/, /booking-db/]) {
     assert.doesNotMatch(src, re, String(re));
   }
+});
+
+test("root: a cached eligibility cannot build a request once the row or intent changed (mint first, then mutate)", () => {
+  const i = confirmed();
+  const e = elig();
+  assert.equal(e.ok, true);
+  const b = (intent, captureOp, pa = ATT) => buildCaptureRequest({ intent, captureOp, eligibility: e, paymentAttemptId: pa }).code;
+  // root's reproduction: the op became outcome_unknown (dispatched) BEFORE the unknown event bumped the intent version
+  assert.equal(i.version, e.intentVersion);
+  assert.equal(b(i, { ...OP(), state: "outcome_unknown", dispatchedAt: at(8) }), "OPERATION_ALREADY_CLAIMED_OR_SENT");
+  // claimed / in flight / dispatched / settled / superseded rows
+  for (const [st, d] of [["in_flight", at(8)], ["in_flight", null], ["pending", at(8)], ["succeeded", at(8)], ["failed_definite", at(8)], ["escalated", at(8)], ["superseded", null]]) {
+    assert.equal(b(i, { ...OP(), state: st, dispatchedAt: d }), "OPERATION_ALREADY_CLAIMED_OR_SENT", `${st}/${d}`);
+  }
+  // the intent left reservation_confirmed (terminal / uncertain / later), even with an unchanged version number
+  for (const st of ["capture_unknown", "capture_failed", "payment_captured", "confirmed", "reconciliation_required", "cancelled"]) {
+    assert.equal(b({ ...i, status: st }, OP()), "NOT_RESERVATION_CONFIRMED", st);
+  }
+  assert.equal(b({ ...i, counters: { ...i.counters, captureAttempts: 2 } }, OP()), "NOT_INITIAL_ATTEMPT");
+  // same version, changed money / key / binding values: refused (by the row checks or the snapshot)
+  const sameV = (patch) => ({ ...i, ...patch });
+  assert.equal(b(sameV({ price: { ...i.price, finalTotalMinor: 80000 } }), { ...OP(), payload: { ...OP().payload, amountMinor: 80000 } }), "ELIGIBILITY_SNAPSHOT_CHANGED");
+  assert.equal(b(sameV({ price: { ...i.price, currency: "MXN" } }), OP()), "ELIGIBILITY_SNAPSHOT_CHANGED");
+  assert.equal(b(sameV({ payment: { ...i.payment, amountMinor: 80000 } }), OP()), "ELIGIBILITY_SNAPSHOT_CHANGED");
+  assert.equal(b(sameV({ payment: { ...i.payment, currency: "MXN" } }), OP()), "ELIGIBILITY_SNAPSHOT_CHANGED");
+  assert.equal(b(sameV({ payment: { ...i.payment, captureBefore: i.payment.captureBefore + 1000 } }), OP()), "ELIGIBILITY_SNAPSHOT_CHANGED");
+  assert.equal(b(sameV({ payment: { ...i.payment, authorizationDeadline: i.payment.authorizationDeadline + 1000 } }), OP()), "ELIGIBILITY_SNAPSHOT_CHANGED");
+  assert.equal(b(i, OP(), "other-attempt"), "ELIGIBILITY_SNAPSHOT_CHANGED");
+  assert.equal(buildCaptureRequest({ intent: i, captureOp: OP(), eligibility: e, paymentAttemptId: undefined }).code, "ELIGIBILITY_SNAPSHOT_CHANGED");
+  // a different PaymentIntent on BOTH the intent and the row (consistent with each other) is still refused
+  const otherPi = "pi_test_other";
+  assert.equal(b(sameV({ payment: { ...i.payment, paymentIntentId: otherPi } }),
+    { ...OP(), payload: { ...OP().payload, paymentIntentId: otherPi, providerIdempotencyKey: captureKey("int-1", otherPi, 1) } }), "ELIGIBILITY_NOT_FOR_THIS_OPERATION");
+  // the unchanged inputs still build (the eligibility itself is fine)
+  assert.equal(buildCaptureRequest({ intent: i, captureOp: OP(), eligibility: e, paymentAttemptId: ATT }).ok, true);
+  // the snapshot is frozen and part of the frozen eligibility
+  assert.ok(Object.isFrozen(e.snapshot));
+  assert.throws(() => { e.snapshot.priceMinor = 1; });
 });
