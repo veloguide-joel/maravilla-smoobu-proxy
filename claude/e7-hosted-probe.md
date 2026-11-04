@@ -32,15 +32,19 @@
 - **Timeout:** 20 minutes per job. A job timeout could still interrupt a running step, so it is **not** a claim that zero requests were made.
 
 **The wrapper** (`preflight` | `verify` | `execute`):
-1. **Inputs:** validated (`acct_[A-Za-z0-9]{1,64}`, label `[A-Za-z0-9._:-]{1,80}`, 64-hex hashes), never echoed. Preflight takes the account and label together or not at all. `verify` / `execute` require account, label, expected `planHash` and expected `sourceDigest` with **no defaults**, and the expected digest must equal the fixed accepted digest. `verify` and `preflight` refuse if a secret is in scope.
+1. **Inputs:** validated (`acct_[A-Za-z0-9]{1,64}`, label `[A-Za-z0-9._:-]{1,80}`, 64-hex hashes), never echoed. The **reserved SYNTHETIC account and label are refused in every mode** (R-H3). Preflight takes the account and label together or not at all. `verify` / `execute` require account, label, expected `planHash` and expected `sourceDigest` with **no defaults**, and the expected digest must equal the fixed accepted digest. `verify` and `preflight` refuse if a secret is in scope.
 2. **Layout:** `RUNNER_TEMP` must be outside both the workspace and the tooling checkout.
 3. **Tooling bytes:** the 13 closure files are hashed (regular files only, no symlink, ≤ 256 KiB each, ≤ 2 MiB total, the accepted framing) **before any tooling code runs**. The result must equal `23212caabf508f0aa929a2c3beb9f6f216b0cc3bc697cd783ba7ed203e21ce3d`. Locally, the wrapper's own function over the accepted checkout gives exactly that value.
-4. **Preflight only — E1:** `node --test --test-reporter=tap test/e7-connected-probe-cli-main.test.mjs` in the tooling checkout. These are fake / synthetic tests, **labelled not connectivity evidence**.
+4. **Preflight only — E1:** `node --test --test-reporter=tap test/e7-connected-probe-cli-main.test.mjs` in the tooling checkout. These are fake / synthetic tests, **labelled not connectivity evidence**. E1 passes only with an acknowledged child (no spawn failure or signal, not truncated), status 0 and a meaningful TAP (`# tests` > 0, pass = tests, fail = 0).
 5. **Plan:** listing `606998`, `["P-H1","P-S1"]`, limits `10000 / 30000 / 5000`, `Stripe-Version 2026-08-26.dahlia`, Node `22.22.0`, `reviewedCommit` = the tooling commit.
    - With no account / label, preflight builds a **labelled SYNTHETIC** plan (`acct_SyntheticPreflightOnly`, `SYNTHETIC-preflight-not-for-execute`) whose hash is reported as `planKind: SYNTHETIC` and is never usable for execute.
    - With them, it builds the **REAL** plan.
 
-   The accepted CLI's `prepare-plan` writes the canonical plan in a fresh `0700` temp dir. `inspect` must then report exit 10, `ENV_OK`, the fixed digest, the same `planHash` and exactly 2 probes. These checks happen **before** any credential file or network.
+   The accepted CLI's `prepare-plan` writes the canonical plan in a fresh `0700` temp dir.
+   - **prepare** must have real process status 0 plus `e7-probe-prepare-v1` / `PREP_OK` / file `CLOSED_ACK` / `exitCode` 0.
+   - **inspect** must have real process status **10** plus the `e7-probe-cli-stdout-v1` envelope with `exitCode` 10, `ENV_OK`, the fixed digest, the same `planHash` and exactly 2 probes.
+
+   These checks happen **before** any credential file or network, and a failed prepare / inspect never leads to `execute` (R-H1).
 6. **`execute`:**
    - the inspected `planHash` must equal the expected one;
    - both secrets must be present (otherwise `HOSTED_CREDENTIALS_MISSING`, with no file and no child);
@@ -48,11 +52,15 @@
    - the accepted CLI `execute` runs with `--expect-requests 2`;
    - the credential file and every job-owned temp dir are removed afterwards. Nothing else is deleted.
 7. **Children:** every child is a plain `node <cli> …` (no Node flags, `shell: false`). Its env is the job env **minus every `E7_*` key**, so neither secret reaches a child. Refused security variables are **not** unset or bypassed. stdout is captured with a bound, stderr is only counted, and the execute child is never killed by the wrapper.
-8. **Publication:** only a **whitelisted projection** is printed (one JSON line in the step log plus a job-summary table): mode, code, workflow commit, tooling commit, computed digest, plan kind, `planHash`, E1 counts, inspect exit / env code, and the execute envelope's exit / outcome / `tailUncertain` / summary-file state / per-probe id-outcome-code-HTTP / gates. Anything else becomes `REDACTED`.
+8. **Execute status (R-H1):** an unacknowledged child (spawn failure, signal, truncated stdout) gives `HOSTED_CHILD_FAILED` with output `UNKNOWN`. The real process status must equal the envelope's own `exitCode`, otherwise `HOSTED_CHILD_OUTPUT_UNKNOWN`. Success requires status 0, `exitCode` 0, `CLI_COMPLETED_OK`, `tailUncertain:false`, summary file `CLOSED_ACK` and close state `CLOSED`. Known nonzero accepted outcomes (e.g. 6 / 11 / 8 / 9) stay `EXECUTE_NOT_OK`, with their evidence and no retry.
+9. **Publication:** only a **reviewed projection** is printed (one JSON line in the step log plus a job-summary table): mode, code, workflow commit, tooling commit, computed digest, plan kind, `planHash`, E1 counts, inspect exit / env code, and the execute envelope's exit / outcome / `tailUncertain` / summary-file state / per-probe id-outcome-code-HTTP / gates.
+   - **Every published child string must be an exact member of its field's copied accepted vocabulary** (`VOCAB`: probe ids / outcomes / codes, transport codes, gate names and values, tail, primary outcomes, summary-file / close states, env and credential codes). Digests and hashes must be exact 64-hex, and HTTP statuses must be integers 100…599.
+   - Anything else is published as `REDACTED`, and unknown gate NAMES are dropped and only counted. It is never a syntax-rule pass (R-H2).
+   - The workflow and tooling identities are fixed constants, or a separately validated 40-hex commit.
 
    There are no raw child outputs, paths, secrets or error text. The public repo's logs show only this.
 
-**Tests (CLAUDE-run, container, Node `22.22.0`):** `node --test test/e7-hosted-probe.test.mjs` passed 10/10 on the **first full run**. It covers:
+**Tests (CLAUDE-run, container, Node `22.22.0`):** the original head `07807310` passed 10/10 on its first full run. See §4 for the root CODE HOLD corrections and their red / green runs. It covers:
 - mode defaults / usage;
 - synthetic vs real plan separation;
 - the E1 failure path;
@@ -95,3 +103,18 @@ The https / fetch guards counted 0, and no real credential or network was used. 
 - **Secrets in the wrapper:** they are present in the wrapper process's own env during the final step (never in children, files other than the `0600` credential file, logs or outputs). GitHub's log masking is extra protection, not relied on.
 - **Review boundary:** the wrapper and workflow bytes are a **separate review boundary**. They are not covered by the C3 `sourceDigest`, which binds only the tooling closure.
 - **Out of scope:** the Hostaway calendar link is irrelevant to these two GETs, and calendar syncing is owner-proven separately. Bookings, writes, payments, notifications and Airbnb stay CLOSED. The protected reservations `70636076 / 71045356 / 71072615 / 71081885` get zero action.
+
+## 4. Root CODE HOLD on `07807310` — corrections (same branch, fast-forward)
+Only `scripts/e7-hosted-probe.mjs`, `test/e7-hosted-probe.test.mjs` and this doc changed; the workflow is unchanged.
+
+| Item | Defect (root probes failed 3 / 3) | Correction |
+|---|---|---|
+| **R-H1** true child status | Process status, signal, spawn failure and truncation were ignored. A child exiting 17 while printing an `exitCode: 0` envelope was reported `EXECUTE_COMPLETED_OK`. The FAKE inspect also exited 0 while claiming 10 — a fixture fault | Every stage validates the acknowledgment (no spawn failure or signal, safe integer status, no truncation) **and** the accepted status plus schema: E1 0 with meaningful TAP; prepare 0 / `PREP_OK` / `CLOSED_ACK`; inspect **10** with envelope `exitCode` 10; execute status === envelope `exitCode`, and success only when all accepted success fields agree. Failures give `HOSTED_CHILD_FAILED` / `HOSTED_CHILD_OUTPUT_UNKNOWN` / `HOSTED_*_FAILED` / `EXECUTE_NOT_OK`, and never reach `execute` after a failed prepare / inspect. The fake CLI now exits with the accepted statuses (prepare 0, inspect 10, execute = envelope `exitCode`) |
+| **R-H2** exact output vocabulary | The `[A-Za-z0-9_.:-]` syntax rule let a plain-ASCII synthetic token through into `probes[].code` and the job summary | Per-field exact membership in copied accepted vocabularies (`VOCAB`); exact 64-hex for digests / hashes; otherwise `REDACTED` (unknown gate names dropped and counted). A **parity test** compares every copied list with the accepted exports when `E7_PARITY_TOOLING_DIR` points at the accepted checkout (run here against `d1e20d71`-identical bytes: equal; skipped on `main`, where that checkout is absent) |
+| **R-H3** synthetic cannot execute | The synthetic preflight hash plus the reserved synthetic account / label could pass `verify` / `execute` | The reserved synthetic account **or** label is refused (`HOSTED_INPUT_INVALID`) in every mode, at input validation, before the layout check, the source check, any child, any credential file or any network. A synthetic preflight result can never qualify a REAL package |
+
+**Red / green (CLAUDE-run):**
+- **RED:** the new tests (and the corrected fixture), run against the unchanged `07807310` wrapper, gave **10 / 14**. The four failures were R-H1, R-H2, the R-H2 parity test (no `VOCAB` export) and R-H3.
+- **GREEN, FIRST FULL TAP of the corrected wrapper: 13 / 14.** The R-H1 test helper `failedSpawn("prepare")` matched argv `"prepare"`, but the CLI token is `"prepare-plan"`, so that case never failed the spawn. This was a test bug; the wrapper was unchanged.
+- **Run 2: 14 / 14** with parity, and 13 + 1 skipped without the parity directory (as on `main`).
+- Guards (https / fetch) counted 0. No provider, PR, merge, environment, secret or runner action.

@@ -37,13 +37,17 @@ import { createHash } from "node:crypto";
 const ctl = JSON.parse(readFileSync(new URL("../../control.json", import.meta.url), "utf8"));
 const a = process.argv.slice(2); const sha = (s) => createHash("sha256").update(s).digest("hex");
 const rec = { argv0: a[0], execArgvLen: process.execArgv.length, envHasE7: Object.keys(process.env).some((k) => k.startsWith("E7_")) };
+const end = (stage, dflt) => { if (ctl.flood === stage) process.stdout.write("x".repeat(300000));
+  if (ctl.signal === stage) { process.kill(process.pid, "SIGKILL"); return; }
+  process.exitCode = (ctl.exit && stage in ctl.exit) ? ctl.exit[stage] : dflt; };
+const H = ctl.hostile;
 if (a[0] === "prepare-plan") { const t = readFileSync(a[2], "utf8"); writeFileSync(a[4], t + "\\n", { mode: 0o600 }); rec.plan = JSON.parse(t);
-  appendFileSync(ctl.record, JSON.stringify(rec) + "\\n"); process.stdout.write(JSON.stringify({ schema: "e7-probe-prepare-v1", code: "PREP_OK", planCode: null, planHash: sha(t + "\\n"), file: "CLOSED_ACK", exitCode: 0 }) + "\\n"); }
+  appendFileSync(ctl.record, JSON.stringify(rec) + "\\n"); process.stdout.write(JSON.stringify({ schema: "e7-probe-prepare-v1", code: "PREP_OK", planCode: null, planHash: sha(t + "\\n"), file: "CLOSED_ACK", exitCode: 0 }) + "\\n"); end("prepare", 0); }
 else if (a[0] === "inspect") { const t = readFileSync(a[2], "utf8"); const p = JSON.parse(t); const probes = ctl.probes ?? p.probes;
   appendFileSync(ctl.record, JSON.stringify(rec) + "\\n");
   process.stdout.write(JSON.stringify({ schema: "e7-probe-cli-stdout-v1", exitCode: ctl.inspectExit ?? 10, primaryOutcome: "CLI_INSPECT_OK", tailUncertain: false,
-    output: { summaryFile: "NOT_ATTEMPTED", summaryCloseState: "NOT_OPENED" }, payload: { preflight: { code: ctl.envCode ?? "ENV_OK" }, source: { sourceDigest: ctl.digest },
-    plan: { planHash: sha(t), probes, maxRequests: probes.length } } }) + "\\n"); }
+    output: { summaryFile: "NOT_ATTEMPTED", summaryCloseState: "NOT_OPENED" }, payload: { preflight: { code: ctl.inspectHostile ?? ctl.envCode ?? "ENV_OK" }, source: { sourceDigest: ctl.digest },
+    plan: { planHash: sha(t), probes, maxRequests: probes.length } } }) + "\\n"); end("inspect", ctl.inspectExit ?? 10); }
 else if (a[0] === "execute") { const cp = a[a.indexOf("--credentials") + 1]; const st = statSync(cp); const dirSt = statSync(cp.slice(0, cp.lastIndexOf("/")));
   const c = JSON.parse(readFileSync(cp, "utf8"));
   Object.assign(rec, { args: a.map((x, i) => (["--plan", "--credentials", "--summary-out"].includes(a[i - 1]) ? "<path>" : x)), credMode: st.mode & 0o777, credDirMode: dirSt.mode & 0o777,
@@ -51,11 +55,15 @@ else if (a[0] === "execute") { const cp = a[a.indexOf("--credentials") + 1]; con
   appendFileSync(ctl.record, JSON.stringify(rec) + "\\n");
   if (ctl.stderr) process.stderr.write(ctl.stderr);
   if (ctl.rawStdout !== undefined) { process.stdout.write(ctl.rawStdout); process.exit(0); }
-  const probe = (id) => ({ id, outcome: "OK", code: ctl.probeCode ?? "PROBE_OK", httpStatus: id === "P-H1" ? 200 : null, transportCode: null, evidence: { secret: "x" } });
-  process.stdout.write(JSON.stringify({ schema: "e7-probe-cli-stdout-v1", exitCode: 0, primaryOutcome: "CLI_COMPLETED_OK", tailUncertain: false,
-    output: { summaryFile: "CLOSED_ACK", summaryCloseState: "CLOSED" }, payload: { preflight: { code: "ENV_OK" }, source: { sourceDigest: ctl.digest },
-    plan: { planHash: a[a.indexOf("--expect-plan-hash") + 1] }, credential: { code: "CRED_OK", closeState: "CLOSED" }, requestsAttempted: 2,
-    summary: { outcome: "COMPLETED", probes: [probe("P-H1"), probe("P-S1")], gates: { G_SHAPE_listing: "OBSERVED", G_FILTER: "NOT_PROBED" } }, finalize: { tail: "NONE" } } }) + "\\n"); }
+  const probe = (id) => ({ id: H ?? id, outcome: H ?? "OK", code: H ?? ctl.probeCode ?? "PROBE_OK", httpStatus: id === "P-H1" ? 200 : null, transportCode: H ?? null, evidence: { secret: "x" } });
+  const ex = ctl.execEnvelope ?? {};
+  const exitCode = ex.exitCode ?? 0;
+  process.stdout.write(JSON.stringify({ schema: "e7-probe-cli-stdout-v1", exitCode, primaryOutcome: H ?? ex.primaryOutcome ?? "CLI_COMPLETED_OK", tailUncertain: ex.tailUncertain ?? false,
+    output: { summaryFile: H ?? ex.summaryFile ?? "CLOSED_ACK", summaryCloseState: H ?? "CLOSED" }, payload: { preflight: { code: H ?? "ENV_OK" }, source: { sourceDigest: H ?? ctl.digest },
+    plan: { planHash: H ?? a[a.indexOf("--expect-plan-hash") + 1] }, credential: { code: H ?? "CRED_OK", closeState: H ?? "CLOSED" }, requestsAttempted: 2,
+    summary: { outcome: H ?? "COMPLETED", probes: [probe("P-H1"), probe("P-S1")], gates: H ? { [H]: H, G_FILTER: H } : { G_SHAPE_listing: "OBSERVED", G_FILTER: "NOT_PROBED" } },
+    finalize: { tail: H ?? "NONE" } } }) + "\\n");
+  end("execute", exitCode); }
 else process.exit(2);
 `;
 /** a synthetic "tooling" tree: the 13 closure paths (entry 2 = FAKE CLI), a trivial E1 test, control.json; plus runner temp + workspace */
@@ -214,4 +222,78 @@ test("H10 wrapper source pins: Node built-ins only; no network module, shell, ev
   for (const re of [/node:https?\b|node:net|node:tls|node:dns/, /\bfetch\b/, /shell: true/, /\beval\b|new Function/, /\bconsole\b/, /\bimport\s*\(/, /\brequire\s*\(/, /JSON\.stringify\(env\)|JSON\.stringify\(process\.env\)/])
     assert.doesNotMatch(code, re, String(re));
   assert.equal((code.match(/import\.meta\.main/g) || []).length, 1); assert.match(code, /shell: false/);
+});
+
+// ===== root CODE HOLD corrections (R-H1 / R-H2 / R-H3) ==================================================================================
+const failedSpawn = (stage) => (args, o) => (args[1] === stage || (stage === "prepare" && args[1] === "prepare-plan") || (stage === "e1" && args[0] === "--test")
+  ? Promise.resolve({ status: null, signal: null, stdout: "", truncated: false, stderrBytes: 0, spawnFailed: true }) : W.spawnNode(args, o));
+const statusOverride = (stage, status) => async (args, o) => { const r = await W.spawnNode(args, o); return args[1] === stage ? { ...r, status } : r; };
+test("R-H1 true child status: nonzero / signal / spawn failure / truncation at any pre-secret stage → zero credential file, zero execute; execute status must agree", async () => {
+  const pre = [["prepare", { exit: { prepare: 3 } }], ["prepare", { signal: "prepare" }], ["prepare", { flood: "prepare" }], ["inspect", { exit: { inspect: 0 } }],
+    ["inspect", { exit: { inspect: 4 } }], ["inspect", { signal: "inspect" }], ["inspect", { flood: "inspect" }]];
+  for (const [stage, ctl] of pre) for (const mode of ["preflight", "execute"]) {
+    const w = world(ctl); const h = "a".repeat(64);
+    const r = await W.runWrapper({ mode, env: w.env(mode === "execute" ? execEnv(w, h) : {}), spawnChild: W.spawnNode, constants: w.constants });
+    assert.equal(r.exitCode, 1, `${stage} ${JSON.stringify(ctl)} ${mode}`); assert.ok(!/OK/.test(r.result.code), r.result.code);
+    assert.ok(!w.records().some((x) => x.argv0 === "execute")); assert.deepEqual(leftovers(w), []);
+  }
+  for (const stage of ["e1", "prepare", "inspect"]) {
+    const w = world(); const r = await W.runWrapper({ mode: "preflight", env: w.env(), spawnChild: failedSpawn(stage), constants: w.constants });
+    assert.equal(r.result.code, "HOSTED_CHILD_FAILED", stage); assert.equal(r.exitCode, 1);
+  }
+  // E1: status 0 is not enough without an acknowledged meaningful TAP
+  { const w = world(); const r = await W.runWrapper({ mode: "preflight", env: w.env(), constants: w.constants,
+      spawnChild: async (args, o) => (args[0] === "--test" ? { status: 0, signal: null, stdout: "", truncated: false, stderrBytes: 0, spawnFailed: false } : W.spawnNode(args, o)) });
+    assert.equal(r.result.code, "HOSTED_E1_FAILED"); }
+  // execute: root repro — child status 17 while stdout claims exit 0 → never success
+  { const w = world(); const h = await realPlanHash(w);
+    const r = await W.runWrapper({ mode: "execute", env: w.env(execEnv(w, h)), spawnChild: statusOverride("execute", 17), constants: w.constants });
+    assert.equal(r.exitCode, 1); assert.equal(r.result.code, "HOSTED_CHILD_OUTPUT_UNKNOWN"); }
+  for (const ctl of [{ signal: "execute" }, { flood: "execute" }]) {
+    const w = world(ctl); const h = await realPlanHash(w); const r = await run(w, "execute", execEnv(w, h));
+    assert.equal(r.exitCode, 1); assert.ok(["HOSTED_CHILD_FAILED", "HOSTED_CHILD_OUTPUT_UNKNOWN"].includes(r.result.code), r.result.code); assert.deepEqual(leftovers(w), []);
+  }
+  // a known nonzero accepted outcome stays a failure WITH evidence (status agrees with the envelope)
+  { const w = world({ execEnvelope: { exitCode: 6, primaryOutcome: "CLI_PROBE_STOPPED" } }); const h = await realPlanHash(w); const r = await run(w, "execute", execEnv(w, h));
+    assert.equal(r.exitCode, 1); assert.equal(r.result.code, "EXECUTE_NOT_OK"); assert.equal(r.result.execute.exitCode, 6); assert.equal(r.result.execute.primaryOutcome, "CLI_PROBE_STOPPED"); }
+  // success requires every accepted success field to agree
+  for (const env of [{ summaryFile: "UNKNOWN" }, { tailUncertain: true }, { primaryOutcome: "CLI_COMPLETED_INCONCLUSIVE" }]) {
+    const w = world({ execEnvelope: env }); const h = await realPlanHash(w); const r = await run(w, "execute", execEnv(w, h));
+    assert.equal(r.exitCode, 1, JSON.stringify(env)); assert.notEqual(r.result.code, "EXECUTE_COMPLETED_OK");
+  }
+});
+test("R-H2 exact vocabularies: a plain-ASCII token / key planted in EVERY published child field never reaches stdout JSON or the Markdown summary", async () => {
+  for (const S of [TOKEN, KEY, "PROBE_OK_BUT_NOT_REALLY"]) {
+    const w = world({ hostile: S }); const h = await realPlanHash(w); const r = await run(w, "execute", execEnv(w, h));
+    const out = JSON.stringify(r.result) + W.summaryMarkdown(r.result);
+    assert.ok(!out.includes(S), `leak ${S}`); assert.notEqual(r.result.code, "EXECUTE_COMPLETED_OK");
+    assert.ok(r.result.execute.probes.every((p) => p.id === "REDACTED" && p.code === "REDACTED" && p.outcome === "REDACTED" && p.transportCode === "REDACTED"));
+  }
+  const wi = world({ inspectHostile: TOKEN }); const ri = await run(wi, "preflight");
+  assert.equal(ri.result.code, "HOSTED_ENV_REFUSED"); assert.ok(!(JSON.stringify(ri.result) + W.summaryMarkdown(ri.result)).includes(TOKEN));
+  // valid evidence stays useful
+  const ok = world(); const h = await realPlanHash(ok); const r = await run(ok, "execute", execEnv(ok, h));
+  assert.equal(r.result.code, "EXECUTE_COMPLETED_OK"); assert.deepEqual(r.result.execute.probes.map((p) => [p.id, p.outcome, p.code]), [["P-H1", "OK", "PROBE_OK"], ["P-S1", "OK", "PROBE_OK"]]);
+  assert.deepEqual(r.result.execute.gates, { G_SHAPE_listing: "OBSERVED", G_FILTER: "NOT_PROBED" }); assert.equal(r.result.execute.planHash, h);
+});
+test("R-H2 parity: the copied vocabularies equal the accepted tooling exports (runs only where the accepted tooling checkout is available)", { skip: !process.env.E7_PARITY_TOOLING_DIR }, async () => {
+  const d = process.env.E7_PARITY_TOOLING_DIR;
+  const P = await import(`${d}/scripts/e7-connected/readonly-probe.mjs`); const C2 = await import(`${d}/scripts/e7-connected/probe-command.mjs`);
+  const E = await import(`${d}/scripts/e7-connected/probe-env-preflight.mjs`); const C1 = await import(`${d}/scripts/e7-connected/probe-credential-file.mjs`);
+  const V = W.VOCAB;
+  assert.deepEqual([...V.probeIds], [...P.PROBE_IDS]); assert.deepEqual([...V.probeCodes], [...P.CODES.probe]); assert.deepEqual([...V.transportCodes], [...P.T_ERROR_CODES]);
+  assert.deepEqual([...V.gateValues], [...P.CODES.gate]); assert.deepEqual([...V.tail], [...P.CODES.tail]); assert.deepEqual([...V.primaryOutcomes], [...C2.PRIMARY_OUTCOMES]);
+  assert.deepEqual([...V.summaryFile], [...C2.SUMMARY_FILE_STATES]); assert.deepEqual([...V.envCodes], [...E.ENV_CODES]); assert.deepEqual([...V.credCodes], [...C1.CREDENTIAL_CODES]);
+  assert.deepEqual([...V.closeStates], [...C1.CLOSE_STATES]);
+});
+test("R-H3 the reserved SYNTHETIC account or label can never qualify a REAL plan: refused in verify / execute and as explicit preflight inputs, before any tooling child", async () => {
+  const w0 = world(); const syn = await run(w0, "preflight"); assert.equal(syn.result.planKind, "SYNTHETIC"); const sh = syn.result.planHash;
+  const S = W.CONSTANTS.synthetic;
+  for (const [acct, ref] of [[S.accountId, S.approvalRef], [S.accountId, REF], [ACCT, S.approvalRef]]) {
+    for (const mode of ["verify", "execute"]) {
+      const w = world(); const e = execEnv(w, sh, { E7_STRIPE_ACCOUNT_ID: acct, E7_APPROVAL_REF: ref }); if (mode === "verify") { delete e.E7_HOSTAWAY_TOKEN; delete e.E7_STRIPE_TEST_KEY; }
+      const r = await run(w, mode, e); assert.equal(r.result.code, "HOSTED_INPUT_INVALID", `${mode} ${acct} ${ref}`); assert.deepEqual(w.records(), []); assert.equal(r.result.sourceDigest, null);
+    }
+    const wp = world(); const rp = await run(wp, "preflight", { E7_STRIPE_ACCOUNT_ID: acct, E7_APPROVAL_REF: ref }); assert.equal(rp.result.code, "HOSTED_INPUT_INVALID"); assert.deepEqual(wp.records(), []);
+  }
 });
