@@ -121,7 +121,7 @@ Observations for a future runner (not gaps, no action taken):
 
 A **docs-only contract for a scoped conflict-inbox visibility + bounded processing step**. It would decide who calls `process_recording_conflict_inbox_one`, scoped how (listing / intent / protected exclusion before any LIMIT), how often and with what bounds, and what the owner sees. The reason: this rehearsal shows every successful recording leaves unprocessed inbox items, and post-confirmation contradiction detection depends on them. It needs no provider, credential, notification or deployment decision.
 
-**Status pointer (2026-11-03):** root ACCEPTED this rehearsal OFFLINE at `4e76227c`; `capture_failed` cleanup remains untested here. The recommended contract is `claude/e7-scoped-recording-inbox-contract.md` on `feature/e7-scoped-recording-inbox-contract` (DOCS ONLY, PROPOSED, pending root review).
+**Status pointer (2026-11-03):** root ACCEPTED this rehearsal OFFLINE at `4e76227c`; `capture_failed` cleanup remains untested here. The recommended contract is `claude/e7-scoped-recording-inbox-contract.md` on `feature/e7-scoped-recording-inbox-contract` (DOCS ONLY, PROPOSED). Revision 1 `6efe4895` got a root HOLD (R1–R3); revision 2 is pending root re-review.
 
 ## 7. Validation (CLAUDE-RUN, disposable local PG 16; full TAP in `scratchpad/tap-lc/`)
 
