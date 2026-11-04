@@ -21,15 +21,15 @@ export const nextRef = () => `MV-T${(++refCounter).toString(36).toUpperCase().pa
 export const tokenHash = () => createHash("sha256").update(randomUUID()).digest();
 
 /** A price object shaped like lib/checkout/final-price.js output (values as in the E3 tests). */
-export function priceFor({ listingId = 603566, from = "2026-12-20", to = "2026-12-24", guests = 2 } = {}) {
+export function priceFor({ listingId = 603566, from = "2026-12-20", to = "2026-12-24", guests = 2, currency = "MXN" } = {}) {   // E7.4b worker: optional USD
   return {
     version: "final-price-v1", quoteBasis: "hostaway.priceDetails.v2",
-    listingId, from, to, guests, nights: 4, currency: "MXN",
+    listingId, from, to, guests, nights: 4, currency,
     standardTotalMinor: 640000, eligibleMinor: 640000, discountMinor: 64000, finalTotalMinor: 576000,
     policyVersion: "direct-v1", rateBps: 1000,
     lines: [{ kind: "accommodation", code: "baseRate", label: "Accommodation", amountMinor: 640000 },
             { kind: "direct_discount", code: "direct-v1", label: "Book Direct discount (10%)", amountMinor: -64000 }],
-    charge: { currency: "mxn", amountMinor: 576000, quantity: 1, description: `Stay · ${from} to ${to} · 4 nights · 2 guests` },
+    charge: { currency: currency.toLowerCase(), amountMinor: 576000, quantity: 1, description: `Stay · ${from} to ${to} · 4 nights · 2 guests` },
     quoteHash: "b".repeat(64)
   };
 }
@@ -42,7 +42,7 @@ export const authEvent = (sessionId, piId, minutes = 5, extra = {}) => ({
 let resCounter = 20000;
 export const nextReservationId = () => ++resCounter;
 export const reservationFor = (stay = {}, reservationId = 9001) => ({
-  reservationId, listingId: stay.listingId ?? 603566, from: stay.from ?? "2026-12-20", to: stay.to ?? "2026-12-24", totalMinor: 576000, currency: "MXN"
+  reservationId, listingId: stay.listingId ?? 603566, from: stay.from ?? "2026-12-20", to: stay.to ?? "2026-12-24", totalMinor: 576000, currency: stay.currency ?? "MXN"
 });
 
 export function ok(r, msg) {
@@ -80,7 +80,7 @@ export async function pending(pool, stay = {}) {
 export async function authorized(pool, stay = {}) {
   const p = await pending(pool, stay);
   const piId = `pi_test_${p.id.slice(0, 8)}`;
-  ok(await applyEvent(pool, p.id, authEvent(p.sessionId, piId), { now: at(5), actor: "webhook" }), "auth");
+  ok(await applyEvent(pool, p.id, authEvent(p.sessionId, piId, 5, stay.currency ? { currency: stay.currency.toLowerCase() } : {}), { now: at(5), actor: "webhook" }), "auth");
   return { ...p, piId };
 }
 export async function dispatched(pool, stay = {}, worker = "w1") {
@@ -95,7 +95,7 @@ export async function claimOp(pool, intentId, opType, now, workerId = "w1", leas
 }
 export async function reserved(pool, stay = {}) {
   const d = await dispatched(pool, stay);
-  const rid = nextReservationId();
+  const rid = stay.reservationId ?? nextReservationId();                                     // E7.4b worker: test-only fixed id option
   const op = await claimOp(pool, d.id, "hostaway.create_reservation", at(6));
   assert.ok(op, "create op claimable while lease held");
   // mocked Hostaway 201
@@ -108,7 +108,7 @@ export async function captured(pool, stay = {}) {
   const r = await reserved(pool, stay);
   const op = await claimOp(pool, r.id, "stripe.capture_payment_intent", at(8));
   ok(await completeOperation(pool, op.id, { workerId: "w1", now: at(8), outcome: { status: "succeeded", resultRef: r.piId } }), "capture op");
-  const c = ok(await applyEvent(pool, r.id, { type: "CAPTURE_SUCCEEDED", id: `evt_cap_${r.piId}`, amountMinor: 576000, currency: "mxn" }, { now: at(8), actor: "webhook" }), "capture");
+  const c = ok(await applyEvent(pool, r.id, { type: "CAPTURE_SUCCEEDED", id: `evt_cap_${r.piId}`, amountMinor: 576000, currency: (stay.currency ?? "MXN").toLowerCase() }, { now: at(8), actor: "webhook" }), "capture");
   return { ...r, ochOpId: c.operations.find((o) => o.opType === "hostaway.record_offline_charge").id };
 }
 /** E7.4b-D2: full confirming-evidence `observed` (offline-charge-proof EVIDENCE_OBSERVED_KEYS) for a recording of intent `c` ({ id, reservationId, listingId }). */

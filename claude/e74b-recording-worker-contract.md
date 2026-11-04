@@ -4,7 +4,7 @@
 
 **Status.**
 - **D5 / 0014 is PRESENT and accepted offline at `bc0f93c`**; the 0010–0014 database foundation is accepted OFFLINE. Not live or payment readiness.
-- **The recording worker is PROPOSED** (this document). Nothing is implemented. No SQL, helper, worker, fixture, test, adapter, route, UI, config, dependency or schedule change in this slice.
+- **The recording-worker DESIGN is ACCEPTED offline at `6f5f704`** (root ruling; R2-B `READ_ROWS_MAX = 6` approved; no evidence for refused confirming pages approved; addendum A–E). **The worker is IMPLEMENTED offline / injected-mock** on `feature/e7-offline-charge-worker` (pending root code review); the exact map is **§11**. Not live, provider or payment readiness.
 
 **What this is.** The integration design that wires the ACCEPTED pure proof module (`lib/checkout/offline-charge-proof.js`) and the ACCEPTED 0010–0014 primitives into ONE bounded offline worker step with INJECTED mock reads / write, following the accepted capture / compensation workers. It does not redesign those foundations.
 
@@ -347,3 +347,45 @@ Lock orders (unchanged): intent → work → op → reads → advisory (assessme
 - Count-only diagnostic evidence for a REFUSED but complete confirming page is deliberately NOT written in v1 (code on the read row only); it can be proposed later if owners need it.
 
 **Remaining real blockers (outside this offline slice):** owner `paymentMethod`; live provider shapes, credentials and gates; a scoped inbox-drain design; a notification stage; the historical e74a guard failure.
+
+---
+
+## 11. Implementation map (offline / injected mock; `feature/e7-offline-charge-worker` from exact `6f5f704`) — pending root code review
+
+**Files.**
+- new `lib/booking-db/recording-worker.js` (internal library; no route / cron / entrypoint / provider client / env read);
+- `lib/checkout/offline-charge-proof.js`: ONE additive export `preflightListObservation` (`:307`); no existing export changed;
+- new `test/e74b-recording-worker.test.mjs` (unit, no DB, 7 tests) and `test/db/e74b-recording-worker.test.mjs` (disposable PG, 21 tests);
+- `test/db/fixtures.mjs`: optional `stay.currency` (default `MXN`, unchanged) threaded through `priceFor` / auth / reservation / capture, and an optional test-only `stay.reservationId`;
+- **deviation for root:** `test/packaging-closure.test.mjs` — one token: `"recording-worker"` added to the pinned `lib/booking-db` file list (necessarily changed by the authorized new file; same pin the E7.4a slice extended at `8c9dfe0`; its route-reachability checks are unchanged and pass);
+- this §11 and the D5 status pointer. Migrations 0001–0014 byte-identical; no migration, config, dependency, route, UI, adapter, entrypoint or drain API.
+
+**Mapping (contract rev 2 → code).**
+
+| Item | Code |
+|---|---|
+| Gate, frozen basis (C) | `recordingWorkerGate` `:67` — plain deep-frozen objects only (no `Map`), copied cfgs / executor refs / labels; `paymentMethod` explicit, USD; step uses only `basis` |
+| W-5 skew | `runRecordingStep` `:598` (round trip ≤ 1 s, skew ≤ 2 s) |
+| Scope + protected (A) | `SCOPE_SQL` `:173` excludes protected ids BEFORE `LIMIT` in `maintenance` `:177`, `recoveryPass` `:189`, `claimWork` `:200`; accepted helpers then run per selected allowed intent; explicit protected `intentId` refused after a read-only lookup, before maintenance; `PROTECTED_RESERVATION_ID` is NOT in `ESCALATE_ALLOWLIST` `:39` |
+| W-3 | `recordedPaymentAt` `:110` (unique DB-stamped entry transition) |
+| R2 floor / selection / budget (B) | `floorSql` `:242` (full DB precision, compared IN SQL), `readRows` `:249`, `selectRead` `:263` (fresh escalated cited once; exactly one open candidate reused; `next_attempt_at` obeyed; > 1 open → `READ_ROWS_AMBIGUOUS`; ≥ 6 rows → budget; caller clock not past F → `TIMING_FLOOR` WAIT, never a manufactured time) |
+| Read phase + evidence (§5.1) | `readPhase` `:290` (transport → `READ_TRANSPORT_*` uncounted until escalated; response → bounded pure code on the read row; evidence only for a positive identity / complete page) |
+| List-first | `listFirst` `:327` — **deviation:** also list-first when the latest list row is escalated AND already cited (rev 2 §4.3 said "open with attempts ≥ 1"); this keeps identity reads from being burnt between list-exhaustion cycles (test: 4 identity reads, not 6) |
+| S6 / latch / W-6 | `preflightAndSend` `:539`, `escalate` `:150` (allowlist only; fenced on planned version, scope, work lease) |
+| S7–S9 | PRE-CLAIM `buildOfflineChargeRequest`; claim; `finalCheck` `:384` (field-by-field recording identity, audit `assessment_id = A`, assessment binding, intent facts, leases, carried freshness, request, budget) |
+| S10–S13 | `sendAndConfirm` `:434` — no await between the decision and the executor call; ≤ 1 `createOfflineCharge` per op; reply never sufficient; ONE new confirming read; no evidence for a refused page (code on the row) |
+| Late reply (R4 / D) | `observeLate` `:485` — finite `lateWindowMs` (default 30 s; not `unref()`ed so it resolves even in an idle process), handlers attached, bounded `{kind, settled, httpStatus}`, no DB call / event |
+| §6.3 (E) | no `try/finally`: any thrown error (outer DB failure, hook fault) propagates unchanged with no further query, not even `releaseWork`; `settleUnknown` `:374` at most once per op; known refusals are data; completion success never reclassified |
+| S14 / W-7 / W-8 | `finalise` `:158` (fenced; event id `op-outcome:<opId>`; recovery applies only `OFFLINE_CHARGE_RECORDED`); the queued `guest.notify` row is created once, never executed |
+
+**Tests (CLAUDE-RUN, disposable local PostgreSQL 16; full TAP in `scratchpad/tap-rw/`).** Focused worker 28/28 (unit 7 + DB 21); worker + 0010–0014 + migrations + offline-charge suites 152/152; `npm test` 681/681; `test:db` 408/408 (387 + 21). The historical e74a guard did not fail in these runs (still unexplained, open).
+Covered: both fixture methods; gate refusals with zero queries; protected zero-action (explicit refusal + unscoped step skipping a protected expired op and a protected linked missed outcome while serving an allowed intent); out of scope, ATTEMPT_GT1, SUCCEEDED_UNPROVEN, active hold, outcome_unknown; three conflict kinds; 3 counted HTTP refusals; 30 identity timeouts (3 rows, 30 executions, retries-exhausted case, hold); list-first (3 list rows, 4 identity reads, hold); budget escalation; escalated-row citation, stale escalated not cited, two open candidates; epoch 2 incl. a pre-release open row never reused; D5 refusal at completion; S9 aborts (op lease, work lease, hold, budget, same-worker newer assessment, identity changed, op not held, assessment binding, stale preflight, intent changed); post-write branches (timeout, throw, non-2xx, zero, multiple, id mismatch, future, backwards clock); late observation (never settles / fulfilled / rejected); lease loss; competing workers; crash after completion and after claim; the §6.3 matrix (claim / assessment / evidence / completion / event / settlement × rolled back / committed-reply-lost) with error identity, no further statement, persisted rows and ≤ 1 write / ≤ 1 outbox row.
+Not stageable: `NOT_LATEST` at S9 (the 0001 `external_operations_one_open_offline_charge` index forbids a second open recording); `REQUEST_INVALID` (the request is frozen from the eligibility); a confirming read that is after dispatch yet older than 2 min (its observation time is the read's own completion).
+
+**Mutants (reported separately).**
+- Campaign 1 (31 targeted, both worker test files): 22 killed, 9 survived.
+- Strengthening: escalated-row citation / stale / two-open test, a pre-release open row in the epoch-2 test, and a unit test of the `escalate` allowlist policy.
+- Campaign 2 (the 9 survivors): R02 (escalated never cited), R03 (freshness filter), R06 (floor), R09 (multiple open) and P03 (allowlist bypass) KILLED; 4 survive, all redundant under enforced invariants: S02 (audit worker — the 0012/0013 audit guard forces audit worker = claimant = lease holder), S09 (`lf.code` — the field-by-field facts comparison catches the same change), S13 (one-settlement guard — a single call path), R07 (not-due row — the claim helper itself requires `next_attempt_at <= now`). They are kept.
+
+**Residual limits.** Labels TRUST; mock shapes DOC-DERIVED / LIVE-UNVERIFIED; worker-stamped times are caller clock (W-5 bounds skew); a same-`workerId` process pair is caught only at S9 (use a per-process nonce); only 4 protected ids exist (fewer than the batch sizes), so "protected cannot starve allowed" is shown by exclusion-before-LIMIT and the P01 mutant, not by exhausting a batch; the late window keeps a timer alive up to `lateWindowMs`; inbox draining stays outside the worker; owner `paymentMethod`, live shapes / credentials / gates and a notification stage stay closed.
+
