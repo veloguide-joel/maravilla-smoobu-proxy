@@ -1,4 +1,7 @@
-# E7 connected-test runner — OWNER-RUN READ-ONLY PROBE CLI / PREFLIGHT / CREDENTIAL-INGRESS CONTRACT, revision 2 (accepted design basis at `34903dec`) + C1 implementation map (§10)
+# E7 connected-test runner — OWNER-RUN READ-ONLY PROBE CLI / PREFLIGHT / CREDENTIAL-INGRESS CONTRACT, revision 3: C1 ACCEPTED (§10) + C2 executable contract (§11, PROPOSED)
+
+> **Revision 3 (DOCS ONLY; branch `feature/e7-connected-probe-command-contract` from exact `ac974d75`):** C1 ACCEPTED OFFLINE by root at `ac974d75` (R-C1A closed). §11 is the C2 executable contract, finishing the §4 deferred interface and superseding §§3–4 where they differ. **C2 is NOT implemented and NOT authorized; C3 and any real request remain CLOSED.** The note below and §§0–10 are kept verbatim as history.
+
 
 > **C1 implementation (branch `feature/e7-connected-probe-ingress`, cut from exact `34903dec`):** stage C1 ONLY, OFFLINE, fake-only tests — `scripts/e7-connected/probe-env-preflight.mjs`, `scripts/e7-connected/probe-credential-file.mjs`, `test/e7-connected-probe-ingress.test.mjs`, and §10 of this file. **C2 and C3 are DEFERRED — not implemented, not authorized**; C2 needs a refreshed executable contract after C1 before any implementation; C3 stays CLOSED. §§0–9 below are kept verbatim as the revision 2 history (their "PROPOSED / not implemented" wording describes revision 2 at `34903dec`); §10 records what C1 implements, every binding clarification A–E, deviations and residuals.
 
@@ -74,12 +77,14 @@ Files (4): the two modules above; NEW `test/e7-connected-probe-ingress.test.mjs`
 **Exit criteria:** focused suite green with FIRST FULL TAP preserved and real first-run failures reported; foundation / P / T / X / F / pins units and `npm test` green; no change outside the four files; root CODE review.
 
 ## 3. Source identity (R-CLI2) — exact recipe (C2 computes, C3 enforces; not C1)
+> *Revision 3: superseded where different by §11.4 (pure helper + caller snapshot; C3 computes / enforces before import; C2 re-compares only).*
 - **Closure (explicit, reviewed, static):** the CLI's own files `scripts/e7-connected/probe-cli-main.mjs`, `probe-command.mjs`, `probe-env-preflight.mjs`, `probe-credential-file.mjs`, plus the complete static local import closure of P / T / X at `b6603cac`: `scripts/e7-connected/readonly-probe.mjs`, `scripts/e7-connected/http-transports.mjs`, `scripts/e7-connected/real-exchange.mjs`, `lib/checkout/compensation-proof.js` (imports `./recovery-plan.js`, `./capture-proof.js`, `./intent-state.js`, `compensation-proof.js:15–17`; defines the protected ids, `:23`), `lib/checkout/recovery-plan.js`, `lib/checkout/capture-proof.js`, `lib/checkout/intent-state.js`; and the module-resolution input `package.json` (`"type": "module"` decides how the `.js` files load; no `imports` / `exports` maps). Verified now (read-only): these files contain no `require`, `createRequire`, dynamic `import()`, `import.meta` or `process` use; their only non-local imports are `node:crypto`, `node:util`, `node:https`. Any change of the closure (a new import) must change this list in a reviewed revision; there is no dynamic module walk or discovery.
 - **Recipe:** `sourceDigest = SHA-256( "e7-probe-source-v1\n" ‖ for each path in the fixed list order: utf8(path) ‖ 0x00 ‖ decimal(byteLength) ‖ 0x00 ‖ bytes ‖ 0x00 )`; files read with the same no-follow regular-file rules (≤ 256 KiB each); any missing / extra / unreadable file → `SOURCE_UNREADABLE`.
 - **Order vs loading:** C3 statically imports only Node built-ins, computes the digest from disk, compares it with `--expect-source-digest`, and only then dynamically imports C2 (which imports P / T / X / C1) by fixed relative path. **Limits:** the disk digest does not prove the bytes already loaded if files change between hashing and import (same-uid mutation not defeated); the Node binary, global intrinsics and OS remain TRUST. `metadata.reviewedCommit` stays a label; `approvalRef` / hashes / switches are never permission.
 - **Test (in C2):** with a fake reader, changing one byte of `compensation-proof.js` (protected constants) or of `package.json` changes the digest; reordering or adding a file changes it; path / length framing prevents concatenation ambiguity.
 
 ## 4. C2 — deferred contract (`probe-command.mjs`; PROPOSED, not yet authorized)
+> *Revision 3: superseded where different by §11 (exact schemas, stage order, payload vs disposition, vocabulary).*
 `runProbeCommand({ argv, deps }) → native Promise<frozen disposition>`; C2 performs no `process.exit`, owns no real signal, timer or fs, and never writes stdout itself. `deps` (all injected): `readPlanFile`, `envSnapshot`, `credentialFs`, `outputFs`, `repoRoot`, `sourceDigest`, `primitive`, `monotonic`, `timers`, `interrupt` (a genuine `AbortSignal` C3 aborts on the first SIGINT).
 - **Grammar:** `inspect --plan <abs>` (default) or `execute --plan <abs> --credentials <abs> --summary-out <abs> --expect-plan-hash <64hex> --expect-source-digest <64hex> --expect-requests <1..8> --approval-ref <label>`; **`--summary-out` is MANDATORY for execute**; every flag once; anything else → `CLI_USAGE`.
 - **Stage order (each refusal ⇒ zero later stages; `interrupt` checked natively before every stage and after every await):**
@@ -235,3 +240,257 @@ Close is still attempted exactly once: no retry, no guessed disposal. This evalu
 Runs:
 - **RED** with the test alone against the exact `29d7b63e` module: 21/22. C13b failed on the first malformed value (`false` → `ok:true`).
 - **GREEN after the fix, FIRST FULL TAP:** focused 22/22, units (`e7-connected-*`, `hostaway-reservations`, `e4-connected-path`) 208/208, first full `npm test` 873/873. No first-run failures.
+
+## 11. C2 EXECUTABLE CONTRACT (revision 3; DOCS ONLY; proposed for the next bounded implementation turn, NOT implemented, NOT authorized)
+**Status.** C1 was ACCEPTED OFFLINE by root at `ac974d75` (R-C1A closed). The accepted limits are retained:
+- the strict object-of-strings parser and its duplicate-key refusal;
+- policy-over-identity precedence;
+- no elapsed bound;
+- ownership of rejections from invalid (non-native) promises stays with the caller;
+- `UNCLOSABLE` / `CLOSE_FAILED` may leave a descriptor open;
+- same-process / namespace TRUST;
+- no JS-string erasure;
+- the env result evaluates the supplied snapshot only.
+
+This section **finishes the §4 deferred interface; it does not redesign C1 / P / T / X**. Where §3 or §4 differ from it, **§11 supersedes them**; §§3–4 stay as history. Real execution, C3 and every live gate stay CLOSED.
+
+**Citation convention.** `file:line` at `ac974d75`. Sources:
+- P `scripts/e7-connected/readonly-probe.mjs`: `validateProbePlan` :138, `canonicalJson` :131, `runReadonlyProbes` :366 (input keys `{plan, hostaway?, stripe?, deps:{monotonic, timers:{arm}}, signal?}` :371–391), `finalize` :554–571 → `{ tail, timerCleanup }`, summary :539–540, `CODES` :29, `VOCABULARY` :45, `T_ERROR_CODES` :23, `STRIPE_VERSION_CANDIDATE` :18.
+- T `scripts/e7-connected/http-transports.mjs`: `createE7HostawaySend({exchange, credential, maxBytes?})` :307 (`credential` must be a SYNCHRONOUS non-async function, :65 / :309), `createE7StripeTestSend({exchange, credential, accountId, apiVersion, maxBytes?})` :353.
+- X `scripts/e7-connected/real-exchange.mjs`: `createE7RealExchange({provider, primitive?})` :186. **When `primitive` is omitted, X defaults to `NODE_HTTPS_PRIMITIVE` (:189, :28).** It calls `new PrimAgent(AGENT_OPTIONS)` :282 and then `apply(primRequest, undefined, [options])` :288.
+- C1 `probe-env-preflight.mjs` / `probe-credential-file.mjs` (§2, §10).
+
+### 11.1 Files proposed for the C2 implementation turn (exactly four)
+| File | Why |
+|---|---|
+| NEW `scripts/e7-connected/probe-command.mjs` | `runProbeCommand`, the ONLY assembly. Imports exactly: `node:util` (`types`); P `validateProbePlan`, `canonicalJson`, `runReadonlyProbes`, `VOCABULARY`, `T_ERROR_CODES`, `CODES`; T `createE7HostawaySend`, `createE7StripeTestSend`; X `createE7RealExchange`; C1 `evaluateProbeEnvironment`, `ENV_CODES`, `ENV_CHECK_KEYS`, `readProbeCredentialFile`, `CREDENTIAL_CODES`, `CLOSE_STATES`. **Never** imported: `node:fs`, `node:crypto`, `process`, timers, `console`, `node:https` (X imports it transitively; C2 never names `NODE_HTTPS_PRIMITIVE`), booking core, A, workers, DB, SDK, or the reservation adapter. |
+| NEW `scripts/e7-connected/probe-source-digest.mjs` | **Justified extra helper (§11.4):** the digest must be computed BEFORE C2 is imported, so it cannot live inside C2 without a circular bootstrap. Pure; imports exactly `node:crypto` (`createHash`) and `node:util` (`types`). It reads nothing itself. |
+| NEW `test/e7-connected-probe-command.test.mjs` | Fake-only integration tests (§11.10). |
+| `claude/e7-connected-probe-cli-contract.md` | C2 implementation map. |
+
+### 11.2 `runProbeCommand({ argv, deps })` — signature, promise and throw semantics
+- **Returns** a native Promise of a deep-frozen **disposition** (§11.8). It **never throws and never rejects.** A synchronous fault or an unexpected internal rejection becomes disposition `CLI_INTERNAL`, exit 1, with no raw error.
+- **Top input:** a plain or null-prototype object with own enumerable DATA keys exactly `{ argv, deps }`. It is read once, getter-free (the C1 `dataExactly` rule); proxies, including revoked ones, are refused. A malformed top input gives `CLI_DEPS_INVALID`, exit 1.
+- **`argv`:** a genuine dense `Array`, non-proxy, own data elements only, length ≤ 32. Each element is a string of 1…4096 characters without NUL. It is snapshotted once, by index descriptors only; no iterator is ever called.
+- **Grammar** (tokens are `--name value` pairs; no `=` form; each flag at most once; nothing positional except the optional first mode word):
+  - **`inspect`, the DEFAULT** — used when `argv[0]` is absent or starts with `--`, or when `argv[0] === 'inspect'`.
+    - Required: `--plan <abs>`.
+    - Optional, compared and reported only, never required: `--expect-plan-hash <64 lowercase hex>`, `--expect-source-digest <64 lowercase hex>`, `--expect-requests <1…8>`, `--approval-ref <label>`.
+    - `--credentials` and `--summary-out` are **refused** in inspect (`CLI_USAGE`): inspect has no route to secrets or output.
+  - **`execute`** — `argv[0] === 'execute'`. ALL of these are required: `--plan`, `--credentials`, `--summary-out` (**mandatory**), `--expect-plan-hash`, `--expect-source-digest`, `--expect-requests`, `--approval-ref`.
+  - **Value rules:**
+    - Paths: C1 `canonical(p, false)` — absolute, ≤ 4096, no NUL, no empty / `.` / `..` segment, no trailing `/`, never `/`.
+    - Hashes: `^[0-9a-f]{64}$`.
+    - `--expect-requests`: `^[1-8]$`.
+    - `--approval-ref`: `^[A-Za-z0-9._:-]{1,80}$`, P's metadata rule (`readonly-probe.mjs:143`).
+    - In execute, the `--plan`, `--credentials` and `--summary-out` paths must be pairwise distinct.
+  - Anything else gives `CLI_USAGE`, exit 2.
+- **`deps`:** a plain or null-prototype object with own enumerable DATA keys **exactly** the set for the mode. Extra or missing keys, proxies, accessors or wrong types give `CLI_DEPS_INVALID`, exit 1. This is a C3 wiring fault, never an owner question.
+
+| Key | inspect | execute | Schema / ownership |
+|---|---|---|---|
+| `envSnapshot` | ✔ | ✔ | Passed to C1 `evaluateProbeEnvironment` unchanged. **It must be frozen, and so must its `present` object** (`Object.isFrozen`), so the `nodeVersion` C2 reads afterwards by own-data descriptor is the same value C1 evaluated. |
+| `repoRoot` | ✔ | ✔ | Canonical absolute string (`/` allowed; C1 then fails closed). |
+| `sourceDigest` | ✔ | ✔ | `null` or a 64-hex string — a value computed by C3 with §11.4 BEFORE it imports C2. C2 treats it as a TRUSTED injected input. |
+| `readPlanFile` | ✔ | ✔ | Non-proxy function (§11.5). |
+| `interrupt` | ✔ | ✔ | Genuine `AbortSignal`, checked through the captured `AbortSignal.prototype.aborted` getter (P's `nativeAborted` rule, `readonly-probe.mjs:62, 78`). C3 aborts it on the first SIGINT. |
+| `credentialFs` | — | ✔ | Passed verbatim to C1 (C1 validates it; §2.2). |
+| `outputFs` | — | ✔ | §11.6. `platform` / `uid` must equal `credentialFs`'s (own-data reads) or `CLI_DEPS_INVALID`. |
+| `primitive` | — | ✔ | Own data exactly `{ Agent, request }`, non-proxy functions. **Always passed explicitly to X, so X's default `NODE_HTTPS_PRIMITIVE` is unreachable from C2.** |
+| `monotonic`, `timers` | — | ✔ | Passed to P unchanged as `deps:{ monotonic, timers }` (P validates them, `:381–389`). C2 itself owns no clock or timer. |
+
+### 11.3 Stage order (first refusal wins; a refusal means zero later stages; `interrupt` checked at every arrow)
+`INT` = a native check of `interrupt`. It runs **before each stage and immediately after every injected call returns synchronously AND after its promise settles** — at the re-entrancy boundary, not only before awaits.
+1. **argv → deps** (no injected call).
+2. **env:** `evaluateProbeEnvironment(envSnapshot)` → INT. In execute, `!ok` gives `CLI_ENV_REFUSED` (exit 3); inspect reports it.
+3. **source:** in execute, `sourceDigest === null` gives `CLI_SOURCE_UNREADABLE` and `sourceDigest !== --expect-source-digest` gives `CLI_SOURCE_MISMATCH` (both exit 4). Inspect reports `sourceDigest` (or `null`) and, when the flag was given, `sourceMatches`. This comparison is a consistency check of an injected value; the real enforcement is C3's pre-import check, which stays CLOSED.
+4. **plan:** `readPlanFile(--plan)` → INT → settle → INT → bytes rules (§11.5) → `validateProbePlan(parsed)` (P refusal code reported from `CODES.plan`; `CLI_PLAN_INVALID`, exit 4). Plan problems refuse in BOTH modes.
+5. **bindings** (execute refuses with `CLI_BINDING_MISMATCH`, exit 4; inspect reports a boolean or `null` per flag):
+   - `plan.planHash === --expect-plan-hash`;
+   - `plan.probes.length === --expect-requests`;
+   - `plan.metadata.nodeVersion === envSnapshot.nodeVersion`;
+   - `plan.metadata.approvalRef === --approval-ref`.
+
+   P already enforces `stripeVersion` (`:144`). `metadata.reviewedCommit` and `approvalRef` are echoed LABELS — never attestation, consent or permission.
+   - **Inspect stops here:** `CLI_INSPECT_OK`, exit 10. **Inspect makes zero `credentialFs` / `outputFs` / `primitive` / `monotonic` / `timers` calls and constructs no T, X or Agent** (those deps are not even accepted).
+6. **output-parent preflight** (§11.6) → INT. This happens **before any secret read**. A bad parent gives `CLI_OUTPUT_PARENT_INVALID`; a target that already exists gives `CLI_OUTPUT_EXISTS` (pre-run refusal, exit 4).
+7. **credentials:** `readProbeCredentialFile({ path: --credentials, repoRoot, needs, fs: credentialFs })`, where `needs = { hostaway: probes include a 'P-H*', stripe: probes include a 'P-S*' }` (derived from the immutable plan only) → INT at return → settle → INT.
+   - A C1 refusal gives `CLI_CREDENTIAL_REFUSED` (exit 5), and the public `{ code, closeState }` is reported.
+   - **If INT fires after C1 settles:** the capability reference is dropped (`cap = null`) and `CLI_INTERRUPTED` (exit 7) is returned. There is no assembly and no network.
+   - **C1 IO may hang** (accepted, no elapsed bound). Neither P's timers nor C2 bound it. An interrupt during a hanging C1 load is observed only when C1 settles; C3 owns any decision to exit (§5).
+8. **assembly X → T → P**, directly, with no extra layer:
+   - `hx = createE7RealExchange({ provider:'hostaway', primitive: counted })` and `sx = createE7RealExchange({ provider:'stripe', primitive: counted })` (only for the providers in `needs`).
+   - **Counted primitive:** `counted = { Agent: primitive.Agent, request(options) { attempted += 1; if (attempted > expectRequests) throw REFUSE; return apply(primitive.request, undefined, [options]); } }`. It never reads, keeps or logs `options`. X maps the synchronous throw to `EXCHANGE_SETUP_FAILED` (`:288`).
+     - Reaching the guard is **unreachable through accepted P** (one send per probe, one exchange per send). It is defense in depth, labelled by that invariant.
+     - `requestsAttempted` is reported in the payload.
+   - **T sends:**
+     - `createE7HostawaySend({ exchange: hx.exchange, credential: tokenFn })`;
+     - `createE7StripeTestSend({ exchange: sx.exchange, credential: keyFn, accountId: plan.stripe.accountId, apiVersion: plan.metadata.stripeVersion })`;
+     - `tokenFn` / `keyFn` are plain synchronous functions that read a C2-local `let creds` (the frozen capability's non-enumerable properties). Any `ok:false` from X or T gives `CLI_INTERNAL`.
+   - **P run:** `runReadonlyProbes({ plan, hostaway?, stripe?, deps:{ monotonic, timers }, signal: interrupt })`. P's `ok:false` gives `CLI_INTERNAL` with the P run code reported.
+   - **Probe inventory:** only P's accepted GET inventory (`requestFor`, `:341–355`). There is no request, state, page, retry, fallback or write endpoint derived from any reply. Bindings (plan, needs, accountId, version, request limit) are immutable primitives captured before the run.
+9. **await `result`, then await `finalize()`** (both native and never-rejecting per P). Then `creds = null`, so a late `credential()` call gets `null` and T gives `CREDENTIAL_INVALID`. An interrupt during stage 9 is P's `signal` (`PROBE_CANCELLED`), and C2 still awaits both truthfully. P's STOP vs INCONCLUSIVE continuation is unchanged: C2 never re-drives, skips or reinterprets probes.
+10. **payload → summary file (§11.7) → disposition (§11.8).** Pre-run refusals (stages 1–7, including `CLI_INTERRUPTED`) write **no** summary file (`summaryFile:'NOT_ATTEMPTED'`). Only a run that reached stage 8 writes evidence.
+
+### 11.4 Source digest seam — who computes, who compares
+- **Computes:** `probe-source-digest.mjs` exports `SOURCE_CLOSURE` (frozen, fixed order) and `computeSourceDigest(snapshot) → frozen { ok:true, digest } | { ok:false, code:'SOURCE_SNAPSHOT_INVALID' }`.
+- **Snapshot:** a dense array, exactly `SOURCE_CLOSURE.length` entries, of own-data `{ path, bytes }` objects.
+  - `path` must equal `SOURCE_CLOSURE[i]` exactly.
+  - `bytes` must be a genuine `Uint8Array` (exact prototype, non-proxy, not on a `SharedArrayBuffer`), of 1…262144 bytes; the total must be ≤ 2 MiB.
+  - Each array is **copied once** into an owned buffer before hashing.
+  - Missing, extra, reordered or oversize entries give `SOURCE_SNAPSHOT_INVALID`.
+- **Recipe (§3, unchanged framing):** `SHA-256( "e7-probe-source-v1\n" ‖ Σ ( utf8(path) ‖ 0x00 ‖ ascii(decimal(byteLength)) ‖ 0x00 ‖ bytes ‖ 0x00 ) )`, lowercase hex.
+- **`SOURCE_CLOSURE` (13 entries, this order):**
+  1. `package.json`
+  2. `scripts/e7-connected/probe-cli-main.mjs`
+  3. `scripts/e7-connected/probe-source-digest.mjs`
+  4. `scripts/e7-connected/probe-command.mjs`
+  5. `scripts/e7-connected/probe-env-preflight.mjs`
+  6. `scripts/e7-connected/probe-credential-file.mjs`
+  7. `scripts/e7-connected/readonly-probe.mjs`
+  8. `scripts/e7-connected/http-transports.mjs`
+  9. `scripts/e7-connected/real-exchange.mjs`
+  10. `lib/checkout/compensation-proof.js`
+  11. `lib/checkout/recovery-plan.js`
+  12. `lib/checkout/capture-proof.js`
+  13. `lib/checkout/intent-state.js`
+
+  This is the reviewed static closure of §3 plus the new helper. `intent-state.js` has no imports; the others' local imports are cited in §3. Today's largest member is 45.8 KB, well under the 256 KiB bound.
+- **Reads:** nobody in C2. C3 (CLOSED) would statically import only Node built-ins plus this helper, read the 13 files with its own no-follow regular-file adapter, compute the digest, compare it with `--expect-source-digest`, and **only then** dynamically import C2. It then passes the computed value as `deps.sourceDigest`.
+  - **`probe-cli-main.mjs` does not exist yet, so real enforcement is impossible until C3 exists.** C2 tests use synthetic bytes for that entry.
+  - There is no dynamic module discovery, no git subprocess and no guessing of C3 code.
+- **Compares:** C3 is authoritative (pre-import). C2 re-compares the injected value (§11.3 step 3) only to refuse inconsistent wiring.
+- **Limits (unchanged):** the disk digest does not prove the bytes actually loaded (TOCTOU, same-uid mutation); the Node binary, intrinsics and OS remain TRUST.
+
+### 11.5 `readPlanFile` — minimum schema
+- `readPlanFile(path)` → a native unpatched Promise (B/T/P rule) of a genuine `Uint8Array` (exact prototype, non-proxy, non-shared) of length 1…16384. It is called exactly once and never retried.
+  - A rejection, a non-native promise, a sync throw or a wrong value gives `CLI_PLAN_UNREADABLE` (exit 4).
+  - A non-native return is never observed; its rejection is caller-owned (the C1 residual, applied unchanged).
+- C2 copies the bytes once into an owned buffer, decodes them as fatal UTF-8 (`ignoreBOM:true`, so a BOM is refused), then `JSON.parse`.
+- **Canonical-file rule:** the decoded text must equal `canonicalJson(parsed)` exactly, optionally followed by a single `"\n"`; otherwise `CLI_PLAN_INVALID` with plan code `PLAN_NOT_CANONICAL`.
+  - This removes duplicate-key and whitespace ambiguity without a new parser: a file containing two values for one key cannot be canonical.
+  - The text a human approves is exactly what `planHash` covers (`readonly-probe.mjs:180`).
+  - Plan contents are not secret. Plan identifiers never appear in the payload (only `planHash`, `probes`, `maxRequests`, metadata labels).
+- The plan adapter (C3, CLOSED) is TRUSTED to read the named path with no-follow regular-file rules. The integrity that matters in execute comes from `--expect-plan-hash`.
+
+### 11.6 `outputFs` — minimum adapter, ownership, bounds
+- **Shape:** own data exactly `{ platform, uid, lstat, realpath, create }`.
+  - `lstat` / `realpath` follow exactly C1's schema and absence rules (§2.2): the stat record has 9 fields with strict types, and ABSENT means own-data `code` `ENOENT` / `ENOTDIR` only.
+  - C2 re-implements the small stat / path validators locally. C1 is accepted and is not modified to export them.
+- **Preflight (stage 6)**, with `parent = dirname(--summary-out)`:
+  - `realpath(parent) === parent`;
+  - `lstat(parent)`: kind `dir`, `uid === outputFs.uid`, `(mode & 0o022) === 0`;
+  - not inside `realpath(repoRoot)` (repoRoot `/` fails closed) and no `.git` ancestor (≤ 64, root `/.git` exactly);
+  - `lstat(target)` must be ABSENT, otherwise `CLI_OUTPUT_EXISTS`.
+
+  Any other failure or malformed reply gives `CLI_OUTPUT_PARENT_INVALID`.
+  - This preflight is only a pre-run refusal; the authoritative race check is `O_EXCL` at create time.
+- **`create(path, 'summary-create')`:** the single reviewed kind, `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW`, mode `0600`. It returns a native promise of a handle with own data exactly `{ write, sync, close }`.
+  - **Close is captured FIRST** (C1 rule): close-first capture, invoked once after every started write / sync settled, never retried, acknowledged only by a native fulfilment of exactly `undefined` (R-C1A).
+  - Malformed but closable handles are closed. With no safely callable close, the state is `UNCLOSABLE`, and no cleanup is claimed.
+- **`write(bytes, offset, length)`:** C2 passes its own payload `Uint8Array`. The reply must be a native promise of a safe integer in 1…`length`; each call makes positive progress. There are at most `payloadBytes` calls (≤ 65536). A `0` reply, an invalid count or a rejection gives UNKNOWN.
+- **`sync()`:** a native promise of exactly `undefined`.
+- **Operation bounds:** ≤ 2 `realpath`, ≤ 64 `.git` `lstat`, 1 parent `lstat`, 1 target `lstat`, 1 `create`, ≤ 65536 `write`, 1 `sync`, 1 `close`. There is **no elapsed bound**; a hanging output fs keeps C2 pending (C3 decides).
+- **Summary file states** (for the file only):
+  - `NOT_ATTEMPTED`;
+  - `RACE_EXISTS` — create rejected with own-data `code === 'EEXIST'`; nothing was written by this process;
+  - `UNKNOWN` — any other create failure (a create that failed for another reason cannot prove no file was created), any write / sync failure, a non-`undefined` sync / close reply, or `CLOSE_FAILED` / `UNCLOSABLE`. Partial or landed-but-unacknowledged content is possible, so this is **never "nothing written"**;
+  - `CLOSED_ACK` — every byte acknowledged, `sync` returned `undefined` and `close` returned `undefined`.
+
+  `summaryCloseState ∈ CLOSE_STATES` is reported separately.
+- **Never** overwrite, append, repair, unlink, rename, retry or create a second time.
+
+### 11.7 Payload vs output disposition (no circular claims)
+- **Payload:** immutable and built BEFORE any output IO. It is a deep-frozen plain object, serialized with P's `canonicalJson`, ≤ 65536 bytes UTF-8:
+  - `schema: 'e7-probe-cli-result-v1'`, `mode`, `primaryOutcome`;
+  - `runExitCode` — the precedence of the operational facts only (§11.8 rows 8 / 6 / 11 / 0), never output facts;
+  - `tailUncertain`, `interruptObserved`;
+  - `preflight` (C1 env result), `credential` (`null` or `{ code, closeState }`), `plan` (`{ planHash, probes, maxRequests, metadata }`), `sourceDigest`, `requestsAttempted`;
+  - `summary` (P summary verbatim), `finalize` (`{ tail, timerCleanup }` verbatim).
+
+  It contains **no** summary-file, stdout or final-exit status.
+- **Summary file bytes** = `canonicalJson(payload) + "\n"`.
+- **Stdout line** = `canonicalJson({ schema:'e7-probe-cli-stdout-v1', payload, output:{ summaryFile, summaryCloseState }, exitCode })`, built AFTER the file outcome is known.
+  - The payload object is identical (the same canonical bytes) in both places. **The file and stdout are deliberately NOT byte-identical:** stdout carries the later file disposition, which the file cannot contain about itself.
+  - For pre-run refusals and inspect, there is no file, and `payload.summary` / `finalize` are `null`.
+- **Stdout acknowledgment** cannot be described inside stdout. C3 performs the single write. On failure C3 raises the exit code to 9 (unless it is 130) and makes no second attempt; nothing is promised flushed.
+- **Mechanical redaction before any output:**
+  - every string value in the payload / stdout must be in the whitelist union: P `VOCABULARY` ∪ `T_ERROR_CODES` ∪ `ENV_CODES` ∪ `CREDENTIAL_CODES` ∪ `CLOSE_STATES` ∪ CLI codes ∪ the summary-file states ∪ the two schemas ∪ the modes ∪ `planHash` ∪ `sourceDigest` ∪ the four metadata labels;
+  - keys must come from the fixed key set.
+
+  A violation (unreachable by construction) or an oversize payload gives `CLI_INTERNAL`: no summary file, and a fixed stdout envelope with `payload:null` but with `primaryOutcome` kept. **No raw error, body, path, size, env value, credential or identifier is ever emitted.**
+
+### 11.8 Disposition, precedence (computed exactly once in C2), vocabulary
+- **Disposition:** deep-frozen `{ exitCode, primaryOutcome, tailUncertain, summaryFile, summaryCloseState, stdoutLine }`, returned to C3. C2 performs no `process.exit`, owns no signal and never writes stdout.
+- **Precedence:** one function `exitFor(facts)`, the only place it is computed in C2. It covers: `9` summary file ≠ `CLOSED_ACK` (execute run only) > `8` tail uncertain (`tail ∈ {UNSETTLED, UNOBSERVABLE}` or `cancelFailed + uncancellable > 0`) > `6` P `STOPPED` > `11` completed with ≥ 1 non-OK probe (INCONCLUSIVE / `PREREQ_INCONCLUSIVE`; **not success**) > `0` all probes OK.
+  - C3 applies only the two tiers C2 cannot know: `130` (second SIGINT) and stdout failure → `9`.
+  - Pre-run and other codes, with no run: `2` usage, `3` env, `4` source / plan / binding / output-parent / output-exists, `5` credential, `7` interrupted before the run, `10` inspect OK, `1` deps / internal.
+- **`primaryOutcome`** (the true operational result, kept separate from the exit code): one of `CLI_INSPECT_OK, CLI_COMPLETED_OK, CLI_COMPLETED_INCONCLUSIVE, CLI_PROBE_STOPPED, CLI_USAGE, CLI_DEPS_INVALID, CLI_ENV_REFUSED, CLI_SOURCE_UNREADABLE, CLI_SOURCE_MISMATCH, CLI_PLAN_UNREADABLE, CLI_PLAN_INVALID, CLI_BINDING_MISMATCH, CLI_OUTPUT_PARENT_INVALID, CLI_OUTPUT_EXISTS, CLI_CREDENTIAL_REFUSED, CLI_INTERRUPTED, CLI_INTERNAL`.
+- **Output-fault codes** (disposition / `output` only, never primary): `CLI_TAIL_UNCERTAIN, CLI_OUTPUT_RACE, CLI_OUTPUT_UNKNOWN`.
+- **CLI vocabulary:** the union of the two lists above (20 codes). §4's list is superseded by this one, which adds `CLI_DEPS_INVALID` and `CLI_PLAN_UNREADABLE`.
+- `PLAN_NOT_CANONICAL` is a C2 plan sub-code added to the whitelist.
+
+### 11.9 Resolution / decision map (root items 1–6)
+| # | Decision | Where |
+|---|---|---|
+| 1 | Exact own-data `{argv, deps}`; inspect default without expect flags; per-mode exact deps sets; never throws or rejects; C1 used as accepted (private capability, close exactly `undefined`), with no new credential API or policy | §11.2 |
+| 2 | Pure helper `probe-source-digest.mjs` with a caller-provided read snapshot; C3 computes and enforces before import (CLOSED); C2 re-compares the injected value only; fixed 13-path closure, framing, byte-copy bounds; labels never attestation | §11.4 |
+| 3 | Minimal `readPlanFile` (bytes only, canonical-file rule) and `outputFs` (`create` / handle) schemas with bounds and ownership; all preflights before C1; inspect zero secrets / T / X / Agent; direct X → T → P; counted primitive; immutable bindings | §11.3, §11.5, §11.6 |
+| 4 | INT before every stage and after every injected return / settle; capability discarded after C1 settles if interrupted; C1 hang unbounded and stated; P result / finalize awaited truthfully, `tail` / `timerCleanup` propagated verbatim; disposition only; P semantics unchanged | §11.3, §11.8 |
+| 5 | Immutable payload vs later file / stdout disposition; deliberately non-identical file vs stdout bytes, stated; `RACE_EXISTS` vs `UNKNOWN`; existence preflight vs `O_EXCL` race separated; precedence once; close-first, once, `undefined`-only acknowledgment; no leak | §11.6, §11.7, §11.8 |
+| 6 | Exactly four files, with the helper justified; fake-only tests listed below | §11.1, §11.10 |
+
+**Material unresolved blockers: none for the offline C2 implementation.** Items that are not blockers but remain true:
+- real enforcement of the digest and of the output adapter's `O_EXCL | O_NOFOLLOW` needs C3 and native evidence (CLOSED);
+- the canonical plan file must be produced by the owner-side preparation step (C3-prep scope).
+
+### 11.10 C2 tests (fake-only; meaningful integrated checks, no mutation quota)
+All snapshots, fs objects, handles, promises, bodies and primitives are fakes, with short synthetic key patterns (e.g. `sk_test_Fake1`). There are no real files, temp files, env, credentials, PG, installs, provider calls or network.
+1. **Inspect:**
+   - default (no mode word) and explicit, with and without the optional expect flags;
+   - exact reports;
+   - **zero** `credentialFs`, `outputFs`, `primitive`, `monotonic` and `timers` deps and calls;
+   - refusal of `--credentials` / `--summary-out` in inspect.
+2. **Usage / deps matrices:** missing, extra or duplicated flags; bad values; `=` form; proxy / accessor / revoked `argv` and `deps`; an unfrozen `envSnapshot`; mismatched `platform` / `uid` → `CLI_USAGE` / `CLI_DEPS_INVALID`, with zero injected calls.
+3. **Refusal before secrets:** env, source (`null` / mismatch), plan unreadable / non-canonical (including a duplicate-key plan) / P-invalid, each binding, output-parent faults, output exists → **zero `credentialFs` calls and zero `primitive` calls.**
+4. **C1 → T / X / P over a fake https primitive** (both providers and single-provider plans):
+   - `requestsAttempted === probes.length`;
+   - `credential()` reads a non-enumerable capability, and after finalize it yields `CREDENTIAL_INVALID`;
+   - the summary bytes equal `canonicalJson(payload)+"\n"`, and the stdout envelope holds the identical payload;
+   - exit 0;
+   - C1 refusal → 5 with zero primitive calls.
+5. **P semantics:** STOP → `CLI_PROBE_STOPPED` / 6; INCONCLUSIVE continuation → 11, with independent probes still run.
+6. **Interrupt:**
+   - before env / after plan read / after the preflight → 7, no credential read;
+   - during a pending C1 load (abort, then C1 settles) → capability discarded, zero primitive calls, 7;
+   - during P → `PROBE_CANCELLED` per P, result and finalize awaited, summary written.
+7. **Output faults:**
+   - `EEXIST` → `RACE_EXISTS` / 9;
+   - other create rejection → `UNKNOWN` / 9;
+   - partial write then rejection / zero write / sync fault / close non-`undefined` / unclosable → `UNKNOWN` / 9;
+   - exactly one create and one close, with no retry or second create;
+   - `primaryOutcome` preserved.
+8. **Tail / cleanup:**
+   - `UNSETTLED` / `UNOBSERVABLE` / `cancelFailed` → 8;
+   - combinations 9 + 8 → 9 with `tailUncertain:true`; 6 + 8 → 8 with primary `CLI_PROBE_STOPPED`; 11 + 9 → 9.
+9. **Source digest helper:**
+   - framing vectors;
+   - one changed byte in `compensation-proof.js` or `package.json` changes the digest;
+   - reorder / missing / extra / oversize / non-genuine bytes → `SOURCE_SNAPSHOT_INVALID`;
+   - a synthetic `probe-cli-main.mjs` entry;
+   - the input array is copied (mutating it after the call does not change the result).
+10. **Redaction / pins:**
+    - sentinels (paths, token, key, plan ids, error messages) are absent from every disposition and file payload;
+    - the C2 / helper import lists are exact;
+    - no `process` / `node:fs` / timers / `console` / `node:https` / `NODE_HTTPS_PRIMITIVE` / booking-core / reservation-adapter text in the new scripts.
+
+**Exit criteria:** focused and relevant units (P / T / X / rehearsal / C1 / pins) plus `npm test` green, the FIRST FULL TAP preserved, no change outside the four files, root CODE review.
+
+### 11.11 Remaining path after C2 (not done here; nothing below is authorization)
+1. **C2 implementation** (this spec) → root CODE review.
+2. **C3 preparation contract** (CLOSED until separately authorized): the real read-only fs adapters (refusing to construct without `O_NOFOLLOW`), the snapshot builder, the pre-import digest bootstrap, signals / stdout / exit, and a canonical-plan preparation step.
+3. **Native evidence** on the owner's exact platform and Node version (separate CLOSED scope).
+4. **Owner inputs**, all UNSET: plan values, listing / reservations (never a protected id), TEST account / PI, the credential file.
+5. **ONE consolidated exact approval package (§6)** → Joel's explicit approval of that package → a single controlled read-only run.
+
+No step claims readiness or that anything is live.
