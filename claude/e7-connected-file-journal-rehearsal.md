@@ -57,3 +57,6 @@ npm test
 - G3 / G4 file faults are injected through the swappable adapter, not real disk failures.
 - The no-resume refusals rest on the journal; a lost or replaced journal falls back to the core's DB P0 eligibility (file-journal contract §5), which this rehearsal does not re-test.
 - Live gates CLOSED; owner inputs UNSET; protected ids zero action (no fake request named one); e74a OPEN.
+
+## 6. Status / next step
+Root REVIEW **ACCEPTED** this rehearsal offline at `14d975ab` (tests / report / pointer only; PG results CLAUDE-RUN). Next (DOCS ONLY, not implemented, not authorized): the transport safety contract `claude/e7-connected-transport-contract.md` (branch `feature/e7-connected-transport-contract`), specifying the injected HTTP transport layer for the accepted adapters' `send` interfaces. Nothing in this report changes.
