@@ -1,6 +1,6 @@
 # E7 connected-test orchestration + live-gate manifest — CONTRACT (all changes PROPOSED)
 
-**Status (2026-11-04):** root ACCEPTED `1df87d5a` as a conditional OFFLINE planning baseline (not a live approval package), with the cleanup-wording corrections applied below. The offline / injected-fake executor-adapter foundation is implemented on `feature/e7-connected-executor-adapters` (§9; pending root CODE review). Every live gate stays CLOSED; every owner input stays UNSET.
+**Status (2026-11-04):** root ACCEPTED `1df87d5a` as a conditional OFFLINE planning baseline (not a live approval package), with the cleanup-wording corrections applied below. The offline / injected-fake executor-adapter foundation is implemented on `feature/e7-connected-executor-adapters` (§9). Root CODE HOLD on `2aeac7e1` (R-A1 reservation recovery factory, R-A2 signal validation) → corrections in §9.6, pending root CODE re-review. Every live gate stays CLOSED; every owner input stays UNSET.
 
 **Branch** `feature/e7-connected-test-manifest`, cut from exact `62843150ad36c2db75a6819811c1d4f634ee5156`. **Runtime baseline** `ede4c43c25f9c025c540ba1f26a766eef5845556` (unchanged; not merged, deployed or live). Every source citation is at that runtime baseline.
 **What this is.** A conditional plan for ONE manually run, owner-supervised connected test, concrete enough for root design review. **What it is not:**
@@ -201,6 +201,7 @@ How inputs are read:
 | Phase | Binding keys | Notes |
 |---|---|---|
 | reservation | `listingId, arrivalDate, departureDate, ref, guests, totalMinor, currency, refFieldId, guest{firstName,lastName,email}, reservationId:null` | The creation / lookup factory never has a bound id. `retrieveReservation` refuses `RESERVATION_UNBOUND`; a later id-bound phase uses a new factory |
+| reservation-recovery (R-A1) | same keys, `reservationId` = ONE non-protected candidate id string | Same executor key set (accepted by `reservationWorkerGate`). `retrieveReservation` maps only the bound id. **`createReservation` always refuses `RECOVERY_MODE_NO_CREATE`**, with zero calls. Pricing and lookup stay bound as in `reservation`. See §9.2a |
 | capture | `listingId, arrivalDate, departureDate, ref, reservationId, accountId, paymentIntentId, amountMinor, captureIdempotencyKey` | — |
 | cleanup | `listingId, arrivalDate, departureDate, ref, reservationId (or null for the void-only reservation_failed path), accountId, paymentIntentId, voidIdempotencyKey` | — |
 | recording | `listingId, reservationId, intentId, amountMinor, paymentMethod (credit_card / other), accountRef, clientSnapshotId` | The label is TRUST, not verified ownership |
@@ -213,6 +214,28 @@ Rules that apply to every phase:
   - 603566: only with `pilotException: "E4_CONNECTED_603566_MXN"`, never with USD, never for recording (USD-only).
   - The exception flag is refused on any other listing.
   - The workers' own branded adapter config remains required separately.
+
+### 9.2a The reservation recovery binding: what the later runner must validate first (runner and DB reader NOT implemented)
+
+The reservation worker's by-id recovery read (`executeRead` / `readsStep`, `reservation-worker.js:233–260`, `:482–493`) executes a claimed `hostaway.retrieve_reservation` operation whose `payload.reservationId` was queued in one of two ways:
+- by E3, after the reservation is adopted (`reservationRead`, `intent-state.js:254`);
+- by the recovery planner (`requestRecoveryRead`, `recovery.js:159`; planner `recovery-plan.js:245–262`), from a **not-yet-adopted candidate**. That candidate is either:
+  - the create operation's recorded `result_ref` after `CREATE_REF_NOT_ECHOED:READS_REQUIRED` (`reservation-worker.js:404–408`; the provider reply was recorded first, `:384–385`); or
+  - a by-ref lookup evidence row's `observed.reservationId`.
+
+So `intents.hostaway_reservation_id` is **not** required to be populated. A recovery factory is legitimate for a candidate that the by-id read is meant to prove.
+
+Before constructing a `reservation-recovery` factory, the future runner must validate all of the following from the accepted persisted DB facts (never from a raw reply alone):
+1. There is a `hostaway.retrieve_reservation` operation for THIS intent, of retry class `read`, pending / claimable, whose `payload.reservationId` is the id to bind.
+2. That id traces to exactly one of:
+   - **(a)** the intent's `hostaway.create_reservation` operation, `state = succeeded` with `result_ref` = that id (the ref-not-echoed path);
+   - **(b)** `hostaway_reservation` evidence with status `found_active`, `observed.bookingRef` = the intent ref, `matchCount = 1` and `observed.reservationId` = that id;
+   - **(c)** an adopted `intents.hostaway_reservation_id` = that id.
+3. No other candidate id is known for the intent (the planner escalates `RESERVATION_ID_CONFLICT` otherwise, `recovery-plan.js:257`).
+4. The id is non-protected (also enforced by this factory) and its listing / dates / ref binding equals the intent row.
+5. The intent is in a reservation-worker phase (`reservation-worker.js:54`).
+
+The factory is rebuilt between bounded steps; an existing basis is never mutated. Another create is impossible through it, and nothing binds automatically.
 
 ### 9.3 Executor keys, worker arguments and mapping
 
@@ -255,8 +278,8 @@ There is no pass-through facility.
 
 **Invocation and cancellation.**
 - Exactly ONE injected invocation per adapter call, no retry.
-- The worker's `AbortSignal` is passed as `{ signal }`.
-- A missing, fake or already-aborted signal is refused before invocation.
+- The worker's genuine `AbortSignal` is passed through unchanged as `{ signal }`.
+- Signals are inspected natively (§9.6, R-A2). A missing, fake, proxied or already-aborted signal is refused before invocation, and the aborted state is re-checked natively immediately before the invocation.
 
 Cross-process at-most-once remains the accepted DB operation fence plus the future journal, not anything in memory.
 
@@ -290,5 +313,77 @@ No PG run was needed: the compatibility tests use the accepted gates and pure he
 - Full worker-in-PG runs over these adapters, and the real transports, belong to the future runner slice.
 - The fake tests prove mapping only.
 - The cancel and offline-charge endpoints remain prerequisites (primary documentation / read-only probes).
+- Hostaway account identity remains TRUST.
+
+### 9.6 Root CODE HOLD on `2aeac7e1` — corrections R-A1 / R-A2 (same three files; pending root CODE re-review)
+
+**R-A1 — reservation recovery was unsatisfiable.** In the held version:
+- the creation factory required `reservationId: null`, so its `retrieveReservation` always refused;
+- capture / cleanup factories have the wrong key set for `reservationWorkerGate`.
+
+The worker's by-id recovery read (including `CREATE_REF_NOT_ECHOED:READS_REQUIRED`, which the E4 connected run hit) therefore could not be served.
+
+Fix: a new phase `reservation-recovery` in the same factory API (§9.2, §9.2a), with:
+- an immutable binding to ONE non-protected candidate id;
+- the full reservation key set;
+- `createReservation` always refusing `RECOVERY_MODE_NO_CREATE`;
+- retrieve accepting only the bound id.
+
+The creation factory is unchanged (unbound, create mapped). There is no automatic binding and no reply adoption.
+
+**R-A2 — signal validation executed caller getters and leaked raw errors.** In the held version:
+- `instanceof` plus `signal.aborted` ran an own `aborted` getter and still dispatched;
+- `Object.create(AbortSignal.prototype)` threw a raw `ERR_INVALID_THIS`;
+- an aborted signal with a `false` shadow was dispatched.
+
+Fix (`nativeAborted`):
+- `util.types.isProxy` first (a native check that runs no trap). Node's intrinsic getter brand-checks *through* a proxy to its target, which is why proxies are refused separately.
+- Then the intrinsic `AbortSignal.prototype` `aborted` getter, captured once at module load, is applied with `Reflect.apply`. It reads the internal state, ignores own shadows, and throws for fakes. Only that call is caught → `ExecutorRefusal("SIGNAL_REQUIRED")`.
+- `stillLive()` re-checks natively immediately before each invocation, after all argument introspection, so a proxy trap that aborts the signal mid-validation cannot dispatch.
+- The original genuine signal is passed through. There are no patched globals, and the transport is never inside a catch other than the documented failure mapping.
+
+**Red / green (CLAUDE-RUN).** The updated test file against the exact `2aeac7e` module: 12 pass / **5 fail** (`gnf/tap/ra-red-2aeac7e.tap`):
+
+| Test | Red failure |
+|---|---|
+| R-A1 ×3 | `PHASE_INVALID` |
+| R-A2 hostile signals | the own `aborted` getter ran and the call dispatched |
+| R-A2 mid-introspection abort | dispatched ("Missing expected rejection") |
+
+Against the fix: **17 / 17** (`gnf/tap/ra-green.tap`). New tests:
+- **13 — recovery factory:** accepted by the real `reservationWorkerGate`; the accepted by-id request maps once to `GET /v1/reservations/{id}`; the creation factory is unchanged.
+- **14 — recovery refusals:**
+  - create refused (any arguments);
+  - other / protected ids refused;
+  - protected, unbound and malformed bindings refused;
+  - 603564 refused.
+- **15 — end to end on the accepted pure helpers:** a no-echo create reply, then `assessRefNotEchoed` (eligible, the candidate id), then a recovery factory bound to it, then the by-id read, then `unwrapEnvelope` / `normalizeReservation`, which give the same id / ref / listing / dates.
+- **16 — hostile signals:**
+  - shadow getter on a live signal: dispatched, getter not run;
+  - aborted signal with a `false` data shadow, aborted signal with a throwing getter, prototype fake, proxy, revoked proxy, plain object, function: each refused with a code, with zero caller-getter runs and zero calls;
+  - ordinary aborted and live controls; the original signal is passed through.
+- **17 — a signal aborted by a proxy trap during request / params / body introspection:** refused for Hostaway reads, Stripe and a write.
+
+**Targeted mutants B01–B08**, each restored and sha256-checked: 8 / 8 caught. They removed:
+- the pre-invocation recheck (Hostaway / Stripe);
+- the proxy check;
+- the getter catch;
+- the intrinsic call, replaced by a caller-property read;
+- the recovery create refusal;
+- the recovery requirement for a bound id;
+- the creation requirement for no bound id.
+
+A01–A12 were not repeated (A02's anchor was replaced by B01–B05).
+
+| Run | Result |
+|---|---|
+| Focused | 17 / 17 |
+| `npm test` | **738 / 738** |
+| PG | not run (module-only corrections, as root ruled) |
+
+**Residuals.**
+- `util.types.isProxy` is a Node built-in (the CLI is Node by design).
+- The §9.2a persisted-fact validation is the future runner's job and is not implemented here.
+- The cancel and offline-charge endpoints remain ASSUMED / LIVE-UNVERIFIED.
 - Hostaway account identity remains TRUST.
 

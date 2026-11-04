@@ -19,6 +19,7 @@
 //     non-envelope. The original error / body / message is never read, kept or returned.
 // HTTP statuses (404 / 429 / 5xx / anything) are passed through unchanged inside the envelope; nothing is reclassified, retried or rewritten.
 // At-most-once across processes is the accepted DB operation fence + the future journal, not anything in this module.
+import { types as nodeTypes } from "node:util";
 import { PROTECTED_HOSTAWAY_RESERVATION_IDS, CANCEL_BODY } from "../../lib/checkout/compensation-proof.js";
 import { LIST_LIMIT, offlineChargeTitle, exactAmount, APPROVED_PAYMENT_METHODS } from "../../lib/checkout/offline-charge-proof.js";
 
@@ -43,11 +44,14 @@ export function isRealDate(s) {
 }
 
 export const EXECUTOR_ADAPTERS_VERSION = "e7-connected-executor-adapters-v1";
-export const PHASES = Object.freeze(["reservation", "capture", "cleanup", "recording"]);
+// "reservation-recovery" (R-A1): the reservation worker's key set bound to ONE persisted candidate reservation id for its by-id recovery
+// read; createReservation always refuses in this mode. The creation factory ("reservation") stays unbound.
+export const PHASES = Object.freeze(["reservation", "reservation-recovery", "capture", "cleanup", "recording"]);
 /** the exact executor key set each accepted worker gate requires (reservation-worker.js:53, capture-worker.js:46, compensation-worker.js:49,
  *  recording-worker.js:30 + the `label` the recording gate requires, :73–77) */
 export const PHASE_KEYS = Object.freeze({
   reservation: Object.freeze(["pricing", "lookupPage", "retrieveReservation", "createReservation"]),
+  "reservation-recovery": Object.freeze(["pricing", "lookupPage", "retrieveReservation", "createReservation"]),
   capture: Object.freeze(["retrieveAccount", "retrievePaymentIntent", "capturePaymentIntent", "retrieveReservation", "lookupPage"]),
   cleanup: Object.freeze(["retrieveAccount", "retrievePaymentIntent", "cancelPaymentIntent", "retrieveReservation", "lookupPage", "cancelReservation"]),
   recording: Object.freeze(["retrieveReservation", "listOfflineCharges", "createOfflineCharge", "label"])
@@ -55,6 +59,7 @@ export const PHASE_KEYS = Object.freeze({
 const COMMON = ["listingId", "arrivalDate", "departureDate", "ref"];
 export const BINDING_KEYS = Object.freeze({
   reservation: Object.freeze([...COMMON, "guests", "totalMinor", "currency", "refFieldId", "guest", "reservationId"].sort()),
+  "reservation-recovery": Object.freeze([...COMMON, "guests", "totalMinor", "currency", "refFieldId", "guest", "reservationId"].sort()),
   capture: Object.freeze([...COMMON, "reservationId", "accountId", "paymentIntentId", "amountMinor", "captureIdempotencyKey"].sort()),
   cleanup: Object.freeze([...COMMON, "reservationId", "accountId", "paymentIntentId", "voidIdempotencyKey"].sort()),
   recording: Object.freeze(["listingId", "reservationId", "intentId", "amountMinor", "paymentMethod", "accountRef", "clientSnapshotId"].sort())
@@ -124,15 +129,33 @@ const keysEq = (o, keys) => { const k = Object.keys(o).sort(); return k.length =
 const refuse = (code) => { throw new ExecutorRefusal(code); };
 /** snapshot a caller argument; introspection errors become a refusal (never the caller's error) */
 function argSnap(v) { let s; try { s = snap(v); } catch { s = BAD; } if (s === BAD) refuse("ARGUMENT_INVALID"); return s; }
-/** the worker's per-call options: exactly the allowed keys; `signal` must be a real, not-yet-aborted AbortSignal */
+// R-A2: native branded signal inspection. The intrinsic `aborted` getter is captured ONCE at module load from AbortSignal.prototype and
+// applied with Reflect.apply: it reads the internal aborted state of a GENUINE AbortSignal, ignores any own `aborted` property (shadow
+// getter or data) and throws for anything without the internal slot (a prototype fake); proxies (incl. revoked) are refused first by the
+// native util.types.isProxy check, because Node's getter would otherwise see through a proxy to its target. No caller property,
+// getter or method (incl. `instanceof` / Symbol.hasInstance) is consulted. Only this inspection is caught.
+const NATIVE_ABORTED = Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted").get;
+/** true / false for a genuine AbortSignal; ExecutorRefusal('SIGNAL_REQUIRED') for anything else (code only, never the caller's error) */
+function nativeAborted(sig) {
+  if (sig === null || typeof sig !== "object") refuse("SIGNAL_REQUIRED");
+  // Node's intrinsic getter brand-checks THROUGH a proxy (its internal-slot test is forwarded to the target), so proxies are refused
+  // first with the native util.types.isProxy check, which runs no trap
+  if (nodeTypes.isProxy(sig)) refuse("SIGNAL_REQUIRED");
+  let a;
+  try { a = Reflect.apply(NATIVE_ABORTED, sig, []); } catch { refuse("SIGNAL_REQUIRED"); }
+  if (typeof a !== "boolean") refuse("SIGNAL_REQUIRED");
+  return a;
+}
+/** the worker's per-call options: exactly the allowed keys; `signal` must be a GENUINE, not-yet-aborted AbortSignal */
 function callOptions(o, allowed) {
   let p; try { p = plainProps(o); } catch { p = BAD; }
   if (p === BAD) refuse("OPTIONS_INVALID");
   for (const k of Object.keys(p)) if (!allowed.includes(k)) refuse("OPTIONS_INVALID");
-  if (!(p.signal instanceof AbortSignal)) refuse("SIGNAL_REQUIRED");
-  if (p.signal.aborted) refuse("ABORTED");
+  if (nativeAborted(p.signal)) refuse("ABORTED");
   return p;
 }
+/** immediately before the ONE invocation (after all argument introspection, whose proxy traps could have aborted it) */
+function stillLive(signal) { if (nativeAborted(signal)) refuse("ABORTED"); }
 const protectedId = (id) => PROTECTED_HOSTAWAY_RESERVATION_IDS.includes(String(id));
 
 // ---------------------------------------------------------------------------------------------
@@ -149,15 +172,16 @@ function validateBinding(phase, raw) {
   if (FORBIDDEN_PILOT_LISTING_IDS.includes(b.listingId)) {
     if (b.listingId !== CONNECTED_TEST_LISTING_ID || b.pilotException !== PILOT_EXCEPTION) return null;
     if (phase === "recording") return null;                                       // recording is USD-only (offline-charge-proof.js:33)
-    if (phase === "reservation" && b.currency !== CONNECTED_TEST_CURRENCY) return null;
+    if ((phase === "reservation" || phase === "reservation-recovery") && b.currency !== CONNECTED_TEST_CURRENCY) return null;
   } else if (b.pilotException !== undefined) return null;
   if (b.reservationId !== null && b.reservationId !== undefined && (typeof b.reservationId !== "string" || !RID_RE.test(b.reservationId) || protectedId(b.reservationId))) return null;
   if (phase !== "recording") {
     if (!isRealDate(b.arrivalDate) || !isRealDate(b.departureDate) || !(b.arrivalDate < b.departureDate)) return null;
     if (typeof b.ref !== "string" || !REF_RE.test(b.ref)) return null;
   }
-  if (phase === "reservation") {
-    if (b.reservationId !== null) return null;                                     // creation / lookup factory: no bound id (§9.2)
+  if (phase === "reservation" || phase === "reservation-recovery") {
+    if (phase === "reservation" && b.reservationId !== null) return null;          // creation / lookup factory: no bound id (§9.2)
+    if (phase === "reservation-recovery" && typeof b.reservationId !== "string") return null;   // ONE persisted candidate id (§9.2a)
     if (!isPosInt(b.guests) || b.guests > 50 || !isPosInt(b.totalMinor) || typeof b.currency !== "string" || !CURRENCY_RE.test(b.currency) || !isPosInt(b.refFieldId)) return null;
     if (exactAmount(b.totalMinor) === null) return null;
     const g = b.guest;
@@ -184,6 +208,7 @@ function validateBinding(phase, raw) {
 // the ONE invocation (outside every validation try): exactly one call, no retry; failures become a code-only transport failure
 
 async function invokeHostaway(send, request, signal) {
+  stillLive(signal);
   let reply;
   try { reply = await send(request, Object.freeze({ signal })); } catch { throw new ExecutorTransportFailure("TRANSPORT_FAILED"); }
   let env;
@@ -194,6 +219,7 @@ async function invokeHostaway(send, request, signal) {
   return env;                                                                 // json passed through unchanged (provider facts untouched)
 }
 async function invokeStripe(send, call, signal) {
+  stillLive(signal);
   try { return await send(call, Object.freeze({ signal })); } catch { throw new ExecutorTransportFailure("TRANSPORT_FAILED"); }
 }
 /** Hostaway request: both worker path conventions ('/x' relative to /v1, and '/v1/x') normalised to exactly ONE '/v1' prefix */
@@ -241,7 +267,7 @@ function hostawayKeys(b, send) {
   return keys;
 }
 
-function reservationKeys(b, send) {
+function reservationKeys(b, send, recovery) {
   const k = hostawayKeys(b, send);
   const L = b.listingId;
   const pricingReply = (env) => Object.freeze({ status: env.httpStatus, json: env.json });   // pricing's accepted {status, json} contract
@@ -272,6 +298,7 @@ function reservationKeys(b, send) {
   const CREATE_BODY_KEYS = ["arrivalDate", "channelId", "currency", "customFieldValues", "departureDate", "guestEmail", "guestFirstName", "guestLastName",
     "guestName", "listingMapId", "numberOfGuests", "totalPrice"];
   k.createReservation = async (req, opts) => {
+    if (recovery) refuse("RECOVERY_MODE_NO_CREATE");                                       // a recovery factory never creates
     const o = callOptions(opts, ["signal"]);
     const r = workerRequest(req, { method: "POST", paths: both("/reservations"), body: true });
     if (Object.keys(r.query).length !== 0) refuse("CREATE_QUERY_REFUSED");                  // never forceOverbooking / provider / any param
@@ -381,7 +408,7 @@ function recordingKeys(b, send) {
 
 /**
  * createPhaseExecutors({ phase, binding, hostaway, stripe? }) -> { ok:true, executors } | { ok:false, code }
- *   phase    'reservation' | 'capture' | 'cleanup' | 'recording'
+ *   phase    'reservation' | 'reservation-recovery' | 'capture' | 'cleanup' | 'recording'
  *   binding  exactly BINDING_KEYS[phase] (+ optional pilotException); frozen copy taken before anything else; see §9.2
  *   hostaway exactly { send: function }   (mandatory injection; no default)
  *   stripe   exactly { send: function }   for capture / cleanup only; absent otherwise
@@ -411,7 +438,7 @@ export function createPhaseExecutors(opts) {
   const hs = (req, x) => Reflect.apply(hsend, undefined, [req, x]);               // unbound call: no `this` from caller objects
   const ss = ssend ? (call, x) => Reflect.apply(ssend, undefined, [call, x]) : null;
   let ex;
-  if (phase === "reservation") ex = reservationKeys(binding, hs);
+  if (phase === "reservation" || phase === "reservation-recovery") ex = reservationKeys(binding, hs, phase === "reservation-recovery");
   else if (phase === "capture") ex = { ...hostawayKeys(binding, hs), ...stripeKeys(binding, ss, "capture") };
   else if (phase === "cleanup") ex = { ...cleanupHostawayKeys(binding, hs), ...stripeKeys(binding, ss, "cleanup") };
   else ex = recordingKeys(binding, hs);

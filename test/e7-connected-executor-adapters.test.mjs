@@ -6,7 +6,7 @@ import { readFileSync } from "node:fs";
 import { createPhaseExecutors, PHASE_KEYS, BINDING_KEYS, ExecutorRefusal, ExecutorTransportFailure, PILOT_EXCEPTION } from "../scripts/e7-connected/executor-adapters.mjs";
 import * as AD from "../scripts/e7-connected/executor-adapters.mjs";
 import * as HR from "../lib/hostaway-reservations.js";
-import { validateAdapterConfig, buildCreateReservationRequest, classifyCreateResponse, lookupByRef, connectedTestAdapterConfig } from "../lib/hostaway-reservations.js";
+import { validateAdapterConfig, buildCreateReservationRequest, classifyCreateResponse, lookupByRef, connectedTestAdapterConfig, assessRefNotEchoed, unwrapEnvelope, normalizeReservation } from "../lib/hostaway-reservations.js";
 import { reservationWorkerGate } from "../lib/booking-db/reservation-worker.js";
 import { captureWorkerGate } from "../lib/booking-db/capture-worker.js";
 import { compensationWorkerGate } from "../lib/booking-db/compensation-worker.js";
@@ -343,4 +343,113 @@ test("local adapter constants equal the pure Hostaway adapter's exports (no impo
   for (const re of [/hostaway-reservations/, /connectedTestAdapterConfig/, /from\s+["'][^"']*lib\/hostaway\.js["']/, /\bfetch\s*\(/, /process\./, /from\s+["']stripe["']/, /node:(https?|net|fs|child_process)/]) {
     assert.doesNotMatch(src, re, String(re));
   }
+});
+
+// ---------------------------------------------------------------------------------------------
+// R-A1 (root CODE HOLD on 2aeac7e1): reservation by-id RECOVERY factory
+
+const recoveryBinding = (rid = RID) => ({ ...B.reservation(), reservationId: rid });
+const byIdRequest = (id) => Object.freeze({ method: "GET", path: `/reservations/${id}`, query: {} });   // = reservation-worker.js:237 (pinned in test 2)
+
+test("R-A1: the id-bound reservation-recovery factory is accepted by the real reservation gate; maps the accepted by-id request once", async () => {
+  const sp = spies();
+  const r = createPhaseExecutors({ phase: "reservation-recovery", binding: recoveryBinding(), hostaway: sp.hostaway });
+  assert.equal(r.ok, true, `recovery factory: ${r.code}`);
+  assert.deepEqual(Object.keys(r.executors).sort(), [...PHASE_KEYS.reservation].sort());
+  const g = reservationWorkerGate({ env: ENV, adapterConfig: CFG, listings: new Map([[L, { currency: "USD" }]]), executors: r.executors, clock: Date.now });
+  assert.equal(g.ok, true, g.code);
+  await r.executors.retrieveReservation(byIdRequest(RID), { signal: sig() });
+  assert.equal(sp.h.length, 1);
+  assert.deepEqual(plainJSON(sp.h[0].req), { method: "GET", path: `/v1/reservations/${RID}`, query: {} });
+  // the unbound creation factory is unchanged: by-id still refuses, create still maps
+  const sp2 = spies(); const c = make("reservation", sp2);
+  await refusedZero(() => c.retrieveReservation(byIdRequest(RID), { signal: sig() }), sp2, "RESERVATION_UNBOUND", "creation factory by-id");
+  const plan = { ref: REF, listingId: L, arrivalDate: IN, departureDate: OUT, guests: 2, totalMinor: 50000, currency: "USD", guest: { ...GUEST } };
+  await c.createReservation(buildCreateReservationRequest(plan, CFG), { signal: sig() });
+  assert.equal(sp2.h.length, 1);
+});
+
+test("R-A1: recovery mode refuses every create, other / protected ids, and an unbound or malformed recovery binding (zero calls)", async () => {
+  const sp = spies();
+  const r = createPhaseExecutors({ phase: "reservation-recovery", binding: recoveryBinding(), hostaway: sp.hostaway });
+  assert.equal(r.ok, true, r.code);
+  const plan = { ref: REF, listingId: L, arrivalDate: IN, departureDate: OUT, guests: 2, totalMinor: 50000, currency: "USD", guest: { ...GUEST } };
+  await refusedZero(() => r.executors.createReservation(buildCreateReservationRequest(plan, CFG), { signal: sig() }), sp, "RECOVERY_MODE_NO_CREATE", "create in recovery");
+  await refusedZero(() => r.executors.createReservation(undefined, undefined), sp, "RECOVERY_MODE_NO_CREATE", "any create in recovery");
+  await refusedZero(() => r.executors.retrieveReservation(byIdRequest("6100002"), { signal: sig() }), sp, "PATH", "other id");
+  for (const id of ["70636076", "71045356", "71072615", "71081885"]) {
+    await refusedZero(() => r.executors.retrieveReservation(byIdRequest(id), { signal: sig() }), sp, "PATH", `protected ${id} via request`);
+    assert.deepEqual({ ...createPhaseExecutors({ phase: "reservation-recovery", binding: recoveryBinding(id), hostaway: sp.hostaway }) }, { ok: false, code: "BINDING_INVALID" }, `protected ${id} binding`);
+  }
+  for (const bad of [null, "0", "abc", 6100001, "61000011234567890"]) {
+    assert.deepEqual({ ...createPhaseExecutors({ phase: "reservation-recovery", binding: recoveryBinding(bad), hostaway: sp.hostaway }) }, { ok: false, code: "BINDING_INVALID" }, String(bad));
+  }
+  assert.equal(createPhaseExecutors({ phase: "reservation-recovery", binding: { ...recoveryBinding(), listingId: 603564, pilotException: PILOT_EXCEPTION }, hostaway: sp.hostaway }).ok, false);
+});
+
+test("R-A1: a missing-ref-echo create reply → assessRefNotEchoed candidate → recovery factory bound to it → by-id read normalises to the same identity", async () => {
+  const plan = { ref: REF, listingId: L, arrivalDate: IN, departureDate: OUT, guests: 2, totalMinor: 50000, currency: "USD", guest: { ...GUEST } };
+  const noEcho = { id: Number(RID), listingMapId: L, channelId: 2000, arrivalDate: IN, departureDate: OUT, totalPrice: 500, currency: "USD", status: "new", customFieldValues: [] };
+  const create = await make("reservation", spies({ reply: () => ({ httpStatus: 201, json: { status: "success", result: noEcho } }) }))
+    .createReservation(buildCreateReservationRequest(plan, CFG), { signal: sig() });
+  const gap = assessRefNotEchoed(create, plan, CFG);
+  assert.equal(gap.eligible, true, gap.code);                                 // the worker's CREATE_REF_NOT_ECHOED:READS_REQUIRED path
+  assert.equal(String(gap.reservationId), RID);
+  // the later runner binds THIS persisted candidate (create op result_ref / the queued by-id read's payload), never a raw reply alone
+  const sp = spies({ reply: () => ({ httpStatus: 200, json: { status: "success", result: { ...noEcho, customFieldValues: [{ customFieldId: 777016, value: REF }] } } }) });
+  const r = createPhaseExecutors({ phase: "reservation-recovery", binding: recoveryBinding(String(gap.reservationId)), hostaway: sp.hostaway });
+  assert.equal(r.ok, true, r.code);
+  const reply = await r.executors.retrieveReservation(byIdRequest(String(gap.reservationId)), { signal: sig() });
+  const env = unwrapEnvelope(reply.json); assert.equal(env.ok, true);
+  const n = normalizeReservation(env.result, CFG);
+  assert.equal(n.ok, true, n.code);
+  assert.deepEqual([String(n.reservation.reservationId), n.reservation.bookingRef, n.reservation.listingId, n.reservation.from, n.reservation.to], [RID, REF, L, IN, OUT]);
+  assert.equal(sp.h.length, 1, "one by-id read");
+});
+
+// ---------------------------------------------------------------------------------------------
+// R-A2 (root CODE HOLD on 2aeac7e1): native branded signal inspection
+
+test("R-A2: hostile signals — own aborted getter / data shadow, prototype fake, proxies, revoked — refused with zero caller getter runs and zero calls; no raw error", async () => {
+  let runs = 0;
+  const sp = spies(); const c = make("capture", sp);
+  const shadowGetter = () => { const s = new AbortController().signal; Object.defineProperty(s, "aborted", { get() { runs += 1; return false; } }); return s; };
+  const abortedShadow = () => { const ac = new AbortController(); ac.abort(); Object.defineProperty(ac.signal, "aborted", { value: false }); return ac.signal; };
+  const throwingGetter = () => { const ac = new AbortController(); ac.abort(); Object.defineProperty(ac.signal, "aborted", { get() { runs += 1; throw new Error("hostile"); } }); return ac.signal; };
+  const fake = () => Object.create(AbortSignal.prototype);
+  const proxied = () => new Proxy(new AbortController().signal, {});
+  const revoked = () => { const r = Proxy.revocable(new AbortController().signal, {}); r.revoke(); return r.proxy; };
+  // a genuine signal with an own (non-aborted) getter is still GENUINE and live: the native getter ignores the shadow → mapped, getter not run
+  await c.retrieveAccount({ signal: shadowGetter() });
+  assert.equal(sp.s.length, 1, "genuine live signal dispatched"); assert.equal(runs, 0, "own aborted getter never ran");
+  for (const [label, mk, code] of [["aborted + false data shadow", abortedShadow, "ABORTED"], ["aborted + throwing getter", throwingGetter, "ABORTED"],
+    ["prototype fake", fake, "SIGNAL_REQUIRED"], ["proxy", proxied, "SIGNAL_REQUIRED"], ["revoked proxy", revoked, "SIGNAL_REQUIRED"],
+    ["plain object", () => ({ aborted: false }), "SIGNAL_REQUIRED"], ["function", () => () => {}, "SIGNAL_REQUIRED"]]) {
+    const e = await c.retrieveAccount({ signal: mk() }).then(() => null, (x) => x);
+    assert.ok(e instanceof ExecutorRefusal && e.code === code, `${label}: ${e && (e.code || e.name)}`);
+  }
+  assert.equal(sp.s.length, 1, "no hostile signal reached the transport"); assert.equal(runs, 0, "no caller getter ran");
+  // ordinary controls
+  const ac = new AbortController(); ac.abort();
+  await refusedZero(() => c.retrieveAccount({ signal: ac.signal }), sp, "ABORTED", "ordinary aborted");
+  const live = new AbortController().signal;
+  await c.retrieveAccount({ signal: live });
+  assert.equal(sp.s.at(-1).x.signal, live, "the original genuine signal is passed through");
+});
+
+test("R-A2: a signal aborted DURING argument introspection (proxy trap) is re-checked natively right before the invocation → refused, zero calls", async () => {
+  const sp = spies(); const c = make("capture", sp); const k = make("cleanup", sp);
+  const mk = () => {
+    const ac = new AbortController();
+    const req = new Proxy({ method: "GET", path: `/reservations/${RID}`, query: {} }, { ownKeys(t) { ac.abort(); return Reflect.ownKeys(t); } });
+    return { ac, req };
+  };
+  const a = mk();
+  await refusedZero(() => c.retrieveReservation(a.req, { signal: a.ac.signal }), sp, "ABORTED", "hostaway");
+  const ac2 = new AbortController();
+  const params = new Proxy({ expand: ["latest_charge"] }, { ownKeys(t) { ac2.abort(); return Reflect.ownKeys(t); } });
+  await refusedZero(() => c.retrievePaymentIntent(PI, params, { signal: ac2.signal }), sp, "ABORTED", "stripe");
+  const ac3 = new AbortController();
+  const body = new Proxy({ cancelledBy: "host" }, { ownKeys(t) { ac3.abort(); return Reflect.ownKeys(t); } });
+  await refusedZero(() => k.cancelReservation({ method: "PUT", path: `/v1/reservations/${RID}/statuses/cancelled`, query: {}, body }, { signal: ac3.signal }), sp, "ABORTED", "write");
 });
