@@ -4,7 +4,7 @@
 
 **Labels.** Everything in §1 is **PRESENT** at `4e76227c` and cited `file:line`. Everything from §3 on is **PROPOSED**; nothing is implemented. Migrations 0001–0014 stay byte-identical.
 
-**Status (2026-11-03).** Root ACCEPTED revision 2 OFFLINE as the design at `99a78fcf`. **Implemented offline** on `feature/e7-scoped-recording-inbox` (migration 0015 + `lib/booking-db/recording-inbox.js`), pending root CODE review; implementation map **§11**. Not live readiness.
+**Status (2026-11-03).** Root ACCEPTED revision 2 OFFLINE as the design at `99a78fcf`. **Implemented offline** on `feature/e7-scoped-recording-inbox` (migration 0015 + `lib/booking-db/recording-inbox.js`) and ACCEPTED OFFLINE by root at `7df10c33` (not deployment / live readiness; D5 residual unchanged); implementation map **§11**. Not live readiness.
 
 **Boundaries of this document.** Read-only repository inspection only. No SQL / code / test / fixture / migration edit, no suite run, no DB / provider / credential / environment access.
 
