@@ -15,7 +15,9 @@ import pg from "pg";
 import { startMigratedDatabase } from "./harness.mjs";
 import * as F from "./fixtures.mjs";
 import { applyEvent, loadIntent, createIntentRecord, collectGuestDetails, beginPayStep, recordCheckoutSession } from "../../lib/booking-db/repo.js";
-import { claimNextOperation, completeOperation } from "../../lib/booking-db/operations.js";
+import { claimNextOperation, completeOperation, requestRead, recordProviderEvidence } from "../../lib/booking-db/operations.js";
+import { loadRecoveryFacts } from "../../lib/booking-db/recovery.js";
+import { planRecovery } from "../../lib/checkout/recovery-plan.js";
 import { runOrchestratorStep, PROTECTED_HOSTAWAY_RESERVATION_IDS } from "../../lib/booking-db/reservation-worker.js";
 import { priceStay } from "../../lib/checkout/server-pricer.js";
 import { readDirectPolicyFromEnv } from "../../lib/direct-policy.js";
@@ -438,7 +440,7 @@ test("SYNTHETIC derivation (pure, on a mutated COPY of real facts): conflicts, p
     ["not reservation phase", mut((f) => { f.intent.state = "reservation_confirmed"; }), "NOT_RESERVATION_PHASE"]
   ];
   for (const [name, f, expected] of cases) {
-    const r = deriveRecoveryCandidate(f);
+    const r = derive(f);
     if (expected === undefined) { assert.equal(r.ok, true, `${name}: ${r.code}`); assert.equal(r.id, rid); }
     else assert.deepEqual({ ...r }, { ok: false, code: expected }, name);
     assert.ok(Object.isFrozen(r));
@@ -563,3 +565,132 @@ test("PG: accepted pg query promises pass the stricter native rule; a real COMMI
 });
 
 test("whole suite: zero network attempts", () => { assert.equal(netAttempts, 0); });
+
+// =================================================================================================================================
+// Root CODE HOLD on e081b1e4 — R-C1 (positive candidate must carry a usable OBSERVED id) / R-C2 (getter-free option validation)
+const USABLE_ID = /^[1-9][0-9]{0,15}$/;                                       // = accepted adapter RID_RE (executor-adapters.mjs:73)
+/** independent invariant used by every derivation assertion: ok:true ⇒ a non-null canonical usable id */
+function derive(f) {
+  const r = deriveRecoveryCandidate(f);
+  if (r.ok) assert.ok(typeof r.id === "string" && USABLE_ID.test(r.id) && !PROTECTED_HOSTAWAY_RESERVATION_IDS.includes(r.id), `ok:true without a usable id: ${JSON.stringify(r)}`);
+  return r;
+}
+const SID = "00000000-0000-4000-8000-0000000000d1"; const LK = "a1000000-0000-4000-8000-0000000000d1"; const CR = "a1000000-0000-4000-8000-0000000000d2";
+const AT = "a1000000-0000-4000-8000-0000000000d3";
+/** SYNTHETIC source-b-only facts (no a / c) with one API lookup */
+function bFacts({ ext = "6100001", obs = "6100001", omitObs = false, create = null, attemptId = null } = {}) {
+  const observed = { bookingRef: "MV-SYNTH01", matchCount: 1, listingId: 891001, from: "2026-12-04", to: "2026-12-06", totalMinor: 50000, currency: "USD" };
+  if (!omitObs) observed.reservationId = obs;
+  const ops = [{ id: LK, opType: "hostaway.lookup_reservation", state: "succeeded", payload: { ref: "MV-SYNTH01" }, resultRef: null, lateResultRef: null }];
+  if (create) ops.push({ id: CR, opType: "hostaway.create_reservation", state: create.state, payload: {}, resultRef: create.resultRef, lateResultRef: null });
+  return { version: RUN_FACTS_VERSION, intentId: SID,
+    intent: { id: SID, ref: "MV-SYNTH01", state: "reservation_unknown", listingId: 891001, from: "2026-12-04", to: "2026-12-06", finalTotalMinor: 50000, currency: "USD", hostawayReservationId: null },
+    operations: ops, reservationAttempts: create ? [{ id: AT, operationId: CR, bookingRef: "MV-SYNTH01", hostawayReservationId: attemptId }] : [],
+    reservationEvidence: [{ id: "e0000000-0000-4000-8000-0000000000d1", kind: "hostaway_reservation", source: "hostaway_api", externalRef: ext, status: "found_active", observedAt: 1,
+      readOperationId: LK, readIntentId: SID, readOpType: "hostaway.lookup_reservation", selector: { ref: "MV-SYNTH01", reservationId: null }, observed }] };
+}
+
+test("R-C1 SYNTHETIC: source b requires a canonical OBSERVED id agreeing with external_ref; incomplete b is never positive; ok ⇒ usable id", () => {
+  const cases = [
+    ["agreeing positive b", bFacts(), { ok: true, id: "6100001" }],
+    ["16-digit boundary", bFacts({ ext: "9".repeat(16), obs: "9".repeat(16) }), { ok: true, id: "9".repeat(16) }],
+    ["numeric observed id agreeing", bFacts({ obs: 6100001 }), { ok: true, id: "6100001" }],
+    ["observed id missing (no a / c)", bFacts({ omitObs: true }), "KNOWN_ID_WITHOUT_CANDIDATE"],
+    ["observed id null", bFacts({ obs: null }), "KNOWN_ID_WITHOUT_CANDIDATE"],
+    ["observed id empty", bFacts({ obs: "" }), "KNOWN_ID_WITHOUT_CANDIDATE"],
+    ["observed id ≠ external_ref", bFacts({ obs: "6100002" }), "EVIDENCE_IDENTITY_MISMATCH"],
+    ["external id null", bFacts({ ext: null, obs: null }), "FACT_MALFORMED"],
+    ["external id missing", (() => { const f = bFacts(); delete f.reservationEvidence[0].externalRef; return f; })(), "FACT_MALFORMED"],
+    ["external id non-numeric", bFacts({ ext: "abc", obs: "abc" }), "FACT_MALFORMED"],
+    ["external id leading zero", bFacts({ ext: "0610001", obs: "0610001" }), "FACT_MALFORMED"],
+    ["external id oversize (17 digits)", bFacts({ ext: "1".repeat(17), obs: "1".repeat(17) }), "FACT_MALFORMED"],
+    ["observed id oversize", bFacts({ obs: "1".repeat(17) }), "FACT_MALFORMED"],
+    ["valid a + incomplete b, same id", bFacts({ omitObs: true, create: { state: "succeeded", resultRef: "6100001" } }), { ok: true, id: "6100001", sources: ["a"] }],
+    ["valid a + incomplete b, other id", bFacts({ ext: "6100009", omitObs: true, create: { state: "succeeded", resultRef: "6100001" } }), "RESERVATION_ID_CONFLICT"],
+    ["valid a + agreeing b", bFacts({ create: { state: "succeeded", resultRef: "6100001" } }), { ok: true, id: "6100001", sources: ["a", "b"] }],
+    ["oversize result_ref (a)", bFacts({ omitObs: true, create: { state: "succeeded", resultRef: "1".repeat(17) } }), "FACT_MALFORMED"],
+    ["attempt id differs from incomplete b", bFacts({ omitObs: true, create: { state: "outcome_unknown", resultRef: null }, attemptId: "6100003" }), "KNOWN_ID_WITHOUT_CANDIDATE"]
+  ];
+  for (const [name, f, want] of cases) {
+    const r = derive(f);
+    if (typeof want === "string") assert.deepEqual({ ...r }, { ok: false, code: want }, name);
+    else { assert.equal(r.ok, true, `${name}: ${r.code}`); assert.equal(r.id, want.id, name); if (want.sources) assert.deepEqual([...r.sources], want.sources, name); }
+  }
+});
+
+test("R-C1 PG: incomplete lookup evidence (no observed id) appended through ACCEPTED evidence APIs over a real succeeded lookup op — snapshot keeps it incomplete, derivation refuses; planner parity: not proven", async () => {
+  const w = world(); w.mode.create = "appliedThen503"; const bk = await authorizedBooking(w); const L = lane(w, bk);
+  await L.R(); await L.R();
+  assert.equal(await state(bk.id), "reservation_unknown");
+  const create = (await ownerAll("SELECT id, dispatched_at FROM booking.external_operations WHERE intent_id = $1 AND op_type = 'hostaway.create_reservation'", [bk.id]))[0];
+  const rid = String([...w.res.keys()][0]);
+  const now = create.dispatched_at.getTime() + 3 * MIN;                       // FRESH by the accepted 2-minute rule; still in the past
+  assert.ok(now < Date.now());
+  // accepted APIs only: queue the read, claim it, complete it, record what it "observed" (labelled SYNTHETIC provider content)
+  const readId = await requestRead(db.app, bk.id, "hostaway.lookup_reservation", bk.ref, { now });
+  const claimed = await claimNextOperation(db.app, { workerId: "rf-stage", now, opId: readId });
+  assert.equal(claimed.id, readId);
+  F.ok(await completeOperation(db.app, readId, { workerId: "rf-stage", now, outcome: { status: "succeeded" } }));
+  const ev = await recordProviderEvidence(db.app, { readOpId: readId, kind: "hostaway_reservation", externalRef: rid, status: "found_active",
+    observed: { bookingRef: bk.ref, matchCount: 1, listingId: bk.listingId, from: bk.stay.from, to: bk.stay.to, totalMinor: bk.total, currency: "USD" } });
+  assert.equal(ev.ok, true, `validate_evidence (0003:89–90) accepts found_active without reservationId: ${ev.error}`);
+  const s = await snapshot(bk.id);
+  assert.equal(s.ok, true, s.code);
+  const row = s.facts.reservationEvidence.find((e) => e.readOperationId === readId);
+  assert.deepEqual([row.externalRef, row.observed.reservationId, row.observed.bookingRef, row.observed.matchCount, row.selector.ref], [rid, null, bk.ref, 1, bk.ref]);
+  const cand = derive(s.facts);
+  assert.equal(cand.ok, false, "incomplete lookup evidence is never a positive candidate");
+  assert.equal(cand.code, "KNOWN_ID_WITHOUT_CANDIDATE");
+  // planner parity on the SAME persisted facts (accepted loader + pure planner; nothing is applied)
+  const pf = await loadRecoveryFacts(db.app, create.id);
+  assert.ok(pf.evidence.some((e) => e.readOpType === "hostaway.lookup_reservation" && e.observed.reservationId === undefined));
+  const plan = planRecovery({ ...pf, now: Date.now() });
+  assert.ok(!(plan.kind === "event" && ["RECONCILED_RESERVATION_FOUND", "RESERVATION_SUCCEEDED"].includes(plan.event.type)), `planner must not prove it: ${JSON.stringify(plan.kind === "event" ? plan.event.type : plan)}`);
+  assert.ok(!(plan.event && plan.event.reservation), "the planner never derives a reservation from incomplete lookup evidence");
+  console.log(`# R-C1 planner parity on incomplete lookup: ${plan.kind}${plan.event ? `:${plan.event.type}` : ""}${plan.code ? `:${plan.code}` : ""}`);
+});
+
+test("R-C2: option validation is ONE own-data-descriptor snapshot; getters never run; introspection faults are code-only FACTS_ARGUMENT_INVALID with zero statements", async () => {
+  const g = fakeGuard(); const c = fakeClient(okRows);
+  const ok = { client: c, intentId: ID, guard: g.guard, deadline: 15_000 };
+  let runs = 0;
+  const getter = (v) => ({ enumerable: true, configurable: true, get() { runs += 1; throw new Error("CALLER_DATA"); } });
+  class ProtoGetterClient { get query() { runs += 1; throw new Error("CALLER_DATA"); } }
+  const ownQueryGetter = Object.defineProperty({}, "query", getter());
+  const revoked = Proxy.revocable({ ...ok }, {}); revoked.revoke();
+  const bads = [
+    Object.defineProperty({ intentId: ID, guard: g.guard, deadline: 1 }, "client", getter()),
+    Object.defineProperty({ client: c, guard: g.guard, deadline: 1 }, "intentId", getter()),
+    { ...ok, client: ownQueryGetter }, { ...ok, client: new ProtoGetterClient() }, { ...ok, client: new Proxy(c, {}) },
+    revoked.proxy, new Proxy({ ...ok }, { ownKeys() { runs += 1; throw new Error("CALLER_DATA"); } }), new Proxy({ ...ok }, {}),
+    Object.create({ ...ok }), Object.assign(Object.create({ inherited: 1 }), ok), { ...ok, extra: 1 }, (() => { const o = { ...ok }; delete o.deadline; return o; })(),
+    { ...ok, [Symbol("s")]: 1 }, Object.defineProperty({ client: c, intentId: ID, guard: g.guard }, "deadline", { value: 1, enumerable: false }),
+    Object.defineProperty({ client: c, intentId: ID, guard: g.guard, deadline: 1 }, "__proto__", { value: {}, enumerable: true }),
+    { ...ok, guard: new Proxy(g.guard, {}) }, { ...ok, client: { query: new Proxy(() => {}, {}) } }, { ...ok, client: { query: "x" } }, new (class Opt { constructor() { Object.assign(this, ok); } })()
+  ];
+  for (const [i, b] of bads.entries()) {
+    for (const fn of [readRunSnapshot, readGuestBinding]) {
+      let r;
+      await assert.doesNotReject(async () => { r = await fn(b); }, `#${i} never throws`);
+      assert.deepEqual({ ...r }, { ok: false, code: "FACTS_ARGUMENT_INVALID", failure: "not_started", clientDisposition: "unused", statementsIssued: 0 }, `#${i}`);
+      assert.ok(!JSON.stringify(r).includes("CALLER"));
+    }
+  }
+  assert.equal(runs, 0, "no caller getter / trap code ran");
+  assert.equal(c.calls.length, 0, "zero statements");
+  // controls: null-prototype options; a class-instance client with a PROTOTYPE data method; genuine pg report / app clients
+  const nul = Object.assign(Object.create(null), ok);
+  assert.equal((await readRunSnapshot(nul)).ok, true);
+  class ProtoClient { constructor() { this.calls = []; } query(sql) { this.calls.push(sql); return Promise.resolve(okRows(sql)); } }
+  assert.equal((await readRunSnapshot({ client: new ProtoClient(), intentId: ID, guard: fakeGuard().guard, deadline: 15_000 })).ok, true);
+  const w = world(); const bk = await authorizedBooking(w);
+  const rc = await reportPool.connect(); const rg = realGuard();
+  const s = await readRunSnapshot(Object.assign(Object.create(null), { client: rc, intentId: bk.id, guard: rg, deadline: deadlineOf(rg) }));
+  rc.release(); assert.equal(s.ok, true, s.code);
+  const ac = await db.app.connect(); const ag = realGuard();
+  const gr = await readGuestBinding(Object.assign(Object.create(null), { client: ac, intentId: bk.id, guard: ag, deadline: deadlineOf(ag) }));
+  ac.release(); assert.equal(gr.ok, true, gr.code);
+  // a genuine DB error after valid options stays on the db / destroy path (never reclassified as bad input)
+  const rej = fakeClient((q, n) => (n === 2 ? "reject" : okRows(q)));
+  assert.deepEqual([(await readRunSnapshot({ client: rej, intentId: ID, guard: fakeGuard().guard, deadline: 15_000 })).code, rej.calls.length], ["DB_FAILURE", 2]);
+});

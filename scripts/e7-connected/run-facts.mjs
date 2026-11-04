@@ -8,6 +8,7 @@
 // Facts are explicit selected fields, copied and frozen; no guest / contact data and no raw provider body is ever selected by the
 // report-role snapshot. The separate guest read is one app-role statement and its values live only in the returned object.
 // A frozen snapshot is a basis, NEVER a fence: accepted workers may commit new facts concurrently after it (contract §4).
+import { types } from "node:util";
 import { createLifecycle, LIMITS } from "./run-guard.mjs";
 import { PROTECTED_HOSTAWAY_RESERVATION_IDS } from "../../lib/checkout/compensation-proof.js";
 
@@ -20,7 +21,7 @@ export const RESERVATION_PHASE_STATES = Object.freeze(["payment_authorized", "re
 export const OP_TYPES = Object.freeze({ CREATE: "hostaway.create_reservation", LOOKUP: "hostaway.lookup_reservation", RETRIEVE: "hostaway.retrieve_reservation" });
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const RES_ID_RE = /^[1-9][0-9]{0,18}$/;
+const RES_ID_RE = /^[1-9][0-9]{0,15}$/;           // = the accepted adapter RID_RE / reservation-worker by-id selector rule (16 digits, no leading 0)
 const REF_RE = /^MV-[A-Z0-9]{6,10}$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const freeze = Object.freeze;
@@ -100,15 +101,37 @@ const rowsOf = (res) => {
 // ---- guarded statement execution ----------------------------------------------------------------------------------------------------
 /** validate the caller-supplied dependencies; the guard must be one created by the accepted createGuard (checked through the accepted
  *  createLifecycle provenance check — a throwaway lifecycle, no side effects) */
+const OPTION_KEYS = Object.freeze(["client", "deadline", "guard", "intentId"]);
+const OBJECT_PROTO = Object.prototype;
+/** ONE own-enumerable-data-descriptor snapshot of the options (exact keys; accessors / symbols / hidden / extra / __proto__ / proxies /
+ *  exotic prototypes refused) and a getter-free lookup of the client's `query` DATA method along its prototype chain (prototype methods,
+ *  as on a real pg client, are supported; an accessor anywhere on the lookup path is refused, never executed). Any introspection fault
+ *  → null (FACTS_ARGUMENT_INVALID, zero statements). No caller error is returned or thrown. */
 function deps(input) {
-  if (input === null || typeof input !== "object") return null;
-  const { client, intentId, guard, deadline } = input;
-  if (typeof intentId !== "string" || !UUID_RE.test(intentId) || typeof deadline !== "number" || !Number.isFinite(deadline)) return null;
-  try { createLifecycle({ guard }); } catch { return null; }
-  if (client === null || typeof client !== "object") return null;
-  const query = client.query;
-  if (typeof query !== "function") return null;
-  return { client, query, intentId, guard, deadline };
+  try {
+    if (input === null || typeof input !== "object" || types.isProxy(input)) return null;
+    const proto = getProto(input);
+    if (proto !== OBJECT_PROTO && proto !== null) return null;
+    const d = Object.getOwnPropertyDescriptors(input);
+    const ks = Reflect.ownKeys(d);
+    if (ks.length !== OPTION_KEYS.length) return null;
+    for (const k of ks) if (typeof k !== "string" || !OPTION_KEYS.includes(k) || !("value" in d[k]) || d[k].enumerable !== true) return null;
+    const client = d.client.value; const intentId = d.intentId.value; const guard = d.guard.value; const deadline = d.deadline.value;
+    if (typeof intentId !== "string" || !UUID_RE.test(intentId) || typeof deadline !== "number" || !Number.isFinite(deadline)) return null;
+    try { createLifecycle({ guard }); } catch { return null; }          // accepted provenance check (no side effects)
+    if (client === null || typeof client !== "object" || types.isProxy(client)) return null;
+    let query = null;
+    for (let o = client, depth = 0; o !== null && depth < 8; o = getProto(o), depth += 1) {
+      if (types.isProxy(o)) return null;
+      const qd = getDesc(o, "query");
+      if (qd === undefined) continue;
+      if (!("value" in qd) || typeof qd.value !== "function" || types.isProxy(qd.value)) return null;
+      query = qd.value;
+      break;
+    }
+    if (!query) return null;
+    return { client, query, intentId, guard, deadline };
+  } catch { return null; }
 }
 const failure = (code, failureKind, clientDisposition, statementsIssued, extra = {}) =>
   freeze({ ok: false, code, failure: failureKind, clientDisposition, statementsIssued, ...extra });
@@ -305,11 +328,19 @@ export function deriveRecoveryCandidate(facts) {
     if (s.id !== id) return refuse(s.open ? "OPEN_READ_CONFLICT" : "RESERVATION_ID_CONFLICT");
   }
   if (f.pendingCreate) return refuse("CANDIDATE_BEFORE_CREATE");
+  if (typeof id !== "string" || !RES_ID_RE.test(id) || isProtected(id)) return refuse("FACT_MALFORMED");   // defensive: ok:true ⇒ a usable bound id
   return freeze({ ok: true, id, sources: freeze([...new Set(f.candidates.map((x) => x[0]))].sort()), adopted: f.intent.hostawayReservationId ?? null });
 }
 
 const inconsistent = () => { throw new Error("FACTS_INCONSISTENT"); };
-const canonId = (v) => (v === null || v === undefined ? null : typeof v === "string" && RES_ID_RE.test(v) ? v : typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? String(v) : bad());
+/** an OPTIONAL id: null / undefined / "" → null (missing); otherwise it must be canonical (string or safe positive integer), else malformed */
+const canonId = (v) => {
+  if (v === null || v === undefined || v === "") return null;
+  const t = typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? String(v) : v;
+  return typeof t === "string" && RES_ID_RE.test(t) ? t : bad();
+};
+/** a REQUIRED id (e.g. evidence external_ref, NOT NULL in the schema): missing or non-canonical → malformed */
+const reqId = (v) => { const t = canonId(v); return t === null ? bad() : t; };
 const arr = (v) => (Array.isArray(v) ? v : bad());
 
 function collect(facts) {
@@ -357,10 +388,10 @@ function collect(facts) {
     const op = e.readOperationId ? opById.get(e.readOperationId) : null;
     if (!op || e.readIntentId !== intentId || op.opType !== e.readOpType || ![OP_TYPES.LOOKUP, OP_TYPES.RETRIEVE].includes(op.opType)) inconsistent();
     if (e.status !== "found_active") continue;
-    const ext = canonId(e.externalRef);
-    const obsId = canonId(e.observed.reservationId);
-    if (obsId && obsId !== ext) { out.identityMismatch = true; continue; }
-    out.known.add(ext);
+    const ext = reqId(e.externalRef);
+    const obsId = canonId(e.observed.reservationId);                      // missing / empty → incomplete (never filled in from external_ref)
+    out.known.add(ext);                                                    // a provider-returned id is ALWAYS part of the conflict set
+    if (obsId !== null && obsId !== ext) { out.identityMismatch = true; continue; }
     if (op.opType === OP_TYPES.RETRIEVE) {
       if (e.selector.reservationId !== ext) out.identityMismatch = true;      // a by-id read returned another id
       continue;
@@ -377,7 +408,8 @@ function collect(facts) {
     let missing = false; let mismatch = false;
     for (const [v, ok] of checks) { if (v === null || v === undefined || v === "") missing = true; else if (!ok(v)) mismatch = true; }
     if (mismatch) { out.identityMismatch = true; continue; }
-    if (!missing) out.candidates.push(["b", ext]);
+    // planner parity (recovery-plan.js planCreate: lo.reservationId missing → not proven): a positive source b needs the OBSERVED id
+    if (!missing && obsId !== null && obsId === ext) out.candidates.push(["b", ext]);
   }
   return out;
 }

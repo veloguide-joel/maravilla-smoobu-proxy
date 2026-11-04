@@ -338,6 +338,7 @@ The core supplies closures over **its** client, for example `subscribe = (ev, h)
 - has a timer, env, fs, fetch or SDK of its own.
 
 **Imports:**
+- `node:util` (`types.isProxy`, for option / client proxy refusal; root R-C2);
 - accepted `run-guard` (`createLifecycle`, `LIMITS`);
 - the pure `PROTECTED_HOSTAWAY_RESERVATION_IDS` (`lib/checkout/compensation-proof.js:23`);
 - no worker, and no new importer of the pinned Hostaway module. Both containment pin suites still pass.
@@ -359,12 +360,21 @@ The core supplies closures over **its** client, for example `subscribe = (ev, h)
 | `readGuestBinding({ client, intentId, guard, deadline })` | → `Promise<frozen GuestResult>` (§2.3.4) |
 | `deriveRecoveryCandidate(facts)` | → frozen `{ ok:true, id, sources, adopted }` / `{ ok:false, code }` (§5.1) |
 
-**Arguments.**
-- `intentId` must be a canonical lowercase UUID.
-- `deadline` is a finite number.
-- `guard` must come from `createGuard`.
-- `client` must have a `query(text, params)` function. It must return a native promise; the accepted `pg` driver's does (tested).
-- Anything else → `FACTS_ARGUMENT_INVALID`, with nothing sent.
+**Arguments (corrected per root R-C2).**
+- **Options snapshot.** The options object is read through **one own enumerable data-descriptor snapshot**:
+  - exactly `client`, `deadline`, `guard`, `intentId`;
+  - prototype `Object.prototype` or `null`;
+  - refused: accessors, symbols, non-enumerable / extra / missing keys, own `__proto__`, proxies (incl. revoked / throwing), class instances, inherited keys.
+- **Values.**
+  - `intentId` must be a canonical lowercase UUID, and `deadline` a finite number.
+  - `guard` must come from `createGuard`, checked through the accepted `createLifecycle`.
+- **Client.** `client` must be a non-proxy object. Its `query` is found by walking the prototype chain with `getOwnPropertyDescriptor` only:
+  - the first `query` found must be a **data** property holding a non-proxy function;
+  - prototype methods are supported, as on a real `pg` client;
+  - an accessor is refused **without being executed**.
+  - It must return a native promise; the accepted `pg` driver's does (tested).
+- **Failure.** Anything else, or any introspection fault, → `FACTS_ARGUMENT_INVALID` (`not_started`, `unused`, zero statements). No caller getter runs, and no caller error is returned or thrown.
+- **DB errors.** A real query / COMMIT error after valid options stays on the `db` / `destroy` path; it is never reclassified as bad input.
 
 #### 2.3.2 Queries (source-checked; every statement parameterized by `$1 = intentId`, explicit columns, deterministic order)
 
@@ -434,7 +444,14 @@ The core supplies closures over **its** client, for example `subscribe = (ev, h)
 - `refusal` / `healthy`: `ROLE_NOT_APP` (not an app member, a report member, or privileged), `GUEST_NOT_FOUND`, `FACT_MALFORMED`.
 - `db` / `destroy` and `not_started` / `unused`: as above. A report login → `DB_FAILURE`.
 
-#### 2.3.5 Deviation
+#### 2.3.5 Errata after root CODE HOLD on `e081b1e4` (corrected on the same branch)
+
+| Item | Gap at `e081b1e4` (root probe) | Correction | Red / green |
+|---|---|---|---|
+| R-C1 | Source-b lookup evidence with `observed.reservationId: null` gave `{ ok:true, id:'6100001', sources:['b'] }`; with `external_ref` null too, `{ ok:true, id:null }`. A 17-digit id was accepted | §5.1 (b) above: an observed id is required; strict 16-digit ids; `ok:true` ⇒ a usable id | New synthetic + PG-staged tests fail on `e081`, pass now. The PG test appends incomplete evidence via `requestRead` → `claimNextOperation` → `completeOperation` → `recordProviderEvidence` (accepted APIs, no raw lifecycle writes). The snapshot keeps `observed.reservationId: null`; the derivation → `KNOWN_ID_WITHOUT_CANDIDATE`; the accepted planner on the same rows → `RECONCILIATION_INCONCLUSIVE` (not proven) |
+| R-C2 | `deps` destructured the options and read `client.query` outside any catch: a throwing `client` getter ran, and both functions rejected with the raw caller error | One own-data-descriptor snapshot plus a getter-free `query` lookup, faults contained | New test (own client / query getter, prototype getter, revoked / throwing / plain proxies, inherited / extra / symbol / hidden / `__proto__` keys, class instances, proxied guard / query): 0 getter runs, 0 statements, code only. Null-prototype options and genuine report / app `pg` clients pass |
+
+#### 2.3.6 Deviation
 
 `checkSameDatabase` (§7.8, proposed in revision 4 for this module) is **not** part of Slice C: root's Slice C scope named the snapshot, the guest read and the candidate derivation only. It stays a core-slice item.
 
@@ -566,12 +583,21 @@ No transaction is held across a worker or network call. A failure inside the sna
 - **Protected scan.** Over `intent.hostaway_reservation_id`, every op's `result_ref` / `late_result_ref` / `payload.reservationId`, the attempt id, every evidence `external_ref`, observed id and selector.
 - **Candidates:**
   - **(a)** a `succeeded` create's canonical `result_ref`;
-  - **(b)** API lookup evidence that meets all of:
+  - **(b)** API lookup evidence that meets all of (corrected per root R-C1):
     - `found_active`;
     - selector `= intent.ref` and `observed.bookingRef = intent.ref`;
     - `matchCount === 1`;
-    - observed `reservationId`, if present, `= external_ref`;
-    - `listingId` / `from` / `to` / `totalMinor` / `currency` equal to the intent: a mismatch refuses, and a missing value makes the evidence no candidate;
+    - a **present, canonical, non-protected observed `reservationId` equal to `external_ref`**;
+    - `listingId` / `from` / `to` / `totalMinor` / `currency` equal to the intent.
+
+    How each failure is treated:
+    - A missing / null / empty observed id makes the evidence **incomplete, never a positive source**. That is planner parity: `planCreate` reads `lo.reservationId` and returns not proven when it is missing (`recovery-plan.js:253–254`). `validate_evidence` does not require it for `found_active` (`0003:89–90`), so incomplete evidence is legal in PG (staged and tested).
+    - An observed id ≠ `external_ref` → `EVIDENCE_IDENTITY_MISMATCH`.
+    - A missing / non-canonical `external_ref` → `FACT_MALFORMED`.
+    - An identity-field mismatch refuses.
+    - Any missing identity field → no candidate.
+    - Incomplete evidence's `external_ref` still joins the known-id conflict set.
+  - **Id rule.** Every id must be `^[1-9][0-9]{0,15}$`: 16 digits, no leading zero, equal to the accepted adapter's `RID_RE` (`executor-adapters.mjs:73`) and the worker's by-id selector rule (`reservation-worker.js:235`). Missing / null / empty optional ids are "absent". Any other non-canonical id → `FACT_MALFORMED`. `ok:true` additionally requires the returned id to match that rule and to be non-protected, checked defensively and asserted independently by every test.
   - **(c)** the adopted `intents.hostaway_reservation_id`.
 - **Known returned ids** (the planner's `RESERVATION_ID_CONFLICT` set): the create's `result_ref` (any state) and `late_result_ref`, the attempt row's `hostaway_reservation_id`, the adopted id, and every `found_active` API evidence id (lookup **and** by-id).
 - **Selectors.** Every `hostaway.retrieve_reservation` op's `payload.reservationId`, marked open when the op is `pending` / `in_flight`.
@@ -1059,7 +1085,8 @@ Run the focused unit suite and `npm test`. No DB run.
 | RR barrier | A real accepted-worker step committed mid-snapshot is invisible to it (same version / ops / transitions); a later snapshot sees it |
 | No-echo candidate (a) | Adopted id NULL; the lane derives each step's factory from run-facts and reaches `reservation_confirmed` with one create; then `NOT_RESERVATION_PHASE` |
 | Lookup candidate (b) | Ambiguous create; lookup evidence joined to its read op / selector; open case present as a fact; one create |
-| SYNTHETIC derivation | 27 cases: conflicts, protected refs (result / attempt / evidence / selector), open vs historical by-id selectors, attempt / late ids, pending create, identity mismatches, duplicate ref, association / consistency violations, malformed shapes |
+| R-C1 / R-C2 corrections | See §2.3.5 (3 tests; red on `e081b1e4`, green now) |
+| SYNTHETIC derivation | 27 cases (every `ok:true` asserted to carry a usable id): conflicts, protected refs (result / attempt / evidence / selector), open vs historical by-id selectors, attempt / late ids, pending create, identity mismatches, duplicate ref, association / consistency violations, malformed shapes |
 | SYNTHETIC cap+1 | Each capped query → `FACT_LIMIT_EXCEEDED` after an acknowledged COMMIT; exactly `cap` rows accepted |
 | SYNTHETIC faults | Rejection at each of the 10 statements (COMMIT included) and timeouts (BEGIN / INTENT / COMMIT): no later statement, no `release` / `end`, no message leak. Mid-sequence cap → destroy. Guard fault before the first statement → zero queries. Marker / role / malformed / foreign-id / non-result refusals |
 | Native rule | A real `pg` query promise passes `isNativePromise` |
