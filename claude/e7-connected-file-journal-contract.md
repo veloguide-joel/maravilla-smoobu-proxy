@@ -1,6 +1,8 @@
-# E7 connected-test runner — FILE JOURNAL CONTRACT, revision 2 (Slice F IMPLEMENTED offline; HOLD R-F1 / R-F2 corrected, pending root CODE re-review)
+# E7 connected-test runner — FILE JOURNAL CONTRACT, revision 2 (Slice F ACCEPTED offline at `94c29abf`; integration rehearsal: see pointer)
 
 **Revision 1** (`d365d816`, branch `feature/e7-connected-file-journal-contract` from `dfdbc32c`, DOCS ONLY) was root DESIGN **ACCEPTED** as the basis for Slice F with binding clarifications 1–7. **Revision 2** (this file; branch `feature/e7-connected-file-journal` from exact `d365d816`) records the implementation: new `scripts/e7-connected/run-journal-file.mjs`, new `test/e7-connected-run-journal-file.test.mjs`, this contract (corrections + §9), a status pointer in the runner contract. Nothing else changed (A–E, core, adapters, workers, pins, packages untouched). Sections 0–8 below are revision 1 with the clarification corrections applied in place; §9 is the implementation / resolution map.
+
+**Status pointer.** Root CODE RE-REVIEW **ACCEPTED** offline Slice F at `94c29abf` (root ran the focused file suite 16/16 incl. the crash test, no GC fd warnings, and A/B/D/F 75/75; R-F1 / R-F2 CLOSED). Next: a TESTS + REPORT ONLY integration rehearsal of the accepted core with this file journal on disposable PG — `claude/e7-connected-file-journal-rehearsal.md` (branch `feature/e7-connected-file-journal-rehearsal`; pending root review). This contract is unchanged otherwise.
 
 **What this is.** The smallest **owner-run, local, file-backed** implementation of the accepted journal interface `{ read(), append(record) }` that the accepted core already consumes (`run-core.mjs:149`, `:258–268`, `:360–366`), using D's accepted record / chain / start rules unchanged. Its purpose is **offline crash / restart preparation**: after a process death, the next invocation must find the evidence and refuse (V1: **no resume**).
 
