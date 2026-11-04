@@ -1498,7 +1498,9 @@ Why the two survivors are equivalent:
 - TAP is in the session scratchpad: `gnf/tap/rc-*.tap`, `e72-adapt-*.tap`; per-mutant `gnf/mut/M28–M35.tap`.
 - **Deviation 1 of §15.6 is superseded.** The observation functions stay VOLATILE, and consistency now comes from the enforced READ ONLY REPEATABLE READ caller transaction, not from a STABLE label.
 
-## 16. Stage 2 implementation map (OFFLINE / INJECTED MOCK; root ACCEPT of `35097c56` as Stage 1 + Stage 2 authorization; root CODE HOLD on `44e8d0a8` → gate correction R-G1 in §16.6; pending root CODE re-review)
+## 16. Stage 2 implementation map (OFFLINE / INJECTED MOCK; root ACCEPT of `35097c56` as Stage 1 + Stage 2 authorization; root CODE HOLD on `44e8d0a8` → gate correction R-G1 in §16.6; root ACCEPTED `ede4c43c` OFFLINE as Stage 2)
+
+**Status pointer (2026-11-04):** readiness consolidation in `claude/e7-offline-readiness.md` on `feature/e7-offline-readiness` (DOCS ONLY, pending root readiness review).
 
 **Branch** `feature/e7-guest-notification-worker`, cut from exact `35097c56518ff6ca922d8698ff93a5b7248cfce9`. Stage 1 code acceptance is not merge / deploy / live authorization; this stage adds no route, scheduler, runner, adapter, config, dependency or UI.
 
