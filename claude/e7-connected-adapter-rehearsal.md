@@ -9,6 +9,8 @@
 
 **Unchanged:** runtime, the adapter module, `lib/`, workers, migrations, fixtures, config, packages, routes. There is no runner or CLI.
 
+**Status pointer (2026-11-04):** root ACCEPTED this rehearsal as OFFLINE integration evidence at `9f13c816` (findings adopted; the §9.2a ordering is corrected in the manifest). An open ambiguity case is a STOP for the proposed connected run before capture. The runner contract is `claude/e7-connected-runner-contract.md` on `feature/e7-connected-runner-contract` (DOCS ONLY, PROPOSED). The original lifecycle rehearsal's notification claims stay separate.
+
 **Status.** OFFLINE / INJECTED-FAKE evidence on a disposable local TEST-marked PostgreSQL, CLAUDE-RUN. **Not** provider, account, payment, deployment or live readiness; nothing here opens a live gate, and every owner input stays UNSET.
 
 ## 1. What was rehearsed, and how

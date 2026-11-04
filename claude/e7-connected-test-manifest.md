@@ -1,6 +1,6 @@
 # E7 connected-test orchestration + live-gate manifest — CONTRACT (all changes PROPOSED)
 
-**Status (2026-11-04):** root ACCEPTED `1df87d5a` as a conditional OFFLINE planning baseline (not a live approval package), with the cleanup-wording corrections applied below. The offline / injected-fake executor-adapter foundation is implemented on `feature/e7-connected-executor-adapters` (§9). Root CODE HOLD on `2aeac7e1` (R-A1 reservation recovery factory, R-A2 signal validation) → corrections in §9.6, pending root CODE re-review. Every live gate stays CLOSED; every owner input stays UNSET.
+**Status (2026-11-04):** root ACCEPTED `1df87d5a` as a conditional OFFLINE planning baseline (not a live approval package), with the cleanup-wording corrections applied below. The offline / injected-fake executor-adapter foundation is implemented on `feature/e7-connected-executor-adapters` (§9). Root CODE HOLD on `2aeac7e1` (R-A1 reservation recovery factory, R-A2 signal validation) → corrections in §9.6; root ACCEPTED the foundation OFFLINE at `b757d6b7`. Every live gate stays CLOSED; every owner input stays UNSET.
 
 **Status pointer (2026-11-04):** root ACCEPTED the executor-adapter foundation OFFLINE at `b757d6b7` (R-A1 / R-A2 closed). The adapter / worker integration rehearsal (tests + report only) is on `feature/e7-connected-adapter-rehearsal`: `claude/e7-connected-adapter-rehearsal.md`, pending root review. It is not a live approval, and owner inputs stay UNSET.
 
@@ -159,7 +159,7 @@ No `lib/`, SQL, worker, route, config or dependency change.
   - the read-only probes P1–P6;
   - the confirmed-booking cleanup procedure.
 
-## 9. Implementation map — executor-adapter foundation (OFFLINE / INJECTED FAKES; pending root CODE review)
+## 9. Implementation map — executor-adapter foundation (OFFLINE / INJECTED FAKES; root ACCEPTED OFFLINE at `b757d6b7`)
 
 **Branch** `feature/e7-connected-executor-adapters`, cut from exact `1df87d5aea0f70bbd95659d46c749d93cd5ce38d`. **Files:** new `scripts/e7-connected/executor-adapters.mjs`; new `test/e7-connected-executor-adapters.test.mjs`; this section + the status line and cleanup corrections above.
 
@@ -217,7 +217,7 @@ Rules that apply to every phase:
   - The exception flag is refused on any other listing.
   - The workers' own branded adapter config remains required separately.
 
-### 9.2a The reservation recovery binding: what the later runner must validate first (runner and DB reader NOT implemented)
+### 9.2a The reservation recovery binding: what the later runner must validate first (runner and DB reader NOT implemented; ordering corrected per the accepted rehearsal `9f13c816`)
 
 The reservation worker's by-id recovery read (`executeRead` / `readsStep`, `reservation-worker.js:233–260`, `:482–493`) executes a claimed `hostaway.retrieve_reservation` operation whose `payload.reservationId` was queued in one of two ways:
 - by E3, after the reservation is adopted (`reservationRead`, `intent-state.js:254`);
@@ -227,9 +227,15 @@ The reservation worker's by-id recovery read (`executeRead` / `readsStep`, `rese
 
 So `intents.hostaway_reservation_id` is **not** required to be populated. A recovery factory is legitimate for a candidate that the by-id read is meant to prove.
 
+**Ordering (corrected).** The accepted reservation step can queue AND claim the by-id read in the SAME step: `runOrchestratorStep` runs `recoveryPass` (which calls `requestRecoveryRead`) before it claims work and executes reads (`reservation-worker.js:603–605`). The accepted adapter rehearsal observed exactly that (`claude/e7-connected-adapter-rehearsal.md` §3.1).
+
+So a pending by-id row need **not** exist before the step. The candidate is derived **before** the step from facts that already exist; facts first created during the step cannot be used beforehand. If no candidate exists yet, the factory stays unbound (creation mode) and fails closed: its `retrieveReservation` refuses `RESERVATION_UNBOUND` with zero provider calls. The runner contract (`claude/e7-connected-runner-contract.md`) then STOPs rather than guessing.
+
+The adapter's immutable bound-id refusal is what prevents an off-scope provider read **before** it happens. A post-step audit (every executed by-id read named the bound id) is supporting evidence only.
+
 Before constructing a `reservation-recovery` factory, the future runner must validate all of the following from the accepted persisted DB facts (never from a raw reply alone):
-1. There is a `hostaway.retrieve_reservation` operation for THIS intent, of retry class `read`, pending / claimable, whose `payload.reservationId` is the id to bind.
-2. That id traces to exactly one of:
+1. **Any** open (`pending` / `in_flight`) `hostaway.retrieve_reservation` operation for THIS intent names the candidate (`payload.reservationId`); none naming another id may exist. A read queued during the step is covered by the bound-id refusal and verified afterwards.
+2. The candidate traces to exactly one distinct id among:
    - **(a)** the intent's `hostaway.create_reservation` operation, `state = succeeded` with `result_ref` = that id (the ref-not-echoed path);
    - **(b)** `hostaway_reservation` evidence with status `found_active`, `observed.bookingRef` = the intent ref, `matchCount = 1` and `observed.reservationId` = that id;
    - **(c)** an adopted `intents.hostaway_reservation_id` = that id.
@@ -317,7 +323,7 @@ No PG run was needed: the compatibility tests use the accepted gates and pure he
 - The cancel and offline-charge endpoints remain prerequisites (primary documentation / read-only probes).
 - Hostaway account identity remains TRUST.
 
-### 9.6 Root CODE HOLD on `2aeac7e1` — corrections R-A1 / R-A2 (same three files; pending root CODE re-review)
+### 9.6 Root CODE HOLD on `2aeac7e1` — corrections R-A1 / R-A2 (same three files; root ACCEPTED OFFLINE at `b757d6b7`)
 
 **R-A1 — reservation recovery was unsatisfiable.** In the held version:
 - the creation factory required `reservationId: null`, so its `retrieveReservation` always refused;
