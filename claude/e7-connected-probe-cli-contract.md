@@ -1,4 +1,7 @@
-# E7 connected-test runner — OWNER-RUN READ-ONLY PROBE CLI / PREFLIGHT / CREDENTIAL-INGRESS CONTRACT, revision 3: C1 ACCEPTED (§10) + C2 executable contract (§11, PROPOSED)
+# E7 connected-test runner — OWNER-RUN READ-ONLY PROBE CLI / PREFLIGHT / CREDENTIAL-INGRESS CONTRACT, revision 4: C1 + C2 ACCEPTED (§10, §12) + C3 preparation contract (§13, PROPOSED)
+
+> **Revision 4 (DOCS ONLY; branch `feature/e7-connected-probe-entrypoint-contract` from exact `b28e9d9b`):** C2 ACCEPTED OFFLINE by root at `b28e9d9b`; root rulings R-C2a–c recorded in §13. §13 is the implementation-ready C3 preparation contract and supersedes §5 / §6 where they differ. **C3 is NOT implemented and NOT authorized; real execution, live gates, env, credentials and the ONE package stay CLOSED.** Everything below, including the revision 3 note, is kept verbatim as history.
+
 
 > **Revision 3 (DOCS ONLY; branch `feature/e7-connected-probe-command-contract` from exact `ac974d75`):** C1 ACCEPTED OFFLINE by root at `ac974d75` (R-C1A closed). §11 is the C2 executable contract, finishing the §4 deferred interface and superseding §§3–4 where they differ. **C2 is NOT implemented and NOT authorized; C3 and any real request remain CLOSED.** The note below and §§0–10 are kept verbatim as history.
 
@@ -101,9 +104,11 @@ Files (4): the two modules above; NEW `test/e7-connected-probe-ingress.test.mjs`
 - **C2 tests (later):** command matrix of revision 1 §7 adjusted to these rules: inspect zero secrets / network; refusals before any credential read; interrupt at each stage boundary; P semantics (STOP vs INCONCLUSIVE continuation); output state machine incl. `RACE_EXISTS` vs `UNKNOWN`; precedence combinations (9 + 8, 6 + 8, 11 + 9); digest changes for a protected-constant dependency; full P → T → X over a fake primitive with counting guards.
 
 ## 5. C3 — CLOSED outline (`probe-cli-main.mjs`)
+> *Revision 4: superseded where different by §13.*
 Owns every process action: builds the env snapshot (presence booleans + `execArgv.length` only), the real read-only fs adapters (refusing to construct without `O_NOFOLLOW`), `performance.now`, `setTimeout` / `clearTimeout` timer handles in P's exact shape, X's default primitive, the SIGINT handler (first → abort `interrupt`; second → `process.exit(130)` immediately with NO further write attempt — any pending stdout / file output is UNKNOWN, never promised flushed), the single stdout write and `process.exitCode`. After the disposition, if `tailUncertain`, C3 exits explicitly — abandoning in-process work, not claiming it destroyed (a request may still have been delivered). **C3 is not proposed for implementation; no default executable live CLI exists.**
 
 ## 6. ONE consolidated exact approval package — TEMPLATE (all owner fields UNSET; not an approval)
+> *Revision 4: superseded by the template v2 in §13.8.*
 | Field | Value |
 |---|---|
 | Scope | READ-ONLY probe run only; separate from any later booking / write / notification / calendar approval |
@@ -678,3 +683,239 @@ Coverage:
   - ONE consolidated exact approval package (§6) and Joel's explicit approval.
 
 Live gates, env, credentials and the package stay CLOSED.
+
+## 13. C3 PREPARATION CONTRACT (revision 4; DOCS ONLY; implementation-ready, NOT implemented, NOT authorized)
+**Status.** C2 was ACCEPTED OFFLINE by root at `b28e9d9b` (root focused 11/11, combined 146/146; root boundary probes 3/3). C1 / P / T / X / C2 are unchanged and are not redesigned here. §13 supersedes §5 (the C3 outline) and §6 (the package template) where they differ; §§0–12 stay as history. **C3 implementation, real execution, every live gate, env, credentials and the ONE package stay CLOSED.**
+
+**Root review rulings recorded (semantics already in C2; no runtime change):**
+- **R-C2a — interrupt during the output write.** The single prescribed post-run evidence write may complete despite an abort during the output IO, provided every byte, `sync` and `close` is acknowledged and no provider request is issued. Root probe: abort inside `write` → `CLOSED_ACK`, exit 0, exactly 1 earlier request.
+  - `payload.interruptObserved` is a **PRE-OUTPUT snapshot**, not a claim that no later interrupt happened. It must never be presented as the final process-lifetime status.
+  - Second SIGINT, forced exit and output-`UNKNOWN` belong to C3 (§13.4).
+- **R-C2b — refusal plus abort.** A C1 refusal that coincides with an abort keeps `CLI_CREDENTIAL_REFUSED` / exit 5 with `interruptObserved:true` (zero requests, no output). This is accepted fail-closed diagnostic precedence: **not every abort maps to exit 7.** A successful C1 load with an abort still discards the capability and makes no network call.
+- **R-C2c — accepted as is.** The additive payload / source / binding fields, the declared limits and the unreachable-guard test limits are accepted. `UNSETTLED` is not manufactured through X; P's own coverage plus the honest composed `LATE_*` cases suffice.
+
+**Citations.** Repository at `b28e9d9b`; Node.js docs:
+- [ECMAScript modules — `import.meta.main`](https://nodejs.org/api/esm.html): "Added in: v24.2.0, v22.18.0", Stability 1.0 "Early development", "`true` when the current module is the entry point of the current process".
+- [Process](https://nodejs.org/api/process.html): `process.exit()` "will force the process to exit as quickly as possible even if there are still asynchronous operations pending … including I/O operations to `process.stdout`"; `process.exitCode` sets the code "when the process exits gracefully".
+- [File system](https://nodejs.org/api/fs.html): `filehandle.read` "Fulfills … with an object with two properties: `bytesRead` … `buffer`"; `filehandle.close()` "Fulfills with `undefined` upon success".
+
+**Not re-quoted this session** (the doc fetch was truncated; the shapes below are standard Node API and are VERIFIED by the future N-tests on the run machine, never assumed): `fs.constants.O_NOFOLLOW` / `O_EXCL` / `O_CREAT` availability, `filehandle.write` → `{ bytesWritten, buffer }`, `filehandle.sync()` → `undefined`, bigint stats `*Ns`, and the per-platform synchronous / asynchronous stdout note.
+
+### 13.1 Proposed C3 implementation files (exactly three; no closure change)
+| File | Purpose |
+|---|---|
+| NEW `scripts/e7-connected/probe-cli-main.mjs` | The ONLY process-touching module: entry guard, SIGINT, source bootstrap, native adapters, env snapshot, real clock / timers, `prepare-plan` mode, dynamic import of C2, the single stdout write, exit. **It is already entry 2 of `SOURCE_CLOSURE` (§11.4)**, so the 13-path closure needs no update. |
+| NEW `test/e7-connected-probe-cli-main.test.mjs` | Bootstrap tests through a fake process shim, plus native-adapter N-tests over SYNTHETIC temp files only (§13.6). |
+| `claude/e7-connected-probe-cli-contract.md` | C3 implementation map. |
+
+**Why one file.** The native adapters live inside the entrypoint, not in a separate module, so no closure path is added. They are thin mappings onto the accepted C1 / C2 schemas: no policy is re-implemented, and C1 still decides every credential refusal.
+
+**Static imports (exact; the only ones permitted BEFORE the digest check):**
+- `node:process`
+- `node:fs/promises` (`open`, `lstat`, `realpath`)
+- `node:fs` (`constants` only)
+- `node:url` (`fileURLToPath`)
+- `node:perf_hooks` (`performance`)
+- `node:https` (`request`, `Agent` — referenced only to build the execute primitive)
+- `./probe-source-digest.mjs`
+
+**Dynamic imports** (fixed string specifiers only, after the bootstrap):
+- `./probe-command.mjs` (inspect / execute);
+- `./readonly-probe.mjs` (`prepare-plan` only — it never loads C2, T or X).
+
+**Never present:** booking runner, A, core, workers, DB, SDK, the reservation adapter, a git subprocess, `child_process`, dynamic dependency walks, network discovery, token minting or key creation.
+
+### 13.2 Entry guard, grammar, execute gating
+- **Import-vs-execution guard:** `export async function main(proc, hooks)` does everything. The module's only top-level effect is `if (import.meta.main === true) main(REAL_PROC, REAL_HOOKS)`.
+  - Importing the module (tests, tooling) registers no signal, reads no file, writes nothing and never calls `main`. A test asserts this: 0 SIGINT listeners added, 0 stdout writes, 0 fs calls.
+  - A non-boolean `import.meta.main` cannot occur on the pinned Node `22.22.0` / `24.22.1`, both of which are ≥ the "Added in" versions. If it did, nothing would run, which fails closed.
+- **`main(proc, hooks)`:** `proc` is a process-like object `{ argv, platform, versions, execArgv, env, getuid, stdout, onSigint, exit, setExitCode }`; `hooks` is `{ primitive, importCommand, importPlanModule }`.
+  - The real entry passes the real process, `{ request, Agent }` from `node:https`, and the fixed `import()` thunks.
+  - Tests pass fakes. **No CLI argument can select a hook**, and `hooks` is never read from env or argv.
+- **Grammar:**
+  - `argv = proc.argv.slice(2)`, a copy.
+  - If `argv[0] === 'prepare-plan'`, C3 handles it (§13.3).
+  - Otherwise the argv is passed **unchanged** to C2, which owns the exact inspect-default / execute grammar (§11.2). C3 reads only the `--expect-source-digest` value for the pre-import check (§13.5) and never re-parses or extends C2's grammar.
+- **Inspect / early refusal:**
+  - zero credential-fs, output-fs and primitive construction; no `https` call;
+  - `deps` are exactly C2's five inspect keys;
+  - bootstrap refusals happen before any C2 import.
+- **Execute gating:**
+  - Implementing or testing the execute path authorizes nothing.
+  - `--approval-ref` / `metadata.approvalRef`, `--expect-*` and `reviewedCommit` are assertions and labels, **not authentication or consent**.
+  - The only gate on a REAL execute run is procedural: **Joel's explicit approval of ONE exact consolidated package (§13.7)**, given outside the code. Nothing in the code can grant, detect or record that approval, and there is no "approved" switch.
+  - Until that approval, execute is run only in tests over fake primitives.
+
+### 13.3 `prepare-plan` — explicit offline canonicalization (C3-only mode)
+- **Grammar:** `prepare-plan --in <abs> --out <abs>`, each flag exactly once. The two paths are canonical (C1 rule) and distinct; anything else gives a usage refusal.
+- **Steps:**
+  1. Read `--in` with the native plan reader (§13.4.2; ≤ 16384 bytes, no-follow, regular file).
+  2. Fatal UTF-8 decode and one `JSON.parse`.
+  3. The iterative depth bound (≤ 8, the same rule as C2).
+  4. `validateProbePlan`, through `importPlanModule` (P only).
+  5. Write `canonicalJson(body) + "\n"` with the native `summary-create` semantics (`O_EXCL`, `0600`, close-first, write / sync / close acknowledged; never overwrite, unlink or retry).
+  6. Print one line, `{ schema:'e7-probe-prepare-v1', code, planHash | null, file:<state>, exitCode }`.
+- **Codes:** `PREP_OK` (0), `PREP_USAGE` (2), `PREP_UNREADABLE` (4), `PREP_INVALID` with a P / C2 plan sub-code (4), `PREP_EXISTS` / `PREP_OUTPUT_UNKNOWN` (9).
+- **It never imports C2, T or X, reads no credential, builds no primitive and touches no network.** Its output is exactly the file C2 accepts (§11.5) and inspect then reports.
+- It is a convenience for producing the owner's plan; `planHash` stays the binding.
+
+### 13.4 Native adapters, env snapshot, clock / timers, signals, stdout, exit
+**Fail-closed construction.**
+- If `proc.platform ∉ { linux, darwin }`, or any of `constants.O_RDONLY` / `O_WRONLY` / `O_CREAT` / `O_EXCL` / `O_NOFOLLOW` is not a non-negative integer, C3 constructs no adapter and prints the bootstrap refusal `BOOT_UNSUPPORTED` (exit 3).
+- **Native Windows stays unsupported** until a separately reviewed ACL design.
+- There is no weakened no-follow, no TLS / proxy / trust-store change and no file rewriting.
+
+1. **Stat mapping** — `lstat(p)` → `fsp.lstat(p, { bigint:true })`; the handle's `stat()` → `fh.stat({ bigint:true })`. Fields map as follows:
+   - `kind`: `isFile` → `file`, `isDirectory` → `dir`, `isSymbolicLink` → `symlink`, else `other`;
+   - `dev`, `ino`, `mtimeNs`, `ctimeNs`: `String(bigint)` (decimal, no sign);
+   - `mode`, `nlink`, `uid`, `size`: `Number(bigint)`, only if `≤ Number.MAX_SAFE_INTEGER`; otherwise the adapter rejects with own-data `code:'E7_STAT_RANGE'`, which C1 treats as `CRED_IO` and C2 as invalid.
+
+   Every adapter function is an `async` function, so C1 / C2 receive unpatched native promises. Node fs rejections pass through unchanged, so `ENOENT` / `ENOTDIR` / `EEXIST` arrive as the error's own-data `code` (N-test verifies). The adapter reads no other error property.
+2. **`credentialFs`** (C1 §2.2, exact):
+   - `{ platform: proc.platform, uid: proc.getuid(), lstat, realpath: fsp.realpath, open }`;
+   - `open(p, 'credential-read')` → `fsp.open(p, O_RDONLY | O_NOFOLLOW)` → `{ stat, read: (b, o, l) => fh.read(b, o, l, null).then((r) => r.bytesRead), close: () => fh.close() }`.
+
+   C1 owns every policy check, the read loop, the counts and the close.
+
+   **Plan reader** `readPlanFile(p)`:
+   - open `O_RDONLY | O_NOFOLLOW`; `fh.stat` must show a regular file of 1…16384 bytes;
+   - read into an owned 16385-byte buffer until EOF (≤ 16386 calls);
+   - the size must match, otherwise reject;
+   - close exactly once; a close that does not fulfil `undefined` rejects;
+   - resolve a fresh **`Uint8Array`** copy, not a `Buffer`, because C2 requires the exact prototype.
+
+   **Source reader:** the same rule per closure path (≤ 262144 bytes), relative to `repoRoot = fileURLToPath(new URL('../../', import.meta.url))` with no trailing `/`, in `SOURCE_CLOSURE` order. Any failure gives `sourceDigest = null`.
+3. **`outputFs`** (§11.6, exact):
+   - `{ platform, uid, lstat, realpath, create }`;
+   - `create(p, 'summary-create')` → `fsp.open(p, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)` → `{ write: (b, o, l) => fh.write(b, o, l, null).then((r) => r.bytesWritten), sync: () => fh.sync(), close: () => fh.close() }`.
+
+   The umask can only remove permission bits from `0600`. C2 owns parent checks, counts, the exactly-`undefined` acknowledgments, close-once and the file states.
+4. **Env snapshot**, built ONCE immediately before C2 is called, deep-frozen:
+   - `{ schema:'e7-probe-env-snapshot-v1', nodeVersion: proc.versions.node, platform: proc.platform, execArgvCount: proc.execArgv.length, uidAvailable: typeof proc.getuid === 'function', present }`;
+   - `present` is the 14 keys of §2.1, each `Object.hasOwn(proc.env, key)`: **presence only, no value is ever read, copied or printed.**
+
+   The pure C1 preflight then evaluates it inside C2, before any credential read. There is no auto-fix, no unsetting and no re-exec.
+5. **Clock / timers** (P's exact shape):
+   - `monotonic = () => performance.now()`;
+   - `timers = { arm(ms) { let id; const promise = new Promise((res) => { id = setTimeout(res, ms); }); return { promise, cancel: () => clearTimeout(id) }; } }`.
+
+   The timers are ref'd, and P cancels them.
+6. **Signals:**
+   - **First SIGINT** → `controller.abort()`; `controller.signal` is C2's `interrupt`.
+   - **Second SIGINT** → `proc.exit(130)` **immediately**. No further write is attempted, and nothing pending (stdout, summary file, sockets) is promised flushed or completed; the output is UNKNOWN.
+   - The handler is registered at the start of `main` for every mode, and only there.
+7. **Stdout — exactly one attempt:** `proc.stdout.write(stdoutLine + "\n", cb)`, with a one-shot `'error'` listener attached.
+   - Acknowledged only when the callback runs without an error.
+   - An error or `'error'` event → stdout UNKNOWN → exit `9`, unless 130 already happened. There is never a second write.
+   - Whether Node writes stdout synchronously depends on platform and stream type, so C3 relies only on the callback.
+8. **Exit:**
+   - After the stdout callback (or its error), C3 sets `setExitCode(code)` and then calls `proc.exit(code)` **explicitly in every mode**.
+   - This stops a stray handle or a late tail from keeping the process alive indefinitely. Any in-process work still pending (e.g. an `UNSETTLED` request reported through `tailUncertain`) is **abandoned, not claimed destroyed**; a request may still have been delivered.
+   - The code is C2's `disposition.exitCode`, raised to 9 on stdout failure. 130 only happens through the second SIGINT. The pure modules remain unchanged.
+
+**Elapsed-time bounds:** none for fs IO, as accepted. A hanging native fs read leaves the process waiting until the owner's second SIGINT.
+
+### 13.5 Pre-import source bootstrap
+1. `main` reads the 13 closure files with the source reader and computes `computeSourceDigest` (the helper is the only local static import). Any read or snapshot failure gives `null`.
+2. **Execute:**
+   - the `--expect-source-digest` value is located by an exact pair scan of `argv`;
+   - if it is absent or malformed, C3 prints `BOOT_USAGE` (exit 2) without importing C2;
+   - if `digest === null` or `digest !== expected`, C3 prints `BOOT_SOURCE_MISMATCH` / `BOOT_SOURCE_UNREADABLE` (exit 4) **before importing `probe-command.mjs`**;
+   - otherwise it imports C2 and passes `deps.sourceDigest = digest`, and C2 re-compares (§11.3).
+3. **Inspect:** imports C2 and passes `sourceDigest = digest` or `null`. No expected value is required, and inspect reports the actual digest.
+4. **Bootstrap line:** `{ schema:'e7-probe-cli-boot-v1', code, sourceDigest | null, exitCode }`.
+   - Vocabulary: `BOOT_UNSUPPORTED` (3), `BOOT_USAGE` (2), `BOOT_SOURCE_UNREADABLE` (4), `BOOT_SOURCE_MISMATCH` (4), `BOOT_IMPORT_FAILED` (1).
+   - It goes through the same single stdout attempt and exit rule.
+5. **TRUST (explicit):**
+   - the entrypoint and the helper are bootstrap bytes that hash themselves; that self-hash is **not authentication**;
+   - the Node binary, OS and global intrinsics;
+   - the directory namespace. `O_NOFOLLOW` covers only the final path component, and there is a TOCTOU window between hashing and import — same-uid mutation is not defeated.
+
+   The digest binds the reviewed bytes at read time only. There is no git subprocess and no dependency walk.
+
+### 13.6 Tests for the C3 implementation turn (bounded; no new infrastructure)
+**Guards first.** `node:https` `request` / `Agent` are replaced by counting guards before the entrypoint loads (§12.5 technique). A `fetch` guard is installed. The guards and `unhandledRejection` must count 0, except where the execute B-tests below pass FAKE primitives through `hooks`.
+
+**B-tests (fake process shim + fake hooks; real C2 / P / T / X; synthetic temp files only):**
+- **B1.** Importing the module runs nothing.
+- **B2.** Inspect default with a synthetic plan in a `0700` temp dir: `CLI_INSPECT_OK` / 10, actual repo digest reported, zero https / primitive / credential reads.
+- **B3.** `prepare-plan`:
+  - canonical output `0600`;
+  - an existing output gives `PREP_EXISTS` with no overwrite;
+  - invalid plan, deep plan and duplicate key each refuse;
+  - inspect then accepts the produced file;
+  - the C2 / X modules are never imported (counting `importCommand`).
+- **B4.** Execute with a missing / mismatched / unreadable expected digest → exit 2 / 4 **with `importCommand` never called**.
+- **B5.** Execute through a FAKE primitive (the rehearsal doubles) with a synthetic `0600` credential file (`tokFake1` / `sk_test_Fake1`) and a summary in a `0700` temp dir: `CLOSED_ACK`, exit 0, one stdout write, `exit` called once after the stdout callback.
+- **B6.** SIGINT: first → `interrupt` aborted (pre-run gives 7); second → `exit(130)` with no later write.
+- **B7.** Stdout failure (callback error / `'error'` event) → exit 9 with exactly one write. Platform `win32`, or a missing `O_NOFOLLOW` in the shim → `BOOT_UNSUPPORTED` with no fs.
+
+**N-tests (real `node:fs/promises` over SYNTHETIC files in `fs.mkdtemp` `0700` dirs, removed afterwards; never owner paths):**
+- **N1.** Stat mapping: decimal-string `dev` / `ino` / `*Ns`, safe numbers, `kind` for file / dir / symlink.
+- **N2.** `O_NOFOLLOW` on a symlinked credential path rejects with the own-data code and C1 refuses. Own-data `ENOENT` for a missing path.
+- **N3.** `credential-read`: `read` → byte counts; `close` → `undefined`.
+- **N4.** `summary-create`: `O_EXCL` second create → own-data `EEXIST`; `write` → `bytesWritten`; `sync` / `close` → `undefined`; resulting mode `0600`.
+- **N5.** The plan / source readers return an exact `Uint8Array`; size bounds; a non-regular file refuses.
+- **N6.** The real-repo source digest is stable across two reads, and changes when a synthetic copy changes one byte (the copy goes through the injected reader).
+
+**Not included:** real credentials, accounts, Hostaway / Stripe, loopback / TLS, installs and permission changes. No standalone rehearsal and no mutation quota.
+
+**Exit criteria:**
+- the focused C3 suite plus the relevant units (C1 / C2 / P / T / X / rehearsal / pins) plus `npm test` are green, with the FIRST FULL TAP preserved;
+- exactly the three files changed;
+- the pins hold (closure unchanged; the entrypoint's imports are exactly §13.1);
+- root CODE review.
+
+### 13.7 Native / platform evidence — what remains a true real-run prerequisite
+- **Sufficient OFFLINE evidence, already accepted:**
+  - the fake P / T / X stack and C2 integration;
+  - C1 policy over fake adapters;
+  - the C3 B- and N-tests once implemented.
+- **True real-run prerequisites:**
+  - **E1.** The C3 N-tests (`node --test test/e7-connected-probe-cli-main.test.mjs`) run green on the owner's machine with the exact Node version. This is local-only, synthetic temp files, no network.
+  - **E2.** `inspect` run on that machine reports `ENV_OK`, the expected `sourceDigest` and the `planHash` for the owner's prepared plan. Inspect reads no credential and makes no request.
+
+  Both outputs go into the package.
+- **Source-inspected residual (NOT a blocker):** X's composition with real `node:https` sockets and TLS — native event ordering, close / destroy timing, TLS failure codes. X was validated against fake doubles modelled on Node's documented `http.request` orders (§12.5 / rehearsal), not native ordering.
+  - **Consequence if wrong:** a fault becomes `EXCHANGE_FAILED` / `TRANSPORT_FAILED` STOP or a reported `tailUncertain`.
+  - The run is read-only GETs (≤ 8, P inventory), so a mismatch fails closed rather than writing anything.
+  - Default Node TLS verification and trust store are used unchanged.
+- **Smallest separately scoped local-only validation (OPTIONAL, not run, not authorized):** **L1** — a loopback HTTPS server with an ephemeral self-signed certificate, driven through X by a **test-only primitive wrapper** that adds a per-request `ca` for `127.0.0.1` only. It would exercise X's happy / abort / destroy / oversize / redirect orders over real native sockets.
+  - It needs no production X change, no trust-store change and no `NODE_TLS_REJECT_UNAUTHORIZED`.
+  - **Recommendation: treat it as a residual and skip L1** unless root wants native-order evidence before the first run; the read-only fail-closed outcome bounds the risk.
+
+### 13.8 ONE consolidated exact approval package — TEMPLATE v2 (supersedes §6; owner fields UNSET; NOT an approval)
+| Field | Value |
+|---|---|
+| Scope | ONE owner-run READ-ONLY probe run; separate from any booking / write / notification / calendar approval |
+| Reviewed commit (C1 + C2 + C3) | UNSET (the future accepted C3 head) |
+| `sourceDigest` (13-path closure, §11.4) | UNSET (from E2 `inspect` on that commit) |
+| Prepare command | `node scripts/e7-connected/probe-cli-main.mjs prepare-plan --in <abs draft> --out <abs plan>` — paths UNSET |
+| Inspect command | `node scripts/e7-connected/probe-cli-main.mjs inspect --plan <abs plan>` (no `node` flags: `execArgvCount` must be 0) |
+| Execute command (exact shape) | `node scripts/e7-connected/probe-cli-main.mjs execute --plan <abs> --credentials <abs> --summary-out <abs> --expect-plan-hash <64hex> --expect-source-digest <64hex> --expect-requests <n> --approval-ref <label>` — every value UNSET |
+| `planHash` / probe inventory / request count | UNSET (≤ 8 from `P-H1…P-H6`, `P-S1`, `P-S2`; P-H3 excluded by default; P-H6 only with an approved control) |
+| Plan values: listing (USD), dates, sample + control reservations with listings | UNSET (never `70636076 / 71045356 / 71072615 / 71081885`; P refuses them) |
+| Stripe TEST account / existing TEST PaymentIntent | UNSET |
+| Stripe-Version | `2026-08-26.dahlia` (source constant; owner confirmation UNSET) |
+| Plan limits | UNSET within the source ranges: `perProbeMs` 1000…15000, `runMs` 1000…180000 (≥ perProbeMs), `tailMs` 0…10000 |
+| Owner environment | UNSET: linux or darwin; Node exactly `22.22.0` or `24.22.1`; E2 `preflight` = `ENV_OK` (no refused variables; proxy presence reported only) |
+| Native evidence | E1 N-test result + E2 inspect line on the owner's machine: UNSET |
+| Credential ingress | UNSET: one `0600` regular file, owned by the running uid, outside the repo and `.git`, with exactly the needed keys (`hostawayToken` existing token, no mint; `sk_test_` key only). The owner deletes / rotates afterwards. |
+| Output | `--summary-out` in a `0700` owner directory outside the repo; returned evidence is the stdout line plus the `0600` summary file (§11.7, §12.4) |
+| Stop / outcome semantics | Accepted P: a STOP ends the run; INCONCLUSIVE continues with dependents skipped; no retry / fallback / resend. Exit codes per `exitFor` (0 / 11 / 6 / 8 / 9 / pre-run codes; 130 = second SIGINT, output UNKNOWN) |
+| Interpretation limits | `interruptObserved` = pre-output snapshot (R-C2a); a C1 refusal can win over an abort (R-C2b); TRUST per §13.5; X native ordering residual per §13.7 |
+| Joel's explicit approval of THIS exact package | UNSET — given outside the code; labels / `approvalRef` / flags never substitute |
+
+**Source-derived constants filled:** the commands' shape, closure size 13, Node labels, Stripe-Version, probe ids, protected ids, limit ranges, file modes and the exit codes. **Everything owner-specific stays UNSET. There are no owner questions yet;** the next request to Joel is this package, once filled.
+
+### 13.9 Genuine remaining blockers and next step
+**Blockers for the C3 implementation turn: none.**
+
+**Blockers for a real run** (procedural, all CLOSED):
+1. C3 implemented and accepted;
+2. E1 + E2 on the owner's machine;
+3. the owner's plan, credential file and account values;
+4. the filled §13.8 package;
+5. Joel's explicit approval of it.
+
+**Proposed next:** the C3 implementation turn on the three files of §13.1, with tests §13.6 → root CODE review.
