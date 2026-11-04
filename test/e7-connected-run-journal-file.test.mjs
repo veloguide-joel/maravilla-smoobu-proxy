@@ -27,6 +27,9 @@ const realFetch = globalThis.fetch;
 globalThis.fetch = async () => { netAttempts += 1; throw new Error("network refused (offline file-journal suite)"); };
 const DIRS = [];
 after(() => { globalThis.fetch = realFetch; for (const d of DIRS) rmSync(d, { recursive: true, force: true }); assert.equal(netAttempts, 0); });
+const assertAllClosed = (label) => {
+  for (const l of LOGS) assert.deepEqual([l.closes, l.dirCloses, l.leftover.length], [l.opens.length, l.dirOpens, 0], `${label}: every fd opened through the adapter was closed exactly once (${l.site}; ${l.opens.join(",")})`);
+};
 const POSIX = process.platform !== "win32";
 const tmp = () => { const d = mkdtempSync(join(tmpdir(), "e7fj-")); DIRS.push(d); return d; };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -56,13 +59,19 @@ const RECS = chain();
 assert.equal(validateJournal(RECS, ID).status, "ENDED", "SYNTHETIC sequence is D-valid");
 const bytesOf = (recs) => Buffer.concat(recs.map(encodeRecordLine));
 const fileIn = (dir, id = ID) => join(dir, journalFileName(id.runId));
-const open = (dir, extra = {}) => openFileJournal({ dir, identity: ID, ...extra });
+/** every journal open in this suite goes through a counting adapter (a passthrough `faulty()` unless a test injects one) */
+const open = (dir, extra = {}) => openFileJournal({ dir, identity: ID, ...("fsAdapter" in extra ? extra : { ...extra, fsAdapter: faulty().a }) });
 async function appendAll(j, recs) { const acks = []; for (const r of recs) acks.push(await j.journal.append(r)); return acks; }
 
 // ---- labelled fault adapter over the module's own default adapter --------------------------------------------------------------
+const LOGS = [];
+/** TEST-ONLY cleanup of fds a labelled fault deliberately left open; returns how many were closed here */
+const closeLeftovers = async (log) => { let n = 0; for (const h of log.leftover.splice(0)) { await h.close(); log.closes += 1; n += 1; } return n; };
 function faulty(plan = {}) {
   const base = createNodeFsAdapter();
-  const log = { opens: [], closes: 0, writes: 0, syncs: 0, reads: 0, dirOpens: 0 };   // write / sync / read counters: JOURNAL handles only
+  const log = { opens: [], closes: 0, writes: 0, syncs: 0, reads: 0, dirOpens: 0, dirCloses: 0, leftover: [] };   // write / sync / read counters: JOURNAL handles only
+  log.site = String(new Error().stack).split("\n").slice(2, 4).map((x) => x.trim().replace(/^.*test\.mjs:/, "line ")).join(" < ");   // which test opened it
+  LOGS.push(log);
   const wrap = (h, kind) => Object.freeze({
     write: async (buf, off, len) => {
       if (kind === "journal-open" || kind === "journal-create") {
@@ -75,12 +84,23 @@ function faulty(plan = {}) {
     read: async (buf, off, len, pos) => { if (!kind.startsWith("journal")) return h.read(buf, off, len, pos); log.reads += 1; const r = plan.read && await plan.read(log.reads, { buf, off, len, pos, base: h }); return r || h.read(buf, off, len, pos); },
     sync: async () => { if (kind.startsWith("journal")) { log.syncs += 1; if (plan.sync) await plan.sync(log.syncs); } return h.sync(); },
     stat: async () => h.stat(),
-    close: async () => { log.closes += 1; if (plan.close && kind.startsWith("journal")) await plan.close(); return h.close(); }
+    close: async () => {
+      if (plan.close && kind.startsWith("journal")) {
+        // INJECTED close failure: the REAL fd is kept for explicit TEST-ONLY cleanup (log.leftover); the module must not retry
+        log.leftover.push(h);
+        await plan.close();
+      }
+      await h.close(); log.closes += 1;
+    }
   });
   const a = Object.freeze({
     realpath: base.realpath, lstat: base.lstat, unlink: base.unlink,
-    open: async (p, kind) => { log.opens.push(kind); return wrap(await base.open(p, kind), kind); },
-    openDir: async (p) => { log.dirOpens += 1; if (plan.dirSync) { const d = await base.openDir(p); return Object.freeze({ sync: async () => { throw plan.dirSync; }, close: d.close }); } return base.openDir(p); },
+    open: async (p, kind) => { const h = await base.open(p, kind); log.opens.push(kind); return wrap(h, kind); },   // counted only when an fd exists
+    openDir: async (p) => {
+      log.dirOpens += 1;
+      const d = await base.openDir(p);
+      return Object.freeze({ sync: async () => { if (plan.dirSync) throw plan.dirSync; return d.sync(); }, close: async () => { await d.close(); log.dirCloses += 1; } });
+    },
     platform: plan.platform ?? base.platform, uid: base.uid
   });
   return { a, log };
@@ -228,8 +248,10 @@ test("F5. INJECTED write-loop faults: short writes complete ONE append; invalid 
     assert.equal(await codeOf(j.journal.append(RECS[1])), "JOURNAL_IO_FAILED");
     assert.equal(j.status().head.seq, 1, "head never advanced without the sync ack");
     await j.close();
-    const rr = await (await open(d)).journal.read();
+    const j2 = await open(d);
+    const rr = await j2.journal.read();
     assert.deepEqual([rr.records.length, evaluateStart(rr, ID).code], [2, "RESTART_AMBIGUOUS"]);
+    await j2.close();
   }
 });
 
@@ -280,6 +302,8 @@ test("F7. read / close races: close waits for an in-flight READ; append during a
   const c = await cp;
   assert.deepEqual({ ...c }, { fileClose: "failed", lock: "released" }, "file close failure reported code-only; lock still released once");
   assert.equal(await codeOf(j.journal.append(RECS[1])), "JOURNAL_CLOSED");
+  assert.equal(j.close(), cp, "no second close attempt by the module (once-only)");
+  assert.equal(await closeLeftovers(f.log), 1, "TEST-ONLY: the one fd the injected failure kept is closed by the test");
 });
 
 test("F8. path vs fd identity: external append / same-size rewrite / pathname replacement → JOURNAL_FILE_CHANGED (poison), never stale-cache acceptance", async () => {
@@ -448,6 +472,38 @@ test("F13. core-interface compatibility (no PG): getter-free data methods, nativ
   const o = await guard.observe(performance.now() + 2000, () => j.journal.append(RECS[0]));
   assert.deepEqual([o.kind, o.value.seq, o.value.hash], ["fulfilled", 1, recordHash(RECS[0])], "exactly the ack the core checks (run-core.mjs:259–260)");
   await j.close();
+});
+
+test("F15 (R-F1). APPEND (no prior read) verifies the bytes on disk still equal the acknowledged bytes: same-size rewrite / changed bytes → FILE_CHANGED, zero added bytes", async () => {
+  const at0 = `"at":${RECS[0].at}`;
+  for (const [label, mutate] of [
+    ["same-size CANONICAL rewrite", (b) => Buffer.from(b.toString("utf8").replace(at0, `"at":${RECS[0].at + 2}`))],
+    ["same-size garbage bytes", (b) => { const c = Buffer.from(b); c.fill(0x78, 5, 15); return c; }]
+  ]) {
+    const d = tmp(); const j = await open(d);
+    await j.journal.append(RECS[0]);
+    const changed = mutate(readFileSync(fileIn(d)));
+    assert.equal(changed.length, readFileSync(fileIn(d)).length, `${label}: same byte count`);
+    writeFileSync(fileIn(d), changed);                                 // SAME path / inode (writeFile truncates + rewrites in place)
+    assert.equal(await codeOf(j.journal.append(RECS[1])), "JOURNAL_FILE_CHANGED", `${label}: append refused without any read()`);
+    assert.deepEqual(readFileSync(fileIn(d)), changed, `${label}: zero bytes added`);
+    assert.deepEqual([j.status().state, j.status().head.seq, j.status().records], ["failed", 1, 1], `${label}: poisoned; head / history not advanced`);
+    assert.equal(await codeOf(j.journal.append(RECS[1])), "JOURNAL_FAILED");
+    await j.close();
+  }
+  {   // control: an unchanged file keeps appending through the same verification
+    const d = tmp(); const j = await open(d);
+    const acks = await appendAll(j, RECS.slice(0, 4));
+    assert.deepEqual(acks.map((a) => a.seq), [1, 2, 3, 4]);
+    assert.deepEqual(readFileSync(fileIn(d)), bytesOf(RECS.slice(0, 4)));
+    assert.equal(validateJournal((await j.journal.read()).records, ID).status, "IN_PROGRESS");
+    await j.close();
+  }
+});
+
+test("F16 (R-F2). resource accounting: every fd the suite opened through an adapter was closed exactly once (no GC-closed descriptors)", () => {
+  assertAllClosed("suite");
+  assert.ok(LOGS.length > 40, "the accounting covers the suite's opens");
 });
 
 test("F14. source pins: exact imports; no timers / env / network / child process / SDK / core / worker import; process only in the default adapter", () => {

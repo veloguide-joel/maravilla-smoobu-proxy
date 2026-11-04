@@ -7,8 +7,8 @@
 //   * Ack only after the whole line was written (bounded write loop) AND the file sync resolved. Directory sync once at creation on
 //     POSIX platforms (failure fails closed); Windows is classified 'unsupported' deliberately. No power-loss / storage guarantee is made.
 //   * One handle operation at a time (read XOR append); close() waits for every started operation, then closes / unlocks exactly once.
-//   * Paths: trusted owner-controlled directory; path identity (lstat) and fd identity (fstat) are re-checked at each boundary; observed
-//     swaps are refused. No race-free defence against a hostile process renaming ancestors (no openat-style primitives).
+//   * Paths: trusted owner-controlled directory; path identity (lstat) and fd identity (fstat) are re-checked at each boundary, and the
+//     bounded file contents are byte-compared with the acknowledged bytes before every append and every read; observed changes are refused. No race-free defence against a hostile process renaming ancestors (no openat-style primitives).
 //   * Code-only: every refusal is D's JournalError(code) / { ok:false, code }; no path, errno text, record content or caller value leaks.
 //   * No timers, env, network, child process, SDK, worker, DB or core import. `process` is read only by the default fs adapter.
 import * as fsp from "node:fs/promises";
@@ -358,6 +358,11 @@ export async function openFileJournal(input) {
       try {
         const ic = await checkIdentity();
         if (ic) throw new JournalError(poison(ic));
+        // R-F1: before writing, the bounded current contents must still equal the bytes this handle acknowledged (same-size rewrites
+        // included). Detection of observed changes only: no atomic protection against a concurrent hostile edit after this check.
+        const cur = await readExact(knownSize);
+        if (cur.code) throw new JournalError(poison(cur.code));
+        if (Buffer.compare(cur.buf, known) !== 0) throw new JournalError(poison("JOURNAL_FILE_CHANGED"));
         if (!(await writeAll(fh, line))) throw new JournalError(poison("JOURNAL_IO_FAILED"));   // one append, completed; never retried
         try { await call(fh.fns.sync, []); } catch { throw new JournalError(poison("JOURNAL_IO_FAILED")); }
         known = Buffer.concat([known, line]); knownSize += line.length;
