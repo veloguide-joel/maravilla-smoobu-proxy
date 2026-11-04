@@ -1,6 +1,6 @@
-# E7 local connected-test RUNNER — CONTRACT, revision 8 (Slices A–D ACCEPTED; core integration map; core NOT yet implemented)
+# E7 local connected-test RUNNER — CONTRACT, revision 9 (Slices A–D ACCEPTED; Slice E core IMPLEMENTED offline, pending root CODE review)
 
-**Branch** `feature/e7-connected-core-contract`, cut from exact `d5a93e0f`. DOCS ONLY: this file is the only change. Nothing is implemented by this revision.
+**Branch** `feature/e7-connected-run-core`, cut from exact `ea830a62` (revision 8, root DESIGN ACCEPTED). Slice E changes exactly three files: new `scripts/e7-connected/run-core.mjs`, new `test/db/e7-connected-runner.test.mjs`, and this contract (status + §13). Revision 8 (`feature/e7-connected-core-contract`, from `d5a93e0f`) was docs only.
 
 **Provenance:**
 - Revision 1 `36a6da15`: root DESIGN HOLD R-R1 to R-R4.
@@ -17,6 +17,8 @@
 - Revision 8 (this file, DOCS ONLY) brings the core plan to the **exact accepted A / B / C / D interfaces** and resolves the remaining integration decisions in one source-cited map (§12).
   - It proposes the smallest executable offline core slice (§9.4).
   - The core is **not implemented and not authorized** by this revision.
+  - Root DESIGN REVIEW **ACCEPTED** revision 8 at `ea830a62` and authorized Slice E, with binding clarifications 1–6 (recorded in §13.1).
+- Revision 9 (this file) records the implemented Slice E (§13): `runConnectedTest` + `checkSameDatabase` in `run-core.mjs`, and the disposable-PG suite E1–E23. All results are **CLAUDE-RUN** (root cannot run PG). Pending root CODE review.
 
 **Citation convention.**
 - Current interfaces are cited by **file:line at `d5a93e0f`**: workers under `lib/booking-db/`, runner modules under `scripts/e7-connected/`.
@@ -43,7 +45,7 @@ Those are independent, CLOSED slices. All owner inputs stay **UNSET**. Live gate
 | Slice D: `run-journal-memory` (memory journal, record / chain / start validation) | **ACCEPTED** (`d5a93e0f`) | §2.5, §8 |
 | Import boundary (A) | **CLOSED** root decision | §2.0 |
 | Core integration decisions: same-DB check, ownership, journal emission, per-step bindings | **Resolved as a proposal in this revision** | §12 |
-| Slice E: `run-core` + disposable-PG runner test | **PROPOSED**; not implemented, not authorized | §9.4 |
+| Slice E: `run-core` + disposable-PG runner test | **IMPLEMENTED offline** at `feature/e7-connected-run-core`; pending root CODE review | §9.4, §13 |
 | File journal, real transports, credentials, Stripe ingress, CLI, read-only provider probes | **CLOSED**, separate slices | §9.4 |
 
 ## 1. Present runtime vs accepted foundation vs proposed core
@@ -53,7 +55,7 @@ Those are independent, CLOSED slices. All owner inputs stay **UNSET**. Live gate
 | Workers | **Accepted code**, used unchanged: `runOrchestratorStep` (`reservation-worker.js:585`), `runCaptureStep` (`capture-worker.js:600`), `runRecordingStep` (`recording-worker.js:598`), `runCleanupStep` (`compensation-worker.js:643`). Each step: (1) checks the `test` marker itself (`pool.js:73`; recording `:606–607`); (2) does its own scoped maintenance, recovery pass, at most one claim, its own provider calls (bounded by its own `setTimeout`, `reservation-worker.js:96–108`) and `releaseWork` SQL (`:171`) on the pool it is given; and (3) may leave a **late tail** (§7.3) |
 | Executor adapters | **Accepted** (`scripts/e7-connected/executor-adapters.mjs`, `b757d6b7`) |
 | Manifest (A), guard (B), facts (C), memory journal (D) | **Accepted** offline modules under `scripts/e7-connected/` (§2.1–§2.3, §2.5) |
-| Core (`run-core.mjs`) | **Not present.** The proposed interface is §2.4; the integration map is §12; the proposed slice is §9.4 |
+| Core (`run-core.mjs`) | **Implemented offline (Slice E, pending review).** Interface §2.4; integration map §12; implementation record §13 |
 | Real transports, credentials, Stripe TEST ingress, file journal, live CLI | **CLOSED**, separate slices |
 
 ## 2. Files and exports
@@ -460,7 +462,7 @@ The core supplies closures over **its** client, for example `subscribe = (ev, h)
 
 `checkSameDatabase` (§7.8, proposed in revision 4 for this module) is **not** part of Slice C: root's Slice C scope named the snapshot, the guest read and the candidate derivation only. It stays a core-slice item. Its exact design is now §12.1 (core-owned SQL in `run-core.mjs`).
 
-### 2.4 `run-core.mjs` — PROPOSED interface (Slice E, §9.4); not implemented
+### 2.4 `run-core.mjs` — interface (Slice E, §9.4; implemented, §13)
 
 `runConnectedTest(opts) → Promise<frozen RunResult>`
 
@@ -1299,7 +1301,7 @@ Run the focused unit suite and `npm test`. No DB run.
 5. `createMemoryJournal` options are `{ identity, preload, faults }`, replacing revision 4's `{ failAt, hangAt, lateAt, preload }`.
 6. `MAX_RECORDS` 1024.
 
-### 9.4 PROPOSED Slice E — `run-core` + disposable-PG runner test (offline); not authorized
+### 9.4 Slice E — `run-core` + disposable-PG runner test (offline); AUTHORIZED at `ea830a62`, implemented (§13)
 
 **Allowed files (proposed):**
 - new `scripts/e7-connected/run-core.mjs`: `runConnectedTest`, `checkSameDatabase`, and the lock / same-DB SQL constants (§2.4, §12);
@@ -1569,3 +1571,55 @@ Scenario C's create stays `outcome_unknown` with an open `HOSTAWAY_CREATE_OUTCOM
 - `writes` counting from `dispatched_at`.
 
 **Before any real run** (all CLOSED): real transports with proven zero automatic retries, a credential loader, Stripe TEST ingress, a file journal, a live CLI, read-only provider probes (cancel / offline-charge mappings remain LIVE-UNVERIFIED), the pilot containment decision (§3.3) and every owner decision (§10).
+
+## 13. Slice E implementation record (revision 9; offline; pending root CODE review)
+
+**Files (exactly three):** new `scripts/e7-connected/run-core.mjs`; new `test/db/e7-connected-runner.test.mjs`; this contract. No change to A / B / C / D, adapters, workers, `lib/`, SQL, grants, fixtures, config, packages or containment pins. No CLI, file journal, real transport, credential loading or ingress.
+
+**Exports:** `runConnectedTest(opts)` (§2.4), `checkSameDatabase(s1Rows, s2Rows)` (the pure §12.1 comparison; the two statements are issued by `runConnectedTest`), `SQL` (`LOCK`, `UNLOCK`, `SAME_DB`, the only SQL text in the module), `LOCK_KEY`, `PHASE_LIMITS`, `IDLE_WAIT_MS`, `P0_BUDGET_MS`, `RUN_CORE_VERSION`. Imports: A, B, C, D, the adapters, the four worker entrypoints + their `*_DEFAULT_TIMEOUTS`, `node:util` (E23 pins the exact list).
+
+### 13.1 Root binding clarifications (ACCEPTED rev 8 → Slice E), as implemented
+
+1. **Absolute deadlines.** Every await is `guard.observe / wait / lc.observeTail / observeConnect / observeStep` with an ABSOLUTE monotonic deadline = `now + bounded duration`, capped by the current phase budget (`deadline(ms)` helper; the step deadline is `min(now + stepBudgetMs + STEP_MARGIN_MS, phaseDeadline)`). A failed `guard.now()` is never used: the helper returns null and the run stops with the guard's code. An invalid business-clock reading at an append stops `CLOCK_INVALID` (no append).
+2. **Basis, not fence.** A post-step snapshot is reused as the next pre-step basis only when no wait / attestation / other awaited external boundary happened in between (`delayMs = 0` and not idle). After every wait and every attestation a FRESH C snapshot is taken before deciding to start the next step; after `AIRBNB_BLOCKED` it is gated strictly (open case, any `in_flight` / `outcome_unknown` / `escalated` write, protected refs) before capture — and also on the `capture:false` end path. The strict gate runs before every capture / recording step (the conservative reading of §6.1 vs §12.4: ANY `in_flight` write, not only dispatched ones). No network inside a DB transaction (C's read-only transaction never overlaps a worker or transport call).
+3. **Bindings.** Capture / cleanup Common = exactly `listingId, arrivalDate, departureDate, ref`; every binding is built field by field from that step's frozen facts. The journal carries only D's projected action tokens, the unlisted-action COUNT, refusal `{ key, code }` (≤ 16), counts and states: never guest values, raw replies / errors, executor arguments or unlisted actions (E5 asserts no guest value in any record).
+4. **finalize.** `result.finalize` is `() => lc.finalize()` (B's same memoized promise; E2/E5 assert identity). It is never called by the core; the bounded RunResult is returned first. The lock client is retained for STEP / TAIL (E13 asserts it is neither unlocked nor released while finalize is pending). Late callbacks never append or mutate the frozen result (E14).
+5. **Pre-attach loss.** The lock client's tracker `onLoss` sets a core flag before `attachLock`; after the try-lock the core checks `tracker.state()` and the flag, and on loss destroys once (idempotent tracker) and refuses `LOCK_LOST` with zero further SQL (E16 "lost before attach": the real lock statement succeeded, then the session was terminated before the runner attached it). Losses during P0 setup and after attachment are tested too. Healthy clients: `tracker.dispose()` then `release()` (E2/E5 assert the event order). DB family: local `release(true)`, `markDbFamily`, and no further runner SQL, unlock included (E11). Worker-owned SQL after a step timeout / rejection is outside this rule (labelled in the module header and §12.2 row 9).
+6. **Accounting.** The conservative key comes from acknowledged facts + the open phase (+ the cleanup entry key), never from `phases` flags; an unused phase cannot lower it. One fresh `createPhaseExecutors` + `createLedger` + `wrapExecutors` per step; no resume, no new key, no retry. Phase / state success only from acknowledged C snapshots and exact D emission (`validateRecord` before each append; the head advances only on an acknowledgement whose `{seq, hash}` equals the record's). A rejected / timed-out append sets "no later append" (terminal included). The terminal is attempted once; an unacknowledged terminal is reported `journalTerminal:'unknown'`, never repaired.
+
+### 13.2 Deviations / routine choices (for review)
+
+- **D1 `effectsKnown` on STOP** is computed (§6.2 list: false on outstanding / rejected / open step, stale counts, DB family, or an unknown write in the last facts), not hard-coded false; e.g. `OWNER_DECLINED` at `CALENDAR_BASELINE` journals `effectsKnown:true`, key null.
+- **D2 Key null only per §6.2:** once a phase has started, a null key is raised to `reservedNotConfirmed` unless effects are known, no create op is beyond `pending`, and no reservation work is outstanding / rejected.
+- **D3 P0 eligibility order:** protected / malformed candidate codes first, then state / write ops / open case → `INTENT_NOT_ELIGIBLE`, then any other candidate code. (First full TAP showed the earlier order surfaced C's `NOT_RESERVATION_PHASE` for an ineligible intent; corrected — see §13.3.)
+- **D4 Strict gate scope:** reservation and cleanup steps are NOT gated on open cases / unknown writes (the accepted recovery path runs with an `outcome_unknown` create and an open case — rehearsal C); they keep the protected / malformed stop and §12.4 binding codes. Strict gates: before capture / recording steps and after `AIRBNB_BLOCKED` (incl. `capture:false`, where an open case therefore stops `OPEN_CASE` rather than ending reserved).
+- **D5 Between phases** (attestations, terminal append) no phase deadline applies; each await keeps its own `LIMITS` bound. P0 has its own 60 s budget.
+- **D6 Idle wait:** a worker result `idle` with no `delayMs` waits `IDLE_WAIT_MS` (5 s) before the next fresh snapshot.
+- **D7 Pre-step end state:** entering capture with `capture_failed` already set (external actor) runs ONE capture step (it idles) so `PHASE_ENDED capture capture_failed` is legal in D; then cleanup.
+- **D8 Tail failure:** `STEP_ENDED { state:null, writes: last acknowledged }`, then `RUN_STOPPED LATE_TAIL_OUTSTANDING` (E15), as §12.3.
+- **D9 OPTIONS_INVALID / manifest refusals** return a reduced frozen result `{ ok:false, outcome:'REFUSED', stopCode, phase:'P0', finalize }` (no lifecycle exists yet; zero I/O). All later results have the full §2.4 shape (E2/E5 assert keys).
+- **D10 D's third released path** (a reservation existed and cleanup ended `authorization_released`) stops `STATE_UNEXPECTED` with key `reservedNotConfirmed`; D unchanged.
+
+### 13.3 Validation (all CLAUDE-RUN; root cannot run PG)
+
+Commands, from the repository root at the Slice E head:
+
+```
+node --test --test-concurrency=1 test/db/e7-connected-runner.test.mjs        # focused PG suite (needs local PG binaries)
+node --test test/e7-connected-*.test.mjs test/hostaway-reservations.test.mjs test/e4-connected-path.test.mjs   # A/B/D units + adapters + pins
+npm test
+```
+
+- **FIRST FULL TAP (preserved, honest):** run 1 — E1–E7 ok; **E8 not ok** (its appended E4 eligibility check on the E8 booking got `NOT_RESERVATION_PHASE`, expected `INTENT_NOT_ELIGIBLE` → core fix D3). That failed assertion skipped the check's `finalize`, so its run lock stayed held and **E9–E15 cascaded as `RUN_LOCK_HELD` (test-setup cascade, not separate defects)**; I interrupted the run after 15 results. Fixes: D3 in the core; test-setup `afterEach` that destroys any client a scenario still holds; finalize before asserting in the E4 add-on.
+- **Run 2:** 22/23 — E12 not ok: the first post-`STEP_STARTED` app statement is the worker's own marker check, which the accepted worker converts into a `refused` result (`STEP_REFUSED`, observed and journaled correctly); a **test-design** issue. E12 now rejects the worker's first maintenance statement (`nth: 2`), which propagates as a step rejection.
+- **Run 3:** **23/23** (duration ≈ 90 s), same code as run 2 except the E12 fault selector. TAP: E1–E23 all `ok`.
+- Units + adapters + pins: 132/132. `npm test`: 797/797. Full `test:db` not run (the focused evidence shows no wider concern). e74a not in scope and not reproduced.
+
+### 13.4 Residuals (stated)
+
+- The `in_flight` branch of the strict gate is covered by the same predicate as `outcome_unknown` / `escalated` but has no separate PG case (an `in_flight` write cannot be produced legitimately between steps without raw lifecycle writes or worker injection).
+- Worker-owned SQL / provider calls keep running after a step timeout or rejection (E13 / E14 / E15); `finalize` can stay pending forever for an unobservable tail (E13), and callers must not end `pools.app` meanwhile.
+- STEP-timeout and tail tests depend on the workers' own real timers (pricing 8 s, create 20 s): E14 ≈ 8 s, E15 ≈ 30 s real.
+- Same-DB check is accidental-misconfiguration detection only (§12.1). The advisory lock is not a worker fence.
+- Time in tests is scaled real time (K = 10; K = 3 for E15) plus a test-only `advance` / `jump`; the business clock follows §12.4 (real clock for recording scenarios; behind-real-time, capped, for recovery / cleanup scenarios).
+- All live / provider / credential / network / install / shared-DB / merge / deploy / real-message gates remain CLOSED; owner inputs UNSET; protected ids zero action; e74a OPEN.
