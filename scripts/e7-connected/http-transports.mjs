@@ -13,6 +13,15 @@
 //   * Credentials: an injected synchronous callback, called ONCE per permitted send after request validation. The value necessarily exists
 //     in the private exchange request's Authorization header; it is never returned, thrown, logged or kept by this module.
 //   * Errors are code-only (E7TransportError); no URL, header, id, key, token, provider body or caller error ever leaves.
+//   * Promise observation (root HOLD R-TC2, the accepted run-guard rule ported, not imported): `send` is a plain function returning a
+//     promise made by the captured native constructor; it never `await`s. A caller promise is observed ONLY through the intrinsic
+//     Promise.prototype.then captured at load, and only when it is unpatched (brand, exact prototype, no own string key, only plain
+//     unregistered symbol DATA props) AND Promise.prototype.constructor / Promise[@@species] still have their load-time descriptors
+//     (descriptor identity, re-checked synchronously immediately before each attachment; no getter runs). GLOBAL INTRINSIC TRUST: this
+//     module does not claim arbitrary same-process code cannot modify built-ins (e.g. Object.prototype); it is not a sandbox. A caller
+//     return that is not such a promise is refused code-only and never assimilated; a rejection it carries is then not observed here.
+//   * Abort (R-TC1): the genuine signal is re-checked after the exchange settles — fulfilled OR rejected — before the reply is used;
+//     aborted → ABORTED_IN_FLIGHT. That does NOT mean the request had no server effect.
 import { types } from "node:util";
 import { PROTECTED_HOSTAWAY_RESERVATION_IDS } from "../../lib/checkout/compensation-proof.js";
 
@@ -44,11 +53,16 @@ const TA_LENGTH = getDesc(TA_PROTO, "byteLength").get;
 const TA_SET = TA_PROTO.set;
 const AB_DETACHED = getDesc(ArrayBuffer.prototype, "detached")?.get ?? null;
 const NATIVE_ABORTED = getDesc(AbortSignal.prototype, "aborted").get;
+const NativePromise = Promise;
 const P_THEN = Promise.prototype.then;
 const PROMISE_PROTO = Promise.prototype;
+const CTOR_DESC = getDesc(Promise.prototype, "constructor");
+const SPECIES_DESC = getDesc(Promise, Symbol.species);
+const SYMBOL_KEY_FOR = Symbol.keyFor;
 const DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
 const PROTECTED = new Set(PROTECTED_HOSTAWAY_RESERVATION_IDS.map(String));
 const isFn = (f) => typeof f === "function" && !types.isProxy(f);
+const isSyncFn = (f) => isFn(f) && !types.isAsyncFunction(f) && !types.isGeneratorFunction(f);
 
 // ---- getter-free snapshots ------------------------------------------------------------------------------------------------------
 const BAD = Symbol("bad");
@@ -106,18 +120,45 @@ const WELL_KNOWN = new Set(Object.getOwnPropertyNames(Symbol).map((k) => Symbol[
 /** genuine, UNPATCHED native promise: Promise.prototype directly; no own string-keyed property (so no own `then` / `constructor`, which
  *  the intrinsic `then` would consult via SpeciesConstructor), no own well-known or registered symbol. Unique unregistered symbol DATA
  *  properties are tolerated: Node's async_hooks attaches `async_id_symbol` / `trigger_async_id_symbol` to every promise under node:test. */
+/** the two built-ins the intrinsic then consults (SpeciesConstructor: p.constructor → C[@@species]) still carry their load-time
+ *  descriptors — descriptor identity only, nothing is called */
+function intrinsicsIntact() {
+  const c = getDesc(PROMISE_PROTO, "constructor");
+  const sp = getDesc(NativePromise, Symbol.species);
+  return !!c && "value" in c && c.value === CTOR_DESC.value && !!sp && sp.get === SPECIES_DESC.get && sp.set === SPECIES_DESC.set;
+}
 const isNativePromise = (p) => {
   try {
     if (p === null || typeof p !== "object" || types.isProxy(p) || !types.isPromise(p) || getProto(p) !== PROMISE_PROTO) return false;
-    for (const k of ownKeys(p)) {
-      if (typeof k !== "symbol" || WELL_KNOWN.has(k) || Symbol.keyFor(k) !== undefined) return false;
-      const d = getDesc(p, k); if (!d || !("value" in d)) return false;
+    const d = getDescs(p);
+    for (const k of ownKeys(d)) {
+      if (typeof k !== "symbol" || WELL_KNOWN.has(k) || apply(SYMBOL_KEY_FOR, Symbol, [k]) !== undefined || !("value" in d[k])) return false;
     }
-    return true;
+    return intrinsicsIntact();
   } catch { return false; }
 };
-/** settle a native promise through the captured intrinsic `then` (a patched Promise.prototype.then is never consulted) */
-const settle = (p) => new Promise((res, rej) => { apply(P_THEN, p, [res, rej]); });
+/** attach handlers through the captured intrinsic then → true; false WITHOUT attaching when `p` is not an unpatched native promise with
+ *  intact intrinsics. Checked synchronously immediately before the attachment (no caller code can run in between). Handlers never throw. */
+function observe(p, onFulfilled, onRejected) {
+  if (!isNativePromise(p)) return false;
+  try {
+    apply(P_THEN, p, [(v) => { try { onFulfilled(v); } catch { /* contained */ } }, (e) => { try { onRejected(e); } catch { /* contained */ } }]);
+    return true;
+  } catch { return false; }
+}
+const noop = () => {};
+/** a code-only rejection / error from anything thrown inside this module (never a caller error object) */
+const asCode = (e) => (e instanceof E7TransportError ? e : new E7TransportError("REPLY_INVALID"));
+const rejected = (e) => new NativePromise((_, rej) => { rej(asCode(e)); });
+/** the synchronous credential callback, called once. A non-string return is CREDENTIAL_INVALID; a genuine unpatched native promise
+ *  (e.g. a normal function returning Promise.reject(...)) is CONTAINED — a no-op handler attached via the intrinsic then, never awaited
+ *  or used as a credential — so it cannot surface as an unhandled rejection (R-TC3). Other thenables are never touched. */
+function callCredential(credential) {
+  let v;
+  try { v = apply(credential, undefined, []); } catch { fail("CREDENTIAL_INVALID"); }
+  if (typeof v !== "string") { if (v !== null && typeof v === "object") observe(v, noop, noop); fail("CREDENTIAL_INVALID"); }
+  return v;
+}
 
 /** the exchange reply's bytes: genuine Uint8Array (no subclass / proxy), ordinary non-shared non-detached buffer, ≤ max; copied once */
 function copyBytes(v, max) {
@@ -154,21 +195,27 @@ function parseJson(bytes) {
   try { return deepFreeze(JSON.parse(DECODER.decode(bytes))); } catch { return BAD; }
 }
 
-/** one exchange: final native signal check IMMEDIATELY before it, exactly one call, reply envelope snapshotted, no follow-up */
-async function exchangeOnce(exchange, req, signal, max) {
-  const a = nativeAborted(signal);
-  if (a !== false) fail(a === true ? "ABORTED" : "OPTIONS_INVALID");
-  let p;
-  try { p = apply(exchange, undefined, [req]); } catch { fail("EXCHANGE_FAILED"); }
-  if (!isNativePromise(p)) fail("EXCHANGE_FAILED");
-  let r;
-  try { r = await settle(p); } catch { fail(nativeAborted(signal) === true ? "ABORTED_IN_FLIGHT" : "EXCHANGE_FAILED"); }
-  const env = topData(r, ["bytes", "contentType", "status"]);
-  if (!env) fail("REPLY_INVALID");
-  if (!Number.isSafeInteger(env.status) || env.status < 100 || env.status > 599) fail("REPLY_INVALID");
-  if (env.contentType !== null && typeof env.contentType !== "string") fail("REPLY_INVALID");
-  if (env.status >= 300 && env.status <= 399) fail("REDIRECT_REFUSED");      // never followed
-  return { status: env.status, bytes: copyBytes(env.bytes, max) };
+/** one exchange → native promise of finish(status, bytes). Final native signal check IMMEDIATELY before the call, exactly one call,
+ *  native signal re-checked after settlement (fulfilled or rejected) BEFORE the reply is used, envelope snapshotted, no follow-up. */
+function exchangeOnce(exchange, req, signal, max, finish) {
+  return new NativePromise((resolve, reject) => {
+    const a = nativeAborted(signal);
+    if (a !== false) { reject(new E7TransportError(a === true ? "ABORTED" : "OPTIONS_INVALID")); return; }
+    let p;
+    try { p = apply(exchange, undefined, [req]); } catch { reject(new E7TransportError("EXCHANGE_FAILED")); return; }
+    const attached = observe(p, (r) => {
+      try {
+        if (nativeAborted(signal) !== false) fail("ABORTED_IN_FLIGHT");         // R-TC1: abort observed after a FULFILLED settlement
+        const env = topData(r, ["bytes", "contentType", "status"]);
+        if (!env) fail("REPLY_INVALID");
+        if (!Number.isSafeInteger(env.status) || env.status < 100 || env.status > 599) fail("REPLY_INVALID");
+        if (env.contentType !== null && typeof env.contentType !== "string") fail("REPLY_INVALID");
+        if (env.status >= 300 && env.status <= 399) fail("REDIRECT_REFUSED");  // never followed
+        resolve(finish(env.status, copyBytes(env.bytes, max)));
+      } catch (e) { reject(asCode(e)); }
+    }, () => { reject(new E7TransportError(nativeAborted(signal) === false ? "EXCHANGE_FAILED" : "ABORTED_IN_FLIGHT")); });
+    if (!attached) reject(new E7TransportError("EXCHANGE_FAILED"));          // not observable: never assimilated, never retried
+  });
 }
 const maxOpt = (v, cap) => (v === undefined ? cap : Number.isSafeInteger(v) && v >= 1 && v <= cap ? v : null);
 
@@ -259,13 +306,14 @@ const queryString = (pairs) => {
  */
 export function createE7HostawaySend(input) {
   const o = topData(input, ["credential", "exchange"], ["maxBytes"]);
-  if (!o || !isFn(o.exchange) || !isFn(o.credential)) return freeze({ ok: false, code: "OPTIONS_INVALID" });
+  if (!o || !isFn(o.exchange) || !isSyncFn(o.credential)) return freeze({ ok: false, code: "OPTIONS_INVALID" });
   const max = maxOpt(o.maxBytes, HOSTAWAY_MAX_BYTES);
   if (max === null) return freeze({ ok: false, code: "OPTIONS_INVALID" });
   const { exchange, credential } = o;
-  async function send(request, opts) {
+  function send(request, opts) {
+   try {
     const signal = callSignal(opts);
-    const r = safeSnap(request);                                 // frozen own-data copy before any await
+    const r = safeSnap(request);                                 // frozen own-data copy; send never awaits
     if (r === BAD || r === null || typeof r !== "object" || Array.isArray(r)) fail("REQUEST_NOT_ALLOWED");
     const hasBody = "body" in r;
     if (!keysExactly(r, hasBody ? ["body", "method", "path", "query"] : ["method", "path", "query"])) fail("REQUEST_NOT_ALLOWED");
@@ -273,17 +321,18 @@ export function createE7HostawaySend(input) {
     if (hasBody && (r.body === null || typeof r.body !== "object" || Array.isArray(r.body))) fail("REQUEST_NOT_ALLOWED");
     const f = hostawayForm(r);
     if (!f || (["H5", "H6", "H7", "H9"].includes(f.form) !== hasBody)) fail("REQUEST_NOT_ALLOWED");
-    let token;
-    try { token = apply(credential, undefined, []); } catch { fail("CREDENTIAL_INVALID"); }
-    if (typeof token !== "string" || !TOKEN_RE.test(token)) fail("CREDENTIAL_INVALID");
+    let token = callCredential(credential);
+    if (!TOKEN_RE.test(token)) fail("CREDENTIAL_INVALID");
     const headers = { Accept: "application/json", Authorization: `Bearer ${token}`, "Cache-control": "no-cache" };
     if (hasBody) headers["Content-Type"] = "application/json";
     token = null;
     const req = freeze({ method: r.method, url: `${HOSTAWAY_ORIGIN}${r.path}${queryString(f.wire)}`, headers: freeze(headers),
       body: hasBody ? JSON.stringify(r.body) : null, signal, maxBytes: max });
-    const { status, bytes } = await exchangeOnce(exchange, req, signal, max);
-    const json = parseJson(bytes);
-    return freeze({ httpStatus: status, json: json === BAD ? null : json });   // statuses passed through unchanged; no re-mint on 401 / 403
+    return exchangeOnce(exchange, req, signal, max, (status, bytes) => {
+      const json = parseJson(bytes);
+      return freeze({ httpStatus: status, json: json === BAD ? null : json }); // statuses passed through unchanged; no re-mint on 401 / 403
+    });
+   } catch (e) { return rejected(e); }
   }
   return freeze({ ok: true, transport: freeze({ send }) });
 }
@@ -303,13 +352,14 @@ const expandOnly = (p) => p && typeof p === "object" && keysExactly(p, ["expand"
  */
 export function createE7StripeTestSend(input) {
   const o = topData(input, ["accountId", "apiVersion", "credential", "exchange"], ["maxBytes"]);
-  if (!o || !isFn(o.exchange) || !isFn(o.credential) || typeof o.accountId !== "string" || !ACCT_RE.test(o.accountId)
+  if (!o || !isFn(o.exchange) || !isSyncFn(o.credential) || typeof o.accountId !== "string" || !ACCT_RE.test(o.accountId)
       || typeof o.apiVersion !== "string" || !VERSION_RE.test(o.apiVersion)) return freeze({ ok: false, code: "OPTIONS_INVALID" });
   const max = maxOpt(o.maxBytes, STRIPE_MAX_BYTES);
   if (max === null) return freeze({ ok: false, code: "OPTIONS_INVALID" });
   const { exchange, credential } = o;
   const accountId = o.accountId; const apiVersion = o.apiVersion;     // primitives: immutable binding
-  async function send(call, opts) {
+  function send(call, opts) {
+   try {
     const signal = callSignal(opts);
     const c = safeSnap(call);
     if (c === BAD || c === null || typeof c !== "object" || Array.isArray(c) || typeof c.op !== "string") fail("REQUEST_NOT_ALLOWED");
@@ -327,15 +377,14 @@ export function createE7StripeTestSend(input) {
         && typeof c.idempotencyKey === "string" && KEY_RE.test(c.idempotencyKey) && c.params && typeof c.params === "object" && !Array.isArray(c.params) && Object.keys(c.params).length === 0) {
       method = "POST"; path = `/v1/payment_intents/${c.id}/cancel`; idem = c.idempotencyKey; kind = "pi"; form = "";
     } else fail("REQUEST_NOT_ALLOWED");
-    let key;
-    try { key = apply(credential, undefined, []); } catch { fail("CREDENTIAL_INVALID"); }
-    if (typeof key !== "string" || key.length === 0) fail("CREDENTIAL_INVALID");
+    let key = callCredential(credential);
+    if (key.length === 0) fail("CREDENTIAL_INVALID");
     if (!TEST_KEY_RE.test(key)) fail("KEY_NOT_TEST");                 // sk_live_ / rk_live_ / rk_test_ / anything else: zero exchanges
     const headers = { Authorization: `Bearer ${key}`, "Stripe-Version": apiVersion };
     key = null;
     if (method === "POST") { headers["Content-Type"] = "application/x-www-form-urlencoded"; headers["Idempotency-Key"] = idem; }
     const req = freeze({ method, url: `${STRIPE_ORIGIN}${path}`, headers: freeze(headers), body: method === "POST" ? form : null, signal, maxBytes: max });
-    const { status, bytes } = await exchangeOnce(exchange, req, signal, max);
+    return exchangeOnce(exchange, req, signal, max, (status, bytes) => {
     if (status >= 400) fail(status >= 500 ? "STRIPE_HTTP_5XX" : "STRIPE_HTTP_4XX");
     if (status < 200) fail("REPLY_INVALID");
     const obj = parseJson(bytes);
@@ -349,6 +398,8 @@ export function createE7StripeTestSend(input) {
       if (obj.livemode !== false) fail("LIVEMODE_REFUSED");
     }
     return obj;
+    });
+   } catch (e) { return rejected(e); }
   }
   return freeze({ ok: true, transport: freeze({ send }) });
 }

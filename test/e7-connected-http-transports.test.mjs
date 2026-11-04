@@ -356,3 +356,95 @@ test("T10. source pins: imports, no default network / env / timers / fs / SDK, n
   assert.equal(CHARGE_LIST_LIMIT, LIST_LIMIT);
   assert.equal(netAttempts, 0);
 });
+
+// ---- root CODE HOLD on b4150809: R-TC1 / R-TC2 / R-TC3 (each FAILS on exact b4150809; see contract §11.1) -------------------------
+const PI_CALL = { op: "paymentIntents.retrieve", id: PI, params: { expand: ["latest_charge"] } };
+
+test("T11 (R-TC1). abort AFTER the exchange started: fulfilled OR rejected settlement → ABORTED_IN_FLIGHT, one exchange, no follow-up; controls succeed", async () => {
+  for (const provider of ["hostaway", "stripe"]) {
+    const reply = provider === "hostaway" ? ok({ status: "success", result: {} }) : ok(PIOBJ());
+    const call = provider === "hostaway" ? H.cancel() : PI_CALL;
+    const mk = (exchange) => { let n = 0; const ex = (r) => { n += 1; return exchange(r); };
+      const t = provider === "hostaway" ? createE7HostawaySend({ exchange: ex, credential: () => HTOKEN }).transport
+        : createE7StripeTestSend({ exchange: ex, credential: () => SKEY, accountId: ACCT, apiVersion: VERSION }).transport;
+      return { t, n: () => n }; };
+    { const ac = new AbortController(); const u = mk(() => { ac.abort(); return Promise.resolve(reply); });
+      assert.deepEqual([await codeOf(u.t.send(call, { signal: ac.signal })), u.n()], ["ABORTED_IN_FLIGHT", 1], `${provider}: fulfil after abort`); }
+    { const ac = new AbortController(); const u = mk(() => new Promise((res) => { queueMicrotask(() => { ac.abort(); res(reply); }); }));
+      assert.deepEqual([await codeOf(u.t.send(call, { signal: ac.signal })), u.n()], ["ABORTED_IN_FLIGHT", 1], `${provider}: abort while pending, then fulfil`); }
+    { const ac = new AbortController(); const u = mk(() => { ac.abort(); return Promise.reject(new Error("synthetic")); });
+      assert.deepEqual([await codeOf(u.t.send(call, { signal: ac.signal })), u.n()], ["ABORTED_IN_FLIGHT", 1], `${provider}: reject after abort`); }
+    { const u = mk(() => Promise.resolve(reply)); const r = await u.t.send(call, { signal: sig() });
+      assert.equal(u.n(), 1); assert.ok(provider === "hostaway" ? r.httpStatus === 200 : r.object === "payment_intent", `${provider}: ordinary success control`); }
+    { const u = mk(() => Promise.reject(new Error("synthetic")));
+      assert.deepEqual([await codeOf(u.t.send(call, { signal: sig() })), u.n()], ["EXCHANGE_FAILED", 1], `${provider}: ordinary rejection control`); }
+  }
+});
+
+test("T12 (R-TC2). Promise[@@species] / inherited constructor getters armed by the exchange: ZERO getter runs, code-only refusal; genuine controls pass", async () => {
+  const targets = [["Promise[@@species]", Promise, Symbol.species], ["Promise.prototype.constructor", Promise.prototype, "constructor"]];
+  for (const provider of ["hostaway", "stripe"]) {
+    for (const [label, target, key] of targets) {
+      const orig = Object.getOwnPropertyDescriptor(target, key);
+      let runs = 0; let n = 0;
+      const exchange = () => { n += 1; const p = Promise.resolve(provider === "hostaway" ? ok({}) : ok(PIOBJ()));
+        Object.defineProperty(target, key, { configurable: true, get() { runs += 1; return orig.value ?? Promise; } }); return p; };
+      const t = provider === "hostaway" ? createE7HostawaySend({ exchange, credential: () => HTOKEN }).transport
+        : createE7StripeTestSend({ exchange, credential: () => SKEY, accountId: ACCT, apiVersion: VERSION }).transport;
+      let p, during;
+      try { p = t.send(provider === "hostaway" ? H.byId() : PI_CALL, { signal: sig() }); during = runs; }
+      finally { Object.defineProperty(target, key, orig); }                  // restored BEFORE this test's own await (an await reads constructor)
+      assert.deepEqual(Object.getOwnPropertyDescriptor(target, key), orig, "descriptor restored");
+      assert.equal(await codeOf(p), "EXCHANGE_FAILED", `${provider} ${label}`);
+      assert.deepEqual([during, runs, n], [0, 0, 1], `${provider} ${label}: the module ran no getter; one exchange, no retry`);
+    }
+    // genuine control under node:test (async_hooks symbol DATA props present), after restoration
+    const g = provider === "hostaway" ? hostaway() : stripe(() => ok(PIOBJ()));
+    const r = await g.send(provider === "hostaway" ? H.byId() : PI_CALL, { signal: sig() });
+    assert.ok(provider === "hostaway" ? r.httpStatus === 200 : r.id === PI);
+  }
+  // send itself returns a promise made by the captured native constructor, with no own properties beyond async_hooks symbols
+  const sp = hostaway().send(H.byId(), { signal: sig() });
+  assert.ok(sp instanceof Promise && Object.getPrototypeOf(sp) === Promise.prototype && Object.keys(sp).length === 0);
+  await sp;
+  // original rejection identity is never leaked
+  const boom = new Error("synthetic exchange failure detail");
+  let err; try { await createE7HostawaySend({ exchange: () => Promise.reject(boom), credential: () => HTOKEN }).transport.send(H.byId(), { signal: sig() }); } catch (e) { err = e; }
+  assert.ok(err instanceof E7TransportError && err !== boom && err.cause === undefined && !String(err.stack).includes("synthetic exchange failure detail"));
+});
+
+test("T13 (R-TC3). credential returning a REJECTED native promise: CREDENTIAL_INVALID, one call, zero exchanges, ZERO unhandled rejections; async credential refused at construction", async () => {
+  let unhandled = 0; const onU = () => { unhandled += 1; };
+  process.on("unhandledRejection", onU);
+  try {
+    for (const make of [() => createE7HostawaySend, () => createE7StripeTestSend]) {
+      const factory = make(); let c = 0; let x = 0;
+      const base = { exchange: () => { x += 1; return Promise.resolve(ok(ACCOUNT)); }, credential: () => { c += 1; return Promise.reject(new Error("synthetic rejected credential")); } };
+      const t = factory(factory === createE7StripeTestSend ? { ...base, accountId: ACCT, apiVersion: VERSION } : base).transport;
+      let err; try { await t.send(factory === createE7StripeTestSend ? { op: "accounts.retrieve" } : H.byId(), { signal: sig() }); } catch (e) { err = e; }
+      assert.equal(err.code, "CREDENTIAL_INVALID");
+      assert.ok(!String(err.stack).includes("synthetic rejected credential") && err.cause === undefined, "no original error retained");
+      assert.deepEqual([c, x], [1, 0]);
+      // a caller THENABLE is never assimilated: its then is not called
+      let thenRuns = 0; const thenable = { then() { thenRuns += 1; } };
+      const t2 = factory(factory === createE7StripeTestSend ? { ...base, credential: () => thenable, accountId: ACCT, apiVersion: VERSION } : { ...base, credential: () => thenable }).transport;
+      assert.equal(await codeOf(t2.send(factory === createE7StripeTestSend ? { op: "accounts.retrieve" } : H.byId(), { signal: sig() })), "CREDENTIAL_INVALID");
+      assert.equal(thenRuns, 0);
+      assert.deepEqual({ ...factory({ ...base, credential: async () => HTOKEN, ...(factory === createE7StripeTestSend ? { accountId: ACCT, apiVersion: VERSION } : {}) }) }, { ok: false, code: "OPTIONS_INVALID" });
+    }
+    await new Promise((r) => setTimeout(r, 25));
+    assert.equal(unhandled, 0, "in-process: zero unhandled rejections");
+  } finally { process.off("unhandledRejection", onU); }
+  // process-level isolation: a bounded child process (test-file only; the runtime module imports no child_process)
+  const { spawnSync } = await import("node:child_process");
+  const mod = join(ROOT, "scripts/e7-connected/http-transports.mjs");
+  const script = `import { createE7HostawaySend } from ${JSON.stringify("file://" + mod)};
+let u = 0; process.on("unhandledRejection", () => { u += 1; });
+const t = createE7HostawaySend({ exchange: () => Promise.resolve({ status: 200, contentType: null, bytes: new Uint8Array(0) }), credential: () => Promise.reject(new Error("synthetic")) }).transport;
+let code; try { await t.send({ method: "GET", path: "/v1/reservations/6100001", query: {} }, { signal: new AbortController().signal }); } catch (e) { code = e.code; }
+await new Promise((r) => setTimeout(r, 50));
+process.stdout.write(JSON.stringify({ code, u }));`;
+  const r = spawnSync(process.execPath, ["--input-type=module", "-e", script], { encoding: "utf8", timeout: 10_000 });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(JSON.parse(r.stdout), { code: "CREDENTIAL_INVALID", u: 0 }, "child process: zero unhandled rejections");
+});
