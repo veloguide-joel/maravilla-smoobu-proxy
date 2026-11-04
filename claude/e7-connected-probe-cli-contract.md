@@ -494,3 +494,187 @@ All snapshots, fs objects, handles, promises, bodies and primitives are fakes, w
 5. **ONE consolidated exact approval package (§6)** → Joel's explicit approval of that package → a single controlled read-only run.
 
 No step claims readiness or that anything is live.
+
+## 12. C2 implementation / clarification / deviation / FIRST-TAP map (branch `feature/e7-connected-probe-command` from exact `d81fea91`)
+**Scope held.** Exactly four files:
+- NEW `scripts/e7-connected/probe-command.mjs`
+- NEW `scripts/e7-connected/probe-source-digest.mjs`
+- NEW `test/e7-connected-probe-command.test.mjs`
+- this contract (§§0–11 kept verbatim)
+
+**Imports are exactly §11.1.**
+- The command imports `node:util`, P, T, X and the two C1 modules.
+- The helper imports `node:crypto` and `node:util`.
+
+Pin test C2-10 checks this. It also checks the absence of `process`, `node:fs`, `node:http(s)`, net / tls / dns, `fetch`, timers, `console`, `Date`, `NODE_HTTPS_PRIMITIVE`, URLs, booking core and the reservation adapter's name.
+
+Nothing outside the four files changed: C1, P, T, X, F, A, core, workers, lib, DB, config, deps, routes, pins, fixtures and other docs are untouched. **There is still no C3 entrypoint, default fs, env, timer, native network or CLI.**
+
+### 12.1 Clarification A — validation and order
+- **Single getter-free snapshot of every input:**
+  - `{ argv, deps }` own enumerable DATA, read once.
+  - `argv` is copied from its index descriptors only. It must be a genuine `Array` with exact prototype and exactly `n` indices plus `length`, so an own `Symbol.iterator` or any extra key refuses. No iterator, getter or trap runs (tests C2-2: `ran === 0`).
+  - `deps` must have the exact per-mode key set: inspect accepts only the five `INSPECT_DEPS` keys; execute accepts the ten `EXECUTE_DEPS` keys.
+- **Env snapshot:** `envSnapshot` and its own-data `present` are checked as non-proxy and `Object.isFrozen` BEFORE C1 is relied on. `nodeVersion` is then read by descriptor only. Failure gives `CLI_DEPS_INVALID`.
+- **Execute-only deps:** `credentialFs` must be non-proxy with own-data `platform` / `uid` equal to `outputFs`; C1 validates the rest of its shape. `primitive` must be exactly `{ Agent, request }` non-proxy functions. P validates `monotonic` / `timers`.
+- **Promises:** only unpatched native promises are observed, via the captured `then` (`callOnce`). A thenable or non-native return is never assimilated, and its rejection is caller-owned (the residual, unchanged from C1 / P).
+- **Faults are code-only:** sync throws, introspection faults and unexpected internal faults all become fixed codes. The outer wrapper never rejects; its fallback keeps a truthful `primaryOutcome`, and if P ran, that fallback is exit 9 with no file.
+- **Order** (C2-3: every pre-secret refusal leaves `credentialFs` and the primitive untouched):
+  1. args;
+  2. deps;
+  3. env;
+  4. source;
+  5. plan;
+  6. bindings;
+  7. output parent;
+  8. credentials;
+  9. X → T → P.
+- **Inspect:**
+  - It never constructs T, X or an Agent.
+  - Execute deps passed to inspect give `CLI_DEPS_INVALID` (C2-1).
+  - `bindings.nodeVersion` is always a boolean, because it has no flag. The other three bindings are `null` when their flag is absent.
+- **Pre-run dispositions (fixed shape):**
+  - The payload always carries every field. Stages not reached are exactly `null`: `source`, `plan`, `planCode`, `bindings`, `credential`, `requestsAttempted`, `internalCode`, `summary`, `finalize` (C2-3).
+  - `runExitCode` is the pre-run code.
+  - `summaryFile` is `NOT_ATTEMPTED` and `summaryCloseState` is `NOT_OPENED`. A pre-run refusal never writes a file.
+- **Fixed codes added (bounded, listed):**
+  - `PLAN_FILE_CODES = PLAN_NOT_JSON, PLAN_TOO_DEEP, PLAN_NOT_CANONICAL` (carried in `planCode` alongside P's own plan codes).
+  - `INTERNAL_CODES = P's run codes ∪ PLAN_NOT_VALIDATED, OPTIONS_INVALID, EXCHANGE_OPTIONS_INVALID, PAYLOAD_LIMIT, REDACTION, UNEXPECTED` (carried in `internalCode`; only reachable as a P / T / X setup refusal or an unreachable guard).
+  - The CLI vocabulary itself is unchanged: 20 codes.
+
+### 12.2 Clarification B — plan / source bytes
+- **Bytes rule** (`ownedBytes`; the same rule in both modules):
+  - exact `Uint8Array.prototype`, non-proxy;
+  - `%TypedArray%.prototype.buffer` / `length` read through captured getters;
+  - not on a `SharedArrayBuffer`;
+  - a detached view reports length 0 and is refused by the lower bound;
+  - copied once with the captured `%TypedArray%.prototype.set`.
+
+  No shadowed property, iterator or `toJSON` is read. `Buffer`, proxies, shared views, empty arrays and oversize arrays are refused (C2-3, C2-9).
+- **Plan pipeline:**
+  1. fatal UTF-8 decode (`ignoreBOM:true`, so a BOM is refused);
+  2. one `JSON.parse`;
+  3. an **iterative** structural bound: depth ≤ 8 and ≤ 16384 nodes. This runs before any recursive code (a 5000-deep array is refused as `PLAN_TOO_DEEP`, C2-3b);
+  4. `validateProbePlan(parsed)`;
+  5. canonical-file equality against `canonicalJson` of the **validated, frozen plan object without `planHash`**. That is the same content P hashed (`readonly-probe.mjs:180`); there is no second parse or caller snapshot.
+
+  Duplicate keys, extra whitespace, two trailing newlines and non-canonical order are all refused as `PLAN_NOT_CANONICAL`.
+- **Digest helper:**
+  - the snapshot array is copied from its descriptors once;
+  - the fixed 13-path closure is checked exactly;
+  - framing and limits follow §11.4 (256 KiB per file, 2 MiB total);
+  - it reads no disk and imports none of the listed entries.
+
+  The exact SHA-256 framing vector is recomputed independently in the test. A single byte change in `compensation-proof.js`, `package.json` or the placeholder changes the digest, and moving a byte between adjacent entries does too (C2-9).
+- **The entrypoint entry is a SYNTHETIC placeholder in tests; no real enforcement exists today.**
+
+### 12.3 Clarification C — interrupt lifecycle (exact boundary)
+**Before P is invoked**, `interrupt` is re-checked natively (captured `AbortSignal.prototype.aborted` getter) at these points:
+- before the stages;
+- after env;
+- immediately after EVERY injected call returns synchronously, and again after it settles (plan reader, each output-fs call, C1);
+- after C1 settles;
+- after X / T construction, immediately before `runReadonlyProbes`.
+
+An abort at any of these gives `CLI_INTERRUPTED` (exit 7):
+- the capability reference is dropped;
+- C1 has always closed its handle by then (C1 is awaited, never abandoned);
+- no X Agent or request is created;
+- no file is written.
+
+Tests C2-6 cover: already aborted; aborted inside the plan reader; aborted inside the `.git` walk; aborted inside the C1 open (C1 still closes once, credential reported `CRED_OK` / `CLOSED`, zero primitive use).
+
+**Once P is invoked**, C2 performs no more interrupt checks that could replace the run:
+- the abort is P's `signal`;
+- `result` and `finalize()` are always awaited;
+- the credentials are dropped afterwards (`creds = null`, so a late T `credential()` call gets `null`);
+- P's real summary and cause (`PROBE_CANCELLED`) are reported;
+- `interruptObserved: true` is set;
+- the ONE prescribed evidence write is performed.
+
+An aborted signal does not prohibit that write (C2-6: abort during the first request gives `PROBE_CANCELLED`, `CLOSED_ACK`, one request).
+
+**During output IO** an interrupt does not stop the single prescribed write: every operation in it belongs to that one write, and no new or extra operation is ever started. If an operation faults, no further write / sync is started, and close is invoked once after the started operations settled.
+
+C1 / plan / output IO may hang; there is no elapsed guarantee and no preemption claim. Only the CLOSED entrypoint's second SIGINT would end the process.
+
+The returned disposition is deep-frozen; late callbacks cannot alter it. C2 registers no signal and performs no stdout or process action.
+
+### 12.4 Clarification D — output ownership and payload
+- **Create:** `create(target, 'summary-create')` is called once.
+  - `EEXIST` (own-data code) gives `RACE_EXISTS` / `NOT_OPENED`.
+  - Any other rejection, or a non-native / thenable reply, gives `UNKNOWN` / `NOT_OPENED`.
+- **On a native create fulfilment:**
+  - close is captured FIRST (own-data, non-proxy function), including on a malformed but closable handle;
+  - the shape is then checked as exactly `{ close, sync, write }`;
+  - writes must report positive in-range counts (`0`, `1.5` and `len + 1` give `UNKNOWN`);
+  - `sync` and `close` must each fulfil with exactly `undefined`;
+  - close is invoked once, after the started write / sync settled, and never retried.
+- **Results:** `CLOSE_FAILED` / `UNCLOSABLE` / malformed / partial give `UNKNOWN`, with `summaryCloseState` reported separately; acknowledged writes give `CLOSED_ACK`. There is never an overwrite, unlink, rename, repair, retry or second create (C2-7: one create and at most one close in each case).
+- The output parent / identity rules are applied as in §11.6 against the supplied fake adapter only.
+- **Payload** — fixed before any output:
+  - `schema, mode, primaryOutcome, runExitCode, tailUncertain, interruptObserved, preflight, source:{ sourceDigest, matches }, planCode, plan, bindings, credential, requestsAttempted, internalCode, summary, finalize`.
+  - **Deviation from §11.7 (additive):** `sourceDigest` is nested in `source`, and `planCode`, `bindings`, `internalCode` and `interruptObserved` were added so pre-run results stay exact.
+- **File** = `canonicalJson(payload) + "\n"`, ≤ 65536 bytes including the newline.
+- **Stdout envelope** = `{ schema:'e7-probe-cli-stdout-v1', payload | null, output:{ summaryFile, summaryCloseState }, exitCode, primaryOutcome, tailUncertain }`, with its own cap of `MAX_STDOUT_BYTES = 131072`. It carries `primaryOutcome` / `tailUncertain` outside the payload, so the fixed `payload:null` fallback stays truthful.
+  - It reports the LATER file outcome.
+  - The file never contains `summaryFile` (asserted in C2-4).
+  - Stdout cannot claim its own delivery.
+  - File bytes equal `canonicalJson(envelope.payload)+"\n"` (C2-4).
+- **Redaction** runs before writing and checks BOTH every key and every string value:
+  - keys ∈ C2 keys ∪ P summary keys ∪ `T_ERROR_CODES`;
+  - values ∈ P `VOCABULARY` ∪ `T_ERROR_CODES` ∪ ENV / CRED / CLOSE / CLI / file-state / plan / internal codes ∪ schemas ∪ modes ∪ the dynamic `planHash` / `sourceDigest` / four metadata labels.
+
+  A violation or oversize payload gives no file and `payload:null`, with primary kept. Sentinel tests check that tokens, keys, paths, plan ids, account / PI ids, guest sentinels and raw error messages appear in neither stdout nor file.
+- **Successful credential load** is reported as `{ code:'CRED_OK', closeState:'CLOSED' }`. The capability is never serialized.
+- **`exitFor`** is the single precedence function (table-tested in C2-8): run → 9 > 8 > 6 > 11 > 0; no run → fixed pre-run codes. `null` for the output fact gives the payload's `runExitCode`. The entrypoint alone would apply 130 and stdout failure → 9.
+
+### 12.5 Clarification E — coverage
+Eleven fake-only tests (C2-1…C2-10, with 3b). The fakes are a labelled copy of the accepted rehearsal https primitive and fake clock (no sleeps). The `node:https` request / Agent guards are installed before X loads, and they, the `fetch` guard and `unhandledRejection` all count 0.
+
+Coverage:
+- inspect / default;
+- pre-secret refusals;
+- both, Hostaway-only and Stripe-only C1 → X → T → P runs;
+- P STOP vs INCONCLUSIVE continuation;
+- interrupts at the final handoffs;
+- output acknowledgment / race / partial / close faults;
+- tail / precedence;
+- digest framing vectors;
+- redaction and pins.
+
+**Not manufactured (labelled):**
+- An `UNSETTLED` transport tail is not reachable through accepted X with these fakes: X settles promptly when P aborts it, so P observes `LATE_*`. Tail uncertainty is exercised through P's accepted `timerCleanup.uncancellable` (a timer handle without a callable cancel). P's own suite covers `UNSETTLED` / `UNOBSERVABLE`.
+- The counted-request guard is unreachable through accepted P.
+- The write-call bound is unreachable under positive progress.
+
+### 12.6 Validation (FIRST FULL TAP preserved)
+- **Focused FIRST FULL TAP:** **10 / 11**. C2-8 expected exit 8 but got 6. Cause (test design): the "held" fake request was still observed by P as a `LATE_*` tail, because accepted X settles on abort.
+  - Run 2, with the held request also ignoring `destroy`: still 10 / 11, for the same reason. X does not wait for the destroy, so the fixture assumption was wrong.
+  - Run 3, with tail uncertainty driven through P's `uncancellable` cleanup report as in §12.5: **11 / 11**.
+  - The module did not change between runs.
+- **Optional probes** (temporarily applied, then reverted; module byte-identical afterwards):
+  - M2 (sync accepts any value): killed (2 failures).
+  - M3 (canonical-file check removed): killed (1).
+  - M1 (the interrupt check right after C1 removed): survived. This is EQUIVALENT: the next check, immediately before dispatch, catches the same abort with the same result (capability dropped, exit 7, zero primitive use). It is labelled defense-in-depth, not a coverage gap.
+- **Units** (`e7-connected-*`, `hostaway-reservations`, `e4-connected-path`): **219 / 219**.
+- **First full `npm test`:** **884 / 884**.
+- No DB, install or network.
+
+### 12.7 Remaining C3 prerequisites (not readiness; nothing below is authorized)
+- **Real adapters**, built only with `O_NOFOLLOW`:
+  - the credential `credential-read` adapter;
+  - the plan reader;
+  - the `summary-create` `O_EXCL` output adapter;
+  - real stat-record mapping from bigint stats.
+- **Snapshot and bootstrap:**
+  - an env snapshot builder that records only presence booleans and the `execArgv` count;
+  - the pre-import source-digest bootstrap over the 13-file closure, which needs the entrypoint file itself.
+- **Process ownership:** SIGINT (first → abort `interrupt`; second → exit 130, nothing promised flushed), the single stdout write, and stdout failure → 9.
+- **Preparation:** a canonical plan-file preparation step.
+- **Evidence, inputs and approval:**
+  - native evidence on the owner's exact platform / Node;
+  - owner inputs, all UNSET;
+  - ONE consolidated exact approval package (§6) and Joel's explicit approval.
+
+Live gates, env, credentials and the package stay CLOSED.
