@@ -23,6 +23,7 @@
 - Root CODE RE-REVIEW at `d16b57ec`: R-E2 / R-E3 CLOSED; narrow HOLD R-E1d (acquisition handoff). Corrected on the same branch (fast-forward), §13.6; suite E1–E28.
 - Root CODE RE-REVIEW **ACCEPTED** offline Slice E at `dfdbc32c` (root reran five exact-core synthetic probes and A/B/D 59/59; PG 34/34, units + pins 132, `npm test` 797 are CLAUDE-RUN). R-E1 (incl. d), R-E2, R-E3 CLOSED. A–E ACCEPTED offline; no live readiness implied.
 - **Next slice pointer (status only):** the owner-run local FILE JOURNAL is specified, DOCS ONLY, in `claude/e7-connected-file-journal-contract.md` (branch `feature/e7-connected-file-journal-contract` from `dfdbc32c`; proposed Slice F; not implemented, not authorized). Nothing in this contract changes.
+- **Slice F status pointer:** root DESIGN ACCEPTED the file-journal contract at `d365d816`; Slice F (`scripts/e7-connected/run-journal-file.mjs` + `test/e7-connected-run-journal-file.test.mjs`) is IMPLEMENTED offline on `feature/e7-connected-file-journal`, pending root CODE review — record in the file-journal contract §9. The core is unchanged.
 
 **Citation convention.**
 - Current interfaces are cited by **file:line at `d5a93e0f`**: workers under `lib/booking-db/`, runner modules under `scripts/e7-connected/`.
@@ -50,7 +51,7 @@ Those are independent, CLOSED slices. All owner inputs stay **UNSET**. Live gate
 | Import boundary (A) | **CLOSED** root decision | §2.0 |
 | Core integration decisions: same-DB check, ownership, journal emission, per-step bindings | **Resolved as a proposal in this revision** | §12 |
 | Slice E: `run-core` + disposable-PG runner test | **ACCEPTED offline** (`dfdbc32c`) | §9.4, §13 |
-| File journal (proposed Slice F) | **Contract only** (DOCS), `claude/e7-connected-file-journal-contract.md`; not implemented, not authorized | separate contract |
+| File journal (Slice F) | **IMPLEMENTED offline**, pending root CODE review; `claude/e7-connected-file-journal-contract.md` §9 | separate contract |
 | File journal, real transports, credentials, Stripe ingress, CLI, read-only provider probes | **CLOSED**, separate slices | §9.4 |
 
 ## 1. Present runtime vs accepted foundation vs proposed core
