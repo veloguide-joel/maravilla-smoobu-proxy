@@ -1,6 +1,14 @@
-# E7 guest notification — CONTRACT revision 2 (DOCS ONLY, PROPOSED): the smallest OFFLINE / injected-MOCK notification slice
+# E7 guest notification — CONTRACT revision 3 (DOCS ONLY, PROPOSED): the smallest OFFLINE / injected-MOCK notification slice
 
-**Branch.** `feature/e7-guest-notification-contract`. Revision 1 was `2e20972ac96bbbf6bfa984be3c84ec3542969e8a` (root DESIGN HOLD, findings R1–R6). This revision 2 is cut from exact `2e20972a`.
+**Branch.** `feature/e7-guest-notification-contract`.
+
+| Revision | Commit | Root outcome |
+|---|---|---|
+| 1 | `2e20972ac96bbbf6bfa984be3c84ec3542969e8a` | DESIGN HOLD, findings R1–R6 |
+| 2 | `4796b59788e8211c40565c4b15bf3348b8074182` | DESIGN HOLD, findings R7–R9. Accepted: freeze-at-claim, the dedicated claim / presend / completion, both generic-claim exclusions, the markUnknown branch, durable unknowns, narrow error / redaction, and N1 = a, N2 = a, N3 = a as OFFLINE decisions only |
+| 3 (this) | cut from exact `4796b597` | — |
+
+The R7–R9 resolution map is §0.4. The R1–R6 resolutions are retained, and any change to them is stated in place.
 
 **Labels used in this document.**
 - **PRESENT**: true at `2e20972a`, whose code is identical to accepted `7df10c33`. Cited as `file:line`.
@@ -59,6 +67,7 @@
 - Protected rows get zero action:
   - excluded before LIMIT in every selection and rechecked under lock;
   - no latch, case, render or page row.
+  - **Refined by R8 (revision 3):** protection is re-decided at every notification-owned write. Protection that becomes visible after a claim writes nothing new and undoes nothing (§7.6). A global generic-helper residual remains (U2).
 - Four eligibility classes are each defined by SQL: ELIGIBLE, WAITING, OUT_OF_V1_SCOPE, LATCHED.
 - The latch is permanent, written once and excluded before LIMIT. So there is no hot loop and no repeated owner case.
 - An unknown stays durable and unresolved:
@@ -95,7 +104,9 @@
 - Exact contracts: one reply notation, the id grammar, function returns and refusals, option validation, a deep-frozen basis.
 - `.invalid` is a test-address rule, not transport authentication.
 
-### 0.3 New decisions surfaced by revision 2 (recommendation first)
+### 0.3 Decisions surfaced by revision 2
+
+Root ruling on `4796b597`: **N1 = a, N2 = a, N3 = a**, as OFFLINE decisions only. They are not approval of any live policy. The options are kept below for the record.
 
 - **N1 — how a latch is made visible.**
   - (a) A latch row plus the read-only page, and **no reconciliation case** (recommended). Any open case blocks guest-data purge (`0005:146`).
@@ -106,6 +117,25 @@
 - **N3 — recipient hash retention.** `notification_renders.recipient_hash` survives guest purge. It is pseudonymous, guessable personal data (§4.3).
   - (a) Keep it, offline only. Any live retention policy needs an owner decision before enablement (recommended).
   - (b) Omit it and bind the recipient only inside the claim transaction. This loses pre-send detection of a recipient change.
+
+### 0.4 R7–R9 resolution map (revision 3)
+
+| R | Root finding (short) | Resolution in revision 3 | Sections | Key sources |
+|---|---|---|---|---|
+| R7 | "At most one notify per intent" was not a DB invariant. The INSERT check races, and the existing UNIQUE is per template. | A partial UNIQUE index `external_operations_one_guest_notify ON (intent_id) WHERE op_type = 'guest.notify'`. Exact INSERT requirements. `source_version` and every other column frozen on notify UPDATEs. Upgrade refuses pre-existing duplicates under lock. E3 same-key replay is still absorbed by the `idempotency_key` arbiter. | §6.3, §8.1, §8.2, §8.3, §12.8 | `0001:363`, `0001:393–396` (precedent partial uniques), `repo.js:107–108`, `:118–131`, `:376–390`, `0004:53–56` |
+| R8 | Protection can appear after a claim. The generic recovery has no protected exclusion. A pre-send "protected" result led to a write. | Protection is re-decided at every notification-owned write, under a defined lock bundle. That covers work acquisition, maintenance, claim, latch, completion and release. Only the step's own scoped maintenance function is used; generic `recoverExpiredOperations` is not changed and not called. A protected result writes NOTHING, the existing audit is kept, and the row is never re-invoked. The temporal guarantee is stated per protection source; non-serialised sources are named. A new `provider_evidence` AFTER INSERT advisory trigger is offered as choice U1. The generic GLOBAL maintenance residual is explicit. | §6.5, §6.6, §7.1, §7.2, §7.6, §12.9, §14 | `operations.js:426–468`, `0010:354–406` (advisory for `hostaway_offline_charges` only, `:387–389`, `:402–404`), `repo.js:617–627`, `intent-state.js:609–614`, worker callers `recording-worker.js:182`, `reservation-worker.js:601`, `capture-worker.js:622`, `compensation-worker.js:661` |
+| R9 | The predicates and API were ambiguous. | C7 narrowed to Stripe references. A2 gets an explicit vacuous floor. A deterministic evidence order (`observed_at, created_at, id`). An allowlist of observed fields with fail-closed `EVIDENCE_MALFORMED`. K3 limited to what the evidence actually records. The version-bump claim corrected and `SNAPSHOT_STALE` retry policy made explicit. An immutable-lookup page cursor. The summary function defined. A complete Stage 1 object / function map. An exact allowed-file scope. | §5.2, §5.3, §6.2, §7.5, §7.7, §13 | `0003:52–103`, `0010:383` (API `observed_at` = read completion), `recovery-plan.js:64–96`, `capture-proof.js:32`, `:54–67`, `0004:56` |
+
+### 0.5 Unresolved choices raised by revision 3 (recommendation first)
+
+- **U1 — serialising evidence with notification decisions.**
+  - (a) **Recommended.** A 0016 `AFTER INSERT` row trigger on `booking.provider_evidence` takes `pg_advisory_xact_lock(hashtext('booking.notification_facts'), hashtext(intent_id::text))` for kinds `payment_intent`, `hostaway_reservation` and `hostaway_offline_charges`.
+    - It changes no 0001–0015 function body. Its only effect on accepted writers is a possible short wait on the intent's notification decision.
+    - Lock-order proof: §6.6.
+  - (b) No trigger. Evidence inserts are then **not serialised** with notification decisions; only committed-before-snapshot visibility applies. The guarantee in §7.6 weakens accordingly.
+- **U2 — the generic exported `recoverExpiredOperations`.**
+  - (a) **Recommended.** Leave it unchanged and document it. A direct call with `opTypes` null, or including `guest.notify`, can mark a protected expired notify row unknown and open a case. No accepted worker makes such a call: they all pass their own `opTypes`.
+  - (b) A notify-specific skip inside the generic helper. **Not recommended:** a skipped expired row would be re-selected on every global call, a hot loop.
 
 ## 1. Current inventory (PRESENT)
 
@@ -124,13 +154,14 @@
 - The DB lets a terminal state move only to `reconciliation_required` (`0001:188–190`).
 - From `reconciliation_required`, only `PAYMENT_AUTHORIZED` (late money, recorded as ledger `authorization_rejected`, `repo.js:192–197`) and `RESOLVE` are accepted (`intent-state.js:136`). Neither emits `guest.notify`; RESOLVE is at `:609–625`.
 
-**Derived invariant (PROPOSED, enforced by a test).** Each intent gets at most ONE `guest.notify` row in its lifetime.
-- The source states of the four emissions are never reachable again from a terminal state.
-- The key `notify:{intent}:{template}` is UNIQUE and is inserted with `ON CONFLICT DO NOTHING` (`repo.js:107–108`, `:118–131`).
+**State-machine production (derived, not a DB invariant).** E3 produces at most ONE `guest.notify` row per intent in its lifetime, because the source states of the four emissions are never reachable again from a terminal state.
+- At `2e20972a` the DB does **not** enforce this. `idempotency_key` UNIQUE (`0001:363`) is per template (`notify:{intent}:{template}`, `repo.js:107–108`), so a raw INSERT with a different template key is accepted.
+- Revision 3 makes it a DB invariant with a partial UNIQUE index (§6.3, R7).
 
 **Version facts.**
 - `source_version = after.version` of the producing transition (`repo.js:121`, `:127`).
 - **Every** `intents` UPDATE advances the version by exactly 1 (`0001:159–162`).
+- **Correction (R9):** facts outside the `intents` row can change WITHOUT a version bump. Examples: provider evidence, cases, refunds, webhooks, recording holds, guest purge or reinsert, create-attempt results (`repo.js:617–627`). The version latch covers intent-row facts only; the other facts are re-evaluated at every decision (§5.2, §6.2).
 - Scheduling lives in `intent_work`, "so scheduling never bumps the E3 version" (`0001:251`).
 - A grep for `UPDATE booking.intents` finds one site, `repo.js:378` (applyEvent). The implementation must re-verify this. An unconsidered bump fails safe as a `VERSION_DRIFT` latch.
 
@@ -391,9 +422,13 @@ Matching hashes alone are never enough.
 - **C4:** **no open reconciliation case of ANY kind** for `I`: `NOT EXISTS (SELECT 1 FROM reconciliation_cases WHERE intent_id = I.id AND status = 'open')`. Else `OPEN_CASE`. This is the exact case predicate; no case category is involved.
 - **C5:** no `payment_refunds` row for `I`, in any state. Else `REFUND_PRESENT`.
 - **C6:** no `payment_attempts` row for `I` in `creating`, `open` or `outcome_unknown`. Else `PAYMENT_ATTEMPT_OPEN`.
-- **C7:** returns `FOREIGN_PAYMENT_INTENT` if either:
-  - a ledger `authorization_rejected` exists for `I`; or
-  - a ledger row, PI evidence or capture op of `I` references a PI other than `P`.
+- **C7 (narrowed, R9):** returns `FOREIGN_PAYMENT_INTENT` if ANY of these holds. Only Stripe PaymentIntent references are compared:
+  - a ledger `authorization_rejected` exists for `I`;
+  - a ledger row of `I` with `provider = 'stripe'` has `provider_ref <> P`. Hostaway rows (`offline_charge_recorded`, `provider = 'hostaway'`) carry a charge id and are excluded;
+  - a `provider_evidence` row of `I` with `kind = 'payment_intent'` has `external_ref <> P`;
+  - a `stripe.capture_payment_intent`, `stripe.void_payment_intent` or `stripe.retrieve_payment_intent` op of `I` has `payload ->> 'paymentIntentId'` that is NULL or `<> P`;
+  - a `payment_attempts` row of `I` has `payment_intent_id IS NOT NULL AND payment_intent_id <> P`.
+  - If `P` is NULL while any of these Stripe references exist → `FOREIGN_PAYMENT_INTENT`.
 - **C8:** `I.currency = 'USD'`. This is the v1 scope; it is also a scope class (§7.1).
 - **C9:** no capture, void, cancel, create or recording op of `I` in `in_flight`, `outcome_unknown` or `escalated`. Else `OPERATION_UNSETTLED`.
 - **C10 (`booking_confirmed` only):** no active recording hold (checked via `recording_active_hold_id`) and no open `OFFLINE_CHARGE_HOLD_%` case (already covered by C4).
@@ -406,12 +441,18 @@ Matching hashes alone are never enough.
 - **K2:** `CAPTURE_HISTORY` unless both hold:
   - exactly one capture op with `payload ->> 'paymentIntentId' = P` is `succeeded`;
   - every other capture op of `I` is `failed_definite`, or is `superseded` or `pending` with `dispatched_at IS NULL`.
-- **K3:** the latest `payment_intent` evidence for `P` (by `observed_at DESC, created_at DESC`) must:
-  - have status `succeeded`;
-  - have `observed_at ≥` the `dispatched_at` of the K2 op;
-  - have `observed ->> 'amountReceivedMinor' = I.captured_minor`.
-  - In addition, no PI evidence for `P` may show a positive `amountRefundedMinor` or `refunded = true`.
-  - Codes: `PI_EVIDENCE_MISSING` when no such evidence exists, `PI_EVIDENCE_CONTRADICTS` when it fails a condition.
+- **K3 (limited to what accepted evidence records, R9):** let `E` = the latest `payment_intent` evidence for `P` in the §5.3 order.
+  - **`PI_EVIDENCE_MISSING`** if `E` does not exist.
+  - **`PI_EVIDENCE_UNPROVEN`** if `E` is not API-sourced: `E.source <> 'stripe_api'`, or `E.observed ->> 'proofVersion'` ∉ {`'pi-proof-v2'`, `'pi-proof-v3'`} (`recovery-plan.js:72`, `capture-proof.js:32`). Owner dashboard attestations cannot qualify a confirmation in v1.
+  - **`PI_EVIDENCE_CONTRADICTS`** unless all hold:
+    - `E.status = 'succeeded'`;
+    - `E.observed_at ≥` the K2 op's `dispatched_at` (API `observed_at` = the read op's completion, `0010:383`);
+    - `amountReceivedMinor` (§5.3) = `I.captured_minor`;
+    - `currency` (§5.3) = `I.currency`.
+  - **Every** PI evidence row for `P`: if `latestCharge.amountRefundedMinor` is present it must be 0; if `latestCharge.refunded` is present it must be `false`. Absent means "not recorded", which is **not** proof of no refund; refunds are covered by C5 only.
+  - **Malformed** → `EVIDENCE_MALFORMED` (§5.3).
+  - **What K3 establishes:** only that the reviewed read path recorded these field values at `observed_at`.
+  - **What it does not establish:** `accountVerified`, `livemode` and metadata are recorded by the JS read path and are not re-attested by SQL (TRUST). It is not a fresh provider read, and not a DB attestation of current provider state. Currency is bound through the ledger (K1) and the recorded field; both ultimately derive from the price snapshot and the provider response as recorded.
 - **K4:** `RECORDING_NOT_PROVEN` unless all hold:
   - `I.offline_charge_id` is not NULL;
   - there is exactly one ledger `offline_charge_recorded` for `I` with `provider_ref = offline_charge_id` and the same amount and currency;
@@ -431,8 +472,8 @@ Matching hashes alone are never enough.
 - **A2 (positive release proof):** `RELEASE_NOT_PROVEN` unless all hold:
   - at least one `payment_intent` evidence for `P` has status `canceled`;
   - the latest PI evidence for `P` is `canceled`;
-  - no PI evidence for `P` has status `succeeded` or `amountReceivedMinor > 0`;
-  - the canceled evidence has `observed_at ≥` the latest `dispatched_at` of any capture op for `P`.
+  - no PI evidence for `P` has status `succeeded`, or a present `amountReceivedMinor` that is not 0. A present but malformed value → `EVIDENCE_MALFORMED`;
+  - **dispatch floor (explicit, R9):** `NOT EXISTS (capture op for P with dispatched_at IS NOT NULL AND dispatched_at > L.observed_at)`, where `L` is the latest canceled PI evidence in the §5.3 order. On the normal reservation-failed / void path no capture was ever dispatched, so the condition is vacuously true. No `MAX(...)` is compared with NULL.
 - **A3:** the transition with `version_after = I.version` has `event_type` ∈ {`VOID_SUCCEEDED`, `RECONCILED_AUTHORIZATION_GONE`}. Else `RELEASE_NOT_PROVEN`. This binds the copy to the leg event that was actually applied.
 - **A4 (no booking):** `RESERVATION_PRESENT` unless both hold:
   - `R` is NULL;
@@ -446,7 +487,7 @@ Matching hashes alone are never enough.
   - `R` is not NULL;
   - the latest `hostaway_reservation` evidence with `external_ref = R` is `cancelled`;
   - no `found_active` for `R` was observed after it;
-  - if a cancel op for `R` was dispatched, the cancelled evidence has `observed_at ≥` its `dispatched_at`.
+  - if a cancel op for `R` was dispatched, the cancelled evidence has `observed_at ≥` its `dispatched_at`. This uses the same explicit `NOT EXISTS` form as A2, so it is vacuous when no cancel op was dispatched (for example, an owner-attested cancellation).
 - **X4:** `intent_transitions` for `I` contains, after the entry into `capture_failed`, a `RESERVATION_CANCELLED` and one of `VOID_SUCCEEDED` or `RECONCILED_AUTHORIZATION_GONE`. Else `CANCEL_NOT_PROVEN`.
 
 **Freshness, scope and reference rules.**
@@ -454,6 +495,28 @@ Matching hashes alone are never enough.
 - There is no age requirement on the evidence. The evidence proves a past provider state, accepted by the reviewed transition path.
 - It does **not** prove the current provider state. There is no provider read and no general guarantee of fresh provider data.
 - Every reference is scoped exactly to `I`, `P` and `R`.
+
+### 5.3 Evidence order and observed-field allowlist (fail-closed, R9)
+
+**Deterministic order.** "Latest" always means `ORDER BY observed_at DESC, created_at DESC, id DESC`. The `id` (uuid) tie-breaker is arbitrary but total and stable, so ties are resolved the same way at claim and at pre-send.
+
+**Allowlisted fields.** Read only through private IMMUTABLE helpers. Nothing else in `observed` is read.
+
+| Field (JSON path) | Accepted type | Helper result |
+|---|---|---|
+| `amountReceivedMinor` | `jsonb_typeof = 'number'`, text matching `^(0\|[1-9][0-9]{0,14})$` | bigint, or the MALFORMED sentinel |
+| `currency` | string matching `^[A-Z]{3}$` | text, or MALFORMED |
+| `proofVersion` | string 1–40 chars | text, or MALFORMED |
+| `latestCharge.amountRefundedMinor` | as `amountReceivedMinor` | bigint, or MALFORMED |
+| `latestCharge.refunded` | `jsonb_typeof = 'boolean'` | boolean, or MALFORMED |
+
+**Rules.**
+- Values are never cast unvalidated: no `::bigint` on text, so a 22P02 crash loop is impossible.
+- Each helper returns **ABSENT** (key missing or JSON null) or **MALFORMED** (present with a wrong type or format) as distinct sentinel results.
+- A rule that **requires** a field (K3: `amountReceivedMinor`, `currency`, `proofVersion`) treats ABSENT as `PI_EVIDENCE_UNPROVEN`, and MALFORMED as `EVIDENCE_MALFORMED`.
+- A rule that only **forbids** a value (A2's `amountReceivedMinor ≠ 0`; K3's refund fields) treats ABSENT as "not recorded" and MALFORMED as `EVIDENCE_MALFORMED`.
+- Hostaway reservation evidence is read only through its `status` column, which is CHECK-constrained (`0003:85–88`). No `observed` field participates.
+- `EVIDENCE_MALFORMED` is a latching code (§7.3). Malformed accepted evidence therefore refuses once and permanently, and never qualifies via SQL NULL.
 
 **TRUST limits.**
 - The SQL shadow checks status, reference, amount and ordering. The strict v3 shape (`accountVerified`, `livemode`, `captureBefore`, full reservation identity) is enforced only by the reviewed JS, at transition time.
@@ -477,36 +540,57 @@ Matching hashes alone are never enough.
 **Phase 1 — validate and lock.**
 1. **Validate arguments.** A malformed uuid, worker, hash or version raises `22023`. These are programming errors and throw.
 2. **Read** `O.intent_id` and `O.op_type` without a lock. If the op is not a notify op → `{status:'not_claimable', code:'NOT_NOTIFY'}`.
-3. **Lock** `intents` `FOR SHARE`. If the intent is protected (§7.2) → `{status:'protected'}`, with **no write of any kind**.
-4. **Lock** `intent_work` `FOR SHARE`.
-5. **Lock** the op in `external_operations` `FOR UPDATE`.
-6. **Lock** `intent_guests` `FOR KEY SHARE` (when the row exists).
-7. **Take** `pg_advisory_xact_lock(hashtext('booking.recording_evidence'), hashtext(intent::text))`. This is the 0010/0011 key, so the claim serialises with evidence writers, link and finalisation.
-8. **Set** `v_t := clock_timestamp()` **after all locks**. This is the decision clock.
+3. **Lock, in this order.** The two row locks plus the `notification_facts` advisory form the **protection lock bundle** (§6.6), which every notification-owned writer takes in the same relative order.
+   - `intents` `FOR SHARE`;
+   - `hostaway_reservation_attempts` `FOR SHARE`, when the row exists;
+   - `intent_work` `FOR SHARE`;
+   - the op in `external_operations` `FOR UPDATE`;
+   - `intent_guests` `FOR KEY SHARE`, when the row exists;
+   - the advisory `('booking.notification_facts', intent)` (U1);
+   - the advisory `('booking.recording_evidence', intent)`, the 0010/0011 key.
+4. **Set** `v_t := clock_timestamp()` **after all locks**. This is the decision clock.
+5. **Re-check protection** (§7.2) in a NEW statement, which sees every commit that preceded it. If the intent is protected → `{status:'protected'}`, with **no write of any kind**.
 
 **Phase 2 — decide.**
-9. **Not claimable** if either:
+6. **Not claimable** if either:
    - `O.state <> 'pending'`, `attempts <> 0`, `dispatched_at IS NOT NULL`, a render row exists, or a latch exists → `{status:'not_claimable', code}`;
    - `p_worker` does not hold the work lease with `work_lease_until ≥ v_t + OP_LEASE_MS` → `{status:'not_claimable', code:'WORK_LEASE'}`.
-10. **Qualify** with `r := guest_notification_refusal(p_op)`:
+7. **Qualify** with `r := guest_notification_refusal(p_op)`:
     - a WAITING or OUT_OF_V1_SCOPE code → `{status:'waiting', code}`, with no write;
     - any other code → INSERT the latch (§7.3) → `{status:'latched', code}`.
-11. **Compare the snapshot.** If the current `facts_hash` or `recipient_hash` differs from the expected value → `{status:'not_claimable', code:'SNAPSHOT_STALE'}`, with no write. The next step takes a new snapshot; a real fact change bumps the version and latches.
+8. **Compare the snapshot.** If the current `facts_hash` or `recipient_hash` differs from the caller's expected value → `{status:'not_claimable', code:'SNAPSHOT_STALE'}`, with no write.
+    - **Corrected policy (R9):** facts can change without a version bump (§1.1). So `SNAPSHOT_STALE` is **not** a latch.
+    - The row stays ELIGIBLE, and a later step may retry it pre-claim, under the unchanged version, with a fresh snapshot.
+    - Each retry requires a concurrent commit that changed the facts, so retries are bounded by external writes.
+    - If the changed facts no longer qualify, the retry's step 7 latches permanently, as an explicit decision.
 
 **Phase 3 — write.**
-12. INSERT the render row (§4.4) with `claimed_at = v_t`. Then `UPDATE … SET state='in_flight', attempts=1, dispatched_at=v_t, lease_worker_id=p_worker, lease_until=v_t + OP_LEASE_MS, updated_at=v_t`.
-13. Return `{status:'claimed', leaseUntil, dbNow:v_t}`.
+9. INSERT the render row (§4.4) with `claimed_at = v_t`. Then `UPDATE … SET state='in_flight', attempts=1, dispatched_at=v_t, lease_worker_id=p_worker, lease_until=v_t + OP_LEASE_MS, updated_at=v_t`.
+10. Return `{status:'claimed', leaseUntil, dbNow:v_t}`.
 
 ### 6.3 Authoritative triggers
 
 These apply to every path, including raw UPDATEs and privileged sessions.
 
+**`external_operations_one_guest_notify`** — a partial UNIQUE index `ON booking.external_operations (intent_id) WHERE op_type = 'guest.notify'` (R7).
+- This is the **concurrency-proof** one-row invariant. It follows the precedent partial uniques at `0001:393–396`.
+- Two concurrent INSERTs for the same intent, with different template keys: the second blocks on the first's uncommitted index entry. When the first commits, the second fails with `23505` on this index. When the first aborts, the second proceeds. No check-then-insert race exists.
+- **E3 interaction (`repo.js:118–131`).** `insertOperations` uses `ON CONFLICT (idempotency_key) DO NOTHING`.
+  - A same-key replay conflicts on the arbiter index and is absorbed, with no error, exactly as today.
+  - A different-template INSERT for an intent that already has a notify row conflicts only on the new index (not the arbiter), so it raises `23505` and aborts the whole transition.
+  - This never happens on accepted E3 paths (§1.1). If it did, `applyEvent` does not map this constraint (`repo.js:395–402`), so it would throw, deterministically.
+
 **`notify_op_fence`** — BEFORE INSERT OR UPDATE, for `op_type = 'guest.notify'` only.
-- **INSERT** is accepted only when:
+- **INSERT** is accepted only when all of the following hold. They are checked against the intent row, which in the E3 transaction was already updated before `insertOperations` (`repo.js:376–388`).
   - `idempotency_key = 'notify:' || intent_id || ':' || template`;
   - the payload is exactly `{template}`, with a template in TEMPLATES;
   - `retry_class = 'idempotent'`;
-  - no other notify row exists for the intent.
+  - `state = 'pending'` and `attempts = 0` (already enforced by `0004:47–51`);
+  - `dispatched_at`, `completed_at`, `lease_worker_id`, `lease_until`, `result_ref`, `error_code`, `late_result_*`, `settled_evidence_id` and `resolution_id` are all NULL;
+  - `requires_provider_read = false`;
+  - `source_version = intents.version`;
+  - `intents.state` is the template's target state.
+  - The uniqueness itself is the index, not this trigger.
 - **`pending → in_flight`** is accepted only when:
   - `is_privileged()` holds, i.e. it comes through §6.2 (the app role cannot claim by raw UPDATE);
   - `OLD.attempts = 0`, `OLD.dispatched_at IS NULL` and `NEW.attempts = 1`;
@@ -522,7 +606,12 @@ These apply to every path, including raw UPDATEs and privileged sessions.
   - `in_flight → failed_definite`;
   - `in_flight → escalated`;
   - `pending → superseded` and `pending → escalated` (no writer exists today; `repo.js:234–247` touches other op types only).
-- **Same-state UPDATEs** are refused when they change any of: `attempts`, `dispatched_at`, `lease_worker_id`, `lease_until`, `result_ref`, `completed_at`, `next_attempt_at`, `requires_provider_read`, `late_result_status`, `late_result_ref`.
+- **`source_version` is frozen on every notify UPDATE** (R7). The op guard does not include it in its identity list (`0004:53–56`), so this fence adds it.
+- **Same-state UPDATEs** are refused when they change any of: `attempts`, `dispatched_at`, `lease_worker_id`, `lease_until`, `result_ref`, `completed_at`, `next_attempt_at`, `requires_provider_read`, `late_result_status`, `late_result_ref`, `settled_evidence_id`, `resolution_id`, `error_code`, `source_version`.
+- **Allowed changes.** On a state-changing UPDATE, the only columns that may change are those the allowed transition sets:
+  - claim: state, attempts, dispatched_at, lease, updated_at;
+  - completion: state, result_ref or error_code, completed_at, lease cleared, updated_at.
+  - Only `updated_at` may change freely.
 
 **`notify_claim_binding`** — AFTER UPDATE `WHEN (OLD.state='pending' AND NEW.state='in_flight' AND NEW.op_type='guest.notify')`.
 - It re-checks, at its own instant, that a render row exists with `worker = NEW.lease_worker_id`, `intent_version = source_version` and `claimed_at = NEW.dispatched_at`.
@@ -537,7 +626,7 @@ These apply to every path, including raw UPDATEs and privileged sessions.
   - `I.version = render.intent_version`;
   - `guest_notification_refusal IS NULL`;
   - the current `facts_hash` and `recipient_hash` equal the render's;
-  - the intent is not protected.
+  - the intent is not protected. A protected intent returns `{ok:false, code:'PROTECTED'}`, and the worker then makes **no** write (§7.6). Any other refusal leads to `complete_guest_notification(unknown, PRESEND_ABORTED_NOT_INVOKED)`.
 - It takes **no locks**.
 
 **JS then checks the following, with no `await` in between:**
@@ -551,25 +640,46 @@ It then starts `sendMessage(frozenRequest, { signal })` synchronously.
 
 **What it does not guarantee:** that the facts are still true when the mock, or a future provider, processes the request (§6.6).
 
-### 6.5 Settlement
+### 6.5 Settlement and notification-scoped maintenance
 
-**`booking.complete_guest_notification(p_op, p_worker, p_kind text, p_ref text, p_code text) RETURNS text`** (SECURITY DEFINER)
-- **Locks:** intent SHARE → op FOR UPDATE, then reads `v_t`.
-- **With a live lease** (owner `p_worker`, `v_t ≤ lease_until`) it returns the new state:
+**`booking.complete_guest_notification(p_op, p_worker, p_kind text, p_ref text, p_code text) RETURNS text`** — SECURITY DEFINER.
+- **Locks:** the protection lock bundle (§6.6), then op `FOR UPDATE`, then `v_t`.
+- **Protected re-check** in a new statement (§7.2). If protected → `'PROTECTED'`, with **no write**: the row stays as it is (§7.6).
+- **With a live lease** (owner `p_worker`, `v_t ≤ lease_until`):
   - `accepted` → `succeeded`, `result_ref = p_ref`, `completed_at = v_t`;
   - `unknown` → `outcome_unknown`, `error_code = p_code`, plus the case below.
+  - It returns the new state.
 - **Without a live lease** it returns `'LEASE_LOST'` and writes **nothing**. A late reply is observed in memory only, within `LATE_WINDOW_MS`.
+- **Pre-send that returned `PROTECTED`** (§6.4): the worker does **not** call `complete_guest_notification`. It makes no write at all (§7.6).
 
-**JS changes in `operations.js` (D1 = A)**
+**JS changes in `operations.js` (D1 = A; retained)**
 - **(i)** `markUnknown` gets a first branch for `op.op_type === 'guest.notify'`:
   - → `outcome_unknown` plus `openCase('NOTIFICATION_OUTCOME_UNKNOWN', 'op:'+id, {operationId, opType, errorCode})`;
-  - independent of `retry_class` and `attempts`;
-  - covers completion and both maintenance paths.
-- **(ii)** `completeOperation(succeeded)` on a notify row returns `{ok:false, error:'NOTIFY_SUCCESS_REQUIRES_DEDICATED_COMPLETION'}`. The decision is made from the immutable `op_type` before any transaction, following the recording pattern (`:169–171`).
+  - independent of `retry_class` and `attempts`.
+  - It is reached only through the GENERIC helpers (`completeOperation(outcome_unknown)` and `recoverExpiredOperations`). The notification worker uses neither.
+  - It has **no** protected check: see U2 and residual §14.
+- **(ii)** `completeOperation(succeeded)` on a notify row returns `{ok:false, error:'NOTIFY_SUCCESS_REQUIRES_DEDICATED_COMPLETION'}`. The decision is made from the immutable `op_type` before any transaction (the recording pattern, `:169–171`).
 
-**Scoped maintenance.** The step calls the existing phase-guarded `recoverExpiredOperations({opTypes:['guest.notify'], listingIds, intentId, intentStates:[confirmed, authorization_released, cancelled, reconciliation_required]})`.
-- This path is intent-first (`operations.js:428–447`).
-- Protected rows can never be `in_flight` (§6.3), so maintenance never touches them.
+**Notification-scoped maintenance (R8; replaces revision 2's reuse of the generic helper).**
+
+`booking.recover_expired_notifications(p_listing_ids int[], p_intent uuid, p_limit int) RETURNS jsonb` — SECURITY DEFINER, app.
+- **Candidates** (no locks): notify ops that are `in_flight`, with `lease_until < clock_timestamp()` and the intent in scope. **Currently protected intents are excluded before `ORDER BY lease_until, id LIMIT p_limit`.**
+- **For each candidate:**
+  - take the protection lock bundle with `SKIP LOCKED` on the two row locks (skip the intent if it is locked);
+  - lock the op `FOR UPDATE SKIP LOCKED`;
+  - set `v_t`;
+  - re-check, in a new statement: not protected, still `in_flight`, `lease_until < v_t`.
+  - Only then: → `outcome_unknown` (`LEASE_EXPIRED`), plus the case `NOTIFICATION_OUTCOME_UNKNOWN` (`op:{id}`, `ON CONFLICT DO NOTHING`).
+  - A protected or changed row is skipped with no write.
+- **Returns** `{processed, skippedLocked, skippedProtected}` (counts only).
+- **Hot-loop bound.** A protected expired row is excluded before LIMIT, so it never occupies a batch slot.
+
+The generic `recoverExpiredOperations` (`operations.js:426–468`) is **not changed and not called** by the notification worker. Every accepted worker passes its own `opTypes`: `recording-worker.js:182`, `reservation-worker.js:601`, `capture-worker.js:622`, `compensation-worker.js:661`. A direct generic call that includes `guest.notify` remains the residual named in U2 and §14.
+
+**Work release.** `booking.release_notification_work(p_intent uuid, p_worker text) RETURNS text` — SECURITY DEFINER, app.
+- Takes the protection lock bundle, then `intent_work FOR UPDATE`, then re-checks protection.
+- Protected → `'PROTECTED'`, with no write: the lease simply expires.
+- Otherwise it clears the lease only if `p_worker` holds it → `'RELEASED'`, or else `'NOT_HELD'`.
 
 **Persisted error codes (codes only):**
 
@@ -579,68 +689,112 @@ It then starts `sendMessage(frozenRequest, { signal })` synchronously.
 | `SEND_THREW` | The executor threw or rejected |
 | `REPLY_SHAPE` | The reply did not match the grammar |
 | `REPLY_UNREADABLE` | The reply could not be read safely |
-| `PRESEND_ABORTED_NOT_INVOKED` | Claimed, but the pre-send check failed; `sendMessage` was NOT called |
-| `LEASE_EXPIRED` | Set by maintenance |
+| `PRESEND_ABORTED_NOT_INVOKED` | Claimed, but pre-send refused for a reason other than protection; `sendMessage` was NOT called |
+| `LEASE_EXPIRED` | Set by notification-scoped maintenance |
 
-### 6.6 Lock order (library paths)
+### 6.6 Lock order, the protection lock bundle, and what is (not) serialised
+
+**Protection lock bundle** (taken first by every notification-owned writer):
+1. `intents FOR SHARE`;
+2. `hostaway_reservation_attempts FOR SHARE`, when the row exists;
+3. later in each path, after any op / guest row locks: the advisory `('booking.notification_facts', intent)`. This is U1 = a; it is absent under U1 = b.
+
+The ordering between the advisories is fixed: `notification_facts` before `recording_evidence`.
 
 | Path | Order |
 |---|---|
-| `claim_guest_notification` | intent SHARE → work SHARE → op UPDATE → guest KEY SHARE → advisory evidence key → `v_t` |
-| `complete_guest_notification` | intent SHARE → op UPDATE → case INSERT (FK KEY SHARE on intent) |
-| `complete_recording_with_evidence` | intent SHARE → work SHARE → op UPDATE → advisory (`operations.js:184`). Same prefix order as the claim. |
+| `claim_notification_work` | intents SHARE SKIP LOCKED → attempts SHARE SKIP LOCKED → `intent_work` UPDATE SKIP LOCKED → `notification_facts` advisory → re-check |
+| `claim_guest_notification` | intent SHARE → attempts SHARE → work SHARE → op UPDATE → guest KEY SHARE → `notification_facts` advisory → `recording_evidence` advisory → `v_t` → re-check |
+| `latch_guest_notification` | as `claim_guest_notification` |
+| `complete_guest_notification` | intent SHARE → attempts SHARE → op UPDATE → `notification_facts` advisory → `v_t` → re-check → case INSERT (FK KEY SHARE on intent) |
+| `recover_expired_notifications` | per row: intent SHARE SKIP LOCKED → attempts SHARE SKIP LOCKED → op UPDATE SKIP LOCKED → `notification_facts` advisory → re-check → case INSERT |
+| `release_notification_work` | intent SHARE → attempts SHARE → work UPDATE → `notification_facts` advisory → re-check |
+| `complete_recording_with_evidence` | intent SHARE → work SHARE → op UPDATE → `recording_evidence` advisory (`operations.js:184`). Same prefix order; never takes `notification_facts`. |
+| Evidence writers (API `0010:354–390`, dashboard `0010:392–406`) | read-op UPDATE (API only) → evidence INSERT (FK KEY SHARE on intent; compatible with SHARE) → **U1 trigger:** `notification_facts` advisory → `recording_evidence` advisory (0010, `hostaway_offline_charges` only, `:387–389`, `:402–404`) |
+| `recordHostawayCreateResult` | one statement: attempts row UPDATE (`repo.js:617–627`). Conflicts with attempts SHARE. |
+| E3 transition / case opening (`applyEvent`) | intent UPDATE (`repo.js:378`). Conflicts with SHARE. |
 | Generic `claimNextOperation` | intent SHARE → work SHARE (recordings only) → op UPDATE SKIP LOCKED. **Never a notify op.** |
-| Phase-guarded maintenance | intents SHARE (ordered by id) → ops UPDATE SKIP LOCKED → case INSERT |
-| Global maintenance (op-first) | op UPDATE SKIP LOCKED → case INSERT. SKIP LOCKED never waits on a claimed op, and no intent lock is taken. |
-| Evidence writers | read-op UPDATE → evidence INSERT (FK KEY SHARE on intent) → advisory (`0010:359`, `:385–388`). They hold no intent or notify-op lock that the claim waits for in reverse, so there is no cycle. |
-| E3 transition or case opening (`applyEvent`) | intent UPDATE, which conflicts with SHARE. Serialised with claim and pre-send: if it commits first, the claim sees drift and latches; if it commits after, see the race note below. |
-| `purge_guest_data` | guest-row DELETE, no intent lock (`0005:141–150`). It waits on the claim's KEY SHARE; the claim never waits on purge-held locks in reverse. |
-| Work claim (§7.1) | `intent_work` UPDATE SKIP LOCKED only, as in `repo.js:652–661` |
+| Generic maintenance (unchanged) | phase-guarded: intents SHARE → ops UPDATE SKIP LOCKED; global: op UPDATE SKIP LOCKED → case INSERT |
+| `purge_guest_data` | guest-row DELETE, no intent lock (`0005:141–150`). Waits on the claim's KEY SHARE. |
 
-**Direct-UPDATE residual (not a library path).** A raw UPDATE of a notify op locks the op row first; the BEFORE trigger then reads intent and guest facts. A raw UPDATE racing an intent-first path can therefore yield `40P01`, exactly as with the 0007, 0009 and 0011 fences. The deadlock aborts one transaction and never claims.
+**No-cycle argument.**
+- Every party takes row locks in the order intent → attempts → work → op → guest, and advisories after its row locks, in the order `notification_facts` → `recording_evidence`.
+- An evidence writer holds only its read-op row and an intent KEY SHARE (compatible with SHARE) while it waits for `notification_facts`. No notification writer waits on a read-op row.
+- So no wait-for cycle exists among library paths.
 
-**Unavoidable race.**
-- A contradiction, late money, hold or case can be committed after the pre-send snapshot, or while the mock is processing the request, and so coincide with a sent message.
-- It is visible afterwards (case, hold or ledger). It is never "un-sent".
-- This contract does **not** claim that a message cannot become stale after that snapshot.
+**What is serialised with a notification decision, and what is not:**
 
-## 7. Visibility, eligibility, latches and unknowns (R2)
+| Protection / fact source | Serialised? | Reason |
+|---|---|---|
+| `intents.hostaway_reservation_id`, E3-inserted op payloads | Yes | Intent UPDATE vs intent SHARE |
+| `hostaway_reservation_attempts.hostaway_reservation_id` (`recordHostawayCreateResult`) | Yes | Row UPDATE vs attempts SHARE |
+| `provider_evidence` rows, kinds `payment_intent` / `hostaway_reservation` / `hostaway_offline_charges` | **Only under U1 = a** | Via the trigger advisory. Without U1, 0010 takes an advisory only for `hostaway_offline_charges` and only on the `recording_evidence` key (`0010:386–388`). A `payment_intent` or `hostaway_reservation` insert then holds only KEY SHARE on the intent, which does **not** conflict, so it is **not** serialised. |
+| Raw app INSERT of a non-notify op with a protected `payload.reservationId` outside E3 | **No** | Visible only if committed before the decision statement's snapshot (READ COMMITTED) |
+| Cases, refunds, webhooks, holds | **No** | No conflicting lock. Committed-before-statement visibility only. |
+
+**Snapshot timing.**
+- In each SECURITY DEFINER (VOLATILE plpgsql) function, the re-check statement runs after the locks and the advisory are granted. Under READ COMMITTED it therefore sees every transaction that committed before it, including any holder that just released a conflicting lock.
+- `guest_notification_presend` is STABLE and takes **no** locks. It sees only commits that preceded its statement.
+
+**Direct-UPDATE residual (not a library path).** A raw UPDATE of a notify op locks the op row first, and the BEFORE trigger then reads intent and guest facts. It can therefore yield `40P01` against intent-first paths, as with the 0007, 0009 and 0011 fences. The deadlock aborts one transaction and never claims.
+
+**Unavoidable races.**
+- A contradiction, late money, a hold, a case, or newly visible protection can be committed:
+  - after the pre-send snapshot and before or while the mock processes the request; or
+  - in an unserialised source after a decision statement.
+- Such a commit can coincide with a sent message.
+- It is visible afterwards. It is never "un-sent", and no claim is made that a message cannot become stale after that snapshot.
+
+## 7. Visibility, eligibility, latches and unknowns (R2, R8)
 
 ### 7.1 Eligibility classes
 
-Computed by SQL `booking.guest_notification_class(p_op)` and evaluated before LIMIT everywhere.
+Computed by SQL `booking.guest_notification_class(p_op)` and evaluated before LIMIT in every notification selection.
 
 | Class | Exact condition | Action |
 |---|---|---|
-| PROTECTED | §7.2 | **Zero action:** not a candidate, never latched, no case, no render, not in the page |
-| SUCCEEDED / IN_FLIGHT / UNKNOWN | The op state | None. Maintenance handles expired `in_flight` rows only. |
+| PROTECTED | §7.2, evaluated now (whatever the op state) | **No notification-owned write** (§7.6). Not a candidate for work / claim / maintenance; not in the page; counted only in the summary. |
+| SUCCEEDED / IN_FLIGHT / UNKNOWN | The op state | None. Notification-scoped maintenance handles expired `in_flight` rows only. |
 | LATCHED | A latch row exists | None, ever, in v1 |
 | OUT_OF_V1_SCOPE | `I.currency <> 'USD'`, OR the guest email does not match the `.invalid` grammar | Not a candidate; no write; listed with its code |
-| WAITING | A `stripe_webhook_events` row exists with `intent_id = I.id AND status IN ('received','failed_retryable')` | Not a candidate; no write; listed. Becomes a candidate only once the event row is processed or ignored. This is not an owner override. |
-| ELIGIBLE | Pending, attempts 0, and none of the above | A candidate: claimed or latched in one step |
+| WAITING | A `stripe_webhook_events` row exists with `intent_id = I.id AND status IN ('received','failed_retryable')` | Not a candidate; no write; listed. Becomes a candidate once the event row is processed or ignored. This is not an owner override. |
+| ELIGIBLE | Pending, attempts 0, and none of the above | A candidate |
 
-**Work claim.** `booking.claim_notification_work(p_worker, p_listing_ids int[], p_intent uuid, p_lease_ms int) RETURNS uuid`:
-- selects the oldest ELIGIBLE op (`ORDER BY created_at, id`) whose intent is in scope;
-- locks its `intent_work` row `FOR UPDATE SKIP LOCKED`, only when no lease is live;
-- sets `work_worker_id` and `work_lease_until = clock_timestamp() + WORK_LEASE_MS`.
+**Work acquisition.** `booking.claim_notification_work(p_worker text, p_listing_ids int[], p_intent uuid) RETURNS jsonb` — SECURITY DEFINER, app.
+- **Candidates** (no locks): ELIGIBLE notify ops whose intent is in scope, with currently protected intents excluded, `ORDER BY created_at, id`.
+- At most 10 candidates per call, with skip-on-lock as in `operations.js:89`.
+- **For each candidate:**
+  - lock `intents FOR SHARE SKIP LOCKED` and `hostaway_reservation_attempts FOR SHARE SKIP LOCKED`;
+  - lock `intent_work FOR UPDATE SKIP LOCKED`, requiring no live lease;
+  - take the `notification_facts` advisory;
+  - re-check protection and class in a new statement.
+- **Outcome of the re-check:**
+  - protected or no longer ELIGIBLE → skip, **no write**;
+  - otherwise set `work_worker_id = p_worker` and `work_lease_until = clock_timestamp() + WORK_LEASE_MS` → `{status:'acquired', opId, intentId}`.
+- **No candidate** → `{status:'idle'}`.
+- **A legal NULL → protected transition during acquisition.** For example, `RESOLVE confirmed` setting `reservation.reservationId` (`intent-state.js:609–614`).
+  - If the transition holds the intent row, `SKIP LOCKED` skips the candidate.
+  - If it committed before the lock, the re-check sees the protected id and skips.
+  - In both cases no lease is written. Such a row is version-drifted anyway.
 
 **Progress argument.**
-- Every selected row leaves ELIGIBLE after one step: it is either claimed or latched.
-- The only exception is `SNAPSHOT_STALE`, which requires a concurrent fact change.
-- So there is no hot loop and no starvation of other notify rows.
+- Every acquired row leaves ELIGIBLE after one step (claimed or latched).
+- The exception is `SNAPSHOT_STALE`, which requires a concurrent fact change and is retried (§6.2 step 8).
+- Protected, latched, waiting and out-of-scope rows are excluded before LIMIT.
+- So there is no hot loop and no starvation.
 
 ### 7.2 The protected predicate
 
-It is evaluated at intent level and follows every reservation reference. The intent is protected if ANY of these values is in {70636076, 71045356, 71072615, 71081885}:
+Evaluated at intent level, following every reservation reference. The intent is protected if ANY of these values is in {70636076, 71045356, 71072615, 71081885}:
 - `I.hostaway_reservation_id`;
 - any `hostaway_reservation_attempts.hostaway_reservation_id` for `I`;
-- any `provider_evidence.external_ref` of kind `hostaway_reservation` or `hostaway_offline_charges` for `I`;
+- any `provider_evidence.external_ref` of kind `hostaway_reservation` or `hostaway_offline_charges` for `I`, from API or dashboard source. API refs bind to the read selector, not to the intent's current reservation (`0010:371–378`); dashboard refs are free (`0010:392–401`);
 - any op payload `reservationId` for `I`.
 
-It is evaluated in:
-- the work-claim selection, before LIMIT;
-- the claim, under the intent lock;
-- pre-send, the page and the summary.
+It is evaluated:
+- in every notification selection **before LIMIT**: work acquisition, maintenance, the page and the summary;
+- **again in a new statement under the protection lock bundle** immediately before every notification-owned write: work acquisition, claim, latch, completion, maintenance and release;
+- in pre-send, which is a snapshot with no lock.
 
 ### 7.3 Table `booking.notification_latches`
 
@@ -648,33 +802,73 @@ It is evaluated in:
 |---|---|
 | `operation_id` | PK |
 | `intent_id` | |
-| `code` | A `booking.is_code` value from §5.2, or `RENDER_FAILED` |
+| `code` | A `booking.is_code` value from §5.2 / §5.3, or `RENDER_FAILED` |
 | `intent_version_seen` | |
 | `latched_at` | DB clock |
 | `worker` | |
 
 **Writers.** The table is append-only, and each row is written once, by one of:
 - `claim_guest_notification`, with an SQL-derived code;
-- `booking.latch_guest_notification(p_op, p_worker, 'RENDER_FAILED')`. This takes the same locks and refuses if the row is not ELIGIBLE. The code is TRUST: it records that the JS could not render.
+- `booking.latch_guest_notification(p_op, p_worker, 'RENDER_FAILED')`. This takes the same locks as the claim, re-checks protection and ELIGIBLE, and returns `'PROTECTED'` / `'NOT_ELIGIBLE'` with no write. The code is TRUST: it records that the JS could not render.
 
-**Policy.** No requalification, override or case in v1 (D2, N1). A latched row stays `pending` forever and stays visible.
+**Latching codes.** Every non-WAITING, non-OUT_OF_V1_SCOPE code of §5.2, plus `EVIDENCE_MALFORMED` and `RENDER_FAILED`. `SNAPSHOT_STALE` never latches.
+
+**Policy.** No requalification, override or case in v1 (D2, N1 = a). A latched row stays `pending` forever and stays visible.
 
 **Grants.** SELECT for app and admin; no report grant (D4).
 
 ### 7.4 Unknown
 
-- An unknown row is `outcome_unknown` plus a `NOTIFICATION_OUTCOME_UNKNOWN` case opened as `op:{id}`. In v1 it stays **durable and unresolved**, because no closing path exists today:
+- An unknown row is `outcome_unknown` plus a `NOTIFICATION_OUTCOME_UNKNOWN` case opened as `op:{id}`. In v1 it stays **durable and unresolved** (N2 = a), because no closing path exists today:
   - `admin_resolve_operation` → `NOT_SUPPORTED` (`0005:363–364`);
   - `admin_close_case` → `OPERATION_CASE_USE_ADMIN_RESOLVE_OPERATION` (`0011:539–541`).
-- The case blocks guest purge for that intent (`0005:146`; see N2).
-- No owner resend capability exists or is proposed. A future owner notification-resolution slice would need its own evidence, audit and permission design, and must keep the no-second-claim invariant (§8.1).
+- The case blocks guest purge for that intent (`0005:146`). Live use stays blocked on a future owner-resolution / retention design.
+- No owner resend capability exists or is proposed. A future slice must keep the no-second-claim invariant (§8.1).
 
-### 7.5 Read-only page `booking.list_guest_notifications(p_listing_ids, p_after uuid, p_limit int)`
+### 7.5 Read-only page `booking.list_guest_notifications(p_listing_ids int[], p_after_op uuid, p_limit int) RETURNS SETOF record`
 
-- App and admin only.
-- Rows: `{opId, intentId, template, state, class, code, createdAt}`.
-- No hashes and no guest data. Protected rows are excluded.
-- Keyset paging by `(created_at, id)`. LIMIT is between 1 and 100.
+- SECURITY DEFINER, STABLE. App and admin.
+- **Rows:** `{opId, intentId, template, state, class, code, createdAt}`, `ORDER BY created_at, id`.
+- No hashes and no guest data. Currently protected rows are excluded.
+- **Cursor (precision-safe immutable lookup, R9).** `p_after_op` is the `opId` of the last row the caller saw.
+  - The function looks up that op's `(created_at, id)` server-side. `created_at` is immutable (`0004:56`), so microsecond precision never passes through JS.
+  - It returns rows with `(created_at, id) > (c.created_at, c.id)`.
+  - `p_after_op IS NULL` → start from the beginning.
+  - A cursor that does not exist, is not a `guest.notify` op, or whose intent is outside `p_listing_ids` → `22023 NOTIFY_CURSOR_INVALID`. This reveals nothing about other scopes.
+  - A cursor whose intent has since become protected is still accepted for positioning. The row itself is not returned.
+- **Validation:** `p_listing_ids` must be 1–50 distinct positive values, and `p_limit` 1–100. Otherwise `22023`.
+
+### 7.6 Protection appearing after a claim (R8 temporal guarantee)
+
+**Guarantee.** No NEW notification-owned write, and no claim, occurs once protection is visible at the relevant locked decision statement. Notification-owned writes are: work lease, latch, render / claim, completion, maintenance unknown or case, and release. For pre-send, the guarantee holds once protection is visible in its snapshot; there is then no invocation and no write.
+
+Protection that becomes visible after a claim:
+- **does not** retroactively undo anything. The render row, `attempts = 1`, `dispatched_at` and any earlier completion stay byte-identical;
+- **never** leads to a re-claim or re-invocation. The row cannot return to `pending` (§8.1).
+
+Visibility of such rows comes from `guest_notification_summary` (§7.7) as counts only. No new case, latch or page row is written for them.
+
+**Per-phase behaviour when protection is visible at that phase:**
+
+| Phase | Behaviour |
+|---|---|
+| Work acquisition | Skip; no lease |
+| Claim | `{status:'protected'}`; no write |
+| Pre-send | `{ok:false, code:'PROTECTED'}`; the worker does NOT invoke, does NOT complete and does NOT release. Step result `protected`, sends 0. The row stays `in_flight` until its lease expires. |
+| Completion after invocation | `'PROTECTED'`; no write. The row stays `in_flight` with its render. The step result is `protected` with `sends: 1`; the persisted state cannot record the reply. |
+| Notification-scoped maintenance | Excluded before LIMIT and re-checked; the row stays `in_flight` with an expired lease indefinitely |
+| Release | `'PROTECTED'`; no write |
+
+**Residual (U2 = a, explicit).** The generic exported `recoverExpiredOperations` is unchanged. If called directly with `opTypes` null or including `guest.notify`, it **will** mark such a protected expired notify row `outcome_unknown` and open a case: the D1 = A markUnknown branch has no protected check. No accepted worker makes such a call (§6.5). **This contract does not claim the whole DB enforces protected zero action; only the notification functions do.**
+
+### 7.7 Summary `booking.guest_notification_summary(p_listing_ids int[]) RETURNS jsonb`
+
+- SECURITY DEFINER, STABLE. App and admin.
+- **Returns counts only, by class and state:**
+  - `{eligible, waiting, outOfScope, latched, inFlight, inFlightExpired, unknown, succeeded, protectedPending, protectedClaimed}`;
+  - `protectedClaimed` = protected intents whose notify row is `in_flight`, `outcome_unknown` or `succeeded`.
+- No ids, hashes or guest data.
+- The same `p_listing_ids` validation as the page.
 
 ## 8. Lifecycle, upgrade and down invariant map (R5)
 
@@ -682,7 +876,9 @@ It is evaluated in:
 
 | Change | Allowed? | Enforced by |
 |---|---|---|
-| INSERT pending, attempts 0 | Only with the canonical key and payload, and at most 1 per intent | `0004:47–51` + `notify_op_fence` |
+| INSERT pending, attempts 0 | Only with the canonical key and payload, every lifecycle column NULL / default, `source_version` = intent version, intent in the target state (§6.3) | `0004:47–51` + `notify_op_fence` |
+| A second notify row for the same intent (any template, concurrent or not) | **Refused** (`23505`) | Partial UNIQUE `external_operations_one_guest_notify` (R7) |
+| Same-key E3 replay | Absorbed (`DO NOTHING`), no error | Arbiter `idempotency_key` (`repo.js:118–131`) |
 | `pending → in_flight` (attempts 0 → 1, `dispatched_at`, lease) | Only through `claim_guest_notification`, with the render binding | Fence + binding trigger |
 | `pending → superseded` or `pending → escalated` | **Refused** | Fence |
 | `in_flight → succeeded` | Only through `complete_guest_notification` (live lease, DB clock) | Fence + `operations.js` change (ii) |
@@ -690,12 +886,14 @@ It is evaluated in:
 | `in_flight → pending`, `in_flight → failed_definite`, `in_flight → escalated` | **Refused** | Fence |
 | `outcome_unknown → pending`, even when privileged | **Refused** | Fence (`0003:446–450` already blocks the runtime role) |
 | `outcome_unknown → succeeded`, `→ failed_definite`, `→ escalated` | Owner only, but no current owner function supports notify (§7.4) | `0003:446–450`, `0005:363–364` |
-| Same-state change to attempts, dispatched_at, lease, result, completion, next_attempt_at, requires_provider_read or late_result_* | **Refused** | Fence |
+| Same-state change to attempts, dispatched_at, lease, result, completion, next_attempt_at, requires_provider_read, late_result_*, settled_evidence_id, resolution_id or error_code | **Refused** | Fence |
+| Any change to `source_version` | **Refused** | Fence (not in the 0004 identity list) |
 | Render row UPDATE, DELETE or TRUNCATE | **Refused** | `reject_change` |
-| A new key or a replacement op | Impossible: the key is immutable (`0004:53–56`), and the INSERT fence allows at most 1 notify per intent | |
+| A new key or a replacement op | Impossible: the key is immutable (`0004:53–56`) and the partial UNIQUE index allows one notify row per intent | Index + `0004` guard |
 
 **What the DB counts vs what the worker counts.**
-- The DB guarantees at most ONE **claim** per notify row, ever: attempts go 0 → 1 once, the row never returns to pending, and no second row can exist.
+- The DB guarantees at most ONE **claim** per notify row, ever: attempts go 0 → 1 once, and the row never returns to pending.
+- The partial UNIQUE index guarantees at most one notify row per intent, against raw and concurrent INSERTs as well (R7).
 - The DB **cannot count injected calls.** At most one **invocation** per claim is a property of the reviewed worker:
   - one call site, reached only after the pre-send check;
   - never retried;
@@ -708,19 +906,19 @@ It is evaluated in:
 2. Refuse with `NOTIFY_UPGRADE_PRECONDITION` if ANY `guest.notify` row:
    - has `state <> 'pending'`, `attempts > 0`, `dispatched_at IS NOT NULL` or `lease_worker_id IS NOT NULL`;
    - has a non-canonical key or payload;
-   - or is a second notify row for the same intent.
-3. Create the tables, functions, triggers and grants.
+   - or is a second notify row for the same intent (`NOTIFY_UPGRADE_DUPLICATE`, reported before the index build, which would otherwise fail with an unnamed `23505`).
+3. Create the partial UNIQUE index `external_operations_one_guest_notify`, the tables, functions, triggers (including the U1 `provider_evidence` trigger, if chosen) and grants. All of this runs in the same transaction and under the same lock, so no concurrent INSERT can slip in between the check and the index.
 
 At `2e20972a` no code claims notify rows, so the precondition holds on any database produced by the accepted code. A database touched by an ad-hoc generic dispatch is refused and left for owner review.
 
 ### 8.3 Down: 0016 down, race-safe and audit-preserving
 
 **Procedure.**
-1. Take `LOCK TABLE external_operations, notification_renders, notification_latches IN ACCESS EXCLUSIVE MODE`.
+1. Take `LOCK TABLE external_operations, provider_evidence, notification_renders, notification_latches IN ACCESS EXCLUSIVE MODE`.
 2. Refuse if any render or latch row exists, or any notify row has `attempts > 0` or `state <> 'pending'`.
-3. Otherwise drop the triggers, functions and tables in dependency order.
+3. Otherwise drop the triggers (`notify_op_fence`, `notify_claim_binding`, the U1 evidence trigger), the partial UNIQUE index, the functions and the tables, in dependency order.
 
-**Equality.** Down equality is schema-only: `pg_get_functiondef`, ACLs and trigger lists equal a fresh 0015.
+**Equality.** Down equality is schema-only: `pg_get_functiondef`, ACLs, trigger lists and the index list on `external_operations` / `provider_evidence` equal a fresh 0015.
 
 **JS compatibility.** The `operations.js` changes (NOTIFY_FENCE, the markUnknown notify branch, the success guard) **survive an SQL down**. They are safe against a fresh 0015:
 - notify rows stay pending and cannot be claimed by generic code;
@@ -737,8 +935,9 @@ At `2e20972a` no code claims notify rows, so the precondition holds on any datab
   - `completeOperation(outcome_unknown)`, and both the global and phase-guarded `recoverExpiredOperations`, give `outcome_unknown` plus exactly one case — never pending;
   - `admin_resolve_operation` → `NOT_SUPPORTED`, and `admin_close_case` refuses.
 - **Upgrade:**
-  - the precondition refuses pre-existing attempted, in_flight or duplicate rows;
-  - a concurrent writer blocks on the lock.
+  - the precondition refuses pre-existing attempted, in_flight or duplicate rows (two templates for one intent → `NOTIFY_UPGRADE_DUPLICATE`, with the rows unchanged);
+  - a concurrent writer blocks on the lock;
+  - after up, the index exists with the exact partial predicate.
 - **Down:**
   - a refused down leaves render, latch and op rows byte-equal (counts and row digests compared before and after);
   - an allowed down gives fresh-0015 equality.
@@ -811,43 +1010,52 @@ At `2e20972a` no code claims notify rows, so the precondition holds on any datab
 
 **Test and tool logs** never print a recipient, name, subject, body or request. Assertions compare hashes or use synthetic constants.
 
-## 10. The step, end to end (PROPOSED)
+## 10. The step, end to end (PROPOSED, Stage 2)
 
 1. **Gate**, then the test marker, then the skew check.
-2. **Scoped maintenance** (§6.5).
-3. **`claim_notification_work`.** If nothing is claimed → `idle`.
-4. **Snapshot** with `guest_notification_snapshot(op)`: ONE SECURITY DEFINER, STABLE statement returning `{class, code, facts, factsHash, recipientHash, email, firstName}` to the app role. If the class is not ELIGIBLE → release the work lease → `waiting` or `protected`, with no write.
-5. **`buildMessageRequest`.** On failure → `latch_guest_notification(RENDER_FAILED)` → `latched`.
-6. **`claim_guest_notification(…, contentHash(request), factsHash, recipientHash)`** → `claimed`, `latched`, `waiting`, `protected` or `not_claimable`.
-7. **Pre-send** (SQL snapshot plus the JS checks). On failure → `complete_guest_notification(unknown, PRESEND_ABORTED_NOT_INVOKED)`, with sends 0.
+2. **`recover_expired_notifications`** (§6.5) for this scope.
+3. **`claim_notification_work`** → `idle`, or `acquired {opId, intentId}`.
+4. **Snapshot** with `guest_notification_snapshot(op)`: ONE SECURITY DEFINER, STABLE statement returning `{class, code, facts, factsHash, recipientHash, email, firstName}` to the app role.
+   - Class `PROTECTED` → **no write at all**; the work lease is left to expire → `protected`.
+   - Any other non-ELIGIBLE class → `release_notification_work` → `waiting` / `latched` / `not_claimable`, with no other write.
+5. **`buildMessageRequest`.** On failure → `latch_guest_notification(RENDER_FAILED)` → `latched`, or `protected` if it returns `'PROTECTED'`.
+6. **`claim_guest_notification(…, contentHash(request), factsHash, recipientHash)`** → `claimed`, `latched`, `waiting`, `protected` or `not_claimable` (`SNAPSHOT_STALE` is retried by a later step).
+7. **Pre-send** (SQL snapshot plus the JS checks).
+   - `PROTECTED` → **no write, no invocation** → `protected`, sends 0.
+   - Any other failure → `complete_guest_notification(unknown, PRESEND_ABORTED_NOT_INVOKED)`, sends 0.
 8. **ONE bounded `sendMessage`** within `SEND_TIMEOUT_MS`; `sends = 1`. Then `classifyReply`.
-9. **`complete_guest_notification(accepted | unknown)`.** `LEASE_LOST` → kept in memory only.
-10. **Release** the work lease.
+9. **`complete_guest_notification(accepted | unknown)`.**
+   - `'LEASE_LOST'` → kept in memory only.
+   - `'PROTECTED'` → `protected`, sends 1, no write.
+10. **`release_notification_work`**, skipped when any earlier phase returned `protected`.
+
+On every path, an outer DB error stops the step at once and is rethrown as the identical object (§9.1).
 
 **Crash matrix.** Recovery uses persisted facts only and never resends.
 
 | Crash point | Persisted state | Next |
 |---|---|---|
 | Before the claim commits | Nothing (or a latch) | Re-evaluated by class |
-| Claim commit ambiguous | Pending, or in_flight plus a render | Pending → re-evaluated. In_flight → lease expiry → unknown (`LEASE_EXPIRED`), sends 0. |
-| After the claim, before or after invocation, before completion | In_flight plus a render | Lease expiry → unknown plus a case; never re-invoked |
+| Claim commit ambiguous | Pending, or in_flight plus a render | Pending → re-evaluated. In_flight → lease expiry → unknown (`LEASE_EXPIRED`), sends 0, unless protected by then (§7.6). |
+| After the claim, before or after invocation, before completion | In_flight plus a render | Lease expiry → unknown plus a case, unless protected by then (§7.6); never re-invoked |
 | Completion commit ambiguous | Succeeded or in_flight | Either is safe; never resent |
 
 ## 11. Relation to the 0015 scoped inbox
 
 - The two are invoked separately. The step never uses the inbox `drained` flag, which is not proof.
-- `booking_confirmed` relies on the synchronous `recording_conflict_refusal` (K4) and on the hold and case checks (C4, C10). These run under the same advisory key as the evidence writers.
+- `booking_confirmed` relies on the synchronous `recording_conflict_refusal` (K4) and on the hold and case checks (C4, C10).
+- The claim takes the `recording_evidence` advisory, which 0010 evidence writers take only for `hostaway_offline_charges` (`0010:386–388`, `:402–404`). Other evidence kinds are serialised only under U1 = a (§6.6).
 - A hold that the inbox opens later latches any confirmation not yet claimed (C4, C10).
 
-## 12. Planned deterministic tests (future slice; unit + disposable PG + mock; no network)
+## 12. Planned deterministic tests (future; unit + disposable PG + mock; no network)
 
-1. **Unit:**
+1. **Unit (Stage 2):**
    - templates, with USD formatting and the exact copy;
    - the request grammar, the canonical encoding and `contentHash` test vectors;
    - `classifyReply` against getters, proxies, extra keys, `accepted: 'true'` and bad ids;
    - option validation with zero queries, and deep-freeze;
    - no PII in return values.
-2. **Predicates.** Every code in §5.2, positive and negative, including:
+2. **Predicates (Stage 1).** Every code in §5.2 / §5.3, positive and negative, including:
    - a second PI;
    - a refund in each state, and a failed refund with captured 0;
    - an unknown capture op;
@@ -856,42 +1064,125 @@ At `2e20972a` no code claims notify rows, so the precondition holds on any datab
    - a `found_active` after a `cancelled`;
    - a missing leg event;
    - a legacy MXN intent → OUT_OF_V1_SCOPE.
-3. **Classes:**
+3. **Classes (Stage 1):**
    - protected via each of the four references → zero writes (row digests unchanged);
    - WAITING clears only after the webhook row is processed;
    - a latch is written once;
-   - no hot loop: 100 latched or waiting rows do not block an eligible one.
-4. **At most once:**
-   - each of these ends unknown, with `sends ≤ 1` and repeated steps sending 0: a timeout, a throw, a bad reply, accepted-but-completion-lost, lease expiry after the claim, an ambiguous claim commit;
+   - no hot loop: 100 latched / waiting / protected rows do not block an eligible one.
+4. **At most once (Stage 1 for the DB claim; Stage 2 for invocation):**
+   - a timeout, a throw, a bad reply, accepted-but-completion-lost, lease expiry after the claim, an ambiguous claim commit → unknown, `sends ≤ 1`, repeated steps 0;
    - the whole §8.4 map.
-5. **Races (using hooks):**
+5. **Races (hooks):**
    - two workers at once;
    - an E3 drift between snapshot and claim → latch;
+   - a non-version fact change (new PI evidence, a case) between snapshot and claim → `SNAPSHOT_STALE`, no write; the retry then claims or latches;
    - a contradiction between claim and pre-send → `PRESEND_ABORTED_NOT_INVOKED`, sends 0;
    - a purge during the claim (blocked) and after the claim (abort);
    - the documented post-snapshot race.
-6. **Migration:**
-   - grants: the report role sees neither table;
+6. **Migration (Stage 1):**
+   - grants: the report role sees neither table, nor the page or summary;
    - append-only behaviour;
    - the up precondition and the down gate;
-   - fresh-0015 equality after an allowed down.
+   - fresh-0015 equality after an allowed down, including the index and trigger lists.
 7. **Regressions:**
    - the lifecycle rehearsal (rows stay pending unless a reviewed slice changes that);
    - the 0010–0015 suites, `npm test` and `test:db`;
-   - mechanical 0016 version pins only.
+   - mechanical 0016 version pins only, each reported.
    - If the e74a listing-lock failure reproduces: keep the FIRST FULL TAP and STOP. Never rerun to green.
+8. **R7 — the one-row invariant (Stage 1):**
+   - two concurrent raw INSERTs for one intent with different template keys (two sessions; the second blocks, then `23505` on `external_operations_one_guest_notify` after the first commits; proceeds if the first aborts);
+   - a deterministic sequential duplicate → `23505`, and no row change;
+   - an E3 same-key replay (applyEvent replay of a producing transition) → absorbed, one row, no error;
+   - a raw INSERT with a wrong key, payload, `source_version`, state, non-NULL lifecycle columns or a non-target intent state → refused;
+   - a raw UPDATE of `source_version` (same state and with a state change) → refused;
+   - pre-existing duplicates at upgrade → `NOTIFY_UPGRADE_DUPLICATE`, with the rows unchanged.
+9. **R8 — protection after claim (Stage 1, hooks between phases):**
+   - protection appearing through each source:
+     - a `provider_evidence` API row (read selector = protected ref);
+     - an owner dashboard row;
+     - a `recordHostawayCreateResult` id;
+     - a `RESOLVE` transition setting the reservation id;
+   - each source tested in each window: after claim / before pre-send → `PROTECTED`, no complete, no release; after invocation / before completion → `'PROTECTED'`, no write; after lease expiry / before maintenance → excluded and re-checked, no write;
+   - in every case: render, op and case rows byte-equal before and after; summary `protectedClaimed` incremented; never re-claimed;
+   - 100 protected expired rows ahead in `lease_until` order do not consume the maintenance LIMIT;
+   - a NULL → protected transition holding the intent lock during work acquisition → skipped; committed just before the lock → the re-check skips; no lease written;
+   - U1 = a: an evidence insert that holds the `notification_facts` advisory makes the claim wait, and the claim then sees it; a claim holding the advisory makes the evidence trigger wait; no deadlock against `complete_recording_with_evidence` or the 0010 writers (lock-order probe);
+   - U1 = b (only if chosen): the documented non-serialisation is demonstrated, not hidden;
+   - U2 = a: a direct generic `recoverExpiredOperations` with `opTypes` null DOES mark a protected expired notify row unknown. The test pins the residual.
+10. **R9 — predicate precision and API (Stage 1):**
+    - C7: a Hostaway `offline_charge_recorded` does not trip `FOREIGN_PAYMENT_INTENT`; each Stripe reference kind does;
+    - A2 with no capture op ever dispatched → qualifies, with no NULL comparison;
+    - an evidence tie on `observed_at` and `created_at` → resolved by `id` identically at claim and at pre-send;
+    - each allowlisted field: absent, JSON null, wrong type, a string number, negative, float, overflow → the exact code (§5.3); never a SQL error, never qualifies;
+    - a K3 dashboard-only evidence row → `PI_EVIDENCE_UNPROVEN`;
+    - page cursor: NULL start; an exact continuation with no duplicates or gaps on equal `created_at`; an unknown / non-notify / out-of-scope cursor → `22023`; a cursor intent that became protected → positioning only;
+    - summary counts against fixtures;
+    - every Stage 1 function's return-code set (§13.1) exercised.
 
 ## 13. Smallest justified staging (each stage authorized separately)
 
-**Stage 1 — the DB fence only.**
-- `0016_guest_notification_fence.up/.down.sql`, containing:
-  - the refusal, class, facts, snapshot, presend, claim, work-claim, latch, complete and page functions;
-  - two tables, two triggers and the grants.
-- The three `operations.js` changes (§6.1, §6.5 i–ii).
-- `test/db/e7-guest-notification-fence.test.mjs`: predicates, classes, the §8 map, and races without an executor.
-- No worker or executor exists yet, so nothing can invoke anything.
+### 13.1 Stage 1 — DB fence + narrow `operations.js` helpers + disposable-PG tests (no renderer, worker or executor)
 
-**Stage 2 — the pure module, the worker and mock tests.**
+**Schema objects (migration 0016):**
+
+| Object | Kind | Notes |
+|---|---|---|
+| `external_operations_one_guest_notify` | partial UNIQUE index on `external_operations (intent_id) WHERE op_type = 'guest.notify'` | R7 |
+| `notification_renders` | table, append-only (`reject_change` UPDATE / DELETE / TRUNCATE), RLS | SELECT app + admin; no report; no write grant |
+| `notification_latches` | table, same guards | same grants |
+| `notify_op_fence` | BEFORE INSERT OR UPDATE trigger on `external_operations`, `WHEN (NEW.op_type = 'guest.notify')` | §6.3 |
+| `notify_claim_binding` | AFTER UPDATE trigger on `external_operations` (pending → in_flight, notify) | §6.3 |
+| `notification_evidence_lock` | AFTER INSERT row trigger on `provider_evidence`, kinds `payment_intent` / `hostaway_reservation` / `hostaway_offline_charges` | **U1 = a only** |
+
+**Functions.** All use `search_path = pg_catalog, booking` and `REVOKE ALL FROM PUBLIC`.
+
+| Function | Volatility / security | Grant | Writes | Returns / codes |
+|---|---|---|---|---|
+| `guest_notification_protected(p_intent)` | STABLE, DEFINER | none (private) | — | boolean |
+| `guest_notification_facts(p_op)` | STABLE, DEFINER | none | — | jsonb (§4.2) |
+| `guest_notification_refusal(p_op)` | STABLE, DEFINER | none | — | text: a §5.2 / §5.3 code, or NULL |
+| `guest_notification_class(p_op)` | STABLE, DEFINER | none | — | text: §7.1 class |
+| `gn_obs_int / gn_obs_text / gn_obs_bool(jsonb, text[])` | IMMUTABLE, INVOKER | none | — | value, or ABSENT / MALFORMED sentinel |
+| `claim_notification_work(p_worker, p_listing_ids, p_intent)` | VOLATILE, DEFINER | app | `intent_work` lease | `{status: acquired \| idle}`; `22023` on bad args |
+| `release_notification_work(p_intent, p_worker)` | VOLATILE, DEFINER | app | `intent_work` lease cleared | `RELEASED \| NOT_HELD \| PROTECTED` |
+| `guest_notification_snapshot(p_op)` | STABLE, DEFINER | app | — | `{class, code, facts, factsHash, recipientHash, email, firstName}` |
+| `claim_guest_notification(p_op, p_worker, p_template_version, p_content_hash, p_expected_facts_hash, p_expected_recipient_hash)` | VOLATILE, DEFINER | app | render + op claim, or latch | `{status: claimed \| latched \| waiting \| protected \| not_claimable, code}` |
+| `latch_guest_notification(p_op, p_worker, p_code)` | VOLATILE, DEFINER | app | latch | `LATCHED \| NOT_ELIGIBLE \| PROTECTED`; only `p_code = 'RENDER_FAILED'` (`22023` otherwise) |
+| `guest_notification_presend(p_op, p_worker)` | STABLE, DEFINER | app | — | `{ok, code, dbNow, opLeaseUntil, workLeaseUntil, contentHash, templateVersion, messageRef}`; codes `PROTECTED \| NOT_IN_FLIGHT \| LEASE_NOT_HELD \| VERSION_DRIFT \| FACTS_CHANGED \| RECIPIENT_CHANGED` or a §5.2 code |
+| `complete_guest_notification(p_op, p_worker, p_kind, p_ref, p_code)` | VOLATILE, DEFINER | app | op settle + unknown case | `succeeded \| outcome_unknown \| LEASE_LOST \| PROTECTED`; `22023` on bad kind / ref / code |
+| `recover_expired_notifications(p_listing_ids, p_intent, p_limit)` | VOLATILE, DEFINER | app | op → unknown + case | `{processed, skippedLocked, skippedProtected}` |
+| `list_guest_notifications(p_listing_ids, p_after_op, p_limit)` | STABLE, DEFINER | app, admin | — | rows (§7.5); `22023 NOTIFY_CURSOR_INVALID` |
+| `guest_notification_summary(p_listing_ids)` | STABLE, DEFINER | app, admin | — | jsonb counts (§7.7) |
+| trigger functions for `notify_op_fence` / `notify_claim_binding` / `notification_evidence_lock` | DEFINER where they read private predicates | none | — | raise `check_violation` with a `NOTIFY_*` message |
+
+**Error policy for these functions.**
+- A malformed argument raises `22023`. This is a programming error and is rethrown unchanged by the JS caller.
+- A fact or state refusal is returned as a code. It never raises.
+- `40P01` / `40001` propagate unchanged; the caller stops.
+
+**Narrow `operations.js` changes (Stage 1):**
+1. `NOTIFY_FENCE` in both stages of `claimNextOperation` (§6.1);
+2. the `markUnknown` `guest.notify` branch (§6.5 i);
+3. the `completeOperation(succeeded)` guard (§6.5 ii).
+
+No other JS changes. No renderer, worker or executor.
+
+**Allowed files for the Stage 1 implementation (exact):**
+
+| File | Change |
+|---|---|
+| `db/migrations/0016_guest_notification_fence.up.sql` | new |
+| `db/migrations/0016_guest_notification_fence.down.sql` | new |
+| `lib/booking-db/operations.js` | only the three changes above |
+| `test/db/e7-guest-notification-fence.test.mjs` | new; disposable PG only |
+| `test/e7-guest-notification-operations.test.mjs` | new; unit checks of the JS fences, with no DB |
+| `claude/e7-guest-notification-contract.md` | implementation map section only |
+| Existing tests that pin the latest migration version or db-smoke object counts (e.g. `test/db/migrations.test.mjs` and the e74b-d1 / d2 version pins) | **mechanical pins only, where necessary**, each listed in the report |
+
+No other file. 0001–0015, accepted workers, routes, UI, config, deps and fixtures stay unchanged.
+
+### 13.2 Stage 2 — pure module, worker and mock tests (after Stage 1 is accepted)
+
 - `lib/checkout/guest-notification.js` and `lib/booking-db/notification-worker.js`.
 - Unit and PG worker tests.
 - The packaging pin `OFFLINE_ONLY`.
@@ -901,14 +1192,17 @@ Neither stage changes E3 producers, other workers, routes, UI, config or deps.
 ## 14. Residuals (open, not resolved here)
 
 1. `alert.owner` rows keep the generic resend exposure (`repo.js:109–110`, `operations.js:414–418`). This needs a separate slice.
-2. N2: notification unknown cases have no closing path, and they block guest purge.
-3. N3: `recipient_hash` survives guest purge.
-4. False latches are possible, from a benign open case (C4) or a code change (`RENDER_FAILED`). They are permanent in v1; owner requalification design is deferred.
+2. N2 = a: notification unknown cases have no closing path and block guest purge. Live use is blocked on a future owner-resolution / retention design.
+3. N3 = a: `recipient_hash` survives guest purge. This is OFFLINE only; live retention stays closed.
+4. False latches are possible, from a benign open case (C4), malformed evidence or a code change (`RENDER_FAILED`). They are permanent in v1; owner requalification design is deferred.
 5. A row can stay WAITING indefinitely if a webhook row never leaves `received` or `failed_retryable`. It stays visible on the page.
-6. Two properties are derived from current code (§1.1): at most one notify per intent, and every version bump being a transition. An unconsidered intent UPDATE would cause a fail-safe `VERSION_DRIFT` latch.
-7. A raw UPDATE racing an intent-first path can deadlock (`40P01`). The global maintenance path is op-first, with SKIP LOCKED.
-8. The post-snapshot race (§6.6), and TRUST in the strict v3 and identity proofs that run in JS at transition time (§5.2).
-9. A trusted executor can do arbitrary work. Labels and `.invalid` do not prove a mock.
-10. The historical e74a listing-lock failure stays OPEN.
+6. "Every intent-row change bumps the version" is DB-enforced (`0001:159–162`). Non-intent facts change without a bump and are re-evaluated (§1.1, §6.2 step 8). E3's at-most-one-notify production is now also a DB invariant (R7).
+7. **U2 = a (generic GLOBAL / phase-guarded maintenance).** If the exported generic `recoverExpiredOperations` is called directly with notify in scope, it writes to protected expired notify rows (`outcome_unknown` + case). No accepted worker does this (§6.5). The protected guarantee covers notification functions only (§7.6).
+8. **Not serialised with notification decisions:** raw non-E3 op INSERTs carrying a protected `reservationId`; cases, refunds, webhooks and holds; and, under U1 = b, `payment_intent` / `hostaway_reservation` evidence. These are committed-before-statement visibility only (§6.6).
+9. A raw UPDATE racing an intent-first path can deadlock (`40P01`). The generic global maintenance path is op-first, with SKIP LOCKED.
+10. The post-snapshot race (§6.6), including newly visible protection between pre-send and invocation, and TRUST in the strict v3 and identity proofs that run in JS at transition time (§5.2, §5.3).
+11. A protected row claimed before protection became visible stays `in_flight` with an expired lease indefinitely under notification functions; it is visible only as a summary count.
+12. A trusted executor can do arbitrary work. Labels and `.invalid` do not prove a mock.
+13. The historical e74a listing-lock failure stays OPEN.
 
 **Live provider, sender identity, recipient policy, retention and copy: CLOSED.**
