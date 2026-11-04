@@ -1,6 +1,6 @@
-# E7 local connected-test RUNNER — CONTRACT, revision 6 (Slice B ACCEPTED; Slice C run-facts implemented; core NOT authorized)
+# E7 local connected-test RUNNER — CONTRACT, revision 7 (Slices A–C ACCEPTED; Slice D memory journal implemented; core NOT authorized)
 
-**Branch** `feature/e7-connected-run-facts`, cut from exact `86acc274`. Slice C adds `scripts/e7-connected/run-facts.mjs` and `test/db/e7-connected-run-facts.test.mjs`, and updates this file.
+**Branch** `feature/e7-connected-run-journal`, cut from exact `0e8bd27a`. Slice D adds `scripts/e7-connected/run-journal-memory.mjs` and `test/e7-connected-run-journal.test.mjs`, and updates this file.
 
 **Provenance:**
 - Revision 1 `36a6da15`: root DESIGN HOLD R-R1 to R-R4.
@@ -12,7 +12,8 @@
   - No provider or live readiness is implied.
 - Revision 4 `49df87b0` turned the former OPEN items A–D into one lifecycle design. Root DESIGN REVIEW **ACCEPTED** it for the bounded Slice B, with binding clarifications 1–6.
 - Revision 5 recorded the implemented Slice B. Root CODE REVIEW **HOLD** on `74e8f509` (R-B1–R-B3) was corrected at `86acc274`. Root CODE RE-REVIEW **ACCEPTED** offline Slice B at `86acc274`: root ran 31/31 focused tests and reran the three probes. `npm test` 780/780 and the old-head red / green are CLAUDE-RUN.
-- Revision 6 (this file) records the **implemented** Slice C (§2.3, §4, §5.1). `run-core` / the journal / CLI and every real connection stay **NOT authorized**.
+- Revision 6 recorded the implemented Slice C. Root CODE REVIEW **HOLD** on `e081b1e4` (R-C1, R-C2) was corrected at `0e8bd27a`. Root CODE RE-REVIEW **ACCEPTED** offline Slice C at `0e8bd27a`: root reran the probes and the extracted 18-case synthetic regression. Root could not run PG; the focused PG 14/14, units / pins 115/115, `npm test` 780/780 and the red / green are CLAUDE-RUN. `checkSameDatabase` stays a core concern.
+- Revision 7 (this file) records the **implemented** Slice D in-memory journal (§2.5, §8.2, §8.4). `run-core` / CLI / file journal and every real connection stay **NOT authorized**.
 
 All source citations are at `cc5d877d`. The runtime is unchanged since `ede4c43c`; the adapters were accepted at `b757d6b7`. Worker paths are under `lib/booking-db/`.
 
@@ -37,8 +38,9 @@ Those are independent, CLOSED slices. All owner inputs stay **UNSET**. Live gate
 | C. Outstanding work NONE / STEP / TAIL; one finalize | Design ACCEPTED; lifecycle implemented in `run-guard` | §7.3, §7.6, §2.2.3 |
 | D. Per-await ownership, late completions, lock lifecycle, precedence | Design ACCEPTED. Guard-side helpers are implemented (late client, tracker, lock release); the per-await SQL use stays in the NOT-authorized core | §7.4, §7.5, §7.7, §2.2.3, §2.2.5 |
 | `run-guard` (deadline + lifecycle + executor wrappers) | **ACCEPTED** (Slice B, root CODE re-review of `86acc274`) | §2.2, §9.1 |
-| `run-facts` (snapshot + guest read + candidate derivation) | **Implemented** (Slice C) for root CODE review | §2.3, §4, §5.1, §9.2 |
-| `run-core`, `run-journal-memory`, PG runner test | Proposed later; **not authorized** | §9.3 |
+| `run-facts` (snapshot + guest read + candidate derivation) | **ACCEPTED** (Slice C, root CODE re-review of `0e8bd27a`) | §2.3, §4, §5.1, §9.2 |
+| `run-journal-memory` (memory journal + record / chain / start validation) | **Implemented** (Slice D) for root CODE review | §2.5, §8, §9.3 |
+| `run-core`, PG runner test, file journal | Proposed later; **not authorized** | §9.4 |
 
 ## 1. Present runtime vs proposed orchestration vs simulated tests
 
@@ -492,12 +494,84 @@ Workers get `pools.app` and their accepted default timeouts. The runner does not
   finalize: () => Promise<Disposal> }   // ALWAYS present; idempotent (§7.6)
 ```
 
-### 2.5 `run-journal-memory.mjs` — PROPOSED later
+### 2.5 `run-journal-memory.mjs` — Slice D (IMPLEMENTED at this head, for root CODE review)
 
-`createMemoryJournal({ failAt?, hangAt?, lateAt?, preload? })`: an in-memory journal for offline tests.
-- It injects rejection, a hang, or a late acknowledgement after the observation deadline.
-- It can preload partial / foreign journals.
-- A file journal is a later, CLOSED slice.
+**What it is not.** An **in-memory** journal plus pure record / chain / start validation:
+- **not durable** and **not a file journal**;
+- it proves nothing about fsync, filesystem atomicity, disk durability or the absence of a late append (all CLOSED);
+- it is never a live gate, an approval or a substitute for the core's DB eligibility check.
+
+**Imports:** `node:crypto`, `node:util`, and the accepted manifest's `canonicalJson` / `CHECKPOINTS`. No timer, env, fs, network, SDK, worker or DB (source-pinned).
+
+**Getter-free inputs.** Every caller value (identity, record, records list, read result, options) is copied through **one** own-enumerable-data-descriptor snapshot before any await:
+- refused: accessors, symbols, non-enumerable / extra keys, `__proto__`, proxies (incl. revoked / throwing), exotic prototypes, sparse or patched arrays;
+- frozen and null-prototype inputs work;
+- bounds: depth 4, 24 keys, 256-element arrays (records lists ≤ `MAX_RECORDS` 1024), 256-character strings.
+
+The validated frozen copy is what is hashed, stored and returned. Callers cannot mutate stored history through their input or through read results.
+
+#### 2.5.1 Exports
+
+| Export | Contract |
+|---|---|
+| `RUN_JOURNAL_VERSION`, `RECORD_VERSION`, `JOURNAL_HASH_PREFIX`, `GENESIS_HASH` | `"e7-run-journal-v1"`, `1`, `"e7-run-journal-v1\n"`, `"0"×64` |
+| `MAX_RECORDS` / `MAX_ACTIONS` / `MAX_RAW_ACTIONS` / `MAX_REFUSALS` / `MAX_STEP` / `MAX_TOKEN_LENGTH` | 1024 / 64 / 256 / 16 / 64 / 160 |
+| `INTENT_STATES`, `OPERATION_TYPES`, `OPERATION_STATES`, `ACTION_NAMES`, `RECOVERY_EVENTS`, `READ_OUTCOMES` | The pinned grammar vocabulary (§8.2). Parity tests: intent states vs `intent-state.js STATES` + `0001:27–32`; op types vs the `0003:31–36` constraint; op states vs `0001:365–366`; recovery events ⊇ the planner's `ev("…")` |
+| `ACTION_TOKEN_RE`, `isActionToken(t)` | The whole-token grammar (anchored, never a prefix match) |
+| `EVENTS`, `TERMINAL_EVENTS`, `STEP_PHASES`, `FACTORY_PHASES`, `STEP_RESULTS`, `OUTCOMES`, `CLEANUP_KEYS`, `WRITE_KEYS`, `IDENTITY_KEYS` | The record vocabulary (§8.2) |
+| `validateIdentity(x)` | → `{ ok:true, identity }` / `{ ok:false, code:'IDENTITY_INVALID' }` |
+| `projectActions(raw)` | → `{ ok:true, actions, unlistedActions }` / `{ ok:false, code:'ACTIONS_INVALID' }`. A core helper: grammar-matching tokens are kept, at most 64; anything else is **counted, never copied** |
+| `validateRecord(x)` | → `{ ok:true, record }` / `{ ok:false, code:'RECORD_SHAPE' \| 'RECORD_FIELD_INVALID' \| 'ACTION_INVALID' }`. One record; no history checks |
+| `recordHash(record)` | `sha256(JOURNAL_HASH_PREFIX + canonicalJson(record))` (manifest canonical JSON: sorted keys) |
+| `validateJournal(records, identity, { trustedHead }?)` | → `JournalVerdict` (§8.4) |
+| `evaluateStart(readResult, identity, { trustedHead }?)` | → `StartVerdict` (§8.4) |
+| `createMemoryJournal({ identity, preload?, faults? })` | → `{ ok:true, journal, controls }` / `{ ok:false, code:'JOURNAL_OPTIONS_INVALID' \| 'IDENTITY_INVALID' }` |
+| `JournalError` | The **only** rejection reason: frozen, `message` `"JOURNAL_ERROR"`, own keys `name` and `code` only. No caller data |
+| `FAULT_MODES`, `READ_FAULT_MODES` | `reject` / `hang` / `late` / `landed_hang`; `reject` / `hang` / `torn` |
+
+#### 2.5.2 `journal` (the interface the core uses) and `controls` (TEST-ONLY)
+
+**`journal.append(record)`** → an unpatched native `Promise<frozen { seq, hash }>`, or a rejection with `JournalError(code)`.
+- **Synchronous validation** before any await, in this order:
+
+| # | Check | Code |
+|---|---|---|
+| 1 | Record shape / fields | `RECORD_INVALID` |
+| 2 | Action tokens | `ACTION_INVALID` |
+| 3 | An earlier append is unacknowledged (serial appends) | `APPEND_IN_FLIGHT` |
+| 4 | Identity ≠ the journal's | `IDENTITY_MISMATCH` |
+| 5 | Stored history does not validate | `JOURNAL_HISTORY_INVALID` |
+| 6 | `seq` ≠ stored + 1, or `prevHash` ≠ hash of the stored tail | `CHAIN_MISMATCH` |
+| 7 | After a terminal | `APPEND_AFTER_TERMINAL` |
+| 8 | Other order violation | `ORDER_INVALID` |
+| 9 | Store full | `JOURNAL_FULL` |
+
+- **Serial ordering.** While an earlier append is unacknowledged, every new append is refused. A synchronously acknowledged append stores before it returns, so a concurrent caller with the same `seq` gets `CHAIN_MISMATCH`. Two appends therefore can never reuse a `seq` / `prevHash` or bypass the one-terminal rule.
+- **No mutation on refusal.** A refusal never changes stored history.
+- **No retry, ever.** The journal never appends a terminal record of its own.
+
+**`journal.read()`** → native `Promise<frozen { records: frozen [frozen record], tail:'complete'|'torn' }>`, or a rejection with `JournalError(code)`. It returns records, not durable JSONL bytes.
+
+**Fault plan (TEST-ONLY, deterministic, keyed by call number; no timer):**
+
+| Fault | `append` behaviour |
+|---|---|
+| `reject` | `INJECTED_APPEND_FAILURE`, before anything is stored |
+| `hang` | Never stored, never settles; later appends refuse `APPEND_IN_FLIGHT` |
+| `late` | Pending until `controls.release(callNo)`, which then stores **and** acknowledges |
+| `landed_hang` | Stored immediately, never acknowledged |
+
+| Fault | `read` behaviour |
+|---|---|
+| `reject` | `INJECTED_READ_FAILURE` |
+| `hang` | Never settles |
+| `torn` | `tail: 'torn'`: a **SYNTHETIC representation** of a torn file tail. Memory records are never torn bytes |
+
+An observer whose deadline expires cannot distinguish `hang` / `late` / `landed_hang`. Its timeout is **never** evidence of absence.
+
+**`preload`** is SYNTHETIC test history (≤ 256 records): snapshotted, stored as given and not order-validated, so start / chain / identity refusals can be exercised. `append` refuses while the stored history does not validate.
+
+**`controls`**: `release(callNo) → boolean`, `appendCalls()`, `readCalls()`, `size()`. This is test-only and separate from the journal interface.
 
 ## 3. Manifest v1 and the complete worker-input map
 
@@ -955,36 +1029,65 @@ DB state is authoritative. The journal is an audit / approval binding, never a r
 
 A new manifest or runId is never authority to bypass a dispatched / unknown op or an ended run. Later action requires separately reviewed scope.
 
-### 8.2 Record
+### 8.2 Record (IMPLEMENTED in Slice D; exact keys per event, no defaults)
+
+**Common keys (every record):**
+
+| Key | Rule |
+|---|---|
+| `v` | `1` |
+| `seq` | 1 … 1024, contiguous |
+| `prevHash` | 64 hex: `GENESIS_HASH` for `seq` 1, else `recordHash(previous record)` |
+| `runId`, `intentId`, `manifestHash`, `baselineCommit` | Manifest grammar. Must equal the expected identity on **every** record |
+| `at` | Safe integer ms, supplied by the caller |
+| `event` | One of the events below |
+
+**Additional keys, exactly, per event:**
+
+| `event` | Keys |
+|---|---|
+| `RUN_STARTED` | — |
+| `ATTESTED` | `attestation: { checkpoint ∈ CHECKPOINTS, evidenceRef ^[A-Za-z0-9._:/-]{1,128}$ }` |
+| `STEP_STARTED` | `phase ∈ reservation / capture / recording / cleanup`, `step 1…64`, `factory: { phase, reservationId }`. Consistency: the factory phase matches the step phase (`reservation-recovery` counts as `reservation`); `reservation-recovery` ⇒ a `^[1-9][0-9]{0,15}$` id; `reservation` ⇒ `null` |
+| `STEP_ENDED` | `phase`, `step`, `result ∈ worked / idle / refused / rejected / timeout / observation_failed`, `state` (intent state or `null`), `actions` (≤ 64 grammar tokens), `unlistedActions` (count), `refusals` (≤ 16 `{ key, code }`, code `^[A-Z_]{1,40}$`), `writes { cancel, capture, create, record, void }` |
+| `PHASE_ENDED` | `phase`, `state` |
+| `RUN_STOPPED` | `code ^[A-Z][A-Z0-9_]{0,47}$`, `outstanding ∈ NONE / STEP / TAIL`, `effectsKnown`, `exclusion ∈ held / lost`, `ownerCleanupRequired`, `writes` |
+| `RUN_ENDED` | `outcome ∈ OUTCOMES`, `outstanding: 'NONE'`, `effectsKnown: true`, `exclusion`, `ownerCleanupRequired`, `writes` |
+
+**Order (journal-level).**
+- `RUN_STARTED` exactly first.
+- `CALENDAR_BASELINE` is attested before the first step.
+- Steps run strictly `STEP_STARTED` → `STEP_ENDED` with the same `phase` / `step`, numbered 1, 2, … per phase. No other event while a step is open, except `RUN_STOPPED` with `outstanding:'STEP'`.
+- Phases are `reservation → capture → recording`, or `reservation | capture → cleanup`. A phase change needs `PHASE_ENDED` of the current phase.
+- `AIRBNB_BLOCKED` needs reservation ended, and capture needs `AIRBNB_BLOCKED`. `AIRBNB_REOPENED` needs cleanup ended. Each checkpoint appears at most once.
+- Exactly one terminal record, which is last. Nothing after it (`APPEND_AFTER_TERMINAL`).
+- An unfinished `STEP_STARTED` is **crash evidence, never permission to resume**.
+
+**Action grammar (pinned from the accepted worker sources; whole-token, anchored).**
 
 ```
-{ v:1, seq, prevHash, runId, intentId, manifestHash, baselineCommit, at, event, phase?, step?,
-  state?, actions?: [token], refusals?: [{key, code}], writes?, factory?: {phase, reservationId|null}, attestation?: {checkpoint, evidenceRef}, code?,
-  outstanding?: "NONE"|"STEP"|"TAIL", effectsKnown?: boolean, exclusion?: "held"|"lost" }   // last three: terminal records only
+token := NAME (":" CODE){0,2} ("->" STATE)? | NAME "!" CODE
+       | "READ:" OPTYPE (":" OUTCOME)? | "READ:PI" ("!" CODE)? | "READ:" ("ID"|"LIST") ":" CODE ((":"|"!") CODE)?
+       | "READ:LEASE!" CODE | "READ!" CODE
+       | "RECOVERY:READ:" (OPTYPE | "PI") | "RECOVERY:" REVENT ("!" CODE)? | "RECOVERY:ESCALATE" (":"|"!") CODE
+       | "RECOVERY:REISSUE" ("!" CODE)? | "MAINTENANCE:" OPTYPE ":" OPSTATE
+CODE  := [A-Za-z0-9_]{1,48}      (lowercase is needed for e.g. "ASSESSED:eligible")      max token length 160
+NAME  := ACTION_NAMES (28 worker verbs)      STATE := INTENT_STATES (20)      OPTYPE := OPERATION_TYPES (13)
+OPSTATE := OPERATION_STATES (7)      REVENT := RECOVERY_EVENTS (19 planner events)      OUTCOME := found|not_found|conflict|error|lease_lost
 ```
 
-- `event` ∈ `RUN_STARTED`, `STEP_STARTED`, `STEP_ENDED`, `PHASE_ENDED`, `ATTESTED`, `RUN_STOPPED`, `RUN_ENDED`.
-- `prevHash` = sha256 of the previous record's canonical JSON, `"0"×64` for `seq` 1.
+- **Pinning.** A test extracts every whole literal pushed to `actions` by the accepted workers + `recovery.js` (template substitutions removed) and asserts it is accepted. It also checks the templated forms as built by the workers, and near-miss refusals (suffix / prefix / bad state / extra segment / spaces / length).
+- **Unknown tokens.** `projectActions` counts them, never copies them.
 
-**Action grammar (exact; anything else is counted as `unlistedActions: n`, with no content):**
+**Redaction and its limit.**
+- Only bounded ids, codes, counts, states, hashes and `evidenceRef` are representable: there is no free-text, message, reply, guest or contact field.
+- The grammar bounds **characters**. It cannot prove that an allowed reference (an `evidenceRef`, a `CODE`) holds no secret: a synthetic alphanumeric marker passes, as a test shows.
+- Callers must never put secrets into these fields.
 
-```
-token    := NAME ( ":" CODE )? ( "->" STATE )?  |  "READ:" OPTYPE ":" OUTCOME  |  "RECOVERY:READ:" OPTYPE  |  "RECOVERY:" EVENT
-NAME     := RESERVATION_STARTED | RESERVATION_DISPATCHED | CREATE_CLAIMED | RESERVATION_SUCCEEDED | CREATE_REF_NOT_ECHOED
-            | RESERVATION_OUTCOME_UNKNOWN | CAPTURE_CLAIMED | CAPTURE_SUCCEEDED | CAPTURE_OUTCOME_UNKNOWN | ASSESSED | CLAIMED
-            | COMPLETED | RECORDED | VOID_SUCCEEDED | ESCALATE | WAIT | STOP | UNKNOWN | SEND_ABORTED | LEASE_LOST
-CODE     := [A-Z0-9_]{1,40}
-STATE    := one of the 0001 intent states
-OPTYPE   := hostaway.lookup_reservation | hostaway.retrieve_reservation | stripe.retrieve_payment_intent | hostaway.list_offline_charges
-OUTCOME  := found | not_found | conflict | error | lease_lost
-EVENT    := RECONCILED_RESERVATION_FOUND | RECONCILED_CAPTURE_SUCCEEDED | RECONCILIATION_INCONCLUSIVE | ESCALATE:CODE
-```
-
-The final grammar is taken from the worker sources at implementation time and pinned by a test. Tokens are matched whole, never by prefix.
-
-**Redaction.** Allowed: ids, codes, counts, states, hashes, `evidenceRef`. Never: secrets, tokens, raw replies, error messages, guest name / e-mail / phone, card data.
-
-**Integrity.** The hash chain is integrity evidence **relative to a trusted head** (e.g. the owner records the final `seq` + hash). It is not authentication: someone who can rewrite the whole chain can forge it.
+**Integrity.**
+- The hash is `sha256(JOURNAL_HASH_PREFIX + canonicalJson(record))`. It is recomputed independently in the tests.
+- The chain is integrity evidence **relative to a trusted head** (`{ seq, hash }`), not authentication. An **unanchored** chain proves only internal consistency: a complete consistent rewrite validates without a trusted head (tested and documented).
+- Supplying the trusted head detects rewrite, truncation and deletion.
 
 ### 8.3 Crash windows (V1: none of them resumes)
 
@@ -997,26 +1100,34 @@ The final grammar is taken from the worker sources at implementation time and pi
 | Terminal append timed out (§7.7) | — | landed late → `RUN_ENDED`; never landed → `RESTART_AMBIGUOUS`; either way zero worker calls |
 | Process exits with a STEP / TAIL outstanding | worker effects may be partial | the journal has `RUN_STARTED` (+ possibly a terminal record) → `RESTART_AMBIGUOUS` / `RUN_ENDED`; no resume |
 
-### 8.4 Start / restart rule (V1)
+### 8.4 Start / restart rule (V1) — IMPLEMENTED as pure `validateJournal` / `evaluateStart` (Slice D)
 
-Before P0 work, the runner reads the journal and validates **all** records:
-- shape; `v`;
-- `seq` contiguity;
-- `prevHash` chain;
-- identical `runId`, `intentId`, `manifestHash` and `baselineCommit` throughout, equal to this manifest;
-- the event grammar and order (`RUN_STARTED` first; at most one terminal record, and it is last).
+**`validateJournal(records, identity, { trustedHead }?)`.** Priority (first failure wins):
+1. `IDENTITY_INVALID` (expected identity);
+2. `TRUSTED_HEAD_INVALID` (opts);
+3. `JOURNAL_MALFORMED` (any record's shape / fields, first bad `at` = seq position);
+4. `MANIFEST_MISMATCH` (any record's identity);
+5. `JOURNAL_CHAIN_INVALID` (`seq` contiguity / `prevHash`);
+6. `JOURNAL_MALFORMED` (event order);
+7. `TRUSTED_HEAD_MISMATCH` (`seq: 0` + `GENESIS_HASH` = "expected empty").
 
-| Journal | Result |
+On success: `{ ok:true, status: 'EMPTY' | 'IN_PROGRESS' (openStep) | 'ENDED' (terminal), head, anchored }`.
+
+**`evaluateStart(readResult, …)`** → frozen:
+
+| Journal | Verdict |
 |---|---|
-| Empty, and the intent is eligible (§6.1 P0) | Start |
-| Any acknowledged `RUN_STARTED` without a terminal record | `REFUSED: RESTART_AMBIGUOUS` |
-| A terminal record | `REFUSED: RUN_ENDED` |
-| A record for another run / intent / manifest / baseline | `REFUSED: MANIFEST_MISMATCH` |
-| Torn / unparsable last record | `REFUSED: JOURNAL_PARTIAL` |
-| Chain or seq break | `REFUSED: JOURNAL_CHAIN_INVALID` |
-| A grammar violation | `REFUSED: JOURNAL_MALFORMED` |
+| Empty | `{ ok:true, code:'EMPTY_JOURNAL', dbEligibilityRequired:true, anchored }`. The **only** start-permitting verdict, and only subject to the core's separate DB eligibility check (§6.1 P0). An empty journal alone authorizes nothing |
+| `RUN_STARTED` without a terminal record | `RESTART_AMBIGUOUS`, with `interruptedStep: true` when a step is open |
+| A terminal record | `RUN_ENDED` |
+| Torn tail (SYNTHETIC `tail:'torn'`) | `JOURNAL_PARTIAL` |
+| Another run / intent / manifest / baseline | `MANIFEST_MISMATCH` |
+| Chain or `seq` break | `JOURNAL_CHAIN_INVALID` |
+| Shape / grammar / order violation | `JOURNAL_MALFORMED` |
+| Trusted head differs | `TRUSTED_HEAD_MISMATCH` |
+| Bad expected identity / head / read result | `IDENTITY_INVALID` / `TRUSTED_HEAD_INVALID` / `READ_RESULT_INVALID` |
 
-All refusals happen with **zero** worker, transport or attest calls. No general resume exists in V1.
+All refusals happen with **zero** worker, transport or attest calls. Neither function resumes, mints a run id or key, or touches the DB.
 
 ## 9. Implementation slices
 
@@ -1066,7 +1177,7 @@ The design was accepted at `49df87b0`; the code awaits root CODE review. Root's 
 
 Run the focused unit suite and `npm test`. No DB run.
 
-### 9.2 Slice C: `run-facts` (snapshot + guest read + candidate derivation) — IMPLEMENTED at this head, for root CODE review
+### 9.2 Slice C: `run-facts` (snapshot + guest read + candidate derivation) — ACCEPTED at `0e8bd27a`
 
 **Files.** `scripts/e7-connected/run-facts.mjs`, `test/db/e7-connected-run-facts.test.mjs` (disposable local PG), and this contract.
 
@@ -1091,7 +1202,35 @@ Run the focused unit suite and `npm test`. No DB run.
 | SYNTHETIC faults | Rejection at each of the 10 statements (COMMIT included) and timeouts (BEGIN / INTENT / COMMIT): no later statement, no `release` / `end`, no message leak. Mid-sequence cap → destroy. Guard fault before the first statement → zero queries. Marker / role / malformed / foreign-id / non-result refusals |
 | Native rule | A real `pg` query promise passes `isNativePromise` |
 
-### 9.3 Later core slice (`run-core`, `run-journal-memory`, disposable-PG runner test) — NOT authorized
+### 9.3 Slice D: `run-journal-memory` (offline unit) — IMPLEMENTED at this head, for root CODE review
+
+**Files.** `scripts/e7-connected/run-journal-memory.mjs`, `test/e7-connected-run-journal.test.mjs` (14 unit tests; no DB, worker or network), and this contract.
+
+**Acceptance (all pass):**
+- Happy chain with independently recomputed heads / hashes.
+- Caller mutation resistance.
+- Every append refusal category with unchanged history.
+- Order refusals: step before baseline, second `RUN_STARTED`, capture before `AIRBNB_BLOCKED`, phase skip, `REOPENED` without cleanup, first event not `RUN_STARTED`.
+- Terminal rules: after-terminal, duplicate terminal, open step vs `RUN_ENDED` / `RUN_STOPPED`.
+- Two concurrent appends: `CHAIN_MISMATCH` / `APPEND_IN_FLIGHT`, no retry.
+- Faults through the accepted guard with fake timers: `reject`, `hang` → timeout, `late` → timeout then lands → `RUN_ENDED`, `landed_hang` → timeout while present; read `reject` / `hang` / `torn` → `JOURNAL_PARTIAL`.
+- Start verdicts, including empty ⇒ `dbEligibilityRequired` and interrupted step ⇒ `RESTART_AMBIGUOUS`.
+- Identity mismatch per field; chain / `seq` edits.
+- Complete rewrite: passes unanchored (documented limit); `TRUSTED_HEAD_MISMATCH` anchored; truncation / deletion detected.
+- Hostile descriptors: 0 caller getter / iterator / `toJSON` / trap runs. Frozen / null-prototype controls accepted.
+- Redaction: planted SYNTHETIC markers counted, never copied; grammar-limit demonstration.
+- Grammar pinned to the worker literals and vocabulary parity.
+- Purity / import pin; option validation; preload of a broken history.
+
+**Routine pure-module choices (deviations from the revision-4 proposal, for root review):**
+1. The hash carries the literal `JOURNAL_HASH_PREFIX` (the manifest's convention); §8.2 previously said the plain sha256 of canonical JSON.
+2. Added record fields: `STEP_ENDED.result` / `unlistedActions` (counted, never copied), and the terminals' `ownerCleanupRequired` / `writes` / `outcome` (`RUN_ENDED`).
+3. The action grammar is broader than the revision-4 draft, because the accepted workers emit `NAME!CODE`, `READ:ID|LIST:…`, `MAINTENANCE:…`, `HOLD:…`, `RECOVERY:REISSUE…`. It stays whole-token and character-bounded.
+4. `read()` resolves `{ records, tail }`, not a bare array, so a SYNTHETIC torn tail is expressible.
+5. `createMemoryJournal` options are `{ identity, preload, faults }`, replacing revision 4's `{ failAt, hangAt, lateAt, preload }`.
+6. `MAX_RECORDS` 1024.
+
+### 9.4 Later core slice (`run-core`, disposable-PG runner test) — NOT authorized
 
 **Proposed files:**
 - `scripts/e7-connected/run-facts.mjs`, `run-core.mjs`, `run-journal-memory.mjs`;
