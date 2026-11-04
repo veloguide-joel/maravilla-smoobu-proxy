@@ -1,0 +1,115 @@
+# E7 hosted READ-ONLY probe (doc: claude/e7-hosted-probe.md). MANUAL dispatch only; default mode `preflight` = no secrets, no provider request.
+# `execute` = exactly two read-only GETs (P-H1 listing 606998, P-S1 Stripe TEST account) — NOT AUTHORIZED until Joel approves the exact
+# filled package. Workflow inputs / labels / hashes are NOT consent. Secrets: environment `e7-readonly-probe` only, final step only.
+name: e7-readonly-probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "preflight (default: no secrets, no provider requests) or execute (NOT AUTHORIZED without Joel's explicit approval of the exact package)"
+        type: choice
+        options: [preflight, execute]
+        default: preflight
+      stripe_account_id:
+        description: "Stripe TEST account id acct_... (non-secret). Empty = labelled SYNTHETIC preflight only."
+        type: string
+        required: false
+        default: ""
+      approval_ref:
+        description: "Approval label (non-secret; a label, never consent). Required together with stripe_account_id."
+        type: string
+        required: false
+        default: ""
+      expected_plan_hash:
+        description: "execute only: exact 64-hex planHash from a REAL-plan preflight (no default)"
+        type: string
+        required: false
+        default: ""
+      expected_source_digest:
+        description: "execute only: exact accepted sourceDigest 23212caabf508f0aa929a2c3beb9f6f216b0cc3bc697cd783ba7ed203e21ce3d (no default)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e7-readonly-probe
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    if: inputs.mode == 'preflight'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout wrapper (this repository, dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout accepted E7 tooling (fixed commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: d1e20d71ecf15f82d2d3b74fd22eb562eaa310f8
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Preflight (no secrets, no provider requests)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_STRIPE_ACCOUNT_ID: ${{ inputs.stripe_account_id }}
+          E7_APPROVAL_REF: ${{ inputs.approval_ref }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+        run: node wrapper/scripts/e7-hosted-probe.mjs preflight
+
+  execute:
+    if: inputs.mode == 'execute' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: e7-readonly-probe
+    timeout-minutes: 20
+    steps:
+      - name: Checkout wrapper (this repository, dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout accepted E7 tooling (fixed commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: d1e20d71ecf15f82d2d3b74fd22eb562eaa310f8
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Verify bindings (no secrets, no provider requests)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_STRIPE_ACCOUNT_ID: ${{ inputs.stripe_account_id }}
+          E7_APPROVAL_REF: ${{ inputs.approval_ref }}
+          E7_EXPECTED_PLAN_HASH: ${{ inputs.expected_plan_hash }}
+          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+        run: node wrapper/scripts/e7-hosted-probe.mjs verify
+      - name: Execute exactly two read-only GETs (environment secrets scoped to this step only)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_STRIPE_ACCOUNT_ID: ${{ inputs.stripe_account_id }}
+          E7_APPROVAL_REF: ${{ inputs.approval_ref }}
+          E7_EXPECTED_PLAN_HASH: ${{ inputs.expected_plan_hash }}
+          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_HOSTAWAY_TOKEN: ${{ secrets.E7_HOSTAWAY_TOKEN }}
+          E7_STRIPE_TEST_KEY: ${{ secrets.E7_STRIPE_TEST_KEY }}
+        run: node wrapper/scripts/e7-hosted-probe.mjs execute
