@@ -4,7 +4,8 @@
 
 **Status.**
 - **0013 is PRESENT and accepted offline at `185da0e`** (root ruling; Claude-run local PG only).
-- **D5 / 0014 was ACCEPTED as the implementation basis at `cb532dc`** (root ruling, binding addendum A–E) and is **IMPLEMENTED offline** on `feature/e7-offline-charge-completion-binding` (pending root code review). The exact map is **§9**; addendum A supersedes the §5 rollback gate.
+- **D5 / 0014 is PRESENT and accepted offline at `bc0f93c`** (root ruling; Claude-run local PG only; the 0010–0014 foundation is accepted offline, not live). The exact map is **§9**; addendum A supersedes the §5 rollback gate.
+- **The recording worker is PROPOSED** in `claude/e74b-recording-worker-contract.md` (docs only).
 
 **Labels.**
 - **[00nn:a–b]**: source lines of `db/migrations/00nn_*.up.sql` at `185da0e`.
