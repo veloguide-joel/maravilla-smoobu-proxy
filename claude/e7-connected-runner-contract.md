@@ -1,6 +1,6 @@
-# E7 local connected-test RUNNER — CONTRACT, revision 4 (lifecycle consolidation; DOCS ONLY)
+# E7 local connected-test RUNNER — CONTRACT, revision 5 (Slice B run-guard implemented; core NOT authorized)
 
-**Branch** `feature/e7-connected-runner-lifecycle-contract`, cut from exact `cc5d877d`. Only this file changes.
+**Branch** `feature/e7-connected-run-guard`, cut from exact `49df87b0`. Slice B adds `scripts/e7-connected/run-guard.mjs` and `test/e7-connected-run-guard.test.mjs`, and updates this file.
 
 **Provenance:**
 - Revision 1 `36a6da15`: root DESIGN HOLD R-R1 to R-R4.
@@ -10,7 +10,8 @@
   - Root verified that the same frozen snapshot is validated, hashed and returned.
   - `npm test` 749/749 is **CLAUDE-RUN**, not root-run.
   - No provider or live readiness is implied.
-- Revision 4 (this file) turns the former OPEN items A–D into one implementable lifecycle design (§2, §5.3, §6.2, §7, §9, §11). It authorizes nothing: the full core stays **not authorized**, and the next proposed slice is §9.1, for root review.
+- Revision 4 `49df87b0` turned the former OPEN items A–D into one lifecycle design. Root DESIGN REVIEW **ACCEPTED** it for the bounded Slice B, with binding clarifications 1–6.
+- Revision 5 (this file) records the **implemented** Slice B API and error map (§2.2), its deviations (§2.2.6), and clarification 6 (§6.2, §7.5). `run-facts` / `run-core` / the journal / PG integration and every real connection stay **NOT authorized**.
 
 All source citations are at `cc5d877d`. The runtime is unchanged since `ede4c43c`; the adapters were accepted at `b757d6b7`. Worker paths are under `lib/booking-db/`.
 
@@ -31,10 +32,10 @@ Those are independent, CLOSED slices. All owner inputs stay **UNSET**. Live gate
 | Slice A: manifest v1 validation + canonical hash | **ACCEPTED** (root CODE review of `cc5d877d`) | §2.1, §3.1 |
 | R-R1 worker-input map, R-R2 no-resume | Accepted design basis. Runtime parts are not implemented | §3.2, §8 |
 | A. Import boundary | **CLOSED design decision** (root) | §2.0 |
-| B. Injected timer / deadline API | Resolved in this revision as a proposal | §7.2 |
-| C. Outstanding work NONE / STEP / TAIL; one finalize | Resolved in this revision as a proposal | §7.3, §7.6 |
-| D. Per-await ownership, late completions, lock lifecycle, precedence | Resolved in this revision as a proposal | §7.4, §7.5, §7.7 |
-| `run-guard` (deadline + lifecycle + executor wrappers) | **Proposed next slice** (§9.1); not implemented | §9.1 |
+| B. Injected timer / deadline API | Design ACCEPTED (`49df87b0`); implemented in `run-guard` | §7.2, §2.2.2 |
+| C. Outstanding work NONE / STEP / TAIL; one finalize | Design ACCEPTED; lifecycle implemented in `run-guard` | §7.3, §7.6, §2.2.3 |
+| D. Per-await ownership, late completions, lock lifecycle, precedence | Design ACCEPTED. Guard-side helpers are implemented (late client, tracker, lock release); the per-await SQL use stays in the NOT-authorized core | §7.4, §7.5, §7.7, §2.2.3, §2.2.5 |
+| `run-guard` (deadline + lifecycle + executor wrappers) | **Implemented** (Slice B) for root CODE review; design ACCEPTED at `49df87b0` | §2.2, §9.1 |
 | `run-facts`, `run-core`, `run-journal-memory`, PG runner test | Proposed later; **not authorized** | §9.2 |
 
 ## 1. Present runtime vs proposed orchestration vs simulated tests
@@ -135,17 +136,169 @@ The full core stays USD / non-pilot, runs on an existing authorized **synthetic*
 
 The accepted implementation has the correct checks. Root requested no snapshot export and no further mutation campaign.
 
-### 2.2 `run-guard.mjs` — PROPOSED next slice (§9.1)
+### 2.2 `run-guard.mjs` — Slice B (IMPLEMENTED at this head, for root CODE review)
 
-These are pure helpers over injected dependencies. There is no SQL text and no worker import.
+**Purity.** Pure helpers over injected dependencies.
+- Imports: exactly `node:util` and the accepted adapter's `ExecutorRefusal`.
+- No SQL text, no worker import, no client / pool / transport / env / fs / fetch / SDK, and no timer of its own. A source pin checks this.
 
-| Export | Contract |
+**Native-promise rule.**
+- Every observed promise must be a genuine native `Promise`: not a proxy, prototype exactly `Promise.prototype`, no own `then`.
+- Settlement is read only through the intrinsic `Promise.prototype.then` captured at load. A caller `then`, getter or thenable is never assimilated.
+- A function that **throws** synchronously counts as a rejection.
+- A function that **returns** a non-native value is **unobservable**, never "not started".
+- Every side handler contains its own exceptions, so no derived promise can leak an unhandled rejection.
+
+**Calling convention.** Every injected callback is called with `this === undefined`, except executor wrappers, which preserve the adapter container (below).
+
+#### 2.2.1 Exports
+
+| Export | Signature → result |
 |---|---|
-| `validateGuardDeps({ monotonic, timers })` | → `{ ok:true, deps }` / `{ ok:false, code:'GUARD_DEPS_INVALID' }` (§7.2) |
-| `createGuard(deps)` | → `{ observe, remaining, wait, armedCount }` (§7.2). `observe(deadline, start)` is the only way the core awaits anything |
-| `createLifecycle({ guard })` | The outstanding-work machine (§7.3), exclusion tracking (§7.5) and the single memoized `finalize` (§7.6). It receives the lock as an opaque handle `{ unlock(): Promise<boolean>, destroy(): void }`, built by the core, so the guard holds no SQL |
-| `wrapExecutors(executors, ledger)` | The exact-key executor wrappers (§5.3): in-flight tracking + refusal recording; the identical promise is returned |
-| `trackClient(client, onLoss)` | Attaches `error` / `end` listeners to a client the runner acquired, marking loss (§7.5) |
+| `RUN_GUARD_VERSION` | `"e7-run-guard-v1"` |
+| `MAX_DELAY_MS`, `MAX_EARLY_FIRES` | 1 800 000; 3 |
+| `LIMITS` | the frozen §7.2 limits table (`CONNECT_MS` … `ATTEST_MS`) |
+| `STEP_PHASES` | `["reservation", "capture", "recording", "cleanup"]` |
+| `isNativePromise(x)` | → boolean (the rule above) |
+| `validateGuardDeps({ monotonic, timers:{ arm } })` | → frozen `{ ok:true, deps }` / `{ ok:false, code:"GUARD_DEPS_INVALID" }`. Descriptor-only inspection: no getter, proxy, `monotonic` or `arm` call. Null-prototype objects are accepted |
+| `createGuard(deps)` | → frozen guard (§2.2.2). Throws `TypeError("GUARD_DEPS_INVALID")` unless `deps` came from `validateGuardDeps` |
+| `createLedger()` | → frozen `{ snapshot(), whenDrained() }` (§2.2.4) |
+| `wrapExecutors(executors, ledger)` | → frozen `{ ok:true, executors }` / `{ ok:false, code:"EXECUTORS_INVALID" }` (§2.2.4) |
+| `trackClient({ subscribe, unsubscribe, destroy, onLoss })` | → frozen `{ ok:true, tracker }` / `{ ok:false, code:"TRACK_INVALID" \| "TRACK_SUBSCRIBE_FAILED" }` (§2.2.5) |
+| `createLifecycle({ guard })` | → frozen lifecycle (§2.2.3). Throws `TypeError("LIFECYCLE_INVALID")` unless `guard` came from `createGuard` |
+
+#### 2.2.2 Guard
+
+**`observe(deadline, start) → Promise<frozen ObserveResult>`.**
+- `deadline` is an absolute monotonic value.
+- `start` is called **at most once**, with no arguments, and **only after the initial timer handle validated** (arm-before-start).
+
+| `kind` | Fields | Meaning |
+|---|---|---|
+| `not_started` | `started:false`, `code` | `start` was **not** called. Codes: `GUARD_BROKEN`, `GUARD_ARGUMENT_INVALID`, `GUARD_MONOTONIC_INVALID`, `EXPIRED_BEFORE_START`, `GUARD_DELAY_OUT_OF_RANGE` (`ceil(remaining)` > `MAX_DELAY_MS`), `GUARD_TIMER_INVALID` (initial `arm` threw or returned an invalid handle) |
+| `fulfilled` | `started:true`, `value`, `op` | settled within the deadline |
+| `rejected` | `started:true`, `reason`, `op` (`null` when `sync:true`), `sync` | `reason` is for the runner's own classification only; never journaled or returned by the core |
+| `timeout` | `started:true`, `op` | the monotonic deadline was reached at a timer wake. `op` is **retained** (still pending), and its late rejection is side-handled |
+| `observation_failed` | `started:true`, `code`, `op`, `opState` ∈ `pending` / `fulfilled` / `rejected` / `unobservable`, plus `value` / `reason` when settled | a **post-start** guard fault. The work is never erased or reclassified as not started, and `op` is retained. Codes: `GUARD_TIMER_INVALID` (re-arm threw or returned an invalid handle, or a 4th early fire), `GUARD_TIMER_FAILED` (timer rejected or fulfilled with a value other than `undefined`), `GUARD_MONOTONIC_INVALID` (fault after a wake), `GUARD_CANCEL_FAILED` (`cancel` threw after the op settled), `GUARD_OPERATION_NOT_NATIVE` (`start` returned a non-native value; `op:null`, `opState:"unobservable"`) |
+
+**Decision point.**
+- The guard wakes on either "op settlement recorded" or "current timer settled".
+- At that point, an op settlement **already recorded** wins. The guard does not promise to inspect settlements scheduled elsewhere in the same event-loop turn.
+- Otherwise the guard reads `monotonic()`:
+  - `≥ deadline` → `timeout`;
+  - earlier (an early fire) → re-arm `ceil(deadline − now)`, at most `MAX_EARLY_FIRES` times.
+- Only observation timers are ever re-armed. `start` is never re-invoked.
+
+**Sticky fault.** Any `GUARD_*` fault after start, an initial-arm failure, or a monotonic fault latches `broken()`. Every later `observe` / `wait` then returns `not_started: GUARD_BROKEN`. Pre-start argument / expiry refusals do not latch.
+
+**Timers.**
+- A valid handle's `cancel` is called once when its observation ends without the timer firing.
+- A fired timer is never cancelled.
+- An **invalid** handle is never used. Its `cancel` is called only if it is an own data property holding a non-proxy function. Getters are never run.
+
+**Other methods:**
+- `wait(deadline)` → `{ kind:"elapsed" }` | `not_started` | `{ kind:"observation_failed", started:false, code }`. An already reached deadline is `elapsed` without arming. The caller passes `now + min(delayMs, phaseRemaining)`.
+- `now()` → `{ ok:true, value }` | `{ ok:false, code }`.
+- `remaining(deadline)` → `{ ok:true, ms }` (fractional, may be ≤ 0) | `{ ok:false, code }`.
+- `armedCount()` → the number of live timers.
+- `cancelAll()` → `{ cancelled, failures }`.
+- `broken()` → code | `null`.
+- `cancelFailures()` → number.
+
+#### 2.2.3 Lifecycle
+
+**`observeStep({ phase, deadline, start, ledger })` → `Promise<frozen { kind, code?, value?, reason?, outstanding }>`.**
+- The kinds are as in §2.2.2. `not_started` means `start` was never called: `LIFECYCLE_ARGUMENT_INVALID`, `LIFECYCLE_BUSY` (outstanding ≠ NONE), `LIFECYCLE_FINALIZING`, or any guard pre-start code.
+- **Ownership begins before `start` runs.** The state becomes `STEP` at the instant `start` is invoked, and the returned native promise is retained, with transitions attached, before the guard observes it.
+
+**Transitions (independent of observation; they continue after a timeout or a fault):**
+- **Fulfilled:**
+  - an own data `late` holding a native promise → `TAIL` (observable);
+  - no `late` → `NONE`;
+  - an accessor / non-native `late` → `TAIL` (unobservable).
+- **Rejected:** `dbFamily = true`. Ledger `started > 0` → `TAIL` (unobservable, **forever**, even if every executor promise later settles). `started === 0` → `NONE`.
+- **Non-native step result:** `TAIL` (unobservable).
+- **Tail settles:** `NONE`. A rejecting tail also sets `dbFamily`.
+
+**`observeTail(deadline)`** → `{ kind:"settled" | "unobservable" | "timeout" | "not_started" | "observation_failed", code?, outstanding }`. It observes the **existing** `late`; no work is started.
+
+**`observeConnect(deadline, connect, destroyClient)`** → `{ kind:"fulfilled", client }` or `{ kind, code? }`.
+- After a `timeout` / post-start fault, a late client is passed to `destroyClient` **exactly once** and to nothing else: never queried, retried or reused.
+- A late rejection is swallowed, and the side promise is fully handled.
+- An in-time rejection returns `rejected`; the core maps it to the DB family.
+
+**Lock:**
+- `attachLock({ unlock, destroy })` → boolean, once. `unlock()` → native `Promise<boolean>`; `destroy()` is local destruction only.
+- `lockLost()`: `exclusion "lost"` and a local destroy **once**. It never unlocks and never implies that a step was cancelled.
+
+**Stop flags:**
+- `stop(code)` → `{ stopCode }`: the first valid code (`^[A-Z][A-Z0-9_]{0,47}$`) wins.
+- `markDbFamily()`.
+- `snapshot()` → `{ stopCode, outstanding, outstandingPhase, tailObservable, dbFamily, exclusion: "not_acquired" | "held" | "lost" | "released", exclusionLost, finalizing }`.
+
+**`finalize()`** → the **same** promise on every call (§7.6). It never rejects. Sequence:
+1. Wait for quiescence: `NONE` and every registered ledger drained. There is no deadline, so this may stay pending forever.
+2. `cancelAll()`.
+3. Release the lock:
+   - `"not_acquired"` or `"lost"` → nothing;
+   - `dbFamily` **or** `guard.broken()` → `destroy()` only (`"destroyed"`), because a broken guard cannot bound an unlock;
+   - otherwise one `observe(now + UNLOCK_MS, unlock)`:
+     - `true` → destroy → `"unlocked"`;
+     - `timeout` → destroy → `"destroyed_after_unlock_timeout"`;
+     - `false` / non-boolean / rejection → destroy → `"destroyed_after_unlock_failure"` (`false` also sets `exclusionLost`);
+     - a pre-start refusal → destroy → `"destroyed"`;
+     - the lock lost meanwhile → `"lost"`.
+4. Resolve:
+
+```js
+Object.freeze({ quiescence: "observed", lockRelease, exclusionLost, lateClientsDestroyed, timerCancelFailures, timersCancelledAtDisposal
+  /* , internalFault: true — only if an internal error was contained; the lock is then destroyed */ })
+```
+
+#### 2.2.4 Ledger and executor wrappers
+
+**Ledger:**
+- `snapshot()` → `{ started, settled, nonNative, refusals: [{ key, code }] }`, frozen.
+- `whenDrained()` → a native promise that fulfils once `settled === started`. It **never** fulfils if any call returned a non-native value.
+
+**`wrapExecutors(executors, ledger)`:**
+- Keeps the same key set, with own enumerable data properties only.
+- `label` passes through **unchanged** (`===`).
+- `pricing` becomes `{ get, post }`, each wrapped with `this` = the original `pricing` object.
+- Every other key must be a non-proxy function, wrapped with `this` = the original executors object.
+- Each call:
+  - increments `started` and calls the adapter with the **identical arguments**, which are never read;
+  - a synchronous throw is rethrown **identically**;
+  - a native result is returned as **the identical promise**, with side handlers;
+  - a non-native result is returned identically and counted in `nonNative`;
+  - `settled` is incremented **exactly once** per call.
+- **Refusal facts** are recorded code-only, and only when the error is a non-proxy object whose prototype is exactly `ExecutorRefusal.prototype` and whose own **data** property `code` matches `^[A-Z_]{1,40}$`.
+  - A forged accessor `code` is never executed.
+  - Introspection failure never replaces the primary error.
+- The wrappers grant no transport access: they wrap the accepted adapters only.
+
+#### 2.2.5 `trackClient({ subscribe, unsubscribe, destroy, onLoss })`
+
+The core supplies closures over **its** client, for example `subscribe = (ev, h) => client.on(ev, h)` and `destroy = () => client.release(true)`. This module never touches a client object.
+
+- The first `error` or `end` while open → state `"lost"`, `destroy()` **once**, then `onLoss()` once. Later events are ignored.
+- `tracker.destroy()` → `true` only for the call that destroyed. A runner-initiated destroy followed by the driver's own `end` is **not** a loss.
+- `tracker.dispose()` removes both listeners, once.
+- `tracker.state()` → `"open" | "lost" | "destroyed"`.
+- A `subscribe` throw → `TRACK_SUBSCRIBE_FAILED`, destroyed once, listeners removed.
+
+#### 2.2.6 Clarifications and deviations from the revision-4 proposal (for root review)
+
+**Deviations:**
+1. `trackClient` takes closures `{ subscribe, unsubscribe, destroy, onLoss }` rather than `(client, onLoss)`, so the guard never touches a client or relies on an EventEmitter.
+2. `observeConnect` (the late-client helper) and `createLedger` are explicit exports / methods.
+3. `wait(deadline)` takes an absolute deadline. The caller computes `min(delayMs, phaseRemaining)`.
+4. The lifecycle sets `dbFamily` itself on any step rejection or tail rejection. Every other stop cause is recorded by the core via `stop()` / `markDbFamily()`.
+5. A latched guard fault makes `finalize` destroy-only, because a broken guard cannot bound the unlock.
+6. `Disposal` adds `timersCancelledAtDisposal` (and `internalFault` only on a contained internal error).
+7. After `finalize`, `snapshot().exclusion` may be `"released"`.
+
+**Clarifications.** Root clarifications 1–5 are implemented as stated in §2.2.2–§2.2.5. Clarification 6 is in §6.2 and §7.5.
 
 ### 2.3 `run-facts.mjs` — PROPOSED later
 
@@ -345,7 +498,7 @@ A run never reports success while leaving a standing reservation or captured mon
 
 **Conservative rule.** On any STOP, `ownerCleanupRequired` is the **highest** of three keys, in the order `null` < `reservedNotConfirmed` < `captured` < `confirmed`:
 - **(i) state:** the key implied by the last acknowledged snapshot's state;
-- **(ii) dispatched writes:** the key that any write op in `dispatched` / `outcome_unknown` / `escalated` could have produced. A create gives `reservedNotConfirmed`; a capture gives `captured`; a recording gives `confirmed`;
+- **(ii) possibly applied writes:** the key that any write op could have produced if its actual facts allow an effect. That means `state` ∈ `in_flight` / `succeeded` / `outcome_unknown` / `escalated`, or `dispatched_at IS NOT NULL` in any state other than `failed_definite` / `superseded` (`0001_booking_core.up.sql:365–375`). *"dispatched" is not an `external_operations` state; accounting uses the real `state` and `dispatched_at` facts.* A create gives `reservedNotConfirmed`; a capture gives `captured`; a recording gives `confirmed`;
 - **(iii) unfinished work:** the key the outstanding or unobservable work of the current phase could have produced. If `outstanding ≠ NONE`, or the step rejected: in P2 → `reservedNotConfirmed`; in P3 → `captured`; in P4 → `confirmed`; in P5 → the P5 entry key.
 
 **When the key may be null.** Only when all of these hold:
@@ -528,7 +681,7 @@ Each row is observed with `observe` (§7.2). "Late" means a completion after the
   - an outstanding STEP / TAIL is still observed, but the run never claims that the advisory lock protects the accepted-worker effects still in progress.
   - Detection is event-based: a silent partition may go unnoticed until the unlock, which then reports `destroyed_after_unlock_failure`.
 - **Never premature.** A **healthy** lock session is never destroyed to satisfy a generic cleanup rule while a STEP / TAIL is outstanding or unobservable. It is released only by disposal after quiescence (§7.6), or by process exit.
-- **Process exit.** All accepted-worker work runs in-process. Process exit therefore ends the outstanding work and the lock session together.
+- **Process exit.** Process exit ends **local** worker execution and the lock session together. It cannot stop a provider request that was already accepted remotely, and it cannot prove that request's outcome. Such writes remain **uncertain**, as the accepted workers record them (`outcome_unknown` / recovery). No resume or retry is authorized.
 
 ### 7.6 `finalize()` — one idempotent disposal
 
@@ -540,7 +693,7 @@ Each row is observed with `observe` (§7.2). "Late" means a completion after the
    - `STEP`: wait for the retained step. If it fulfils, wait for its native `late` (if any) and for the wrapper ledger to drain. If it rejects with `started === 0`: done. If it rejects with `started > 0`: never.
    - `TAIL` (observable): wait for `late` and the ledger.
    - `TAIL` (unobservable): never.
-   - **This may remain pending forever.** There is no "abandon and unlock" escape: the lock is then released only by process exit.
+   - **This may remain pending forever.** There is no "abandon and unlock" escape: the lock is then released only by process exit, which ends local execution but not an already-accepted remote request (§7.5).
 2. **Cancel** every still-armed timer.
 3. **Release the lock.**
    - `exclusion "held"` and the run is **not** on the DB-family path: `observe(monotonic() + UNLOCK_MS, unlock)`.
@@ -676,11 +829,11 @@ All refusals happen with **zero** worker, transport or attest calls. No general 
 
 ## 9. Implementation slices
 
-### 9.1 Proposed NEXT slice — Slice B: `run-guard` (deadline + lifecycle + wrappers), unit tests only
+### 9.1 Slice B: `run-guard` (deadline + lifecycle + wrappers), unit tests only — IMPLEMENTED at this head
 
-This is for root review. It is **not implemented** and not yet authorized.
+The design was accepted at `49df87b0`; the code awaits root CODE review. Root's clarification tests were added beyond G1–W1: post-start faults, tie semantics, fractional readings, `trackClient` event orders, late-client handling, wrapper hostile / forged / late cases, no unhandled rejections, and pending-forever cases asserted after controlled fake progress.
 
-**Allowed files (proposed):**
+**Allowed files (as authorized):**
 - new `scripts/e7-connected/run-guard.mjs` (§2.2);
 - new `test/e7-connected-run-guard.test.mjs`;
 - a status pointer in this contract.
@@ -793,13 +946,13 @@ Routine technical choices (budgets, journal format, lock key, file layout) are r
 
 ## 11. Resolution of the root re-review items A–D (`08b107e4`)
 
-These replace the revision-3 OPEN list. The resolutions are proposals for the core; the core itself is still **not authorized**.
+These replace the revision-3 OPEN list. Root accepted the design at `49df87b0`; the core itself is still **not authorized**.
 
 | Item | Resolution | Status |
 |---|---|---|
 | A. Import boundary | §2.0: the four worker entrypoints + transitive dependencies, the adapters, the manifest, pure constants and Node built-ins. No new pinned-Hostaway importer, no pin / worker change, no worker injection, no copied worker code | **CLOSED** (root decision) |
-| B. Deadline wake-up | §7.2: one injected `timers.arm(delayMs) → { promise, cancel }` alongside `monotonic`. Exact validation, the arm-before-start rule, operation-beats-timer settlement, early-fire re-arm, cancellation cleanup, the inter-step wait expressed through the same API, no runner timers. Fake-timer tests G1–G9 | proposed |
-| C. STEP vs TAIL; finalize | §7.3 / §7.6: NONE / STEP / TAIL (observable or not). A retained step promise, then its `late`, then a ledger drain. One memoized, never-rejecting `finalize` that waits for quiescence with no escape and can stay pending forever. It never mutates the result, refreshes counts, retries or appends | proposed |
-| D. Ownership / late completion / lock | §7.4 table (every await), §7.5 exclusion / loss, §7.6 release paths, §7.7 priority. Late connects destroyed, never queried; bounded acquire / unlock; no runner SQL after the DB family; a healthy lock session kept while work is outstanding; lock loss reported as lost | proposed |
+| B. Deadline wake-up | §7.2: one injected `timers.arm(delayMs) → { promise, cancel }` alongside `monotonic`. Exact validation, the arm-before-start rule, operation-beats-timer settlement, early-fire re-arm, cancellation cleanup, the inter-step wait expressed through the same API, no runner timers. Fake-timer tests G1–G9 | design ACCEPTED; implemented in Slice B (§2.2) |
+| C. STEP vs TAIL; finalize | §7.3 / §7.6: NONE / STEP / TAIL (observable or not). A retained step promise, then its `late`, then a ledger drain. One memoized, never-rejecting `finalize` that waits for quiescence with no escape and can stay pending forever. It never mutates the result, refreshes counts, retries or appends | design ACCEPTED; implemented in Slice B (§2.2) |
+| D. Ownership / late completion / lock | §7.4 table (every await), §7.5 exclusion / loss, §7.6 release paths, §7.7 priority. Late connects destroyed, never queried; bounded acquire / unlock; no runner SQL after the DB family; a healthy lock session kept while work is outstanding; lock loss reported as lost | design ACCEPTED. Guard-side helpers are implemented in Slice B (§2.2); the core's SQL use is not authorized |
 
-Source citations above distinguish **accepted** code (workers, adapters, Slice A at `cc5d877d`) from **proposed** runner modules (§2.2–§2.5), none of which exist.
+Source citations above distinguish **accepted** code (workers, adapters, Slice A at `cc5d877d`) from Slice B `run-guard` (§2.2, implemented, awaiting CODE review) and the **proposed** modules (§2.3–§2.5), none of which exist.
