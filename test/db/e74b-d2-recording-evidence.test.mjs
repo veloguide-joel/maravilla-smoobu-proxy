@@ -32,10 +32,10 @@ async function capturedIntent() {
   return { ...c, listingId: f.listing_id };
 }
 /** captured + claimed initial recording (work lease held by w1); -> { c, op, t } */
-async function claimed({ at = Date.now(), leaseMs = 10 * MIN } = {}) {
+async function claimed({ at = Date.now(), leaseMs = 10 * MIN, pf } = {}) {    // E7.4b-D1 (0014): pf = optional preflight overrides (claimed method / label)
   const c = await capturedIntent();
   await db.app.query("UPDATE booking.intent_work SET work_worker_id = 'w1', work_lease_until = $2 WHERE intent_id = $1", [c.id, new Date(at + 10 * MIN)]);
-  const op = await F.claimHealthyRecording(db.app, { workerId: "w1", now: at, intentId: c.id, opTypes: OCH, leaseMs });
+  const op = await F.claimHealthyRecording(db.app, { workerId: "w1", now: at, intentId: c.id, opTypes: OCH, leaseMs, ...(pf ? { preflight: pf } : {}) });
   assert.ok(op);
   return { c, op, t: at };
 }
@@ -464,8 +464,9 @@ test("downgrade refuses while recordings are linked or progressed (no silent re-
   try {
     // E7.4b-D1 (0012): this file's healthy claims now carry real preflight assessments, so 0012 (latest) refuses FIRST (assessment audit is
     // never discarded) and nothing rolls back; the 0010 PROGRESSED gate itself is exercised in a fresh cluster by e74b-d1-assessments (D-3)
-    await assert.rejects(migrateDown(o, { env: "test", to: 9 }), /DOWNGRADE_REFUSED_RECORDING_ASSESSMENT_AUDIT/);
-    assert.deepEqual(await migrateUp(o, { env: "test" }), [13], "0013 (no 0013 audit here) rolled back first and is re-applied");
+    // E7.4b-D1 (0014): this file now holds claimed recordings that are still unlinked, so the 0014 gate (latest) refuses FIRST and nothing rolls back
+    await assert.rejects(migrateDown(o, { env: "test", to: 9 }), /DOWNGRADE_REFUSED_RECORDING_COMPLETION_BINDING/);
+    assert.deepEqual(await migrateUp(o, { env: "test" }), [], "nothing rolled back");
   } finally { await o.end(); }
   assert.ok((await db.owner.query("SELECT to_regprocedure('booking.complete_recording_with_evidence(uuid,text,uuid,text,integer)') AS f")).rows[0].f, "0010 still applied");
 });
@@ -533,9 +534,9 @@ async function scanAll(limit) {
   } while (after);
   return { all, pages };
 }
-async function ownerSucceededUnlinked(chargeId) {                                              // dispatched at F.at(9), owner-resolved succeeded, no link
+async function ownerSucceededUnlinked(chargeId, pf) {                                          // dispatched at F.at(9), owner-resolved succeeded, no link
   const c = await capturedIntent();
-  const op = await F.claimHealthyRecording(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
+  const op = await F.claimHealthyRecording(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH, ...(pf ? { preflight: pf } : {}) });
   F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(9.2), outcome: { status: "outcome_unknown" } }));
   const ev0 = await F.readEvidence(db.app, c.id, "hostaway_offline_charges", String(c.reservationId), "listed", cntOnly([chargeId]), 30);
   F.ok(await adminResolveOperation(db.reconciler, { operationId: op.id, decision: "succeeded", evidenceIds: [ev0], resultRef: Number(chargeId), resolver: "owner",
@@ -637,8 +638,15 @@ test("paymentMethod / executorAccountRef: a same-id full proof with another appr
   assert.equal((await runComplete({ paymentMethod: "other" }, "992701")).error, "RECORDING_EVIDENCE_CONFLICT", "method differs from the candidate");
   assert.equal((await runComplete({ executorAccountRef: "acct-test-2" }, "992702")).error, "RECORDING_EVIDENCE_CONFLICT", "account label differs from the candidate");
   // the candidate is the reference: the same earlier 'other' row is consistent with an 'other' candidate
+  // E7.4b-D1 (0014 / D5): the candidate must also carry the CLAIMED method, so this recording is claimed under an 'other' config (fixture
+  // value; no owner choice implied); the same 'other' candidate on a credit_card claim is the new intended D5 refusal
   {
     const { c, op, t } = await claimed();
+    await evAt(c, obs(c, "992708", { paymentMethod: "other" }), t + 1);
+    assert.deepEqual(await complete(c, op, await evAt(c, obs(c, "992708", { paymentMethod: "other" }), t + 5), "992708"), { ok: false, error: "RECORDING_CLAIM_BINDING" });
+  }
+  {
+    const { c, op, t } = await claimed({ pf: { config: { paymentMethod: "other" } } });
     await evAt(c, obs(c, "992703", { paymentMethod: "other" }), t + 1);
     assert.deepEqual(await complete(c, op, await evAt(c, obs(c, "992703", { paymentMethod: "other" }), t + 5), "992703"), { ok: true, state: "succeeded" });
   }
@@ -650,7 +658,8 @@ test("paymentMethod / executorAccountRef: a same-id full proof with another appr
     // (that refused candidate is now itself a stored full row with the other label, so this intent stays conflicted either way)
     assert.equal((await linkRecordingEvidence(db.app, op.id, { evidenceId: await evAt(c, obs(c, "992704", { executorAccountRef: "acct-test-2" }), F.at(41)) })).error,
       "RECORDING_EVIDENCE_CONFLICT");
-    const { c: cb, op: opb } = await ownerSucceededUnlinked("992707");
+    // E7.4b-D1 (0014 / D5): claimed under that label (fixture), so the equal-label candidate is also bound to the claim
+    const { c: cb, op: opb } = await ownerSucceededUnlinked("992707", { accountRef: "acct-test-2" });
     await evAt(cb, obs(cb, "992707", { executorAccountRef: "acct-test-2" }), F.at(35));
     assert.deepEqual(await linkRecordingEvidence(db.app, opb.id, { evidenceId: await evAt(cb, obs(cb, "992707", { executorAccountRef: "acct-test-2" }), F.at(40)) }),
       { ok: true, state: "linked" }, "consistent with a candidate carrying that label (equal labels prove nothing about the credential)");

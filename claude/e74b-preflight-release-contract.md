@@ -6,7 +6,7 @@
 - **0012 (slice A) is PRESENT and accepted offline** at `ff07fe8` (root ruling on `ff07fe8`; Claude-run local PG only).
 - **0013 is PRESENT and accepted offline at `185da0e`** (root ruling on `185da0e`; Claude-run local PG only); the exact map is **§13**. It is not live or payment readiness.
 - **Mutation reporting (root):** the original 33-mutant campaign killed 27; 5 survivors are redundant under the enforced writer / hold / epoch invariants (the filters and version checks are retained); G01 survived it. A SEPARATE rerun after splitting the D-13 probe killed G01 and the new G05.
-- **D5 (claim-to-confirmation binding, 0014) is PROPOSED** in `claude/e74b-completion-binding-contract.md`.
+- **D5 (claim-to-confirmation binding, 0014) is ACCEPTED as the implementation basis (root ruling on `cb532dc`, addendum A–E) and IMPLEMENTED offline** on `feature/e7-offline-charge-completion-binding` (pending root code review; map: `claude/e74b-completion-binding-contract.md` §9).
 - It **supersedes §8 of `claude/e74b-preflight-assessment-contract.md`**, which predates the real 0012.
 - It does not redesign accepted 0011 or 0012.
 

@@ -616,6 +616,8 @@ test("D-13: 0013 down with ONLY 0012 epoch-0 audit present == fresh cluster at 1
   const o = new pg.Client({ connectionString: d2.adminUrl }); await o.connect();
   const fresh = await startPostgres(); const f12 = new pg.Client({ connectionString: fresh.adminUrl }); await f12.connect();
   try {
+    // E7.4b-D1 (0014): measures 0013 itself, so 0014 (fresh cluster, no data) is rolled back first and re-applied last
+    assert.deepEqual(await migrateDown(o, { env: "test", to: 13 }), [14]);
     const at13 = await objects(o);
     // 0012-era audit present: a confirmed booking (epoch-0 preflight assessment + epoch-0 claim audit)
     const c = await F.confirmed(d2.app, { listingId: 849901, from: "2032-03-01", to: "2032-03-04" });
@@ -659,7 +661,8 @@ test("D-13: 0013 down with ONLY 0012 epoch-0 audit present == fresh cluster at 1
     await migrateUp(f12, { env: "test", to: 12 });
     assert.deepEqual(await objects(o), await objects(f12), "down 0013 == fresh cluster at 12");
     assert.equal(Number((await o.query("SELECT count(*) AS n FROM booking.recording_claim_assessments")).rows[0].n), 1, "0012 audit preserved");
-    assert.deepEqual(await migrateUp(o, { env: "test" }), [13]);
+    assert.deepEqual(await migrateUp(o, { env: "test", to: 13 }), [13]);
     assert.deepEqual(await objects(o), at13, "re-up identical");
+    assert.deepEqual(await migrateUp(o, { env: "test" }), [14]);
   } finally { await o.end(); await f12.end(); fresh.stop(); await d2.close(); }
 });

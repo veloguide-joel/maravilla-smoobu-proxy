@@ -4,7 +4,7 @@
 
 **Status.**
 - **0013 is PRESENT and accepted offline at `185da0e`** (root ruling; Claude-run local PG only).
-- **D5 / 0014 is PROPOSED** here and is not implemented.
+- **D5 / 0014 was ACCEPTED as the implementation basis at `cb532dc`** (root ruling, binding addendum A–E) and is **IMPLEMENTED offline** on `feature/e7-offline-charge-completion-binding` (pending root code review). The exact map is **§9**; addendum A supersedes the §5 rollback gate.
 
 **Labels.**
 - **[00nn:a–b]**: source lines of `db/migrations/00nn_*.up.sql` at `185da0e`.
@@ -182,3 +182,55 @@ Migrations 0001–0013 stay byte-identical.
 4. Targeted mutants.
 5. Focused + migration + offline + D1 / D2 suites, then `npm test` and `test:db`.
 6. Docs map; commit / push; one ping; stop.
+
+---
+
+## 9. Implementation map (offline, `feature/e7-offline-charge-completion-binding` from exact `cb532dc`) — IMPLEMENTED, pending root code review
+
+Root ruling on `cb532dc`: D5-a lifecycle guard, D5-b fail closed, D5-c historical owner-maintenance policy kept, D5-d no marker / table, R-D5 conditional down with the **corrected** gate (addendum A). §5's proposed gate ("in_flight or succeeded-unlinked") is **superseded** by addendum A below. Citations are to `db/migrations/0014_recording_completion_binding.{up,down}.sql` on this branch.
+
+**Files.**
+- new `0014_recording_completion_binding.up.sql` / `.down.sql` (generator `scratchpad/gen0014/gen.py`: the guard is copied from [0010:166–242] verbatim; the up inserts exactly two marked `-- 0014 (D5)` blocks; the down restores the verbatim body);
+- `lib/booking-db/repo.js`: only `RECORDING_CLAIM_BINDING` added to `DB_SAFETY_CODES`;
+- new `test/db/e74b-d1-completion-binding.test.mjs` (20 tests);
+- `test/db/fixtures.mjs` (minimum fixture options), migration / rollback regression adaptations (listed below);
+- this §9 and the four D1 status pointers.
+
+Not changed: migrations 0001–0013 (byte-identical), complete / link / admin functions and signatures / grants, runtime helpers, pure proof, planner / E3, workers / adapters, routes / UI / config / deps / lockfiles / schedules. No table added; table count unchanged (25); db-smoke unchanged.
+
+| Addendum | Implementation | Tests |
+|---|---|---|
+| A — down gate | down:9 migration-level `LOCK TABLE external_operations, recording_claim_assessments IN SHARE ROW EXCLUSIVE MODE` (fixed order, before the check; no runtime lock change); down:11–20 refuses `DOWNGRADE_REFUSED_RECORDING_COMPLETION_BINDING` for ANY recording with a claim audit and `settled_evidence_id IS NULL` (any state) OR any `in_flight` recording without an audit; linked rows may remain. **Residual:** claims made AFTER an authorized downgrade use schema-13 semantics (no binding). | D-1 (claimed in_flight, outcome_unknown, escalated [TEST SETUP state], owner-resolved succeeded-unlinked, failed_definite, unclaimed in_flight; each refusal: version / objects / data hash unchanged; allowed case == fresh 13, audit kept, identical re-up); D-2 (down WAITS on a concurrent uncommitted claim, then refuses) |
+| B — up existing-link policy | up:17 same lock before inspection; up:57–66 every linked recording WITH a claim audit is checked with the predicate in owner (NULL-worker) mode; any unbound → `MIGRATION_0014_PRECONDITION_UNBOUND_LINK`, whole up rolled back; nothing rewritten / resolved. A consistency precondition, not provenance attestation. | U-1 (unbound link at 13 → refused, version / objects / data unchanged); U-2 (matching linked audit, no-audit linked row with other labels, an unlinked claim → up == fresh 14, data unchanged); U-3 (up WAITS on a concurrent uncommitted unbound completion, then refuses) |
+| C — anchoring / NULL-safety | up:23–53 private `booking.recording_completion_binding_refusal(uuid, uuid, text)`: anchor ONLY `ca.assessment_id`; op / intent / phase / eligible / epoch / current epoch / worker relationships; cfg types + internal accountRef equality; evidence intent; then executorAccountRef = `account_ref`, paymentMethod = `cfg.paymentMethod`. Every test is `coalesce(…, false)` / `IS DISTINCT FROM`. Worker branch: NULL old lease worker → `CLAIM_WORKER`; worker passed = `OLD.lease_worker_id`. Owner branch passes NULL and exempts ONLY `NO_CLAIM_AUDIT`. No bypass flag / invented audit / substituted config. | C-2, C-5, C-5b, C-6, C-7, C-11b (every binding clause in worker AND owner mode, every cfg clause, evidence typing, BINDING_INPUT / NOT_A_RECORDING / EVIDENCE_BINDING / CLAIM_WORKER) |
+| D — guard preservation | up:69–153 = [0010:166–242] verbatim + blocks at up:101–104 (after the `owner_historical` proof, before `RETURN NEW`) and up:147–150 (after the `worker_fresh` proof). INVOKER, `search_path`, ACL, trigger unchanged. Predicate: SECURITY DEFINER, VOLATILE, fixed `search_path`, PUBLIC revoked; no lock, no clock, no claim-freshness; reads only immutable op columns (OLD state suffices in BEFORE UPDATE). | D (body minus the two blocks == fresh-13 body, block positions); C-12; C-9 (backdated assessment + audit by 3 days still completes; lease / work-lease / stale-proof refusals unchanged); C-10 |
+| E — link_full_proof / owner resolution | the owner-branch block raises inside the same statement, so `admin_resolve_recording_hold` loses its decision, link, hold release and case closure together; an op with an audit is governed after owner resolution (outcome_unknown and escalated); no-audit maintenance still needs the owner-resolved succeeded row and full `owner_historical` proof; a no-audit row that is not owner-resolved is not linkable. | C-8 (committed refusal: whole-data hash unchanged, hold active, no decision, case open; matching proof: link + decision + release + case resolved), C-8b, C-5 |
+
+**Error code.** `RECORDING_CLAIM_BINDING: <step>` (check_violation); steps `NO_CLAIM_AUDIT`, `CLAIM_AUDIT_BINDING`, `CLAIM_WORKER`, `CLAIM_CONFIG_INVALID`, `EVIDENCE_BINDING`, `EXECUTOR_ACCOUNT_MISMATCH`, `PAYMENT_METHOD_MISMATCH` (+ unreachable-through-the-guard `BINDING_INPUT`, `NOT_A_RECORDING`). Malformed / mistyped / missing D5 fields stay `RECORDING_PROOF_REFUSED` (0010 runs first; C-3).
+
+**Regression / fixture adaptations (each needed only by 0014):**
+1. `test/db/fixtures.mjs`: `preflight()` gains `accountRef` (default unchanged, applied to identity / list evidence, assessment and cfg); `claimHealthyRecording()` accepts `preflight:` overrides; `claimRecording()` a 5th `pf` argument. Defaults are byte-for-byte the previous behaviour; assessments stay real.
+2. `migrations.test.mjs`: version lists +14 and the file list +`14_recording_completion_binding` (table count unchanged).
+3. `e74b-d2-recording-evidence.test.mjs` "paymentMethod / executorAccountRef …": the 'other'-candidate positive is now claimed under an 'other' config, and the same candidate on a credit_card claim asserts the NEW intended `RECORDING_CLAIM_BINDING`; the acct-test-2 positive is claimed under acct-test-2. The downgrade test now expects the 0014 gate first (this file holds unlinked claimed recordings), nothing rolled back.
+4. `e74b-d1-owner-cases.test.mjs`: T-C9 (fresh cluster) up list `[11, 12, 13, 14]`; T-G2 (shared DB) expects the 0014 gate first, 0013 / 0012 / 0011 still applied (the lower gates stay covered in fresh clusters: T-C9, assessments D-1..D-3, release D-13).
+5. `e74b-d1-assessments.test.mjs`: A-16 measures schema 12 in a FRESH cluster (the shared DB correctly refuses 0014 down); the data clause stays on the shared DB. D-1..D-3: `[14, 13]`.
+6. `e74b-d1-release.test.mjs` D-13: 0014 rolled back first (fresh, no data), 0013 measured, re-applied to 13 then 14.
+
+**Test-design note.** A refused full proof stays stored evidence, and the unchanged D2 rule then makes any later different same-intent candidate a positive contradiction (asserted in C-2). Several candidates on ONE recording are therefore measured in rolled-back owner probes (the stored proof's `observed` patched with triggers bypassed, the real function then run with all triggers on); committed refusals are one per recording.
+
+**Verification (Claude-run, disposable local PG 16 only; full TAP kept in `scratchpad/tap14/`).**
+- focused `e74b-d1-completion-binding.test.mjs`: 20/20;
+- focused + migrations + offline-charge + D1 (assessments / owner-cases / release) + D2: 131/131;
+- `npm test`: 674/674; `test:db` (concurrency 4): 387/387 (367 + 20). No e74a guard failure occurred.
+- Migrations 0001–0013 unchanged (`git diff` empty for them).
+
+**Mutation campaigns (reported separately; no score target).**
+- **Campaign 1** (41 targeted mutants of 0014 up / down, focused file): 34 killed, 7 survived.
+- Test strengthening between campaigns (C-11b only): an anchor pointing to another recording's assessment of the SAME intent (isolates `a.operation_id = p_op`), and owner-path (`link_recording_evidence`) probes with a corrupted audit / invalid cfg (only `NO_CLAIM_AUDIT` is exempt on that path).
+- **Campaign 2** (the 7 survivors + K03 re-run, after strengthening): B02 (`a.operation_id` clause) and N03 (owner exemption widened to `CLAIM_AUDIT_BINDING`) KILLED; 6 survive.
+- **Survivors, honestly classified:** P03 / P04 (`jsonb_typeof = 'string'` before an equality with a jsonb string: equivalent), P05 (account compared with `cfg.accountRef` instead of `account_ref`: equivalent because the cfg step enforces their equality first), B01 (`a.id IS NOT NULL` under `coalesce(…, false)`: equivalent), K01 (`cfg.accountRef` typeof before equality with `to_jsonb(text)`: equivalent), K03 (`cfg.paymentMethod` typeof before `->> IN ('credit_card','other')`: equivalent — no non-string JSON value renders to those texts). The redundant typeof tests are retained deliberately (explicit, NULL-safe, cast-free).
+- Killed by target: each field comparison separately (P01, P02); anchor (A01, A02); every binding clause (B02–B09); worker (W01, W02); cfg (K02, K04); evidence (E01); missing-audit branches (N01, N02, N03, N04); each attach path (G01 worker, G02 owner / link_full_proof, G03, G04, G05); up precondition (U01, U02, U03) and lock (U04); each down clause (D01, D02 = the pre-addendum gate, D03), down lock (D04) and restore (D05).
+
+**Locks.** Runtime lock order unchanged; the predicate takes none. 0014 up / down only: `SHARE ROW EXCLUSIVE` on `external_operations` then `recording_claim_assessments`, held for the migration transaction (blocks concurrent operation / audit writes; observed as `relation` waits in U-3 / D-2).
+
+**Residual limits.** Labels remain [TRUST] (equality is not provider-account authentication); no `paymentMethod` is chosen or defaulted; claims made after an authorized downgrade use schema-13 semantics; the up precondition is consistency, not provenance; identity / cfg drift between claim and completion remains a worker-integration risk; the historical e74a guard failure remains unexplained and open. Nothing here is live or payment readiness.

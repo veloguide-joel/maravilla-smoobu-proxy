@@ -161,18 +161,18 @@ export async function readEvidenceOf(pool, readId, kind, ref, status, observed) 
  * identity + empty list evidence at caller time t). The work lease must already be held by `workerId`. -> { r, identityReadId, ... }
  */
 export async function preflight(pool, intentId, opId, { workerId = "w1", t = Date.now() - 100, outcome = "eligible", code = null, list = {},
-  identity = {}, config = {}, withList = true } = {}) {
+  identity = {}, config = {}, withList = true, accountRef = PREFLIGHT_ACCOUNT_REF } = {}) {     // E7.4b-D1 (0014): accountRef = the claimed label (fixture)
   const f = await preflightFacts(pool, intentId);
   const identityReadId = await completedRead(pool, intentId, "hostaway.retrieve_reservation", f.hostaway_reservation_id, t);
-  const identityEvidenceId = await readEvidenceOf(pool, identityReadId, "hostaway_reservation", f.hostaway_reservation_id, "found_active", identityObserved(f, identity));
+  const identityEvidenceId = await readEvidenceOf(pool, identityReadId, "hostaway_reservation", f.hostaway_reservation_id, "found_active", identityObserved(f, { executorAccountRef: accountRef, ...identity }));
   let listReadId = null; let listEvidenceId = null;
   if (withList) {
     listReadId = await completedRead(pool, intentId, "hostaway.list_offline_charges", f.hostaway_reservation_id, t);
-    listEvidenceId = await readEvidenceOf(pool, listReadId, "hostaway_offline_charges", f.hostaway_reservation_id, "listed", preflightListObserved(list));
+    listEvidenceId = await readEvidenceOf(pool, listReadId, "hostaway_offline_charges", f.hostaway_reservation_id, "listed", preflightListObserved({ executorAccountRef: accountRef, ...list }));
   }
   const r = await recordRecordingAssessment(pool, opId, { workerId, outcome, code, identityReadId, listReadId, identityEvidenceId, listEvidenceId,
-    expectedVersion: f.version, moduleVersion: PROOF_MODULE_VERSION, clientLabel: PREFLIGHT_CLIENT_LABEL, accountRef: PREFLIGHT_ACCOUNT_REF,
-    config: preflightConfig(f, config) });
+    expectedVersion: f.version, moduleVersion: PROOF_MODULE_VERSION, clientLabel: PREFLIGHT_CLIENT_LABEL, accountRef,
+    config: preflightConfig(f, { accountRef, ...config }) });
   return { r, f, identityReadId, identityEvidenceId, listReadId, listEvidenceId };
 }
 /** The pending initial recording of an intent. */
@@ -185,7 +185,8 @@ export const initialRecordingId = async (pool, intentId) => (await pool.query(
  * under a live work lease of `workerId` (set at real time if not already held, and restored afterwards so the rest of the fixture
  * is unchanged). It never bypasses or disables the fence; a fenced row still returns null.
  */
-export async function claimHealthyRecording(pool, opts) {
+export async function claimHealthyRecording(pool, allOpts) {
+  const { preflight: pf = {}, ...opts } = allOpts;                                            // E7.4b-D1 (0014): optional preflight overrides (fixture method / label)
   const { workerId, intentId } = opts;
   const prior = (await pool.query("SELECT work_worker_id, work_lease_until FROM booking.intent_work WHERE intent_id = $1", [intentId])).rows[0];
   const held = prior && prior.work_worker_id === workerId && prior.work_lease_until && new Date(prior.work_lease_until).getTime() > Date.now() + MIN;
@@ -193,7 +194,7 @@ export async function claimHealthyRecording(pool, opts) {
     await pool.query("UPDATE booking.intent_work SET work_worker_id = $2, work_lease_until = $3 WHERE intent_id = $1", [intentId, workerId, new Date(Date.now() + 10 * MIN)]);
   }
   const opId = await initialRecordingId(pool, intentId);
-  ok((await preflight(pool, intentId, opId, { workerId })).r, "eligible preflight assessment");
+  ok((await preflight(pool, intentId, opId, { ...pf, workerId })).r, "eligible preflight assessment");
   const op = await claimNextOperation(pool, opts);
   if (!held) {
     await pool.query("UPDATE booking.intent_work SET work_worker_id = $2, work_lease_until = $3 WHERE intent_id = $1",
@@ -207,10 +208,10 @@ export async function claimHealthyRecording(pool, opts) {
  * E7.4b-D1 (0012): a healthy claim first records a REAL eligible preflight assessment (fresh synthetic identity + empty list evidence)
  * through booking.record_recording_assessment; the fence is never bypassed.
  */
-export async function claimRecording(pool, c, t = Date.now(), workerId = "w1") {
+export async function claimRecording(pool, c, t = Date.now(), workerId = "w1", pf = {}) {
   await pool.query("UPDATE booking.intent_work SET work_worker_id = $2, work_lease_until = $3 WHERE intent_id = $1", [c.id, workerId, new Date(t + 10 * MIN)]);
   const opId = c.ochOpId || await initialRecordingId(pool, c.id);
-  const p = await preflight(pool, c.id, opId, { workerId, t: t - 100 });
+  const p = await preflight(pool, c.id, opId, { ...pf, workerId, t: t - 100 });
   ok(p.r, "eligible preflight assessment");
   const op = await claimNextOperation(pool, { workerId, now: t, intentId: c.id, opTypes: ["hostaway.record_offline_charge"], leaseMs: 10 * MIN });
   assert.ok(op, "recording claimable");

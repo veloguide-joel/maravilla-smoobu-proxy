@@ -895,11 +895,11 @@ test("T-C9: backfill — 0011 up (from 10) enqueues every existing offline-charg
     // written before 0012 existed; this measures the 0011 BACKFILL from 10 and is never a runtime path
     await F.ownerManagedHistory(d2.owner, "DELETE FROM booking.recording_claim_assessments");
     await F.ownerManagedHistory(d2.owner, "DELETE FROM booking.recording_assessments");
-    assert.deepEqual(await migrateDown(o, { env: "test", to: 10 }), [12, 11]);       // 0013 already rolled back by the refused attempt above
+    assert.deepEqual(await migrateDown(o, { env: "test", to: 10 }), [12, 11]);       // 0014 + 0013 already rolled back by the refused attempt above (no claimed unlinked recording)
     assert.equal((await o.query("SELECT to_regclass('booking.recording_conflict_inbox') AS t")).rows[0].t, null);
     const n = Number((await o.query("SELECT count(*) AS n FROM booking.provider_evidence WHERE kind = 'hostaway_offline_charges'")).rows[0].n);
     assert.ok(n >= 2);
-    assert.deepEqual(await migrateUp(o, { env: "test" }), [11, 12, 13]);
+    assert.deepEqual(await migrateUp(o, { env: "test" }), [11, 12, 13, 14]);
     assert.equal(Number((await o.query("SELECT count(*) AS n FROM booking.recording_conflict_inbox WHERE processed_at IS NULL")).rows[0].n), n);
     const out = await drainRecordingConflictInbox(d2.app, { by: "backfill-drain" });
     assert.ok(out.drained && out.errors.length === 0);
@@ -917,14 +917,15 @@ test("T-G2: 0011 down refuses while any hold / observation / decision or attempt
   try {
     // E7.4b-D1 (0012 / 0013): this file holds no 0013 audit, so 0013 rolls back; its healthy claims carry real 0012 assessments, so the 0012 gate
     // refuses next; the 0011 OWNER_CASE gate itself is asserted at the end of T-C9 (fresh cluster) and in e74b-d1-assessments (D-3)
-    await assert.rejects(migrateDown(o, { env: "test", to: 10 }), /DOWNGRADE_REFUSED_RECORDING_ASSESSMENT_AUDIT/);
+    // E7.4b-D1 (0014): this file now holds claimed recordings that are still unlinked, so the 0014 gate refuses FIRST and nothing rolls back;
+    // the 0013 rollback / 0012 refusal are asserted in fresh clusters (e74b-d1-release D-13, e74b-d1-assessments D-1..D-3, T-C9 above)
+    await assert.rejects(migrateDown(o, { env: "test", to: 10 }), /DOWNGRADE_REFUSED_RECORDING_COMPLETION_BINDING/);
+    assert.ok((await o.query("SELECT to_regprocedure('booking.recording_completion_binding_refusal(uuid,uuid,text)') AS f")).rows[0].f, "0014 still applied");
     assert.ok((await o.query("SELECT to_regclass('booking.recording_holds') AS t")).rows[0].t, "0011 still applied");
     assert.ok((await o.query("SELECT to_regclass('booking.recording_assessments') AS t")).rows[0].t, "0012 still applied");
-    assert.equal((await o.query(`SELECT count(*)::int AS n FROM information_schema.columns WHERE table_schema = 'booking' AND column_name = 'assessment_id'
-        AND table_name IN ('recording_holds', 'recording_hold_decisions')`)).rows[0].n, 0, "no 0013 assessment_id on the 0011 tables");
-    assert.equal((await o.query("SELECT count(*)::int AS n FROM pg_proc WHERE proname IN ('admin_release_preflight_hold', 'open_recording_preflight_hold', 'record_release_review_assessment')")).rows[0].n, 0,
-      "0013 rolled back (no 0013 audit in this file)");
-    assert.deepEqual(await migrateUp(o, { env: "test" }), [13], "re-applied");
+    assert.equal((await o.query("SELECT count(*)::int AS n FROM pg_proc WHERE proname IN ('admin_release_preflight_hold', 'open_recording_preflight_hold', 'record_release_review_assessment')")).rows[0].n, 3,
+      "0013 unchanged (refused before it)");
+    assert.deepEqual(await migrateUp(o, { env: "test" }), [], "nothing rolled back");
   } finally { await o.end(); }
 });
 
