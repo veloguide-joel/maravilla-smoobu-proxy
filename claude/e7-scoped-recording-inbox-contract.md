@@ -4,6 +4,8 @@
 
 **Labels.** Everything in §1 is **PRESENT** at `4e76227c` and cited `file:line`. Everything from §3 on is **PROPOSED**; nothing is implemented. Migrations 0001–0014 stay byte-identical.
 
+**Status (2026-11-03).** Root ACCEPTED revision 2 OFFLINE as the design at `99a78fcf`. **Implemented offline** on `feature/e7-scoped-recording-inbox` (migration 0015 + `lib/booking-db/recording-inbox.js`), pending root CODE review; implementation map **§11**. Not live readiness.
+
 **Boundaries of this document.** Read-only repository inspection only. No SQL / code / test / fixture / migration edit, no suite run, no DB / provider / credential / environment access.
 
 **Trust.** Scope is a **selection boundary, not tenant authentication**. `p_by`, account and client labels stay TRUST. The existing role grants and RLS (`mv_booking_app` / `_admin` / `_report`) remain the actual access boundary. No tenant authority, credential or account check is invented.
@@ -480,3 +482,130 @@ No schedule, cron, periodic task, route, UI, deployment, live dispatch, notifica
 No change to tenant / auth / worker scope, and no production cadence or latency promise.
 
 **Remaining blocker:** none for a docs-level review. Open residuals: D5 (the legacy processor can still mark protected-ref items, exactly as today), and the historical e74a guard failure (unrelated; stays open).
+
+## 11. Implementation map (offline; `feature/e7-scoped-recording-inbox` from exact `99a78fcf`) — pending root code review
+
+### 11.1 Files
+
+| File | Content |
+|---|---|
+| `db/migrations/0015_scoped_recording_inbox.up.sql` | §3.1–§3.7 |
+| `db/migrations/0015_scoped_recording_inbox.down.sql` | §3.8 |
+| `lib/booking-db/recording-inbox.js` | §7 |
+| `test/db/e7-scoped-recording-inbox.test.mjs` | §8 matrix; disposable PG |
+| `test/e7-scoped-recording-inbox.test.mjs` | no-PG validation / marker / outer-failure / copy tests |
+| `test/packaging-closure.test.mjs` | `BOOKING_DB_FILES` pin + `OFFLINE_ONLY` entry only |
+| `test/db/migrations.test.mjs` and the 0011–0014 migration tests | mechanical pins, §11.4 |
+
+0001–0014, workers, `operations.js`, `pool.js`, pure modules, fixtures, config, dependencies, routes and UI are unchanged.
+
+### 11.2 SQL map
+
+| Function | LANGUAGE / volatility | Security | `search_path` | Grants |
+|---|---|---|---|---|
+| `recording_protected_reservation_ids()` | sql IMMUTABLE | INVOKER | fixed | none (REVOKE PUBLIC) |
+| `recording_inbox_ref_protected(text, text)` | sql IMMUTABLE | INVOKER | fixed | none |
+| `recording_inbox_process_locked(uuid, text, integer[], uuid)` (core) | plpgsql VOLATILE | DEFINER | fixed | none |
+| `process_recording_conflict_inbox_one(text)` (legacy, `CREATE OR REPLACE`) | plpgsql VOLATILE | DEFINER | fixed | unchanged: app, admin |
+| `process_recording_conflict_inbox_scoped_one(text, integer[], uuid)` | plpgsql VOLATILE | DEFINER | fixed | app, admin |
+| `recording_inbox_page(integer[], uuid, text, bigint, integer)` | plpgsql VOLATILE | DEFINER | fixed | app, admin, report |
+| `recording_inbox_summary(integer[], uuid)` | plpgsql VOLATILE | DEFINER | fixed | app, admin, report |
+
+No table, column, index, trigger, policy or write privilege is added.
+
+**Core.** The 0011:663–717 block, generated mechanically from the 0011 file, with exactly the marked changes (a)–(d):
+- (a) the item re-read `FOR UPDATE`, outside the subtransaction;
+- (b) the scoped recheck after intent `FOR SHARE`;
+- (c) the internal success result;
+- (d) `RETURNING attempts` + the internal error result.
+
+Lock order and all hold / case / observation logic are unchanged.
+
+**Selection and recheck.** Scope (listing, optional intent), evidence binding (`ev.intent_id = q.intent_id`, kind) and BOTH protected halves are in the WHERE clause before `LIMIT` / `FOR UPDATE OF q SKIP LOCKED`. The same predicate text is used by the page and summary CTEs. The recheck uses CURRENT facts under the intent SHARE lock.
+
+**Results.**
+
+| Function | Processed | Error | Stale |
+|---|---|---|---|
+| Legacy | `{evidenceId, outcome, holdId}` | `{evidenceId, error, message}` | raises `INBOX_CORE_STALE_UNSCOPED` (XX000); unreachable |
+| Scoped | `{evidenceId, intentId, outcome, holdId}` | `{evidenceId, intentId, error: SQLSTATE, attempts}` | `{evidenceId, intentId, skipped: 'STALE_OUT_OF_SCOPE'}` |
+
+An unknown core kind in the scoped function raises `INBOX_CORE_RESULT_INVALID` (XX000).
+
+**Down.**
+1. The 0011:654–718 text restored first, with only `CREATE` → `CREATE OR REPLACE`.
+2. `DROP` in dependency order: summary, page, scoped, core, predicate, constant.
+
+**Implementation choices within the contract (labelled):**
+- (i) The page's latest-recording columns use the `recording_latest_id` ordering (0010:30–37) inline in a `LATERAL` subquery, so the whole page is ONE statement snapshot (root's consistency request) instead of a VOLATILE per-row function call. The summary is likewise one statement of CTEs.
+- (ii) Scope validation is inline, identical text, in the three public functions (no extra private helper).
+- (iii) The summary's hold / case set treats an intent with a NULL reservation as protected (fail closed). Such an intent cannot have a recording hold.
+
+### 11.3 JS map
+
+- **Validation:** per call, options are copied once (listingIds element by element) and validated with zero queries:
+  - common: options shape → env → scope (int4 `1..2147483647`, 1–50, distinct) → intentId;
+  - processor-only: `by` / `maxItems` (default 10, clamp 1–25);
+  - page-only: `status` / `after.afterSeq` decimal string ≤ 2^63−1 / `limit` (default 50, clamp 1–200).
+
+  Then the pool shape is checked, then ONE marker `SELECT`. Read APIs refuse processor keys (`OPTIONS_INVALID`).
+- **`calls`** = attempted calls (a thrown one counts); the arrays hold acknowledged replies only.
+- **Outer failure:** the original error is re-thrown with non-enumerable `scopedInboxProgress`. An unexpected reply shape is a thrown TypeError with progress.
+- **Page:** the column list selects `seq::text`; `next` is set iff `rows.length === effectiveLimit`.
+
+### 11.4 Mechanical adaptations of existing regression tests (version / down-prefix pins only; assertion and data gates preserved)
+
+| File | Assertion | Adaptation |
+|---|---|---|
+| `test/db/migrations.test.mjs` | migration file list | `+ 15_scoped_recording_inbox` |
+| same | the four full `[1..14]` up / status / CLI-`applied` arrays | `+ 15` |
+| same | every down-from-latest array | `15` prefix |
+| same | every up-to-latest array | `15` suffix |
+| `test/db/e74b-d1-assessments.test.mjs` | A-16 down to 12 / up; D-1..D-3 down to 12 | `[15, 14, 13]`; `[13, 14, 15]` |
+| `test/db/e74b-d1-release.test.mjs` | D-13 down to 13 / final up | `[15, 14]`; `[14, 15]` |
+| `test/db/e74b-d1-completion-binding.test.mjs` | U-1 / U-2 / U-3 down to 13 | `[15, 14]` |
+| same | U-2 "installs exactly a fresh 14" | explicit `to: 14` for both clusters |
+| same | D-1 / D-2 premise "schema at 14" | explicit down to 14 (`[15]`) first; D-1 re-up `to: 14` |
+| `test/db/e74b-d1-owner-cases.test.mjs` | T-C9 up from 10 | `+ 15`; comment |
+| same | T-G2 "the 0014 gate is the LATEST step; nothing rolled back" | explicit down to 14 first; "nothing rolled back" asserted with `to: 14`; then up `[15]` |
+| `test/db/e74b-d2-recording-evidence.test.mjs` | the same "latest refuses; nothing rolled back" | the same adaptation |
+
+**Why the explicit down to 14:** 0015 is ungated and each migration step is its own transaction, so a refused down from 15 would otherwise roll back 0015 before the measured gate answered.
+
+### 11.5 Results (CLAUDE-RUN, disposable local PG 16; full TAP in `scratchpad/tap-sib/`, mutants in `scratchpad/mut-sib/`)
+
+| Suite | Result |
+|---|---|
+| Scoped PG matrix `test/db/e7-scoped-recording-inbox.test.mjs` | 17/17 |
+| No-PG unit file + packaging closure | 14/14 |
+| Regressions: lifecycle rehearsal, all e74b-d1-*, e74b-d2, e74b-recording-worker, migrations, offline-charge | 160/160 |
+| `npm test` | 690/690 |
+| `npm run test:db` | 433/433 |
+
+- **Pre-adaptation run:** a full `test:db` before §11.4 had 411/433. The 22 failures were all the version pins listed there; TAP kept as `test-db-pre-adapt.tap`.
+- **e74a listing-lock guard:** passed in both runs (`ok 190`). The historical failure stays OPEN and unexplained.
+- **Targeted mutants:** 7/7 killed; the file was restored and hash-verified after each.
+
+| Mutant | Killed by |
+|---|---|
+| M1 scope-before-LIMIT removed | 9 tests |
+| M2 evidence half dropped from selection | T-R1a |
+| M3 intent half dropped from selection | T-R1d |
+| M4 in-lock recheck removed | T-R1d |
+| M5 message added to scoped projection | T-C3, T-E1 |
+| M6 page evidence half | T-R1a |
+| M7 summary evidence half | T-R1a |
+
+No surviving or redundant mutant; no broader campaign.
+
+**Probe / TEST SETUP used** (all labelled in the file):
+- the T-C7-pattern impossible-hold probe (triggers bypassed) to create a poison item;
+- `setval` above 2^53 on the disposable identity sequence;
+
+The legacy global processor is called only in the isolated parity / concurrency clusters, which hold no protected-reference item.
+
+**Residuals:**
+- D5: the legacy global processor still marks protected-reference items, exactly as before; it is never a scoped fallback.
+- No production cadence, scheduler, route or UI.
+- No exactly-once or wall-latency claim; the known wrapped-transaction / direct-UPDATE deadlock limits remain (T-C3).
+- The e74a historical failure stays open.

@@ -542,7 +542,7 @@ test("D (addendum D): the 0014 guard is the 0010 body verbatim plus exactly the 
 test("U-1 (addendum B): up refuses with MIGRATION_0014_PRECONDITION_UNBOUND_LINK when a linked CLAIMED recording carries unbound proof — schema and data untouched; never rewritten / resolved", async () => {
   const d = await startMigratedDatabase(); const o = await adminClient(d);
   try {
-    assert.deepEqual(await migrateDown(o, { env: "test", to: 13 }), [14]);
+    assert.deepEqual(await migrateDown(o, { env: "test", to: 13 }), [15, 14]);   // E7 (0015): mechanical prefix
     const at13 = await objects(o);
     const x = await claimed({ d }); const id = cid();
     assert.deepEqual(await complete(x.c, x.op.id, await evAt(x.c, obs(x.c, id, { paymentMethod: "other" }), x.t + 5, d), id, { d }), { ok: true, state: "succeeded" },
@@ -557,15 +557,15 @@ test("U-2 (addendum B): up keeps MATCHING linked audits, linked historical no-au
   const d = await startMigratedDatabase(); const o = await adminClient(d);
   const fresh = await startPostgres(); const f14 = new pg.Client({ connectionString: fresh.adminUrl }); await f14.connect();
   try {
-    assert.deepEqual(await migrateDown(o, { env: "test", to: 13 }), [14]);
+    assert.deepEqual(await migrateDown(o, { env: "test", to: 13 }), [15, 14]);   // E7 (0015): mechanical prefix
     const m = await claimed({ d }); const mid = cid();
     F.ok(await complete(m.c, m.op.id, await evAt(m.c, obs(m.c, mid), m.t + 5, d), mid, { d }));
     const n = await inheritedInFlight({ d }); const nid = cid();
     F.ok(await complete(n.c, n.opId, await evAt(n.c, obs(n.c, nid, { executorAccountRef: ACCT2, paymentMethod: "other" }), n.t + 5, d), nid, { d }), "no-audit link at 13");
     await claimed({ d });                                                                    // a claimed, still UNLINKED recording: not inspected by up
     const h0 = await dataHash(d);
-    assert.deepEqual(await migrateUp(o, { env: "test" }), [14]);
-    await migrateUp(f14, { env: "test" });
+    assert.deepEqual(await migrateUp(o, { env: "test", to: 14 }), [14]);   // E7 (0015): explicit target 14 (this test measures 0014 itself)
+    await migrateUp(f14, { env: "test", to: 14 });
     assert.deepEqual(await objects(o), await objects(f14), "== fresh cluster at 14");
     assert.equal(await dataHash(d), h0, "no link / audit rewritten");
   } finally { await o.end(); await f14.end(); fresh.stop(); await d.close(); }
@@ -574,7 +574,7 @@ test("U-2 (addendum B): up keeps MATCHING linked audits, linked historical no-au
 test("U-3 (addendum B): up vs a concurrent unbound completion — up WAITS on its migration-level table lock, then sees the committed link and refuses", async () => {
   const d = await startMigratedDatabase(); const o = await adminClient(d);
   try {
-    assert.deepEqual(await migrateDown(o, { env: "test", to: 13 }), [14]);
+    assert.deepEqual(await migrateDown(o, { env: "test", to: 13 }), [15, 14]);   // E7 (0015): mechanical prefix
     const at13 = await objects(o);
     const x = await claimed({ d }); const id = cid();
     const ev = await evAt(x.c, obs(x.c, id, { executorAccountRef: ACCT2 }), x.t + 5, d);
@@ -596,6 +596,7 @@ test("D-1 (addendum A): down refuses for each D5-governed state — claimed in_f
   const d = await startMigratedDatabase(); const o = await adminClient(d);
   const fresh = await startPostgres(); const f13 = new pg.Client({ connectionString: fresh.adminUrl }); await f13.connect();
   try {
+    assert.deepEqual(await migrateDown(o, { env: "test", to: 14 }), [15]);   // E7 (0015): explicit target 14 (this test measures the 0014 gate at 14)
     const at14 = await objects(o);
     const refuses = async (name) => {
       const h0 = await dataHash(d);
@@ -631,7 +632,7 @@ test("D-1 (addendum A): down refuses for each D5-governed state — claimed in_f
     await migrateUp(f13, { env: "test", to: 13 });
     assert.deepEqual(await objects(o), await objects(f13), "down 0014 == fresh cluster at 13 (guard body / ACL / security / search_path / triggers / all objects)");
     assert.deepEqual([(await d.owner.query("SELECT count(*)::int AS n FROM booking.recording_claim_assessments")).rows[0].n, await dataHash(d)], [auditN, h0], "data kept");
-    assert.deepEqual(await migrateUp(o, { env: "test" }), [14]);
+    assert.deepEqual(await migrateUp(o, { env: "test", to: 14 }), [14]);   // E7 (0015): explicit target 14
     assert.deepEqual(await objects(o), at14, "re-up identical");
     // failed_definite WITH audit: refuses (state-agnostic clause; this row is permanent, so it is checked last)
     const c4 = await capturedIntent(d);
@@ -649,6 +650,7 @@ test("D-1 (addendum A): down refuses for each D5-governed state — claimed in_f
 test("D-2 (addendum A): down vs a concurrent NEW claim — down WAITS on its migration-level table lock, then sees the committed claim audit and refuses", async () => {
   const d = await startMigratedDatabase(); const o = await adminClient(d);
   try {
+    assert.deepEqual(await migrateDown(o, { env: "test", to: 14 }), [15]);   // E7 (0015): explicit target 14 (this test measures the 0014 gate at 14)
     const at14 = await objects(o);
     const c = await capturedIntent(d);
     const opId = await F.initialRecordingId(d.app, c.id);

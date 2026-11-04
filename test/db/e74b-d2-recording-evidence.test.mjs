@@ -465,8 +465,11 @@ test("downgrade refuses while recordings are linked or progressed (no silent re-
     // E7.4b-D1 (0012): this file's healthy claims now carry real preflight assessments, so 0012 (latest) refuses FIRST (assessment audit is
     // never discarded) and nothing rolls back; the 0010 PROGRESSED gate itself is exercised in a fresh cluster by e74b-d1-assessments (D-3)
     // E7.4b-D1 (0014): this file now holds claimed recordings that are still unlinked, so the 0014 gate (latest) refuses FIRST and nothing rolls back
+    // E7 (0015): explicit target 14 first (function-only 0015 is ungated), so the 0014 gate is again the LATEST step, exactly as this test measures
+    assert.deepEqual(await migrateDown(o, { env: "test", to: 14 }), [15]);
     await assert.rejects(migrateDown(o, { env: "test", to: 9 }), /DOWNGRADE_REFUSED_RECORDING_COMPLETION_BINDING/);
-    assert.deepEqual(await migrateUp(o, { env: "test" }), [], "nothing rolled back");
+    assert.deepEqual(await migrateUp(o, { env: "test", to: 14 }), [], "nothing rolled back");
+    assert.deepEqual(await migrateUp(o, { env: "test" }), [15]);   // E7 (0015): restore the latest schema
   } finally { await o.end(); }
   assert.ok((await db.owner.query("SELECT to_regprocedure('booking.complete_recording_with_evidence(uuid,text,uuid,text,integer)') AS f")).rows[0].f, "0010 still applied");
 });

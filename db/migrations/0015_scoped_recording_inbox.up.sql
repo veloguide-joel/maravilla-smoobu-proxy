@@ -1,0 +1,292 @@
+-- 0015_scoped_recording_inbox (up) — Stage E7 (offline). DISPOSABLE LOCAL test databases only.
+-- Contract: claude/e7-scoped-recording-inbox-contract.md revision 2 (accepted at 99a78fcf). FUNCTIONS + GRANTS ONLY: no table, column, index,
+-- trigger or policy. Scope is a SELECTION boundary, not tenant authentication (labels stay TRUST; role grants + RLS remain the access boundary).
+--   * private protected-id constant + ONE two-reference protected predicate (intent's CURRENT reservation id, the evidence row's immutable external_ref)
+--   * private shared processing core = the 0011 processor block (0011:663–717) with exactly four marked "0015" changes
+--   * legacy process_recording_conflict_inbox_one: same signature / grant / global selection / result keys (incl. message), body = selection + core
+--   * scoped process_recording_conflict_inbox_scoped_one (app, admin): listing allowlist REQUIRED, optional intent narrowing, protected halves +
+--     evidence binding BEFORE LIMIT / locks, in-lock recheck, SQLSTATE-only errors; never falls back to the global function
+--   * read-only scoped page + summary (app, admin, report), one SQL statement each (one snapshot)
+
+DO $$
+BEGIN
+  IF to_regprocedure('booking.recording_completion_binding_refusal(uuid,uuid,text)') IS NULL THEN
+    RAISE EXCEPTION 'MIGRATION_0015_PRECONDITION: 0014 is not applied' USING ERRCODE = 'check_violation';
+  END IF;
+END $$;
+
+-- ---------------------------------------------------------------------------------------------
+-- private: the protected historical Hostaway reservation ids (pinned to JS PROTECTED_HOSTAWAY_RESERVATION_IDS by a test). No grant.
+CREATE FUNCTION booking.recording_protected_reservation_ids() RETURNS text[]
+LANGUAGE sql IMMUTABLE SECURITY INVOKER SET search_path = pg_catalog, booking AS $$
+  SELECT ARRAY['70636076', '71045356', '71072615', '71081885']::text[]
+$$;
+REVOKE ALL ON FUNCTION booking.recording_protected_reservation_ids() FROM PUBLIC;
+
+-- private: the ONE protected predicate. Inputs are the intent's CURRENT hostaway_reservation_id and the item's own evidence external_ref
+-- (immutable, 0003:73–76); never the observed JSON. A NULL intent reservation is not protected by that half; a NULL evidence ref fails closed.
+-- Never NULL. No grant.
+CREATE FUNCTION booking.recording_inbox_ref_protected(p_intent_reservation text, p_evidence_ref text) RETURNS boolean
+LANGUAGE sql IMMUTABLE SECURITY INVOKER SET search_path = pg_catalog, booking AS $$
+  SELECT coalesce(p_intent_reservation = ANY (booking.recording_protected_reservation_ids()), false)
+      OR p_evidence_ref IS NULL
+      OR p_evidence_ref = ANY (booking.recording_protected_reservation_ids())
+$$;
+REVOKE ALL ON FUNCTION booking.recording_inbox_ref_protected(text, text) FROM PUBLIC;
+
+-- ---------------------------------------------------------------------------------------------
+-- private shared core. PRECONDITION: the calling wrapper locked the pending inbox row p_evidence FOR UPDATE in this statement. p_scope IS NULL
+-- only from the legacy wrapper. Internal result: {kind:'processed', evidenceId, intentId, outcome, holdId} | {kind:'error', evidenceId, intentId,
+-- sqlstate, message, attempts} | {kind:'stale', evidenceId, intentId}. The block below is 0011:663–717 verbatim except the marked 0015 changes:
+--   (a) boundary: this private function (the selection stays in the wrappers) and the item re-read below; (b) the scoped recheck;
+--   (c) the internal success result; (d) RETURNING attempts + the internal error result. No grant.
+CREATE FUNCTION booking.recording_inbox_process_locked(p_evidence uuid, p_by text, p_scope integer[], p_scope_intent uuid) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE q booking.recording_conflict_inbox%ROWTYPE; v_op uuid; i booking.intents%ROWTYPE; o booking.external_operations%ROWTYPE;
+        h booking.recording_holds%ROWTYPE; c booking.reconciliation_cases%ROWTYPE; v_t timestamptz; v_out text; v_hold uuid; v_case uuid;
+        st text; msg text;
+        e_ref text; e_intent uuid; e_kind text; v_attempts integer;
+BEGIN
+  -- 0015 (deliberate change a): re-read the item this statement already holds FOR UPDATE (a no-op re-lock), outside the subtransaction
+  SELECT * INTO q FROM booking.recording_conflict_inbox WHERE evidence_id = p_evidence AND processed_at IS NULL FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'INBOX_ITEM_NOT_LOCKED' USING ERRCODE = 'internal_error'; END IF;
+  BEGIN
+    SELECT * INTO i FROM booking.intents WHERE id = q.intent_id FOR SHARE;
+    -- 0015 (deliberate change b): authoritative SCOPED recheck on CURRENT facts under the intent SHARE lock (legacy wrapper: p_scope IS NULL)
+    IF p_scope IS NOT NULL THEN
+      SELECT ev.external_ref, ev.intent_id, ev.kind INTO e_ref, e_intent, e_kind FROM booking.provider_evidence AS ev WHERE ev.id = q.evidence_id;
+      IF i.id IS NULL OR e_intent IS DISTINCT FROM q.intent_id OR e_kind IS DISTINCT FROM 'hostaway_offline_charges'
+         OR NOT (i.listing_id = ANY (p_scope)) OR (p_scope_intent IS NOT NULL AND i.id IS DISTINCT FROM p_scope_intent)
+         OR booking.recording_inbox_ref_protected(i.hostaway_reservation_id, e_ref) THEN
+        RETURN jsonb_build_object('kind', 'stale', 'evidenceId', q.evidence_id, 'intentId', q.intent_id);   -- no write of any kind
+      END IF;
+    END IF;
+    v_op := booking.recording_latest_id(q.intent_id);
+    IF v_op IS NOT NULL THEN SELECT * INTO o FROM booking.external_operations WHERE id = v_op FOR SHARE; END IF;
+    PERFORM pg_advisory_xact_lock(hashtext('booking.recording_evidence'), hashtext(q.intent_id::text));
+    v_t := clock_timestamp();
+    IF v_op IS NULL OR booking.recording_latest_id(q.intent_id) IS DISTINCT FROM v_op OR o.state IS DISTINCT FROM 'succeeded'
+       OR o.settled_evidence_id IS NULL OR o.result_ref IS NULL THEN
+      v_out := 'not_latest_linked';                                                          -- judged by 0010 at completion / link / finalisation
+    ELSIF NOT booking.recording_evidence_contradicts(q.intent_id, o.dispatched_at, o.result_ref, o.settled_evidence_id, q.evidence_id) THEN
+      v_out := 'consistent';
+    ELSE
+      SELECT * INTO h FROM booking.recording_holds WHERE operation_id = v_op AND released_at IS NULL FOR UPDATE;
+      SELECT * INTO c FROM booking.reconciliation_cases
+       WHERE intent_id = q.intent_id AND kind = 'OFFLINE_CHARGE_HOLD_LINKED_CONTRADICTED' AND status = 'open' FOR UPDATE;
+      v_t := clock_timestamp();
+      IF h.id IS NOT NULL AND h.reason IS DISTINCT FROM 'LINKED_CONTRADICTED' THEN
+        RAISE EXCEPTION 'HOLD_STATE_UNEXPECTED: % hold % is active on a linked recording', h.reason, h.id USING ERRCODE = 'check_violation';
+      END IF;
+      IF h.id IS NOT NULL THEN
+        v_hold := h.id;
+        IF EXISTS (SELECT 1 FROM booking.recording_hold_observations WHERE hold_id = h.id AND evidence_id = q.evidence_id) THEN
+          v_out := 'contradiction_duplicate';
+        ELSE
+          INSERT INTO booking.recording_hold_observations (id, hold_id, evidence_id, recorded_at) VALUES (gen_random_uuid(), h.id, q.evidence_id, v_t);
+          v_out := 'contradiction_appended';
+        END IF;
+      ELSE
+        v_hold := gen_random_uuid();
+        IF c.id IS NULL THEN
+          v_case := gen_random_uuid();
+          INSERT INTO booking.reconciliation_cases (id, intent_id, kind, status, opened_at, opened_by, evidence)
+          VALUES (v_case, q.intent_id, 'OFFLINE_CHARGE_HOLD_LINKED_CONTRADICTED', 'open', v_t, 'recording-hold:' || v_case::text,
+                  jsonb_build_object('operationId', v_op, 'reason', 'LINKED_CONTRADICTED', 'opKey', o.idempotency_key, 'opState', o.state,
+                                     'intentVersion', i.version, 'firstEvidenceId', q.evidence_id));
+          v_out := 'contradiction_opened';
+        ELSE
+          v_case := c.id;
+          v_out := 'contradiction_joined_case';
+        END IF;
+        INSERT INTO booking.recording_holds (id, operation_id, intent_id, reason, case_id, op_state_at_hold, op_key_at_hold, intent_state_at_hold,
+           intent_version_at_hold, created_at, created_by)
+        VALUES (v_hold, v_op, q.intent_id, 'LINKED_CONTRADICTED', v_case, o.state, o.idempotency_key, i.state, i.version, v_t, p_by);
+        INSERT INTO booking.recording_hold_observations (id, hold_id, evidence_id, recorded_at) VALUES (gen_random_uuid(), v_hold, q.evidence_id, v_t);
+      END IF;
+    END IF;
+    UPDATE booking.recording_conflict_inbox SET processed_at = v_t, outcome = v_out, hold_id = v_hold WHERE evidence_id = q.evidence_id;
+    -- 0015 (deliberate change c): internal result
+    RETURN jsonb_build_object('kind', 'processed', 'evidenceId', q.evidence_id, 'intentId', q.intent_id, 'outcome', v_out, 'holdId', v_hold);
+  EXCEPTION WHEN OTHERS THEN
+    GET STACKED DIAGNOSTICS st = RETURNED_SQLSTATE, msg = MESSAGE_TEXT;
+    UPDATE booking.recording_conflict_inbox
+       SET attempts = attempts + 1, last_error = left(st || ': ' || msg, 500), last_attempt_at = clock_timestamp()
+     WHERE evidence_id = q.evidence_id
+     RETURNING attempts INTO v_attempts;                                                       -- 0015 (deliberate change d)
+    RETURN jsonb_build_object('kind', 'error', 'evidenceId', q.evidence_id, 'intentId', q.intent_id, 'sqlstate', st, 'message', left(msg, 300),
+                              'attempts', v_attempts);
+  END;
+END $$;
+REVOKE ALL ON FUNCTION booking.recording_inbox_process_locked(uuid, text, integer[], uuid) FROM PUBLIC;
+
+-- ---------------------------------------------------------------------------------------------
+-- legacy global wrapper: same signature, owner, SECURITY DEFINER, search_path, VOLATILE and grant (0011:835 app, admin); the same validation and
+-- the same GLOBAL selection as 0011:660–662 (key only); exact legacy result keys incl. message. A stale core result is unreachable (NULL scope).
+CREATE OR REPLACE FUNCTION booking.process_recording_conflict_inbox_one(p_by text) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE v_ev uuid; r jsonb;
+BEGIN
+  IF p_by IS NULL OR length(btrim(p_by)) NOT BETWEEN 1 AND 200 THEN RAISE EXCEPTION 'INBOX_BY_INVALID' USING ERRCODE = 'invalid_parameter_value'; END IF;
+  SELECT q.evidence_id INTO v_ev FROM booking.recording_conflict_inbox AS q WHERE q.processed_at IS NULL ORDER BY q.attempts, q.seq LIMIT 1 FOR UPDATE SKIP LOCKED;
+  IF NOT FOUND THEN RETURN NULL; END IF;
+  r := booking.recording_inbox_process_locked(v_ev, p_by, NULL, NULL);
+  IF r ->> 'kind' = 'processed' THEN RETURN jsonb_build_object('evidenceId', r -> 'evidenceId', 'outcome', r -> 'outcome', 'holdId', r -> 'holdId'); END IF;
+  IF r ->> 'kind' = 'error' THEN RETURN jsonb_build_object('evidenceId', r -> 'evidenceId', 'error', r -> 'sqlstate', 'message', r -> 'message'); END IF;
+  RAISE EXCEPTION 'INBOX_CORE_STALE_UNSCOPED' USING ERRCODE = 'internal_error';
+END $$;
+REVOKE ALL ON FUNCTION booking.process_recording_conflict_inbox_one(text) FROM PUBLIC;
+
+-- ---------------------------------------------------------------------------------------------
+-- scoped one-item processor (app, admin). Distinct name, no defaults: it can never resolve to the global function. Scope + both protected halves +
+-- the evidence binding are part of the selection predicate (before LIMIT and before any lock); only the inbox row is locked here; the core
+-- re-checks current facts under the intent SHARE lock. No intent-state filter. Projection: never message / last_error / labels.
+CREATE FUNCTION booking.process_recording_conflict_inbox_scoped_one(p_by text, p_listing_ids integer[], p_intent uuid) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE v_ev uuid; r jsonb;
+BEGIN
+  IF p_by IS NULL OR length(btrim(p_by)) NOT BETWEEN 1 AND 200 THEN RAISE EXCEPTION 'INBOX_BY_INVALID' USING ERRCODE = 'invalid_parameter_value'; END IF;
+  IF p_listing_ids IS NULL OR array_ndims(p_listing_ids) IS DISTINCT FROM 1 OR cardinality(p_listing_ids) NOT BETWEEN 1 AND 50
+     OR array_position(p_listing_ids, NULL) IS NOT NULL
+     OR EXISTS (SELECT 1 FROM unnest(p_listing_ids) AS u(listing) WHERE u.listing <= 0)
+     OR (SELECT count(DISTINCT u.listing) FROM unnest(p_listing_ids) AS u(listing)) <> cardinality(p_listing_ids) THEN
+    RAISE EXCEPTION 'INBOX_SCOPE_INVALID' USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+  SELECT q.evidence_id INTO v_ev
+    FROM booking.recording_conflict_inbox AS q
+    JOIN booking.provider_evidence AS ev ON ev.id = q.evidence_id
+    JOIN booking.intents AS it ON it.id = q.intent_id
+   WHERE q.processed_at IS NULL
+       AND ev.intent_id = q.intent_id AND ev.kind = 'hostaway_offline_charges'
+       AND it.listing_id = ANY (p_listing_ids)
+       AND (p_intent IS NULL OR q.intent_id = p_intent)
+       AND NOT booking.recording_inbox_ref_protected(it.hostaway_reservation_id, ev.external_ref)
+   ORDER BY q.attempts, q.seq
+   LIMIT 1
+   FOR UPDATE OF q SKIP LOCKED;
+  IF NOT FOUND THEN RETURN NULL; END IF;
+  r := booking.recording_inbox_process_locked(v_ev, p_by, p_listing_ids, p_intent);
+  IF r ->> 'kind' = 'processed' THEN
+    RETURN jsonb_build_object('evidenceId', r -> 'evidenceId', 'intentId', r -> 'intentId', 'outcome', r -> 'outcome', 'holdId', r -> 'holdId');
+  ELSIF r ->> 'kind' = 'error' THEN
+    RETURN jsonb_build_object('evidenceId', r -> 'evidenceId', 'intentId', r -> 'intentId', 'error', r -> 'sqlstate', 'attempts', r -> 'attempts');
+  ELSIF r ->> 'kind' = 'stale' THEN
+    RETURN jsonb_build_object('evidenceId', r -> 'evidenceId', 'intentId', r -> 'intentId', 'skipped', 'STALE_OUT_OF_SCOPE');
+  END IF;
+  RAISE EXCEPTION 'INBOX_CORE_RESULT_INVALID' USING ERRCODE = 'internal_error';
+END $$;
+REVOKE ALL ON FUNCTION booking.process_recording_conflict_inbox_scoped_one(text, integer[], uuid) FROM PUBLIC;
+
+-- ---------------------------------------------------------------------------------------------
+-- read-only scoped page (app, admin, report): ONE statement (one snapshot); the same scope / protected / binding predicate before LIMIT; seq keyset
+-- (unique identity); full-microsecond UTC strings; SQLSTATE-only error code; NULL hold / case fields without a hold and NULL latest-recording
+-- fields without a recording. The latest recording uses the recording_latest_id ordering (0010:30–37) inline, so it shares the statement snapshot.
+-- CAVEAT: identity values can commit out of seq order; a lower seq can appear after a page passed it (a fresh scan sees it).
+CREATE FUNCTION booking.recording_inbox_page(p_listing_ids integer[], p_intent uuid, p_status text, p_after_seq bigint, p_limit integer)
+RETURNS TABLE (seq bigint, evidence_id uuid, intent_id uuid, listing_id integer, intent_state text, enqueued_at_exact text, db_now_exact text,
+               attempts integer, last_attempt_at_exact text, last_error_code text, processed_at_exact text, outcome text, hold_id uuid,
+               hold_reason text, hold_active boolean, case_id uuid, case_status text, latest_op_id uuid, latest_op_state text, latest_op_linked boolean,
+               evidence_source text, evidence_observed_at_exact text, evidence_read_operation_id uuid)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+#variable_conflict use_column
+DECLARE n integer;
+BEGIN
+  IF p_listing_ids IS NULL OR array_ndims(p_listing_ids) IS DISTINCT FROM 1 OR cardinality(p_listing_ids) NOT BETWEEN 1 AND 50
+     OR array_position(p_listing_ids, NULL) IS NOT NULL
+     OR EXISTS (SELECT 1 FROM unnest(p_listing_ids) AS u(listing) WHERE u.listing <= 0)
+     OR (SELECT count(DISTINCT u.listing) FROM unnest(p_listing_ids) AS u(listing)) <> cardinality(p_listing_ids) THEN
+    RAISE EXCEPTION 'INBOX_SCOPE_INVALID' USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+  IF p_status IS NULL OR p_status NOT IN ('pending', 'processed', 'all') THEN
+    RAISE EXCEPTION 'INBOX_STATUS_INVALID' USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+  IF p_after_seq IS NOT NULL AND p_after_seq <= 0 THEN RAISE EXCEPTION 'INBOX_CURSOR_INVALID' USING ERRCODE = 'invalid_parameter_value'; END IF;
+  n := greatest(1, least(200, coalesce(p_limit, 50)));
+  RETURN QUERY
+    WITH s AS (
+      SELECT q.seq, q.evidence_id, q.intent_id, it.listing_id, it.state AS intent_state, q.enqueued_at, q.attempts, q.last_attempt_at, q.last_error,
+             q.processed_at, q.outcome, q.hold_id, ev.source, ev.observed_at, ev.read_operation_id
+        FROM booking.recording_conflict_inbox AS q
+        JOIN booking.provider_evidence AS ev ON ev.id = q.evidence_id
+        JOIN booking.intents AS it ON it.id = q.intent_id
+       WHERE TRUE
+       AND ev.intent_id = q.intent_id AND ev.kind = 'hostaway_offline_charges'
+       AND it.listing_id = ANY (p_listing_ids)
+       AND (p_intent IS NULL OR q.intent_id = p_intent)
+       AND NOT booking.recording_inbox_ref_protected(it.hostaway_reservation_id, ev.external_ref)
+         AND (p_status = 'all' OR (p_status = 'pending' AND q.processed_at IS NULL) OR (p_status = 'processed' AND q.processed_at IS NOT NULL))
+         AND (p_after_seq IS NULL OR q.seq > p_after_seq)
+       ORDER BY q.seq
+       LIMIT n)
+    SELECT s.seq, s.evidence_id, s.intent_id, s.listing_id, s.intent_state::text, to_char(s.enqueued_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'), to_char(statement_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+           s.attempts, to_char(s.last_attempt_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'), left(s.last_error, 5), to_char(s.processed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'), s.outcome, s.hold_id,
+           h.reason::text, CASE WHEN h.id IS NULL THEN NULL ELSE h.released_at IS NULL END, h.case_id, cs.status::text,
+           lo.id, lo.state::text, CASE WHEN lo.id IS NULL THEN NULL ELSE lo.settled_evidence_id IS NOT NULL END,
+           s.source::text, to_char(s.observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'), s.read_operation_id
+      FROM s
+      LEFT JOIN booking.recording_holds AS h ON h.id = s.hold_id
+      LEFT JOIN booking.reconciliation_cases AS cs ON cs.id = h.case_id
+      LEFT JOIN LATERAL (
+        SELECT o.id, o.state, o.settled_evidence_id FROM booking.external_operations AS o
+         WHERE o.intent_id = s.intent_id AND o.op_type = 'hostaway.record_offline_charge'
+         ORDER BY booking.recording_attempt_no(o.idempotency_key) DESC NULLS LAST, o.created_at DESC, o.id DESC LIMIT 1) AS lo ON TRUE
+     ORDER BY s.seq;
+END $$;
+REVOKE ALL ON FUNCTION booking.recording_inbox_page(integer[], uuid, text, bigint, integer) FROM PUBLIC;
+
+-- read-only scoped summary (app, admin, report): ONE statement. Item counts from the scoped ITEMS (same predicate as the page / processor);
+-- holds / cases counted DISTINCT from their own scoped sets (in-scope, intent-non-protected intents; an intent with a NULL reservation counts as
+-- protected here: fail closed, and it cannot have a recording hold), never by joining items. Empty scope result: zero counts, NULL max / oldest.
+CREATE FUNCTION booking.recording_inbox_summary(p_listing_ids integer[], p_intent uuid) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE r jsonb;
+BEGIN
+  IF p_listing_ids IS NULL OR array_ndims(p_listing_ids) IS DISTINCT FROM 1 OR cardinality(p_listing_ids) NOT BETWEEN 1 AND 50
+     OR array_position(p_listing_ids, NULL) IS NOT NULL
+     OR EXISTS (SELECT 1 FROM unnest(p_listing_ids) AS u(listing) WHERE u.listing <= 0)
+     OR (SELECT count(DISTINCT u.listing) FROM unnest(p_listing_ids) AS u(listing)) <> cardinality(p_listing_ids) THEN
+    RAISE EXCEPTION 'INBOX_SCOPE_INVALID' USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+  WITH si AS (
+    SELECT q.processed_at, q.attempts, q.enqueued_at, q.outcome
+      FROM booking.recording_conflict_inbox AS q
+      JOIN booking.provider_evidence AS ev ON ev.id = q.evidence_id
+      JOIN booking.intents AS it ON it.id = q.intent_id
+     WHERE TRUE
+       AND ev.intent_id = q.intent_id AND ev.kind = 'hostaway_offline_charges'
+       AND it.listing_id = ANY (p_listing_ids)
+       AND (p_intent IS NULL OR q.intent_id = p_intent)
+       AND NOT booking.recording_inbox_ref_protected(it.hostaway_reservation_id, ev.external_ref)),
+  sin AS (
+    SELECT it.id FROM booking.intents AS it
+     WHERE it.listing_id = ANY (p_listing_ids) AND (p_intent IS NULL OR it.id = p_intent)
+       AND NOT booking.recording_inbox_ref_protected(it.hostaway_reservation_id, it.hostaway_reservation_id)),
+  agg AS (
+    SELECT count(*) FILTER (WHERE si.processed_at IS NULL) AS pending,
+           count(*) FILTER (WHERE si.processed_at IS NULL AND si.attempts > 0) AS pending_err,
+           max(si.attempts) FILTER (WHERE si.processed_at IS NULL) AS max_att,
+           min(si.enqueued_at) FILTER (WHERE si.processed_at IS NULL) AS oldest
+      FROM si),
+  byo AS (
+    SELECT jsonb_object_agg(k.outcome, (SELECT count(*) FROM si WHERE si.outcome = k.outcome)) AS m
+      FROM unnest(ARRAY['not_latest_linked', 'consistent', 'contradiction_opened', 'contradiction_joined_case', 'contradiction_appended',
+                        'contradiction_duplicate']) AS k(outcome)),
+  hc AS (
+    SELECT count(DISTINCT h.id) AS n FROM booking.recording_holds AS h JOIN sin ON sin.id = h.intent_id
+     WHERE h.reason = 'LINKED_CONTRADICTED' AND h.released_at IS NULL),
+  cc AS (
+    SELECT count(DISTINCT c.id) AS n FROM booking.reconciliation_cases AS c JOIN sin ON sin.id = c.intent_id
+     WHERE starts_with(c.kind, 'OFFLINE_CHARGE_HOLD_') AND c.status = 'open')
+  SELECT jsonb_build_object('pendingItems', agg.pending, 'pendingItemsWithErrors', agg.pending_err, 'maxPendingAttempts', agg.max_att,
+           'oldestPendingEnqueuedAtExact', to_char(agg.oldest AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'), 'processedItemsByOutcome', byo.m,
+           'activeLinkedContradictedHolds', hc.n, 'openHoldCases', cc.n, 'dbNowExact', to_char(statement_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'))
+    INTO r FROM agg, byo, hc, cc;
+  RETURN r;
+END $$;
+REVOKE ALL ON FUNCTION booking.recording_inbox_summary(integer[], uuid) FROM PUBLIC;
+
+-- ---------------------------------------------------------------------------------------------
+-- grants (EXECUTE only; no write privilege; private helpers / core: none)
+GRANT EXECUTE ON FUNCTION booking.process_recording_conflict_inbox_scoped_one(text, integer[], uuid) TO mv_booking_app, mv_booking_admin;
+GRANT EXECUTE ON FUNCTION booking.recording_inbox_page(integer[], uuid, text, bigint, integer) TO mv_booking_app, mv_booking_admin, mv_booking_report;
+GRANT EXECUTE ON FUNCTION booking.recording_inbox_summary(integer[], uuid) TO mv_booking_app, mv_booking_admin, mv_booking_report;
