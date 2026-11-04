@@ -1498,7 +1498,7 @@ Why the two survivors are equivalent:
 - TAP is in the session scratchpad: `gnf/tap/rc-*.tap`, `e72-adapt-*.tap`; per-mutant `gnf/mut/M28–M35.tap`.
 - **Deviation 1 of §15.6 is superseded.** The observation functions stay VOLATILE, and consistency now comes from the enforced READ ONLY REPEATABLE READ caller transaction, not from a STABLE label.
 
-## 16. Stage 2 implementation map (OFFLINE / INJECTED MOCK; root ACCEPT of `35097c56` as Stage 1 + Stage 2 authorization; pending root CODE review)
+## 16. Stage 2 implementation map (OFFLINE / INJECTED MOCK; root ACCEPT of `35097c56` as Stage 1 + Stage 2 authorization; root CODE HOLD on `44e8d0a8` → gate correction R-G1 in §16.6; pending root CODE re-review)
 
 **Branch** `feature/e7-guest-notification-worker`, cut from exact `35097c56518ff6ca922d8698ff93a5b7248cfce9`. Stage 1 code acceptance is not merge / deploy / live authorization; this stage adds no route, scheduler, runner, adapter, config, dependency or UI.
 
@@ -1533,7 +1533,7 @@ Fixed budgets (`NOTIFICATION_LIMITS`, not configurable): maintenance batch 5; ON
 
 | # | Phase | Calls | Outcome / error |
 |---|---|---|---|
-| 0 | gate (pure) | none — **zero queries** | `OPTIONS_INVALID` (exact keys, own enumerable DATA properties, no accessor ever invoked; workerId / scope / intent / sender / executor label / clock / hooks) or `ENV_REFUSED`. Basis deep-frozen copy before any await |
+| 0 | gate (pure) | none — **zero queries** | `OPTIONS_INVALID` (exact keys; own, string-keyed, enumerable DATA properties from ONE descriptor snapshot per object into a null-prototype copy; `__proto__` keys refused; `listingIds` copied from its descriptors as a dense ordinary array, see §16.6; no ordinary getter / iterator / caller method invoked; introspection errors caught at the gate only; workerId / scope / intent / sender / executor label / clock / hooks) or `ENV_REFUSED`. Basis deep-frozen copy before any await |
 | 1 | marker | `SELECT environment FROM booking.instance` (ONE) | wrong / absent → `DATABASE_NOT_TEST`; a thrown error propagates as the same object, nothing follows |
 | 2 | skew | `SELECT clock_timestamp()` | `CLOCK_SKEW` |
 | 3 | maintenance | `recover_expired_notifications(scope, intent, 5)` | scoped, notification-only; never a generic helper or inbox drain |
@@ -1585,3 +1585,38 @@ TAP (session scratchpad): `gnf/tap/s2-*.tap`; per-mutant `gnf/mut2/W01–W25.tap
 2. `afterSend` / settlement-time protection means a mock invocation already happened; the DB stays unchanged (`PROTECTED`), the row stays `in_flight` and is summary-visible only (§14 item 11).
 3. The executor is trusted injected code; `mock-` labels / ids and `.invalid` addresses are restrictions and correlation, not authentication.
 4. Copy, sender, recipient policy, retention, provider and every live gate remain CLOSED. The historical e74a listing-lock failure stays OPEN.
+
+### 16.6 Root CODE HOLD on `44e8d0a8` — R-G1 gate validation correction (same branch, gate / data-copy helpers only; pending root CODE re-review)
+
+**Change (`notification-worker.js`, gate helpers only).** Invocation, observation, settlement, the pure message module, SQL and every other file are unchanged.
+- `dataProps`: ONE `Object.getOwnPropertyDescriptors` read; only own, string-keyed, enumerable DATA properties qualify; a `__proto__` key refuses; values go into an `Object.create(null)` accumulator, so no key can vanish into, or be served from, a scratch prototype. `hooks` is kept as a frozen null-prototype copy.
+- `denseArrayCopy(listingIds, 50)`: ordinary `Array.prototype` array; ONE descriptor snapshot; data `length` 1–50; exactly the keys `0…length-1` plus `length`; every index an enumerable DATA descriptor. Values are copied from the descriptors into a fresh frozen array; range (positive int4) and distinctness are then checked on that copy, which is exactly what the basis keeps. No element access, iterator or caller method runs.
+- `notificationWorkerGate` wraps ONLY the option introspection / validation (`gateUnsafe`) in a catch → `OPTIONS_INVALID`. The caller's error is never returned or rethrown. Nothing inside touches the pool; marker / observation / settlement / release errors are outside it and still propagate as the identical object (asserted).
+- Proxy traps necessarily run when inspected; ordinary getters / iterators do not.
+
+**Root probes (`gnf/rg1/probe.mjs`, the same probes against the exact `44e8` module and the fix):**
+
+| Probe | `44e8d0a8` | Fix |
+|---|---|---|
+| 1. `listingIds=[1]` with an enumerable accessor at `'0'` | ACCEPTED; getter ran 3 times | `OPTIONS_INVALID`; 0 runs |
+| 2. own `Symbol.iterator` yielding 2 | ACCEPTED; `basis.listingIds = [2]` (validated `[1]`) | `OPTIONS_INVALID`; 0 runs |
+| 3. own enumerable DATA `__proto__` on opts | ACCEPTED (key disappeared) | `OPTIONS_INVALID` |
+| 4. Proxy whose `getPrototypeOf` throws | threw the caller's error object | `OPTIONS_INVALID` |
+
+**Tests (`test/e7-guest-notification.test.mjs`, +7).** Every hostile case asserts `OPTIONS_INVALID` from the gate (which never throws, code-only) AND from the step, with zero pool / connect / executor calls and zero getter / iterator runs:
+- the four probes; `__proto__` on opts, env, sender, executors, hooks, plus required keys supplied only through `__proto__`;
+- throwing `getPrototypeOf` / `ownKeys` / `getOwnPropertyDescriptor` traps and revoked proxies at opts, env, sender, executors, hooks and listingIds (24 cases);
+- listingIds: changing getter, holes, trailing hole via `length`, non-enumerable index, non-enumerable accessor index, custom `.some` (enumerable and not), non-enumerable iterator, symbol key, extra string key, Array subclass, null-prototype array, array-like object, length 51, empty;
+- valid controls: dense frozen array, null-prototype config at every level (both run a full step to `accepted`); copied basis equals the validated data; mutation after the gate changes nothing;
+- boundary control: a marker error after a valid gate still propagates as the identical object with no follow-up.
+
+**Red / green (CLAUDE-RUN).** The new unit file against the exact `44e8` worker: 20 pass / 6 fail (the 5 hostile groups, plus the valid-control test, which also asserts the new null-prototype `hooks` copy). Against the fix: 26 / 26.
+
+| Run | Result |
+|---|---|
+| Focused unit + packaging | 34 / 34 |
+| `npm test` | **721 / 721** (714 + 7) |
+| PG worker `test/db/e7-guest-notification-worker.test.mjs` (valid-caller compatibility) | 12 / 12 |
+
+`test:db`, Stage 1 / SQL regressions and W01–W25 were not rerun (not affected; root said no repeat campaign). TAP: `gnf/tap/rg1-*.tap`; probes `gnf/rg1/probe-out.txt`.
+

@@ -424,3 +424,118 @@ test("timeout: ONE bounded call aborted at the fixed send timeout → unknown SE
   assert.deepEqual({ ...late }, { kind: "late_reply", classified: "accepted" });
   assert.equal(pool.log.length, n, "no query after the late reply");
 });
+
+// ---------------------------------------------------------------------------------------------
+// R-G1 (root CODE HOLD on 44e8d0a8): the gate copies exactly the DATA it validates; hostile option data is OPTIONS_INVALID, zero calls.
+
+/** run one hostile option set through the gate AND the step: structured refusal, zero pool / connect / executor calls */
+async function refusedQuietly(make, label) {
+  const snk = sink(); const pool = scriptedPool();
+  let g;
+  assert.doesNotThrow(() => { g = notificationWorkerGate(make(snk)); }, `${label}: the gate never throws`);
+  assert.deepEqual({ ...g }, { ok: false, code: "OPTIONS_INVALID" }, label);
+  assert.ok(Object.isFrozen(g) && Object.keys(g).length === 2, `${label}: code-only refusal (no caller error leaked)`);
+  const r = await runNotificationStep(pool, make(snk));
+  assert.deepEqual({ ...r }, { ok: false, code: "OPTIONS_INVALID" }, label);
+  assert.equal(pool.log.length, 0, `${label}: zero pool / connect calls`);
+  assert.equal(snk.count, 0, `${label}: zero executor calls`);
+}
+const withIds = (ids) => (snk) => opts(snk, { listingIds: ids() });
+
+test("R-G1 root probe 1: an enumerable accessor at index '0' is refused and NEVER invoked", async () => {
+  let runs = 0;
+  const ids = () => { const a = [1]; Object.defineProperty(a, "0", { get() { runs += 1; return 1; }, enumerable: true, configurable: true }); return a; };
+  await refusedQuietly(withIds(ids), "index accessor");
+  assert.equal(runs, 0, "getter never ran (44e8: 3 runs, accepted)");
+});
+
+test("R-G1 root probe 2: an own Symbol.iterator cannot make the copied scope differ from the validated scope", async () => {
+  let iter = 0;
+  const ids = () => { const a = [1]; a[Symbol.iterator] = function* () { iter += 1; yield 2; }; return a; };
+  await refusedQuietly(withIds(ids), "own iterator");
+  assert.equal(iter, 0, "iterator never ran (44e8: accepted, basis [2])");
+});
+
+test("R-G1 root probe 3: an own enumerable '__proto__' DATA key is an unknown key on opts and on every nested object", async () => {
+  const proto = (o) => Object.defineProperty(o, "__proto__", { enumerable: true, configurable: true, writable: true, value: { extra: true } });
+  await refusedQuietly((snk) => proto(opts(snk)), "opts.__proto__");
+  await refusedQuietly((snk) => opts(snk, { env: proto({ ...ENV }) }), "env.__proto__");
+  await refusedQuietly((snk) => opts(snk, { sender: proto({ ...SENDER }) }), "sender.__proto__");
+  await refusedQuietly((snk) => opts(snk, { executors: proto({ sendMessage: snk.sendMessage, label: "mock-sink" }) }), "executors.__proto__");
+  await refusedQuietly((snk) => opts(snk, { hooks: proto({ afterClaim: async () => {} }) }), "hooks.__proto__");
+  // the stronger variant: required values supplied only through a '__proto__' key are never served from a scratch prototype
+  await refusedQuietly((snk) => { const o = opts(snk); const { workerId, clock } = o; delete o.workerId; delete o.clock;
+    return Object.defineProperty(o, "__proto__", { enumerable: true, value: { workerId, clock } }); }, "required keys via __proto__");
+});
+
+test("R-G1 root probe 4: throwing / revoked proxies at every level → OPTIONS_INVALID, never the caller's error object", async () => {
+  const boom = new Error("synthetic trap failure");
+  const throwing = (t, trap) => new Proxy(t, { [trap]() { throw boom; } });
+  const revoked = (t) => { const r = Proxy.revocable(t, {}); r.revoke(); return r.proxy; };
+  const levels = {
+    opts: (snk, f) => f(opts(snk)),
+    env: (snk, f) => opts(snk, { env: f({ ...ENV }) }),
+    sender: (snk, f) => opts(snk, { sender: f({ ...SENDER }) }),
+    executors: (snk, f) => opts(snk, { executors: f({ sendMessage: snk.sendMessage, label: "mock-sink" }) }),
+    hooks: (snk, f) => opts(snk, { hooks: f({ afterClaim: async () => {} }) }),
+    listingIds: (snk, f) => opts(snk, { listingIds: f([891001]) })
+  };
+  for (const [lvl, mk] of Object.entries(levels)) {
+    for (const trap of ["getPrototypeOf", "ownKeys", "getOwnPropertyDescriptor"]) await refusedQuietly((snk) => mk(snk, (t) => throwing(t, trap)), `${lvl}: ${trap} throws`);
+    await refusedQuietly((snk) => mk(snk, revoked), `${lvl}: revoked`);
+  }
+});
+
+test("R-G1 listingIds variants: changing getter, holes, non-enumerable / accessor index, custom methods / iterators / symbol / extra keys, subclass", async () => {
+  let runs = 0;
+  const def = (a, k, d) => Object.defineProperty(a, k, { configurable: true, ...d });
+  const cases = {
+    "changing index getter": () => def([1, 2], "1", { get() { runs += 1; return runs > 1 ? 1 : 2; }, enumerable: true }),
+    "sparse (hole)": () => [891001, , 891003],                                   // eslint-disable-line no-sparse-arrays
+    "trailing hole via length": () => { const a = [891001]; a.length = 2; return a; },
+    "non-enumerable index": () => def([891001], "0", { value: 891001, enumerable: false, writable: true }),
+    "non-enumerable accessor index": () => def([1], "0", { get() { runs += 1; return 1; }, enumerable: false }),
+    "custom .some": () => { const a = [0]; a.some = () => false; return a; },
+    "custom .some non-enumerable": () => def([0], "some", { value: () => false, enumerable: false }),
+    "non-enumerable iterator": () => def([1], Symbol.iterator, { value: function* () { runs += 1; yield 2; }, enumerable: false }),
+    "symbol key": () => { const a = [1]; a[Symbol("x")] = 1; return a; },
+    "extra string key": () => { const a = [1]; a.extra = 1; return a; },
+    "subclass prototype": () => { class Ids extends Array {} return Ids.from([1]); },
+    "null-prototype array": () => Object.setPrototypeOf([1], null),
+    "array-like object": () => ({ 0: 1, length: 1 }),
+    "length 51": () => Array.from({ length: 51 }, (_, i) => i + 1),
+    "empty": () => []
+  };
+  for (const [label, mk] of Object.entries(cases)) await refusedQuietly(withIds(mk), label);
+  assert.equal(runs, 0, "no getter / iterator ran");
+});
+
+test("R-G1 valid controls: dense frozen array, plain and null-prototype configs; copied basis equals the validated data; caller mutation after the gate changes nothing", async () => {
+  const nul = (o) => Object.assign(Object.create(null), o);
+  for (const [label, mk] of [["frozen dense array", (snk) => opts(snk, { listingIds: Object.freeze([891001, 891002]) })],
+    ["null-prototype everywhere", (snk) => nul({ ...opts(snk), env: nul(ENV), sender: nul(SENDER), executors: nul({ sendMessage: snk.sendMessage, label: "mock-sink" }),
+      hooks: nul({ afterClaim: async () => {} }), listingIds: [891001, 891002] })]]) {
+    const snk = sink(); const o = mk(snk);
+    const g = notificationWorkerGate(o);
+    assert.equal(g.ok, true, label);
+    assert.deepEqual([...g.basis.listingIds], [891001, 891002], `${label}: copied scope = validated scope`);
+    assert.ok(Object.isFrozen(g.basis.listingIds) && Object.getPrototypeOf(g.basis.listingIds) === Array.prototype && g.basis.listingIds !== o.listingIds);
+    assert.deepEqual({ ...g.basis.sender }, { ...SENDER });
+    assert.ok(Object.isFrozen(g.basis.hooks) && Object.getPrototypeOf(g.basis.hooks) === null);
+    const pool = scriptedPool();
+    const r = await runNotificationStep(pool, mk(snk));
+    assert.equal(r.outcome, "accepted", label); assert.equal(snk.count, 1);
+  }
+  // mutation after the gate (writable array) changes nothing
+  const snk = sink(); const o = opts(snk, { listingIds: [891001] });
+  const g = notificationWorkerGate(o);
+  o.listingIds[0] = 5; o.listingIds.push(6);
+  assert.deepEqual([...g.basis.listingIds], [891001]);
+});
+
+test("R-G1 boundary: the gate catch is option-only — a runtime marker error still propagates as the SAME object after the gate", async () => {
+  const boom = Object.assign(new Error("synthetic"), { code: "08006" });
+  const pool = scriptedPool({ marker: () => { throw boom; } });
+  await assert.rejects(runNotificationStep(pool, opts(sink())), (e) => e === boom);
+  assert.deepEqual(pool.log, ["pool:marker"]);
+});
