@@ -1,0 +1,116 @@
+# E7 connected-test runner — REAL EXCHANGE CONTRACT, revision 1 (DOCS ONLY; proposed Slice X; not implemented, not authorized)
+
+**Branch** `feature/e7-connected-real-exchange-contract`, cut from exact `8173067e` (A–F, T and the HTTP-stack rehearsal ACCEPTED offline). Files: this new contract + an accepted / next-slice pointer in `claude/e7-connected-http-stack-rehearsal.md`. No code, test, run, config, dependency, pin, core, worker, adapter, T or SQL change. Public official docs and the installed Node's own built-in source were read (read-only) for §1; no API request, login, probe, token, key or provider network action.
+
+**What this is.** The smallest real HTTP exchange that can later be handed to the ACCEPTED Slice T as its injected `exchange({ method, url, headers, body, signal, maxBytes }) → native Promise<{ status, contentType, bytes }>` without editing T. **What it is not.** Credential / token loading, Hostaway token mint, Stripe ingress, a manifest real-mode change, wiring, an owner CLI or probe orchestration — all separate and CLOSED. The exchange receives headers already built by T; it never discovers, loads, mints or refreshes a key or token. **Preparation for connectivity, not permission to connect.** Owner inputs UNSET; live gates CLOSED; protected reservations 70636076 / 71045356 / 71072615 / 71081885 zero-action; notification / owner-alert sending CLOSED; e74a OPEN; Joel's ONE consolidated live-run approval package governs any real action.
+
+## 0. Decisions at a glance
+| # | Decision |
+|---|---|
+| X0 | Substrate: **`node:https.request`** (built-in; no dependency / install). Built-in `fetch` is **rejected** (§1.2 — it can replay a request automatically and that cannot be disabled). This **reverses** the transport contract's §2.4 `fetch` recommendation. |
+| X1 | Factory `createE7RealExchange({ provider, primitive? })` → frozen `{ ok:true, exchange }` / frozen `{ ok:false, code:'EXCHANGE_OPTIONS_INVALID' }`. `provider` ∈ `'hostaway' \| 'stripe'` fixes ONE origin. Inert on import and construction: no socket, Agent, DNS, timer or env read until an exchange is invoked with a valid request. |
+| X2 | One permitted invocation = one fresh dedicated `https.Agent({ keepAlive:false, maxSockets:1, maxCachedSessions:0 })` + exactly one `ClientRequest`; never a second request, retry, redirect follow or re-dispatch. Agent destroyed after the request closes. |
+| X3 | TLS verification always ON (`rejectUnauthorized: true` passed explicitly; no CA / cert / key / `checkServerIdentity` / `createConnection` / `lookup` / `insecureHTTPParser` / proxy option). |
+| X4 | Exactly-one-settlement state machine (§3); bounded body read into a fresh genuine `Uint8Array` (never a `Buffer`, which T refuses); 3xx resolved without reading the body or `Location`; no timers (deadline = the worker's signal). |
+| X5 | Code-only `E7ExchangeError(code)`; no URL / header / key / token / query / body / provider text / raw error in any error or result; no logging. The successful reply body is the normal result, handed to T unchanged — it may contain guest or provider data and is NOT claimed non-sensitive. |
+| X6 | At most one application exchange; NOT at most one server-side effect (§6). |
+
+## 1. Substrate: source evidence (installed Node, read-only)
+Environment: repo `package.json` has **no `engines`**; local Node **v22.22.0**, bundled undici **6.23.0**; `https.globalAgent.keepAlive === true`. Line numbers below are from this Node's built-in module source (`process.binding('natives')`, read only for this design). The owner machine's Node version is unknown → recorded as an environment item for the live package (§7), not assumed.
+
+### 1.1 `node:https.request` (chosen)
+- **No retry / redirect code** in the client: `_http_client` (1,053 lines) has no retry or redirect logic; a response with any status is emitted to the caller as-is. The Node HTTP docs describe the documented event orders (success: `socket` → `response` → `data`* → `end` → `close`; connection error: `socket` → `error` → `close`; destroy before / after response; premature close before / after response) and that a `signal` abort behaves like `req.destroy()` (Node docs, `http.request`, read on the v26 docs page; Slice X tests must confirm the order on the installed v22).
+- **Proxy only by explicit opt-in:** an Agent gets proxy configuration only from its `proxyEnv` option (`_http_agent:116–118`); the GLOBAL agents receive it only under `--use-env-proxy` / `NODE_USE_ENV_PROXY` (`_http_agent:632–633`, `https:603–604`). A **dedicated `new https.Agent({...})` without `proxyEnv` never proxies** → X2 always passes its own Agent (never the global agent and never `agent:false`, which builds `new defaultAgent.constructor()` at `_http_client:214–215` — equivalent, but implicit).
+- **TLS:** the client default is `rejectUnauthorized: !allowUnauthorized` (`_tls_wrap:1766–1769`, the `NODE_TLS_REJECT_UNAUTHORIZED` environment default), overridden by an explicit option (`_tls_wrap:1790`). X3 passes `rejectUnauthorized: true` explicitly, so the env var cannot turn verification off. `NODE_EXTRA_CA_CERTS` (`tls:172`) and `--use-openssl-ca` / `--use-system-ca` change the PROCESS trust store at startup — not controllable by this module → owner-environment item (§7).
+- **Wire framing:** with a non-keep-alive agent Node sends `Connection: close` (`_http_outgoing:533 / 546`); an explicit `Content-Length` disables chunked encoding (`_http_outgoing:554–559`); `Host` is set from the hostname (`_http_client:358`). Node adds no `Accept-Encoding`, so the reply must be identity-encoded (§3).
+
+### 1.2 Built-in `fetch` (rejected)
+- **Automatic replay on 421:** undici's `httpNetworkOrCacheFetch` (bundled `internal/deps/undici/undici`, lines **11144–11159**) — when the reply is `421`, the fetch was not already a new-connection fetch, and the body is null **or has a source** (a string body has one), it destroys the connection and **re-runs the request on a new connection**. This is spec behaviour (Fetch Standard, HTTP-network-or-cache fetch) with no option to disable it; it would turn one `exchange` into two server deliveries of a POST (capture, create, offline charge).
+- Also: a fetch `Request`'s `redirect` defaults to `'follow'` (`undici:10229`, `init.redirect ?? "follow"`; every caller would have to pass `'error'`), automatic decompression / `Accept-Encoding`, and a process-global dispatcher that any same-process code can replace (`setGlobalDispatcher`). The bundled build carries undici's retry error type (`undici:337–354`, `UND_ERR_REQ_RETRY`), used only by opt-in retry handlers that fetch does not install by default; the 421 path above is enough to reject.
+- No SDK (Stripe / Hostaway clients retry and add headers implicitly).
+
+## 2. API, inputs and the request it builds
+```
+createE7RealExchange({ provider, primitive? }) → frozen { ok:true, exchange } | frozen { ok:false, code:'EXCHANGE_OPTIONS_INVALID' }
+exchange(request) → native Promise<frozen { status, contentType, bytes:Uint8Array }> | rejects E7ExchangeError(code)
+```
+- **Options:** own-data snapshot (T's `topData` pattern; no getter / proxy runs); exactly `provider` + optional `primitive`. `provider` fixes the origin: `hostaway` → `api.hostaway.com`, `stripe` → `api.stripe.com`; no host / port / origin override exists. `primitive` = `{ request, Agent }` (non-proxy functions); **default = `https.request` / `https.Agent` captured at module load** (capturing references is not I/O). Tests inject a fake primitive (§5); a source pin asserts the default is exactly the `node:https` pair. The injected primitive is trusted code — like T's injected exchange, no label prevents it from doing I/O.
+- **Request snapshot before any work:** own-data snapshot of exactly `{ method, url, headers, body, signal, maxBytes }` (T's frozen request); `headers` own-data, string values only.
+- **Validation (→ `EXCHANGE_INPUT_INVALID`, zero primitive calls):**
+  - `method` ∈ `GET | POST | PUT`.
+  - `url` string ≤ 2,048; parsed with the captured `URL`; `protocol === 'https:'`, `hostname` exactly the provider host, `port === ''`, no `username` / `password`, `hash === ''`, and `url === origin + pathname + search` (canonical round-trip: no backslash / dot-segment / case / percent normalisation tricks); `pathname` matches `^/v1(/[A-Za-z0-9_.-]+)+$` with no `.` / `..` segment; `search` empty or `^\?[A-Za-z0-9_.%=&-]{1,1024}$`.
+  - **Protected refs:** no path segment and no query value equals a protected Hostaway id (`PROTECTED_HOSTAWAY_RESERVATION_IDS`, same import as T) — a second line behind T's refusal.
+  - `headers`: exactly the per-provider / per-method name set T builds — Hostaway `Accept, Authorization, Cache-control` (+ `Content-Type` with a body); Stripe `Authorization, Stripe-Version` (+ `Content-Type, Idempotency-Key` on POST); each value `^[\x20-\x7e]{1,4096}$` (no CR / LF), `Authorization` starts `Bearer `. The exchange never adds, reads out or changes credentials; it does not inspect the token beyond this shape.
+  - `body`: `null` for GET; a string for POST / PUT (Stripe cancel `""`), UTF-8 byte length ≤ 64 KiB.
+  - `signal`: a GENUINE `AbortSignal` (captured intrinsic `aborted` getter, T's `nativeAborted` rule); already aborted → `EXCHANGE_ABORTED`, zero primitive calls.
+  - `maxBytes`: safe integer `1 … cap` (Hostaway 1 MiB, Stripe 256 KiB — T's caps).
+- **Request options handed to the primitive (exact, frozen):** `{ protocol:'https:', hostname, port:443, servername:hostname, method, path: pathname+search, headers: { ...T headers, 'Content-Length': <bytes> only when body !== null }, agent: <fresh Agent>, rejectUnauthorized:true, setHost:true, insecureHTTPParser:false, maxHeaderSize:16384, joinDuplicateHeaders:false }`. Never passed: `signal` (the exchange owns its abort listener, §3), `timeout`, `createConnection`, `lookup`, `family`, `localAddress`, `auth`, `ca` / `cert` / `key` / `pfx` / `passphrase`, `checkServerIdentity`, `proxyEnv`, `defaultPort` overrides.
+- Dispatch: listeners attached first, then `req.end(body)` (or `req.end()`) synchronously inside the invocation; the exchange writes nothing else.
+
+## 3. Response / event state machine (exactly one settlement)
+States: `PRECHECK → DISPATCHED → HEADERS → BODY → SETTLED`. One `settled` flag; the first decisive event settles, everything later is ignored.
+
+| Event (state) | Action |
+|---|---|
+| signal already aborted (PRECHECK) | reject `EXCHANGE_ABORTED`; no Agent, no request |
+| signal abort (DISPATCHED / HEADERS / BODY) | `req.destroy()`; reject `EXCHANGE_ABORTED` (T then sees an aborted genuine signal → `ABORTED_IN_FLIGHT`) |
+| `req` `error` before a response | reject `EXCHANGE_NETWORK_ERROR` (or `EXCHANGE_ABORTED` if our abort caused it); error object never read beyond being an event |
+| `req` `close` with no response | reject `EXCHANGE_PREMATURE_CLOSE` |
+| `response` with `statusCode` not a safe integer 200–599 | `res.destroy()`; reject `EXCHANGE_STATUS_INVALID` (1xx are Node `information` events, never a response) |
+| `response`: `content-type` an array / > 256 chars; `content-encoding` present and ≠ `identity` | destroy; reject `EXCHANGE_HEADERS_INVALID` / `EXCHANGE_ENCODING_REFUSED` |
+| `response`: `content-length` present and > `maxBytes` | destroy without reading; reject `EXCHANGE_BODY_TOO_LARGE` |
+| `response` 3xx | **resolve** `{ status, contentType, bytes: new Uint8Array(0) }` WITHOUT reading the body or `Location`; destroy the response; T refuses `REDIRECT_REFUSED`; never followed |
+| `data` chunk (BODY) | must be a Uint8Array (Node `Buffer`); if running total + chunk > `maxBytes` → destroy, reject `EXCHANGE_BODY_TOO_LARGE` (the overflowing chunk is never retained); else retain |
+| `end` with `res.complete === true` | copy the retained chunks into ONE fresh `Uint8Array(total)` via the captured %TypedArray% `set` (T requires exactly `Uint8Array.prototype`); resolve frozen `{ status, contentType, bytes }` |
+| `res` `aborted` / `error` / `close` before a complete `end` | reject `EXCHANGE_PREMATURE_CLOSE` (or `EXCHANGE_ABORTED` if the signal is aborted) |
+| any event after SETTLED | ignored (no follow-up request, no second settlement) |
+
+- **Statuses:** 401 / 403 / 429 / 5xx resolve as ordinary replies (T passes Hostaway statuses through and maps Stripe non-2xx to codes); the exchange never retries, re-mints, waits on `Retry-After` or follows anything.
+- **Bounds that are NOT claimed:** headers are bounded by `maxHeaderSize` (Node parser); body retention by `maxBytes` + the refusal of the overflowing chunk; a slow / trickling or hanging body or connect is bounded ONLY by the caller's signal. The exchange owns **no timer**: business deadlines stay worker-owned (`startBounded`); a later standalone probe must supply its own bounded signal.
+- **Ownership / cleanup:** the exchange owns the Agent, `req`, `res` and the abort listener. On settlement: remove the abort listener; if not completed, `destroy()` the request / response; keep **no-op `error` listeners** on `req` / `res` until each emits `close` (an `EventEmitter` `error` without a listener would throw / crash); on `req` `close`, remove all listeners and `agent.destroy()`. No socket reuse, no session cache, no global agent. The returned native promise settles exactly once whenever any decisive event happens; it stays pending only while the caller's signal neither aborts nor the connection ends (by design — the caller owns the deadline). No other promise is created, so nothing can surface as an unhandled rejection.
+
+## 4. Errors and redaction
+- `E7ExchangeError` (message constant `E7_EXCHANGE_ERROR`, frozen, no `cause`), `code` ∈ `EXCHANGE_OPTIONS_INVALID, EXCHANGE_INPUT_INVALID, EXCHANGE_ABORTED, EXCHANGE_NETWORK_ERROR, EXCHANGE_PREMATURE_CLOSE, EXCHANGE_STATUS_INVALID, EXCHANGE_HEADERS_INVALID, EXCHANGE_ENCODING_REFUSED, EXCHANGE_BODY_TOO_LARGE`. T maps every rejection to `EXCHANGE_FAILED` / `ABORTED_IN_FLIGHT` anyway; the codes exist only for offline tests.
+- Never in an error, result, diagnostic or log: URL, path, query, header names / values, key, token, request body, response body, provider status text, socket / TLS / DNS error objects or messages. No `console`, no file, no env read.
+- The successful body bytes ARE the result (T decodes them). They can contain guest names, emails, amounts and provider ids; the exchange does not copy them anywhere else and does not call them non-sensitive.
+
+## 5. Proposed Slice X — smallest OFFLINE implementation (not authorized)
+**Files:** NEW `scripts/e7-connected/real-exchange.mjs`; NEW `test/e7-connected-real-exchange.test.mjs` (pure; runs under `npm test`); this contract (implementation / validation map). No change to T, adapters, core, workers, pins, config or packages.
+**Imports:** `node:https` (`request`, `Agent` captured; default primitive only), `node:util` (`types`), `../../lib/checkout/compensation-proof.js` (`PROTECTED_HOSTAWAY_RESERVATION_IDS`). No `fetch`, `undici`, `node:http`, `node:net`, `node:tls`, `node:dns`, timers, `process`, fs, child process, SDK. Checked: the existing `node:https?` source pins scan only their own files (`test/e4-connected-path.test.mjs:406`, `test/e7-connected-run-journal-file.test.mjs:514`, `test/e7-connected-run-guard.test.mjs:492`), and the `hostaway-reservations` importer pin (`test/hostaway-reservations.test.mjs:547–569`) is unaffected → **no pin change needed**.
+**Tests (no network: an injected fake primitive = `EventEmitter`-based `ClientRequest` / `IncomingMessage` doubles driven step by step; the real `https.request` is never called; global fetch guard 0):**
+1. Options / inertness: exact keys; invalid provider / primitive → `EXCHANGE_OPTIONS_INVALID`; construction and import make zero primitive calls; source pin: default primitive is exactly `node:https` `request` / `Agent`.
+2. Request options: exact frozen option object per provider / method (origin, port 443, `servername`, `rejectUnauthorized:true`, `insecureHTTPParser:false`, own Agent `keepAlive:false / maxSockets:1 / maxCachedSessions:0`, `Content-Length` only with a body, none of the forbidden options); `end` called once with the exact body.
+3. Input refusals with zero primitive calls: other host / scheme / port / userinfo / fragment / non-canonical URL / dot segment / backslash / protected id in path or query / extra or missing header / CR-LF value / GET with body / oversize body / bad `maxBytes` / fake, proxy or aborted signal.
+4. Statuses: 200 / 201 / 401 / 403 / 404 / 429 / 500 / 503 resolve once with the bytes; 301 / 302 / 307 / 308 resolve with empty bytes, body and `Location` unread; exactly one primitive call each — **no retry**.
+5. Body: multi-chunk accumulation; exactly-`maxBytes` accepted; one byte over → `BODY_TOO_LARGE`, `destroy` called, overflowing chunk not retained; `content-length` over the bound refused before any `data`; result `bytes` has exactly `Uint8Array.prototype` (not `Buffer`) and is a copy (later chunk mutation has no effect); `content-encoding: gzip` refused.
+6. Cancellation at each boundary: before dispatch (no request); after `end` before `socket`; after `socket` before `response`; after `response` before `data`; mid-body → `EXCHANGE_ABORTED`, `destroy` once, listener removed.
+7. Races / late events: `error` then `close`; `end` then `error`; `close` before `end` (premature); `aborted` on the response; events after settlement ignored; abort after settlement ignored; exactly one settlement; zero `unhandledRejection` / uncaught `error`; every listener removed and `agent.destroy()` called after `close`.
+8. Redaction: no URL / token / body / provider text in any error (`String(err)`, `err.stack`, own props).
+9. Accepted T integration: `createE7HostawaySend` / `createE7StripeTestSend` over `createE7RealExchange({ provider, primitive: fake })` for H1–H9 / S1–S4 shapes: exact primitive options; a held reply + genuine abort → T `ABORTED_IN_FLIGHT`; 3xx → T `REDIRECT_REFUSED`; Stripe 500 → `STRIPE_HTTP_5XX`; one primitive call per send.
+10. Source pins: imports exactly as above; no `fetch(` / `undici` / `node:http"` / `node:net` / `node:tls` / `process.` / timers / `console.` / `rejectUnauthorized: false` / `createConnection` / `proxyEnv` / `NODE_TLS` / retry.
+**Validation:** `node --test test/e7-connected-real-exchange.test.mjs`; `node --test test/e7-connected-*.test.mjs test/hostaway-reservations.test.mjs test/e4-connected-path.test.mjs`; `npm test`. Root-runnable (no PG, install or network). Local loopback / TLS server tests or real-provider tests are a SEPARATE authorization (new certificates / OS trust changes are not part of X).
+
+## 6. Trust boundary and ambiguity (stated, not hidden)
+- One invocation creates exactly one `ClientRequest` on one fresh connection and never re-dispatches. That is an **application-level** guarantee only: once `end()` has been called, any outcome other than a complete response (abort, reset, premature close, oversize refusal, even some connect-phase errors) may have delivered and applied the request (TCP / TLS / load balancer / provider). The exchange makes no "not sent" claim; the accepted DB operation fence, Stripe idempotency keys and the workers' unknown handling own that ambiguity.
+- The injected `primitive` (and any same-process code that modifies built-ins such as `https.request` or `URL`) is trusted (GLOBAL INTRINSIC TRUST, as in T §11.1); the module is not a sandbox. Synthetic manifest labels do not prevent I/O, and no accepted manifest authorizes a real connection (A refuses `synthetic !== true`).
+- The exchange binds origin / shape only. The values inside (ids, amounts, idempotency keys, credentials) are bound by T and the accepted adapters (transport contract §6.1).
+
+## 7. Blockers
+**For the offline Slice X:** none known beyond root authorization (built-in `node:https` only; no dependency, install or pin change; the T interface is used unchanged).
+
+**Live gates (all CLOSED; a documented mapping is NOT live verification):**
+- **G-AUTH** — Hostaway `jwt` vs Bearer on the guest-payment endpoints (docs examples disagree).
+- **G-FILTER** — the real `reservationIds` filter behaviour of the charge list.
+- **G-SHAPE** — real reply / error shapes of every route.
+- **B4** — the real `Stripe-Version` (the offline pin is synthetic).
+- **B5** — manifest real mode (A refuses non-synthetic runs).
+- **B6** — credential / token loading, Hostaway token mint, wiring of T + X into the runner, owner CLI / probe orchestration.
+- **Owner environment** (to record in the package, not enforced by X): Node version on the owner machine; no `NODE_TLS_REJECT_UNAUTHORIZED=0`; no `NODE_EXTRA_CA_CERTS` / `--use-openssl-ca` / `--use-system-ca` / `--use-env-proxy` / `NODE_USE_ENV_PROXY` unless reviewed; outbound HTTPS path.
+- **ONE consolidated exact approval package from Joel** for any real request, write, cleanup, notification or calendar check — root acceptance of this design is not that approval.
+
+**Recommended next smallest allowed files:** Slice X exactly as in §5 (3 files), then — separately — a docs-only credential / probe design for G-AUTH / G-FILTER / G-SHAPE / B4 read-only checks.
+
+## 8. Sources (read-only)
+- Node.js documentation, `http.request` (event orders, `agent`, `timeout`, `signal`): https://beta.docs.nodejs.org/http/request-2 (page documents v26; the installed v22.22.0 behaviour is to be confirmed by Slice X's fake-primitive tests and, live, only under a separate authorization).
+- Installed Node v22.22.0 built-in source (read via `process.binding('natives')`, no network): `_http_client:214–215, 255–259, 268–271, 358, 405`; `_http_agent:110, 116–118, 632–633`; `https:603–604`; `_tls_wrap:1766–1769, 1790`; `tls:172`; `_http_outgoing:533, 546, 554–559`; bundled undici 6.23.0 `internal/deps/undici/undici:11144–11159` (421 replay), `10229` (fetch `Request` `redirect` default `'follow'`), `337–354` (opt-in retry error type).
+- Transport contract rev 2 §2 / §6.1 / §11.1 (`claude/e7-connected-transport-contract.md`), HTTP-stack rehearsal §4 (`claude/e7-connected-http-stack-rehearsal.md`).

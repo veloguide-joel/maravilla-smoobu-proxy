@@ -1,5 +1,7 @@
 # E7 connected-test runner — HTTP-STACK REHEARSAL (TESTS + REPORT ONLY; OFFLINE)
 
+> **Status (pointer):** ACCEPTED OFFLINE by root at `8173067e` (H1–H3 CLAUDE-RUN; root source review; the H3 differential limitation is accepted — H3 does NOT prove R-TC1, unit T11 does). No live readiness implied. Next slice (docs only): `claude/e7-connected-real-exchange-contract.md` — the real `node:https` exchange contract and proposed offline Slice X; not implemented, not authorized.
+
 **Branch** `feature/e7-connected-http-stack-rehearsal`, cut from exact `0830f9a4` (Slice T ACCEPTED offline). Files: NEW `test/db/e7-connected-http-stack-rehearsal.test.mjs` (H1–H3); this report; a status / next-step pointer in `claude/e7-connected-transport-contract.md`. No runtime change: T, A–F, core, file journal, adapters, workers, lib, SQL, config, dependencies, pins and fixtures are unchanged (`git diff 0830f9a4 -- scripts lib db package.json` is empty).
 
 **What this is.** The last offline cross-layer mapping check before any design of a real exchange / wrapper. **What it is not.** Real-connection readiness or authorization. Live gates G-AUTH / G-FILTER / G-SHAPE / B4–B6 CLOSED; owner inputs UNSET; protected reservations 70636076 / 71045356 / 71072615 / 71081885 zero-action; notification / owner-alert sending CLOSED; the ONE consolidated live-run approval package still governs any real write. e74a OPEN.
