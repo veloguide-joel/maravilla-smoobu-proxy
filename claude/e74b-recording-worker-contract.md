@@ -4,7 +4,8 @@
 
 **Status.**
 - **D5 / 0014 is PRESENT and accepted offline at `bc0f93c`**; the 0010–0014 database foundation is accepted OFFLINE. Not live or payment readiness.
-- **The recording-worker DESIGN is ACCEPTED offline at `6f5f704`** (root ruling; R2-B `READ_ROWS_MAX = 6` approved; no evidence for refused confirming pages approved; addendum A–E). **The worker is IMPLEMENTED offline / injected-mock** on `feature/e7-offline-charge-worker` (pending root code review); the exact map is **§11**. Not live, provider or payment readiness.
+- **The recording-worker DESIGN is ACCEPTED offline at `6f5f704`** (root ruling; R2-B `READ_ROWS_MAX = 6` approved; no evidence for refused confirming pages approved; addendum A–E). **The worker is IMPLEMENTED offline / injected-mock** on `feature/e7-offline-charge-worker`; the exact map is **§11**. Not live, provider or payment readiness.
+- **Status pointer (2026-11-03):** root ACCEPTED the worker OFFLINE at `e0191684` (`ddda945` + R-C1/R-C2). The cross-worker offline lifecycle rehearsal (tests + report only) is `claude/e7-offline-lifecycle-rehearsal.md` on `feature/e7-offline-lifecycle-rehearsal`, pending root review.
 
 **What this is.** The integration design that wires the ACCEPTED pure proof module (`lib/checkout/offline-charge-proof.js`) and the ACCEPTED 0010–0014 primitives into ONE bounded offline worker step with INJECTED mock reads / write, following the accepted capture / compensation workers. It does not redesign those foundations.
 
