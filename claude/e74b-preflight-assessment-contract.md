@@ -5,7 +5,8 @@
 - **Revision 2** answers root's HOLD on `44ca7df`: decisions D1–D9 and corrections R1–R6. The resolution map is §13. This revision **replaces** revision 1 entirely.
 
 **Status (updated on `feature/e7-offline-charge-assessments`).**
-- Root ACCEPTED revision 2 (`3967755`) as the **0012 (slice A)** implementation basis, with binding addendum A–F. **0012 is now IMPLEMENTED offline** on `feature/e7-offline-charge-assessments` (pending root code review); the exact map is **§14**. **0013 stays PROPOSED and is NOT authorized.**
+- Root ACCEPTED revision 2 (`3967755`) as the **0012 (slice A)** implementation basis, with binding addendum A–F. **0012 is PRESENT and accepted offline at `ff07fe8`** (root ruling on `ff07fe8`; Claude-run local PG only); the exact map is **§14**.
+- **0013 (slice B) stays PROPOSED and NOT authorized. §8 below is SUPERSEDED** by `claude/e74b-preflight-release-contract.md` (refreshed against the actual 0012); where they differ, that document governs.
 - **PRESENT and accepted:** 0010 (`d801b43`); 0011 + R1 / R2 helpers (`cd77088` + `34f0314`); the pure module `lib/checkout/offline-charge-proof.js` (`4f6b27f`, unchanged).
 - **Design (revision 2):** two separate executable migrations, **0012** (slice A: assessments + claim fence + conflict / exhaustion latch) and **0013** (slice B: preflight holds + owner release). Each is independently reviewable and reversible to its predecessor when audit-free. An accepted / applied 0012 is never amended into 0013.
 - Migrations 0001–0011 stay byte-identical on disk; historical comment errata are in §12.
@@ -360,7 +361,7 @@ After each wait, every subsequent plpgsql statement takes a fresh READ COMMITTED
 
 ---
 
-## 8. Migration 0013 (slice B) [PROPOSED-0013]
+## 8. Migration 0013 (slice B) [PROPOSED-0013] — SUPERSEDED by `claude/e74b-preflight-release-contract.md`
 
 ### 8.1 Table and column changes
 
