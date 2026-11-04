@@ -919,3 +919,111 @@ Live gates, env, credentials and the package stay CLOSED.
 5. Joel's explicit approval of it.
 
 **Proposed next:** the C3 implementation turn on the three files of §13.1, with tests §13.6 → root CODE review.
+
+## 14. C3 implementation / clarification A–F / first-TAP map (branch `feature/e7-connected-probe-entrypoint` from exact `68712630`)
+**Scope held.** Exactly three files:
+- NEW `scripts/e7-connected/probe-cli-main.mjs`
+- NEW `test/e7-connected-probe-cli-main.test.mjs`
+- this contract (§§0–13 kept)
+
+`SOURCE_CLOSURE` (13 paths; the entrypoint is entry 2) and every accepted C1 / C2 / P / T / X / runtime / pin / config / dep file are unchanged.
+- **Static imports, exactly:** `node:process`, `node:fs/promises` (`open` / `lstat` / `realpath`), `node:fs` (`constants`), `node:url`, `node:perf_hooks`, `node:https` (`request` / `Agent`), and `./probe-source-digest.mjs`.
+- **Dynamic imports, exactly two fixed specifiers:** `./probe-command.mjs` and `./readonly-probe.mjs`.
+
+Test B1 pins this. It also pins the absence of `child_process`, `fetch`, `eval`, keyed `process.env` reads, booking / lib paths, `require` and the reservation adapter's name.
+
+**Still not done:** no real execute, provider call, credential, owner-env access, TLS or loopback test, and no install.
+
+### 14.1 Clarification A — `prepare-plan` duplicate keys (root ruling)
+- **The rule:** ONE `JSON.parse`, so a duplicate key in the **draft** follows ordinary last-key-wins — in this offline conversion mode only.
+- **Test B3:** a draft with `approvalRef` set twice canonicalizes to the effective last value, and the printed `planHash` equals P's hash of that effective plan.
+- **Before any approval,** the owner must inspect the final canonical file and its `planHash`. The accepted C2 inspect / execute refusal of non-canonical bytes is unchanged: the produced file is canonical and inspect accepts it (B3).
+- **Order of checks:** fatal UTF-8 decode (`ignoreBOM:true`, so a BOM is refused), then the 16384-byte cap, then the iterative depth bound (≤ 8, nodes ≤ 16384) BEFORE `validateProbePlan`.
+- **What is written:** exactly `canonicalJson` of the validated plan without the derived `planHash` (as C2 does) plus `"\n"` — never the original object.
+- No credential, primitive, C2, T or X is used: `importCommand` counts 0 in B3, and only P is imported.
+- **Refusals (code-only; no path in output):**
+  - `PREP_USAGE`;
+  - `PREP_UNREADABLE` (missing, oversize);
+  - `PREP_INVALID` with a plan sub-code (`PLAN_SHAPE` / `PLAN_TOO_DEEP` / `PLAN_NOT_JSON` / `PLAN_PROTECTED`);
+  - `PREP_OUTPUT_PARENT_INVALID` (parent not canonical, not an owner-uid directory, or group / world writable);
+  - `PREP_EXISTS` (pre-check, or `O_EXCL` `EEXIST`; never overwritten — B3 checks the bytes are unchanged);
+  - `PREP_OUTPUT_UNKNOWN` (any partial or unacknowledged write / sync / close);
+  - `PREP_INTERRUPTED` (a first SIGINT before the create).
+
+### 14.2 Clarification B — native readers and adapters
+- **TRUST:** `O_NOFOLLOW` protects the final component only; ancestors and the namespace remain TRUST.
+- **Construction order:** an unsupported platform (not linux / darwin), or any of `O_RDONLY` / `O_WRONLY` / `O_CREAT` / `O_EXCL` / `O_NOFOLLOW` not a non-negative safe integer, gives `BOOT_UNSUPPORTED` (exit 3) BEFORE any adapter is constructed or any file is read (B7: an injected `readSource` that throws is never called).
+- **`getuid`:** it is called only when it is a function. If it is unavailable, execute and `prepare-plan` refuse with `BOOT_UNSUPPORTED`, and inspect reports `ENV_UID_UNAVAILABLE` (B7).
+- **`readBounded`** (plan ≤ 16384, source ≤ 262144):
+  - the acquired `fh` is owned immediately and closed once on every outcome;
+  - an earlier code-only refusal stays primary;
+  - a close that doesn't fulfil `undefined` rejects with `E7_CLOSE`;
+  - buffer of cap + 1 bytes as a growth probe; positive-progress loop; byte counts range-checked; EOF size must match;
+  - returns an exact owned `Uint8Array` copy (N5);
+  - the buffer is zero-filled.
+- **`mapStat`:** bigint stats map to decimal strings for `dev` / `ino` / `*Ns` and to safe numbers for `mode` / `nlink` / `size` / `uid`. Negative, unsafe or non-bigint values reject with `E7_STAT_RANGE` (N1).
+- **Adapters:** all are `async`, so C1 / C2 receive native promises. Node rejections pass through untouched, and only the own-data `code` is consumed.
+
+  Verified natively over synthetic files:
+  - `ELOOP` for the symlinked final component (N2);
+  - `ENOENT` (N2) and `EEXIST` (N4);
+  - `read` → `bytesRead` (N3) and `write` → `bytesWritten` (N4);
+  - `sync()` / `close()` → `undefined` (N3, N4);
+  - mode `0600` on create (N4);
+  - the full accepted C1 loader succeeding over a synthetic `0600` file, and refusing a symlink (`CRED_NOT_REGULAR`) and a missing path (`CRED_MISSING`) (N3).
+- **Policy:** no C1 / C2 policy is re-implemented, and there is no broad policy change.
+- **Native tests:** they use only disposable `mkdtemp` `0700` dirs, all removed afterwards (none were left). Public repository source is read only for the digest (N6).
+
+### 14.3 Clarification C — signals and the terminal latch
+- **First SIGINT:** `controller.abort()`. That is C2's `interrupt`; pre-run it gives `CLI_INTERRUPTED` / 7 with zero requests and no summary file (B6).
+- **Second SIGINT:** sets `latch.terminal = true` **before** `exit(130)`. After the latch:
+  - `gate()` makes every NEW `open` / `read` / `create` / `write` / `stat` / `lstat` / `realpath` throw `E7_TERMINAL` (close is never gated);
+  - the gated primitive's `request` and `Agent` throw, so X refuses (`EXCHANGE_SETUP_FAILED`);
+  - after every awaited handoff `main` returns without importing, emitting or exiting again;
+  - `exitOnce` makes the exit decision single.
+- **B6, with a fake `exit` that RETURNS:**
+  - a double SIGINT before import gives `exits [130]`, 0 imports, 0 stdout, 0 requests;
+  - a double SIGINT inside the first provider request gives exactly 1 request, no summary file, 0 stdout, and `exits [130]`.
+- R-C2a / R-C2b precedence is untouched: C2 still decides everything before output.
+
+### 14.4 Clarification D — stdout and exit
+- **One `write` attempt.** It settles exactly once on the callback, the `'error'` event or a synchronous throw. A `false` return value is backpressure only (B7 `backpressure` gives 10).
+- **Races:** a callback error followed by an error event and then a late success callback settles once, to 9 (B7 `race`). A decided outcome never flips.
+- **Exit:** it happens only after a successful callback: `setExitCode(code)` then `exit(code)`, once.
+- **No acknowledgment:** no exit and no flush claim; the second SIGINT is the escape (B7 `never` gives `exits []`, then `[130]`).
+- **Containment:** every `main`, import or adapter exception becomes a bounded code-only bootstrap line (`BOOT_IMPORT_FAILED` / `BOOT_INTERNAL`) with no raw path or error text. `main` never rejects, and the suite counts 0 unhandled rejections.
+- **Explicit exit abandons any pending in-process work. It is not proof of socket or handle cleanup.**
+
+### 14.5 Clarification E — pre-import execute digest
+- **Execute** is identified by the exact token `argv[0] === 'execute'`. Exactly one `--expect-source-digest` followed by 64 lowercase hex is required; a missing, repeated or malformed value gives `BOOT_USAGE` (2) BEFORE the import.
+- The 13-path closure is hashed in the accepted order, with the per-file and total caps (via the accepted helper). `null` gives `BOOT_SOURCE_UNREADABLE`, and a mismatch gives `BOOT_SOURCE_MISMATCH` (4) — all before the import (B4: `importCommand` counts 0).
+- C2 remains the full argument authority; its grammar is not widened.
+- **Inspect** reports the actual digest, or `null`, without needing an expected value (B2, B4). It constructs no credential / output adapter usage and no https primitive (guards 0).
+- **`prepare-plan`** imports P only.
+- **Hooks:** the exported `main(proc, hooks)` is inert on import (B1: no SIGINT listener added). Hooks are a parameter only and are never derived from argv or env.
+- **Import failure** gives `BOOT_IMPORT_FAILED` / 1 with zero requests (B4).
+- **TRUST caveats unchanged:** the entrypoint / helper self-hash is not authentication; TOCTOU between hash and import; Node / OS / intrinsics.
+
+### 14.6 Clarification F — validation (FIRST FULL TAP preserved)
+- **Focused FIRST FULL TAP:** **7 / 8**. In B7's "stdout never acknowledges" case the write count was 0 when 1 was expected. Cause (test timing): that sub-case checked after 60 event-loop ticks, but inspect's real native fs reads take longer.
+- **Fix (test only):** a bounded poll (≤ 20000 ticks) for the single write. The module was unchanged.
+- **Run 2:** **8 / 8**.
+- **Relevant units** (`e7-connected-*` incl. C1 / C2 / P / T / X / rehearsal, `hostaway-reservations`, `e4-connected-path`): **227 / 227**.
+- **First full `npm test`:** **892 / 892**.
+- No DB, install or network was used.
+- No mutation campaign, L1, separate rehearsal or real-process run (running the entrypoint as a real process would read this container's env presence; out of scope).
+
+### 14.7 Residuals and remaining real-run prerequisites (not readiness)
+**Residuals:**
+- an ancestor / namespace symlink or a same-uid actor (TRUST);
+- no elapsed bound on fs IO;
+- an unacknowledged stdout waits for the second SIGINT;
+- an explicit exit abandons, it does not prove cleanup;
+- native X socket / TLS ordering remains a fail-closed source-inspected residual (§13.7).
+
+**Real-run prerequisites, unchanged and CLOSED:**
+- **E1:** this suite green on the owner's machine with the exact Node version.
+- **E2:** owner `inspect` (`ENV_OK`, digest, `planHash`).
+- The owner's plan, credentials and account values (UNSET).
+- The filled §13.8 package.
+- Joel's explicit approval of it.
