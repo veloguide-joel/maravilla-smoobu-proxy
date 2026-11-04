@@ -1,4 +1,4 @@
-# E7 local connected-test RUNNER — CONTRACT, revision 9 (Slices A–D ACCEPTED; Slice E core IMPLEMENTED offline, pending root CODE review)
+# E7 local connected-test RUNNER — CONTRACT, revision 9 (Slices A–D ACCEPTED; Slice E core IMPLEMENTED offline; HOLD R-E1–R-E3 corrected, pending root CODE re-review)
 
 **Branch** `feature/e7-connected-run-core`, cut from exact `ea830a62` (revision 8, root DESIGN ACCEPTED). Slice E changes exactly three files: new `scripts/e7-connected/run-core.mjs`, new `test/db/e7-connected-runner.test.mjs`, and this contract (status + §13). Revision 8 (`feature/e7-connected-core-contract`, from `d5a93e0f`) was docs only.
 
@@ -19,6 +19,7 @@
   - The core is **not implemented and not authorized** by this revision.
   - Root DESIGN REVIEW **ACCEPTED** revision 8 at `ea830a62` and authorized Slice E, with binding clarifications 1–6 (recorded in §13.1).
 - Revision 9 (this file) records the implemented Slice E (§13): `runConnectedTest` + `checkSameDatabase` in `run-core.mjs`, and the disposable-PG suite E1–E23. All results are **CLAUDE-RUN** (root cannot run PG). Pending root CODE review.
+- Root CODE REVIEW **HOLD** on `6e253977` (R-E1 stop boundaries, R-E2 post-step observation, R-E3 terminal failure). Corrections on the same branch (fast-forward), recorded in §13.5; suite now E1–E27. Pending root CODE re-review.
 
 **Citation convention.**
 - Current interfaces are cited by **file:line at `d5a93e0f`**: workers under `lib/booking-db/`, runner modules under `scripts/e7-connected/`.
@@ -1623,3 +1624,30 @@ npm test
 - Same-DB check is accidental-misconfiguration detection only (§12.1). The advisory lock is not a worker fence.
 - Time in tests is scaled real time (K = 10; K = 3 for E15) plus a test-only `advance` / `jump`; the business clock follows §12.4 (real clock for recording scenarios; behind-real-time, capped, for recovery / cleanup scenarios).
 - All live / provider / credential / network / install / shared-DB / merge / deploy / real-message gates remain CLOSED; owner inputs UNSET; protected ids zero action; e74a OPEN.
+
+### 13.5 Root CODE REVIEW HOLD on `6e253977` (R-E1–R-E3) — corrections (same branch, fast-forward)
+
+Scope: `run-core.mjs`, `test/db/e7-connected-runner.test.mjs`, this contract only. A / B / C / D, adapters, workers, `lib/`, SQL, fixtures, config, packages and pins unchanged.
+
+**R-E1 — stop boundaries.** One check, `blocked()` = an existing stop cause, or `boundary()` (lock lost incl. the pre-attach flag, run signal aborted / invalid, guard broken), now runs before EVERY new runner operation: each owned-client acquisition (lock, S2 app client, every snapshot / guest client), each runner statement (S1, S2), the journal read, every attestation, after `prepare` / the guest read and before `STEP_STARTED`, again IMMEDIATELY before `lc.observeStep` invokes the worker, and at the start of every successful end (`ended()`). After a detected stop the only later operation is the single terminal append. Operations already started (a C snapshot in flight, a running worker step) are observed to their end, never interrupted. Consequences:
+- loss observed during S1 → `REFUSED LOCK_LOST`, zero app connects / queries;
+- cancellation / loss after an acknowledged `STEP_STARTED` → `RUN_STOPPED` (open step, outstanding `NONE`, `effectsKnown:false`), the worker never invoked;
+- cancellation / loss during a step → the step runs to its end, but NO new post-step snapshot is started: `STEP_ENDED { state:null }`, stale counts, effects unknown, phase key; a final capture / recording / cleanup step therefore never falls into `RUN_ENDED`;
+- cancellation at the last boundary (e.g. during the final `PHASE_ENDED` append, facts already acknowledged) → `STOPPED CANCELLED` with known effects and the state's key;
+- an initially aborted signal → `REFUSED CANCELLED` with zero DB / worker / journal / attest calls.
+
+**R-E2 — post-step observation.** Counts become stale the moment the worker is invoked (inside the `observeStep` start callback); only a valid acknowledged C snapshot clears stale, and after `RUN_STARTED` any unsuccessful snapshot (DB failure OR acknowledged refusal: cap / role / marker / malformed …) marks stale. The step's effect uncertainty (`unfinished`) is cleared only by a valid post-step snapshot AND an acknowledged `STEP_ENDED`; logging `STEP_ENDED { state:null }` no longer clears it. So an invoked reservation / capture / recording step without an accepted post snapshot yields `effectsKnown:false` and at least `reservedNotConfirmed` / `captured` / `confirmed` (cleanup keeps its entry key, raised to `reservedNotConfirmed` by the §6.2 null rule), even when the lifecycle reports outstanding `NONE`. No refresh, retry or reconstruction SQL after a failure.
+
+**R-E3 — terminal failure.** A terminal append that is rejected / times out / is unobservable / is acknowledged with a wrong `{seq, hash}` now calls `stop(<JOURNAL_FAILURE | TIMEOUT_JOURNAL | GUARD_*>)` (first cause wins, so an earlier stop code is preserved). On a planned-success path `ended()` then returns a FAILED result:
+- `ok:false`, `outcome:'STOPPED'`, `stopCode` = the journal cause, `journalTerminal:'unknown'` (or `'not_attempted'` if the record could not even be built: `CLOCK_INVALID` / `JOURNAL_RECORD_INVALID`);
+- `ownerCleanupRequired` = the planned outcome's exact key (the acknowledged designation is kept); `writes` / `countsAsOf` / `effectsKnown` describe the last acknowledged DB facts (the uncertainty is the journal, not the DB);
+- exactly one terminal attempt — no replacement `RUN_STOPPED`. Whether the attempted `RUN_ENDED` landed is decided by the next invocation's start rule (`RUN_ENDED` if landed, else `RESTART_AMBIGUOUS`; both zero workers).
+
+`RunResult.outcome` is therefore a planned outcome ONLY when `ok:true` (terminal acknowledged); `'STOPPED'` / `'REFUSED'` otherwise, always with a non-null `stopCode`.
+
+**New / changed regression cases:** E24 (R-E1 a/b + initial abort), E25 (R-E1c: abort during the final recording write, abort during the final `PHASE_ENDED`, lock loss during the final capture step, abort during the final cleanup void), E26 (R-E2: acknowledged `FACT_MALFORMED` post-step refusal after a genuinely applied create / capture / offline-charge write — a TEST-ONLY row mutation on C's exact `INTENT` statement), E27 (R-E3: `reject` / `hang` / `late` / `landed_hang` / invalid ack on the planned `ENDED_RESERVED_NOT_CAPTURED` path, plus the next invocation). Updated: E21 (no new snapshot after cancellation: `state:null`, stale, key), E18 (effects unknown after a failed `STEP_ENDED`), E15 (stale). E19 keeps the earlier-cause case (`OWNER_DECLINED` survives a terminal failure).
+
+**Validation (CLAUDE-RUN):**
+- RED on exact `6e253977` (core unchanged, new suite): 22/27 — the 5 correction cases fail (E21, E24, E25, E26, E27): e.g. E24 core invoked the worker after an observed abort, E25 returned `ENDED_CONFIRMED` after cancellation in the final step, E26 `effectsKnown:true` / key null after an acknowledged refusal, E27 `ENDED_RESERVED_NOT_CAPTURED` with `stopCode:null` on a rejected terminal. TAP retained.
+- GREEN (first full TAP of the corrected head): **27/27** (≈ 90 s), first full run of the corrected head; TAP retained.
+- Units + adapters + pins 132/132; `npm test` 797/797. Full `test:db` not run. e74a not reproduced.

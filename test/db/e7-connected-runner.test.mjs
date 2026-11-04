@@ -285,6 +285,7 @@ class FaultPool {
   apply(f, real, client) {
     if (f.mode === "reject") return Promise.reject(synthErr());
     if (f.mode === "hang") return new Promise(() => {});
+    if (f.mode === "mutate") return (async () => f.fn(await real()))();                            // real statement, TEST-ONLY altered rows
     return (async () => { const r = await real(); await f.fn(client, this); return r; })();     // "after": real statement, then the hook
   }
   async connect() {
@@ -377,6 +378,7 @@ async function scenario(o = {}) {
   const j = jm ? jm.journal : null;
   S.journal = j && {
     append: (rec) => {
+      if (o.override && o.override[rec.event]) { tl.push(`J:${rec.event}`); return o.override[rec.event](rec); }   // TEST-ONLY ack override
       tl.push(`J:${rec.event}${rec.phase ? `:${rec.phase}` : ""}${rec.attestation ? `:${rec.attestation.checkpoint}` : ""}`);
       const h = S.hooks[rec.event];
       return h ? (async () => { await h(S, rec); return j.append(rec); })() : j.append(rec);
@@ -741,7 +743,7 @@ test("E15. post-result tail never settles in the bound → LATE_TAIL_OUTSTANDING
   const ev = await S.events();
   assert.deepEqual(ev.slice(-2).map((e) => e.split(":").slice(0, 2).join(":")), ["STEP_ENDED:reservation", "RUN_STOPPED"], "STEP_ENDED logged, then the stop");
   const recs = await S.records();
-  assert.deepEqual([recs.at(-2).state, recs.at(-1).outstanding], [null, "TAIL"], "STEP_ENDED state null (no post-step snapshot), stop with TAIL");
+  assert.deepEqual([recs.at(-2).state, recs.at(-1).outstanding, r.countsAsOf.stale], [null, "TAIL", true], "STEP_ENDED state null (no post-step snapshot), stop with TAIL, counts stale");
   await journalValid(S);
   assert.equal((await settledWithin(r.finalize(), 200)).settled, false);
   g.release();
@@ -854,7 +856,10 @@ test("E18. journal append fails mid-run (RUN_STARTED / STEP_STARTED / STEP_ENDED
     assert.equal(S.tl.filter((x) => x === "J:STEP_STARTED:reservation").length, n >= 3 ? 1 : 0, `${label}: at most the one logged step`);
     const creates = S.t.count(/^GET \/v1\/listings\//);
     assert.ok(steps === 0 ? creates === 0 : creates > 0, `${label}: ${steps === 0 ? "no worker step" : "exactly the logged step ran"}`);
-    if (n === 4) assert.ok(!S.tl.slice(S.tl.indexOf("J:STEP_ENDED:reservation") + 1).some((x) => x.startsWith("J:")), `${label}: no further step / append`);
+    if (n === 4) {
+      assert.ok(!S.tl.slice(S.tl.indexOf("J:STEP_ENDED:reservation") + 1).some((x) => x.startsWith("J:")), `${label}: no further step / append`);
+      assert.deepEqual([r.effectsKnown, r.ownerCleanupRequired], [false, "reservedNotConfirmed"], `${label}: an invoked step whose end was never logged`);
+    }
     await settledWithin(r.finalize(), 3000);
     await S.cleanup();
   }
@@ -905,9 +910,11 @@ test("E21. signal aborted during a step → the step is observed to its end (wor
   const orig = w.pricing.get; let done = false;
   w.pricing.get = async (...a) => { if (!done) { done = true; S.ac.abort(); } return orig(...a); };
   const r = await S.run();
-  assert.deepEqual([r.outcome, r.stopCode, r.outstanding], ["STOPPED", "CANCELLED", "NONE"], JSON.stringify(plainResult(r)));
+  assert.deepEqual([r.outcome, r.stopCode, r.outstanding, r.effectsKnown, r.countsAsOf.stale, r.ownerCleanupRequired], ["STOPPED", "CANCELLED", "NONE", false, true, "reservedNotConfirmed"],
+    JSON.stringify(plainResult(r)));
   const ev = await S.events();
   assert.ok(ev[ev.length - 2].startsWith("STEP_ENDED:reservation"), "the aborted step ran to its end and was logged");
+  assert.equal((await S.records()).at(-2).state, null, "R-E1: no NEW snapshot after the observed cancellation (state null, counts stale)");
   assert.equal(ev.filter((e) => e.startsWith("STEP_STARTED")).length, 1, "no step after the abort");
   await journalValid(S);
   assert.equal((await r.finalize()).lockRelease, "unlocked");
@@ -920,6 +927,132 @@ test("E22. the phase budget cannot cover the next step deadline → BUDGET_EXHAU
   assert.equal((await S.events()).filter((e) => e.startsWith("STEP_STARTED")).length, 1, "the next step never started");
   await journalValid(S);
   assert.equal((await r.finalize()).lockRelease, "unlocked");
+});
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// ROOT CODE REVIEW HOLD on 6e253977 — R-E1 / R-E2 / R-E3 regressions (red on 6e253977, green after the correction)
+test("E24 (R-E1). stop boundaries before every new owned client / query / worker start: initial abort; loss during S1; abort / loss after an acknowledged STEP_STARTED", async () => {
+  {
+    const S = await scenario(); S.ac.abort();
+    const r = await S.run();
+    assert.deepEqual([r.outcome, r.stopCode], ["REFUSED", "CANCELLED"]);
+    assert.deepEqual([S.report.connects, S.app.connects, S.t.h.length + S.t.s.length, S.jm.controls.appendCalls(), S.attestCalls.length], [0, 0, 0, 0, 0], "initial abort: zero DB / worker / journal / attest");
+    await r.finalize();
+  }
+  {
+    const S = await scenario();
+    S.report.addFault({ kind: "query", sql: SQL.SAME_DB, mode: "after", fn: async (c) => { await terminate(c); } });   // loss observed during S1, valid rows returned
+    const r = await S.run();
+    assert.deepEqual([r.outcome, r.stopCode, r.exclusion], ["REFUSED", "LOCK_LOST", "lost"]);
+    assert.equal(S.app.connects, 0, "no app client / query after the observed loss");
+    assert.deepEqual(S.report.sqlLog(), [SQL.LOCK, SQL.SAME_DB]);
+    assert.equal((await r.finalize()).lockRelease, "lost");
+  }
+  for (const kind of ["abort", "loss"]) {
+    const S = await scenario({ hooks: { STEP_STARTED: async (S0) => { S0.appAt = S0.app.log.length; if (kind === "abort") S0.ac.abort(); else await terminate(S0.report.clients[0]); } } });
+    const r = await S.run();
+    assert.deepEqual([r.outcome, r.stopCode, r.outstanding, r.effectsKnown], ["STOPPED", kind === "abort" ? "CANCELLED" : "LOCK_LOST", "NONE", false], `${kind}: ${JSON.stringify(plainResult(r))}`);
+    assert.equal(S.app.log.length, S.appAt, `${kind}: the worker was never invoked after the acknowledged STEP_STARTED`);
+    assert.equal(S.app.connects, S.app.clients.length);
+    assert.equal(S.t.h.length + S.t.s.length, 0, `${kind}: zero transport calls`);
+    assert.deepEqual((await S.events()).slice(-2), ["STEP_STARTED:reservation", "RUN_STOPPED"]);
+    await journalValid(S);
+    assert.equal((await r.finalize()).lockRelease, kind === "abort" ? "unlocked" : "lost");
+  }
+});
+
+test("E25 (R-E1c). cancellation / loss during a FINAL step or its awaited boundary never falls into a successful end", async () => {
+  {   // abort during the final recording step's (applied) offline-charge write
+    const w = world(); const bk = await authorizedBooking(w);
+    const S = await scenario({ w, bk, clock: "real" });
+    const orig = w.exec.W.createOfflineCharge;
+    w.exec.W.createOfflineCharge = async (...a) => { S.ac.abort(); return orig(...a); };
+    const r = await S.run();
+    assert.deepEqual([r.ok, r.outcome, r.stopCode, r.effectsKnown, r.countsAsOf.stale, r.ownerCleanupRequired], [false, "STOPPED", "CANCELLED", false, true, "confirmed"], JSON.stringify(plainResult(r)));
+    assert.equal(w.writes.createOfflineCharge, 1, "the running worker completed its write (never interrupted)");
+    const recs = await S.records();
+    assert.deepEqual([recs.at(-2).event, recs.at(-2).phase, recs.at(-2).state, recs.at(-1).event], ["STEP_ENDED", "recording", null, "RUN_STOPPED"]);
+    await journalValid(S);
+    assert.equal((await r.finalize()).lockRelease, "unlocked");
+  }
+  {   // abort during the final phase's PHASE_ENDED append (facts acknowledged, then the boundary)
+    const S = await scenario({ clock: "real", hooks: { PHASE_ENDED: async (S0, rec) => { if (rec.phase === "recording") S0.ac.abort(); } } });
+    const r = await S.run();
+    assert.deepEqual([r.ok, r.outcome, r.stopCode, r.effectsKnown, r.ownerCleanupRequired], [false, "STOPPED", "CANCELLED", true, "confirmed"], JSON.stringify(plainResult(r)));
+    assert.deepEqual((await S.events()).slice(-2), ["PHASE_ENDED:recording:confirmed", "RUN_STOPPED"]);
+    await journalValid(S);
+    assert.equal((await r.finalize()).lockRelease, "unlocked");
+  }
+  {   // lock loss during the final capture step (recording:false)
+    const w = world(); const bk = await authorizedBooking(w);
+    const S = await scenario({ w, bk, clock: "real", phases: { capture: true, recording: false } });
+    const orig = w.exec.C.capturePaymentIntent;
+    w.exec.C.capturePaymentIntent = async (...a) => { await terminate(S.report.clients[0]); return orig(...a); };
+    const r = await S.run();
+    assert.deepEqual([r.ok, r.outcome, r.stopCode, r.exclusion, r.effectsKnown, r.ownerCleanupRequired], [false, "STOPPED", "LOCK_LOST", "lost", false, "captured"], JSON.stringify(plainResult(r)));
+    assert.equal(w.writes.capturePaymentIntent, 1);
+    await journalValid(S);
+    assert.equal((await r.finalize()).lockRelease, "lost");
+  }
+  {   // abort during the final cleanup step's void (reservation_failed path)
+    const w = world(); const bk = await authorizedBooking(w); w.nightly += 25;
+    const S = await scenario({ w, bk });
+    const orig = w.exec.K.cancelPaymentIntent;
+    w.exec.K.cancelPaymentIntent = async (...a) => { S.ac.abort(); return orig(...a); };
+    const r = await S.run();
+    assert.deepEqual([r.ok, r.outcome, r.stopCode, r.effectsKnown], [false, "STOPPED", "CANCELLED", false], JSON.stringify(plainResult(r)));
+    assert.equal(r.ownerCleanupRequired, "reservedNotConfirmed", "§6.2: never null without known effects");
+    assert.ok(!(await S.events()).includes("RUN_ENDED"));
+    await journalValid(S);
+    assert.equal((await r.finalize()).lockRelease, "unlocked");
+  }
+});
+
+test("E26 (R-E2). an ACKNOWLEDGED C refusal after a genuinely applied mock write → effects unknown, counts stale, phase key (reservation / capture / recording)", async () => {
+  const malformed = (rows) => rows.map((x) => ({ ...x, ref: "not-a-ref" }));
+  for (const [phase, step, opts, key, write] of [
+    ["reservation", 2, { clock: "real", phases: { capture: false, recording: false } }, "reservedNotConfirmed", "createReservation"],
+    ["capture", 1, { clock: "real", phases: { capture: true, recording: false } }, "captured", "capturePaymentIntent"],
+    ["recording", 1, { clock: "real" }, "confirmed", "createOfflineCharge"]
+  ]) {
+    const S = await scenario({ ...opts, hooks: { STEP_STARTED: async (S0, rec) => {
+      // TEST-ONLY fault: the NEXT intent statement (= this step's post-step snapshot) returns a malformed row; C refuses and COMMITs
+      if (rec.phase === phase && rec.step === step) S0.report.addFault({ kind: "query", sql: FACTS_SQL.INTENT, mode: "mutate", fn: (res) => ({ ...res, rows: malformed(res.rows) }) });
+    } } });
+    const r = await S.run();
+    assert.deepEqual([r.outcome, r.stopCode, r.effectsKnown, r.countsAsOf.stale, r.ownerCleanupRequired, r.outstanding], ["STOPPED", "FACT_MALFORMED", false, true, key, "NONE"],
+      `${phase}: ${JSON.stringify(plainResult(r))}`);
+    assert.equal(S.w.writes[write], 1, `${phase}: the mock really applied the write`);
+    const recs = await S.records();
+    assert.deepEqual([recs.at(-2).event, recs.at(-2).phase, recs.at(-2).state], ["STEP_ENDED", phase, null]);
+    assert.deepEqual([recs.at(-1).effectsKnown, recs.at(-1).ownerCleanupRequired], [false, key]);
+    assert.equal(S.report.clients.at(-1).events.at(-1), "release()", `${phase}: the refusal was acknowledged (healthy client), no DB family`);
+    await journalValid(S);
+    assert.equal((await r.finalize()).lockRelease, "unlocked");
+  }
+});
+
+test("E27 (R-E3). terminal append failure on a PLANNED-SUCCESS path → failed run with the journal cause; one terminal attempt; designation kept", async () => {
+  for (const [label, faults, override, code, next] of [
+    ["reject", { append: { 9: "reject" } }, null, "JOURNAL_FAILURE", "RESTART_AMBIGUOUS"],
+    ["hang", { append: { 9: "hang" } }, null, "TIMEOUT_JOURNAL", "RESTART_AMBIGUOUS"],
+    ["late", { append: { 9: "late" } }, null, "TIMEOUT_JOURNAL", "RESTART_AMBIGUOUS"],
+    ["landed_hang", { append: { 9: "landed_hang" } }, null, "TIMEOUT_JOURNAL", "RUN_ENDED"],
+    ["invalid ack", undefined, { RUN_ENDED: (rec) => Promise.resolve({ seq: rec.seq, hash: "0".repeat(64) }) }, "JOURNAL_FAILURE", "RESTART_AMBIGUOUS"]
+  ]) {
+    const w = world(); const bk = await authorizedBooking(w);
+    const S = await scenario({ w, bk, clock: "real", phases: { capture: false, recording: false }, journalFaults: faults, override,
+      hooks: { RUN_ENDED: async (S0, rec) => { S0.endSeq = rec.seq; } } });
+    const r = await S.run();
+    assert.equal(S.endSeq ?? (await S.records()).length + 1, 9, `${label}: TEST-SETUP precondition — RUN_ENDED is append call 9`);
+    assert.deepEqual([r.ok, r.outcome, r.stopCode, r.journalTerminal, r.ownerCleanupRequired], [false, "STOPPED", code, "unknown", "reservedNotConfirmed"], `${label}: ${JSON.stringify(plainResult(r))}`);
+    assert.equal(S.tl.filter((x) => x.startsWith("J:")).length, 9, `${label}: exactly one terminal attempt, no replacement RUN_STOPPED`);
+    assert.equal((await r.finalize()).lockRelease, "unlocked");
+    const S2 = await scenario({ w, bk, manifest: S.manifest, jm: S.jm });
+    const r2 = await S2.run();
+    assert.deepEqual([r2.outcome, r2.stopCode, S2.t.h.length + S2.t.s.length], ["REFUSED", next, 0], `${label}: next invocation`);
+    await r2.finalize();
+  }
 });
 
 test("E23. source pins: exact imports; no runner timers / env / fs / fetch / Date; no pinned identifiers; SQL limited to the three statements", () => {

@@ -189,9 +189,14 @@ export async function runConnectedTest(input) {
     if (guard.broken()) return stop(guard.broken());
     return null;
   };
+  /** R-E1: the stop check before EVERY new runner operation (owned client, statement, snapshot, journal read, attestation, worker start,
+   *  successful end). Once any stop cause exists, or loss / cancellation / a broken guard is observed, nothing new starts; the only later
+   *  operation is the single terminal append. An operation already started (a C snapshot, a running worker) is observed to its end. */
+  const blocked = () => S.cause !== null || boundary() !== null;
 
   // ---------------- clients (B ownership, §12.2) ----------------
   async function acquire(pool, onLoss) {
+    if (blocked()) return { pre: true };
     const connect = dataMethod(pool, "connect");
     const d = deadline(LIMITS.CONNECT_MS);
     if (d === null) return { fail: guardCode() };
@@ -204,15 +209,18 @@ export async function runConnectedTest(input) {
     if (!t.ok) return { fail: "DB_FAILURE" };
     return { client: c, query, tracker: t.tracker, release: () => { t.tracker.dispose(); if (t.tracker.state() === "open") { try { apply(rel, c, []); } catch { t.tracker.destroy(); } } } };
   }
-  const statement = (h, sql, params, ms = LIMITS.STATEMENT_MS) => observeMapped(ms, () => apply(h.query, h.client, [sql, params]), { rejected: "DB_FAILURE", timeout: "TIMEOUT_DB_READ" });
+  const statement = (h, sql, params, ms = LIMITS.STATEMENT_MS) => (blocked() ? Promise.resolve({ pre: true })
+    : observeMapped(ms, () => apply(h.query, h.client, [sql, params]), { rejected: "DB_FAILURE", timeout: "TIMEOUT_DB_READ" }));
   /** one C report snapshot on a fresh client; disposition honoured exactly */
   async function snapshot() {
     const h = await acquire(pools.report, () => {});
+    if (h.pre) return { stop: S.cause };
     if (h.fail) return dbStop(h.fail);
     const d = deadline(LIMITS.SNAPSHOT_MS);
     if (d === null) { h.tracker.destroy(); return stop(guardCode()); }
     const r = await readRunSnapshot({ client: h.client, intentId: identity.intentId, guard, deadline: d });
-    if (r.ok) { h.release(); S.lastFacts = r.facts; S.countsSeq = S.head.seq; return { facts: r.facts }; }
+    if (r.ok) { h.release(); S.lastFacts = r.facts; S.countsSeq = S.head.seq; S.stale = false; return { facts: r.facts }; }   // R-E2: only a valid snapshot clears stale
+    if (S.started) S.stale = true;                            // R-E2: ANY unsuccessful observation (incl. an acknowledged refusal) leaves counts stale
     if (r.clientDisposition === "destroy") { h.tracker.destroy(); return dbStop(r.code); }
     h.release();
     if (r.failure === "not_started") return stop(r.code === "SNAPSHOT_BUDGET_EXHAUSTED" ? "BUDGET_EXHAUSTED" : r.code);
@@ -220,6 +228,7 @@ export async function runConnectedTest(input) {
   }
   async function guest() {
     const h = await acquire(pools.app, () => {});
+    if (h.pre) return { stop: S.cause };
     if (h.fail) return dbStop(h.fail);
     const d = deadline(LIMITS.STATEMENT_MS);
     if (d === null) { h.tracker.destroy(); return stop(guardCode()); }
@@ -244,7 +253,8 @@ export async function runConnectedTest(input) {
     const ackOk = !r.fail && r.value !== null && typeof r.value === "object" && getDesc(r.value, "seq")?.value === rec.seq && getDesc(r.value, "hash")?.value === expect;
     if (!ackOk) {
       S.journalOk = false;                                   // no later append, ever (a late landing stays uncertain)
-      if (terminal) S.journalTerminal = "unknown"; else stop(r.fail || "JOURNAL_FAILURE");
+      if (terminal) S.journalTerminal = "unknown";          // attempted once, outcome unknown; never repaired by another terminal
+      stop(r.fail || "JOURNAL_FAILURE");                     // R-E3: first cause wins (an earlier stop code is kept)
       return false;
     }
     S.head = { seq: rec.seq, hash: expect };
@@ -252,6 +262,7 @@ export async function runConnectedTest(input) {
     return true;
   }
   const attestCheckpoint = async (checkpoint) => {
+    if (blocked()) return { stop: S.cause };
     const request = freeze({ checkpoint, runId: identity.runId, intentId: identity.intentId, manifestHash: identity.manifestHash });
     const r = await observeMapped(LIMITS.ATTEST_MS, () => apply(attest, undefined, [checkpoint, request, { signal }]), { rejected: "ATTESTATION_FAILED", timeout: "TIMEOUT_ATTEST" });
     if (r.fail) return stop(r.fail);
@@ -292,12 +303,15 @@ export async function runConnectedTest(input) {
     return result("STOPPED", { outcome: "STOPPED", ownerCleanupRequired: k, effectsKnown });
   }
   async function ended(outcome, key) {
+    if (blocked()) return stopped();                          // R-E1c: a cancellation / loss observed at the last boundary is never a success
     const ls = lc.snapshot();
-    S.outcome = outcome;
     const ok = await append("RUN_ENDED", { outcome, outstanding: "NONE", effectsKnown: true, exclusion: ls.exclusion === "lost" ? "lost" : "held", ownerCleanupRequired: key,
       writes: countWrites(S.lastFacts) });
-    if (!ok && S.journalTerminal !== "unknown") { S.outcome = null; return stopped(); }
-    return result("ENDED", { outcome, ownerCleanupRequired: key, ok: S.journalTerminal === "acknowledged" });
+    // R-E3: an unacknowledged / unattempted terminal is a FAILED run carrying the journal cause (stopCode); the acknowledged facts and the
+    // outcome's cleanup designation are kept; journalTerminal says whether the single attempt's landing is unknown. No second terminal.
+    if (!ok) return result("STOPPED", { outcome: "STOPPED", ownerCleanupRequired: key, ok: false });
+    S.outcome = outcome;
+    return result("ENDED", { outcome, ownerCleanupRequired: key, ok: true });
   }
 
   // =======================================================================================================================
@@ -305,6 +319,7 @@ export async function runConnectedTest(input) {
   S.phaseDeadline = (nowOr() ?? 0) + P0_BUDGET_MS;
   {
     const h = await acquire(pools.report, () => { S.lockLostEarly = true; lc.lockLost(); });
+    if (h.pre) return refused();
     if (h.fail) { stop(h.fail); lc.markDbFamily(); return refused(); }
     S.lockClient = h;
     const lr = await statement(h, SQL.LOCK, [LOCK_KEY], LIMITS.LOCK_ACQUIRE_MS);
@@ -318,13 +333,16 @@ export async function runConnectedTest(input) {
   }
   {
     const s1 = await statement(S.lockClient, SQL.SAME_DB, []);
+    if (s1.pre) return refused();
     if (s1.fail) { lc.markDbFamily(); stop(s1.fail); return refused(); }
     const a = rowsOf(s1.value);
     const c1 = checkSameDatabase(a, [{ environment: "test", is_app: true, is_report: false, privileged: false }]);
     if (!c1.ok && c1.code !== "POOLS_MISMATCH") { stop(c1.code); return refused(); }      // S1 refusals before any app client
     const app = await acquire(pools.app, () => {});
+    if (app.pre) return refused();
     if (app.fail) { lc.markDbFamily(); stop(app.fail); return refused(); }
     const s2 = await statement(app, SQL.SAME_DB, []);
+    if (s2.pre) { app.tracker.destroy(); return refused(); }
     if (s2.fail) { app.tracker.destroy(); lc.markDbFamily(); stop(s2.fail); return refused(); }
     const b = rowsOf(s2.value);
     app.release();
@@ -332,7 +350,7 @@ export async function runConnectedTest(input) {
     if (!c2.ok) { stop(c2.code); return refused(); }
   }
   {
-    const rb = boundary(); if (rb) return refused();
+    if (blocked()) return refused();
     const jr = await observeMapped(LIMITS.JOURNAL_MS, () => apply(journalRead, journal, []), { rejected: "JOURNAL_FAILURE", timeout: "TIMEOUT_JOURNAL" });
     if (jr.fail) { stop(jr.fail); return refused(); }
     const v = evaluateStart(jr.value, identity, o.trustedHead === null ? undefined : { trustedHead: o.trustedHead });
@@ -340,7 +358,7 @@ export async function runConnectedTest(input) {
     if (!v.ok) { stop(v.code); return refused(); }
   }
   {
-    const rb = boundary(); if (rb) return refused();
+    if (blocked()) return refused();
     const s = await snapshot();
     if (s.stop) return refused();
     const f = s.facts; const i = f.intent; const m = manifest;
@@ -446,10 +464,12 @@ export async function runConnectedTest(input) {
       const ledger = createLedger();
       const wrapped = wrapExecutors(built.executors, ledger);
       if (!wrapped.ok) return stop("EXECUTORS_INVALID");
+      if (blocked()) return { stop: S.cause };                // R-E1b: re-checked after prepare / guest read, before STEP_STARTED
       if (!(await append("STEP_STARTED", { phase, step, factory: { phase: prep.factoryPhase, reservationId: prep.reservationId } }))) return { stop: S.cause };
-      S.unfinished = true;
+      S.unfinished = true;                                    // cleared only by a valid post-step snapshot + an acknowledged STEP_ENDED
+      if (blocked()) return { stop: S.cause };                // R-E1b: and IMMEDIATELY before the worker is invoked (no start after a detected stop)
       const sd = nowOr(); if (sd === null) return stop(guardCode());
-      const r = await lc.observeStep({ phase, deadline: Math.min(sd + L.stepBudgetMs + LIMITS.STEP_MARGIN_MS, S.phaseDeadline), ledger, start: () => prep.run(wrapped.executors) });
+      const r = await lc.observeStep({ phase, deadline: Math.min(sd + L.stepBudgetMs + LIMITS.STEP_MARGIN_MS, S.phaseDeadline), ledger, start: () => { S.stale = true; return prep.run(wrapped.executors); } });   // R-E2: an invoked step can change facts
       if (r.kind !== "fulfilled") {
         S.stale = true;
         if (r.kind === "rejected") { S.rejected = true; lc.markDbFamily(); return stop("DB_FAILURE"); }
@@ -470,12 +490,12 @@ export async function runConnectedTest(input) {
         const t = td === null ? { kind: "observation_failed" } : await lc.observeTail(td);
         if (t.kind !== "settled") {
           S.stale = true;
-          if (await append("STEP_ENDED", stepEnded(null, lastW()))) S.unfinished = false;
+          await append("STEP_ENDED", stepEnded(null, lastW()));   // logged, but effects stay unknown (S.unfinished kept)
           return stop(t.kind === "unobservable" || t.kind === "timeout" ? "LATE_TAIL_OUTSTANDING" : (t.code || guardCode()));
         }
       }
       const post = await snapshot();
-      if (post.stop) { if (await append("STEP_ENDED", stepEnded(null, lastW()))) S.unfinished = false; return post; }
+      if (post.stop) { await append("STEP_ENDED", stepEnded(null, lastW())); return post; }   // R-E2: no accepted post snapshot ⇒ effects unknown
       if (!(await append("STEP_ENDED", stepEnded(post.facts.intent.state, countWrites(post.facts))))) return { stop: S.cause };
       S.unfinished = false;
       const refusals = ledger.snapshot().refusals;
