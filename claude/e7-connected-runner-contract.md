@@ -1,4 +1,4 @@
-# E7 local connected-test RUNNER — CONTRACT, revision 9 (Slices A–D ACCEPTED; Slice E core IMPLEMENTED offline; HOLD R-E1–R-E3 corrected; R-E1d acquisition handoff corrected, pending root CODE re-review)
+# E7 local connected-test RUNNER — CONTRACT, revision 9 (Slices A–E ACCEPTED offline; next: file-journal contract, DOCS ONLY)
 
 **Branch** `feature/e7-connected-run-core`, cut from exact `ea830a62` (revision 8, root DESIGN ACCEPTED). Slice E changes exactly three files: new `scripts/e7-connected/run-core.mjs`, new `test/db/e7-connected-runner.test.mjs`, and this contract (status + §13). Revision 8 (`feature/e7-connected-core-contract`, from `d5a93e0f`) was docs only.
 
@@ -21,6 +21,8 @@
 - Revision 9 (this file) records the implemented Slice E (§13): `runConnectedTest` + `checkSameDatabase` in `run-core.mjs`, and the disposable-PG suite E1–E23. All results are **CLAUDE-RUN** (root cannot run PG). Pending root CODE review.
 - Root CODE REVIEW **HOLD** on `6e253977` (R-E1 stop boundaries, R-E2 post-step observation, R-E3 terminal failure). Corrections on the same branch (fast-forward), recorded in §13.5; suite now E1–E27. Pending root CODE re-review.
 - Root CODE RE-REVIEW at `d16b57ec`: R-E2 / R-E3 CLOSED; narrow HOLD R-E1d (acquisition handoff). Corrected on the same branch (fast-forward), §13.6; suite E1–E28.
+- Root CODE RE-REVIEW **ACCEPTED** offline Slice E at `dfdbc32c` (root reran five exact-core synthetic probes and A/B/D 59/59; PG 34/34, units + pins 132, `npm test` 797 are CLAUDE-RUN). R-E1 (incl. d), R-E2, R-E3 CLOSED. A–E ACCEPTED offline; no live readiness implied.
+- **Next slice pointer (status only):** the owner-run local FILE JOURNAL is specified, DOCS ONLY, in `claude/e7-connected-file-journal-contract.md` (branch `feature/e7-connected-file-journal-contract` from `dfdbc32c`; proposed Slice F; not implemented, not authorized). Nothing in this contract changes.
 
 **Citation convention.**
 - Current interfaces are cited by **file:line at `d5a93e0f`**: workers under `lib/booking-db/`, runner modules under `scripts/e7-connected/`.
@@ -47,7 +49,8 @@ Those are independent, CLOSED slices. All owner inputs stay **UNSET**. Live gate
 | Slice D: `run-journal-memory` (memory journal, record / chain / start validation) | **ACCEPTED** (`d5a93e0f`) | §2.5, §8 |
 | Import boundary (A) | **CLOSED** root decision | §2.0 |
 | Core integration decisions: same-DB check, ownership, journal emission, per-step bindings | **Resolved as a proposal in this revision** | §12 |
-| Slice E: `run-core` + disposable-PG runner test | **IMPLEMENTED offline** at `feature/e7-connected-run-core`; pending root CODE review | §9.4, §13 |
+| Slice E: `run-core` + disposable-PG runner test | **ACCEPTED offline** (`dfdbc32c`) | §9.4, §13 |
+| File journal (proposed Slice F) | **Contract only** (DOCS), `claude/e7-connected-file-journal-contract.md`; not implemented, not authorized | separate contract |
 | File journal, real transports, credentials, Stripe ingress, CLI, read-only provider probes | **CLOSED**, separate slices | §9.4 |
 
 ## 1. Present runtime vs accepted foundation vs proposed core
