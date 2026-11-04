@@ -1,4 +1,6 @@
-# E7 connected-test orchestration + live-gate manifest — CONTRACT (DOCS ONLY, all changes PROPOSED)
+# E7 connected-test orchestration + live-gate manifest — CONTRACT (all changes PROPOSED)
+
+**Status (2026-11-04):** root ACCEPTED `1df87d5a` as a conditional OFFLINE planning baseline (not a live approval package), with the cleanup-wording corrections applied below. The offline / injected-fake executor-adapter foundation is implemented on `feature/e7-connected-executor-adapters` (§9; pending root CODE review). Every live gate stays CLOSED; every owner input stays UNSET.
 
 **Branch** `feature/e7-connected-test-manifest`, cut from exact `62843150ad36c2db75a6819811c1d4f634ee5156`. **Runtime baseline** `ede4c43c25f9c025c540ba1f26a766eef5845556` (unchanged; not merged, deployed or live). Every source citation is at that runtime baseline.
 **What this is.** A conditional plan for ONE manually run, owner-supervised connected test, concrete enough for root design review. **What it is not:**
@@ -20,7 +22,7 @@ No notification or owner-alert transport is supplied, so queued outbox rows stay
 
 | Mode | Hostaway | Stripe | How the intent reaches `payment_authorized` | What it proves | What it cannot prove / risks |
 |---|---|---|---|---|---|
-| **H-real / S-mock** | real account | in-memory mock (as the rehearsals) | authorization FIXTURE: `applyEvent(PAYMENT_AUTHORIZED)` with a synthetic PI, as in the E7 rehearsals | the reservation worker's real create / lookup / read path; and, if cleanup is a pre-capture refusal, the real host cancel | **No card, no Stripe shape.** Capture would be mock-only. Recording would then write a REAL "paid" Hostaway row for money that never existed, so in this mode recording **must be excluded** (stop at `payment_captured` is not acceptable either, §4) |
+| **H-real / S-mock** | real account | in-memory mock (as the rehearsals) | authorization FIXTURE: `applyEvent(PAYMENT_AUTHORIZED)` with a synthetic PI, as in the E7 rehearsals | the reservation worker's real create / lookup / read path. **No automated exit for a successful reservation:** a pre-reservation refusal (`reservation_failed`) is an authorization void only (mock here), and this mode must not manufacture `capture_failed` or cancel a successfully reserved booking to fake an exit. A real reservation left standing needs an explicitly approved cleanup procedure even with no capture | **No card, no Stripe shape.** Capture would be mock-only. Recording would then write a REAL "paid" Hostaway row for money that never existed, so in this mode recording **must be excluded** (stop at `payment_captured` is not acceptable either, §4) |
 | **H-real / S-TEST** | real account | Stripe TEST account, real TEST API | a real TEST Checkout Session completed with a TEST card, then a verified `checkout.session.completed` processed by the accepted handler (`processVerifiedStripeEvent`, `lib/checkout/stripe-test-webhook.js:102`). Ingress is an open root choice (§5.4) | real TEST PaymentIntent shapes for capture / void (`capture-proof.js:84–107`; `compensation-proof.js:184`) and real Hostaway; with recording, the offline-charge create shape | **TEST money only.** A captured TEST charge plus a real Hostaway `status: "paid"` offline charge (`offline-charge-proof.js:373–375`) records a **TEST artifact as if paid**. That artifact and its review / cleanup must be in the consolidated approval (§4.3) |
 | **S-LIVE** | — | live | — | — | **Refused by code**: `CHARGE_NOT_TEST_MODE` (`capture-proof.js:97`, `compensation-proof.js:184`), webhook `LIVEMODE_REFUSED` (`stripe-test-webhook.js:108`), `stripeTestGate` (`stripe-test-mode.js:45–49`). Out of scope; no proposal flips livemode |
 
@@ -45,7 +47,7 @@ A mock authorization is never evidence of a real card payment. A TEST capture is
 | P3 | Reservation | `runOrchestratorStep` (`reservation-worker.js:585`), ≤ N steps (N fixed in the runner contract; each step bounded by `DEFAULT_TIMEOUTS`, `:78`) | **one create** max (`hcreate:{intent}`, non-idempotent, `repo.js:97–98`) | `reservation_confirmed` → Joel attests the **Airbnb block** (G9 checkpoint 1). `reservation_failed` → P6 |
 | P4 | Capture | `runCaptureStep` (`capture-worker.js:600`; states `:47`) | **one capture** per accepted capture row (idempotency key `intent-state.js:251`) | `payment_captured`, else stop per §4.2 |
 | P5 | Recording (U only; excluded in S-mock) | `runRecordingStep` (`recording-worker.js:598`); only the initial `och:{intent}:1` is ever eligible (`offline-charge-proof.js:21`) | **one create** max | `confirmed` → P7 (cleanup of a confirmed booking: manual, §4.3) |
-| P6 | Failure compensation (only `reservation_failed` / `capture_failed`, `compensation-worker.js:50`) | `runCleanupStep` (`compensation-worker.js:643`) | one void + one cancel max | `authorization_released` / `cancelled` → Joel attests the **Airbnb reopen** (G9 checkpoint 2) |
+| P6 | Failure compensation (only `reservation_failed` / `capture_failed`, `compensation-worker.js:50`), state-specific (`compensation-worker.js:103–107`) | `runCleanupStep` (`compensation-worker.js:643`) | `reservation_failed`: one authorization void max. `capture_failed`: the void (if the authorization is still unsettled) and the host cancel (if the reservation is not yet cancelled), per the accepted compensation plan, one each max | `authorization_released` / `cancelled` → Joel attests the **Airbnb reopen** (G9 checkpoint 2) |
 | P7 | Report | journal close: phase decisions, provider-write counts, final states, Airbnb attestations, outbox rows still queued | — | root review of the journal |
 
 **Maintenance:** only the accepted scoped forms (`recoverExpiredOperations` with `opTypes`, `intentId` and `listingIds`, `operations.js:441`), plus the workers' own recovery passes. **Excluded:**
@@ -60,7 +62,7 @@ A mock authorization is never evidence of a real card payment. A TEST capture is
 | Observed | Stop |
 |---|---|
 | success at each phase | pause for Joel, then the next phase |
-| pre-capture refusal → `reservation_failed` | P6 only (void + host cancel), then report |
+| pre-reservation refusal → `reservation_failed` | P6: the authorization void only (no reservation was created, so no host cancel), then report |
 | `reservation_unknown` / `capture_unknown` / recording `UNKNOWN` / `OFFLINE_CHARGE_OUTCOME_UNKNOWN` case | STOP. The run ends after the worker's own bounded recovery read (if any) settles or escalates; no second write. Owner resolution only through the existing admin functions (`db/lib/admin.js`) |
 | contradictory evidence (identity / amount / currency / ref mismatch, protected id anywhere) | STOP; no write; report the code |
 | `reconciliation_required` / any open case | STOP; owner review |
@@ -72,8 +74,9 @@ A mock authorization is never evidence of a real card payment. A TEST capture is
 
 | Situation | Path | Status |
 |---|---|---|
-| Failure before capture | `runCleanupStep`: void (`compensation-proof.js:274–286`) + host cancel `PUT /v1/reservations/{id}/statuses/cancelled`, body `{cancelledBy:"host"}` (`compensation-proof.js:27`, `:421`) | Accepted offline; real path UNVERIFIED |
-| `capture_failed` | same worker | reached offline only by a test-applied event |
+| `reservation_failed` (refused before any reservation exists) | `runCleanupStep`: authorization void only (`compensation-proof.js:274–286`) | Accepted offline; real path UNVERIFIED |
+| `capture_failed` | `runCleanupStep`, conditional per the accepted plan (`compensation-worker.js:103–107`): void if still unsettled; host cancel `PUT /v1/reservations/{id}/statuses/cancelled`, body `{cancelledBy:"host"}` (`compensation-proof.js:27`, `:421`), if not yet cancelled | Reached offline only by a test-applied event; the cancel endpoint is ASSUMED / LIVE-UNVERIFIED |
+| A **successfully reserved** booking that does not reach `confirmed` (e.g. H-real / S-mock, or a stopped run) | **none automated**; never fake `capture_failed`, never cancel through the compensation worker | An explicitly approved owner cleanup procedure, exactly like the captured / confirmed row below |
 | **Confirmed / captured booking** | **NOT IMPLEMENTED.** E3 never refunds or cancels captured money (`intent-state.js:547`); `runCleanupStep` does not run in `payment_captured` / `confirmed` | Two options, neither designed here: **(a)** an owner-run manual procedure. It must state: who cancels the Hostaway reservation and how; Stripe TEST refund or no refund; how the TEST-paid offline-charge row is reviewed and deleted or annotated (deletion support is UNVERIFIED); the read-only proof of each; and how the DB intent is resolved (`admin_resolve_intent`, `db/lib/admin.js:38`). **(b)** a future, separately designed automated cancel / refund path |
 | Hostaway / Airbnb automations (guest messages, payment requests, tasks, channel e-mails) | **not controlled by this code**; `guest.notify` staying queued does not suppress them | Must be verified independently (side-effect reads as in E4: charges / conversations / tasks) and listed in the approval |
 
@@ -153,3 +156,139 @@ No `lib/`, SQL, worker, route, config or dependency change.
   - primary documentation for the cancel and offline-charge endpoints;
   - the read-only probes P1–P6;
   - the confirmed-booking cleanup procedure.
+
+## 9. Implementation map — executor-adapter foundation (OFFLINE / INJECTED FAKES; pending root CODE review)
+
+**Branch** `feature/e7-connected-executor-adapters`, cut from exact `1df87d5aea0f70bbd95659d46c749d93cd5ce38d`. **Files:** new `scripts/e7-connected/executor-adapters.mjs`; new `test/e7-connected-executor-adapters.test.mjs`; this section + the status line and cleanup corrections above.
+
+**Not changed:** workers, `lib/`, SQL, config, routes, packages, other tests.
+
+**Not present:** runner, CLI entrypoint, credential loader, default / real transport, SDK construction, env access, `fetch`.
+
+### 9.1 Factory interface (injection mandatory)
+
+`createPhaseExecutors({ phase, binding, hostaway, stripe? })` returns `{ ok:true, executors }` or `{ ok:false, code }`.
+
+| Argument | Rule |
+|---|---|
+| `phase` | `reservation`, `capture`, `cleanup` or `recording` |
+| `binding` | exactly `BINDING_KEYS[phase]`, plus the optional `pilotException` |
+| `hostaway` | exactly `{ send }`, always required |
+| `stripe` | exactly `{ send }`; required for capture / cleanup, refused otherwise |
+
+Refusal codes: `OPTIONS_INVALID`, `PHASE_INVALID`, `BINDING_INVALID`, `TRANSPORT_INVALID`.
+
+How inputs are read:
+- **Synchronous, one pass.** Option and binding validation is synchronous: each object is read once through its own data properties (the R-G1 rules).
+- **What is refused:** accessors, symbol keys, non-enumerable, extra or missing keys, `__proto__` keys, non-plain prototypes, sparse or iterator-patched arrays, and hostile or revoked proxies. No getter or iterator ever runs.
+- **What is caught:** only this introspection is caught; transports are never invoked by the factory.
+- **What is kept:** the binding is kept as a deep-frozen copy, so later caller mutation changes nothing. Transport functions are called unbound.
+
+`executors` has exactly the key set of that worker's gate (`PHASE_KEYS`; recording adds the TRUST `label`), and is frozen. All four accepted gates accept the factories' outputs (test 1).
+
+**Injected transport interfaces (documented here; not an SDK convention):**
+- `hostaway.send(request, { signal })` → `Promise<{ httpStatus: int 100–599, json }>`.
+  - `request` is frozen `{ method, path, query, body? }`.
+  - `path` always has exactly ONE `/v1` prefix.
+  - `query` / `body` are frozen data copies.
+- `stripe.send(call, { signal })` → `Promise<raw Stripe object>`.
+  - `call` is frozen `{ op }` with `op` ∈ `accounts.retrieve`, `paymentIntents.retrieve`, `paymentIntents.capture`, `paymentIntents.cancel`, plus `id`, `params` and `idempotencyKey` where applicable.
+  - A future real implementation must map this to the SDK with **zero automatic retries**, including SDK and auth retries, proven by its own reviewed tests. A fake or a label does not establish that.
+  - `lib/hostaway.js` is not reused as a write transport.
+
+### 9.2 Scope binding (immutable per factory instance)
+
+| Phase | Binding keys | Notes |
+|---|---|---|
+| reservation | `listingId, arrivalDate, departureDate, ref, guests, totalMinor, currency, refFieldId, guest{firstName,lastName,email}, reservationId:null` | The creation / lookup factory never has a bound id. `retrieveReservation` refuses `RESERVATION_UNBOUND`; a later id-bound phase uses a new factory |
+| capture | `listingId, arrivalDate, departureDate, ref, reservationId, accountId, paymentIntentId, amountMinor, captureIdempotencyKey` | — |
+| cleanup | `listingId, arrivalDate, departureDate, ref, reservationId (or null for the void-only reservation_failed path), accountId, paymentIntentId, voidIdempotencyKey` | — |
+| recording | `listingId, reservationId, intentId, amountMinor, paymentMethod (credit_card / other), accountRef, clientSnapshotId` | The label is TRUST, not verified ownership |
+
+Rules that apply to every phase:
+- **Bound id source.** No id is ever adopted from a reply. The Hostaway lookup cursor `afterId` is accepted only as an opaque positive integer and only on the lookup path. The future runner must take every bound value from accepted persisted worker proof / journal (outside this slice).
+- **Protected ids.** Protected ids 70636076 / 71045356 / 71072615 / 71081885 are refused in every binding, and again before every id-bound call.
+- **Pilots.**
+  - 603564: always refused.
+  - 603566: only with `pilotException: "E4_CONNECTED_603566_MXN"`, never with USD, never for recording (USD-only).
+  - The exception flag is refused on any other listing.
+  - The workers' own branded adapter config remains required separately.
+
+### 9.3 Executor keys, worker arguments and mapping
+
+The worker call sites are pinned verbatim by test 2 at this baseline.
+
+| Phase.key | Worker call (signal position) | Validated against the binding | Injected call |
+|---|---|---|---|
+| reservation.pricing.get | `(path, { query?, timeoutMs, signal })` (`reservation-worker.js:110`) | path `/listings/{L}` (no query) or `/listings/{L}/calendar` with exactly `{startDate: arrival, endDate: departure}` | `GET /v1/listings/{L}[/calendar]`; the reply is returned as `{ status, json }` (the pricing contract, `server-pricer.js:29–45`) |
+| reservation.pricing.post | `(path, body, { timeoutMs, signal })` (`:111`) | `/listings/{L}/calendar/priceDetails`, body exactly `{startingDate, endingDate, numberOfGuests: guests, version: 2}` | `POST /v1/listings/{L}/calendar/priceDetails` → `{ status, json }` |
+| *.lookupPage | `(req, { signal })` (`reservation-worker.js:211`, `capture-worker.js:280`, `compensation-worker.js:280`) | `GET /reservations`, query exactly `{listingId: L, channelId: 2000, arrivalStartDate = arrivalEndDate = arrival, limit: 100, includeResources: 1[, afterId: int]}` | `GET /v1/reservations` → `{ httpStatus, json }` |
+| *.retrieveReservation | `(req, { signal })` (`reservation-worker.js:238`, `capture-worker.js:252`, `compensation-worker.js:253`, `recording-worker.js:217`) | `GET /reservations/{bound}` or `/v1/reservations/{bound}`, empty query | `GET /v1/reservations/{bound}` |
+| reservation.createReservation | `(request, { signal })` (`reservation-worker.js:366`) | `POST /reservations`, **empty query** (no `forceOverbooking` / `provider` / anything). Body exactly the 12 mapped fields (`hostaway-reservations.js:252–265`), each equal to the binding (listing, dates, guests, `exactAmount(totalMinor)`, currency, guest names / e-mail, channel 2000, `customFieldValues = [{refFieldId, ref}]`). `forceOverbooking` anywhere is refused | `POST /v1/reservations` |
+| capture.retrieveAccount / cleanup | `({ signal })` (`capture-worker.js:217`, `compensation-worker.js:215`) | options exactly `{signal}` | `{op:"accounts.retrieve"}`; the worker itself checks `id === stripeAccountId` (`capture-worker.js:219`) |
+| *.retrievePaymentIntent | `(pi, { expand:["latest_charge"] }, { signal })` (`capture-worker.js:233`, `compensation-worker.js:231`) | `pi` = bound PI; params exactly `{expand:["latest_charge"]}` | `{op:"paymentIntents.retrieve", id, params}` |
+| capture.capturePaymentIntent | `(pi, { amount_to_capture, final_capture, expand }, { idempotencyKey, signal })` (`capture-worker.js:437–438`) | bound PI; `amount_to_capture = amountMinor`; `final_capture: true`; expand latest_charge; `idempotencyKey` = the bound key exactly (never a new or implicit key) | `{op:"paymentIntents.capture", id, params, idempotencyKey}` |
+| cleanup.cancelPaymentIntent | `(pi, {}, { idempotencyKey, signal })` (`compensation-worker.js:427`) | bound PI; empty params; bound void key | `{op:"paymentIntents.cancel", id, params:{}, idempotencyKey}` |
+| cleanup.cancelReservation | `(req, { signal })` (`compensation-worker.js:521`) | `PUT /v1/reservations/{bound}/statuses/cancelled` (either prefix form), empty query, body exactly `{cancelledBy:"host"}` | `PUT /v1/reservations/{bound}/statuses/cancelled` — **ASSUMED / LIVE-UNVERIFIED** |
+| recording.listOfflineCharges | `(req, { signal })` (`recording-worker.js:217`, `:223`) | `GET /v1/guestPayments/charges`, query exactly `{reservationId: bound, limit: 500}` | `GET /v1/guestPayments/charges` |
+| recording.createOfflineCharge | `(plan.request, { signal })` (`recording-worker.js:439`) | `POST /v1/guestPayments/charges/{bound}`, empty query, body exactly `{title: offlineChargeTitle(intentId), amount: exactAmount(amountMinor), paymentMethod: bound, status:"paid", scheduledDate: 'YYYY-MM-DD HH:MM:SS'}` | `POST /v1/guestPayments/charges/{bound}` — **ASSUMED / LIVE-UNVERIFIED** |
+
+**Path rule.** The outgoing path is always constructed from the binding, never copied from the worker. A worker path is accepted only if it equals one of the two exact accepted forms (relative or `/v1`-prefixed), so these are all refused:
+- absolute URLs, `//host`, `/v1/v1`;
+- traversal and encoded separators;
+- `?` / `#` in the path;
+- case changes and leading zeros.
+
+There is no pass-through facility.
+
+### 9.4 Replies, errors, cancellation (no new policy)
+
+**Replies.**
+- Hostaway: `{ httpStatus, json }` is passed through with `json` untouched. 404, 429, 5xx and 201 are returned as they are, so the workers' accepted classifiers decide. An ambiguous write reply is never converted into a definite failure.
+- Pricing: only the envelope is renamed, to `{ status, json }`.
+- Stripe: the raw object is returned unchanged.
+
+**Errors.** The accepted workers treat any executor rejection as a transport failure: a bounded read retry or an `unknown`, never definite.
+- `ExecutorRefusal(code)`: refused **before** invocation, zero transport calls. For a write, the worker therefore records an unknown. This is conservative; the future journal records the refusal code.
+- `ExecutorTransportFailure("TRANSPORT_FAILED")`: the single invocation threw or rejected. The original error, message, body and credentials are never read or kept (asserted with a planted secret).
+- `ExecutorTransportFailure("TRANSPORT_REPLY_SHAPE")`: a non-envelope Hostaway reply. Only exact `{httpStatus: int 100–599, json}` is accepted.
+
+**Invocation and cancellation.**
+- Exactly ONE injected invocation per adapter call, no retry.
+- The worker's `AbortSignal` is passed as `{ signal }`.
+- A missing, fake or already-aborted signal is refused before invocation.
+
+Cross-process at-most-once remains the accepted DB operation fence plus the future journal, not anything in memory.
+
+### 9.5 Tests and results (CLAUDE-RUN)
+
+`test/e7-connected-executor-adapters.test.mjs` has 12 tests, all synthetic, with a global fetch guard (0 network attempts):
+1. **Factories and gates:** the factories' key sets are accepted by all four real worker gates.
+2. **Source pins:** the worker call-site source is pinned.
+3. **Positive mapping:** exact mapping for every key; one invocation each; `/v1` normalisation; replies passed through.
+4. **Scope refusals:** 34 cases with zero calls — listing, dates, ref, amount, guest, extra fields, `forceOverbooking`, create query, method, PI, params, idempotency key, cancel body, list query, charge amount / method / extra field / other reservation.
+5. **Path bypasses:** 11 cases.
+6. **Bindings:** protected ids, pilot rules, malformed and missing values.
+7. **Descriptor and mutation probes:** factory options and call arguments; getter / iterator runs = 0.
+8. **Signals.**
+9. **Transport outcomes:** throws and rejects (no leak), bad envelopes, status passthrough, an ambiguous create not classified as refused.
+10. **Compatibility with the accepted pure helpers:** `priceStay` through `pricing`, `buildCreateReservationRequest` → `createReservation` → `classifyCreateResponse` = `created`, `lookupByRef` through `lookupPage` = `found`.
+11. **Void-only cleanup factory:** cancel and id reads refused.
+12. **Constant parity with the pure Hostaway adapter**, and the module source has no network / env / SDK / `lib/hostaway.js` import.
+
+| Run | Result |
+|---|---|
+| Focused | 12 / 12 |
+| `npm test` | **733 / 733** (721 + 12) |
+| Targeted mutants A01–A12 | 11 caught. **A08** (double-`/v1` normalisation) survived as an **equivalent** mutant: the outgoing path is built from the binding, so the normalisation branch is unreachable |
+
+No PG run was needed: the compatibility tests use the accepted gates and pure helpers directly, so no DB-backed worker integration was run. TAP: `gnf/tap/ead-*.tap`.
+
+**Deviation.** The module does **not** import `lib/hostaway-reservations.js`. That module's importer set is pinned by two accepted containment tests (`test/hostaway-reservations.test.mjs:544–569`, `test/e4-connected-path.test.mjs:404–421`), which are outside the allowed files. Instead, five constants and `isRealDate` are local copies, asserted equal to the pure adapter's exports (test 12). Amounts use `exactAmount` from `offline-charge-proof.js`.
+
+**Residuals.**
+- Full worker-in-PG runs over these adapters, and the real transports, belong to the future runner slice.
+- The fake tests prove mapping only.
+- The cancel and offline-charge endpoints remain prerequisites (primary documentation / read-only probes).
+- Hostaway account identity remains TRUST.
+
