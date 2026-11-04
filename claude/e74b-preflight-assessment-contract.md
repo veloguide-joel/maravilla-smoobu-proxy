@@ -6,7 +6,7 @@
 
 **Status (updated on `feature/e7-offline-charge-assessments`).**
 - Root ACCEPTED revision 2 (`3967755`) as the **0012 (slice A)** implementation basis, with binding addendum A–F. **0012 is PRESENT and accepted offline at `ff07fe8`** (root ruling on `ff07fe8`; Claude-run local PG only); the exact map is **§14**.
-- **0013 (slice B) is IMPLEMENTED offline** on `feature/e7-offline-charge-preflight-release` (pending root code review). **§8 below is SUPERSEDED** by `claude/e74b-preflight-release-contract.md` (refreshed against the actual 0012); where they differ, that document governs.
+- **0013 (slice B) is PRESENT and accepted offline at `185da0e`**; D5 / 0014 is PROPOSED (`claude/e74b-completion-binding-contract.md`). **§8 below is SUPERSEDED** by `claude/e74b-preflight-release-contract.md` (refreshed against the actual 0012); where they differ, that document governs.
 - **PRESENT and accepted:** 0010 (`d801b43`); 0011 + R1 / R2 helpers (`cd77088` + `34f0314`); the pure module `lib/checkout/offline-charge-proof.js` (`4f6b27f`, unchanged).
 - **Design (revision 2):** two separate executable migrations, **0012** (slice A: assessments + claim fence + conflict / exhaustion latch) and **0013** (slice B: preflight holds + owner release). Each is independently reviewable and reversible to its predecessor when audit-free. An accepted / applied 0012 is never amended into 0013.
 - Migrations 0001–0011 stay byte-identical on disk; historical comment errata are in §12.
