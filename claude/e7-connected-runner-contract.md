@@ -1,6 +1,6 @@
-# E7 local connected-test RUNNER — CONTRACT, revision 5 (Slice B run-guard implemented; core NOT authorized)
+# E7 local connected-test RUNNER — CONTRACT, revision 6 (Slice B ACCEPTED; Slice C run-facts implemented; core NOT authorized)
 
-**Branch** `feature/e7-connected-run-guard`, cut from exact `49df87b0`. Slice B adds `scripts/e7-connected/run-guard.mjs` and `test/e7-connected-run-guard.test.mjs`, and updates this file.
+**Branch** `feature/e7-connected-run-facts`, cut from exact `86acc274`. Slice C adds `scripts/e7-connected/run-facts.mjs` and `test/db/e7-connected-run-facts.test.mjs`, and updates this file.
 
 **Provenance:**
 - Revision 1 `36a6da15`: root DESIGN HOLD R-R1 to R-R4.
@@ -11,7 +11,8 @@
   - `npm test` 749/749 is **CLAUDE-RUN**, not root-run.
   - No provider or live readiness is implied.
 - Revision 4 `49df87b0` turned the former OPEN items A–D into one lifecycle design. Root DESIGN REVIEW **ACCEPTED** it for the bounded Slice B, with binding clarifications 1–6.
-- Revision 5 (this file) records the **implemented** Slice B API and error map (§2.2), its deviations (§2.2.6), and clarification 6 (§6.2, §7.5). `run-facts` / `run-core` / the journal / PG integration and every real connection stay **NOT authorized**.
+- Revision 5 recorded the implemented Slice B. Root CODE REVIEW **HOLD** on `74e8f509` (R-B1–R-B3) was corrected at `86acc274`. Root CODE RE-REVIEW **ACCEPTED** offline Slice B at `86acc274`: root ran 31/31 focused tests and reran the three probes. `npm test` 780/780 and the old-head red / green are CLAUDE-RUN.
+- Revision 6 (this file) records the **implemented** Slice C (§2.3, §4, §5.1). `run-core` / the journal / CLI and every real connection stay **NOT authorized**.
 
 All source citations are at `cc5d877d`. The runtime is unchanged since `ede4c43c`; the adapters were accepted at `b757d6b7`. Worker paths are under `lib/booking-db/`.
 
@@ -35,8 +36,9 @@ Those are independent, CLOSED slices. All owner inputs stay **UNSET**. Live gate
 | B. Injected timer / deadline API | Design ACCEPTED (`49df87b0`); implemented in `run-guard` | §7.2, §2.2.2 |
 | C. Outstanding work NONE / STEP / TAIL; one finalize | Design ACCEPTED; lifecycle implemented in `run-guard` | §7.3, §7.6, §2.2.3 |
 | D. Per-await ownership, late completions, lock lifecycle, precedence | Design ACCEPTED. Guard-side helpers are implemented (late client, tracker, lock release); the per-await SQL use stays in the NOT-authorized core | §7.4, §7.5, §7.7, §2.2.3, §2.2.5 |
-| `run-guard` (deadline + lifecycle + executor wrappers) | **Implemented** (Slice B) for root CODE review; design ACCEPTED at `49df87b0` | §2.2, §9.1 |
-| `run-facts`, `run-core`, `run-journal-memory`, PG runner test | Proposed later; **not authorized** | §9.2 |
+| `run-guard` (deadline + lifecycle + executor wrappers) | **ACCEPTED** (Slice B, root CODE re-review of `86acc274`) | §2.2, §9.1 |
+| `run-facts` (snapshot + guest read + candidate derivation) | **Implemented** (Slice C) for root CODE review | §2.3, §4, §5.1, §9.2 |
+| `run-core`, `run-journal-memory`, PG runner test | Proposed later; **not authorized** | §9.3 |
 
 ## 1. Present runtime vs proposed orchestration vs simulated tests
 
@@ -329,12 +331,112 @@ The core supplies closures over **its** client, for example `subscribe = (ev, h)
 | R-B3 | An own `__proto__` executor key returned `ok:true` with an output that had **no** keys (the prototype setter fired) | Refused; output built with `defineProperty` |
 | (shared) | The descriptor helper accepted non-enumerable own data properties | All exact-key inputs (deps, timers, lifecycle / lock / tracker inputs, `pricing`) now require **enumerable** own data properties |
 
-### 2.3 `run-facts.mjs` — PROPOSED later
+### 2.3 `run-facts.mjs` — Slice C (IMPLEMENTED at this head, for root CODE review)
 
-- `readRunSnapshot(client, intentId, guard, deadline) → frozen facts` (§4). The client is supplied by the core; the snapshot owns no pool.
-- `readGuestBinding(client, intentId, guard, deadline) → { firstName, lastName, email } | null`. The values are held in memory only for the executor binding and never journaled.
-- `deriveRecoveryCandidate(facts) → { ok:true, id, sources } | { ok:false, code }` (§5).
-- `checkSameDatabase(reportClient, appClient, …)` (§7.8).
+**Boundary.** Read-only. A pure codec / derivation layer over a **caller-supplied, connected** client. The module never:
+- connects or ends a pool, releases or destroys a client, unlocks, or calls a worker / provider;
+- has a timer, env, fs, fetch or SDK of its own.
+
+**Imports:**
+- accepted `run-guard` (`createLifecycle`, `LIMITS`);
+- the pure `PROTECTED_HOSTAWAY_RESERVATION_IDS` (`lib/checkout/compensation-proof.js:23`);
+- no worker, and no new importer of the pinned Hostaway module. Both containment pin suites still pass.
+
+**Guard provenance.** The accepted guard API does not export its provenance check, so the module checks a guard by constructing a throwaway `createLifecycle({ guard })`. That has no side effects, and it throws `LIFECYCLE_INVALID` for anything `createGuard` did not make. No guard edit was needed.
+
+**Deadlines.** Each statement is observed with `guard.observe(min(now + LIMITS.STATEMENT_MS, deadline), …)`. The caller's `deadline` is the absolute whole-snapshot cap (core: `now + LIMITS.SNAPSHOT_MS`).
+
+#### 2.3.1 Exports
+
+| Export | Value / signature |
+|---|---|
+| `RUN_FACTS_VERSION` | `"e7-run-facts-v1"` |
+| `FACT_CAPS` | `{ operations: 200, reservationAttempts: 1, reservationEvidence: 200, cases: 32, transitions: 200 }`. Each query uses `LIMIT cap + 1`, and more than `cap` rows → `FACT_LIMIT_EXCEEDED`. Never a silent truncation. `reservationAttempts` is 1 because the table is `UNIQUE (intent_id)` (`0001:437`) |
+| `PAYLOAD_KEYS` | the only `external_operations.payload` keys copied: `amountMinor`, `attempt`, `currency`, `expiresAt`, `listingId`, `paymentAttemptId`, `paymentIntentId`, `providerIdempotencyKey`, `ref`, `reissueDepth`, `reissueOf`, `reservationId`, `sessionId`, `template`. Each is selected as its own `payload -> 'k'` column, with primitive values only; any other key is only **counted** (`payloadUnlistedKeys`), never copied |
+| `RESERVATION_PHASE_STATES`, `OP_TYPES` | as in §5.1 |
+| `SQL` | the frozen statement texts (below), published so the API is reviewable and testable |
+| `readRunSnapshot({ client, intentId, guard, deadline })` | → `Promise<frozen Snapshot>` (§2.3.3) |
+| `readGuestBinding({ client, intentId, guard, deadline })` | → `Promise<frozen GuestResult>` (§2.3.4) |
+| `deriveRecoveryCandidate(facts)` | → frozen `{ ok:true, id, sources, adopted }` / `{ ok:false, code }` (§5.1) |
+
+**Arguments.**
+- `intentId` must be a canonical lowercase UUID.
+- `deadline` is a finite number.
+- `guard` must come from `createGuard`.
+- `client` must have a `query(text, params)` function. It must return a native promise; the accepted `pg` driver's does (tested).
+- Anything else → `FACTS_ARGUMENT_INVALID`, with nothing sent.
+
+#### 2.3.2 Queries (source-checked; every statement parameterized by `$1 = intentId`, explicit columns, deterministic order)
+
+| # | Statement | Source of the columns |
+|---|---|---|
+| 1 | `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` | — |
+| 2 | **Marker + role:** `booking.instance (environment, created_at)` (`0001:15–19`; there is no other column), plus `pg_has_role(current_user, 'mv_booking_report' / 'mv_booking_app', 'MEMBER')` and `rolsuper OR rolbypassrls` from `pg_roles` | The snapshot requires a report member that is neither an app member nor privileged |
+| 3 | **Intent:** `id, ref, environment, state, version, listing_id, from_date::text, to_date::text, guests, currency, final_total_minor, rate_bps, policy_version, stripe_payment_intent_id, authorized_minor, captured_minor, hostaway_reservation_id, reservation_confirmed_at, dispatch_at, dispatch_attempt, offline_charge_id, reservation_attempts, reason_code, updated_at` | `0001:47–110`. **Not** selected: `access_token_hash`, `checkout_session_id`, the price snapshot body, lease columns |
+| 4 | **Work:** `intent_work (next_action_at, work_worker_id, work_lease_until)` | `0001:252–258` |
+| 5 | **Operations:** identity, state, attempts, lease, `dispatched_at`, `completed_at`, `result_ref`, `error_code`, `late_result_status`, `late_result_ref`, `settled_evidence_id` (`0004:26`), `created_at`, plus the allowlisted payload keys, ordered by `created_at, id` | `0001:356–383` |
+| 6 | **Attempts:** `hostaway_reservation_attempts (id, operation_id, booking_ref, state, dispatched_at, responded_at, http_status, refusal_code, hostaway_reservation_id, lookup_count, last_lookup_result)` | `0001:435–456` |
+| 7 | **Reservation evidence:** `provider_evidence` with `kind = 'hostaway_reservation'` (`0003:52–71`), **LEFT JOIN**ed to its read op for `read_intent_id`, `read_op_type` and the selector `payload ->> 'ref'` / `'reservationId'`. From `observed`, only the scalar sub-values `bookingRef`, `matchCount`, `reservationId`, `listingId`, `from`, `to`, `totalMinor`, `currency` are taken, never the body. Ordered by `observed_at, id` | `0003:52–71`, `recovery.js:104–109` selector rule |
+| 8 | **Cases:** `reconciliation_cases (id, kind, status, opened_at, opened_by, resolution, resolved_at)`; the `evidence` jsonb is not selected | `0001:536–549` |
+| 9 | **Transitions:** `intent_transitions (version_after, from_state, to_state, event_type, reason_code, actor, at)`, ordered by `version_after` | `0001:207–221` |
+| 10 | `COMMIT`. Its acknowledgement is required before `ok:true` | — |
+
+**Guest statement.**
+- A single statement: `SELECT g.first_name, g.last_name, g.email` plus the role columns, from `(SELECT 1) LEFT JOIN booking.intent_guests g ON g.intent_id = $1`.
+- It runs as the app role only, with no transaction. Phone and terms are never selected.
+- **Roles (source-checked):**
+  - The report role has `SELECT` + RLS `report_ro` on `instance`, `intents`, `intent_transitions`, `intent_work`, `external_operations`, `hostaway_reservation_attempts` and `reconciliation_cases` (`0002:36–40`, `:51`), and on `provider_evidence` (`0003:709`, `:720`).
+  - The report role has no grant or policy on `intent_guests` (`0002:50`). A report login running the guest statement gets permission denied, which is a `DB_FAILURE` (tested).
+  - No new grant, function or migration.
+
+#### 2.3.3 `readRunSnapshot` results (frozen; code-only; no error message ever kept or returned)
+
+| `failure` | `code` | `clientDisposition` | Meaning |
+|---|---|---|---|
+| — (`ok:true`) | — | healthy | `facts` (below) + `statementsIssued` (10). COMMIT acknowledged |
+| `refusal` | `ROLE_NOT_REPORT`, `MARKER_INVALID`, `DATABASE_NOT_TEST`, `INTENT_NOT_FOUND`, `INTENT_NOT_TEST`, `FACT_MALFORMED`, `FACT_LIMIT_EXCEEDED` | `healthy` | The facts were **acknowledged** but refused. Reading stops, and the read-only transaction is closed by one guarded `COMMIT`, which was acknowledged |
+| `db` | `DB_FAILURE` (a rejected statement or `COMMIT`), `TIMEOUT_DB_READ` (a statement or `COMMIT` not settled in time, or the snapshot cap reached mid-transaction), `DB_RESULT_INVALID`, `GUARD_*` (post-start guard fault) | `destroy` | **No further statement** was issued: no `ROLLBACK`, `COMMIT` or count refresh. The caller must destroy its client (`release(true)`). A timeout does **not** cancel the server-side statement or `COMMIT`. When a refusal was pending and the closing `COMMIT` then failed, it is reported in `refusal` |
+| `not_started` | `FACTS_ARGUMENT_INVALID`, `SNAPSHOT_BUDGET_EXHAUSTED`, guard pre-start codes | `unused` | Nothing was sent (`statementsIssued: 0`) |
+
+**`facts` (deep-frozen; every row checked against the intent id):**
+
+```js
+{ version: "e7-run-facts-v1", intentId,
+  marker: { environment: "test", createdAt },
+  intent: { id, ref, environment, state, version, listingId, from, to, guests, currency, finalTotalMinor, rateBps, policyVersion,
+            stripePaymentIntentId, authorizedMinor, capturedMinor, hostawayReservationId, reservationConfirmedAt, dispatchAt,
+            dispatchAttempt, offlineChargeId, reservationAttempts, reasonCode, updatedAt },
+  work: null | { nextActionAt, workerId, leaseUntil },
+  operations: [{ id, opType, idempotencyKey, retryClass, state, sourceVersion, attempts, maxAttempts, requiresProviderRead, leaseWorkerId,
+                 leaseUntil, nextAttemptAt, dispatchedAt, completedAt, resultRef, errorCode, lateResultStatus, lateResultRef,
+                 settledEvidenceId, createdAt, payload: { …PAYLOAD_KEYS }, payloadUnlistedKeys }],
+  reservationAttempts: [{ id, operationId, bookingRef, state, dispatchedAt, respondedAt, httpStatus, refusalCode,
+                          hostawayReservationId, lookupCount, lastLookupResult }],
+  reservationEvidence: [{ id, kind, source, externalRef, status, observedAt, readOperationId, readIntentId, readOpType,
+                          selector: { ref, reservationId },
+                          observed: { bookingRef, matchCount, reservationId, listingId, from, to, totalMinor, currency } }],
+  cases: [{ id, kind, status, openedAt, openedBy, resolution, resolvedAt }],
+  transitions: [{ versionAfter, fromState, toState, eventType, reasonCode, actor, at }],
+  limits: FACT_CAPS }
+```
+
+**Value rules.**
+- Timestamps become milliseconds, and dates are `YYYY-MM-DD` text.
+- `bigint` values are parsed to safe integers.
+- `jsonb` sub-values must be primitives.
+- Anything unexpected → `FACT_MALFORMED`. Nothing is ever defaulted.
+
+**No fence.** A frozen snapshot is a **basis, not a fence**: accepted workers may commit new facts concurrently after it (§4).
+
+#### 2.3.4 `readGuestBinding` results
+
+- `{ ok:true, guest: { firstName, lastName, email }, statementsIssued: 1 }`. The values exist only in this frozen object, for the executor binding, and are never journaled or logged.
+- `refusal` / `healthy`: `ROLE_NOT_APP` (not an app member, a report member, or privileged), `GUEST_NOT_FOUND`, `FACT_MALFORMED`.
+- `db` / `destroy` and `not_started` / `unused`: as above. A report login → `DB_FAILURE`.
+
+#### 2.3.5 Deviation
+
+`checkSameDatabase` (§7.8, proposed in revision 4 for this module) is **not** part of Slice C: root's Slice C scope named the snapshot, the guest read and the candidate derivation only. It stays a core-slice item.
 
 ### 2.4 `run-core.mjs` — PROPOSED later
 
@@ -440,7 +542,7 @@ V1 therefore refuses pilots (`PILOT_NOT_IN_THIS_SLICE`). **Smallest test-pin cha
 - The report role has no guest data (`0002:35`, `:50`). The guest row is read by the app role (`0002:29–31`, `:49`), as the reservation worker itself does (`reservation-worker.js:179`).
 - No new grant or API is proposed.
 
-**Snapshot.** One `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` on a fresh report connection:
+**Snapshot (implemented in Slice C, §2.3).** One `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` on a report connection supplied by the core:
 - it contains every fact listed in §5, plus open cases, the ops of all five provider-write types with their states, and the `booking.instance` marker;
 - then `COMMIT` and release, all **before** the step.
 
@@ -450,17 +552,51 @@ No transaction is held across a worker or network call. A failure inside the sna
 
 ## 5. Candidate provenance, factory choice and refusal observation
 
-### 5.1 `deriveRecoveryCandidate`, before every reservation step
+### 5.1 `deriveRecoveryCandidate(facts)` — IMPLEMENTED (Slice C), before every reservation step
 
-1. **Phase.** State ∈ `payment_authorized`, `reservation_pending`, `reservation_unknown` (`reservation-worker.js:54`).
-2. **Candidates:**
-   - **(a)** a `hostaway.create_reservation` op with `state = succeeded` and a `result_ref`;
-   - **(b)** lookup-read evidence with `found_active`, `observed.bookingRef = expectedRef` and `matchCount = 1` (its `external_ref`);
-   - **(c)** `intents.hostaway_reservation_id`.
-3. More than one distinct id → `CANDIDATE_CONFLICT`. Any protected id anywhere in the intent's ops / evidence → `PROTECTED_REFERENCE`.
-4. An open `hostaway.retrieve_reservation` naming another id → `OPEN_READ_CONFLICT`.
-5. A `pending` (undispatched) create and a candidate together → `CANDIDATE_BEFORE_CREATE`.
-6. **Factory:** one candidate → `reservation-recovery` bound to it; none → `reservation` (unbound).
+**Purity.** It never builds a factory, starts an operation or touches the DB. Its input is `readRunSnapshot().facts`, or, for unit tests, a SYNTHETIC object of the same shape. It matches the accepted planner (`recovery-plan.js:193–269`, `knownIds` `:226–229`) and `loadRecoveryFacts` (`recovery.js:99–135`).
+
+**Collection, all checked before any candidate is trusted:**
+- **Shape and identity.** Version, canonical ids and the facts' intent id. At most one `hostaway.create_reservation` op (the DB's unique index), and at most one attempt row, bound to that create op with `booking_ref = intent.ref`.
+- **Evidence association** (API sources only):
+  - evidence must name a read op that is present in the same facts, for the **same intent**, whose `op_type` equals `readOpType` and is a lookup / retrieve;
+  - a lookup's selector must be `intent.ref`;
+  - violations → `FACTS_INCONSISTENT`.
+  - Attested dashboard evidence is never a candidate source, but it is still protected-scanned.
+- **Protected scan.** Over `intent.hostaway_reservation_id`, every op's `result_ref` / `late_result_ref` / `payload.reservationId`, the attempt id, every evidence `external_ref`, observed id and selector.
+- **Candidates:**
+  - **(a)** a `succeeded` create's canonical `result_ref`;
+  - **(b)** API lookup evidence that meets all of:
+    - `found_active`;
+    - selector `= intent.ref` and `observed.bookingRef = intent.ref`;
+    - `matchCount === 1`;
+    - observed `reservationId`, if present, `= external_ref`;
+    - `listingId` / `from` / `to` / `totalMinor` / `currency` equal to the intent: a mismatch refuses, and a missing value makes the evidence no candidate;
+  - **(c)** the adopted `intents.hostaway_reservation_id`.
+- **Known returned ids** (the planner's `RESERVATION_ID_CONFLICT` set): the create's `result_ref` (any state) and `late_result_ref`, the attempt row's `hostaway_reservation_id`, the adopted id, and every `found_active` API evidence id (lookup **and** by-id).
+- **Selectors.** Every `hostaway.retrieve_reservation` op's `payload.reservationId`, marked open when the op is `pending` / `in_flight`.
+
+**Decision (first match wins).** All codes are code-only and frozen:
+
+| # | Condition | Code |
+|---|---|---|
+| 1 | unexpected shape / non-canonical id | `FACT_MALFORMED` |
+| 2 | relationship violation | `FACTS_INCONSISTENT` |
+| 3 | a protected id anywhere | `PROTECTED_REFERENCE` |
+| 4 | state ∉ `payment_authorized` / `reservation_pending` / `reservation_unknown` | `NOT_RESERVATION_PHASE` |
+| 5 | lookup / by-id evidence contradicting the intent or itself | `EVIDENCE_IDENTITY_MISMATCH` |
+| 6 | `matchCount > 1` | `DUPLICATE_BOOKING_REF` |
+| 7 | > 1 distinct candidate | `CANDIDATE_CONFLICT` |
+| 8 | 0 candidates but a known id or by-id selector exists (fail closed) | `KNOWN_ID_WITHOUT_CANDIDATE` |
+| 9 | 0 candidates, nothing known | `NO_CANDIDATE` (explicit; never auto-adoption) |
+| 10 | a known returned id ≠ the candidate | `RESERVATION_ID_CONFLICT` |
+| 11 | a by-id selector ≠ the candidate: open → `OPEN_READ_CONFLICT`; historical → `RESERVATION_ID_CONFLICT` | |
+| 12 | a `pending` create plus a candidate | `CANDIDATE_BEFORE_CREATE` |
+| — | otherwise | `{ ok:true, id, sources: ['a'\|'b'\|'c'], adopted }` |
+
+**Same-step scheduling.** A pending by-id read does **not** need to exist yet. An open by-id read for the **same** id is fine.
+
+**Factory choice (core, later).** One candidate → `reservation-recovery` bound to it. `NO_CANDIDATE` → `reservation` (unbound). Any other refusal → STOP.
 
 ### 5.2 Same-step facts
 
@@ -858,7 +994,7 @@ All refusals happen with **zero** worker, transport or attest calls. No general 
 
 ## 9. Implementation slices
 
-### 9.1 Slice B: `run-guard` (deadline + lifecycle + wrappers), unit tests only — IMPLEMENTED at this head
+### 9.1 Slice B: `run-guard` (deadline + lifecycle + wrappers), unit tests only — ACCEPTED at `86acc274`
 
 The design was accepted at `49df87b0`; the code awaits root CODE review. Root's clarification tests were added beyond G1–W1: post-start faults, tie semantics, fractional readings, `trackClient` event orders, late-client handling, wrapper hostile / forged / late cases, no unhandled rejections, and pending-forever cases asserted after controlled fake progress.
 
@@ -904,7 +1040,31 @@ The design was accepted at `49df87b0`; the code awaits root CODE review. Root's 
 
 Run the focused unit suite and `npm test`. No DB run.
 
-### 9.2 Later core slice (`run-facts`, `run-core`, `run-journal-memory`, disposable-PG test) — NOT authorized
+### 9.2 Slice C: `run-facts` (snapshot + guest read + candidate derivation) — IMPLEMENTED at this head, for root CODE review
+
+**Files.** `scripts/e7-connected/run-facts.mjs`, `test/db/e7-connected-run-facts.test.mjs` (disposable local PG), and this contract.
+
+**Labels:**
+- **PG enforcement** uses real `mv_booking_report` (`test_report`) and `mv_booking_app` (`test_app`) logins as the functions' clients; the owner is used only for test assertions.
+- Real facts come from accepted repo functions and the accepted reservation worker, driven through the accepted adapters into the rehearsal's **synthetic** fake world (copied test-locally, labelled). The authorization is labelled fixture setup.
+- **SYNTHETIC** cases are labelled per test: pure derivation on mutated copies, and fake clients for cap+1 / faults / marker.
+
+**Acceptance (all pass):**
+
+| Case | Evidence |
+|---|---|
+| Successful report snapshot + app guest read | 10 statements; deep-frozen; no guest / token / contact value in the facts; `NO_CANDIDATE` on a fresh booking |
+| Roles | Report → guest read is a `DB_FAILURE` (permission denied, no message); app → snapshot `ROLE_NOT_REPORT`; owner → `ROLE_NOT_REPORT` / `ROLE_NOT_APP` |
+| Identity / scoping across two intents | Each snapshot's ids equal exactly that intent's rows; an unknown intent → acknowledged `INTENT_NOT_FOUND` |
+| RR barrier | A real accepted-worker step committed mid-snapshot is invisible to it (same version / ops / transitions); a later snapshot sees it |
+| No-echo candidate (a) | Adopted id NULL; the lane derives each step's factory from run-facts and reaches `reservation_confirmed` with one create; then `NOT_RESERVATION_PHASE` |
+| Lookup candidate (b) | Ambiguous create; lookup evidence joined to its read op / selector; open case present as a fact; one create |
+| SYNTHETIC derivation | 27 cases: conflicts, protected refs (result / attempt / evidence / selector), open vs historical by-id selectors, attempt / late ids, pending create, identity mismatches, duplicate ref, association / consistency violations, malformed shapes |
+| SYNTHETIC cap+1 | Each capped query → `FACT_LIMIT_EXCEEDED` after an acknowledged COMMIT; exactly `cap` rows accepted |
+| SYNTHETIC faults | Rejection at each of the 10 statements (COMMIT included) and timeouts (BEGIN / INTENT / COMMIT): no later statement, no `release` / `end`, no message leak. Mid-sequence cap → destroy. Guard fault before the first statement → zero queries. Marker / role / malformed / foreign-id / non-result refusals |
+| Native rule | A real `pg` query promise passes `isNativePromise` |
+
+### 9.3 Later core slice (`run-core`, `run-journal-memory`, disposable-PG runner test) — NOT authorized
 
 **Proposed files:**
 - `scripts/e7-connected/run-facts.mjs`, `run-core.mjs`, `run-journal-memory.mjs`;
