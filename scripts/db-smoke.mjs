@@ -36,7 +36,9 @@ const EXPECTED_TABLE_PRIVS = {
   // E7.4b-D1 (0011): owner-hold audit tables are read-only for the runtime role (writes only inside schema-owner functions)
   recording_holds: [S], recording_hold_decisions: [S], recording_hold_observations: [S], recording_conflict_inbox: [S],
   // E7.4b-D1 (0012): assessment reference data / assessments / claim audit are read-only for the runtime role
-  recording_assessment_codes: [S], recording_assessments: [S], recording_claim_assessments: [S]
+  recording_assessment_codes: [S], recording_assessments: [S], recording_claim_assessments: [S],
+  // E7 guest notification (0016): render / latch audit read-only for the runtime role; the write-authority token table has no privilege
+  notification_renders: [S], notification_latches: [S], notification_write_authority: []
 };
 const ALL_PRIVS = ["SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"];
 const FUNCS_ALLOWED = ["booking.claim_release_blockers(uuid)", "booking.release_claim_if_safe(uuid,text)",
@@ -152,7 +154,7 @@ async function main() {
         const want = [...(EXPECTED_TABLE_PRIVS[t] || [])].sort().join(","), got = [...(actual[t] || [])].sort().join(",");
         if (want !== got) diffs.push(`${t}: expected ${want || "none"} got ${got || "none"}`);
       }
-      check("table_privilege_matrix_exact", diffs.length === 0 && tables.size === 25, diffs.length ? diffs : `${tables.size} tables`);
+      check("table_privilege_matrix_exact", diffs.length === 0 && tables.size === 28, diffs.length ? diffs : `${tables.size} tables`);
       check("no_delete_or_truncate_anywhere", !privRows.some((r) => r.ok && (r.priv === "DELETE" || r.priv === "TRUNCATE")));
 
       const fn = async (sig) => (await q("SELECT has_function_privilege(current_user, $1, 'EXECUTE') AS ok", [sig]))[0].ok;

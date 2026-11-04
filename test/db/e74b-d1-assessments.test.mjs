@@ -755,14 +755,14 @@ test("A-16: 0012 stands alone — no 0013 object (no hold_id / assessment_id on 
   const d12 = await startMigratedDatabase();
   const mo = new pg.Client({ connectionString: d12.adminUrl }); await mo.connect();
   try {
-  assert.deepEqual(await migrateDown(mo, { env: "test", to: 12 }), [15, 14, 13]);   // E7 (0015): mechanical prefix (function-only 0015, no data)
+  assert.deepEqual(await migrateDown(mo, { env: "test", to: 12 }), [16, 15, 14, 13]);   // E7 (0015): mechanical prefix (function-only 0015, no data)
   const cols = (await mo.query(`SELECT table_name || '.' || column_name AS c FROM information_schema.columns WHERE table_schema = 'booking'
       AND column_name IN ('hold_id', 'assessment_id') ORDER BY 1`)).rows.map((x) => x.c);
   assert.deepEqual(cols, ["recording_claim_assessments.assessment_id", "recording_conflict_inbox.hold_id", "recording_hold_decisions.hold_id", "recording_hold_observations.hold_id"]);
   assert.equal((await mo.query("SELECT count(*)::int AS n FROM pg_proc WHERE proname IN ('admin_release_preflight_hold', 'open_recording_preflight_hold', 'record_release_review_assessment', 'recording_preflight_epoch')")).rows[0].n, 0);
   const defs = (await mo.query(`SELECT conname, pg_get_constraintdef(oid) AS d FROM pg_constraint WHERE conname IN ('recording_holds_reason_check', 'recording_hold_decisions_decision_check')`)).rows;
   assert.ok(defs.every((x) => !/PREFLIGHT|release_for_initial_send/.test(x.d)), "0011 CHECKs unchanged");
-  assert.deepEqual(await migrateUp(mo, { env: "test" }), [13, 14, 15]);   // E7 (0015): mechanical suffix
+  assert.deepEqual(await migrateUp(mo, { env: "test" }), [13, 14, 15, 16]);   // E7 (0015): mechanical suffix
   } finally { await mo.end(); await d12.close(); }
 });
 
@@ -783,7 +783,7 @@ test("D-1..D-3: down gates — 0012 down restores a FRESH 0011 exactly (bodies /
   const fresh = await startPostgres(); const f11 = new pg.Client({ connectionString: fresh.adminUrl }); await f11.connect();
   try {
     // E7.4b-D1 (0013): this measures 0012 itself, so 0013 (no 0013 audit here) is rolled back first
-    assert.deepEqual(await migrateDown(o, { env: "test", to: 12 }), [15, 14, 13]);   // E7 (0015): mechanical prefix              // E7.4b-D1 (0014): fresh cluster, no data: 0014 rolls back too
+    assert.deepEqual(await migrateDown(o, { env: "test", to: 12 }), [16, 15, 14, 13]);   // E7 (0015): mechanical prefix              // E7.4b-D1 (0014): fresh cluster, no data: 0014 rolls back too
     const at12 = await objects(o);
     // D-1: audit-free -> exact fresh 11, then identical re-up
     assert.deepEqual(await migrateDown(o, { env: "test", to: 11 }), [12]);

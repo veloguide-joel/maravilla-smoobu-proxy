@@ -6,7 +6,7 @@
 |---|---|---|
 | 1 | `2e20972ac96bbbf6bfa984be3c84ec3542969e8a` | DESIGN HOLD, findings R1–R6 |
 | 2 | `4796b59788e8211c40565c4b15bf3348b8074182` | DESIGN HOLD, findings R7–R9. Accepted: freeze-at-claim, the dedicated claim / presend / completion, both generic-claim exclusions, the markUnknown branch, durable unknowns, narrow error / redaction, and N1 = a, N2 = a, N3 = a as OFFLINE decisions only |
-| 3 (this) | cut from exact `4796b597` | — |
+| 3 (this) | `6e3fca5f9177e5fdd34544c974b023c320fc9ce7` | ACCEPTED as OFFLINE design with root addenda A–C (U1 = a, U2 = a). Stage 1 implemented offline on `feature/e7-guest-notification-fence`, pending root CODE review: implementation map **§15** |
 
 The R7–R9 resolution map is §0.4. The R1–R6 resolutions are retained, and any change to them is stated in place.
 
@@ -1206,3 +1206,202 @@ Neither stage changes E3 producers, other workers, routes, UI, config or deps.
 13. The historical e74a listing-lock failure stays OPEN.
 
 **Live provider, sender identity, recipient policy, retention and copy: CLOSED.**
+
+## 15. Stage 1 implementation map (OFFLINE; root ACCEPT of `6e3fca5f` as design + addenda A–C; pending root CODE REVIEW)
+
+**Branch** `feature/e7-guest-notification-fence`, cut from exact `6e3fca5f9177e5fdd34544c974b023c320fc9ce7`.
+
+**Status.** Implemented OFFLINE on disposable local PostgreSQL only. This is not live readiness. There is no renderer, notification worker, executor, provider adapter, SDK, route, UI, scheduler or send. Root decisions U1 = a and U2 = a are applied. N1 = a, N2 = a and N3 = a apply OFFLINE only.
+
+### 15.1 Files (the §13.1 allowed set)
+
+| File | Change |
+|---|---|
+| `db/migrations/0016_guest_notification_fence.up.sql` | new |
+| `db/migrations/0016_guest_notification_fence.down.sql` | new |
+| `lib/booking-db/operations.js` | only: two-stage `NOTIFY_FENCE`; the `markUnknown` `guest.notify` branch; the generic `completeOperation(succeeded)` refusal |
+| `test/db/e7-guest-notification-fence.test.mjs` | new; disposable PG |
+| `test/e7-guest-notification-operations.test.mjs` | new; unit, no DB |
+| `claude/e7-guest-notification-contract.md` | this map + status line |
+| `claude/e7-offline-lifecycle-rehearsal.md` | status pointer |
+| mechanical migration-version pins | mechanical pins only (migration version arrays / the migration name list gain 16; table counts 25 → 28; two privilege-matrix rows + the empty token-table row). The exact diff is in this commit: `test/db/migrations.test.mjs`, `e7-scoped-recording-inbox`, `e74b-d1-assessments`, `e74b-d1-completion-binding`, `e74b-d1-owner-cases`, `e74b-d1-release`, `e74b-d2-recording-evidence`; table-count pins in `guests.test.mjs`, `intents.test.mjs`, `migrations.test.mjs`; `scripts/db-smoke.mjs` (privilege matrix rows + table count) |
+
+Migrations 0001–0015, every accepted worker, fixtures, config and dependencies are byte-identical.
+
+### 15.2 SQL object / security map (as implemented)
+
+All functions use `search_path = pg_catalog, booking` and have `REVOKE ALL … FROM PUBLIC`. The ACLs below were read from the catalog by the focused suite.
+
+**Objects**
+
+| Object | Kind | Notes |
+|---|---|---|
+| `external_operations_one_guest_notify` | partial UNIQUE index `(intent_id) WHERE op_type = 'guest.notify'` | R7 |
+| `notification_renders` | table; append-only (`reject_change` UPDATE / DELETE / TRUNCATE); RLS | SELECT + policy for app and admin; no report access; no write grant |
+| `notification_latches` | table; same guards and grants | |
+| `notification_write_authority (txid xid8, operation_id, action)` | **private** table; RLS, no policy, no grant | Addendum A token; see §15.3 |
+| `notify_op_fence` | BEFORE INSERT OR UPDATE on `external_operations` `WHEN (NEW.op_type = 'guest.notify')` | **SECURITY INVOKER** |
+| `notify_claim_binding` | AFTER UPDATE (pending → in_flight, notify) | **SECURITY INVOKER** |
+| `notification_evidence_lock` | AFTER INSERT on `provider_evidence`, kinds `payment_intent` / `hostaway_reservation` / `hostaway_offline_charges` | **SECURITY INVOKER** (U1 = a) |
+
+**Functions granted to the runtime role (all SECURITY DEFINER, VOLATILE unless stated)**
+
+| Function | Grant | Returns / codes |
+|---|---|---|
+| `claim_notification_work(text, integer[], uuid)` | app | `{status: acquired, opId, intentId, workLeaseUntil}` or `{status: idle}` |
+| `release_notification_work(uuid, text)` | app | `RELEASED` / `NOT_HELD` / `PROTECTED` |
+| `guest_notification_snapshot(uuid)` | app | `{class, code, template, facts, factsHash, recipientHash, email, firstName}`, or `{class}` only when not ELIGIBLE (PROTECTED included) |
+| `claim_guest_notification(uuid, text, text, text, text, text)` | app | `{status: claimed \| latched \| waiting \| protected \| not_claimable, code}` |
+| `latch_guest_notification(uuid, text, text)` | app | `LATCHED` / `NOT_ELIGIBLE` / `PROTECTED` / `WORK_LEASE`; only `RENDER_FAILED` accepted |
+| `guest_notification_presend(uuid, text)` | app | `{ok, code, dbNow, opLeaseUntil, workLeaseUntil, contentHash, templateVersion, messageRef}` |
+| `complete_guest_notification(uuid, text, text, text, text)` | app | `succeeded` / `outcome_unknown` / `LEASE_LOST` / `PROTECTED` |
+| `recover_expired_notifications(integer[], uuid, integer)` | app | `{processed, skippedLocked, skippedProtected}` |
+| `list_guest_notifications(integer[], uuid, integer)` | app, admin; STABLE | rows |
+| `guest_notification_summary(integer[])` | app, admin; STABLE | counts |
+
+**Private helpers (no grant)**
+- DEFINER: `guest_notification_protected` (STABLE), `guest_notification_class` (STABLE), `guest_notification_facts`, `guest_notification_recipient_hash` (STABLE), `guest_notification_refusal`, `gn_latest_evidence` (STABLE), `gn_lock_bundle`, `gn_facts_advisory`.
+- INVOKER, IMMUTABLE: `gn_templates`, `gn_target_state`, `gn_recipient_in_scope`, `gn_obs`, `gn_obs_int`, `gn_obs_text`, `gn_obs_bool`, `gn_hash_facts`, `gn_non_latching`, `gn_check_worker`, `gn_check_scope`.
+
+**Error policy**
+- A malformed argument raises `22023`.
+- A fact or state refusal is returned as a code and never raises.
+- `40P01` / `40001` propagate unchanged. The new APIs have no retry loop.
+
+### 15.3 Addendum A — caller authority
+
+**The mechanism.** The fence is **SECURITY INVOKER**, so `current_user` inside it is the caller.
+- For a raw runtime-role UPDATE, `current_user` = `test_app`, so `is_privileged()` is false and the fence refuses with `NOTIFY_CLAIM_AUTHORITY` or `NOTIFY_COMPLETE_AUTHORITY` (`42501`).
+- Inside the dedicated SECURITY DEFINER APIs, `current_user` is the schema owner.
+
+**The binding to the dedicated API.** It does **not** rest on `is_privileged()` alone. The API inserts a row `(pg_current_xact_id(), op, 'claim' | 'complete')` into the private `notification_write_authority` immediately before its UPDATE, and deletes it immediately after. The fence requires that exact row.
+- No role except the schema owner can read or write that table.
+- So other booking SECURITY DEFINER functions, and a session-settable value, cannot authorise a notify claim or success.
+- `in_flight → outcome_unknown` is allowed for any role. It is the fail-safe direction used by the generic `markUnknown` branch.
+
+**Proven as the actual app role.**
+- Raw `pending → in_flight`: refused.
+- Raw `in_flight → succeeded` with a valid render present: refused.
+- Wrong-worker completion: `LEASE_LOST`, no write.
+- Expired-lease completion: `LEASE_LOST`.
+- The dedicated APIs work for the legitimate lease holder.
+- The generic success helper refuses with `NOTIFY_SUCCESS_REQUIRES_DEDICATED_COMPLETION`.
+- Generic `claimNextOperation` returns null, with and without `opId`.
+- The token table is unreadable and unwritable for the app role.
+
+**Not a security boundary.** The schema-owner or superuser session: it can write the token itself. The suite only shows that the owner without a token is refused. Inside the APIs, lifecycle, lease, payload and render are still validated after the locks, and the AFTER binding trigger re-checks the render.
+
+### 15.4 Addendum B — concurrency as implemented
+
+- **Call contract.** Every writer entrypoint is ONE top-level AUTOCOMMIT call per transaction. No universal deadlock-freedom claim is made for arbitrary multi-call transactions.
+- **Lock bundle.**
+  1. intent `FOR SHARE`;
+  2. create attempt `FOR SHARE`;
+  3. work / op / guest rows as the path needs;
+  4. the `booking.notification_facts` advisory;
+  5. the `booking.recording_evidence` advisory (claim and latch only).
+- **Fresh re-check.** Protection and class are re-checked in a fresh READ COMMITTED statement after the locks, before every scoped write.
+- **SKIP LOCKED variants.** `gn_lock_bundle(…, true)` is used by work acquisition and maintenance.
+- **Maintenance order.** `recover_expired_notifications` chooses candidates with protected intents excluded before `ORDER BY lease_until, id LIMIT`, then processes them in ONE deterministic `ORDER BY intent_id, id`.
+- **U1 trigger timing.** The trigger fires INSIDE the evidence INSERT statement. That is before the 0010 writers' `recording_evidence` advisory (`0010:386–388`, `:402–404`) on both the API and dashboard paths. `zz1_evidence_enqueue` takes no lock. So every party takes `notification_facts` before `recording_evidence`.
+
+**Observed waits (CLAUDE-RUN, both commit orders where applicable)**
+
+| Pair | Result |
+|---|---|
+| Evidence insert (dashboard; each of the 3 kinds) vs claim | Claim waits; evidence waits on a held claim |
+| API `record_provider_evidence` vs a held completion | Evidence waits |
+| Evidence vs work acquisition and release | Both wait |
+| Evidence vs scoped maintenance | Maintenance waits, then a fresh re-check sees PROTECTED evidence committed meanwhile and skips (`skippedProtected: 1`, no write) |
+| Guest purge vs a held claim | Purge waits on the guest-row KEY SHARE |
+| Accepted attempt-row write vs a held claim / held completion | Waits in both orders |
+| An E3 transition holding the intent row during work acquisition | SKIP LOCKED → idle, no write |
+
+- **Impact on accepted evidence paths.** At most these waits, only while a notification decision on the same intent is in flight. Every accepted-worker chain in the suite runs through the trigger unchanged.
+- **Legal NULL → protected.** The only notify-bearing route is RESOLVE confirmed. It needs `found_active` evidence for the result ref (`0003:603–630`), and that evidence is itself a protection source, so protection becomes visible at the evidence insert. The intent-row lock interplay of a transition is tested separately: SKIP LOCKED during work acquisition.
+- **Late protected create id.** Not reachable for a notify-bearing intent: create results are recorded before any terminal state, and `recordHostawayCreateResult` only updates `responded_at IS NULL` rows (`repo.js:617–627`). The test pins `{ recorded: false }`.
+
+### 15.5 Addendum C — replay, facts and failure
+
+**Replay paths, kept distinct:**
+- E3 same-event replay: `applyEvent` returns `duplicate` before any INSERT.
+- Same-key direct `ON CONFLICT` INSERT that is canonical and current: the BEFORE fence passes and the arbiter absorbs it.
+- Stale same-key direct replay: refused by the BEFORE fence, which runs before the arbiter. This is documented, not relaxed.
+- Different template: refused by the fence's state binding; the unique index is proven in isolation.
+
+**Evidence ordering.** `observed_at, created_at, id` with the uuid tie-break, identical at claim and pre-send.
+
+**Fail-closed observed fields.** Absent, JSON null, wrong type, string numbers, negative, float, overflow and non-object intermediates are tested. ABSENT is accepted only for explicitly optional refund fields.
+
+**Hashes.** Snapshot hashes are SQL-derived and were re-derived independently in the test. The content hash is one synthetic TRUST constant; no message is rendered.
+
+**Original-error rule.** Original outer JS errors propagate as the identical object with no follow-up query. Generic helper semantics changed only as authorized.
+
+### 15.6 Deviations from the contract text (each deliberate; for root review)
+
+1. **VOLATILE instead of STABLE.** `guest_notification_presend`, `guest_notification_snapshot` and `guest_notification_refusal` are VOLATILE plpgsql, not "STABLE single snapshot".
+   - The refusal reuses VOLATILE 0010 / 0011 predicates (`recording_latest_id`, `recording_active_hold_id`, `recording_conflict_refusal`).
+   - Each statement therefore reads all commits that precede it (statement-level READ COMMITTED), not one snapshot.
+   - No single-snapshot claim is made.
+2. **`claim_notification_work` arguments.** It has no `p_lease_ms`; the work lease is fixed at 120 s. It returns `workLeaseUntil`.
+3. **`latch_guest_notification`.** It also returns `WORK_LEASE`, and requires the caller's live work lease.
+4. **Extra refusal codes.** `NOT_NOTIFY`, `TEMPLATE_UNKNOWN` and `RECORDING_HOLD_ACTIVE` (C10). Their order: scope / waiting codes come before C1 / C2 (non-latching first); `RECIPIENT_MISSING` comes before scope.
+5. **X4 "entry into capture_failed".** It is the first transition into `capture_failed` from another state. The leg events are themselves `capture_failed → capture_failed` transitions. Found by the positive chain; mutant M11.
+6. **Class `OTHER`.** Used for non-pending / non-claimed states, and for a pending row with a render or attempts.
+7. **The fence refuses `late_result_*` writes on notify rows.** A generic late completion therefore raises an unmapped `23514` (`repo.js` `DB_SAFETY_CODES` is outside the allowed files). No accepted path does this.
+
+### 15.7 Tests and results (CLAUDE-RUN)
+
+**Focused suites.** `test/db/e7-guest-notification-fence.test.mjs` (13 tests) plus `test/e7-guest-notification-operations.test.mjs` (5 tests): **18 / 18 pass**. They include one real 61 s wait; no lease is manipulated. What they cover:
+- the positive lifecycle for all 3 templates, on accepted-worker USD chains;
+- addendum A, tested as the actual app role;
+- R7: E3 replay, direct same-key and stale-replay INSERTs, the index in isolation under both concurrent commit orders;
+- R9 predicate codes, including fail-closed field values, the id tie-break, and scope / waiting rows that never latch;
+- latch / `SNAPSHOT_STALE`;
+- addendum B lock waits;
+- R8 protection after a claim;
+- the expiry batch: scoped maintenance, protected noise before LIMIT, protection during maintenance, `LEASE_LOST`, the generic `markUnknown` branch on a non-protected row, durable unknown;
+- page / summary / cursor;
+- attempt-row serialisation;
+- migration up precondition / refused down / exact down / identical re-up / JS compatibility;
+- unit checks of the `operations.js` branches, and identical-error propagation.
+
+**Mutation probes: 27 targeted, 27 caught.** Each mutant was restored and hash-checked (sha256 of `0016.up` `1902d3ff…`, `0016.down` `37c20976…`, `operations.js` `f3520f20…`).
+- M19 (claim latching a non-latching code) first SURVIVED.
+- That was a coverage gap: no test claimed a WAITING row while holding the work lease. A test was added, and M19 is now caught.
+- No equivalent survivors remain.
+
+| Mutants | What each removes or changes |
+|---|---|
+| M01–M04 | claim / success authority; fence made DEFINER |
+| M05–M06 | `→ pending` allowed; `source_version` not frozen |
+| M07–M08 | the unique index; the INSERT binding |
+| M09–M12 | C4; the K3 source check; X4 entry; int type check |
+| M13–M17 | protected re-checks: claim / complete / maintenance before LIMIT / maintenance post-lock; work class re-check |
+| M18 | the U1 trigger |
+| M19 | latch on a non-latching code |
+| M20–M21 | the up duplicate check; the down gate |
+| M22 | report grant |
+| M23 | cursor `>=` |
+| M24–M27 | the JS fence (each stage), the `markUnknown` branch, the success guard |
+
+**Regressions.**
+- `npm test`: **695 / 695**.
+- `test:db` before the pins: 416 / 446. The 30 failures were 29 mechanical version / count / privilege pins plus the e72 item below.
+- `test:db` final: **445 / 446**, ONE failure, kept as the first full TAP. The e74a listing-lock guard PASSED. The historical e74a failure stays OPEN; it was not reproduced.
+
+**The one open failure is not mechanical and was not edited (outside the allowed files): `e72-reservation-worker.test.mjs:381`.**
+- The test plants a NON-canonical `guest.notify` row with a raw runtime INSERT: template `"t"`, key `test-notify:…`, on a `reservation_unknown` intent. It does this to show the reservation worker never touches notifications.
+- The authorized 0016 INSERT fence (§6.3, R7) now refuses that row with `NOTIFY_INSERT_REFUSED`. That premise can no longer be constructed.
+- **Root decision needed:** (a) authorize a fixture-only adaptation (recommended): plant the row as labelled TEST SETUP with triggers bypassed, or assert the refusal plus the worker's non-touch of a canonical row; or (b) relax the fence (not recommended).
+
+All TAP files are kept in the session scratchpad (`gnf/tap/`): `focused-final.tap`, `npm-test-final.tap`, `test-db-run1-preadapt.tap`, `test-db-run2-postpins.tap`, `test-db-final.tap`, and per-mutant `gnf/mut/M*.tap`.
+
+### 15.8 Residuals (unchanged from §14, plus)
+
+- **U2 = a.** The generic exported `recoverExpiredOperations` (global and phase-guarded) writes `outcome_unknown` plus a case to an expired notify row whatever its protection. No accepted worker calls it for `guest.notify`. Not exercised on a protected row; the residual is pinned on a non-protected row.
+- **Raw non-E3 INSERTs.** Raw INSERTs of other op types with a protected payload are outside the scoped guarantee.
+- **The post-snapshot race.**
+- **Unresolvable unknown cases.** Unknown cases block purge (N2 = a).
+- **No catalogued refusal mapping.** The new `NOTIFY_*` fence codes are not in `DB_SAFETY_CODES`, so a generic helper surfaces them as raw errors.
+- **e74a.** The historical listing-lock failure stays OPEN.

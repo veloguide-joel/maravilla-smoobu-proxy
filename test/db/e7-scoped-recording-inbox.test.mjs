@@ -759,7 +759,7 @@ test("T-L1: legacy parity — the 0015 legacy wrapper returns the same keys / va
   const p15 = await startMigratedDatabase();
   const p14 = await startMigratedDatabase();
   try {
-    assert.deepEqual(await migrateDown(p14.owner, { env: "test", to: 14 }), [15], "p14 = 0015 rolled back (equality with a fresh 14 is T-M1)");
+    assert.deepEqual(await migrateDown(p14.owner, { env: "test", to: 14 }), [16, 15], "p14 = 0015 rolled back (equality with a fresh 14 is T-M1)");
     const scenario = async (d) => {
       const A = await linkedOn(d, 875001);
       const B = await claimedOn(d, 875002);
@@ -828,17 +828,17 @@ test("T-M1: 0015 down (UNGATED) restores the legacy body FIRST and drops the new
       .map((r) => JSON.stringify(r.rows)).join("\n");
     const a0 = await auditAll(); const at15 = await objs(m.owner);
     assert.ok((await holdsOf(m, l.c.id)).length === 1);
-    assert.deepEqual(await migrateDown(m.owner, { env: "test", to: 14 }), [15]);
+    assert.deepEqual(await migrateDown(m.owner, { env: "test", to: 14 }), [16, 15]);
     await migrateUp(f14, { env: "test", to: 14 });
     assert.deepEqual(await objs(m.owner), await objs(f14), "15 -> 14 == fresh 14 (functiondef md5 / ACL / secdef / volatility / search_path)");
     assert.equal(await auditAll(), a0, "audit byte-identical after down");
-    assert.deepEqual(await migrateUp(m.owner, { env: "test" }), [15]);
+    assert.deepEqual(await migrateUp(m.owner, { env: "test" }), [15, 16]);
     assert.deepEqual(await objs(m.owner), at15);
     assert.equal(await auditAll(), a0, "audit byte-identical after up");
     // the PRIOR audit gates are unchanged: each down step is its own transaction, so 15 / 14 / 13 roll back first and 0012's audit gate refuses
     await assert.rejects(migrateDown(m.owner, { env: "test", to: 10 }), /DOWNGRADE_REFUSED_RECORDING_ASSESSMENT_AUDIT/, "the prior audit gate still refuses");
     assert.equal((await m.owner.query("SELECT max(version)::int AS v FROM booking_migrations.applied")).rows[0].v, 12);
-    assert.deepEqual(await migrateUp(m.owner, { env: "test" }), [13, 14, 15]);
+    assert.deepEqual(await migrateUp(m.owner, { env: "test" }), [13, 14, 15, 16]);
     assert.equal(await auditAll(), a0, "audit rows unchanged after the refused down + re-up");
     assert.deepEqual(await objs(m.owner), at15);
   } finally { await f14.end(); fresh.stop(); await m.close(); }

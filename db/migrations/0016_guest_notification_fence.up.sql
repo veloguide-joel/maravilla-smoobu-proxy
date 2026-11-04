@@ -1,0 +1,946 @@
+-- 0016_guest_notification_fence (up) — Stage E7 guest notification STAGE 1 (offline). DISPOSABLE LOCAL test databases only.
+-- Contract: claude/e7-guest-notification-contract.md revision 3 (accepted as OFFLINE design at 6e3fca5f with root addenda A–C).
+-- DB fence only: no renderer, worker, executor, provider adapter or send exists. Scope is a selection boundary, not tenant
+-- authentication. Every 0016 writer entrypoint is ONE top-level AUTOCOMMIT call per transaction by contract (root addendum B).
+--   * partial UNIQUE one-notify-per-intent index (R7)
+--   * notification_renders / notification_latches (append-only audit) + notification_write_authority (private, transaction-scoped
+--     write tokens: the caller-authority mechanism of root addendum A; no role but the schema owner can read or write it)
+--   * notify_op_fence (BEFORE INSERT OR UPDATE, SECURITY INVOKER) + notify_claim_binding (AFTER UPDATE, SECURITY INVOKER)
+--   * notification_evidence_lock (AFTER INSERT on provider_evidence, U1 = a): notification_facts advisory BEFORE any 0010 recording_evidence advisory
+--   * private predicates (protected / scope / facts / refusal / class) and the dedicated SECURITY DEFINER APIs (§13.1)
+
+DO $$
+BEGIN
+  IF to_regprocedure('booking.process_recording_conflict_inbox_scoped_one(text,integer[],uuid)') IS NULL
+     OR to_regprocedure('booking.recording_protected_reservation_ids()') IS NULL THEN
+    RAISE EXCEPTION 'MIGRATION_0016_PRECONDITION: 0015 is not applied' USING ERRCODE = 'check_violation';
+  END IF;
+END $$;
+
+-- ---------------------------------------------------------------------------------------------
+-- race-safe upgrade precondition (contract §8.2): existing guest.notify rows must be canonical, never attempted, one per intent
+LOCK TABLE booking.external_operations IN SHARE ROW EXCLUSIVE MODE;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM booking.external_operations WHERE op_type = 'guest.notify' GROUP BY intent_id HAVING count(*) > 1) THEN
+    RAISE EXCEPTION 'NOTIFY_UPGRADE_DUPLICATE: an intent has more than one guest.notify row' USING ERRCODE = 'check_violation';
+  END IF;
+  IF EXISTS (SELECT 1 FROM booking.external_operations o WHERE o.op_type = 'guest.notify' AND (
+        o.state <> 'pending' OR o.attempts <> 0 OR o.dispatched_at IS NOT NULL OR o.lease_worker_id IS NOT NULL OR o.lease_until IS NOT NULL
+     OR o.completed_at IS NOT NULL OR o.result_ref IS NOT NULL OR o.settled_evidence_id IS NOT NULL OR o.resolution_id IS NOT NULL
+     OR o.retry_class <> 'idempotent'
+     OR o.payload <> jsonb_build_object('template', o.payload ->> 'template')
+     OR (o.payload ->> 'template') IS NULL
+     OR (o.payload ->> 'template') NOT IN ('booking_confirmed', 'not_charged_authorization_may_show', 'not_completed_not_charged')
+     OR o.idempotency_key <> 'notify:' || o.intent_id::text || ':' || (o.payload ->> 'template'))) THEN
+    RAISE EXCEPTION 'NOTIFY_UPGRADE_PRECONDITION: a guest.notify row is attempted, in flight or not canonical' USING ERRCODE = 'check_violation';
+  END IF;
+END $$;
+
+CREATE UNIQUE INDEX external_operations_one_guest_notify ON booking.external_operations (intent_id) WHERE op_type = 'guest.notify';
+
+-- ---------------------------------------------------------------------------------------------
+-- tables
+CREATE TABLE booking.notification_renders (
+  operation_id     uuid PRIMARY KEY REFERENCES booking.external_operations (id),
+  intent_id        uuid NOT NULL REFERENCES booking.intents (id),
+  template         text NOT NULL CHECK (template IN ('booking_confirmed', 'not_charged_authorization_may_show', 'not_completed_not_charged')),
+  template_version text NOT NULL CHECK (template_version = 'gn-v1'),
+  intent_version   integer NOT NULL,
+  facts            jsonb NOT NULL CHECK (jsonb_typeof(facts) = 'object'),
+  facts_hash       text NOT NULL CHECK (facts_hash ~ '^[0-9a-f]{64}$'),
+  recipient_hash   text NOT NULL CHECK (recipient_hash ~ '^[0-9a-f]{64}$'),
+  content_hash     text NOT NULL CHECK (content_hash ~ '^[0-9a-f]{64}$'),
+  message_ref      text NOT NULL,
+  worker           text NOT NULL CHECK (length(worker) BETWEEN 1 AND 100),
+  claimed_at       timestamptz NOT NULL,
+  CHECK (message_ref = 'gn1-' || operation_id::text)
+);
+CREATE TRIGGER notification_renders_append_only BEFORE UPDATE OR DELETE ON booking.notification_renders
+  FOR EACH ROW EXECUTE FUNCTION booking.reject_change();
+CREATE TRIGGER notification_renders_no_truncate BEFORE TRUNCATE ON booking.notification_renders
+  FOR EACH STATEMENT EXECUTE FUNCTION booking.reject_change();
+
+CREATE TABLE booking.notification_latches (
+  operation_id        uuid PRIMARY KEY REFERENCES booking.external_operations (id),
+  intent_id           uuid NOT NULL REFERENCES booking.intents (id),
+  code                text NOT NULL CHECK (booking.is_code(code)),
+  intent_version_seen integer NOT NULL,
+  latched_at          timestamptz NOT NULL,
+  worker              text NOT NULL CHECK (length(worker) BETWEEN 1 AND 100)
+);
+CREATE TRIGGER notification_latches_append_only BEFORE UPDATE OR DELETE ON booking.notification_latches
+  FOR EACH ROW EXECUTE FUNCTION booking.reject_change();
+CREATE TRIGGER notification_latches_no_truncate BEFORE TRUNCATE ON booking.notification_latches
+  FOR EACH STATEMENT EXECUTE FUNCTION booking.reject_change();
+
+-- private: a transaction-scoped write token. A dedicated SECURITY DEFINER API inserts (txid, op, action) immediately before its
+-- notify UPDATE and deletes it immediately after; the INVOKER fence requires it. No grant, RLS enabled with no policy: only the
+-- schema owner (i.e. code running inside a booking SECURITY DEFINER function, or the owner's own session) can read or write it.
+CREATE TABLE booking.notification_write_authority (
+  txid         xid8 NOT NULL,
+  operation_id uuid NOT NULL,
+  action       text NOT NULL CHECK (action IN ('claim', 'complete')),
+  PRIMARY KEY (txid, operation_id, action)
+);
+
+DO $$
+DECLARE t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['notification_renders', 'notification_latches', 'notification_write_authority'] LOOP
+    EXECUTE format('ALTER TABLE booking.%I ENABLE ROW LEVEL SECURITY', t);
+    EXECUTE format('REVOKE ALL ON booking.%I FROM PUBLIC', t);
+  END LOOP;
+  FOREACH t IN ARRAY ARRAY['notification_renders', 'notification_latches'] LOOP
+    EXECUTE format('GRANT SELECT ON booking.%I TO mv_booking_app, mv_booking_admin', t);   -- D4: no report grant
+    EXECUTE format('CREATE POLICY app_admin_read ON booking.%I FOR SELECT TO mv_booking_app, mv_booking_admin USING (true)', t);
+  END LOOP;
+END $$;
+
+-- ---------------------------------------------------------------------------------------------
+-- private pure helpers (IMMUTABLE, INVOKER, no grant)
+CREATE FUNCTION booking.gn_templates() RETURNS text[]
+LANGUAGE sql IMMUTABLE SECURITY INVOKER SET search_path = pg_catalog, booking AS $$
+  SELECT ARRAY['booking_confirmed', 'not_charged_authorization_may_show', 'not_completed_not_charged']::text[]
+$$;
+REVOKE ALL ON FUNCTION booking.gn_templates() FROM PUBLIC;
+
+CREATE FUNCTION booking.gn_target_state(p_template text) RETURNS text
+LANGUAGE sql IMMUTABLE SECURITY INVOKER SET search_path = pg_catalog, booking AS $$
+  SELECT CASE p_template WHEN 'booking_confirmed' THEN 'confirmed' WHEN 'not_charged_authorization_may_show' THEN 'authorization_released'
+                         WHEN 'not_completed_not_charged' THEN 'cancelled' END
+$$;
+REVOKE ALL ON FUNCTION booking.gn_target_state(text) FROM PUBLIC;
+
+-- v1 recipient scope: synthetic .invalid addresses only (a TEST-ADDRESS restriction, not transport authentication)
+CREATE FUNCTION booking.gn_recipient_in_scope(p_email text) RETURNS boolean
+LANGUAGE sql IMMUTABLE SECURITY INVOKER SET search_path = pg_catalog, booking AS $$
+  SELECT coalesce(length(p_email) <= 254 AND p_email ~ '^[a-z0-9._+-]{1,64}@([a-z0-9-]{1,63}\.)+invalid$', false)
+$$;
+REVOKE ALL ON FUNCTION booking.gn_recipient_in_scope(text) FROM PUBLIC;
+
+-- observed-field access (contract §5.3). Walks p_path; any intermediate value that is present but not an object is MALFORMED.
+-- Result kind: 'ABSENT' (key missing / JSON null), 'MALFORMED', or 'OK' with the value. Never casts.
+CREATE FUNCTION booking.gn_obs(p_obj jsonb, p_path text[], OUT kind text, OUT val jsonb)
+LANGUAGE plpgsql IMMUTABLE SECURITY INVOKER SET search_path = pg_catalog, booking AS $$
+DECLARE cur jsonb := p_obj; k text;
+BEGIN
+  FOREACH k IN ARRAY p_path LOOP
+    IF cur IS NULL OR jsonb_typeof(cur) = 'null' THEN kind := 'ABSENT'; RETURN; END IF;
+    IF jsonb_typeof(cur) <> 'object' THEN kind := 'MALFORMED'; RETURN; END IF;
+    cur := cur -> k;
+  END LOOP;
+  IF cur IS NULL OR jsonb_typeof(cur) = 'null' THEN kind := 'ABSENT'; RETURN; END IF;
+  kind := 'OK'; val := cur;
+END $$;
+REVOKE ALL ON FUNCTION booking.gn_obs(jsonb, text[]) FROM PUBLIC;
+
+-- non-negative integer minor amount: NULL = ABSENT, -1 = MALFORMED, else the value (validated text before the cast)
+CREATE FUNCTION booking.gn_obs_int(p_obj jsonb, p_path text[]) RETURNS bigint
+LANGUAGE plpgsql IMMUTABLE SECURITY INVOKER SET search_path = pg_catalog, booking AS $$
+DECLARE r record;
+BEGIN
+  r := booking.gn_obs(p_obj, p_path);
+  IF r.kind = 'ABSENT' THEN RETURN NULL; END IF;
+  IF r.kind = 'MALFORMED' OR jsonb_typeof(r.val) <> 'number' OR NOT ((r.val #>> '{}') ~ '^(0|[1-9][0-9]{0,14})$') THEN RETURN -1; END IF;
+  RETURN (r.val #>> '{}')::bigint;
+END $$;
+REVOKE ALL ON FUNCTION booking.gn_obs_int(jsonb, text[]) FROM PUBLIC;
+
+-- string matching p_pattern: NULL = ABSENT, '!' = MALFORMED (no pattern below can match '!')
+CREATE FUNCTION booking.gn_obs_text(p_obj jsonb, p_path text[], p_pattern text) RETURNS text
+LANGUAGE plpgsql IMMUTABLE SECURITY INVOKER SET search_path = pg_catalog, booking AS $$
+DECLARE r record;
+BEGIN
+  r := booking.gn_obs(p_obj, p_path);
+  IF r.kind = 'ABSENT' THEN RETURN NULL; END IF;
+  IF r.kind = 'MALFORMED' OR jsonb_typeof(r.val) <> 'string' OR NOT ((r.val #>> '{}') ~ p_pattern) THEN RETURN '!'; END IF;
+  RETURN r.val #>> '{}';
+END $$;
+REVOKE ALL ON FUNCTION booking.gn_obs_text(jsonb, text[], text) FROM PUBLIC;
+
+-- boolean: NULL = ABSENT, -1 = MALFORMED, 0 = false, 1 = true
+CREATE FUNCTION booking.gn_obs_bool(p_obj jsonb, p_path text[]) RETURNS smallint
+LANGUAGE plpgsql IMMUTABLE SECURITY INVOKER SET search_path = pg_catalog, booking AS $$
+DECLARE r record;
+BEGIN
+  r := booking.gn_obs(p_obj, p_path);
+  IF r.kind = 'ABSENT' THEN RETURN NULL; END IF;
+  IF r.kind = 'MALFORMED' OR jsonb_typeof(r.val) <> 'boolean' THEN RETURN -1; END IF;
+  RETURN CASE WHEN (r.val #>> '{}')::boolean THEN 1 ELSE 0 END;
+END $$;
+REVOKE ALL ON FUNCTION booking.gn_obs_bool(jsonb, text[]) FROM PUBLIC;
+
+-- ---------------------------------------------------------------------------------------------
+-- private predicates (SECURITY DEFINER, no grant)
+
+-- protected (contract §7.2): every reservation reference of the intent, evaluated at call time. A NULL intent -> true (fail closed).
+CREATE FUNCTION booking.guest_notification_protected(p_intent uuid) RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+  SELECT p_intent IS NULL
+      OR EXISTS (SELECT 1 FROM booking.intents i WHERE i.id = p_intent AND i.hostaway_reservation_id = ANY (booking.recording_protected_reservation_ids()))
+      OR EXISTS (SELECT 1 FROM booking.hostaway_reservation_attempts a WHERE a.intent_id = p_intent
+                  AND a.hostaway_reservation_id = ANY (booking.recording_protected_reservation_ids()))
+      OR EXISTS (SELECT 1 FROM booking.provider_evidence e WHERE e.intent_id = p_intent AND e.kind IN ('hostaway_reservation', 'hostaway_offline_charges')
+                  AND e.external_ref = ANY (booking.recording_protected_reservation_ids()))
+      OR EXISTS (SELECT 1 FROM booking.external_operations o WHERE o.intent_id = p_intent
+                  AND (o.payload ->> 'reservationId') = ANY (booking.recording_protected_reservation_ids()))
+$$;
+REVOKE ALL ON FUNCTION booking.guest_notification_protected(uuid) FROM PUBLIC;
+
+-- eligibility class (contract §7.1); one SQL statement. Never evaluates the full refusal: a non-qualifying ELIGIBLE row is latched by the claim.
+CREATE FUNCTION booking.guest_notification_class(p_op uuid) RETURNS text
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+  SELECT CASE
+    WHEN o.id IS NULL OR o.op_type <> 'guest.notify' THEN 'NOT_NOTIFY'
+    WHEN booking.guest_notification_protected(o.intent_id) THEN 'PROTECTED'
+    WHEN o.state = 'succeeded' THEN 'SUCCEEDED'
+    WHEN o.state = 'in_flight' THEN 'IN_FLIGHT'
+    WHEN o.state = 'outcome_unknown' THEN 'UNKNOWN'
+    WHEN o.state <> 'pending' THEN 'OTHER'
+    WHEN EXISTS (SELECT 1 FROM booking.notification_latches l WHERE l.operation_id = o.id) THEN 'LATCHED'
+    WHEN o.attempts <> 0 OR o.dispatched_at IS NOT NULL OR EXISTS (SELECT 1 FROM booking.notification_renders r WHERE r.operation_id = o.id) THEN 'OTHER'
+    WHEN EXISTS (SELECT 1 FROM booking.intent_guests g WHERE g.intent_id = o.intent_id AND NOT booking.gn_recipient_in_scope(g.email))
+      OR (SELECT i.currency FROM booking.intents i WHERE i.id = o.intent_id) IS DISTINCT FROM 'USD' THEN 'OUT_OF_V1_SCOPE'
+    WHEN EXISTS (SELECT 1 FROM booking.stripe_webhook_events w WHERE w.intent_id = o.intent_id AND w.status IN ('received', 'failed_retryable')) THEN 'WAITING'
+    ELSE 'ELIGIBLE' END
+  FROM (SELECT p_op AS id0) x LEFT JOIN booking.external_operations o ON o.id = x.id0
+$$;
+REVOKE ALL ON FUNCTION booking.guest_notification_class(uuid) FROM PUBLIC;
+
+-- recipient hash (SQL-derived; pseudonymous, guessable personal data — N3 offline only). NULL when the guest row is absent.
+CREATE FUNCTION booking.guest_notification_recipient_hash(p_intent uuid) RETURNS text
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+  SELECT encode(sha256(convert_to('gn-v1-recipient' || E'\n' || g.email || E'\n' || g.first_name, 'UTF8')), 'hex')
+    FROM booking.intent_guests g WHERE g.intent_id = p_intent
+$$;
+REVOKE ALL ON FUNCTION booking.guest_notification_recipient_hash(uuid) FROM PUBLIC;
+
+-- latest evidence of a kind / ref in the deterministic contract order (observed_at, created_at, id)
+CREATE FUNCTION booking.gn_latest_evidence(p_intent uuid, p_kind text, p_ref text) RETURNS uuid
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+  SELECT e.id FROM booking.provider_evidence e WHERE e.intent_id = p_intent AND e.kind = p_kind AND e.external_ref = p_ref
+   ORDER BY e.observed_at DESC, e.created_at DESC, e.id DESC LIMIT 1
+$$;
+REVOKE ALL ON FUNCTION booking.gn_latest_evidence(uuid, text, text) FROM PUBLIC;
+
+-- SQL facts object (contract §4.2). Non-PII ids / dates / amounts only. VOLATILE: fresh READ COMMITTED reads per statement.
+CREATE FUNCTION booking.guest_notification_facts(p_op uuid) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE o booking.external_operations%ROWTYPE; i booking.intents%ROWTYPE; t text; f jsonb; v_rec uuid; rec booking.external_operations%ROWTYPE;
+BEGIN
+  SELECT * INTO o FROM booking.external_operations WHERE id = p_op AND op_type = 'guest.notify';
+  IF NOT FOUND THEN RETURN NULL; END IF;
+  SELECT * INTO i FROM booking.intents WHERE id = o.intent_id;
+  t := o.payload ->> 'template';
+  f := jsonb_build_object('v', 1, 'template', t, 'ref', i.ref, 'checkIn', i.from_date::text, 'checkOut', i.to_date::text,
+         'nights', (i.to_date - i.from_date), 'guests', i.guests, 'totalMinor', i.final_total_minor, 'currency', i.currency);
+  IF t = 'booking_confirmed' THEN
+    v_rec := booking.recording_latest_id(i.id);
+    SELECT * INTO rec FROM booking.external_operations WHERE id = v_rec;
+    f := f || jsonb_build_object(
+      'piId', i.stripe_payment_intent_id,
+      'captureLedgerId', (SELECT max(l.id) FROM booking.payment_ledger l WHERE l.intent_id = i.id AND l.entry = 'capture_succeeded'),
+      'captureOpId', (SELECT min(c.id::text) FROM booking.external_operations c WHERE c.intent_id = i.id AND c.op_type = 'stripe.capture_payment_intent' AND c.state = 'succeeded'),
+      'piEvidenceId', booking.gn_latest_evidence(i.id, 'payment_intent', i.stripe_payment_intent_id),
+      'offlineChargeId', i.offline_charge_id, 'recordingOpId', v_rec, 'settledEvidenceId', rec.settled_evidence_id,
+      'reservationId', i.hostaway_reservation_id);
+  ELSE
+    f := f || jsonb_build_object(
+      'piId', i.stripe_payment_intent_id,
+      'piCanceledEvidenceId', (SELECT e.id FROM booking.provider_evidence e WHERE e.intent_id = i.id AND e.kind = 'payment_intent'
+                                 AND e.external_ref = i.stripe_payment_intent_id AND e.status = 'canceled'
+                               ORDER BY e.observed_at DESC, e.created_at DESC, e.id DESC LIMIT 1),
+      'legEvent', (SELECT tr.event_type FROM booking.intent_transitions tr WHERE tr.intent_id = i.id AND tr.version_after = i.version));
+    IF t = 'not_completed_not_charged' THEN
+      f := f || jsonb_build_object('reservationId', i.hostaway_reservation_id,
+        'cancelEvidenceId', booking.gn_latest_evidence(i.id, 'hostaway_reservation', i.hostaway_reservation_id));
+    END IF;
+  END IF;
+  RETURN f;
+END $$;
+REVOKE ALL ON FUNCTION booking.guest_notification_facts(uuid) FROM PUBLIC;
+
+CREATE FUNCTION booking.gn_hash_facts(p_facts jsonb) RETURNS text
+LANGUAGE sql IMMUTABLE SECURITY INVOKER SET search_path = pg_catalog, booking AS $$
+  SELECT CASE WHEN p_facts IS NULL THEN NULL ELSE encode(sha256(convert_to('gn-v1-facts' || E'\n' || p_facts::text, 'UTF8')), 'hex') END
+$$;
+REVOKE ALL ON FUNCTION booking.gn_hash_facts(jsonb) FROM PUBLIC;
+
+-- the exact qualification predicate (contract §5.2 / §5.3). NULL = qualifies. Non-latching codes: RECIPIENT_OUT_OF_V1_SCOPE,
+-- CURRENCY_OUT_OF_V1_SCOPE, WEBHOOK_UNPROCESSED, NOT_NOTIFY (booking.gn_non_latching). VOLATILE on purpose (as 0010:40–41): every
+-- statement takes a fresh READ COMMITTED snapshot, so rows committed while the caller waited on a lock are seen.
+CREATE FUNCTION booking.guest_notification_refusal(p_op uuid) RETURNS text
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE o booking.external_operations%ROWTYPE; i booking.intents%ROWTYPE; g booking.intent_guests%ROWTYPE; t text; p text; r text;
+        cap booking.external_operations%ROWTYPE; e booking.provider_evidence%ROWTYPE; rec booking.external_operations%ROWTYPE;
+        n integer; v_int bigint; v_txt text; v_bool smallint; v_cf integer;
+BEGIN
+  SELECT * INTO o FROM booking.external_operations WHERE id = p_op;
+  IF NOT FOUND OR o.op_type <> 'guest.notify' THEN RETURN 'NOT_NOTIFY'; END IF;
+  t := o.payload ->> 'template';
+  IF t IS NULL OR NOT (t = ANY (booking.gn_templates())) THEN RETURN 'TEMPLATE_UNKNOWN'; END IF;
+  SELECT * INTO i FROM booking.intents WHERE id = o.intent_id;
+  SELECT * INTO g FROM booking.intent_guests WHERE intent_id = o.intent_id;
+  -- C3 (before scope: a missing recipient is a permanent fact)
+  IF g.intent_id IS NULL THEN RETURN 'RECIPIENT_MISSING'; END IF;
+  -- v1 scope / waiting classes (non-latching, contract §7.1)
+  IF NOT booking.gn_recipient_in_scope(g.email) THEN RETURN 'RECIPIENT_OUT_OF_V1_SCOPE'; END IF;
+  IF i.currency IS DISTINCT FROM 'USD' THEN RETURN 'CURRENCY_OUT_OF_V1_SCOPE'; END IF;                                   -- C8
+  IF EXISTS (SELECT 1 FROM booking.stripe_webhook_events w WHERE w.intent_id = i.id AND w.status IN ('received', 'failed_retryable')) THEN
+    RETURN 'WEBHOOK_UNPROCESSED';
+  END IF;
+  -- C1 / C2
+  IF i.version IS DISTINCT FROM o.source_version THEN RETURN 'VERSION_DRIFT'; END IF;
+  IF i.state IS DISTINCT FROM booking.gn_target_state(t) THEN RETURN 'STATE_MISMATCH'; END IF;
+  -- C4: ANY open case
+  IF EXISTS (SELECT 1 FROM booking.reconciliation_cases c WHERE c.intent_id = i.id AND c.status = 'open') THEN RETURN 'OPEN_CASE'; END IF;
+  -- C5: any refund row in any state
+  IF EXISTS (SELECT 1 FROM booking.payment_refunds f WHERE f.intent_id = i.id) THEN RETURN 'REFUND_PRESENT'; END IF;
+  -- C6
+  IF EXISTS (SELECT 1 FROM booking.payment_attempts a WHERE a.intent_id = i.id AND a.status IN ('creating', 'open', 'outcome_unknown')) THEN
+    RETURN 'PAYMENT_ATTEMPT_OPEN';
+  END IF;
+  -- C7 (Stripe PaymentIntent references only)
+  p := i.stripe_payment_intent_id;
+  IF EXISTS (SELECT 1 FROM booking.payment_ledger l WHERE l.intent_id = i.id AND l.entry = 'authorization_rejected')
+     OR EXISTS (SELECT 1 FROM booking.payment_ledger l WHERE l.intent_id = i.id AND l.provider = 'stripe' AND l.provider_ref IS DISTINCT FROM p)
+     OR EXISTS (SELECT 1 FROM booking.provider_evidence e2 WHERE e2.intent_id = i.id AND e2.kind = 'payment_intent' AND e2.external_ref IS DISTINCT FROM p)
+     OR EXISTS (SELECT 1 FROM booking.external_operations x WHERE x.intent_id = i.id
+                 AND x.op_type IN ('stripe.capture_payment_intent', 'stripe.void_payment_intent', 'stripe.retrieve_payment_intent')
+                 AND (x.payload ->> 'paymentIntentId') IS DISTINCT FROM p)
+     OR EXISTS (SELECT 1 FROM booking.payment_attempts a WHERE a.intent_id = i.id AND a.payment_intent_id IS NOT NULL AND a.payment_intent_id IS DISTINCT FROM p) THEN
+    RETURN 'FOREIGN_PAYMENT_INTENT';
+  END IF;
+  -- C9
+  IF EXISTS (SELECT 1 FROM booking.external_operations x WHERE x.intent_id = i.id
+              AND x.op_type IN ('stripe.capture_payment_intent', 'stripe.void_payment_intent', 'hostaway.cancel_reservation',
+                                'hostaway.create_reservation', 'hostaway.record_offline_charge')
+              AND x.state IN ('in_flight', 'outcome_unknown', 'escalated')) THEN
+    RETURN 'OPERATION_UNSETTLED';
+  END IF;
+  r := i.hostaway_reservation_id;
+
+  IF t = 'booking_confirmed' THEN
+    -- C10
+    IF booking.recording_latest_id(i.id) IS NOT NULL AND booking.recording_active_hold_id(booking.recording_latest_id(i.id)) IS NOT NULL THEN
+      RETURN 'RECORDING_HOLD_ACTIVE';
+    END IF;
+    -- K1
+    IF p IS NULL OR i.captured_minor IS DISTINCT FROM i.final_total_minor
+       OR (SELECT count(*) FROM booking.payment_ledger l WHERE l.intent_id = i.id AND l.entry = 'capture_succeeded') <> 1
+       OR (SELECT count(*) FROM booking.payment_ledger l WHERE l.intent_id = i.id AND l.entry = 'capture_succeeded' AND l.provider = 'stripe'
+             AND l.provider_ref = p AND l.amount_minor = i.final_total_minor AND l.currency = i.currency) <> 1 THEN
+      RETURN 'CAPTURE_NOT_PROVEN';
+    END IF;
+    -- K2
+    SELECT count(*) INTO n FROM booking.external_operations x WHERE x.intent_id = i.id AND x.op_type = 'stripe.capture_payment_intent' AND x.state = 'succeeded';
+    SELECT * INTO cap FROM booking.external_operations x WHERE x.intent_id = i.id AND x.op_type = 'stripe.capture_payment_intent' AND x.state = 'succeeded'
+       AND (x.payload ->> 'paymentIntentId') = p;
+    IF n <> 1 OR cap.id IS NULL OR cap.dispatched_at IS NULL
+       OR EXISTS (SELECT 1 FROM booking.external_operations x WHERE x.intent_id = i.id AND x.op_type = 'stripe.capture_payment_intent' AND x.id <> cap.id
+                   AND NOT (x.state = 'failed_definite' OR (x.state IN ('superseded', 'pending') AND x.dispatched_at IS NULL))) THEN
+      RETURN 'CAPTURE_HISTORY';
+    END IF;
+    -- K3 (limited to what the accepted API read recorded)
+    SELECT * INTO e FROM booking.provider_evidence WHERE id = booking.gn_latest_evidence(i.id, 'payment_intent', p);
+    IF e.id IS NULL THEN RETURN 'PI_EVIDENCE_MISSING'; END IF;
+    v_txt := booking.gn_obs_text(e.observed, ARRAY['proofVersion'], '^[a-z0-9-]{1,40}$');
+    IF v_txt = '!' THEN RETURN 'EVIDENCE_MALFORMED'; END IF;
+    IF e.source <> 'stripe_api' OR v_txt IS NULL OR v_txt NOT IN ('pi-proof-v2', 'pi-proof-v3') THEN RETURN 'PI_EVIDENCE_UNPROVEN'; END IF;
+    v_int := booking.gn_obs_int(e.observed, ARRAY['amountReceivedMinor']);
+    v_txt := booking.gn_obs_text(e.observed, ARRAY['currency'], '^[A-Z]{3}$');
+    IF v_int = -1 OR v_txt = '!' THEN RETURN 'EVIDENCE_MALFORMED'; END IF;
+    IF v_int IS NULL OR v_txt IS NULL THEN RETURN 'PI_EVIDENCE_UNPROVEN'; END IF;
+    IF e.status <> 'succeeded' OR e.observed_at < cap.dispatched_at OR v_int <> i.captured_minor OR v_txt <> i.currency THEN
+      RETURN 'PI_EVIDENCE_CONTRADICTS';
+    END IF;
+    FOR e IN SELECT * FROM booking.provider_evidence WHERE intent_id = i.id AND kind = 'payment_intent' AND external_ref = p LOOP
+      v_int := booking.gn_obs_int(e.observed, ARRAY['latestCharge', 'amountRefundedMinor']);
+      v_bool := booking.gn_obs_bool(e.observed, ARRAY['latestCharge', 'refunded']);
+      IF v_int = -1 OR v_bool = -1 THEN RETURN 'EVIDENCE_MALFORMED'; END IF;
+      IF coalesce(v_int, 0) <> 0 OR coalesce(v_bool, 0) <> 0 THEN RETURN 'PI_EVIDENCE_CONTRADICTS'; END IF;
+    END LOOP;
+    -- K4
+    SELECT * INTO rec FROM booking.external_operations WHERE id = booking.recording_latest_id(i.id);
+    IF i.offline_charge_id IS NULL OR rec.id IS NULL OR rec.state <> 'succeeded' OR rec.settled_evidence_id IS NULL
+       OR rec.result_ref IS DISTINCT FROM i.offline_charge_id OR rec.dispatched_at IS NULL
+       OR (SELECT count(*) FROM booking.payment_ledger l WHERE l.intent_id = i.id AND l.entry = 'offline_charge_recorded') <> 1
+       OR (SELECT count(*) FROM booking.payment_ledger l WHERE l.intent_id = i.id AND l.entry = 'offline_charge_recorded' AND l.provider = 'hostaway'
+             AND l.provider_ref = i.offline_charge_id AND l.amount_minor = i.captured_minor AND l.currency = i.currency) <> 1
+       OR booking.recording_conflict_refusal(i.id, rec.dispatched_at, rec.result_ref, rec.settled_evidence_id) IS NOT NULL THEN
+      RETURN 'RECORDING_NOT_PROVEN';
+    END IF;
+    -- K5
+    IF r IS NULL
+       OR EXISTS (SELECT 1 FROM booking.provider_evidence e3 WHERE e3.id = booking.gn_latest_evidence(i.id, 'hostaway_reservation', r)
+                   AND e3.status IN ('cancelled', 'not_found'))
+       OR EXISTS (SELECT 1 FROM booking.external_operations x WHERE x.intent_id = i.id AND x.op_type = 'hostaway.cancel_reservation' AND x.state = 'succeeded') THEN
+      RETURN 'RESERVATION_CONTRADICTED';
+    END IF;
+    RETURN NULL;
+  END IF;
+
+  -- "not charged" templates: A1 / X1
+  IF i.captured_minor <> 0
+     OR EXISTS (SELECT 1 FROM booking.payment_ledger l WHERE l.intent_id = i.id AND l.entry IN ('capture_succeeded', 'offline_charge_recorded', 'refund_succeeded'))
+     OR EXISTS (SELECT 1 FROM booking.external_operations x WHERE x.intent_id = i.id AND x.op_type = 'stripe.capture_payment_intent' AND x.state = 'succeeded') THEN
+    RETURN 'MONEY_PRESENT';
+  END IF;
+  -- A2 / X2: positive release proof
+  IF p IS NULL THEN RETURN 'RELEASE_NOT_PROVEN'; END IF;
+  SELECT * INTO e FROM booking.provider_evidence WHERE id = booking.gn_latest_evidence(i.id, 'payment_intent', p);
+  IF e.id IS NULL OR e.status <> 'canceled' THEN RETURN 'RELEASE_NOT_PROVEN'; END IF;
+  IF EXISTS (SELECT 1 FROM booking.provider_evidence e4 WHERE e4.intent_id = i.id AND e4.kind = 'payment_intent' AND e4.external_ref = p AND e4.status = 'succeeded') THEN
+    RETURN 'RELEASE_NOT_PROVEN';
+  END IF;
+  SELECT count(*) INTO v_cf FROM booking.provider_evidence e5 WHERE e5.intent_id = i.id AND e5.kind = 'payment_intent' AND e5.external_ref = p
+     AND booking.gn_obs_int(e5.observed, ARRAY['amountReceivedMinor']) = -1;
+  IF v_cf > 0 THEN RETURN 'EVIDENCE_MALFORMED'; END IF;
+  IF EXISTS (SELECT 1 FROM booking.provider_evidence e5 WHERE e5.intent_id = i.id AND e5.kind = 'payment_intent' AND e5.external_ref = p
+              AND booking.gn_obs_int(e5.observed, ARRAY['amountReceivedMinor']) > 0) THEN
+    RETURN 'RELEASE_NOT_PROVEN';
+  END IF;
+  -- explicit dispatch floor: vacuous when no capture was ever dispatched (never a NULL comparison)
+  IF EXISTS (SELECT 1 FROM booking.external_operations x WHERE x.intent_id = i.id AND x.op_type = 'stripe.capture_payment_intent'
+              AND (x.payload ->> 'paymentIntentId') = p AND x.dispatched_at IS NOT NULL AND x.dispatched_at > e.observed_at) THEN
+    RETURN 'RELEASE_NOT_PROVEN';
+  END IF;
+
+  IF t = 'not_charged_authorization_may_show' THEN
+    -- A3: the transition that produced the current version applied a leg event
+    IF NOT EXISTS (SELECT 1 FROM booking.intent_transitions tr WHERE tr.intent_id = i.id AND tr.version_after = i.version
+                    AND tr.event_type IN ('VOID_SUCCEEDED', 'RECONCILED_AUTHORIZATION_GONE')) THEN
+      RETURN 'RELEASE_NOT_PROVEN';
+    END IF;
+    -- A4: no booking
+    IF r IS NOT NULL OR EXISTS (SELECT 1 FROM booking.hostaway_reservation_attempts a WHERE a.intent_id = i.id
+                                 AND NOT (a.state = 'refused' AND a.hostaway_reservation_id IS NULL)) THEN
+      RETURN 'RESERVATION_PRESENT';
+    END IF;
+    RETURN NULL;
+  END IF;
+
+  -- not_completed_not_charged: X3 positive cancel proof
+  IF r IS NULL THEN RETURN 'CANCEL_NOT_PROVEN'; END IF;
+  SELECT * INTO e FROM booking.provider_evidence WHERE id = booking.gn_latest_evidence(i.id, 'hostaway_reservation', r);
+  IF e.id IS NULL OR e.status <> 'cancelled' THEN RETURN 'CANCEL_NOT_PROVEN'; END IF;
+  IF EXISTS (SELECT 1 FROM booking.external_operations x WHERE x.intent_id = i.id AND x.op_type = 'hostaway.cancel_reservation'
+              AND (x.payload ->> 'reservationId') = r AND x.dispatched_at IS NOT NULL AND x.dispatched_at > e.observed_at) THEN
+    RETURN 'CANCEL_NOT_PROVEN';
+  END IF;
+  -- X4: both leg events after the entry into capture_failed
+  -- the ENTRY into capture_failed (the leg events themselves are capture_failed -> capture_failed transitions)
+  SELECT min(tr.version_after) INTO n FROM booking.intent_transitions tr WHERE tr.intent_id = i.id AND tr.to_state = 'capture_failed'
+     AND tr.from_state IS DISTINCT FROM 'capture_failed';
+  IF n IS NULL
+     OR NOT EXISTS (SELECT 1 FROM booking.intent_transitions tr WHERE tr.intent_id = i.id AND tr.version_after > n AND tr.event_type = 'RESERVATION_CANCELLED')
+     OR NOT EXISTS (SELECT 1 FROM booking.intent_transitions tr WHERE tr.intent_id = i.id AND tr.version_after > n
+                     AND tr.event_type IN ('VOID_SUCCEEDED', 'RECONCILED_AUTHORIZATION_GONE')) THEN
+    RETURN 'CANCEL_NOT_PROVEN';
+  END IF;
+  RETURN NULL;
+END $$;
+REVOKE ALL ON FUNCTION booking.guest_notification_refusal(uuid) FROM PUBLIC;
+
+CREATE FUNCTION booking.gn_non_latching(p_code text) RETURNS boolean
+LANGUAGE sql IMMUTABLE SECURITY INVOKER SET search_path = pg_catalog, booking AS $$
+  SELECT p_code IN ('RECIPIENT_OUT_OF_V1_SCOPE', 'CURRENCY_OUT_OF_V1_SCOPE', 'WEBHOOK_UNPROCESSED', 'NOT_NOTIFY')
+$$;
+REVOKE ALL ON FUNCTION booking.gn_non_latching(text) FROM PUBLIC;
+
+-- argument validation (programming errors -> 22023)
+CREATE FUNCTION booking.gn_check_worker(p_worker text) RETURNS void
+LANGUAGE plpgsql IMMUTABLE SECURITY INVOKER SET search_path = pg_catalog, booking AS $$
+BEGIN
+  IF p_worker IS NULL OR p_worker !~ '^[A-Za-z0-9._:-]{1,100}$' THEN
+    RAISE EXCEPTION 'NOTIFY_ARGUMENT_INVALID: worker' USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+END $$;
+REVOKE ALL ON FUNCTION booking.gn_check_worker(text) FROM PUBLIC;
+
+CREATE FUNCTION booking.gn_check_scope(p_listing_ids integer[]) RETURNS void
+LANGUAGE plpgsql IMMUTABLE SECURITY INVOKER SET search_path = pg_catalog, booking AS $$
+BEGIN
+  IF p_listing_ids IS NULL OR cardinality(p_listing_ids) NOT BETWEEN 1 AND 50 OR array_ndims(p_listing_ids) <> 1
+     OR EXISTS (SELECT 1 FROM unnest(p_listing_ids) x WHERE x IS NULL OR x <= 0)
+     OR (SELECT count(DISTINCT x) FROM unnest(p_listing_ids) x) <> cardinality(p_listing_ids) THEN
+    RAISE EXCEPTION 'NOTIFY_ARGUMENT_INVALID: listing scope' USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+END $$;
+REVOKE ALL ON FUNCTION booking.gn_check_scope(integer[]) FROM PUBLIC;
+
+-- ---------------------------------------------------------------------------------------------
+-- triggers (SECURITY INVOKER: current_user is the CALLER, so a raw runtime-role write is distinguishable from a dedicated
+-- SECURITY DEFINER API, inside which current_user is the schema owner — root addendum A)
+
+CREATE FUNCTION booking.notify_op_fence() RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, booking AS $$
+DECLARE i_state text; i_version integer; t text;
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    t := NEW.payload ->> 'template';
+    SELECT state, version INTO i_state, i_version FROM booking.intents WHERE id = NEW.intent_id;
+    IF t IS NULL OR t NOT IN ('booking_confirmed', 'not_charged_authorization_may_show', 'not_completed_not_charged')
+       OR NEW.payload <> jsonb_build_object('template', t)
+       OR NEW.idempotency_key IS DISTINCT FROM 'notify:' || NEW.intent_id::text || ':' || t
+       OR NEW.retry_class IS DISTINCT FROM 'idempotent' THEN
+      RAISE EXCEPTION 'NOTIFY_INSERT_REFUSED: key / payload / retry class not canonical' USING ERRCODE = 'check_violation';
+    END IF;
+    IF NEW.state <> 'pending' OR NEW.attempts <> 0 OR NEW.dispatched_at IS NOT NULL OR NEW.completed_at IS NOT NULL
+       OR NEW.lease_worker_id IS NOT NULL OR NEW.lease_until IS NOT NULL OR NEW.result_ref IS NOT NULL OR NEW.error_code IS NOT NULL
+       OR NEW.late_result_status IS NOT NULL OR NEW.late_result_ref IS NOT NULL OR NEW.settled_evidence_id IS NOT NULL
+       OR NEW.resolution_id IS NOT NULL OR NEW.requires_provider_read THEN
+      RAISE EXCEPTION 'NOTIFY_INSERT_REFUSED: lifecycle columns must be initial' USING ERRCODE = 'check_violation';
+    END IF;
+    IF i_version IS DISTINCT FROM NEW.source_version OR i_state IS DISTINCT FROM
+       (CASE t WHEN 'booking_confirmed' THEN 'confirmed' WHEN 'not_charged_authorization_may_show' THEN 'authorization_released'
+               ELSE 'cancelled' END) THEN
+      RAISE EXCEPTION 'NOTIFY_INSERT_REFUSED: source version / intent state' USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+  END IF;
+  -- UPDATE (op_type / identity immutability is 0004's guard)
+  IF NEW.source_version IS DISTINCT FROM OLD.source_version THEN
+    RAISE EXCEPTION 'NOTIFY_OP_FROZEN: source_version' USING ERRCODE = 'check_violation';
+  END IF;
+  IF NEW.state = OLD.state THEN
+    IF (NEW.attempts, NEW.dispatched_at, NEW.lease_worker_id, NEW.lease_until, NEW.result_ref, NEW.completed_at, NEW.next_attempt_at,
+        NEW.requires_provider_read, NEW.late_result_status, NEW.late_result_ref, NEW.settled_evidence_id, NEW.resolution_id, NEW.error_code)
+       IS DISTINCT FROM
+       (OLD.attempts, OLD.dispatched_at, OLD.lease_worker_id, OLD.lease_until, OLD.result_ref, OLD.completed_at, OLD.next_attempt_at,
+        OLD.requires_provider_read, OLD.late_result_status, OLD.late_result_ref, OLD.settled_evidence_id, OLD.resolution_id, OLD.error_code) THEN
+      RAISE EXCEPTION 'NOTIFY_OP_FROZEN: same-state change of a notification lifecycle column' USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+  END IF;
+  -- columns no transition may touch
+  IF (NEW.next_attempt_at, NEW.requires_provider_read, NEW.late_result_status, NEW.late_result_ref, NEW.settled_evidence_id, NEW.resolution_id)
+     IS DISTINCT FROM (OLD.next_attempt_at, OLD.requires_provider_read, OLD.late_result_status, OLD.late_result_ref, OLD.settled_evidence_id, OLD.resolution_id) THEN
+    RAISE EXCEPTION 'NOTIFY_OP_FROZEN: column not settable by a notification transition' USING ERRCODE = 'check_violation';
+  END IF;
+  IF OLD.state = 'pending' AND NEW.state = 'in_flight' THEN
+    IF NOT booking.is_privileged() THEN
+      RAISE EXCEPTION 'NOTIFY_CLAIM_AUTHORITY: claimed only through booking.claim_guest_notification' USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM booking.notification_write_authority a WHERE a.txid = pg_current_xact_id() AND a.operation_id = NEW.id AND a.action = 'claim') THEN
+      RAISE EXCEPTION 'NOTIFY_CLAIM_AUTHORITY: no claim token in this transaction' USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    IF OLD.attempts <> 0 OR OLD.dispatched_at IS NOT NULL OR NEW.attempts <> 1 OR NEW.dispatched_at IS NULL OR NEW.lease_worker_id IS NULL
+       OR NEW.lease_until IS NULL OR NEW.result_ref IS NOT NULL OR NEW.completed_at IS NOT NULL OR NEW.error_code IS DISTINCT FROM OLD.error_code THEN
+      RAISE EXCEPTION 'NOTIFY_CLAIM_FENCED: only the never-attempted row, attempts 0 -> 1' USING ERRCODE = 'check_violation';
+    END IF;
+    IF booking.guest_notification_protected(NEW.intent_id) OR EXISTS (SELECT 1 FROM booking.notification_latches l WHERE l.operation_id = NEW.id)
+       OR booking.guest_notification_refusal(NEW.id) IS NOT NULL THEN
+      RAISE EXCEPTION 'NOTIFY_CLAIM_FENCED: protected, latched or not qualified at the fence instant' USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+  END IF;
+  IF OLD.state = 'in_flight' AND NEW.state = 'succeeded' THEN
+    IF NOT booking.is_privileged() THEN
+      RAISE EXCEPTION 'NOTIFY_COMPLETE_AUTHORITY: completed only through booking.complete_guest_notification' USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM booking.notification_write_authority a WHERE a.txid = pg_current_xact_id() AND a.operation_id = NEW.id AND a.action = 'complete') THEN
+      RAISE EXCEPTION 'NOTIFY_COMPLETE_AUTHORITY: no completion token in this transaction' USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    IF NEW.attempts <> OLD.attempts OR NEW.dispatched_at IS DISTINCT FROM OLD.dispatched_at OR NEW.lease_worker_id IS NOT NULL OR NEW.lease_until IS NOT NULL
+       OR NEW.completed_at IS NULL OR NEW.error_code IS NOT NULL OR NEW.result_ref IS NULL OR NEW.result_ref !~ '^mock-[A-Za-z0-9._:-]{1,95}$'
+       OR NOT EXISTS (SELECT 1 FROM booking.notification_renders r WHERE r.operation_id = NEW.id) THEN
+      RAISE EXCEPTION 'NOTIFY_COMPLETE_FENCED: succeeded needs a render, a cleared lease and a mock result id' USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+  END IF;
+  IF OLD.state = 'in_flight' AND NEW.state = 'outcome_unknown' THEN
+    -- the fail-safe direction: any role (generic markUnknown, the dedicated completion / maintenance)
+    IF NEW.attempts <> OLD.attempts OR NEW.dispatched_at IS DISTINCT FROM OLD.dispatched_at OR NEW.lease_worker_id IS NOT NULL OR NEW.lease_until IS NOT NULL
+       OR NEW.result_ref IS NOT NULL OR NEW.error_code IS NULL THEN
+      RAISE EXCEPTION 'NOTIFY_UNKNOWN_FENCED: unknown keeps attempts / dispatch, clears the lease, records a code' USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+  END IF;
+  RAISE EXCEPTION 'NOTIFY_TRANSITION_REFUSED: guest.notify % -> % is not allowed (no resend, no reset, no owner settlement in v1)', OLD.state, NEW.state
+    USING ERRCODE = 'check_violation';
+END $$;
+REVOKE ALL ON FUNCTION booking.notify_op_fence() FROM PUBLIC;
+CREATE TRIGGER notify_op_fence BEFORE INSERT OR UPDATE ON booking.external_operations
+  FOR EACH ROW WHEN (NEW.op_type = 'guest.notify') EXECUTE FUNCTION booking.notify_op_fence();
+
+-- claim binding: written by the claim statement itself (AFTER ROW), re-checked at its own instant (0012 claim-audit pattern)
+CREATE FUNCTION booking.notify_claim_binding() RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, booking AS $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM booking.notification_renders r WHERE r.operation_id = NEW.id AND r.worker = NEW.lease_worker_id
+                  AND r.intent_version = NEW.source_version AND r.claimed_at = NEW.dispatched_at AND r.intent_id = NEW.intent_id) THEN
+    RAISE EXCEPTION 'NOTIFY_CLAIM_BINDING: no matching render for this claim' USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NULL;
+END $$;
+REVOKE ALL ON FUNCTION booking.notify_claim_binding() FROM PUBLIC;
+CREATE TRIGGER notify_claim_binding AFTER UPDATE ON booking.external_operations
+  FOR EACH ROW WHEN (OLD.state = 'pending' AND NEW.state = 'in_flight' AND NEW.op_type = 'guest.notify')
+  EXECUTE FUNCTION booking.notify_claim_binding();
+
+-- U1 = a: evidence inserts of the three qualification kinds take the per-intent notification_facts advisory INSIDE the INSERT
+-- statement, i.e. BEFORE the 0010 writers' recording_evidence advisory (0010:386–388, :402–404). zz1_evidence_enqueue takes no lock.
+CREATE FUNCTION booking.notification_evidence_lock() RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, booking AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtext('booking.notification_facts'), hashtext(NEW.intent_id::text));
+  RETURN NULL;
+END $$;
+REVOKE ALL ON FUNCTION booking.notification_evidence_lock() FROM PUBLIC;
+CREATE TRIGGER notification_evidence_lock AFTER INSERT ON booking.provider_evidence
+  FOR EACH ROW WHEN (NEW.kind IN ('payment_intent', 'hostaway_reservation', 'hostaway_offline_charges'))
+  EXECUTE FUNCTION booking.notification_evidence_lock();
+
+-- ---------------------------------------------------------------------------------------------
+-- dedicated APIs (SECURITY DEFINER; one top-level AUTOCOMMIT call per transaction by contract; no automatic retry: 40P01 / 40001 propagate)
+
+-- the protection lock bundle, row part (contract §6.6): intent SHARE -> create attempt SHARE. p_skip = SKIP LOCKED variant.
+-- Returns false when a row was skipped (p_skip) or the intent does not exist. Private.
+CREATE FUNCTION booking.gn_lock_bundle(p_intent uuid, p_skip boolean) RETURNS boolean
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE x uuid;
+BEGIN
+  IF p_skip THEN
+    SELECT id INTO x FROM booking.intents WHERE id = p_intent FOR SHARE SKIP LOCKED;
+    IF x IS NULL THEN RETURN false; END IF;
+    IF EXISTS (SELECT 1 FROM booking.hostaway_reservation_attempts WHERE intent_id = p_intent) THEN
+      SELECT intent_id INTO x FROM booking.hostaway_reservation_attempts WHERE intent_id = p_intent FOR SHARE SKIP LOCKED;
+      IF x IS NULL THEN RETURN false; END IF;
+    END IF;
+  ELSE
+    SELECT id INTO x FROM booking.intents WHERE id = p_intent FOR SHARE;
+    IF x IS NULL THEN RETURN false; END IF;
+    PERFORM 1 FROM booking.hostaway_reservation_attempts WHERE intent_id = p_intent FOR SHARE;
+  END IF;
+  RETURN true;
+END $$;
+REVOKE ALL ON FUNCTION booking.gn_lock_bundle(uuid, boolean) FROM PUBLIC;
+
+CREATE FUNCTION booking.gn_facts_advisory(p_intent uuid) RETURNS void
+LANGUAGE sql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+  SELECT pg_advisory_xact_lock(hashtext('booking.notification_facts'), hashtext(p_intent::text))
+$$;
+REVOKE ALL ON FUNCTION booking.gn_facts_advisory(uuid) FROM PUBLIC;
+
+-- work acquisition (contract §7.1)
+CREATE FUNCTION booking.claim_notification_work(p_worker text, p_listing_ids integer[], p_intent uuid) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE c record; skip uuid[] := ARRAY[]::uuid[]; k integer; w uuid; v_t timestamptz;
+BEGIN
+  PERFORM booking.gn_check_worker(p_worker);
+  PERFORM booking.gn_check_scope(p_listing_ids);
+  FOR k IN 1..10 LOOP
+    SELECT o.id, o.intent_id INTO c FROM booking.external_operations o JOIN booking.intents i ON i.id = o.intent_id
+     WHERE o.op_type = 'guest.notify' AND o.state = 'pending' AND i.listing_id = ANY (p_listing_ids) AND (p_intent IS NULL OR i.id = p_intent)
+       AND NOT (o.id = ANY (skip)) AND booking.guest_notification_class(o.id) = 'ELIGIBLE'
+     ORDER BY o.created_at, o.id LIMIT 1;
+    IF c.id IS NULL THEN RETURN jsonb_build_object('status', 'idle'); END IF;
+    skip := skip || c.id;
+    IF NOT booking.gn_lock_bundle(c.intent_id, true) THEN CONTINUE; END IF;
+    SELECT intent_id INTO w FROM booking.intent_work WHERE intent_id = c.intent_id
+       AND (work_lease_until IS NULL OR work_lease_until < clock_timestamp()) FOR UPDATE SKIP LOCKED;
+    IF w IS NULL THEN CONTINUE; END IF;
+    PERFORM booking.gn_facts_advisory(c.intent_id);
+    -- fresh READ COMMITTED statements after the locks
+    IF booking.guest_notification_class(c.id) <> 'ELIGIBLE' THEN CONTINUE; END IF;
+    v_t := clock_timestamp();
+    IF EXISTS (SELECT 1 FROM booking.intent_work WHERE intent_id = c.intent_id AND work_lease_until >= v_t) THEN CONTINUE; END IF;
+    UPDATE booking.intent_work SET work_worker_id = p_worker, work_lease_until = v_t + interval '120 seconds' WHERE intent_id = c.intent_id;
+    RETURN jsonb_build_object('status', 'acquired', 'opId', c.id, 'intentId', c.intent_id, 'workLeaseUntil', v_t + interval '120 seconds');
+  END LOOP;
+  RETURN jsonb_build_object('status', 'idle');
+END $$;
+
+CREATE FUNCTION booking.release_notification_work(p_intent uuid, p_worker text) RETURNS text
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE w booking.intent_work%ROWTYPE;
+BEGIN
+  PERFORM booking.gn_check_worker(p_worker);
+  IF p_intent IS NULL THEN RAISE EXCEPTION 'NOTIFY_ARGUMENT_INVALID: intent' USING ERRCODE = 'invalid_parameter_value'; END IF;
+  IF NOT booking.gn_lock_bundle(p_intent, false) THEN RETURN 'NOT_HELD'; END IF;
+  SELECT * INTO w FROM booking.intent_work WHERE intent_id = p_intent FOR UPDATE;
+  PERFORM booking.gn_facts_advisory(p_intent);
+  IF booking.guest_notification_protected(p_intent) THEN RETURN 'PROTECTED'; END IF;
+  IF w.intent_id IS NULL OR w.work_worker_id IS DISTINCT FROM p_worker THEN RETURN 'NOT_HELD'; END IF;
+  UPDATE booking.intent_work SET work_worker_id = NULL, work_lease_until = NULL WHERE intent_id = p_intent;
+  RETURN 'RELEASED';
+END $$;
+
+-- snapshot for the (future, Stage 2) renderer. VOLATILE (see refusal); no write.
+CREATE FUNCTION booking.guest_notification_snapshot(p_op uuid) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE o booking.external_operations%ROWTYPE; cls text; f jsonb; g booking.intent_guests%ROWTYPE;
+BEGIN
+  IF p_op IS NULL THEN RAISE EXCEPTION 'NOTIFY_ARGUMENT_INVALID: op' USING ERRCODE = 'invalid_parameter_value'; END IF;
+  cls := booking.guest_notification_class(p_op);
+  IF cls = 'PROTECTED' OR cls = 'NOT_NOTIFY' THEN RETURN jsonb_build_object('class', cls); END IF;
+  SELECT * INTO o FROM booking.external_operations WHERE id = p_op;
+  IF cls <> 'ELIGIBLE' THEN RETURN jsonb_build_object('class', cls); END IF;
+  f := booking.guest_notification_facts(p_op);
+  SELECT * INTO g FROM booking.intent_guests WHERE intent_id = o.intent_id;
+  RETURN jsonb_build_object('class', cls, 'code', booking.guest_notification_refusal(p_op), 'template', o.payload ->> 'template', 'facts', f,
+    'factsHash', booking.gn_hash_facts(f), 'recipientHash', booking.guest_notification_recipient_hash(o.intent_id),
+    'email', g.email, 'firstName', g.first_name);
+END $$;
+
+-- claim (contract §6.2)
+CREATE FUNCTION booking.claim_guest_notification(p_op uuid, p_worker text, p_template_version text, p_content_hash text,
+  p_expected_facts_hash text, p_expected_recipient_hash text) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE v_intent uuid; v_type text; o booking.external_operations%ROWTYPE; w booking.intent_work%ROWTYPE; i booking.intents%ROWTYPE;
+        v_t timestamptz; r text; f jsonb; fh text; rh text;
+BEGIN
+  PERFORM booking.gn_check_worker(p_worker);
+  IF p_op IS NULL OR p_template_version IS DISTINCT FROM 'gn-v1' OR p_content_hash IS NULL OR p_content_hash !~ '^[0-9a-f]{64}$'
+     OR p_expected_facts_hash IS NULL OR p_expected_facts_hash !~ '^[0-9a-f]{64}$'
+     OR p_expected_recipient_hash IS NULL OR p_expected_recipient_hash !~ '^[0-9a-f]{64}$' THEN
+    RAISE EXCEPTION 'NOTIFY_ARGUMENT_INVALID: claim arguments' USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+  SELECT intent_id, op_type INTO v_intent, v_type FROM booking.external_operations WHERE id = p_op;
+  IF v_intent IS NULL OR v_type <> 'guest.notify' THEN RETURN jsonb_build_object('status', 'not_claimable', 'code', 'NOT_NOTIFY'); END IF;
+  PERFORM booking.gn_lock_bundle(v_intent, false);
+  SELECT * INTO w FROM booking.intent_work WHERE intent_id = v_intent FOR SHARE;
+  SELECT * INTO o FROM booking.external_operations WHERE id = p_op FOR UPDATE;
+  PERFORM 1 FROM booking.intent_guests WHERE intent_id = v_intent FOR KEY SHARE;
+  PERFORM booking.gn_facts_advisory(v_intent);
+  PERFORM pg_advisory_xact_lock(hashtext('booking.recording_evidence'), hashtext(v_intent::text));
+  v_t := clock_timestamp();
+  IF booking.guest_notification_protected(v_intent) THEN RETURN jsonb_build_object('status', 'protected'); END IF;
+  SELECT * INTO o FROM booking.external_operations WHERE id = p_op;
+  IF o.state <> 'pending' OR o.attempts <> 0 OR o.dispatched_at IS NOT NULL
+     OR EXISTS (SELECT 1 FROM booking.notification_renders x WHERE x.operation_id = p_op) THEN
+    RETURN jsonb_build_object('status', 'not_claimable', 'code', 'NOT_PENDING');
+  END IF;
+  IF EXISTS (SELECT 1 FROM booking.notification_latches x WHERE x.operation_id = p_op) THEN
+    RETURN jsonb_build_object('status', 'not_claimable', 'code', 'LATCHED');
+  END IF;
+  SELECT * INTO w FROM booking.intent_work WHERE intent_id = v_intent;
+  IF w.work_worker_id IS DISTINCT FROM p_worker OR w.work_lease_until IS NULL OR w.work_lease_until < v_t + interval '60 seconds' THEN
+    RETURN jsonb_build_object('status', 'not_claimable', 'code', 'WORK_LEASE');
+  END IF;
+  r := booking.guest_notification_refusal(p_op);
+  IF r IS NOT NULL THEN
+    IF booking.gn_non_latching(r) THEN RETURN jsonb_build_object('status', 'waiting', 'code', r); END IF;
+    SELECT * INTO i FROM booking.intents WHERE id = v_intent;
+    INSERT INTO booking.notification_latches (operation_id, intent_id, code, intent_version_seen, latched_at, worker)
+    VALUES (p_op, v_intent, r, i.version, v_t, p_worker);
+    RETURN jsonb_build_object('status', 'latched', 'code', r);
+  END IF;
+  f := booking.guest_notification_facts(p_op);
+  fh := booking.gn_hash_facts(f);
+  rh := booking.guest_notification_recipient_hash(v_intent);
+  IF fh IS DISTINCT FROM p_expected_facts_hash OR rh IS DISTINCT FROM p_expected_recipient_hash THEN
+    RETURN jsonb_build_object('status', 'not_claimable', 'code', 'SNAPSHOT_STALE');
+  END IF;
+  SELECT * INTO i FROM booking.intents WHERE id = v_intent;
+  INSERT INTO booking.notification_renders (operation_id, intent_id, template, template_version, intent_version, facts, facts_hash, recipient_hash,
+     content_hash, message_ref, worker, claimed_at)
+  VALUES (p_op, v_intent, o.payload ->> 'template', p_template_version, o.source_version, f, fh, rh, p_content_hash, 'gn1-' || p_op::text, p_worker, v_t);
+  INSERT INTO booking.notification_write_authority (txid, operation_id, action) VALUES (pg_current_xact_id(), p_op, 'claim');
+  UPDATE booking.external_operations SET state = 'in_flight', attempts = 1, dispatched_at = v_t, lease_worker_id = p_worker,
+         lease_until = v_t + interval '60 seconds', updated_at = v_t
+   WHERE id = p_op;
+  DELETE FROM booking.notification_write_authority WHERE txid = pg_current_xact_id() AND operation_id = p_op AND action = 'claim';
+  RETURN jsonb_build_object('status', 'claimed', 'leaseUntil', v_t + interval '60 seconds', 'dbNow', v_t);
+END $$;
+
+-- latch on a renderer failure (TRUST code), same locks as the claim
+CREATE FUNCTION booking.latch_guest_notification(p_op uuid, p_worker text, p_code text) RETURNS text
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE v_intent uuid; v_type text; w booking.intent_work%ROWTYPE; i booking.intents%ROWTYPE; v_t timestamptz;
+BEGIN
+  PERFORM booking.gn_check_worker(p_worker);
+  IF p_op IS NULL OR p_code IS DISTINCT FROM 'RENDER_FAILED' THEN
+    RAISE EXCEPTION 'NOTIFY_ARGUMENT_INVALID: latch code' USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+  SELECT intent_id, op_type INTO v_intent, v_type FROM booking.external_operations WHERE id = p_op;
+  IF v_intent IS NULL OR v_type <> 'guest.notify' THEN RETURN 'NOT_ELIGIBLE'; END IF;
+  PERFORM booking.gn_lock_bundle(v_intent, false);
+  PERFORM 1 FROM booking.intent_work WHERE intent_id = v_intent FOR SHARE;
+  PERFORM 1 FROM booking.external_operations WHERE id = p_op FOR UPDATE;
+  PERFORM 1 FROM booking.intent_guests WHERE intent_id = v_intent FOR KEY SHARE;
+  PERFORM booking.gn_facts_advisory(v_intent);
+  PERFORM pg_advisory_xact_lock(hashtext('booking.recording_evidence'), hashtext(v_intent::text));
+  v_t := clock_timestamp();
+  IF booking.guest_notification_protected(v_intent) THEN RETURN 'PROTECTED'; END IF;
+  IF booking.guest_notification_class(p_op) <> 'ELIGIBLE' THEN RETURN 'NOT_ELIGIBLE'; END IF;
+  SELECT * INTO w FROM booking.intent_work WHERE intent_id = v_intent;
+  IF w.work_worker_id IS DISTINCT FROM p_worker OR w.work_lease_until IS NULL OR w.work_lease_until < v_t THEN RETURN 'WORK_LEASE'; END IF;
+  SELECT * INTO i FROM booking.intents WHERE id = v_intent;
+  INSERT INTO booking.notification_latches (operation_id, intent_id, code, intent_version_seen, latched_at, worker)
+  VALUES (p_op, v_intent, p_code, i.version, v_t, p_worker);
+  RETURN 'LATCHED';
+END $$;
+
+-- pre-send check (contract §6.4). No locks, no write. VOLATILE (deviation from the contract's STABLE: the refusal it calls reuses
+-- VOLATILE 0010/0011 predicates; each statement reads all commits that precede it).
+CREATE FUNCTION booking.guest_notification_presend(p_op uuid, p_worker text) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE o booking.external_operations%ROWTYPE; rd booking.notification_renders%ROWTYPE; i booking.intents%ROWTYPE; w booking.intent_work%ROWTYPE;
+        r text; v_t timestamptz;
+BEGIN
+  PERFORM booking.gn_check_worker(p_worker);
+  IF p_op IS NULL THEN RAISE EXCEPTION 'NOTIFY_ARGUMENT_INVALID: op' USING ERRCODE = 'invalid_parameter_value'; END IF;
+  SELECT * INTO o FROM booking.external_operations WHERE id = p_op;
+  IF o.id IS NULL OR o.op_type <> 'guest.notify' THEN RETURN jsonb_build_object('ok', false, 'code', 'NOT_NOTIFY'); END IF;
+  IF booking.guest_notification_protected(o.intent_id) THEN RETURN jsonb_build_object('ok', false, 'code', 'PROTECTED'); END IF;
+  v_t := clock_timestamp();
+  SELECT * INTO rd FROM booking.notification_renders WHERE operation_id = p_op;
+  SELECT * INTO i FROM booking.intents WHERE id = o.intent_id;
+  SELECT * INTO w FROM booking.intent_work WHERE intent_id = o.intent_id;
+  IF o.state <> 'in_flight' OR o.attempts <> 1 OR rd.operation_id IS NULL THEN RETURN jsonb_build_object('ok', false, 'code', 'NOT_IN_FLIGHT'); END IF;
+  IF o.lease_worker_id IS DISTINCT FROM p_worker OR rd.worker IS DISTINCT FROM p_worker OR o.lease_until < v_t
+     OR w.work_worker_id IS DISTINCT FROM p_worker OR w.work_lease_until IS NULL OR w.work_lease_until < v_t THEN
+    RETURN jsonb_build_object('ok', false, 'code', 'LEASE_NOT_HELD');
+  END IF;
+  IF i.version IS DISTINCT FROM rd.intent_version THEN RETURN jsonb_build_object('ok', false, 'code', 'VERSION_DRIFT'); END IF;
+  r := booking.guest_notification_refusal(p_op);
+  IF r IS NOT NULL THEN RETURN jsonb_build_object('ok', false, 'code', r); END IF;
+  IF booking.gn_hash_facts(booking.guest_notification_facts(p_op)) IS DISTINCT FROM rd.facts_hash THEN
+    RETURN jsonb_build_object('ok', false, 'code', 'FACTS_CHANGED');
+  END IF;
+  IF booking.guest_notification_recipient_hash(o.intent_id) IS DISTINCT FROM rd.recipient_hash THEN
+    RETURN jsonb_build_object('ok', false, 'code', 'RECIPIENT_CHANGED');
+  END IF;
+  RETURN jsonb_build_object('ok', true, 'code', NULL, 'dbNow', v_t, 'opLeaseUntil', o.lease_until, 'workLeaseUntil', w.work_lease_until,
+    'contentHash', rd.content_hash, 'templateVersion', rd.template_version, 'messageRef', rd.message_ref);
+END $$;
+
+-- settlement (contract §6.5)
+CREATE FUNCTION booking.complete_guest_notification(p_op uuid, p_worker text, p_kind text, p_ref text, p_code text) RETURNS text
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE v_intent uuid; v_type text; o booking.external_operations%ROWTYPE; v_t timestamptz;
+BEGIN
+  PERFORM booking.gn_check_worker(p_worker);
+  IF p_op IS NULL OR p_kind IS NULL OR p_kind NOT IN ('accepted', 'unknown')
+     OR (p_kind = 'accepted' AND (p_ref IS NULL OR p_ref !~ '^mock-[A-Za-z0-9._:-]{1,95}$' OR p_code IS NOT NULL))
+     OR (p_kind = 'unknown' AND (p_ref IS NOT NULL OR p_code IS NULL
+         OR p_code NOT IN ('SEND_TIMEOUT', 'SEND_THREW', 'REPLY_SHAPE', 'REPLY_UNREADABLE', 'PRESEND_ABORTED_NOT_INVOKED'))) THEN
+    RAISE EXCEPTION 'NOTIFY_ARGUMENT_INVALID: completion arguments' USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+  SELECT intent_id, op_type INTO v_intent, v_type FROM booking.external_operations WHERE id = p_op;
+  IF v_intent IS NULL OR v_type <> 'guest.notify' THEN RETURN 'LEASE_LOST'; END IF;
+  PERFORM booking.gn_lock_bundle(v_intent, false);
+  SELECT * INTO o FROM booking.external_operations WHERE id = p_op FOR UPDATE;
+  PERFORM booking.gn_facts_advisory(v_intent);
+  v_t := clock_timestamp();
+  IF booking.guest_notification_protected(v_intent) THEN RETURN 'PROTECTED'; END IF;
+  SELECT * INTO o FROM booking.external_operations WHERE id = p_op;
+  IF o.state <> 'in_flight' OR o.lease_worker_id IS DISTINCT FROM p_worker OR o.lease_until IS NULL OR v_t > o.lease_until THEN RETURN 'LEASE_LOST'; END IF;
+  IF p_kind = 'accepted' THEN
+    INSERT INTO booking.notification_write_authority (txid, operation_id, action) VALUES (pg_current_xact_id(), p_op, 'complete');
+    UPDATE booking.external_operations SET state = 'succeeded', result_ref = p_ref, completed_at = v_t, lease_worker_id = NULL, lease_until = NULL,
+           updated_at = v_t WHERE id = p_op;
+    DELETE FROM booking.notification_write_authority WHERE txid = pg_current_xact_id() AND operation_id = p_op AND action = 'complete';
+    RETURN 'succeeded';
+  END IF;
+  UPDATE booking.external_operations SET state = 'outcome_unknown', error_code = p_code, lease_worker_id = NULL, lease_until = NULL, updated_at = v_t
+   WHERE id = p_op;
+  INSERT INTO booking.reconciliation_cases (id, intent_id, kind, status, opened_at, opened_by, evidence)
+  VALUES (gen_random_uuid(), v_intent, 'NOTIFICATION_OUTCOME_UNKNOWN', 'open', v_t, 'op:' || p_op::text,
+          jsonb_build_object('operationId', p_op, 'opType', 'guest.notify', 'errorCode', p_code))
+  ON CONFLICT (intent_id, kind) WHERE status = 'open' DO NOTHING;
+  RETURN 'outcome_unknown';
+END $$;
+
+-- notification-scoped expired-lease maintenance (contract §6.5). Candidates: protected excluded BEFORE LIMIT; then processed in ONE
+-- deterministic intent order (root addendum B) with the bundle (SKIP LOCKED rows) + op SKIP LOCKED + facts advisory, then rechecked.
+CREATE FUNCTION booking.recover_expired_notifications(p_listing_ids integer[], p_intent uuid, p_limit integer) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE c record; o booking.external_operations%ROWTYPE; v_t timestamptz; n_done integer := 0; n_locked integer := 0; n_prot integer := 0;
+BEGIN
+  PERFORM booking.gn_check_scope(p_listing_ids);
+  IF p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 50 THEN
+    RAISE EXCEPTION 'NOTIFY_ARGUMENT_INVALID: limit' USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+  FOR c IN
+    SELECT s.id, s.intent_id FROM (
+      SELECT o2.id, o2.intent_id FROM booking.external_operations o2 JOIN booking.intents i ON i.id = o2.intent_id
+       WHERE o2.op_type = 'guest.notify' AND o2.state = 'in_flight' AND o2.lease_until < clock_timestamp()
+         AND i.listing_id = ANY (p_listing_ids) AND (p_intent IS NULL OR i.id = p_intent)
+         AND NOT booking.guest_notification_protected(o2.intent_id)
+       ORDER BY o2.lease_until, o2.id LIMIT p_limit) s
+    ORDER BY s.intent_id, s.id
+  LOOP
+    IF NOT booking.gn_lock_bundle(c.intent_id, true) THEN n_locked := n_locked + 1; CONTINUE; END IF;
+    SELECT * INTO o FROM booking.external_operations WHERE id = c.id FOR UPDATE SKIP LOCKED;
+    IF o.id IS NULL THEN n_locked := n_locked + 1; CONTINUE; END IF;
+    PERFORM booking.gn_facts_advisory(c.intent_id);
+    v_t := clock_timestamp();
+    IF booking.guest_notification_protected(c.intent_id) THEN n_prot := n_prot + 1; CONTINUE; END IF;
+    SELECT * INTO o FROM booking.external_operations WHERE id = c.id;
+    IF o.state <> 'in_flight' OR o.lease_until IS NULL OR o.lease_until >= v_t THEN CONTINUE; END IF;
+    UPDATE booking.external_operations SET state = 'outcome_unknown', error_code = 'LEASE_EXPIRED', lease_worker_id = NULL, lease_until = NULL, updated_at = v_t
+     WHERE id = c.id;
+    INSERT INTO booking.reconciliation_cases (id, intent_id, kind, status, opened_at, opened_by, evidence)
+    VALUES (gen_random_uuid(), c.intent_id, 'NOTIFICATION_OUTCOME_UNKNOWN', 'open', v_t, 'op:' || c.id::text,
+            jsonb_build_object('operationId', c.id, 'opType', 'guest.notify', 'errorCode', 'LEASE_EXPIRED'))
+    ON CONFLICT (intent_id, kind) WHERE status = 'open' DO NOTHING;
+    n_done := n_done + 1;
+  END LOOP;
+  RETURN jsonb_build_object('processed', n_done, 'skippedLocked', n_locked, 'skippedProtected', n_prot);
+END $$;
+
+-- read-only page (contract §7.5): precision-safe immutable-lookup cursor; protected rows never returned
+CREATE FUNCTION booking.list_guest_notifications(p_listing_ids integer[], p_after_op uuid, p_limit integer)
+RETURNS TABLE (op_id uuid, intent_id uuid, template text, state text, class text, code text, created_at timestamptz)
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE c_at timestamptz; c_id uuid;
+BEGIN
+  PERFORM booking.gn_check_scope(p_listing_ids);
+  IF p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 100 THEN
+    RAISE EXCEPTION 'NOTIFY_ARGUMENT_INVALID: limit' USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+  IF p_after_op IS NOT NULL THEN
+    SELECT o.created_at, o.id INTO c_at, c_id FROM booking.external_operations o JOIN booking.intents i ON i.id = o.intent_id
+     WHERE o.id = p_after_op AND o.op_type = 'guest.notify' AND i.listing_id = ANY (p_listing_ids);
+    IF c_id IS NULL THEN RAISE EXCEPTION 'NOTIFY_CURSOR_INVALID' USING ERRCODE = 'invalid_parameter_value'; END IF;
+  END IF;
+  RETURN QUERY
+    SELECT o.id, o.intent_id, o.payload ->> 'template', o.state, booking.guest_notification_class(o.id),
+           (SELECT l.code FROM booking.notification_latches l WHERE l.operation_id = o.id), o.created_at
+      FROM booking.external_operations o JOIN booking.intents i ON i.id = o.intent_id
+     WHERE o.op_type = 'guest.notify' AND i.listing_id = ANY (p_listing_ids)
+       AND (c_id IS NULL OR (o.created_at, o.id) > (c_at, c_id))
+       AND NOT booking.guest_notification_protected(o.intent_id)
+     ORDER BY o.created_at, o.id LIMIT p_limit;
+END $$;
+
+-- summary (contract §7.7): counts only
+CREATE FUNCTION booking.guest_notification_summary(p_listing_ids integer[]) RETURNS jsonb
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE out jsonb;
+BEGIN
+  PERFORM booking.gn_check_scope(p_listing_ids);
+  SELECT jsonb_build_object(
+      'eligible', count(*) FILTER (WHERE x.cls = 'ELIGIBLE'), 'waiting', count(*) FILTER (WHERE x.cls = 'WAITING'),
+      'outOfScope', count(*) FILTER (WHERE x.cls = 'OUT_OF_V1_SCOPE'), 'latched', count(*) FILTER (WHERE x.cls = 'LATCHED'),
+      'inFlight', count(*) FILTER (WHERE x.cls = 'IN_FLIGHT'),
+      'inFlightExpired', count(*) FILTER (WHERE x.cls = 'IN_FLIGHT' AND x.lease_until < clock_timestamp()),
+      'unknown', count(*) FILTER (WHERE x.cls = 'UNKNOWN'), 'succeeded', count(*) FILTER (WHERE x.cls = 'SUCCEEDED'),
+      'protectedPending', count(*) FILTER (WHERE x.cls = 'PROTECTED' AND x.state = 'pending'),
+      'protectedClaimed', count(*) FILTER (WHERE x.cls = 'PROTECTED' AND x.state IN ('in_flight', 'outcome_unknown', 'succeeded')))
+    INTO out
+    FROM (SELECT o.state, o.lease_until, booking.guest_notification_class(o.id) AS cls
+            FROM booking.external_operations o JOIN booking.intents i ON i.id = o.intent_id
+           WHERE o.op_type = 'guest.notify' AND i.listing_id = ANY (p_listing_ids)) x;
+  RETURN out;
+END $$;
+
+-- ---------------------------------------------------------------------------------------------
+-- grants: dedicated APIs app; page + summary app + admin; nothing to report; private helpers none
+DO $$
+DECLARE f text;
+BEGIN
+  FOREACH f IN ARRAY ARRAY['booking.claim_notification_work(text,integer[],uuid)', 'booking.release_notification_work(uuid,text)',
+    'booking.guest_notification_snapshot(uuid)', 'booking.claim_guest_notification(uuid,text,text,text,text,text)',
+    'booking.latch_guest_notification(uuid,text,text)', 'booking.guest_notification_presend(uuid,text)',
+    'booking.complete_guest_notification(uuid,text,text,text,text)', 'booking.recover_expired_notifications(integer[],uuid,integer)',
+    'booking.list_guest_notifications(integer[],uuid,integer)', 'booking.guest_notification_summary(integer[])'] LOOP
+    EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', f);
+    EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO mv_booking_app', f);
+  END LOOP;
+  GRANT EXECUTE ON FUNCTION booking.list_guest_notifications(integer[], uuid, integer), booking.guest_notification_summary(integer[]) TO mv_booking_admin;
+END $$;
