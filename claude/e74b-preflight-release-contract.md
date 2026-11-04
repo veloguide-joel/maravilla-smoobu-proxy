@@ -4,7 +4,7 @@
 
 **Status.**
 - **0012 (slice A) is PRESENT and accepted offline** at `ff07fe8` (root ruling on `ff07fe8`; Claude-run local PG only).
-- **0013 (this document) is PROPOSED.** It is not implemented, and nothing here authorizes implementation.
+- **0013 is ACCEPTED as the offline implementation basis** (root ruling on `6204619`: C1–C5 accepted, binding details A–F) and **IMPLEMENTED offline** on `feature/e7-offline-charge-preflight-release` (pending root code review); the exact map is **§13**. It is not live or provider readiness.
 - It **supersedes §8 of `claude/e74b-preflight-assessment-contract.md`**, which predates the real 0012.
 - It does not redesign accepted 0011 or 0012.
 
@@ -192,11 +192,11 @@ All functions keep `SET search_path = pg_catalog, booking` and `REVOKE ALL FROM 
 
 ### 5.3 Floors summary
 
-| Row | DB-stamped floors | [TRUST] floors (caller times) |
+| Row | DB clock vs DB clock | Mixed / [TRUST] (a caller-written time on one side) |
 |---|---|---|
-| Preflight, epoch 0 | evidence > version-transition `recorded_at`; evidence > recording `created_at` (0012) | read `created_at` > recording `created_at` |
-| Preflight, epoch ≥ 1 | the above + evidence > releasing decision `recorded_at` | + read `created_at` > that `recorded_at` |
-| Release review | the 0012 floors + evidence > `hold.created_at` | + read `created_at` > `hold.created_at` |
+| Preflight, epoch 0 | evidence `created_at` > version-transition `recorded_at` | evidence `created_at` > recording `created_at` (the recording row's `created_at` is caller-written: root correction E); read `created_at` > recording `created_at` |
+| Preflight, epoch ≥ 1 | the above + evidence `created_at` > releasing decision `recorded_at` | + read `created_at` > that `recorded_at` |
+| Release review | the 0012 floors + evidence `created_at` > `hold.created_at` | + read `created_at` > `hold.created_at` |
 
 Freshness everywhere: inclusive 2 minutes, no future, at the writer's / release's post-lock `clock_timestamp()`.
 
@@ -377,3 +377,116 @@ All 0010–0012 suites are preserved (incl. R1 / R2, T-C10, predicate / page mic
 3. Focused `e74b-d1-release.test.mjs` + fixture helpers (real holds / reviews / releases; no skip switch).
 4. Fault injection.
 5. Full suites; docs map; commit / push; one ping; stop.
+
+---
+
+## 13. Implementation map — 0013 (slice B), offline, pending root code review
+
+Branch `feature/e7-offline-charge-preflight-release`, cut from exact `6204619`. Migrations 0001–0012 are byte-identical. No D5, worker, adapter, route, UI, config, dependency, schedule or live action.
+
+**Files.**
+- `db/migrations/0013_recording_preflight_release.{up,down}.sql`; the down file is generated, with every restored body copied verbatim from the cited 0011 / 0012 line ranges.
+- `lib/booking-db/operations.js`: only `recordReleaseReviewAssessment` and `openRecordingPreflightHold` were added.
+- `db/lib/admin.js`: `adminReleasePreflightHold`.
+- `lib/booking-db/repo.js`: safety codes.
+- New `test/db/e74b-d1-release.test.mjs`.
+- Adapted tests, listed in §13.5.
+- These four docs.
+
+### 13.1 E1–E16 → implementation
+
+| Item | 0013 |
+|---|---|
+| E1 / E2 | `recording_assessments_epoch_check` → `epoch >= 0`; `recording_assessments_phase_check` → `IN ('preflight','release_review')`; added `hold_id` + `recording_assessments_hold_fk` + `recording_assessments_hold_check`; index `recording_assessments_hold` |
+| E3 / E4 | `record_recording_assessment` (same signature / grant) INSERTs the **current** epoch, computed after the advisory lock. It keeps the active-hold and latch refusals. In epoch ≥ 1 it applies the release floor (the `recorded_at` of the `release_for_initial_send` decision of the epoch-(E−1) hold; missing → `ASSESSMENT_FLOOR`) |
+| E5 / E6 / E7 | `recording_preflight_block`, `recording_claim_refusal`, `recording_claim_audit` use `recording_preflight_epoch(op)` |
+| E8 / E9 | `recording_claim_assessments_epoch_check` → `epoch >= 0`; the guard adds `NEW.epoch = recording_preflight_epoch(op)` |
+| E10 / E11 / E12 | `recording_holds_epoch_check` (≥ 0; 0 for non-preflight); `recording_holds_reason_check` (+4 preflight); `recording_hold_decisions_decision_check` (+`release_for_initial_send`); added `assessment_id` on holds / decisions with FKs and the `*_assessment_check` CHECKs; unique indexes `recording_holds_one_preflight_per_epoch`, `recording_hold_decisions_one_release` |
+| E13 / E14 | `recording_holds_guard`: a preflight INSERT must equal `recording_preflight_latch_citation` (reason, assessment, epoch); a release cites a decision of the kind-matching type. `recording_hold_decisions_guard`: `release_for_initial_send` binds the hold's eligible review (same op / intent / hold / epoch) and `evidence_ids = ARRAY[identity, list]` exactly, with no linked evidence |
+| E15 / E16 | `reserved_case_guard` (+4 kinds); `reserved_case_binding_verify`: resolution and releasing decision follow the kind (`no_action` / `release_for_initial_send` for preflight kinds). Kept: ≥ 1 hold, intent / kind match, open iff active |
+
+**New functions.**
+- `recording_preflight_epoch` and `recording_preflight_latch_citation`: private.
+- The private shared validator, in two parts (`recording_assessment_input_rule` before locks; `recording_assessment_validate` after locks): private, no app / admin / report execute.
+- `record_release_review_assessment`: app.
+- `open_recording_preflight_hold`: app + admin.
+- `admin_release_preflight_hold`: admin.
+
+All are SD, VOLATILE, with a fixed `search_path` and no PUBLIC execute. **Unchanged:** `recording_claim_fence`, `recording_claim_ready`, the claimant-aware mirror in both helper stages, the recording-only work lock, the AFTER audit trigger, `admin_resolve_recording_hold` (keep_visible works on preflight holds), the inbox / page / completion / link / finalisation functions.
+
+### 13.2 Addendum map (root ruling on `6204619`)
+
+| Item | Where / tests |
+|---|---|
+| C1 opener | DB-derived; no lease / state / version requirement; always the latest pending never-claimed initial recording + current-epoch latch + exact citation (B-3) |
+| C2 / C3 | any allowlisted review outcome is recorded; release requires the **latest review across all outcomes** to be the cited eligible one (B-4, B-5, B-7) |
+| C4 | one private validator (two explicit parts so the 0012 refusal order stays identical) |
+| C5 | caller-time floors labelled [TRUST]; the recording `created_at` floor relabelled as mixed (§5.3) |
+| A | validator signatures typed; each writer owns its locks, phase / hold / epoch / state / lease / version checks and post-lock clock; the guard rejects wrong bindings (B-4b) |
+| B | every E1–E16 dependency changed; one preflight hold per op per epoch; no claim on old-epoch rows (B-1, B-2, B-8) |
+| C | exact decision binding and evidence pair; release-time freshness / latest review / version triple / latest pending op; replay read-only; new epoch empty (B-1, B-2, B-5, B-5b, B-6) |
+| D | the down gate tests only 0013 columns / rows; 0012 epoch-0 audit preserved; fresh-12 equivalence with that audit present; identical re-up; each 0013 audit class refuses unchanged (D-13) |
+| E | lock order advisory before hold everywhere; waits observed (B-7) |
+| F | 0010–0012 suites unchanged and passing; no new release types; version-changed / non-captured holds stay visible (B-5b) |
+
+### 13.3 Deviations for root review
+
+- **C4 is implemented as two private functions** (input part before locks, content part after locks), not one, so that every 0012 refusal keeps its exact order.
+- The release decision's `evidence_ids` are the canonical ordered pair `[identity, list]`; any other order, a missing row or an extra row is refused.
+- **Equivalent by construction (not separately testable):**
+  - Review-version vs hold-version: the review writer already forces review version = hold version.
+  - "Latest vs earliest conflict" in the citation: a second conflict cannot be recorded in the same epoch.
+  - Review exclusion from the latest-row selection: reviews are bound to an active hold, which blocks every claim.
+  - The audit's latest-row epoch filter: the latest preflight row of an op is always in the current epoch whenever a claim can pass.
+
+### 13.4 Residual limits
+
+- Read creation times and the recording `created_at` are caller-written [TRUST].
+- Classification, provider timing and account labels remain [TRUST].
+- The direct-UPDATE inversion can still produce 40P01.
+- A version-changed or non-`payment_captured` preflight hold stays visible and unreleasable (no reopen path).
+- Multiple bound holds on one preflight case cannot arise naturally (one initial recording per intent); they were exercised only with labelled test setup.
+
+### 13.5 Adapted existing tests (why)
+
+- `migrations.test.mjs`: version lists +13; the 0011 equivalence test measures at 11 via `[13, 12]`.
+- `e74b-d1-assessments.test.mjs`:
+  - A-2b: `release_review` now answers `recording_assessments_hold_check`; the phase probe uses an unknown phase; the epoch probe uses −1.
+  - A-16 and D-1..D-3: measure 0012 itself at schema 12 (0013 rolled back first, re-applied after).
+- `e74b-d1-owner-cases.test.mjs`:
+  - T-C9: version lists.
+  - T-G2: 0013 (no 0013 audit in that file) rolls back, 0012 refuses, then 13 is re-applied.
+- `e74b-d2-recording-evidence.test.mjs` (downgrade test): 0013 rolls back first and is re-applied.
+- No table count changed (no new table); `scripts/db-smoke.mjs` is unchanged.
+
+### 13.6 Tests and fault injection (CLAUDE-RUN on disposable local PostgreSQL 16; full TAP retained)
+
+- New `e74b-d1-release.test.mjs` (14 tests):
+  - B-1: two complete release cycles (epoch 0 conflict → … → epoch 2 claim + audit), with all older audit kept.
+  - B-2: old-epoch replay; used reads refused by UNIQUE, unused pre-hold / pre-release reads refused by the floors.
+  - B-3: opener (no latch, crash / no lease, idempotent, moved-on intent, a different active hold, a claimed row).
+  - B-4: review rules incl. stale identity / list, future, pre-hold proof, lease, version, any outcome, no counting.
+  - B-4b: guard bindings.
+  - B-5: latest review across outcomes, replay, conflicting replay, app / report refused.
+  - B-5b: stale EACH row at release, version change (visible, no reopen), moved-on intent, keep_visible.
+  - B-6: multiple bound holds / last release; an unrelated open case; decision / case / hold-guard probes.
+  - B-7: observed waits, both orders, for review vs release, concurrent reviews, openers, releases, opener vs writer, lease expiry after a wait.
+  - B-7b: a killed release leaves nothing.
+  - B-8: constraint probes incl. the claim audit against an old-epoch row.
+  - B-9: privilege matrix and private helpers.
+  - B-10: no effects.
+  - D-13: fresh-12 equivalence with 0012 audit present, identical re-up, and each 0013 audit class refusing alone.
+- **Final runs:**
+
+| Run | Result |
+|---|---|
+| focused + migrations + offline-charge + D1 owner-cases + D2 + 0012 assessments | **111 / 111** |
+| `npm test` | **674 / 674** |
+| `npm run test:db` | **367 / 367** |
+
+  The e74a listing-lock guard passed in this run; its historical failure stays unexplained.
+- **Fault injection:** 33 targeted mutants, each in an isolated copy against the focused file. **27 killed.**
+  - Five survivors are equivalent by construction (§13.3): N05, N10, N13, N13b, N30.
+  - The down-gate holds-clause mutant (G01) survived the first pass because the probe combined a hold and its case. The probe was split into two classes, and G01 and the new case-clause mutant G05 were both killed on rerun.
+- **Observed:** waits in every B-7 race. The T-B3 / A-15 inversion produced `["ok","40P01"]` (never a bypass).
+

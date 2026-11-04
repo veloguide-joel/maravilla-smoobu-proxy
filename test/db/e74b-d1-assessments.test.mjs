@@ -186,7 +186,8 @@ test("A-2b (addendum B): constraint probes with triggers bypassed — NULL never
   for (const [o, want] of [
     [{ outcome: null }, "23502"], [{ phase: null }, "23502"], [{ epoch: null }, "23502"], [{ worker: null }, "23502"], [{ cfg: null }, "23502"],
     [{ intent_version: null }, "23502"], [{ module_version: null }, "23502"], [{ client_label: null }, "23502"], [{ recorded_at: null }, "23502"],
-    [{ identity_read_op: null }, "23502"], [{ phase: "release_review" }, "recording_assessments_phase_check"], [{ epoch: 1 }, "recording_assessments_epoch_check"],
+    [{ identity_read_op: null }, "23502"], [{ phase: "audit" }, "recording_assessments_phase_check"], [{ phase: "release_review" }, "recording_assessments_hold_check"],
+    [{ epoch: -1 }, "recording_assessments_epoch_check"],
     [{ code: "PRIOR_RECORDING_MARKER_PRESENT" }, "recording_assessments_code_check"], [{ outcome: "incomplete", code: null }, "recording_assessments_code_check"],
     [{ list_evidence: null }, "recording_assessments_shape_check"], [{ list_read_op: null }, "recording_assessments_shape_check"],
     [{ outcome: "incomplete", code: "LIST_HTTP_STATUS" }, "recording_assessments_shape_check"],
@@ -748,6 +749,9 @@ test("A-15: assessment vs claim in both orders (observed waits); direct-UPDATE i
 
 // ---- A-16 / D: slice A alone; down gates; exact rollback ------------------------------------------------------------
 test("A-16: 0012 stands alone — no 0013 object (no hold_id / assessment_id on 0011 tables, no preflight reason / release / review functions); epoch 0 and preflight only", async () => {
+  // E7.4b-D1 (0013): measured at schema 12 (this file holds no 0013 audit, so 0013 rolls back cleanly) and re-applied afterwards
+  const mo = new pg.Client({ connectionString: db.adminUrl }); await mo.connect();
+  try { assert.deepEqual(await migrateDown(mo, { env: "test", to: 12 }), [13]); } finally { await mo.end(); }
   const cols = (await db.owner.query(`SELECT table_name || '.' || column_name AS c FROM information_schema.columns WHERE table_schema = 'booking'
       AND column_name IN ('hold_id', 'assessment_id') ORDER BY 1`)).rows.map((x) => x.c);
   assert.deepEqual(cols, ["recording_claim_assessments.assessment_id", "recording_conflict_inbox.hold_id", "recording_hold_decisions.hold_id", "recording_hold_observations.hold_id"]);
@@ -755,6 +759,8 @@ test("A-16: 0012 stands alone — no 0013 object (no hold_id / assessment_id on 
   const defs = (await db.owner.query(`SELECT conname, pg_get_constraintdef(oid) AS d FROM pg_constraint WHERE conname IN ('recording_holds_reason_check', 'recording_hold_decisions_decision_check')`)).rows;
   assert.ok(defs.every((x) => !/PREFLIGHT|release_for_initial_send/.test(x.d)), "0011 CHECKs unchanged");
   assert.equal((await db.owner.query("SELECT count(*)::int AS n FROM booking.recording_assessments WHERE epoch <> 0 OR phase <> 'preflight'")).rows[0].n, 0);
+  const mu = new pg.Client({ connectionString: db.adminUrl }); await mu.connect();
+  try { assert.deepEqual(await migrateUp(mu, { env: "test" }), [13]); } finally { await mu.end(); }
 });
 
 test("D-1..D-3: down gates — 0012 down restores a FRESH 0011 exactly (bodies / ACLs / security / volatility / search_path / triggers / constraints / policies / RLS) and re-up is identical; refuses with audit; then the 0011 / 0010 gates", async () => {
@@ -773,12 +779,14 @@ test("D-1..D-3: down gates — 0012 down restores a FRESH 0011 exactly (bodies /
   const o = new pg.Client({ connectionString: d2.adminUrl }); await o.connect();
   const fresh = await startPostgres(); const f11 = new pg.Client({ connectionString: fresh.adminUrl }); await f11.connect();
   try {
+    // E7.4b-D1 (0013): this measures 0012 itself, so 0013 (no 0013 audit here) is rolled back first
+    assert.deepEqual(await migrateDown(o, { env: "test", to: 12 }), [13]);
     const at12 = await objects(o);
     // D-1: audit-free -> exact fresh 11, then identical re-up
     assert.deepEqual(await migrateDown(o, { env: "test", to: 11 }), [12]);
     await migrateUp(f11, { env: "test", to: 11 });
     assert.deepEqual(await objects(o), await objects(f11), "down 0012 == fresh cluster at 11 (incl. the 0011 fence body)");
-    assert.deepEqual(await migrateUp(o, { env: "test" }), [12]);
+    assert.deepEqual(await migrateUp(o, { env: "test", to: 12 }), [12]);
     assert.deepEqual(await objects(o), at12, "re-up identical");
     // D-2: any assessment / claim audit refuses the rollback; nothing changes
     const c = await F.confirmed(d2.app, { listingId: 829901, from: "2031-03-01", to: "2031-03-04" });

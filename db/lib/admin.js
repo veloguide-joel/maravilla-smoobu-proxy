@@ -59,3 +59,13 @@ export function adminResolveRecordingHold(adminPool, { holdId, decision, evidenc
   return call(adminPool, "SELECT booking.admin_resolve_recording_hold($1,$2,$3,$4,$5,$6,$7) AS id",
     [holdId, decision, evidenceIds, linkedEvidenceId, resolver, justification, new Date(at)]);
 }
+
+/**
+ * E7.4b-D1 (0013): owner release of an ACTIVE preflight hold for the initial send ('release_for_initial_send'), via
+ * booking.admin_release_preflight_hold (admin only). The cited review must be the hold's LATEST review and eligible, at the current version =
+ * hold version = review version, with both evidence rows fresh at the post-lock DB instant. Releases the hold (and resolves its case as
+ * no_action when it was the last active hold); never claims, sends or confirms. The next epoch needs a NEW preflight. -> { ok:true, id } | { ok:false, error }
+ */
+export function adminReleasePreflightHold(adminPool, { holdId, reviewId, resolver, justification, at }) {
+  return call(adminPool, "SELECT booking.admin_release_preflight_hold($1,$2,$3,$4,$5) AS id", [holdId, reviewId, resolver, justification, new Date(at)]);
+}
