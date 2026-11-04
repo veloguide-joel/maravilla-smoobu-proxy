@@ -1209,7 +1209,7 @@ Neither stage changes E3 producers, other workers, routes, UI, config or deps.
 
 **Live provider, sender identity, recipient policy, retention and copy: CLOSED.**
 
-## 15. Stage 1 implementation map (OFFLINE; root ACCEPT of `6e3fca5f` as design + addenda A–C; root CODE HOLD on `01c6f036` → corrections R-C1 to R-C3 in §15.9; pending root CODE re-review)
+## 15. Stage 1 implementation map (OFFLINE; root ACCEPT of `6e3fca5f` as design + addenda A–C; root CODE HOLD on `01c6f036` → corrections R-C1 to R-C3 in §15.9; root ACCEPTED `35097c56` OFFLINE as Stage 1)
 
 **Branch** `feature/e7-guest-notification-fence`, cut from exact `6e3fca5f9177e5fdd34544c974b023c320fc9ce7`.
 
@@ -1408,7 +1408,7 @@ All TAP files are kept in the session scratchpad (`gnf/tap/`): `focused-final.ta
 - **No catalogued refusal mapping.** The new `NOTIFY_*` fence codes are not in `DB_SAFETY_CODES`, so a generic helper surfaces them as raw errors.
 - **e74a.** The historical listing-lock failure stays OPEN.
 
-### 15.9 Root CODE HOLD on `01c6f036` — corrections R-C1 to R-C3 (same branch, corrections only; pending root CODE re-review)
+### 15.9 Root CODE HOLD on `01c6f036` — corrections R-C1 to R-C3 (same branch, corrections only; ACCEPTED at `35097c56` OFFLINE as Stage 1)
 
 #### R-C1 — consistent observation snapshots and end-of-check timing
 
@@ -1464,7 +1464,7 @@ The `gn_probe_*_01c6` probe functions are the exact `01c6` bodies under another 
 | Pre-send delayed across the op-lease expiry (inside the real 61 s expiry wait) | `ok:true`, with `dbNow` before the expiry, while returning after it | `LEASE_NOT_HELD` |
 | Pre-send drift: protection / evidence / state / work-lease release committed before the observation | — | `PROTECTED` / `FACTS_CHANGED` / `VERSION_DRIFT` / `LEASE_NOT_HELD` |
 | The same drift committed during the observation | — | `ok:true` (one snapshot, the bounded race). For protection, the next completion returns `PROTECTED` with no write |
-| Work selection: 100 older live-leased rows + older WAITING / PROTECTED / LATCHED / not-yet-due rows + one free row | `idle` | Acquires the free row; all 104 other rows byte-unchanged; intent narrowing honours leases and dueness; another scope is idle |
+| Work selection: 100 older live-leased rows + older WAITING / PROTECTED / LATCHED / not-yet-due rows + one free row | `idle` | Acquires the free row; all 114 other rows (100 leased + WAITING + PROTECTED + LATCHED + 11 not-yet-due) byte-unchanged; intent narrowing honours leases and dueness; another scope is idle |
 | Wrong observation context (×4) | — | Refused (`25000`) |
 
 The token table is empty after all success, refusal and error paths.
@@ -1497,3 +1497,91 @@ Why the two survivors are equivalent:
 - No new mechanical pins were needed for these corrections.
 - TAP is in the session scratchpad: `gnf/tap/rc-*.tap`, `e72-adapt-*.tap`; per-mutant `gnf/mut/M28–M35.tap`.
 - **Deviation 1 of §15.6 is superseded.** The observation functions stay VOLATILE, and consistency now comes from the enforced READ ONLY REPEATABLE READ caller transaction, not from a STABLE label.
+
+## 16. Stage 2 implementation map (OFFLINE / INJECTED MOCK; root ACCEPT of `35097c56` as Stage 1 + Stage 2 authorization; pending root CODE review)
+
+**Branch** `feature/e7-guest-notification-worker`, cut from exact `35097c56518ff6ca922d8698ff93a5b7248cfce9`. Stage 1 code acceptance is not merge / deploy / live authorization; this stage adds no route, scheduler, runner, adapter, config, dependency or UI.
+
+### 16.1 Files (the authorized set)
+
+| File | Change |
+|---|---|
+| `lib/checkout/guest-notification.js` | NEW. Pure: no I/O, clock, network or environment |
+| `lib/booking-db/notification-worker.js` | NEW. ONE bounded notification step; injected executor only |
+| `test/e7-guest-notification.test.mjs` | NEW. Pure vectors + the step against a scripted in-memory pool |
+| `test/db/e7-guest-notification-worker.test.mjs` | NEW. Disposable local PG, accepted-worker chains |
+| `test/packaging-closure.test.mjs` | `BOOKING_DB_FILES` + `notification-worker`; both new modules in `OFFLINE_ONLY` |
+| this contract §15 wording, §16; lifecycle status pointer | docs |
+
+Unchanged: 0001–0016, `operations.js`, `repo.js`, `pool.js`, every accepted worker, shared fixtures (`test/db/fixtures.mjs`, `harness.mjs`), e72 and the lifecycle rehearsal (its `guest.notify` rows stay queued). The optional e72 title clarification was not taken (the file is untouched).
+
+### 16.2 Pure module (`guest-notification.js`)
+
+| Export | Contract |
+|---|---|
+| `buildMessageRequest({template, facts, guest, sender, opId})` | `{ok:true, request}` deep-frozen with EXACTLY `channel, from, fromName, messageRef, subject, template, templateVersion, text, to`; or `{ok:false, code}` with `TEMPLATE_INVALID / OP_ID_INVALID / RENDER_FACTS_INVALID / CURRENCY_NOT_SUPPORTED / RECIPIENT_INVALID / SENDER_INVALID` |
+| recipient | always the bound guest row's email (`.invalid` grammar = the SQL `gn_recipient_in_scope`); no override, CC, BCC, reply-to, attachment, HTML, link, token or access instruction exists |
+| sender | explicit synthetic `{fromAddress (.invalid), fromName}`, exact keys; no default |
+| copy | English MOCK copy, plain text, per template; amounts USD only (`$1,234.56 USD`); not-charged templates carry the pending-authorization sentence and no amount |
+| `canonical(request)` / `contentHash(request)` | sorted keys, strings / safe integers only; `sha256('gn-v1-content\n' + canonical)`; TRUST field stored by 0016 |
+| `recipientHash(email, firstName)` | JS mirror of `gn_recipient_hash_of`; used ONLY to cross-check that an observation is self-consistent |
+| `classifyReply(reply)` | `accepted` only for EXACTLY `{accepted:true, providerMessageId:/^mock-[A-Za-z0-9._:-]{1,95}$/}` (plain or null prototype, two enumerable data properties); everything else `unknown` `REPLY_SHAPE`, a hostile object `REPLY_UNREADABLE`; never throws. `accepted` means mock-accepted, never delivered or read |
+
+### 16.3 Step (`runNotificationStep(pool, opts)`) — caller / error map
+
+Fixed budgets (`NOTIFICATION_LIMITS`, not configurable): maintenance batch 5; ONE send ≤ 10 000 ms (AbortController); pre-send margin 5 000 ms (both leases need ≥ 15 000 ms room); |JS − DB| ≤ 2 000 ms; skew probe round trip ≤ 1 000 ms; each observation ≤ 2 000 ms monotonic from BEFORE `BEGIN` through `COMMIT`; step ≤ 30 000 ms monotonic from step start to the invocation decision (including the send timeout); late-reply window 2 000 ms (memory only). Monotonic = `performance.now()`; the injected wall clock is used only for skew, so a regressing wall clock can only refuse.
+
+| # | Phase | Calls | Outcome / error |
+|---|---|---|---|
+| 0 | gate (pure) | none — **zero queries** | `OPTIONS_INVALID` (exact keys, own enumerable DATA properties, no accessor ever invoked; workerId / scope / intent / sender / executor label / clock / hooks) or `ENV_REFUSED`. Basis deep-frozen copy before any await |
+| 1 | marker | `SELECT environment FROM booking.instance` (ONE) | wrong / absent → `DATABASE_NOT_TEST`; a thrown error propagates as the same object, nothing follows |
+| 2 | skew | `SELECT clock_timestamp()` | `CLOCK_SKEW` |
+| 3 | maintenance | `recover_expired_notifications(scope, intent, 5)` | scoped, notification-only; never a generic helper or inbox drain |
+| 4 | work | `claim_notification_work` | `idle` → `{outcome:'idle', sends:0}`; non-`acquired` / malformed → `TypeError` |
+| 5 | initial observation | fresh connection → `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` → ONE `guest_notification_snapshot` → `COMMIT` → release | `PROTECTED` → zero writes (work lease expires) → `protected`; `LATCHED` → release → `latched`; `WAITING` / `OUT_OF_V1_SCOPE` → release → `waiting`; `SUCCEEDED / IN_FLIGHT / UNKNOWN / OTHER / NOT_NOTIFY` → release → `not_claimable`; unknown class → `TypeError`. Error: ROLLBACK + connection discarded, the same object rethrown, no release |
+| 6 | render | pure `buildMessageRequest` after `recipientHash(email, firstName) === snapshot.recipientHash` | failure → `latch_guest_notification(RENDER_FAILED)`: `LATCHED` → release → `latched` (+ `renderCode`); `PROTECTED` → no further write; `NOT_ELIGIBLE` / `WORK_LEASE` → release → `not_claimable`. Never a fabricated recipient / message |
+| 7 | claim | `claim_guest_notification(op, worker, 'gn-v1', contentHash, factsHash, recipientHash)` | `protected` → no write; `latched` / `waiting` / `not_claimable` (incl. `SNAPSHOT_STALE`) → release; an ELIGIBLE row whose snapshot already carried a refusal code is still claimed so SQL records its exact latch / waiting code |
+| 8 | pre-send observation | same wrapper, ONE `guest_notification_presend` | `PROTECTED` → zero writes → `protected`; other refusal → abort (below) |
+| 9 | final synchronous checks | none (no await / hook / query until the invocation) | `REQUEST_MISMATCH` (hash / version / messageRef vs the audit), `OBSERVATION_SLOW`, `PRESEND_SHAPE`, `CLOCK_SKEW`, `LEASE_ROOM` (`leaseUntil − dbNow − monotonic since BEFORE the observation ≥ 15 000` for op AND work), `STEP_BUDGET`. Abort → `complete_guest_notification(unknown, PRESEND_ABORTED_NOT_INVOKED)`: `outcome_unknown` → release → `unknown`; `LEASE_LOST` → release → `lease_lost`; `PROTECTED` → no release |
+| 10 | invocation | `executors.sendMessage(request, {signal})` ONCE, synchronously | `sends = 1`; throw / reject → `SEND_THREW`; non-exact reply → `REPLY_SHAPE` / `REPLY_UNREADABLE`; timeout → abort + `SEND_TIMEOUT`, late reply observed in memory only (`late`). Never retried |
+| 11 | settlement | `complete_guest_notification(accepted | unknown)` | `succeeded` → release → `accepted` (`contentHashPrefix`); `outcome_unknown` → release → `unknown`; `LEASE_LOST` → release → `lease_lost`; `PROTECTED` → **no release**. A thrown error propagates unchanged with NO further query (no try / finally release); a release failure after an acknowledged settlement propagates and never reclassifies it |
+
+Results are deep-frozen and carry ids, codes and counts only. Deviation from §9.3 (additive, codes only): `release` (`RELEASED / NOT_HELD / PROTECTED`), `abort` (the local / SQL pre-send code), `renderCode` and `late` (a promise resolving to `{kind:'none'}` or `{kind:'late_reply', classified}`); `hooks` (`afterInitialObservation`, `afterClaim`, `inObservation`, `afterSend`) are test-only and never run between the final decision and the invocation.
+
+**Accepted race (unchanged, honest):** a contradiction / money / protection committed after the pre-send snapshot (or while the mock processes) can coincide with an invocation; it becomes visible to the next locked decision (settlement `PROTECTED`, no write). No freshness, provider, delivery or exactly-once claim. At-most-one INVOCATION per row is a property of this reviewed worker; the DB enforces at-most-one claim.
+
+### 16.4 Tests and results (CLAUDE-RUN)
+
+| Run | Result |
+|---|---|
+| Focused unit `test/e7-guest-notification.test.mjs` + packaging | 27 / 27 (19 + 8) |
+| Focused PG `test/db/e7-guest-notification-worker.test.mjs` | 12 / 12 (≈ 85 s; one real 61 s op-lease wait, one real 10 s send timeout) |
+| Regressions: Stage 1 fence, migrations, scoped inbox (unit + PG), lifecycle rehearsal, e72, recording worker, notify operations | 117 / 117 |
+| `npm test` | **714 / 714** (695 + 19) |
+| `test:db` | **461 / 461** (449 + 12); the e74a listing-lock guard passed (historical failure stays OPEN, not reproduced) |
+
+Evidence (PG, accepted-worker USD chains, synthetic `.invalid` guests, global fetch guard: 0 network attempts):
+- All 3 templates: one step → `accepted`, invocation count 1 (asserted on the sink, separately from claim / audit rows); the render's `content_hash` equals `contentHash` of the invoked request; 3 further steps (other worker ids) + scoped maintenance → `idle`, row digests unchanged, sends 1 total.
+- Real-DB statement order: marker → clock → maintenance → work → [connect, RR READ ONLY BEGIN, snapshot, COMMIT, release] → claim → [connect, BEGIN, presend, COMMIT, release] → **invocation** (nothing in between) → completion → release.
+- Drift snapshot → claim: open case → `latched OPEN_CASE`; purge + reinsert → `SNAPSHOT_STALE`, released, next step sends ONCE to the new row; protection → `protected`, digest unchanged.
+- Drift claim → pre-send: API and historical (dashboard, past `observed_at`) evidence contradictions, open case, state → `PRESEND_ABORTED_NOT_INVOKED`, sends 0, never re-claimed; protection after claim / after invocation → zero writes, no release, digests unchanged through the final expiry.
+- Latched (historical contradiction), WAITING, out-of-scope (`.example`, never sent) and protected rows in one scope: byte-unchanged, the free row is still served; WAITING becomes eligible after its webhook is processed and is sent once.
+- 4 parallel workers × 4 rounds over overlapping scopes: 4 rows → exactly 4 invocations, distinct `messageRef`s.
+- Leases / timing (TEST SETUP lease shortening labelled): work or op lease room < 15 s → `LEASE_ROOM`; expired work lease → `LEASE_NOT_HELD`; slow RR observation and slow COMMIT → `OBSERVATION_SLOW`; wall-clock regression → `CLOCK_SKEW`; initial skew → refused after 2 statements. All sends 0.
+- Executor faults: throw, applied-then-rejected, non-exact accepted, non-mock id → code-only unknown + one case (`{errorCode, opType, operationId}` only), invocations 1, no resend; timeout → aborted at 10 s, `SEND_TIMEOUT`, late accepted reply observed in memory with no DB change.
+- Outer DB faults (identity-checked): marker error; initial observation COMMIT loss → ROLLBACK + discard, 0 sends, no claim; pre-send read error / COMMIT loss → 0 sends; completion acknowledgement lost with the completion COMMITTED → durable `succeeded`, no further query, no release, never resent; NOT committed → `in_flight`, never resent, later `LEASE_EXPIRED`; release failure after success → error propagates, success durable, no unknown case. Crash before claim → pending, no render; crash after claim → in_flight, 0 sends.
+- Render failure (recipient cross-check) → `RENDER_FAILED` latch, no claim.
+- Final real expiry: every crashed / lost row → `outcome_unknown LEASE_EXPIRED` by the scoped maintenance inside a step; protected rows untouched; invocation counts unchanged.
+
+Unit (scripted pool): deterministic copy / USD format / canonical / content-hash / recipient-hash vectors; adversarial request, reply (getters, non-enumerable, symbol keys, class instances, hostile proxies) and option shapes (28 gate refusals, each with **zero queries**, accessors never invoked); basis copy; marker / observation / COMMIT / settlement / release error identity with no follow-up; no PII in any result; microtask boundary between the pre-send COMMIT and the invocation; every local abort; every SQL status; unexpected shapes → `TypeError`.
+
+**Targeted mutants (worker decision boundaries only):** 25 probes W01–W25 (RR context, lease room, monotonic elapsed, observation budget, skew, request recheck, step budget, protected at each phase, try / finally release, resend, absent marker, recipient cross-check, swallowed error, connection reuse, basis copy, enable flag, reply classifier, query / await before the invocation, maintenance, unbounded timeout, late-reply write). **25 / 25 caught**, file restored and sha256-checked after each. After the run two result fields were aligned with §9.3 (no ids on `protected`, 8-hex prefix) and the focused + full suites above were run on the final code.
+
+TAP (session scratchpad): `gnf/tap/s2-*.tap`; per-mutant `gnf/mut2/W01–W25.tap`.
+
+### 16.5 Residuals (in addition to §14 / §15.8)
+
+1. A crash between work acquisition and the claim leaves the row pending under a live work lease for up to 120 s (no release after an outer failure); it is then re-evaluated and can be sent at most once (it never was).
+2. `afterSend` / settlement-time protection means a mock invocation already happened; the DB stays unchanged (`PROTECTED`), the row stays `in_flight` and is summary-visible only (§14 item 11).
+3. The executor is trusted injected code; `mock-` labels / ids and `.invalid` addresses are restrictions and correlation, not authentication.
+4. Copy, sender, recipient policy, retention, provider and every live gate remain CLOSED. The historical e74a listing-lock failure stays OPEN.

@@ -11,7 +11,7 @@ import { importClosure } from "./helpers/import-closure.mjs";
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const walk = (d) => (existsSync(join(ROOT, d)) ? readdirSync(join(ROOT, d)).flatMap((n) => (statSync(join(ROOT, d, n)).isDirectory() ? walk(`${d}/${n}`) : [`${d}/${n}`])) : []);
 const MOVED = ["codec", "config", "operations", "pool", "repo", "webhooks"];
-const BOOKING_DB_FILES = [...MOVED, "intent-access", "recovery", "reservation-worker", "capture-worker", "compensation-worker", "recording-worker", "recording-inbox"].sort(); // + E6 bearer-token lookup and shared rate limits; + E7.1 recovery; + E7.2/E7.3b/E7.4a/E7.4b offline workers (not route-reachable)
+const BOOKING_DB_FILES = [...MOVED, "intent-access", "recovery", "reservation-worker", "capture-worker", "compensation-worker", "recording-worker", "recording-inbox", "notification-worker"].sort(); // + E6 bearer-token lookup and shared rate limits; + E7.1 recovery; + E7.2/E7.3b/E7.4a/E7.4b/E7 guest-notification offline workers (not route-reachable)
 const WEBHOOK = "api/checkout/stripe-webhook.js";
 const INTENT_ROUTES = ["api/checkout/intents.js", "api/checkout/intent-step.js"];
 // E6 intent API closure (identical for both routes apart from the entry file); everything after the HTTP layer is lazy.
@@ -131,7 +131,7 @@ test(".vercelignore and public/ containment are unchanged", () => {
 test("E7.1/E7.2: no api/ route's import closure reaches the recovery modules, the reservation worker or the Hostaway adapter", () => {
   const OFFLINE_ONLY = ["lib/booking-db/reservation-worker.js", "lib/booking-db/recording-worker.js", "lib/booking-db/recovery.js", "lib/checkout/recovery-plan.js", "lib/hostaway-reservations.js",
     "lib/checkout/capture-proof.js", "lib/booking-db/capture-worker.js", "lib/checkout/compensation-proof.js", "lib/booking-db/compensation-worker.js",
-    "lib/checkout/offline-charge-proof.js", "lib/booking-db/recording-inbox.js"];   // + E7.3a pure capture proof, E7.3b capture worker, E7.4a-0 pure compensation proof, E7.4b-0 pure offline-charge proof
+    "lib/checkout/offline-charge-proof.js", "lib/booking-db/recording-inbox.js", "lib/checkout/guest-notification.js", "lib/booking-db/notification-worker.js"];   // + E7.3a pure capture proof, E7.3b capture worker, E7.4a-0 pure compensation proof, E7.4b-0 pure offline-charge proof, E7 guest-notification Stage 2
   const routes = walk("api").filter((f) => /\.m?js$/.test(f));
   assert.ok(routes.length >= 10);
   for (const r of routes) {
