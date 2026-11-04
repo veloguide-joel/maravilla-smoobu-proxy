@@ -1,0 +1,597 @@
+-- 0012_recording_assessments (up) — Stage E7.4b-D1 slice A (offline). DISPOSABLE LOCAL test databases only.
+-- Persisted PREFLIGHT ASSESSMENTS of the initial Hostaway payment recording, and the eligible-assessment CLAIM FENCE with an
+-- existence-based conflict / exhaustion LATCH (claude/e74b-preflight-assessment-contract.md revision 2 + root addendum A–F):
+--   * recording_assessment_codes: frozen reference data, one row per persistable (outcome, code) with ONE closed evidence-rule name;
+--   * recording_assessments: append-only, epoch 0 and phase 'preflight' ONLY (no holds / release / review in 0012);
+--   * recording_claim_assessments: append-only claim audit, written in the claim UPDATE's own statement (AFTER trigger);
+--   * record_recording_assessment(): the only writer (app); recording_claim_ready(): advisory read-only mirror (app / admin);
+--   * recording_claim_fence() (0011) replaced: the 0011 body verbatim first, then the 0012 checks marked "-- 0012".
+-- A latched op (any conflict, or 3 counted refusals, in epoch 0) has NO release path in 0012. Classification of an evidence-less
+-- refusal stays TRUST (the raw provider response is never stored); the code allowlist is not proof of provider contents.
+-- No claim, fence or assessment authorizes a provider send.
+
+DO $$
+BEGIN
+  IF to_regclass('booking.recording_holds') IS NULL THEN
+    RAISE EXCEPTION 'MIGRATION_0012_PRECONDITION: 0011 is not applied' USING ERRCODE = 'check_violation';
+  END IF;
+END $$;
+
+-- ---------------------------------------------------------------------------------------------
+-- reference data: persistable (outcome, code) pairs. 'eligible' has code NULL and is NOT a row here.
+CREATE TABLE booking.recording_assessment_codes (
+  outcome       text NOT NULL,
+  code          text NOT NULL,
+  evidence_rule text NOT NULL,
+  CONSTRAINT recording_assessment_codes_pkey PRIMARY KEY (outcome, code),
+  CONSTRAINT recording_assessment_codes_outcome_check CHECK (outcome IN ('conflict_marker', 'conflict_lookalike', 'conflict_same_amount',
+                                                                         'incomplete', 'identity_refused')),
+  CONSTRAINT recording_assessment_codes_code_check CHECK (code ~ '^[A-Z][A-Z0-9_]{2,79}$'),
+  CONSTRAINT recording_assessment_codes_rule_check CHECK (evidence_rule IN (
+    'list_present',                 -- conflicts: positive identity evidence + preflight list evidence (counts re-derived)
+    'list_absent_response',         -- incomplete: positive identity evidence; list read succeeded, NO list evidence
+    'list_absent_escalated',        -- incomplete READ_NOT_COMPLETED: positive identity evidence; list read escalated, NO evidence
+    'identity_absent',              -- identity_refused: identity read succeeded, NO evidence
+    'identity_absent_or_not_found', -- IDENTITY_HTTP_STATUS: no evidence, or a real not_found observation of that read
+    'identity_absent_or_mismatch',  -- field mismatch: no evidence, or found_active evidence whose field is re-derived as mismatching
+    'identity_absent_or_inactive',  -- IDENTITY_STATUS_NOT_ACTIVE: no evidence, cancelled evidence, or found_active with status <> 'new'
+    'identity_absent_escalated'))   -- identity_refused READ_NOT_COMPLETED: identity read escalated, NO evidence
+);
+INSERT INTO booking.recording_assessment_codes (outcome, code, evidence_rule) VALUES
+  ('conflict_marker',      'PRIOR_RECORDING_MARKER_PRESENT',     'list_present'),
+  ('conflict_lookalike',   'MARKER_LOOKALIKE_CONFLICT',          'list_present'),
+  ('conflict_same_amount', 'SAME_AMOUNT_PAID_UNMARKED_CONFLICT', 'list_present'),
+  ('incomplete', 'LIST_HTTP_STATUS', 'list_absent_response'),
+  ('incomplete', 'LIST_MALFORMED_ENVELOPE', 'list_absent_response'),
+  ('incomplete', 'LIST_FAIL_ENVELOPE', 'list_absent_response'),
+  ('incomplete', 'LIST_RESULT_NOT_ARRAY', 'list_absent_response'),
+  ('incomplete', 'LIST_COUNT_INVALID', 'list_absent_response'),
+  ('incomplete', 'LIST_COUNT_LENGTH_MISMATCH', 'list_absent_response'),
+  ('incomplete', 'LIST_ROW_MALFORMED', 'list_absent_response'),
+  ('incomplete', 'LIST_ROW_ID_INVALID', 'list_absent_response'),
+  ('incomplete', 'LIST_DUPLICATE_ID', 'list_absent_response'),
+  ('incomplete', 'LIST_FOREIGN_RESERVATION_ROW', 'list_absent_response'),
+  ('incomplete', 'LIST_FOREIGN_LISTING_ROW', 'list_absent_response'),
+  ('incomplete', 'LIST_ROW_TYPE_INVALID', 'list_absent_response'),
+  ('incomplete', 'LIST_ROW_TITLE_INVALID', 'list_absent_response'),
+  ('incomplete', 'LIST_ROW_CURRENCY_INVALID', 'list_absent_response'),
+  ('incomplete', 'LIST_ROW_STATUS_INVALID', 'list_absent_response'),
+  ('incomplete', 'LIST_ROW_PAYMENTPROVIDER_INVALID', 'list_absent_response'),
+  ('incomplete', 'LIST_ROW_PAYMENTMETHOD_INVALID', 'list_absent_response'),
+  ('incomplete', 'LIST_ROW_TYPE_UNKNOWN', 'list_absent_response'),
+  ('incomplete', 'LIST_ROW_AMOUNT_INVALID', 'list_absent_response'),
+  ('incomplete', 'LIST_ROW_AMOUNT_NOT_EXACT', 'list_absent_response'),
+  ('incomplete', 'READ_NOT_COMPLETED', 'list_absent_escalated'),
+  ('identity_refused', 'IDENTITY_HTTP_STATUS', 'identity_absent_or_not_found'),
+  ('identity_refused', 'IDENTITY_MALFORMED_ENVELOPE', 'identity_absent'),
+  ('identity_refused', 'IDENTITY_FAIL_ENVELOPE', 'identity_absent'),
+  ('identity_refused', 'IDENTITY_RESULT_NOT_OBJECT', 'identity_absent'),
+  ('identity_refused', 'IDENTITY_NOT_NORMALIZABLE', 'identity_absent'),
+  ('identity_refused', 'IDENTITY_MALFORMED_RESERVATION', 'identity_absent'),
+  ('identity_refused', 'IDENTITY_RESERVATION_ID_INVALID', 'identity_absent'),
+  ('identity_refused', 'IDENTITY_RESERVATION_ID_INCONSISTENT', 'identity_absent'),
+  ('identity_refused', 'IDENTITY_LISTING_ID_INVALID', 'identity_absent'),
+  ('identity_refused', 'IDENTITY_CHANNEL_ID_INVALID', 'identity_absent'),
+  ('identity_refused', 'IDENTITY_DATES_INVALID', 'identity_absent'),
+  ('identity_refused', 'IDENTITY_AMOUNT_NOT_EXACT', 'identity_absent'),
+  ('identity_refused', 'IDENTITY_CURRENCY_INVALID', 'identity_absent'),
+  ('identity_refused', 'IDENTITY_STATUS_INVALID', 'identity_absent'),
+  ('identity_refused', 'IDENTITY_CUSTOM_FIELDS_MALFORMED', 'identity_absent'),
+  ('identity_refused', 'IDENTITY_REF_FIELD_DUPLICATED', 'identity_absent'),
+  ('identity_refused', 'IDENTITY_REF_VALUE_INVALID', 'identity_absent'),
+  ('identity_refused', 'IDENTITY_CURRENCY_MISMATCH', 'identity_absent_or_mismatch'),
+  ('identity_refused', 'IDENTITY_RESERVATION_ID_MISMATCH', 'identity_absent_or_mismatch'),
+  ('identity_refused', 'IDENTITY_LISTING_MISMATCH', 'identity_absent_or_mismatch'),
+  ('identity_refused', 'IDENTITY_CHANNEL_MISMATCH', 'identity_absent_or_mismatch'),
+  ('identity_refused', 'IDENTITY_ARRIVAL_MISMATCH', 'identity_absent_or_mismatch'),
+  ('identity_refused', 'IDENTITY_DEPARTURE_MISMATCH', 'identity_absent_or_mismatch'),
+  ('identity_refused', 'IDENTITY_TOTAL_MISMATCH', 'identity_absent_or_mismatch'),
+  ('identity_refused', 'IDENTITY_REF_MISMATCH', 'identity_absent_or_mismatch'),
+  ('identity_refused', 'IDENTITY_STATUS_NOT_ACTIVE', 'identity_absent_or_inactive'),
+  ('identity_refused', 'READ_NOT_COMPLETED', 'identity_absent_escalated');
+-- frozen after seeding: no INSERT / UPDATE / DELETE / TRUNCATE by anyone (schema owner included; only down drops it)
+CREATE TRIGGER recording_assessment_codes_frozen BEFORE INSERT OR UPDATE OR DELETE ON booking.recording_assessment_codes
+  FOR EACH ROW EXECUTE FUNCTION booking.reject_change();
+CREATE TRIGGER recording_assessment_codes_no_truncate BEFORE TRUNCATE ON booking.recording_assessment_codes
+  FOR EACH STATEMENT EXECUTE FUNCTION booking.reject_change();
+
+-- ---------------------------------------------------------------------------------------------
+-- assessments (append-only). Every column NOT NULL except code / list read / evidence, whose nullability is exact per outcome.
+CREATE TABLE booking.recording_assessments (
+  id                uuid NOT NULL,
+  seq               bigint GENERATED ALWAYS AS IDENTITY,
+  operation_id      uuid NOT NULL,
+  intent_id         uuid NOT NULL,
+  phase             text NOT NULL,
+  epoch             integer NOT NULL,
+  outcome           text NOT NULL,
+  code              text,
+  identity_read_op  uuid NOT NULL,
+  list_read_op      uuid,
+  identity_evidence uuid,
+  list_evidence     uuid,
+  intent_version    integer NOT NULL,
+  worker            text NOT NULL,
+  module_version    text NOT NULL,
+  cfg               jsonb NOT NULL,
+  client_label      text NOT NULL,
+  account_ref       text NOT NULL,
+  recorded_at       timestamptz NOT NULL,
+  CONSTRAINT recording_assessments_pkey PRIMARY KEY (id),
+  CONSTRAINT recording_assessments_seq_key UNIQUE (seq),
+  CONSTRAINT recording_assessments_claim_binding_key UNIQUE (id, operation_id, intent_id, worker),
+  CONSTRAINT recording_assessments_identity_read_key UNIQUE (identity_read_op),
+  CONSTRAINT recording_assessments_list_read_key UNIQUE (list_read_op),
+  CONSTRAINT recording_assessments_operation_fk FOREIGN KEY (operation_id) REFERENCES booking.external_operations (id),
+  CONSTRAINT recording_assessments_intent_fk FOREIGN KEY (intent_id) REFERENCES booking.intents (id),
+  CONSTRAINT recording_assessments_identity_read_fk FOREIGN KEY (identity_read_op) REFERENCES booking.external_operations (id),
+  CONSTRAINT recording_assessments_list_read_fk FOREIGN KEY (list_read_op) REFERENCES booking.external_operations (id),
+  CONSTRAINT recording_assessments_identity_evidence_fk FOREIGN KEY (identity_evidence) REFERENCES booking.provider_evidence (id),
+  CONSTRAINT recording_assessments_list_evidence_fk FOREIGN KEY (list_evidence) REFERENCES booking.provider_evidence (id),
+  CONSTRAINT recording_assessments_code_fk FOREIGN KEY (outcome, code) REFERENCES booking.recording_assessment_codes (outcome, code),
+  CONSTRAINT recording_assessments_phase_check CHECK (phase = 'preflight'),
+  CONSTRAINT recording_assessments_epoch_check CHECK (epoch = 0),
+  CONSTRAINT recording_assessments_outcome_check CHECK (outcome IN ('eligible', 'conflict_marker', 'conflict_lookalike', 'conflict_same_amount',
+                                                                    'incomplete', 'identity_refused')),
+  CONSTRAINT recording_assessments_code_check CHECK ((outcome = 'eligible') = (code IS NULL)),
+  CONSTRAINT recording_assessments_shape_check CHECK (CASE
+    WHEN outcome IN ('eligible', 'conflict_marker', 'conflict_lookalike', 'conflict_same_amount')
+      THEN list_read_op IS NOT NULL AND identity_evidence IS NOT NULL AND list_evidence IS NOT NULL
+    WHEN outcome = 'incomplete' THEN list_read_op IS NOT NULL AND identity_evidence IS NOT NULL AND list_evidence IS NULL
+    WHEN outcome = 'identity_refused' THEN list_read_op IS NULL AND list_evidence IS NULL
+    ELSE false END),
+  CONSTRAINT recording_assessments_distinct_reads_check CHECK (list_read_op IS NULL OR list_read_op <> identity_read_op),
+  CONSTRAINT recording_assessments_version_check CHECK (intent_version >= 0),
+  CONSTRAINT recording_assessments_worker_check CHECK (length(btrim(worker)) BETWEEN 1 AND 200),
+  CONSTRAINT recording_assessments_module_check CHECK (module_version IN ('offline-charge-proof-v1')),
+  CONSTRAINT recording_assessments_cfg_check CHECK (jsonb_typeof(cfg) = 'object'),
+  CONSTRAINT recording_assessments_label_check CHECK (client_label ~ '^[A-Za-z0-9._:-]{1,64}$' AND account_ref ~ '^[A-Za-z0-9._:-]{1,64}$')
+);
+CREATE INDEX recording_assessments_op ON booking.recording_assessments (operation_id, epoch, seq);
+
+-- claim audit (append-only): exactly one row per claimed initial recording, bound to the qualifying assessment
+CREATE TABLE booking.recording_claim_assessments (
+  operation_id  uuid NOT NULL,
+  intent_id     uuid NOT NULL,
+  assessment_id uuid NOT NULL,
+  worker        text NOT NULL,
+  epoch         integer NOT NULL,
+  claimed_at    timestamptz NOT NULL,
+  CONSTRAINT recording_claim_assessments_pkey PRIMARY KEY (operation_id),
+  CONSTRAINT recording_claim_assessments_assessment_key UNIQUE (assessment_id),
+  CONSTRAINT recording_claim_assessments_operation_fk FOREIGN KEY (operation_id) REFERENCES booking.external_operations (id),
+  CONSTRAINT recording_claim_assessments_binding_fk FOREIGN KEY (assessment_id, operation_id, intent_id, worker)
+    REFERENCES booking.recording_assessments (id, operation_id, intent_id, worker),
+  CONSTRAINT recording_claim_assessments_epoch_check CHECK (epoch = 0)
+);
+
+-- ---------------------------------------------------------------------------------------------
+-- guards (SECURITY INVOKER; is_privileged() = "inside a schema-owner function")
+CREATE FUNCTION booking.recording_assessments_guard() RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, booking AS $$
+BEGIN
+  IF NOT booking.is_privileged() THEN
+    RAISE EXCEPTION 'ASSESSMENT_IMMUTABLE: assessments are written only by booking.record_recording_assessment' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  RETURN NEW;
+END $$;
+REVOKE ALL ON FUNCTION booking.recording_assessments_guard() FROM PUBLIC;
+CREATE TRIGGER recording_assessments_guard BEFORE INSERT ON booking.recording_assessments FOR EACH ROW EXECUTE FUNCTION booking.recording_assessments_guard();
+CREATE TRIGGER recording_assessments_append_only BEFORE UPDATE OR DELETE ON booking.recording_assessments FOR EACH ROW EXECUTE FUNCTION booking.reject_change();
+CREATE TRIGGER recording_assessments_no_truncate BEFORE TRUNCATE ON booking.recording_assessments FOR EACH STATEMENT EXECUTE FUNCTION booking.reject_change();
+
+CREATE FUNCTION booking.recording_claim_assessments_guard() RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, booking AS $$
+DECLARE a booking.recording_assessments%ROWTYPE; o booking.external_operations%ROWTYPE;
+BEGIN
+  IF NOT booking.is_privileged() THEN
+    RAISE EXCEPTION 'ASSESSMENT_IMMUTABLE: claim audit is written only by the recording claim trigger' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  SELECT * INTO a FROM booking.recording_assessments WHERE id = NEW.assessment_id;
+  SELECT * INTO o FROM booking.external_operations WHERE id = NEW.operation_id;
+  IF a.id IS NULL OR o.id IS NULL OR a.operation_id IS DISTINCT FROM NEW.operation_id OR a.intent_id IS DISTINCT FROM NEW.intent_id
+     OR o.intent_id IS DISTINCT FROM NEW.intent_id OR a.phase IS DISTINCT FROM 'preflight' OR a.epoch IS DISTINCT FROM NEW.epoch
+     OR a.outcome IS DISTINCT FROM 'eligible' OR a.worker IS DISTINCT FROM NEW.worker OR o.lease_worker_id IS DISTINCT FROM NEW.worker
+     OR o.state IS DISTINCT FROM 'in_flight' OR o.op_type IS DISTINCT FROM 'hostaway.record_offline_charge' THEN
+    RAISE EXCEPTION 'RECORDING_CLAIM_AUDIT_BINDING: claim audit does not bind the eligible assessment and the claimed row' USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NEW;
+END $$;
+REVOKE ALL ON FUNCTION booking.recording_claim_assessments_guard() FROM PUBLIC;
+CREATE TRIGGER recording_claim_assessments_guard BEFORE INSERT ON booking.recording_claim_assessments FOR EACH ROW EXECUTE FUNCTION booking.recording_claim_assessments_guard();
+CREATE TRIGGER recording_claim_assessments_append_only BEFORE UPDATE OR DELETE ON booking.recording_claim_assessments FOR EACH ROW EXECUTE FUNCTION booking.reject_change();
+CREATE TRIGGER recording_claim_assessments_no_truncate BEFORE TRUNCATE ON booking.recording_claim_assessments FOR EACH STATEMENT EXECUTE FUNCTION booking.reject_change();
+
+-- ---------------------------------------------------------------------------------------------
+-- private predicates (SECURITY DEFINER, VOLATILE: every statement takes a fresh READ COMMITTED snapshot; none reads a clock
+-- except where stated; owner only)
+
+-- latch, by EXISTENCE in the current epoch (0 in this migration): 'CONFLICT_LATCHED' | 'EXHAUSTED' | NULL
+CREATE FUNCTION booking.recording_preflight_block(p_op uuid) RETURNS text
+LANGUAGE sql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+  SELECT CASE
+    WHEN EXISTS (SELECT 1 FROM booking.recording_assessments a WHERE a.operation_id = p_op AND a.phase = 'preflight' AND a.epoch = 0
+                    AND a.outcome IN ('conflict_marker', 'conflict_lookalike', 'conflict_same_amount')) THEN 'CONFLICT_LATCHED'
+    WHEN (SELECT count(*) FROM booking.recording_assessments a WHERE a.operation_id = p_op AND a.phase = 'preflight' AND a.epoch = 0
+             AND a.outcome IN ('incomplete', 'identity_refused')) >= 3 THEN 'EXHAUSTED'
+  END
+$$;
+REVOKE ALL ON FUNCTION booking.recording_preflight_block(uuid) FROM PUBLIC;
+
+-- exact positive identity evidence of read p_read for intent i, labels bound (eligible / conflict / incomplete)
+CREATE FUNCTION booking.recording_identity_positive(p_ev uuid, p_read uuid, p_intent uuid, p_account_ref text, p_client_label text) RETURNS boolean
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE e booking.provider_evidence%ROWTYPE; i booking.intents%ROWTYPE; o jsonb;
+BEGIN
+  SELECT * INTO e FROM booking.provider_evidence WHERE id = p_ev;
+  SELECT * INTO i FROM booking.intents WHERE id = p_intent;
+  IF e.id IS NULL OR i.id IS NULL OR i.hostaway_reservation_id IS NULL THEN RETURN false; END IF;
+  o := e.observed;
+  RETURN coalesce(
+    e.read_operation_id = p_read AND e.intent_id = p_intent AND e.kind = 'hostaway_reservation' AND e.source = 'hostaway_api'
+    AND e.status = 'found_active' AND e.external_ref = i.hostaway_reservation_id
+    AND (SELECT array_agg(k ORDER BY k) FROM jsonb_object_keys(o) k) = ARRAY['bookingRef', 'channelId', 'clientSnapshotId', 'currency',
+         'executorAccountRef', 'from', 'listingId', 'reservationId', 'status', 'to', 'totalMinor']
+    AND o -> 'reservationId' = to_jsonb(i.hostaway_reservation_id) AND o -> 'listingId' = to_jsonb(i.listing_id)
+    AND o -> 'channelId' = to_jsonb(2000) AND o -> 'from' = to_jsonb(to_char(i.from_date, 'YYYY-MM-DD'))
+    AND o -> 'to' = to_jsonb(to_char(i.to_date, 'YYYY-MM-DD')) AND o -> 'totalMinor' = to_jsonb(i.final_total_minor)
+    AND o -> 'currency' = to_jsonb(i.currency::text) AND o -> 'status' = to_jsonb('new'::text) AND o -> 'bookingRef' = to_jsonb(i.ref)
+    AND o -> 'executorAccountRef' = to_jsonb(p_account_ref) AND o -> 'clientSnapshotId' = to_jsonb(p_client_label), false);
+END $$;
+REVOKE ALL ON FUNCTION booking.recording_identity_positive(uuid, uuid, uuid, text, text) FROM PUBLIC;
+
+-- a REAL refused identity observation retained for identity_refused, re-derived per code. Never a positive match.
+CREATE FUNCTION booking.recording_identity_refused_evidence_ok(p_ev uuid, p_read uuid, p_intent uuid, p_code text, p_rule text,
+  p_account_ref text, p_client_label text) RETURNS boolean
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE e booking.provider_evidence%ROWTYPE; i booking.intents%ROWTYPE; o jsonb; keys text[]; full_keys text[] := ARRAY['bookingRef', 'channelId',
+  'clientSnapshotId', 'currency', 'executorAccountRef', 'from', 'listingId', 'reservationId', 'status', 'to', 'totalMinor'];
+BEGIN
+  SELECT * INTO e FROM booking.provider_evidence WHERE id = p_ev;
+  SELECT * INTO i FROM booking.intents WHERE id = p_intent;
+  IF e.id IS NULL OR i.id IS NULL OR i.hostaway_reservation_id IS NULL THEN RETURN false; END IF;
+  IF NOT coalesce(e.read_operation_id = p_read AND e.intent_id = p_intent AND e.kind = 'hostaway_reservation' AND e.source = 'hostaway_api'
+                  AND e.external_ref = i.hostaway_reservation_id, false) THEN
+    RETURN false;
+  END IF;
+  o := e.observed;
+  keys := (SELECT array_agg(k ORDER BY k) FROM jsonb_object_keys(o) k);
+  IF NOT coalesce(o -> 'executorAccountRef' = to_jsonb(p_account_ref) AND o -> 'clientSnapshotId' = to_jsonb(p_client_label), false) THEN RETURN false; END IF;
+  IF p_rule = 'identity_absent_or_not_found' THEN
+    RETURN coalesce(p_code = 'IDENTITY_HTTP_STATUS' AND e.status = 'not_found'
+                    AND keys = ARRAY['clientSnapshotId', 'executorAccountRef', 'reservationId'] AND o -> 'reservationId' = to_jsonb(i.hostaway_reservation_id), false);
+  END IF;
+  IF keys IS DISTINCT FROM full_keys THEN RETURN false; END IF;
+  IF p_rule = 'identity_absent_or_inactive' THEN
+    RETURN coalesce(p_code = 'IDENTITY_STATUS_NOT_ACTIVE'
+                    AND (e.status = 'cancelled' OR (e.status = 'found_active' AND o -> 'status' IS DISTINCT FROM to_jsonb('new'::text))), false);
+  END IF;
+  IF p_rule <> 'identity_absent_or_mismatch' OR e.status IS DISTINCT FROM 'found_active' THEN RETURN false; END IF;
+  RETURN coalesce(CASE p_code
+    WHEN 'IDENTITY_CURRENCY_MISMATCH'       THEN o -> 'currency' IS DISTINCT FROM to_jsonb(i.currency::text)
+    WHEN 'IDENTITY_RESERVATION_ID_MISMATCH' THEN o -> 'reservationId' IS DISTINCT FROM to_jsonb(i.hostaway_reservation_id)
+    WHEN 'IDENTITY_LISTING_MISMATCH'        THEN o -> 'listingId' IS DISTINCT FROM to_jsonb(i.listing_id)
+    WHEN 'IDENTITY_CHANNEL_MISMATCH'        THEN o -> 'channelId' IS DISTINCT FROM to_jsonb(2000)
+    WHEN 'IDENTITY_ARRIVAL_MISMATCH'        THEN o -> 'from' IS DISTINCT FROM to_jsonb(to_char(i.from_date, 'YYYY-MM-DD'))
+    WHEN 'IDENTITY_DEPARTURE_MISMATCH'      THEN o -> 'to' IS DISTINCT FROM to_jsonb(to_char(i.to_date, 'YYYY-MM-DD'))
+    WHEN 'IDENTITY_TOTAL_MISMATCH'          THEN o -> 'totalMinor' IS DISTINCT FROM to_jsonb(i.final_total_minor)
+    WHEN 'IDENTITY_REF_MISMATCH'            THEN o -> 'bookingRef' IS DISTINCT FROM to_jsonb(i.ref)
+    ELSE false END, false);
+END $$;
+REVOKE ALL ON FUNCTION booking.recording_identity_refused_evidence_ok(uuid, uuid, uuid, text, text, text, text) FROM PUBLIC;
+
+-- exact preflight list evidence (count-only, no marker) of read p_read, with the outcome's count relation
+CREATE FUNCTION booking.recording_list_evidence_ok(p_ev uuid, p_read uuid, p_intent uuid, p_outcome text, p_account_ref text, p_client_label text) RETURNS boolean
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE e booking.provider_evidence%ROWTYPE; i booking.intents%ROWTYPE; o jsonb; m bigint; l bigint; s bigint; n bigint; ids jsonb;
+BEGIN
+  SELECT * INTO e FROM booking.provider_evidence WHERE id = p_ev;
+  SELECT * INTO i FROM booking.intents WHERE id = p_intent;
+  IF e.id IS NULL OR i.id IS NULL OR i.hostaway_reservation_id IS NULL THEN RETURN false; END IF;
+  o := e.observed;
+  IF NOT coalesce(e.read_operation_id = p_read AND e.intent_id = p_intent AND e.kind = 'hostaway_offline_charges' AND e.source = 'hostaway_api'
+     AND e.status = 'listed' AND e.external_ref = i.hostaway_reservation_id
+     AND (SELECT array_agg(k ORDER BY k) FROM jsonb_object_keys(o) k) = ARRAY['clientSnapshotId', 'complete', 'executorAccountRef', 'lookalikeCount',
+          'matchingChargeCount', 'matchingChargeIds', 'readCount', 'requestLimit', 'rowCount', 'sameAmountPaidCount']
+     AND o -> 'complete' = 'true'::jsonb AND o -> 'readCount' = to_jsonb(1) AND o -> 'requestLimit' = to_jsonb(500)
+     AND o -> 'executorAccountRef' = to_jsonb(p_account_ref) AND o -> 'clientSnapshotId' = to_jsonb(p_client_label)
+     AND jsonb_typeof(o -> 'matchingChargeIds') = 'array', false) THEN
+    RETURN false;
+  END IF;
+  -- integral counts 0..500 (text form checked before any cast: no rounding, no overflow)
+  IF NOT coalesce((o ->> 'matchingChargeCount') ~ '^(0|[1-9][0-9]{0,2})$' AND (o ->> 'lookalikeCount') ~ '^(0|[1-9][0-9]{0,2})$'
+     AND (o ->> 'sameAmountPaidCount') ~ '^(0|[1-9][0-9]{0,2})$' AND (o ->> 'rowCount') ~ '^(0|[1-9][0-9]{0,2})$'
+     AND jsonb_typeof(o -> 'matchingChargeCount') = 'number' AND jsonb_typeof(o -> 'lookalikeCount') = 'number'
+     AND jsonb_typeof(o -> 'sameAmountPaidCount') = 'number' AND jsonb_typeof(o -> 'rowCount') = 'number', false) THEN
+    RETURN false;
+  END IF;
+  m := (o ->> 'matchingChargeCount')::bigint; l := (o ->> 'lookalikeCount')::bigint; s := (o ->> 'sameAmountPaidCount')::bigint; n := (o ->> 'rowCount')::bigint;
+  ids := o -> 'matchingChargeIds';
+  IF m > 500 OR l > 500 OR s > 500 OR n > 500 OR n < m + l + s OR jsonb_array_length(ids) <> m
+     OR EXISTS (SELECT 1 FROM jsonb_array_elements(ids) x WHERE jsonb_typeof(x) <> 'string' OR NOT ((x #>> '{}') ~ '^[1-9][0-9]{0,15}$'))
+     OR (SELECT count(DISTINCT x #>> '{}') FROM jsonb_array_elements(ids) x) <> m THEN
+    RETURN false;
+  END IF;
+  RETURN CASE p_outcome
+    WHEN 'eligible'             THEN m = 0 AND l = 0 AND s = 0
+    WHEN 'conflict_marker'      THEN m >= 1
+    WHEN 'conflict_lookalike'   THEN m = 0 AND l >= 1
+    WHEN 'conflict_same_amount' THEN m = 0 AND l = 0 AND s >= 1
+    ELSE false END;
+END $$;
+REVOKE ALL ON FUNCTION booking.recording_list_evidence_ok(uuid, uuid, uuid, text, text, text) FROM PUBLIC;
+
+-- the claim-time 0012 refusal of op p_op at decision instant p_t: NULL = qualifies. p_worker NULL = advisory mirror (no claimant equality).
+-- Reads the latest current-epoch preflight row, the latch, the live work lease and both evidence rows; takes NO lock, reads NO clock.
+CREATE FUNCTION booking.recording_claim_refusal(p_op uuid, p_worker text, p_t timestamptz) RETURNS text
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE o booking.external_operations%ROWTYPE; i booking.intents%ROWTYPE; w booking.intent_work%ROWTYPE; a booking.recording_assessments%ROWTYPE;
+        b text; ie timestamptz; le timestamptz;
+BEGIN
+  IF p_t IS NULL THEN RETURN 'DECISION_TIME_MISSING'; END IF;
+  SELECT * INTO o FROM booking.external_operations WHERE id = p_op AND op_type = 'hostaway.record_offline_charge';
+  IF o.id IS NULL THEN RETURN 'NOT_A_RECORDING'; END IF;
+  SELECT * INTO i FROM booking.intents WHERE id = o.intent_id;
+  SELECT * INTO w FROM booking.intent_work WHERE intent_id = o.intent_id;
+  b := booking.recording_preflight_block(p_op);
+  IF b IS NOT NULL THEN RETURN 'PREFLIGHT_' || b; END IF;
+  SELECT * INTO a FROM booking.recording_assessments WHERE operation_id = p_op AND phase = 'preflight' AND epoch = 0 ORDER BY seq DESC LIMIT 1;
+  IF a.id IS NULL THEN RETURN 'NO_ASSESSMENT'; END IF;
+  IF a.outcome IS DISTINCT FROM 'eligible' THEN RETURN 'LATEST_NOT_ELIGIBLE'; END IF;
+  IF a.intent_id IS DISTINCT FROM o.intent_id OR i.id IS NULL OR a.intent_version IS DISTINCT FROM i.version THEN RETURN 'VERSION_CHANGED'; END IF;
+  IF a.cfg -> 'listingId' IS DISTINCT FROM to_jsonb(i.listing_id) OR a.cfg -> 'currency' IS DISTINCT FROM to_jsonb(i.currency::text) THEN
+    RETURN 'CONFIG_BINDING';
+  END IF;
+  IF w.intent_id IS NULL OR w.work_worker_id IS NULL OR w.work_lease_until IS NULL OR w.work_worker_id IS DISTINCT FROM a.worker
+     OR w.work_lease_until < p_t THEN
+    RETURN 'WORK_LEASE';
+  END IF;
+  IF p_worker IS NOT NULL AND p_worker IS DISTINCT FROM a.worker THEN RETURN 'NOT_ASSESSING_WORKER'; END IF;
+  SELECT observed_at INTO ie FROM booking.provider_evidence WHERE id = a.identity_evidence;
+  SELECT observed_at INTO le FROM booking.provider_evidence WHERE id = a.list_evidence;
+  IF ie IS NULL OR le IS NULL OR ie < p_t - interval '2 minutes' OR ie > p_t OR le < p_t - interval '2 minutes' OR le > p_t THEN
+    RETURN 'STALE';
+  END IF;
+  RETURN NULL;
+END $$;
+REVOKE ALL ON FUNCTION booking.recording_claim_refusal(uuid, text, timestamptz) FROM PUBLIC;
+
+-- advisory read-only mirror for the JS claim helper (both stages, with the would-be claimant; NULL = no claimant equality).
+-- VOLATILE: reads clock_timestamp() and fresh snapshots; takes no lock. The trigger is authoritative.
+CREATE FUNCTION booking.recording_claim_ready(p_op uuid, p_worker text) RETURNS boolean
+LANGUAGE sql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+  SELECT booking.recording_claim_refusal(p_op, p_worker, clock_timestamp()) IS NULL
+$$;
+REVOKE ALL ON FUNCTION booking.recording_claim_ready(uuid, text) FROM PUBLIC;
+
+-- ---------------------------------------------------------------------------------------------
+-- the only writer. Lock order: intent SHARE -> intent_work SHARE -> recording op SHARE -> cited reads SHARE (identity, list) ->
+-- per-intent advisory evidence key, THEN the decision instant v_t; every check below runs on fresh post-wait snapshots.
+CREATE FUNCTION booking.record_recording_assessment(p_op uuid, p_worker text, p_outcome text, p_code text, p_identity_read uuid, p_list_read uuid,
+  p_identity_evidence uuid, p_list_evidence uuid, p_expected_version integer, p_module_version text, p_client_label text, p_account_ref text,
+  p_cfg jsonb) RETURNS uuid
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE v_intent uuid; i booking.intents%ROWTYPE; w booking.intent_work%ROWTYPE; o booking.external_operations%ROWTYPE;
+        ri booking.external_operations%ROWTYPE; rl booking.external_operations%ROWTYPE; v_rule text; v_t timestamptz; v_floor timestamptz;
+        v_block text; v_id uuid := gen_random_uuid(); ei booking.provider_evidence%ROWTYPE; el booking.provider_evidence%ROWTYPE; v_term timestamptz;
+BEGIN
+  -- inputs (no lock)
+  IF p_op IS NULL OR p_worker IS NULL OR length(btrim(p_worker)) NOT BETWEEN 1 AND 200 OR p_outcome IS NULL OR p_identity_read IS NULL
+     OR p_expected_version IS NULL OR p_module_version IS NULL OR p_client_label IS NULL OR p_account_ref IS NULL OR p_cfg IS NULL THEN
+    RAISE EXCEPTION 'ASSESSMENT_INPUT: required input missing' USING ERRCODE = 'check_violation';
+  END IF;
+  IF p_module_version IS DISTINCT FROM 'offline-charge-proof-v1' THEN RAISE EXCEPTION 'ASSESSMENT_INPUT: module version' USING ERRCODE = 'check_violation'; END IF;
+  IF NOT (p_client_label ~ '^[A-Za-z0-9._:-]{1,64}$' AND p_account_ref ~ '^[A-Za-z0-9._:-]{1,64}$') THEN
+    RAISE EXCEPTION 'ASSESSMENT_INPUT: labels' USING ERRCODE = 'check_violation';
+  END IF;
+  IF p_outcome = 'eligible' THEN
+    IF p_code IS NOT NULL THEN RAISE EXCEPTION 'ASSESSMENT_CODE: eligible has no code' USING ERRCODE = 'check_violation'; END IF;
+    v_rule := 'eligible';
+  ELSE
+    SELECT evidence_rule INTO v_rule FROM booking.recording_assessment_codes WHERE outcome = p_outcome AND code = p_code;
+    IF v_rule IS NULL THEN RAISE EXCEPTION 'ASSESSMENT_CODE: (%, %) is not a persistable pair', p_outcome, p_code USING ERRCODE = 'check_violation'; END IF;
+  END IF;
+  -- exact nullability per rule
+  IF (v_rule IN ('eligible', 'list_present') AND (p_list_read IS NULL OR p_identity_evidence IS NULL OR p_list_evidence IS NULL))
+     OR (v_rule IN ('list_absent_response', 'list_absent_escalated') AND (p_list_read IS NULL OR p_identity_evidence IS NULL OR p_list_evidence IS NOT NULL))
+     OR (v_rule IN ('identity_absent', 'identity_absent_escalated') AND (p_list_read IS NOT NULL OR p_identity_evidence IS NOT NULL OR p_list_evidence IS NOT NULL))
+     OR (v_rule IN ('identity_absent_or_not_found', 'identity_absent_or_mismatch', 'identity_absent_or_inactive')
+         AND (p_list_read IS NOT NULL OR p_list_evidence IS NOT NULL)) THEN
+    RAISE EXCEPTION 'ASSESSMENT_INPUT: read / evidence shape does not match (%, %)', p_outcome, p_code USING ERRCODE = 'check_violation';
+  END IF;
+  -- config snapshot: exactly the pure CONFIG_KEYS, typed and bounded, no default. Written as ONE positive conjunction under coalesce(.., false)
+  -- (a NULL anywhere refuses); every cast is guarded by its text check first (CASE), so no input can raise a cast error instead of refusing.
+  IF NOT coalesce(jsonb_typeof(p_cfg) = 'object'
+     AND (SELECT array_agg(k ORDER BY k) FROM jsonb_object_keys(p_cfg) k) = ARRAY['accountRef', 'channelId', 'currency', 'listingId', 'paymentMethod', 'refFieldId']
+     AND jsonb_typeof(p_cfg -> 'accountRef') = 'string' AND p_cfg -> 'accountRef' = to_jsonb(p_account_ref)
+     AND jsonb_typeof(p_cfg -> 'channelId') = 'number' AND p_cfg -> 'channelId' = to_jsonb(2000)
+     AND jsonb_typeof(p_cfg -> 'currency') = 'string'
+     AND jsonb_typeof(p_cfg -> 'listingId') = 'number' AND (p_cfg ->> 'listingId') ~ '^[1-9][0-9]{0,9}$'
+     AND jsonb_typeof(p_cfg -> 'paymentMethod') = 'string' AND (p_cfg ->> 'paymentMethod') IN ('credit_card', 'other')
+     AND jsonb_typeof(p_cfg -> 'refFieldId') = 'number'
+     AND (CASE WHEN (p_cfg ->> 'refFieldId') ~ '^[1-9][0-9]{0,9}$' THEN (p_cfg ->> 'refFieldId')::bigint <= 2147483647 ELSE false END), false) THEN
+    RAISE EXCEPTION 'ASSESSMENT_CONFIG: config snapshot keys / types / bounds' USING ERRCODE = 'check_violation';
+  END IF;
+
+  SELECT intent_id INTO v_intent FROM booking.external_operations WHERE id = p_op AND op_type = 'hostaway.record_offline_charge';
+  IF v_intent IS NULL THEN RAISE EXCEPTION 'ASSESSMENT_TARGET_STATE: not a recording operation' USING ERRCODE = 'check_violation'; END IF;
+  SELECT * INTO i FROM booking.intents WHERE id = v_intent FOR SHARE;
+  SELECT * INTO w FROM booking.intent_work WHERE intent_id = v_intent FOR SHARE;
+  SELECT * INTO o FROM booking.external_operations WHERE id = p_op FOR SHARE;
+  SELECT * INTO ri FROM booking.external_operations WHERE id = p_identity_read FOR SHARE;
+  IF p_list_read IS NOT NULL THEN SELECT * INTO rl FROM booking.external_operations WHERE id = p_list_read FOR SHARE; END IF;
+  PERFORM pg_advisory_xact_lock(hashtext('booking.recording_evidence'), hashtext(v_intent::text));
+  v_t := clock_timestamp();                                                                  -- after every potentially blocking lock
+
+  -- target (re-read after the waits: the locked rows above are current; latch / holds / evidence are read fresh below)
+  IF o.state IS DISTINCT FROM 'pending' OR o.idempotency_key IS DISTINCT FROM 'och:' || v_intent::text || ':1' OR o.attempts IS DISTINCT FROM 0
+     OR o.dispatched_at IS NOT NULL THEN
+    RAISE EXCEPTION 'ASSESSMENT_TARGET_STATE: only the pending, never-dispatched initial recording is assessed' USING ERRCODE = 'check_violation';
+  END IF;
+  IF booking.recording_latest_id(v_intent) IS DISTINCT FROM p_op THEN RAISE EXCEPTION 'ASSESSMENT_TARGET_STATE: not the latest recording' USING ERRCODE = 'check_violation'; END IF;
+  IF i.state IS DISTINCT FROM 'payment_captured' OR i.captured_minor IS DISTINCT FROM i.final_total_minor OR i.offline_charge_attempts IS DISTINCT FROM 0
+     OR i.hostaway_reservation_id IS NULL THEN
+    RAISE EXCEPTION 'ASSESSMENT_TARGET_STATE: intent is not payment_captured with an exact capture and a reservation' USING ERRCODE = 'check_violation';
+  END IF;
+  IF i.version IS DISTINCT FROM p_expected_version THEN RAISE EXCEPTION 'ASSESSMENT_VERSION_CHANGED' USING ERRCODE = 'check_violation'; END IF;
+  IF w.intent_id IS NULL OR w.work_worker_id IS NULL OR w.work_lease_until IS NULL OR w.work_worker_id IS DISTINCT FROM p_worker OR w.work_lease_until < v_t THEN
+    RAISE EXCEPTION 'ASSESSMENT_WORK_LEASE_LOST' USING ERRCODE = 'check_violation';
+  END IF;
+  IF booking.recording_active_hold_id(p_op) IS NOT NULL THEN
+    RAISE EXCEPTION 'ASSESSMENT_HOLD_ACTIVE: an owner hold is active on this recording' USING ERRCODE = 'check_violation';
+  END IF;
+  v_block := booking.recording_preflight_block(p_op);
+  IF v_block = 'CONFLICT_LATCHED' THEN RAISE EXCEPTION 'ASSESSMENT_EPOCH_CONFLICTED: a conflict is recorded in the current epoch' USING ERRCODE = 'check_violation'; END IF;
+  IF v_block = 'EXHAUSTED' THEN RAISE EXCEPTION 'ASSESSMENT_EPOCH_EXHAUSTED: 3 counted refusals in the current epoch' USING ERRCODE = 'check_violation'; END IF;
+  IF p_cfg -> 'listingId' IS DISTINCT FROM to_jsonb(i.listing_id) OR p_cfg -> 'currency' IS DISTINCT FROM to_jsonb(i.currency::text) THEN
+    RAISE EXCEPTION 'ASSESSMENT_CONFIG: config listing / currency differ from the intent' USING ERRCODE = 'check_violation';
+  END IF;
+
+  -- reads: exact intent, type, canonical payload, terminal state; each counted once ever
+  IF ri.id IS NULL OR ri.intent_id IS DISTINCT FROM v_intent OR ri.op_type IS DISTINCT FROM 'hostaway.retrieve_reservation' OR ri.retry_class IS DISTINCT FROM 'read'
+     OR ri.payload IS DISTINCT FROM jsonb_build_object('reservationId', i.hostaway_reservation_id)
+     OR (p_list_read IS NOT NULL AND (rl.id IS NULL OR rl.intent_id IS DISTINCT FROM v_intent OR rl.op_type IS DISTINCT FROM 'hostaway.list_offline_charges'
+         OR rl.retry_class IS DISTINCT FROM 'read' OR rl.payload IS DISTINCT FROM jsonb_build_object('reservationId', i.hostaway_reservation_id))) THEN
+    RAISE EXCEPTION 'ASSESSMENT_READ_BINDING: read intent / type / payload' USING ERRCODE = 'check_violation';
+  END IF;
+  IF ri.state IS DISTINCT FROM (CASE WHEN v_rule = 'identity_absent_escalated' THEN 'escalated' ELSE 'succeeded' END)
+     OR (p_list_read IS NOT NULL AND rl.state IS DISTINCT FROM (CASE WHEN v_rule = 'list_absent_escalated' THEN 'escalated' ELSE 'succeeded' END)) THEN
+    RAISE EXCEPTION 'ASSESSMENT_READ_BINDING: read terminal state does not match the code' USING ERRCODE = 'check_violation';
+  END IF;
+  IF EXISTS (SELECT 1 FROM booking.recording_assessments a WHERE a.identity_read_op IN (p_identity_read, p_list_read) OR a.list_read_op IN (p_identity_read, p_list_read)) THEN
+    RAISE EXCEPTION 'ASSESSMENT_READ_REUSED: a cited read is already counted' USING ERRCODE = 'check_violation';
+  END IF;
+  -- caller-time floor for every cited read (TRUST: requestRead writes created_at from the caller clock)
+  IF NOT (ri.created_at > o.created_at) OR (p_list_read IS NOT NULL AND NOT (rl.created_at > o.created_at)) THEN
+    RAISE EXCEPTION 'ASSESSMENT_FLOOR: read requested before the recording existed' USING ERRCODE = 'check_violation';
+  END IF;
+
+  -- evidence: exact per-rule presence / absence, positive or re-derived content
+  IF p_identity_evidence IS NOT NULL THEN SELECT * INTO ei FROM booking.provider_evidence WHERE id = p_identity_evidence; END IF;
+  IF p_list_evidence IS NOT NULL THEN SELECT * INTO el FROM booking.provider_evidence WHERE id = p_list_evidence; END IF;
+  IF v_rule IN ('eligible', 'list_present', 'list_absent_response', 'list_absent_escalated') THEN
+    IF NOT booking.recording_identity_positive(p_identity_evidence, p_identity_read, v_intent, p_account_ref, p_client_label) THEN
+      RAISE EXCEPTION 'ASSESSMENT_EVIDENCE_MISMATCH: identity evidence is not the exact positive observation of the cited read' USING ERRCODE = 'check_violation';
+    END IF;
+  END IF;
+  IF v_rule IN ('eligible', 'list_present') THEN
+    IF NOT booking.recording_list_evidence_ok(p_list_evidence, p_list_read, v_intent, p_outcome, p_account_ref, p_client_label) THEN
+      RAISE EXCEPTION 'ASSESSMENT_EVIDENCE_MISMATCH: list evidence shape / counts do not match the outcome' USING ERRCODE = 'check_violation';
+    END IF;
+  END IF;
+  IF v_rule IN ('list_absent_response', 'list_absent_escalated')
+     AND EXISTS (SELECT 1 FROM booking.provider_evidence WHERE read_operation_id = p_list_read) THEN
+    RAISE EXCEPTION 'ASSESSMENT_EVIDENCE_PRESENT: the list read has evidence; it cannot be counted as incomplete' USING ERRCODE = 'check_violation';
+  END IF;
+  IF v_rule IN ('identity_absent', 'identity_absent_escalated', 'identity_absent_or_not_found', 'identity_absent_or_mismatch', 'identity_absent_or_inactive')
+     AND p_identity_evidence IS NULL AND EXISTS (SELECT 1 FROM booking.provider_evidence WHERE read_operation_id = p_identity_read) THEN
+    RAISE EXCEPTION 'ASSESSMENT_EVIDENCE_PRESENT: the identity read has evidence that must be cited' USING ERRCODE = 'check_violation';
+  END IF;
+  IF v_rule IN ('identity_absent_or_not_found', 'identity_absent_or_mismatch', 'identity_absent_or_inactive') AND p_identity_evidence IS NOT NULL
+     AND NOT booking.recording_identity_refused_evidence_ok(p_identity_evidence, p_identity_read, v_intent, p_code, v_rule, p_account_ref, p_client_label) THEN
+    RAISE EXCEPTION 'ASSESSMENT_EVIDENCE_MISMATCH: identity evidence does not re-derive %', p_code USING ERRCODE = 'check_violation';
+  END IF;
+
+  -- freshness at v_t (inclusive, no future): evidence observed_at where evidence exists, else the read's terminal caller time
+  IF p_identity_evidence IS NOT NULL THEN
+    IF ei.observed_at < v_t - interval '2 minutes' OR ei.observed_at > v_t THEN RAISE EXCEPTION 'ASSESSMENT_STALE: identity' USING ERRCODE = 'check_violation'; END IF;
+  ELSE
+    v_term := CASE WHEN ri.state = 'escalated' THEN ri.updated_at ELSE ri.completed_at END;
+    IF v_term IS NULL OR v_term < v_t - interval '2 minutes' OR v_term > v_t THEN RAISE EXCEPTION 'ASSESSMENT_STALE: identity read' USING ERRCODE = 'check_violation'; END IF;
+  END IF;
+  IF p_list_read IS NOT NULL THEN
+    IF p_list_evidence IS NOT NULL THEN
+      IF el.observed_at < v_t - interval '2 minutes' OR el.observed_at > v_t THEN RAISE EXCEPTION 'ASSESSMENT_STALE: list' USING ERRCODE = 'check_violation'; END IF;
+    ELSE
+      v_term := CASE WHEN rl.state = 'escalated' THEN rl.updated_at ELSE rl.completed_at END;
+      IF v_term IS NULL OR v_term < v_t - interval '2 minutes' OR v_term > v_t THEN RAISE EXCEPTION 'ASSESSMENT_STALE: list read' USING ERRCODE = 'check_violation'; END IF;
+    END IF;
+  END IF;
+
+  -- DB-stamped floors for every cited evidence row: written after the current intent version was recorded AND after the recording row
+  SELECT recorded_at INTO v_floor FROM booking.intent_transitions WHERE intent_id = v_intent AND version_after = i.version;
+  IF v_floor IS NULL THEN RAISE EXCEPTION 'ASSESSMENT_FLOOR: no transition row for the current version' USING ERRCODE = 'check_violation'; END IF;
+  IF (p_identity_evidence IS NOT NULL AND NOT (ei.created_at > v_floor AND ei.created_at > o.created_at))
+     OR (p_list_evidence IS NOT NULL AND NOT (el.created_at > v_floor AND el.created_at > o.created_at)) THEN
+    RAISE EXCEPTION 'ASSESSMENT_FLOOR: evidence written before the current version / the recording' USING ERRCODE = 'check_violation';
+  END IF;
+
+  INSERT INTO booking.recording_assessments (id, operation_id, intent_id, phase, epoch, outcome, code, identity_read_op, list_read_op, identity_evidence,
+     list_evidence, intent_version, worker, module_version, cfg, client_label, account_ref, recorded_at)
+  VALUES (v_id, p_op, v_intent, 'preflight', 0, p_outcome, p_code, p_identity_read, p_list_read, p_identity_evidence, p_list_evidence, i.version, p_worker,
+     p_module_version, p_cfg, p_client_label, p_account_ref, v_t);
+  RETURN v_id;
+END $$;
+REVOKE ALL ON FUNCTION booking.record_recording_assessment(uuid, text, text, text, uuid, uuid, uuid, uuid, integer, text, text, text, jsonb) FROM PUBLIC;
+
+-- ---------------------------------------------------------------------------------------------
+-- 0011 claim fence replaced: the 0011 body verbatim, then the 0012 checks ("-- 0012"). Same header, security and search_path.
+CREATE OR REPLACE FUNCTION booking.recording_claim_fence() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE i booking.intents%ROWTYPE;
+        w booking.intent_work%ROWTYPE; v_t timestamptz; r text;                                -- 0012
+BEGIN
+  SELECT * INTO i FROM booking.intents WHERE id = NEW.intent_id FOR SHARE;
+  IF i.state IS DISTINCT FROM 'payment_captured' OR i.captured_minor IS DISTINCT FROM i.final_total_minor THEN
+    RAISE EXCEPTION 'RECORDING_CLAIM_FENCED: the intent is not payment_captured with an exact capture' USING ERRCODE = 'check_violation';
+  END IF;
+  IF i.hostaway_reservation_id IS NULL OR (NEW.payload ->> 'reservationId') IS DISTINCT FROM i.hostaway_reservation_id
+     OR (NEW.payload ->> 'amountMinor') IS DISTINCT FROM i.captured_minor::text THEN
+    RAISE EXCEPTION 'RECORDING_CLAIM_FENCED: payload is not bound to the intent reservation / captured amount' USING ERRCODE = 'check_violation';
+  END IF;
+  IF NEW.idempotency_key IS DISTINCT FROM 'och:' || NEW.intent_id::text || ':1' OR OLD.attempts IS DISTINCT FROM 0 OR OLD.dispatched_at IS NOT NULL
+     OR i.offline_charge_attempts IS DISTINCT FROM 0 THEN
+    RAISE EXCEPTION 'RECORDING_CLAIM_FENCED: only the never-dispatched initial attempt can be claimed' USING ERRCODE = 'check_violation';
+  END IF;
+  IF booking.recording_latest_id(NEW.intent_id) IS DISTINCT FROM NEW.id THEN
+    RAISE EXCEPTION 'RECORDING_CLAIM_FENCED: not the latest recording' USING ERRCODE = 'check_violation';
+  END IF;
+  IF booking.recording_active_hold_id(NEW.id) IS NOT NULL
+     OR EXISTS (SELECT 1 FROM booking.reconciliation_cases c WHERE c.intent_id = NEW.intent_id AND c.status = 'open' AND starts_with(c.kind, 'OFFLINE_CHARGE_HOLD_')) THEN
+    RAISE EXCEPTION 'RECORDING_CLAIM_FENCED: an owner hold is active for this recording or intent' USING ERRCODE = 'check_violation';
+  END IF;
+  -- 0012: the work lease row is share-locked here too (direct UPDATE path: op row -> intent -> work), then the decision instant
+  SELECT * INTO w FROM booking.intent_work WHERE intent_id = NEW.intent_id FOR SHARE;    -- 0012
+  v_t := clock_timestamp();                                                                -- 0012
+  r := booking.recording_claim_refusal(NEW.id, NEW.lease_worker_id, v_t);                  -- 0012
+  IF r IS NOT NULL THEN                                                                    -- 0012
+    RAISE EXCEPTION 'RECORDING_CLAIM_FENCED: preflight assessment %', r USING ERRCODE = 'check_violation';
+  END IF;                                                                                  -- 0012
+  RETURN NEW;
+END $$;
+
+-- claim audit, written by the claim UPDATE's own statement only if the row was actually updated (AFTER ROW). Re-checks at its own
+-- instant under the same locks (op row, intent SHARE, work SHARE) and inserts the binding row; a refusal aborts the whole statement.
+CREATE FUNCTION booking.recording_claim_audit() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE v_t timestamptz; r text; a booking.recording_assessments%ROWTYPE;
+BEGIN
+  v_t := clock_timestamp();
+  r := booking.recording_claim_refusal(NEW.id, NEW.lease_worker_id, v_t);
+  IF r IS NOT NULL THEN RAISE EXCEPTION 'RECORDING_CLAIM_FENCED: preflight assessment % (audit)', r USING ERRCODE = 'check_violation'; END IF;
+  SELECT * INTO a FROM booking.recording_assessments WHERE operation_id = NEW.id AND phase = 'preflight' AND epoch = 0 ORDER BY seq DESC LIMIT 1;
+  INSERT INTO booking.recording_claim_assessments (operation_id, intent_id, assessment_id, worker, epoch, claimed_at)
+  VALUES (NEW.id, NEW.intent_id, a.id, NEW.lease_worker_id, a.epoch, v_t);
+  RETURN NULL;
+END $$;
+REVOKE ALL ON FUNCTION booking.recording_claim_audit() FROM PUBLIC;
+CREATE TRIGGER external_operations_recording_claim_audit AFTER UPDATE ON booking.external_operations
+  FOR EACH ROW WHEN (OLD.state = 'pending' AND NEW.state = 'in_flight' AND NEW.op_type = 'hostaway.record_offline_charge')
+  EXECUTE FUNCTION booking.recording_claim_audit();
+
+-- ---------------------------------------------------------------------------------------------
+-- RLS + privileges: SELECT only, for app / admin / report; no write privilege for any role.
+DO $$
+DECLARE t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['recording_assessment_codes', 'recording_assessments', 'recording_claim_assessments'] LOOP
+    EXECUTE format('ALTER TABLE booking.%I ENABLE ROW LEVEL SECURITY', t);
+    EXECUTE format('REVOKE ALL ON booking.%I FROM PUBLIC', t);
+    EXECUTE format('GRANT SELECT ON booking.%I TO mv_booking_app, mv_booking_admin, mv_booking_report', t);
+    EXECUTE format('CREATE POLICY app_ro ON booking.%I FOR SELECT TO mv_booking_app USING (true)', t);
+    EXECUTE format('CREATE POLICY admin_ro ON booking.%I FOR SELECT TO mv_booking_admin USING (true)', t);
+    EXECUTE format('CREATE POLICY report_ro ON booking.%I FOR SELECT TO mv_booking_report USING (true)', t);
+  END LOOP;
+END $$;
+GRANT EXECUTE ON FUNCTION booking.record_recording_assessment(uuid, text, text, text, uuid, uuid, uuid, uuid, integer, text, text, text, jsonb) TO mv_booking_app;
+GRANT EXECUTE ON FUNCTION booking.recording_claim_ready(uuid, text) TO mv_booking_app, mv_booking_admin;

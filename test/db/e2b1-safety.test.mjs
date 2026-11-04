@@ -22,7 +22,7 @@ const active = async (id) => F.count(db.app, "SELECT count(*) AS n FROM booking.
 const charges = (ids) => ({ matchingChargeCount: ids.length, matchingChargeIds: ids.map(String) });
 const ambiguousRecording = async (listingId) => {
   const c = await F.captured(db.app, { listingId });
-  const op = await claimNextOperation(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
+  const op = await F.claimHealthyRecording(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
   F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(9.2), outcome: { status: "outcome_unknown", errorCode: "TIMEOUT" } }));
   return { ...c, op };
 };
@@ -63,7 +63,7 @@ test("C1 / P1b: the runtime role cannot settle an uncertain operation or plant a
 
 test("C1 / P1c: a worker cannot report a timeout as a definite failure (no catalogued refusal yet)", async () => {
   const c = await F.captured(db.app, { listingId: L(4) });
-  const op = await claimNextOperation(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
+  const op = await F.claimHealthyRecording(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
   const r = await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(9.2), outcome: { status: "failed_definite", errorCode: "TIMEOUT" } });
   assert.equal(r.error, "NOT_A_CATALOGUED_DEFINITE_REFUSAL");
   assert.equal((await db.app.query("SELECT state FROM booking.external_operations WHERE id = $1", [op.id])).rows[0].state, "in_flight");

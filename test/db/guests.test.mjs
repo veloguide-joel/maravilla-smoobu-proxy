@@ -40,7 +40,7 @@ test("personal data appears ONLY in intent_guests (full-database scan after comp
     const rows = (await db.owner.query(`SELECT row_to_json(x)::text AS j FROM booking.${t} x`)).rows;
     for (const r of rows) for (const n of needles) assert.ok(!r.j.toLowerCase().includes(n.toLowerCase()), `PII "${n}" found in ${t}`);
   }
-  assert.ok(tables.length === 22); // 14 core + provider_evidence, reconciliation_resolutions, definite_refusal_codes (E2B.1) + api_rate_limits (E6) + 4 owner-hold tables (0011)
+  assert.ok(tables.length === 25); // 14 core + provider_evidence, reconciliation_resolutions, definite_refusal_codes (E2B.1) + api_rate_limits (E6) + 4 owner-hold tables (0011) + 3 assessment tables (0012)
 });
 
 test("access: report role cannot read guests; runtime role cannot update or delete them", async () => {

@@ -35,7 +35,7 @@ async function capturedIntent() {
 async function claimed({ at = Date.now(), leaseMs = 10 * MIN } = {}) {
   const c = await capturedIntent();
   await db.app.query("UPDATE booking.intent_work SET work_worker_id = 'w1', work_lease_until = $2 WHERE intent_id = $1", [c.id, new Date(at + 10 * MIN)]);
-  const op = await claimNextOperation(db.app, { workerId: "w1", now: at, intentId: c.id, opTypes: OCH, leaseMs });
+  const op = await F.claimHealthyRecording(db.app, { workerId: "w1", now: at, intentId: c.id, opTypes: OCH, leaseMs });
   assert.ok(op);
   return { c, op, t: at };
 }
@@ -101,7 +101,7 @@ test("app direct INSERT / UPDATE cannot pre-seed, attach, succeed or relabel a r
   await assert.rejects(db.app.query("UPDATE booking.external_operations SET settled_evidence_id = $2 WHERE id = $1", [pending.id, ev]), /RECORDING_LIFECYCLE_IMMUTABLE/);
   // claimed row: direct -> succeeded with a VALID link is still refused (authorization: not inside the granted function)
   await db.app.query("UPDATE booking.intent_work SET work_worker_id = 'w1', work_lease_until = $2 WHERE intent_id = $1", [c2.id, new Date(Date.now() + 10 * MIN)]);
-  const op = await claimNextOperation(db.app, { workerId: "w1", now: Date.now(), intentId: c2.id, opTypes: OCH, leaseMs: 10 * MIN });
+  const op = await F.claimHealthyRecording(db.app, { workerId: "w1", now: Date.now(), intentId: c2.id, opTypes: OCH, leaseMs: 10 * MIN });
   const ev2 = await evAt(c2, obs(c2, "990002"));
   await assert.rejects(db.app.query(`UPDATE booking.external_operations SET state = 'succeeded', result_ref = '990002', settled_evidence_id = $2, completed_at = now(),
       lease_worker_id = NULL, lease_until = NULL WHERE id = $1`, [op.id, ev2]), (e) => e.code === "42501" && /RECORDING_SUCCESS_REQUIRES_FUNCTION/.test(e.message));
@@ -281,7 +281,7 @@ test("positive-contradiction semantics (addendum A): zero-then-one OK; count-onl
 
 test("owner count-only / dashboard resolution stays succeeded-unproven; >= 15 min historical API proof links it (no age cap); replay is a no-op", async () => {
   const c = await capturedIntent();
-  const op = await claimNextOperation(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
+  const op = await F.claimHealthyRecording(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
   F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(9.2), outcome: { status: "outcome_unknown" } }));
   const dash = await F.dashboardEvidence(db.reconciler, c.id, "hostaway_offline_charges", String(c.reservationId), "listed",
     { matchingChargeCount: 1, matchingChargeIds: ["880101"] }, 30);
@@ -316,7 +316,7 @@ test("owner count-only / dashboard resolution stays succeeded-unproven; >= 15 mi
 
 test("inherited already-confirmed unlinked row: link allowed, state unchanged", async () => {
   const c = await capturedIntent();
-  const op = await claimNextOperation(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
+  const op = await F.claimHealthyRecording(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
   F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(9.2), outcome: { status: "outcome_unknown" } }));
   const ev0 = await F.readEvidence(db.app, c.id, "hostaway_offline_charges", String(c.reservationId), "listed", { matchingChargeCount: 1, matchingChargeIds: ["880201"] }, 30);
   F.ok(await adminResolveOperation(db.reconciler, { operationId: op.id, decision: "succeeded", evidenceIds: [ev0], resultRef: 880201, resolver: "owner",
@@ -335,7 +335,7 @@ test("inherited already-confirmed unlinked row: link allowed, state unchanged", 
 
 test("policy: automated completion is initial-attempt only; maintenance LINK is allowed on the latest owner-succeeded attempt 2 (no send, no new attempt); a failed attempt is not linkable", async () => {
   const c2 = await capturedIntent();
-  const a1 = await claimNextOperation(db.app, { workerId: "w1", now: F.at(9), intentId: c2.id, opTypes: OCH });
+  const a1 = await F.claimHealthyRecording(db.app, { workerId: "w1", now: F.at(9), intentId: c2.id, opTypes: OCH });
   F.ok(await completeOperation(db.app, a1.id, { workerId: "w1", now: F.at(9.2), outcome: { status: "outcome_unknown" } }));
   const api = await F.readEvidence(db.app, c2.id, "hostaway_offline_charges", String(c2.reservationId), "listed", { matchingChargeCount: 0, matchingChargeIds: [] }, 40);
   const dsh = await F.dashboardEvidence(db.reconciler, c2.id, "hostaway_offline_charges", String(c2.reservationId), "listed", { matchingChargeCount: 0, matchingChargeIds: [] }, 45);
@@ -373,7 +373,7 @@ test("policy: automated completion is initial-attempt only; maintenance LINK is 
 
 test("finalisation is gated in the DB: a direct UPDATE on an owner-resolved UNLINKED row is refused by the trigger itself", async () => {
   const c = await capturedIntent();
-  const op = await claimNextOperation(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
+  const op = await F.claimHealthyRecording(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
   F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(9.2), outcome: { status: "outcome_unknown" } }));
   const ev0 = await F.readEvidence(db.app, c.id, "hostaway_offline_charges", String(c.reservationId), "listed", { matchingChargeCount: 1, matchingChargeIds: ["880301"] }, 30);
   F.ok(await adminResolveOperation(db.reconciler, { operationId: op.id, decision: "succeeded", evidenceIds: [ev0], resultRef: 880301, resolver: "owner",
@@ -462,9 +462,10 @@ test("read-only contradiction scan pages > limit findings with a stable (observe
 test("downgrade refuses while recordings are linked or progressed (no silent re-enable of unproven finalisation)", async () => {
   const o = await asOwnerClient();
   try {
-    // E7.4b-D1: 0011 (latest) rolls back first (this file holds no owner-hold audit), then 0010 refuses; re-apply 0011 after
-    await assert.rejects(migrateDown(o, { env: "test", to: 9 }), /DOWNGRADE_REFUSED_RECORDINGS_PROGRESSED/);
-    assert.deepEqual(await migrateUp(o, { env: "test" }), [11]);
+    // E7.4b-D1 (0012): this file's healthy claims now carry real preflight assessments, so 0012 (latest) refuses FIRST (assessment audit is
+    // never discarded) and nothing rolls back; the 0010 PROGRESSED gate itself is exercised in a fresh cluster by e74b-d1-assessments (D-3)
+    await assert.rejects(migrateDown(o, { env: "test", to: 9 }), /DOWNGRADE_REFUSED_RECORDING_ASSESSMENT_AUDIT/);
+    assert.deepEqual(await migrateUp(o, { env: "test" }), []);
   } finally { await o.end(); }
   assert.ok((await db.owner.query("SELECT to_regprocedure('booking.complete_recording_with_evidence(uuid,text,uuid,text,integer)') AS f")).rows[0].f, "0010 still applied");
 });
@@ -481,7 +482,7 @@ for (const [who, writer] of [["completion", "api"], ["completion", "dashboard"],
       call = () => completeRecordingWithEvidence(db.app, x.op.id, { workerId: "w1", evidenceId: ev, resultRef: "991001", expectedVersion: v });
     } else {
       c = await capturedIntent();
-      const op = await claimNextOperation(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
+      const op = await F.claimHealthyRecording(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
       F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(9.2), outcome: { status: "outcome_unknown" } }));
       const ev0 = await F.readEvidence(db.app, c.id, "hostaway_offline_charges", String(c.reservationId), "listed", { matchingChargeCount: 1, matchingChargeIds: ["991001"] }, 30);
       F.ok(await adminResolveOperation(db.reconciler, { operationId: op.id, decision: "succeeded", evidenceIds: [ev0], resultRef: 991001, resolver: "owner",
@@ -534,7 +535,7 @@ async function scanAll(limit) {
 }
 async function ownerSucceededUnlinked(chargeId) {                                              // dispatched at F.at(9), owner-resolved succeeded, no link
   const c = await capturedIntent();
-  const op = await claimNextOperation(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
+  const op = await F.claimHealthyRecording(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
   F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(9.2), outcome: { status: "outcome_unknown" } }));
   const ev0 = await F.readEvidence(db.app, c.id, "hostaway_offline_charges", String(c.reservationId), "listed", cntOnly([chargeId]), 30);
   F.ok(await adminResolveOperation(db.reconciler, { operationId: op.id, decision: "succeeded", evidenceIds: [ev0], resultRef: Number(chargeId), resolver: "owner",

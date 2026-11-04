@@ -47,7 +47,7 @@ async function capturedIntent() { const st = stay(); const c = await F.captured(
 async function claimed({ leaseMs = 10 * MIN } = {}) {
   const c = await capturedIntent(); const t = Date.now();
   await db.app.query("UPDATE booking.intent_work SET work_worker_id = 'w1', work_lease_until = $2 WHERE intent_id = $1", [c.id, new Date(t + 10 * MIN)]);
-  const op = await claimNextOperation(db.app, { workerId: "w1", now: t, intentId: c.id, opTypes: OCH, leaseMs });
+  const op = await F.claimHealthyRecording(db.app, { workerId: "w1", now: t, intentId: c.id, opTypes: OCH, leaseMs });
   assert.ok(op, "attempt 1 claimable");
   return { c, op, t };
 }
@@ -60,7 +60,7 @@ async function linked() {
 /** dispatched at F.at(9), owner-resolved succeeded from count-only API evidence, unlinked */
 async function ownerSucceededUnlinked() {
   const c = await capturedIntent(); const id = cid();
-  const op = await claimNextOperation(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
+  const op = await F.claimHealthyRecording(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
   F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(9.2), outcome: { status: "outcome_unknown" } }));
   const ev0 = await F.readEvidence(db.app, c.id, "hostaway_offline_charges", String(c.reservationId), "listed", cnt([id]), 30);
   F.ok(await adminResolveOperation(db.reconciler, { operationId: op.id, decision: "succeeded", evidenceIds: [ev0], resultRef: Number(id), resolver: "owner",
@@ -70,7 +70,7 @@ async function ownerSucceededUnlinked() {
 /** genuine E3 path: attempt 1 owner-failed, OFFLINE_CHARGE_FAILED queues attempt 2 (pending, never dispatched) */
 async function attempt2Pending() {
   const c = await capturedIntent();
-  const a1 = await claimNextOperation(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
+  const a1 = await F.claimHealthyRecording(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
   F.ok(await completeOperation(db.app, a1.id, { workerId: "w1", now: F.at(9.2), outcome: { status: "outcome_unknown" } }));
   const api = await F.readEvidence(db.app, c.id, "hostaway_offline_charges", String(c.reservationId), "listed", cnt([]), 40);
   const dsh = await F.dashboardEvidence(db.reconciler, c.id, "hostaway_offline_charges", String(c.reservationId), "listed", cnt([]), 45);
@@ -250,6 +250,9 @@ test("T-B1/B2: the recording claim fence covers every claim path — attempt 2 (
   // attempt 1 under an (artificial) active hold: every path refused
   const c1 = await capturedIntent();
   const op1 = (await db.app.query("SELECT * FROM booking.external_operations WHERE intent_id = $1 AND op_type = $2", [c1.id, OCH[0]])).rows[0];
+  // 0012: a real eligible assessment exists first, so the refusal below is the 0011 hold (the assessment alone would qualify)
+  await db.app.query("UPDATE booking.intent_work SET work_worker_id = 'w9', work_lease_until = $2 WHERE intent_id = $1", [c1.id, new Date(Date.now() + 10 * MIN)]);
+  F.ok((await F.preflight(db.app, c1.id, op1.id, { workerId: "w9" })).r, "eligible assessment");
   const h = await artificialHold(c1, op1.id, "ATTEMPT_GT1");
   assert.deepEqual(await paths(c1, op1.id), [null, null, null]);
   await assert.rejects(direct(op1.id), /RECORDING_CLAIM_FENCED: an owner hold is active/);
@@ -257,12 +260,14 @@ test("T-B1/B2: the recording claim fence covers every claim path — attempt 2 (
   // payload / intent bindings (history setup): amount mismatch, intent not payment_captured
   const c2 = await capturedIntent();
   const op2 = (await db.app.query("SELECT * FROM booking.external_operations WHERE intent_id = $1 AND op_type = $2", [c2.id, OCH[0]])).rows[0];
+  await db.app.query("UPDATE booking.intent_work SET work_worker_id = 'w9', work_lease_until = $2 WHERE intent_id = $1", [c2.id, new Date(Date.now() + 10 * MIN)]);
+  F.ok((await F.preflight(db.app, c2.id, op2.id, { workerId: "w9" })).r, "eligible assessment (0012); the payload binding alone fences");
   await F.ownerManagedHistory(db.owner, "UPDATE booking.external_operations SET payload = payload || '{\"amountMinor\": 1}'::jsonb WHERE id = $1", [op2.id]);
   assert.deepEqual(await paths(c2, op2.id), [null, null, null]);
   await assert.rejects(direct(op2.id), /RECORDING_CLAIM_FENCED: payload/);
   // healthy attempt 1: allowed by every path (helper)
   const c3 = await capturedIntent();
-  const op3 = await claimNextOperation(db.app, { workerId: "w9", now: Date.now(), intentId: c3.id, opTypes: OCH });
+  const op3 = await F.claimHealthyRecording(db.app, { workerId: "w9", now: Date.now(), intentId: c3.id, opTypes: OCH });
   assert.ok(op3 && op3.idempotency_key.endsWith(":1"), "healthy attempt 1 is claimable");
   // unrelated op types are unchanged (a read claims normally)
   const rid = await requestRead(db.app, c3.id, "hostaway.list_offline_charges", String(c3.reservationId), { now: Date.now() });
@@ -532,7 +537,7 @@ test("T-C7/C8: a poison item records attempts / last_error durably, stays unproc
   assert.ok(q.last_attempt_at);
   // fresh items are served first (ORDER BY attempts, seq)
   const fl = await linked();
-  await drainRecordingConflictInbox(db.app, { by: "t", maxCalls: 1 });                       // fl's own proof item (fresh, attempts 0) goes first
+  await drainRecordingConflictInbox(db.app, { by: "t", maxCalls: 2 });                       // fl's own items (fresh, attempts 0) go first: its 0012 preflight list + its proof
   const fresh = await evAt(fl.c, cnt([]));
   const one = (await db.app.query("SELECT booking.process_recording_conflict_inbox_one('t') AS r")).rows[0].r;
   assert.equal(one.evidenceId, fresh);
@@ -884,11 +889,17 @@ test("T-C9: backfill — 0011 up (from 10) enqueues every existing offline-charg
     const c = await F.confirmed(d2.app, { listingId: 798001, from: "2029-12-01", to: "2029-12-04" });
     const st = (await d2.app.query("SELECT id, listing_id FROM booking.intents WHERE id = $1", [c.id])).rows[0];
     const bad = await F.chargeListEvidence(d2.app, { ...c, listingId: st.listing_id }, { matchingChargeCount: 1, matchingChargeIds: ["991234"] });
-    assert.deepEqual(await migrateDown(o, { env: "test", to: 10 }), [11]);
+    // E7.4b-D1 (0012): the confirmed history above carries a real preflight assessment + claim audit, so 0012 refuses to roll back ...
+    await assert.rejects(migrateDown(o, { env: "test", to: 10 }), /DOWNGRADE_REFUSED_RECORDING_ASSESSMENT_AUDIT/);
+    // ... TEST SETUP ONLY, in this throwaway cluster: remove the 0012 audit rows as the superuser with triggers bypassed, to simulate history
+    // written before 0012 existed; this measures the 0011 BACKFILL from 10 and is never a runtime path
+    await F.ownerManagedHistory(d2.owner, "DELETE FROM booking.recording_claim_assessments");
+    await F.ownerManagedHistory(d2.owner, "DELETE FROM booking.recording_assessments");
+    assert.deepEqual(await migrateDown(o, { env: "test", to: 10 }), [12, 11]);
     assert.equal((await o.query("SELECT to_regclass('booking.recording_conflict_inbox') AS t")).rows[0].t, null);
     const n = Number((await o.query("SELECT count(*) AS n FROM booking.provider_evidence WHERE kind = 'hostaway_offline_charges'")).rows[0].n);
     assert.ok(n >= 2);
-    assert.deepEqual(await migrateUp(o, { env: "test" }), [11]);
+    assert.deepEqual(await migrateUp(o, { env: "test" }), [11, 12]);
     assert.equal(Number((await o.query("SELECT count(*) AS n FROM booking.recording_conflict_inbox WHERE processed_at IS NULL")).rows[0].n), n);
     const out = await drainRecordingConflictInbox(d2.app, { by: "backfill-drain" });
     assert.ok(out.drained && out.errors.length === 0);
@@ -901,13 +912,17 @@ test("T-C9: backfill — 0011 up (from 10) enqueues every existing offline-charg
   } finally { await o.end(); await d2.close(); }
 });
 
-test("T-G2: 0011 down refuses while any hold / observation / decision or attempted / processed inbox item exists (audit kept); 0012 objects are absent", async () => {
+test("T-G2: 0011 down refuses while any hold / observation / decision or attempted / processed inbox item exists (audit kept); no 0013 object exists", async () => {
   const o = await asOwnerClient();
   try {
-    await assert.rejects(migrateDown(o, { env: "test", to: 10 }), /DOWNGRADE_REFUSED_RECORDING_OWNER_CASE_AUDIT/);
+    // E7.4b-D1 (0012): this file's healthy claims carry real assessments, so the 0012 gate refuses first and nothing rolls back; the 0011
+    // OWNER_CASE gate itself is asserted at the end of T-C9 (fresh cluster) and in e74b-d1-assessments (D-3)
+    await assert.rejects(migrateDown(o, { env: "test", to: 10 }), /DOWNGRADE_REFUSED_RECORDING_ASSESSMENT_AUDIT/);
     assert.ok((await o.query("SELECT to_regclass('booking.recording_holds') AS t")).rows[0].t, "0011 still applied");
-    assert.equal((await o.query("SELECT to_regclass('booking.recording_assessments') AS t")).rows[0].t, null, "no 0012 table");
-    assert.equal((await o.query("SELECT count(*)::int AS n FROM information_schema.columns WHERE table_schema = 'booking' AND column_name = 'assessment_id'")).rows[0].n, 0);
+    assert.ok((await o.query("SELECT to_regclass('booking.recording_assessments') AS t")).rows[0].t, "0012 still applied");
+    assert.equal((await o.query(`SELECT count(*)::int AS n FROM information_schema.columns WHERE table_schema = 'booking' AND column_name = 'assessment_id'
+        AND table_name IN ('recording_holds', 'recording_hold_decisions')`)).rows[0].n, 0, "no 0013 assessment_id on the 0011 tables");
+    assert.equal((await o.query("SELECT count(*)::int AS n FROM pg_proc WHERE proname IN ('admin_release_preflight_hold', 'open_recording_preflight_hold', 'record_release_review_assessment')")).rows[0].n, 0);
   } finally { await o.end(); }
 });
 

@@ -162,7 +162,7 @@ test("money captured during cancellation (read after a void failure) -> owner re
 
 test("paid booking + failed/ambiguous Hostaway accounting update stays a valid paid booking (no cancel, no void)", async () => {
   const c = await F.captured(db.app, { listingId: L(11) });
-  const op = await claimNextOperation(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: ["hostaway.record_offline_charge"] });
+  const op = await F.claimHealthyRecording(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: ["hostaway.record_offline_charge"] });
   F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(9), outcome: { status: "outcome_unknown", errorCode: "TIMEOUT" } }));
   assert.equal(await F.state(db.app, c.id), "payment_captured");
   assert.equal((await ops(c.id, CANCEL[0])).length + (await ops(c.id, VOID[0])).length, 0);

@@ -34,7 +34,9 @@ const EXPECTED_TABLE_PRIVS = {
   provider_evidence: [S], reconciliation_resolutions: [S], definite_refusal_codes: [S],
   api_rate_limits: [],  // E6 (0006): no direct table privilege; only booking.rate_limit_hit()
   // E7.4b-D1 (0011): owner-hold audit tables are read-only for the runtime role (writes only inside schema-owner functions)
-  recording_holds: [S], recording_hold_decisions: [S], recording_hold_observations: [S], recording_conflict_inbox: [S]
+  recording_holds: [S], recording_hold_decisions: [S], recording_hold_observations: [S], recording_conflict_inbox: [S],
+  // E7.4b-D1 (0012): assessment reference data / assessments / claim audit are read-only for the runtime role
+  recording_assessment_codes: [S], recording_assessments: [S], recording_claim_assessments: [S]
 };
 const ALL_PRIVS = ["SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"];
 const FUNCS_ALLOWED = ["booking.claim_release_blockers(uuid)", "booking.release_claim_if_safe(uuid,text)",
@@ -150,7 +152,7 @@ async function main() {
         const want = [...(EXPECTED_TABLE_PRIVS[t] || [])].sort().join(","), got = [...(actual[t] || [])].sort().join(",");
         if (want !== got) diffs.push(`${t}: expected ${want || "none"} got ${got || "none"}`);
       }
-      check("table_privilege_matrix_exact", diffs.length === 0 && tables.size === 22, diffs.length ? diffs : `${tables.size} tables`);
+      check("table_privilege_matrix_exact", diffs.length === 0 && tables.size === 25, diffs.length ? diffs : `${tables.size} tables`);
       check("no_delete_or_truncate_anywhere", !privRows.some((r) => r.ok && (r.priv === "DELETE" || r.priv === "TRUNCATE")));
 
       const fn = async (sig) => (await q("SELECT has_function_privilege(current_user, $1, 'EXECUTE') AS ok", [sig]))[0].ok;
@@ -166,7 +168,8 @@ async function main() {
         // hold one row. (api_rate_limits, E6, is not readable by the runtime role at all; the privilege matrix checks it.)
         const names = Object.keys(EXPECTED_TABLE_PRIVS).filter((t) => EXPECTED_TABLE_PRIVS[t].includes(S)).sort();
         const [c0] = await q(`SELECT ${names.map((t) => `(SELECT count(*) FROM booking.${t})::int AS ${t}`).join(", ")}`);
-        const unexpected = names.filter((t) => c0[t] !== (t === "instance" ? 1 : 0));
+        // E7.4b-D1 (0012): recording_assessment_codes holds its frozen migration seed (51 rows); every other table except instance is empty
+        const unexpected = names.filter((t) => c0[t] !== (t === "instance" ? 1 : t === "recording_assessment_codes" ? 51 : 0));
         check("data_only_instance_row", unexpected.length === 0, unexpected.length ? unexpected : `${names.length} tables`);
         const [blk] = await q("SELECT booking.claim_release_blockers(gen_random_uuid()) AS b");
         check("db_clock_function_callable", JSON.stringify(blk.b) === JSON.stringify(["INTENT_NOT_FOUND"]));

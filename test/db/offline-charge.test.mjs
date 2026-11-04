@@ -20,7 +20,7 @@ const OCH = ["hostaway.record_offline_charge"];
 
 test("timeout while recording the payment in Hostaway -> outcome_unknown + case; no retry; booking stays valid", async () => {
   const c = await F.captured(db.app, { listingId: 750001 });
-  const op = await claimNextOperation(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
+  const op = await F.claimHealthyRecording(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
   F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(9.2), outcome: { status: "outcome_unknown", errorCode: "TIMEOUT" } }));
   assert.equal((await ochOps(c.id))[0].state, "outcome_unknown");
   assert.equal(await F.count(db.app, "SELECT count(*) AS n FROM booking.reconciliation_cases WHERE intent_id = $1 AND kind = 'OFFLINE_CHARGE_OUTCOME_UNKNOWN' AND status = 'open'", [c.id]), 1);
@@ -39,7 +39,7 @@ test("timeout while recording the payment in Hostaway -> outcome_unknown + case;
 
 test("database backstops: no second open recording per intent, no re-queue of an ambiguous one, single attempt", async () => {
   const c = await F.captured(db.app, { listingId: 750002 });
-  const op = await claimNextOperation(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
+  const op = await F.claimHealthyRecording(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
   F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(9.2), outcome: { status: "outcome_unknown" } }));
   // bypassing the code: insert a second recording op directly
   await assert.rejects(db.app.query(`INSERT INTO booking.external_operations (id, intent_id, op_type, idempotency_key, retry_class, state, source_version, max_attempts, next_attempt_at, created_at, updated_at)
@@ -52,7 +52,7 @@ test("database backstops: no second open recording per intent, no re-queue of an
 
 test("worker crash mid-recording (lease expiry) is treated exactly like a timeout", async () => {
   const c = await F.captured(db.app, { listingId: 750003 });
-  const op = await claimNextOperation(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH, leaseMs: 60000 });
+  const op = await F.claimHealthyRecording(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH, leaseMs: 60000 });
   const rec = await recoverExpiredOperations(db.app, { now: F.at(11) });
   assert.equal(rec.find((x) => x.id === op.id).state, "outcome_unknown");
   assert.equal((await applyEvent(db.app, c.id, { type: "OFFLINE_CHARGE_FAILED" }, { now: F.at(12) })).error, "OFFLINE_CHARGE_OUTCOME_UNRESOLVED");
@@ -64,7 +64,7 @@ const charges = (ids) => ({ matchingChargeCount: ids.length, matchingChargeIds: 
 
 test("owner resolution A — the charge WAS recorded (found in Hostaway): evidence-cited resolution, confirm, ledger once", async () => {
   const c = await F.captured(db.app, { listingId: 750004 });
-  const op = await claimNextOperation(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
+  const op = await F.claimHealthyRecording(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
   F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(9.2), outcome: { status: "outcome_unknown" } }));
   const ev = await F.readEvidence(db.app, c.id, "hostaway_offline_charges", String(c.reservationId), "listed", charges([880001]), 30);
   F.ok(await adminResolveOperation(db.reconciler, { operationId: op.id, decision: "succeeded", evidenceIds: [ev], resultRef: 880001,
@@ -90,7 +90,7 @@ test("owner resolution A — the charge WAS recorded (found in Hostaway): eviden
 test("owner resolution B — verified NOT recorded by an API read AND an owner dashboard check, after the settle period: only then a new recording", async () => {
   const c = await F.captured(db.app, { listingId: 750005 });
   const rid = String(c.reservationId);
-  const op = await claimNextOperation(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
+  const op = await F.claimHealthyRecording(db.app, { workerId: "w1", now: F.at(9), intentId: c.id, opTypes: OCH });
   F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(9.2), outcome: { status: "outcome_unknown" } }));
   const resolve = (ids, minutes = 60) => adminResolveOperation(db.reconciler, { operationId: op.id, decision: "failed_definite", evidenceIds: ids,
     resolver: "owner", justification: "NO_CHARGE_IN_HOSTAWAY", at: F.at(minutes) });
@@ -116,7 +116,7 @@ test("definite failure (catalogued response) follows E3's bounded retry; each re
   const c = await F.captured(db.app, { listingId: 750006 });
   for (let n = 1; n <= 3; n++) {
     if (n === 1) {
-      const op = await claimNextOperation(db.app, { workerId: "w1", now: F.at(9 + n), intentId: c.id, opTypes: OCH });
+      const op = await F.claimHealthyRecording(db.app, { workerId: "w1", now: F.at(9 + n), intentId: c.id, opTypes: OCH });
       assert.ok(op, `attempt ${n}`);
       F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(9 + n), outcome: { status: "failed_definite", errorCode: "VALIDATION_ERROR" } }));
     } else {
