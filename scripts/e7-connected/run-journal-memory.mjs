@@ -84,8 +84,19 @@ export const STEP_RESULTS = freeze(["worked", "idle", "refused", "rejected", "ti
 export const OUTCOMES = freeze(["ENDED_CONFIRMED", "ENDED_RESERVED_NOT_CAPTURED", "ENDED_CAPTURED_NOT_RECORDED", "ENDED_RELEASED"]);
 export const CLEANUP_KEYS = freeze(["reservedNotConfirmed", "captured", "confirmed"]);
 export const WRITE_KEYS = freeze(["cancel", "capture", "create", "record", "void"]);
-/** allowed phase changes (§6.1): reservation → capture → recording; reservation | capture → cleanup */
-const NEXT_PHASE = freeze({ reservation: ["capture", "cleanup"], capture: ["recording", "cleanup"], recording: [], cleanup: [] });
+/** the intent states a phase may END in (PHASE_ENDED.state = the phase's last STEP_ENDED.state) — §6.1 */
+export const PHASE_END_STATES = freeze({ reservation: freeze(["reservation_confirmed", "reservation_failed"]), capture: freeze(["payment_captured", "capture_failed"]),
+  recording: freeze(["confirmed"]), cleanup: freeze(["authorization_released", "cancelled"]) });
+/** a phase may START only after the previous phase ENDED in this state (§6.1): the run's single path through P2–P5 */
+const ENTRY = freeze({ capture: ["reservation", "reservation_confirmed"], recording: ["capture", "payment_captured"] });
+const CLEANUP_ENTRY = freeze([["reservation", "reservation_failed"], ["capture", "capture_failed"]]);
+/** successful terminal outcomes: the phase that must have ENDED last, in which state, and the exact cleanup key */
+export const OUTCOME_RULES = freeze({
+  ENDED_RESERVED_NOT_CAPTURED: freeze({ phase: "reservation", state: "reservation_confirmed", key: "reservedNotConfirmed", checkpoint: "AIRBNB_BLOCKED" }),
+  ENDED_CAPTURED_NOT_RECORDED: freeze({ phase: "capture", state: "payment_captured", key: "captured", checkpoint: "AIRBNB_BLOCKED" }),
+  ENDED_CONFIRMED: freeze({ phase: "recording", state: "confirmed", key: "confirmed", checkpoint: "AIRBNB_BLOCKED" }),
+  ENDED_RELEASED: freeze({ phase: "cleanup" })              // key / checkpoint depend on whether a reservation had existed (orderStep)
+});
 const COMMON_KEYS = ["v", "seq", "prevHash", "runId", "intentId", "manifestHash", "baselineCommit", "at", "event"];
 const EVENT_KEYS = freeze({
   RUN_STARTED: [],
@@ -204,8 +215,12 @@ function fieldCheck(r) {
       if (!["NONE", "STEP", "TAIL"].includes(r.outstanding) || typeof r.effectsKnown !== "boolean" || !["held", "lost"].includes(r.exclusion)) return "RECORD_FIELD_INVALID";
       if (r.ownerCleanupRequired !== null && !CLEANUP_KEYS.includes(r.ownerCleanupRequired)) return "RECORD_FIELD_INVALID";
       if (!writesOk(r.writes)) return "RECORD_FIELD_INVALID";
+      if (r.outstanding !== "NONE" && r.effectsKnown !== false) return "RECORD_FIELD_INVALID";      // outstanding work ⇒ effects unknown
       if (r.event === "RUN_STOPPED") return typeof r.code === "string" && RE.code.test(r.code) ? null : "RECORD_FIELD_INVALID";
       if (!OUTCOMES.includes(r.outcome) || r.outstanding !== "NONE" || r.effectsKnown !== true) return "RECORD_FIELD_INVALID";
+      const rule = OUTCOME_RULES[r.outcome];
+      if (rule.key !== undefined && r.ownerCleanupRequired !== rule.key) return "RECORD_FIELD_INVALID";   // exact key per outcome
+      if (r.outcome === "ENDED_RELEASED" && r.ownerCleanupRequired !== null && r.ownerCleanupRequired !== "reservedNotConfirmed") return "RECORD_FIELD_INVALID";
       return null;
     }
     default: return null;                                    // RUN_STARTED: common fields only
@@ -224,8 +239,11 @@ export function validateRecord(input) {
 export const recordHash = (record) => createHash("sha256").update(JOURNAL_HASH_PREFIX + canonicalJson(record), "utf8").digest("hex");
 
 // ---- event-order state machine ----------------------------------------------------------------------------------------------------
-const initialState = () => ({ n: 0, ended: false, phase: null, phaseEnded: new Set(), steps: Object.create(null), openStep: null, attested: new Set() });
-/** apply ONE field-valid record to the order state → error code | null (the state is mutated only on success: callers pass a clone) */
+const initialState = () => ({ n: 0, ended: false, phase: null, phaseEnd: new Map(), lastState: Object.create(null), steps: Object.create(null), openStep: null,
+  attested: new Set() });
+const reservationExisted = (st) => st.phaseEnd.get("reservation") === "reservation_confirmed";
+/** apply ONE field-valid record to the order state → error code | null (the state is mutated only on success: callers pass a clone).
+ *  Structural lifecycle consistency only — never DB or provider attestation. */
 function orderStep(st, r) {
   if (st.ended) return "APPEND_AFTER_TERMINAL";
   if (st.n === 0 && r.event !== "RUN_STARTED") return "ORDER_INVALID";
@@ -236,19 +254,26 @@ function orderStep(st, r) {
       const c = r.attestation.checkpoint;
       if (st.openStep || st.attested.has(c)) return "ORDER_INVALID";
       if (c === "CALENDAR_BASELINE" && st.phase !== null) return "ORDER_INVALID";
-      if (c === "AIRBNB_BLOCKED" && !st.phaseEnded.has("reservation")) return "ORDER_INVALID";
-      if (c === "AIRBNB_REOPENED" && !st.phaseEnded.has("cleanup")) return "ORDER_INVALID";
+      if (c === "AIRBNB_BLOCKED" && st.phaseEnd.get("reservation") !== "reservation_confirmed") return "ORDER_INVALID";
+      // re-opened only when a reservation had existed AND the cleanup cancelled it
+      if (c === "AIRBNB_REOPENED" && !(reservationExisted(st) && st.phaseEnd.get("cleanup") === "cancelled")) return "ORDER_INVALID";
       st.attested.add(c);
       break;
     }
     case "STEP_STARTED": {
       if (st.openStep || !st.attested.has("CALENDAR_BASELINE")) return "ORDER_INVALID";
       if (st.phase !== r.phase) {
-        if (st.phase === null ? r.phase !== "reservation" : !(st.phaseEnded.has(st.phase) && NEXT_PHASE[st.phase].includes(r.phase))) return "ORDER_INVALID";
-        if (st.phaseEnded.has(r.phase)) return "ORDER_INVALID";
-        if (r.phase === "capture" && !st.attested.has("AIRBNB_BLOCKED")) return "ORDER_INVALID";
+        if (st.phase === null) { if (r.phase !== "reservation") return "ORDER_INVALID"; }
+        else {
+          if (!st.phaseEnd.has(st.phase) || st.phaseEnd.has(r.phase)) return "ORDER_INVALID";
+          const from = [st.phase, st.phaseEnd.get(st.phase)];
+          const ok = r.phase === "cleanup" ? CLEANUP_ENTRY.some(([p, x]) => p === from[0] && x === from[1])
+            : ENTRY[r.phase] !== undefined && ENTRY[r.phase][0] === from[0] && ENTRY[r.phase][1] === from[1];
+          if (!ok) return "ORDER_INVALID";
+          if (r.phase === "capture" && !st.attested.has("AIRBNB_BLOCKED")) return "ORDER_INVALID";
+        }
         st.phase = r.phase;
-      } else if (st.phaseEnded.has(r.phase)) return "ORDER_INVALID";
+      } else if (st.phaseEnd.has(r.phase)) return "ORDER_INVALID";
       if (r.step !== (st.steps[r.phase] || 0) + 1) return "ORDER_INVALID";
       st.steps[r.phase] = r.step;
       st.openStep = { phase: r.phase, step: r.step };
@@ -257,26 +282,45 @@ function orderStep(st, r) {
     case "STEP_ENDED":
       if (!st.openStep || st.openStep.phase !== r.phase || st.openStep.step !== r.step) return "ORDER_INVALID";
       st.openStep = null;
+      st.lastState[r.phase] = r.state;
       break;
     case "PHASE_ENDED":
-      if (st.openStep || st.phase !== r.phase || st.phaseEnded.has(r.phase)) return "ORDER_INVALID";
-      st.phaseEnded.add(r.phase);
+      // a phase ends only after ≥ 1 completed step, in the state its LAST completed step reported, and in an allowed end state
+      if (st.openStep || st.phase !== r.phase || st.phaseEnd.has(r.phase) || !st.steps[r.phase]) return "ORDER_INVALID";
+      if (r.state === null || r.state !== st.lastState[r.phase] || !PHASE_END_STATES[r.phase].includes(r.state)) return "ORDER_INVALID";
+      st.phaseEnd.set(r.phase, r.state);
       break;
     case "RUN_STOPPED":
-      if (st.openStep && r.outstanding !== "STEP") return "ORDER_INVALID";   // an open step can only be closed by a stop that says so
+      // a failure stop may close an OPEN logged step with the truthful lifecycle status (NONE after a rejection before any executor
+      // start, TAIL after a rejection with a start, STEP after an observation timeout); it never fabricates a STEP_ENDED. With an open
+      // step, effects are never claimed known.
+      if (st.openStep && r.effectsKnown !== false) return "ORDER_INVALID";
       st.openStep = null; st.ended = true;
       break;
-    case "RUN_ENDED":
+    case "RUN_ENDED": {
       if (st.openStep) return "ORDER_INVALID";
+      const rule = OUTCOME_RULES[r.outcome];
+      if (st.phase !== rule.phase || !st.phaseEnd.has(rule.phase)) return "ORDER_INVALID";      // the outcome's phase is the LAST one, ended
+      if (rule.phase !== "cleanup") {
+        if (st.phaseEnd.get(rule.phase) !== rule.state || !st.attested.has(rule.checkpoint)) return "ORDER_INVALID";
+      } else {
+        const end = st.phaseEnd.get("cleanup");
+        if (!reservationExisted(st)) {                        // reservation_failed → void only: nothing standing, nothing to re-open
+          if (end !== "authorization_released" || r.ownerCleanupRequired !== null || st.attested.has("AIRBNB_REOPENED")) return "ORDER_INVALID";
+        } else if (end === "cancelled") {                     // a reservation existed and was cancelled: Airbnb re-open attested
+          if (r.ownerCleanupRequired !== null || !st.attested.has("AIRBNB_REOPENED")) return "ORDER_INVALID";
+        } else if (r.ownerCleanupRequired !== "reservedNotConfirmed" || st.attested.has("AIRBNB_REOPENED")) return "ORDER_INVALID";   // it still stands
+      }
       st.ended = true;
       break;
+    }
     default: return "ORDER_INVALID";
   }
   st.n += 1;
   return null;
 }
-const cloneState = (st) => ({ ...st, phaseEnded: new Set(st.phaseEnded), steps: Object.assign(Object.create(null), st.steps), attested: new Set(st.attested),
-  openStep: st.openStep ? { ...st.openStep } : null });
+const cloneState = (st) => ({ ...st, phaseEnd: new Map(st.phaseEnd), lastState: Object.assign(Object.create(null), st.lastState),
+  steps: Object.assign(Object.create(null), st.steps), attested: new Set(st.attested), openStep: st.openStep ? { ...st.openStep } : null });
 const sameIdentity = (r, id) => IDENTITY_KEYS.every((k) => r[k] === id[k]);
 
 // ---- whole-journal validation (pure) ----------------------------------------------------------------------------------------------

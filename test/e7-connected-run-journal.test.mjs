@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
 import * as J from "../scripts/e7-connected/run-journal-memory.mjs";
-import { validateGuardDeps, createGuard, isNativePromise } from "../scripts/e7-connected/run-guard.mjs";
+import { validateGuardDeps, createGuard, isNativePromise, createLifecycle, createLedger, wrapExecutors } from "../scripts/e7-connected/run-guard.mjs";
 import { STATES } from "../lib/checkout/intent-state.js";
 import { CHECKPOINTS } from "../scripts/e7-connected/run-manifest.mjs";
 
@@ -129,7 +129,7 @@ test("append refusal categories — each leaves stored history untouched (no par
   }
 });
 
-test("terminal rules: append after terminal and duplicate terminal refused; RUN_ENDED with an open step refused; RUN_STOPPED may close it only as outstanding STEP", async () => {
+test("terminal rules: append after terminal and duplicate terminal refused; RUN_ENDED with an open step refused; RUN_STOPPED closes it with the truthful status, never effectsKnown", async () => {
   const { journal } = mk();
   const recs = chain(HAPPY);
   for (const r of recs) await journal.append(r);
@@ -138,7 +138,9 @@ test("terminal rules: append after terminal and duplicate terminal refused; RUN_
   const afterStep = chain([...HAPPY, ["STEP_STARTED", "recording", 2]]).at(-1);
   assert.equal(await codeOf(journal.append(afterStep)), "APPEND_AFTER_TERMINAL");
   const open = [...HAPPY.slice(0, 3)];
-  for (const [term, want] of [[["RUN_ENDED"], "ORDER_INVALID"], [["RUN_STOPPED", "TIMEOUT_STEP", { outstanding: "NONE" }], "ORDER_INVALID"], [["RUN_STOPPED", "TIMEOUT_STEP", { outstanding: "STEP" }], "RESOLVED"]]) {
+  for (const [term, want] of [[["RUN_ENDED"], "ORDER_INVALID"], [["RUN_STOPPED", "DB_FAILURE", { outstanding: "NONE" }], "RESOLVED"],
+    [["RUN_STOPPED", "DB_FAILURE", { outstanding: "TAIL" }], "RESOLVED"], [["RUN_STOPPED", "TIMEOUT_STEP", { outstanding: "STEP" }], "RESOLVED"],
+    [["RUN_STOPPED", "DB_FAILURE", { outstanding: "NONE", effectsKnown: true }], "ORDER_INVALID"], [["RUN_STOPPED", "TIMEOUT_STEP", { outstanding: "STEP", effectsKnown: true }], "RECORD_INVALID"]]) {
     const j = mk().journal; const c = chain([...open, term]);
     for (const r of c.slice(0, -1)) await j.append(r);
     assert.equal(await codeOf(j.append(c.at(-1))), want, JSON.stringify(term));
@@ -370,4 +372,105 @@ test("journal options validation and code-only errors", async () => {
   assert.equal(J.evaluateStart(await journal.read(), ID).code, "JOURNAL_CHAIN_INVALID", "SYNTHETIC preload of a broken history");
   assert.equal(await codeOf(journal.append(chain(HAPPY.slice(0, 3))[2])), "JOURNAL_HISTORY_INVALID", "no append onto an invalid stored history");
   const e = new J.JournalError("X"); assert.equal(e.message, "JOURNAL_ERROR"); assert.ok(Object.isFrozen(e));
+});
+
+// =================================================================================================================================
+// Root CODE HOLD on 6cdb8ae0 — R-D1 (truthful failure stop from an OPEN logged step) / R-D2 (structural success / release paths)
+const STOP_BODY = (outstanding) => ({ code: "DB_FAILURE", outstanding, effectsKnown: false, exclusion: "held", ownerCleanupRequired: "reservedNotConfirmed", writes: { ...W0 } });
+async function openStepJournal() {
+  const { journal, controls } = mk();
+  for (const r of chain(HAPPY.slice(0, 3))) await journal.append(r);        // RUN_STARTED, CALENDAR_BASELINE, STEP_STARTED reservation/1
+  return { journal, controls };
+}
+const stopRecord = (outstanding, code = "DB_FAILURE") => chain([...HAPPY.slice(0, 3), ["RUN_STOPPED", code, STOP_BODY(outstanding)]])[3];
+
+test("R-D1 with the ACCEPTED guard + lifecycle: the logged step's truthful status (NONE / TAIL unobservable / STEP) is the stop's outstanding value; no STEP_ENDED is invented, nothing awaited", async () => {
+  // (a) rejection BEFORE any executor start → outstanding NONE
+  { const { journal } = await openStepJournal(); const f = fakeGuard(); const lc = createLifecycle({ guard: f.guard }); const ledger = createLedger();
+    const r = await lc.observeStep({ phase: "reservation", deadline: 75_000, ledger, start: () => Promise.reject(new Error("synthetic DB error")) });
+    assert.deepEqual([r.kind, r.outstanding, ledger.snapshot().started], ["rejected", "NONE", 0]);
+    const s = lc.snapshot();
+    assert.equal(await codeOf(journal.append(stopRecord(s.outstanding))), "RESOLVED");
+    assert.deepEqual({ ...J.evaluateStart(await journal.read(), ID) }, { ok: false, code: "RUN_ENDED", anchored: false }); }
+  // (b) rejection AFTER ≥ 1 executor start → outstanding TAIL (unobservable); the tail is NOT awaited
+  { const { journal } = await openStepJournal(); const f = fakeGuard(); const lc = createLifecycle({ guard: f.guard }); const ledger = createLedger();
+    const w = wrapExecutors({ createReservation: () => new Promise(() => {}) }, ledger);
+    const r = await lc.observeStep({ phase: "reservation", deadline: 75_000, ledger, start: () => { w.executors.createReservation({}); return Promise.reject(new Error("synthetic DB error")); } });
+    const s = lc.snapshot();
+    assert.deepEqual([r.kind, s.outstanding, s.tailObservable, ledger.snapshot().started], ["rejected", "TAIL", false, 1]);
+    assert.equal(await codeOf(journal.append(stopRecord(s.outstanding))), "RESOLVED");
+    assert.equal(await stateOf(lc.finalize()), PENDING, "the unobservable tail is never awaited or fabricated as complete");
+    assert.equal(J.evaluateStart(await journal.read(), ID).code, "RUN_ENDED"); }
+  // (c) observation TIMEOUT → outstanding STEP
+  { const { journal } = await openStepJournal(); const f = fakeGuard(); const lc = createLifecycle({ guard: f.guard }); const ledger = createLedger();
+    const p = lc.observeStep({ phase: "reservation", deadline: 75_000, ledger, start: () => new Promise(() => {}) }); await flush(); await f.advance(75_000);
+    const r = await p;
+    assert.deepEqual([r.kind, r.outstanding], ["timeout", "STEP"]);
+    assert.equal(await codeOf(journal.append(stopRecord(lc.snapshot().outstanding, "TIMEOUT_STEP"))), "RESOLVED"); }
+  // effects are never claimed known from an open step, and outstanding work always means effects unknown
+  { const { journal, controls } = await openStepJournal();
+    const known = chain([...HAPPY.slice(0, 3), ["RUN_STOPPED", "DB_FAILURE", { ...STOP_BODY("NONE"), effectsKnown: true }]])[3];
+    assert.equal(await codeOf(journal.append(known)), "ORDER_INVALID"); assert.equal(controls.size(), 3, "history unchanged");
+    for (const o of ["STEP", "TAIL"]) assert.equal(J.validateRecord({ ...stopRecord(o), effectsKnown: true }).ok, false); }
+});
+
+// structurally coherent success / release paths
+const RES_OK = [["RUN_STARTED"], ["ATTESTED", "CALENDAR_BASELINE"], ["STEP_STARTED", "reservation", 1], ["STEP_ENDED", "reservation", 1, { state: "reservation_confirmed" }],
+  ["PHASE_ENDED", "reservation", "reservation_confirmed"]];
+const CAP_OK = [...RES_OK, ["ATTESTED", "AIRBNB_BLOCKED"], ["STEP_STARTED", "capture", 1], ["STEP_ENDED", "capture", 1, { state: "payment_captured" }], ["PHASE_ENDED", "capture", "payment_captured"]];
+const ENDED = (outcome, key, o = {}) => ["RUN_ENDED", { outcome, ownerCleanupRequired: key, ...o }];
+const CLEAN = (state) => [["STEP_STARTED", "cleanup", 1], ["STEP_ENDED", "cleanup", 1, { state }], ["PHASE_ENDED", "cleanup", state]];
+const RES_FAIL = [["RUN_STARTED"], ["ATTESTED", "CALENDAR_BASELINE"], ["STEP_STARTED", "reservation", 1], ["STEP_ENDED", "reservation", 1, { state: "reservation_failed" }],
+  ["PHASE_ENDED", "reservation", "reservation_failed"]];
+const CAP_FAIL = [...RES_OK, ["ATTESTED", "AIRBNB_BLOCKED"], ["STEP_STARTED", "capture", 1], ["STEP_ENDED", "capture", 1, { state: "capture_failed" }], ["PHASE_ENDED", "capture", "capture_failed"]];
+const verdict = (specs) => { const v = J.validateJournal(chain(specs), ID); return v.ok ? `ok:${v.status}` : v.code; };
+
+test("R-D2: every successful terminal needs its completed phase, end state, checkpoint and EXACT cleanup key; released paths by reservation existence", () => {
+  const ok = [
+    ["reserved, not captured", [...RES_OK, ["ATTESTED", "AIRBNB_BLOCKED"], ENDED("ENDED_RESERVED_NOT_CAPTURED", "reservedNotConfirmed")]],
+    ["captured, not recorded", [...CAP_OK, ENDED("ENDED_CAPTURED_NOT_RECORDED", "captured")]],
+    ["confirmed (HAPPY)", HAPPY],
+    ["released: reservation failed → void only", [...RES_FAIL, ...CLEAN("authorization_released"), ENDED("ENDED_RELEASED", null)]],
+    ["released: capture failed → reservation cancelled, Airbnb re-opened", [...CAP_FAIL, ...CLEAN("cancelled"), ["ATTESTED", "AIRBNB_REOPENED"], ENDED("ENDED_RELEASED", null)]],
+    ["released: capture failed → authorization released, reservation still standing", [...CAP_FAIL, ...CLEAN("authorization_released"), ENDED("ENDED_RELEASED", "reservedNotConfirmed")]]
+  ];
+  for (const [name, specs] of ok) assert.equal(verdict(specs), "ok:ENDED", name);
+  const bad = [
+    ["RUN_STARTED → RUN_ENDED (root probe)", [["RUN_STARTED"], ENDED("ENDED_CONFIRMED", "confirmed")]],
+    ["confirmed without recording", [...CAP_OK, ENDED("ENDED_CONFIRMED", "confirmed")]],
+    ["reserved-not-captured without AIRBNB_BLOCKED", [...RES_OK, ENDED("ENDED_RESERVED_NOT_CAPTURED", "reservedNotConfirmed")]],
+    ["reserved-not-captured after a capture phase", [...CAP_OK, ENDED("ENDED_RESERVED_NOT_CAPTURED", "reservedNotConfirmed")]],
+    ["captured-not-recorded with capture failed", [...CAP_FAIL, ENDED("ENDED_CAPTURED_NOT_RECORDED", "captured")]],
+    ["ended with the last phase not ended", [...RES_OK, ["ATTESTED", "AIRBNB_BLOCKED"], ["STEP_STARTED", "capture", 1], ["STEP_ENDED", "capture", 1, { state: "payment_captured" }], ENDED("ENDED_CAPTURED_NOT_RECORDED", "captured")]],
+    ["released after reservation failed with a standing-reservation key", [...RES_FAIL, ...CLEAN("authorization_released"), ENDED("ENDED_RELEASED", "reservedNotConfirmed")]],
+    ["released by cancel without AIRBNB_REOPENED", [...CAP_FAIL, ...CLEAN("cancelled"), ENDED("ENDED_RELEASED", null)]],
+    ["reservation still standing but key null", [...CAP_FAIL, ...CLEAN("authorization_released"), ENDED("ENDED_RELEASED", null)]],
+    ["AIRBNB_REOPENED when no reservation existed", [...RES_FAIL, ...CLEAN("authorization_released"), ["ATTESTED", "AIRBNB_REOPENED"]]],
+    ["cancel when no reservation existed (cleanup cannot end cancelled path)", [...RES_FAIL, ...CLEAN("cancelled"), ENDED("ENDED_RELEASED", null)]],
+    ["capture after reservation FAILED", [...RES_FAIL, ["STEP_STARTED", "capture", 1]]],
+    ["cleanup after reservation CONFIRMED", [...RES_OK, ["ATTESTED", "AIRBNB_BLOCKED"], ["STEP_STARTED", "cleanup", 1]]],
+    ["AIRBNB_BLOCKED after reservation failed", [...RES_FAIL, ["ATTESTED", "AIRBNB_BLOCKED"]]],
+    ["PHASE_ENDED state ≠ the last completed step", [["RUN_STARTED"], ["ATTESTED", "CALENDAR_BASELINE"], ["STEP_STARTED", "reservation", 1], ["STEP_ENDED", "reservation", 1, { state: "reservation_pending" }], ["PHASE_ENDED", "reservation", "reservation_confirmed"]]],
+    ["PHASE_ENDED in a non-terminal state", [["RUN_STARTED"], ["ATTESTED", "CALENDAR_BASELINE"], ["STEP_STARTED", "reservation", 1], ["STEP_ENDED", "reservation", 1, { state: "reservation_pending" }], ["PHASE_ENDED", "reservation", "reservation_pending"]]],
+    ["PHASE_ENDED without a completed step", [["RUN_STARTED"], ["ATTESTED", "CALENDAR_BASELINE"], ["STEP_STARTED", "reservation", 1], ["RUN_STOPPED", "DB_FAILURE", STOP_BODY("STEP")], ["PHASE_ENDED", "reservation", "reservation_confirmed"]]]
+  ];
+  for (const [name, specs] of bad) assert.ok(["JOURNAL_MALFORMED"].includes(verdict(specs)), `${name}: ${verdict(specs)}`);
+  // exact cleanup key per outcome is a FIELD rule
+  for (const [outcome, wrong] of [["ENDED_CONFIRMED", null], ["ENDED_CONFIRMED", "captured"], ["ENDED_CAPTURED_NOT_RECORDED", "confirmed"], ["ENDED_RESERVED_NOT_CAPTURED", null], ["ENDED_RELEASED", "confirmed"]]) {
+    assert.equal(J.validateRecord(chain([["RUN_STARTED"], ENDED(outcome, wrong)])[1]).ok, false, `${outcome} with ${wrong}`);
+  }
+});
+
+test("R-D2 through the journal: a structurally incoherent terminal is refused at append time and history stays unchanged", async () => {
+  const { journal, controls } = mk();
+  const recs = chain([...CAP_OK, ENDED("ENDED_CONFIRMED", "confirmed")]);
+  for (const r of recs.slice(0, -1)) await journal.append(r);
+  assert.equal(await codeOf(journal.append(recs.at(-1))), "ORDER_INVALID");
+  assert.equal(controls.size(), recs.length - 1);
+  const good = chain([...CAP_OK, ENDED("ENDED_CAPTURED_NOT_RECORDED", "captured")]).at(-1);
+  assert.equal(await codeOf(journal.append(good)), "RESOLVED");
+  assert.equal(J.evaluateStart(await journal.read(), ID).code, "RUN_ENDED");
+  const bare = mk(); await bare.journal.append(chain([["RUN_STARTED"]])[0]);
+  assert.equal(await codeOf(bare.journal.append(chain([["RUN_STARTED"], ENDED("ENDED_CONFIRMED", "confirmed")])[1])), "ORDER_INVALID", "root probe through append");
+  assert.equal(bare.controls.size(), 1);
 });

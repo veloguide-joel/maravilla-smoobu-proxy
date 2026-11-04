@@ -529,6 +529,15 @@ The validated frozen copy is what is hashed, stored and returned. Callers cannot
 | `JournalError` | The **only** rejection reason: frozen, `message` `"JOURNAL_ERROR"`, own keys `name` and `code` only. No caller data |
 | `FAULT_MODES`, `READ_FAULT_MODES` | `reject` / `hang` / `late` / `landed_hang`; `reject` / `hang` / `torn` |
 
+**New exports (R-D2):** `PHASE_END_STATES` and `OUTCOME_RULES` (§8.2).
+
+**Errata after root CODE HOLD on `6cdb8ae0` (corrected on the same branch):**
+
+| Item | Gap at `6cdb8ae0` (root probe) | Correction | Red / green |
+|---|---|---|---|
+| R-D1 | `RUN_STOPPED` from an open logged step was refused unless `outstanding:'STEP'`. A real accepted-lifecycle rejection before any executor start (`NONE`), or after one (`TAIL`), could not be logged truthfully | Any truthful `NONE` / `TAIL` / `STEP` may close an open step. `effectsKnown` must be `false` with an open step or outstanding work. No fabricated `STEP_ENDED`, wait or SQL | New test using the accepted `createLifecycle` / `createLedger` / `wrapExecutors` + fake guard: rejection before a start → `NONE`; after a start → `TAIL` unobservable (`finalize` asserted still pending, never awaited); timeout → `STEP`. All three append and give `RUN_ENDED` at start. Fails on `6cdb`, passes now |
+| R-D2 | `RUN_STARTED` → `RUN_ENDED` validated as ENDED, and mismatched outcome / cleanup keys passed the field check | The §8.2 phase / end-state / checkpoint / outcome / exact-key rules, including the three representable released paths | 6 coherent success / release paths accepted; 17 incoherent paths and 5 wrong keys refused; append-time refusal leaves history unchanged. Fails on `6cdb`, passes now. The documented whole-history rewrite limit is still shown with a **structurally coherent** forged history |
+
 #### 2.5.2 `journal` (the interface the core uses) and `controls` (TEST-ONLY)
 
 **`journal.append(record)`** → an unpatched native `Promise<frozen { seq, hash }>`, or a rejection with `JournalError(code)`.
@@ -1054,14 +1063,57 @@ A new manifest or runId is never authority to bypass a dispatched / unknown op o
 | `RUN_STOPPED` | `code ^[A-Z][A-Z0-9_]{0,47}$`, `outstanding ∈ NONE / STEP / TAIL`, `effectsKnown`, `exclusion ∈ held / lost`, `ownerCleanupRequired`, `writes` |
 | `RUN_ENDED` | `outcome ∈ OUTCOMES`, `outstanding: 'NONE'`, `effectsKnown: true`, `exclusion`, `ownerCleanupRequired`, `writes` |
 
-**Order (journal-level).**
+**Order (journal-level; corrected per root R-D1 / R-D2).** This is structural lifecycle consistency only, never DB or provider attestation.
+
+*Start and steps:*
 - `RUN_STARTED` exactly first.
 - `CALENDAR_BASELINE` is attested before the first step.
-- Steps run strictly `STEP_STARTED` → `STEP_ENDED` with the same `phase` / `step`, numbered 1, 2, … per phase. No other event while a step is open, except `RUN_STOPPED` with `outstanding:'STEP'`.
-- Phases are `reservation → capture → recording`, or `reservation | capture → cleanup`. A phase change needs `PHASE_ENDED` of the current phase.
-- `AIRBNB_BLOCKED` needs reservation ended, and capture needs `AIRBNB_BLOCKED`. `AIRBNB_REOPENED` needs cleanup ended. Each checkpoint appears at most once.
+- Steps run `STEP_STARTED` → `STEP_ENDED` with the same `phase` / `step`, numbered 1, 2, … per phase.
+
+*Phases:*
+- A phase ends (`PHASE_ENDED`) only after ≥ 1 completed step, with `state` equal to its **last** `STEP_ENDED.state`, and in an allowed end state (`PHASE_END_STATES`):
+
+| Phase | Allowed end states |
+|---|---|
+| reservation | `reservation_confirmed`, `reservation_failed` |
+| capture | `payment_captured`, `capture_failed` |
+| recording | `confirmed` |
+| cleanup | `authorization_released`, `cancelled` |
+
+- A phase may start only from the previous phase's end state:
+
+| Phase | May start after |
+|---|---|
+| capture | reservation ended `reservation_confirmed`, **and** `AIRBNB_BLOCKED` attested |
+| recording | capture ended `payment_captured` |
+| cleanup | reservation ended `reservation_failed`, or capture ended `capture_failed` |
+
+*Checkpoints:*
+- `AIRBNB_BLOCKED` needs reservation ended `reservation_confirmed`.
+- `AIRBNB_REOPENED` needs a reservation to have existed **and** the cleanup to have ended `cancelled`.
+- Each checkpoint appears at most once.
+
+*Terminal records:*
+- **`RUN_STOPPED`** (failure) may close an **open logged step** with the **truthful lifecycle status**. No `STEP_ENDED` is invented, nothing is awaited or re-read, and no SQL is issued just to satisfy the log:
+  - `NONE`: the step rejected before any executor start;
+  - `TAIL`: the step rejected after ≥ 1 start (unobservable tail);
+  - `STEP`: the observation timed out.
+
+  With an open step, `effectsKnown` must be `false`. In any terminal record, `outstanding ≠ NONE` ⇒ `effectsKnown: false` (a field rule).
+- **`RUN_ENDED`** (success) requires no open step, and the outcome's phase must be the **last** phase, ended:
+
+| Outcome | Last phase, end state | Cleanup key | Checkpoints |
+|---|---|---|---|
+| `ENDED_RESERVED_NOT_CAPTURED` | reservation, `reservation_confirmed` | `reservedNotConfirmed` | `AIRBNB_BLOCKED` |
+| `ENDED_CAPTURED_NOT_RECORDED` | capture, `payment_captured` | `captured` | `AIRBNB_BLOCKED` |
+| `ENDED_CONFIRMED` | recording, `confirmed` | `confirmed` | `AIRBNB_BLOCKED` |
+| `ENDED_RELEASED`, no reservation existed (reservation failed) | cleanup, `authorization_released` | `null` | no `AIRBNB_REOPENED` |
+| `ENDED_RELEASED`, a reservation existed and was cancelled | cleanup, `cancelled` | `null` | `AIRBNB_REOPENED` |
+| `ENDED_RELEASED`, a reservation existed and still stands | cleanup, `authorization_released` | `reservedNotConfirmed` | no `AIRBNB_REOPENED` |
+
+  The exact key per outcome is also a field rule (`OUTCOME_RULES`): `ENDED_RELEASED` allows only `null` / `reservedNotConfirmed`.
 - Exactly one terminal record, which is last. Nothing after it (`APPEND_AFTER_TERMINAL`).
-- An unfinished `STEP_STARTED` is **crash evidence, never permission to resume**.
+- An unfinished `STEP_STARTED` without a terminal record is **crash evidence, never permission to resume**.
 
 **Action grammar (pinned from the accepted worker sources; whole-token, anchored).**
 
@@ -1204,14 +1256,15 @@ Run the focused unit suite and `npm test`. No DB run.
 
 ### 9.3 Slice D: `run-journal-memory` (offline unit) — IMPLEMENTED at this head, for root CODE review
 
-**Files.** `scripts/e7-connected/run-journal-memory.mjs`, `test/e7-connected-run-journal.test.mjs` (14 unit tests; no DB, worker or network), and this contract.
+**Files.** `scripts/e7-connected/run-journal-memory.mjs`, `test/e7-connected-run-journal.test.mjs` (17 unit tests after the R-D1 / R-D2 corrections; no DB, worker or network), and this contract.
 
 **Acceptance (all pass):**
 - Happy chain with independently recomputed heads / hashes.
 - Caller mutation resistance.
 - Every append refusal category with unchanged history.
 - Order refusals: step before baseline, second `RUN_STARTED`, capture before `AIRBNB_BLOCKED`, phase skip, `REOPENED` without cleanup, first event not `RUN_STARTED`.
-- Terminal rules: after-terminal, duplicate terminal, open step vs `RUN_ENDED` / `RUN_STOPPED`.
+- Terminal rules: after-terminal, duplicate terminal, open step vs `RUN_ENDED` / `RUN_STOPPED` (truthful `NONE` / `TAIL` / `STEP`; never `effectsKnown`).
+- R-D1: real accepted guard / lifecycle integration. R-D2: structural success / release paths, at the validator level and at append time (§2.5.1 errata).
 - Two concurrent appends: `CHAIN_MISMATCH` / `APPEND_IN_FLIGHT`, no retry.
 - Faults through the accepted guard with fake timers: `reject`, `hang` → timeout, `late` → timeout then lands → `RUN_ENDED`, `landed_hang` → timeout while present; read `reject` / `hang` / `torn` → `JOURNAL_PARTIAL`.
 - Start verdicts, including empty ⇒ `dbEligibilityRequired` and interrupted step ⇒ `RESTART_AMBIGUOUS`.
