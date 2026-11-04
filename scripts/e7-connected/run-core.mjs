@@ -207,7 +207,14 @@ export async function runConnectedTest(input) {
     if (!on || !off || !rel || !query) { if (rel) { try { apply(rel, c, [true]); } catch { /* local */ } } return { fail: "DB_FAILURE" }; }
     const t = trackClient({ subscribe: (e, h) => apply(on, c, [e, h]), unsubscribe: (e, h) => apply(off, c, [e, h]), destroy: () => apply(rel, c, [true]), onLoss });
     if (!t.ok) return { fail: "DB_FAILURE" };
-    return { client: c, query, tracker: t.tracker, release: () => { t.tracker.dispose(); if (t.tracker.state() === "open") { try { apply(rel, c, []); } catch { t.tracker.destroy(); } } } };
+    const h = { client: c, query, tracker: t.tracker, release: () => { t.tracker.dispose(); if (t.tracker.state() === "open") { try { apply(rel, c, []); } catch { t.tracker.destroy(); } } } };
+    // R-E1d: the HANDOFF check, after the awaited connect + tracker setup and before any statement / C helper on this client.
+    // (1) the acquired client itself was lost meanwhile → it was already destroyed once by its tracker; never queried; DB family.
+    if (t.tracker.state() !== "open") return { fail: "DB_FAILURE" };
+    // (2) a stop / lock loss / cancellation / broken guard became observable while connecting → no new SQL: the never-queried client is
+    //     returned once (dispose + release) when healthy, destroyed once on the DB-family path; the observed cause is recorded first.
+    if (blocked()) { if (lc.snapshot().dbFamily) t.tracker.destroy(); else h.release(); return { pre: true }; }
+    return h;
   }
   const statement = (h, sql, params, ms = LIMITS.STATEMENT_MS) => (blocked() ? Promise.resolve({ pre: true })
     : observeMapped(ms, () => apply(h.query, h.client, [sql, params]), { rejected: "DB_FAILURE", timeout: "TIMEOUT_DB_READ" }));

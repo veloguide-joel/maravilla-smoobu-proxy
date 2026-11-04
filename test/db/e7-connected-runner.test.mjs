@@ -296,6 +296,8 @@ class FaultPool {
     const w = new FaultClient(this, c);
     this.clients.push(w);
     if (f && f.mode === "late") await sleep(f.ms);
+    if (f && f.mode === "beforeHandoff") await f.fn(this, w);         // TEST-ONLY: an event while connecting, before the client is handed back
+    if (f && f.mode === "inject") w.injectOn = f.event;               // TEST-ONLY: synthetic error / end delivered to the tracker on subscribe
     return w;
   }
   query(sql, params) {
@@ -315,7 +317,11 @@ class FaultClient {
     return f ? this.p.apply(f, () => this.c.query(sql, params), this) : this.c.query(sql, params);
   }
   release(x) { this.events.push(x === true ? "release(true)" : "release()"); if (this.released) return undefined; this.released = true; return this.c.release(x); }
-  on(e, h) { this.events.push(`on:${e}`); this.c.on(e, h); return this; }
+  on(e, h) {
+    this.events.push(`on:${e}`); this.c.on(e, h);
+    if (this.injectOn === e) { this.injectOn = null; this.events.push(`inject:${e}`); h(); }   // SYNTHETIC event to the subscriber only
+    return this;
+  }
   removeListener(e, h) { this.events.push(`off:${e}`); this.c.removeListener(e, h); return this; }
   pid() { return this.c.processID; }
 }
@@ -1053,6 +1059,79 @@ test("E27 (R-E3). terminal append failure on a PLANNED-SUCCESS path → failed r
     assert.deepEqual([r2.outcome, r2.stopCode, S2.t.h.length + S2.t.s.length], ["REFUSED", next, 0], `${label}: next invocation`);
     await r2.finalize();
   }
+});
+
+test("E28 (R-E1d). acquisition handoff: a stop / loss observed WHILE connecting, or an acquired client lost before handoff, starts no new SQL", async (t) => {
+  const cQueries = (c) => c.events.filter((e) => e === "query").length;
+  const sqlAfter = (P, n) => P.log.slice(n).map((x) => x.sql);
+  await t.test("lock loss while the P0 snapshot client connects", async () => { for (const L0 of LIVE.splice(0)) await L0.cleanup();   // test-setup isolation between subtests; lock loss while the P0 eligibility snapshot client connects (report connect #2)
+    const S = await scenario();
+    S.report.addFault({ kind: "connect", nth: 2, mode: "beforeHandoff", fn: async (P) => { S.mark = P.log.length; await terminate(P.clients[0]); } });
+    const r = await S.run();
+    assert.deepEqual([r.outcome, r.stopCode, r.exclusion], ["REFUSED", "LOCK_LOST", "lost"], JSON.stringify(plainResult(r)));
+    assert.deepEqual(sqlAfter(S.report, S.mark), [], "zero BEGIN / SELECT after the observed loss");
+    assert.equal(cQueries(S.report.clients[1]), 0, "the new client was never queried");
+    assert.equal(S.report.clients[1].events.filter((e) => e.startsWith("release")).length, 1, "disposed exactly once");
+    assert.equal((await r.finalize()).lockRelease, "lost");
+  });
+  await t.test("lock loss while a mid-run snapshot client connects", async () => { for (const L0 of LIVE.splice(0)) await L0.cleanup();   // test-setup isolation between subtests; lock loss while a MID-RUN (pre-step) snapshot client connects (report connect #3)
+    const S = await scenario();
+    S.report.addFault({ kind: "connect", nth: 3, mode: "beforeHandoff", fn: async (P) => { S.mark = P.log.length; await terminate(P.clients[0]); } });
+    const r = await S.run();
+    assert.deepEqual([r.outcome, r.stopCode, r.exclusion], ["STOPPED", "LOCK_LOST", "lost"], JSON.stringify(plainResult(r)));
+    assert.deepEqual(sqlAfter(S.report, S.mark), []);
+    assert.equal(S.t.h.length + S.t.s.length, 0, "no worker / transport");
+    assert.equal((await S.records()).at(-1).code, "LOCK_LOST", "the loss is the recorded first cause");
+    await journalValid(S);
+  });
+  await t.test("abort while a mid-run snapshot client connects", async () => { for (const L0 of LIVE.splice(0)) await L0.cleanup();   // test-setup isolation between subtests; abort while a mid-run snapshot client connects
+    const S = await scenario();
+    S.report.addFault({ kind: "connect", nth: 3, mode: "beforeHandoff", fn: async (P) => { S.mark = P.log.length; S.ac.abort(); } });
+    const r = await S.run();
+    assert.deepEqual([r.outcome, r.stopCode], ["STOPPED", "CANCELLED"], JSON.stringify(plainResult(r)));
+    assert.deepEqual(sqlAfter(S.report, S.mark), [], "zero C SQL after the observed abort");
+    assert.equal(S.report.clients[2].events.at(-1), "release()", "healthy, never-queried client returned to the pool once");
+    assert.equal(S.t.h.length + S.t.s.length, 0);
+    assert.equal((await r.finalize()).lockRelease, "unlocked");
+  });
+  await t.test("abort while the guest client connects", async () => { for (const L0 of LIVE.splice(0)) await L0.cleanup();   // test-setup isolation between subtests; abort while the guest-read client connects (app connect #2; #1 = same-DB S2)
+    const S = await scenario();
+    S.app.addFault({ kind: "connect", nth: 2, mode: "beforeHandoff", fn: async (P) => { S.mark = P.log.length; S.ac.abort(); } });
+    const r = await S.run();
+    assert.deepEqual([r.outcome, r.stopCode], ["STOPPED", "CANCELLED"], JSON.stringify(plainResult(r)));
+    assert.deepEqual(sqlAfter(S.app, S.mark), [], "no guest SELECT, no worker SQL");
+    assert.equal(cQueries(S.app.clients[1]), 0);
+    assert.equal(S.t.h.length + S.t.s.length, 0, "no worker / transport");
+    assert.ok(!(await S.events()).includes("STEP_STARTED:reservation"));
+    assert.equal((await r.finalize()).lockRelease, "unlocked");
+  });
+  await t.test("abort while the same-DB app client / the lock client connects", async () => { for (const L0 of LIVE.splice(0)) await L0.cleanup();   // test-setup isolation between subtests; abort while the same-DB app client connects (app connect #1) and while the LOCK client connects (report connect #1)
+    const A = await scenario();
+    A.app.addFault({ kind: "connect", nth: 1, mode: "beforeHandoff", fn: async () => { A.ac.abort(); } });
+    const ra = await A.run();
+    assert.deepEqual([ra.outcome, ra.stopCode, A.app.log.length, cQueries(A.app.clients[0])], ["REFUSED", "CANCELLED", 0, 0], "no S2 on the app client");
+    assert.equal((await ra.finalize()).lockRelease, "unlocked");
+    const B = await scenario();
+    B.report.addFault({ kind: "connect", nth: 1, mode: "beforeHandoff", fn: async () => { B.ac.abort(); } });
+    const rb = await B.run();
+    assert.deepEqual([rb.outcome, rb.stopCode, rb.exclusion, B.report.log.length], ["REFUSED", "CANCELLED", "not_acquired", 0], "no try-lock after the abort");
+    assert.equal(B.report.clients[0].events.filter((e) => e.startsWith("release")).length, 1);
+    assert.equal((await rb.finalize()).lockRelease, "not_acquired");
+  });
+  await t.test("SYNTHETIC acquired-client error / end before handoff", async () => { for (const L0 of LIVE.splice(0)) await L0.cleanup();   // test-setup isolation between subtests; SYNTHETIC: an acquired client's own error / end delivered at tracker subscription (before handoff) → never queried, destroyed once
+    for (const [pool, nth, ev] of [["report", 3, "error"], ["app", 2, "end"]]) {
+      const S = await scenario();
+      S[pool].addFault({ kind: "connect", nth, mode: "inject", event: ev });
+      const r = await S.run();
+      const c = S[pool].clients[nth - 1];
+      assert.deepEqual([r.outcome, r.stopCode], ["STOPPED", "DB_FAILURE"], `${pool}/${ev}: ${JSON.stringify(plainResult(r))}`);
+      assert.equal(cQueries(c), 0, `${pool}/${ev}: no query on the lost client`);
+      assert.equal(c.events.filter((e) => e.startsWith("release")).length, 1, `${pool}/${ev}: destroyed exactly once`);
+      assert.equal(c.events.filter((e) => e.startsWith("release")).at(0), "release(true)");
+      assert.equal(S.t.h.length + S.t.s.length, 0);
+      assert.equal((await r.finalize()).lockRelease, "destroyed", `${pool}/${ev}: DB family → destroy-only`);
+    }
+  });
 });
 
 test("E23. source pins: exact imports; no runner timers / env / fs / fetch / Date; no pinned identifiers; SQL limited to the three statements", () => {

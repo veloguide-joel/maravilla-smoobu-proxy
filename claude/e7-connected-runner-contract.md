@@ -1,4 +1,4 @@
-# E7 local connected-test RUNNER — CONTRACT, revision 9 (Slices A–D ACCEPTED; Slice E core IMPLEMENTED offline; HOLD R-E1–R-E3 corrected, pending root CODE re-review)
+# E7 local connected-test RUNNER — CONTRACT, revision 9 (Slices A–D ACCEPTED; Slice E core IMPLEMENTED offline; HOLD R-E1–R-E3 corrected; R-E1d acquisition handoff corrected, pending root CODE re-review)
 
 **Branch** `feature/e7-connected-run-core`, cut from exact `ea830a62` (revision 8, root DESIGN ACCEPTED). Slice E changes exactly three files: new `scripts/e7-connected/run-core.mjs`, new `test/db/e7-connected-runner.test.mjs`, and this contract (status + §13). Revision 8 (`feature/e7-connected-core-contract`, from `d5a93e0f`) was docs only.
 
@@ -20,6 +20,7 @@
   - Root DESIGN REVIEW **ACCEPTED** revision 8 at `ea830a62` and authorized Slice E, with binding clarifications 1–6 (recorded in §13.1).
 - Revision 9 (this file) records the implemented Slice E (§13): `runConnectedTest` + `checkSameDatabase` in `run-core.mjs`, and the disposable-PG suite E1–E23. All results are **CLAUDE-RUN** (root cannot run PG). Pending root CODE review.
 - Root CODE REVIEW **HOLD** on `6e253977` (R-E1 stop boundaries, R-E2 post-step observation, R-E3 terminal failure). Corrections on the same branch (fast-forward), recorded in §13.5; suite now E1–E27. Pending root CODE re-review.
+- Root CODE RE-REVIEW at `d16b57ec`: R-E2 / R-E3 CLOSED; narrow HOLD R-E1d (acquisition handoff). Corrected on the same branch (fast-forward), §13.6; suite E1–E28.
 
 **Citation convention.**
 - Current interfaces are cited by **file:line at `d5a93e0f`**: workers under `lib/booking-db/`, runner modules under `scripts/e7-connected/`.
@@ -1651,3 +1652,25 @@ Scope: `run-core.mjs`, `test/db/e7-connected-runner.test.mjs`, this contract onl
 - RED on exact `6e253977` (core unchanged, new suite): 22/27 — the 5 correction cases fail (E21, E24, E25, E26, E27): e.g. E24 core invoked the worker after an observed abort, E25 returned `ENDED_CONFIRMED` after cancellation in the final step, E26 `effectsKnown:true` / key null after an acknowledged refusal, E27 `ENDED_RESERVED_NOT_CAPTURED` with `stopCode:null` on a rejected terminal. TAP retained.
 - GREEN (first full TAP of the corrected head): **27/27** (≈ 90 s), first full run of the corrected head; TAP retained.
 - Units + adapters + pins 132/132; `npm test` 797/797. Full `test:db` not run. e74a not reproduced.
+
+### 13.6 Root CODE RE-REVIEW narrow HOLD on `d16b57ec` (R-E1d acquisition handoff) — resolution
+
+Root closed R-E2 and R-E3 at `d16b57ec` (root reran its four exact-core probes; PG evidence remains CLAUDE-RUN). Remaining gap **R-E1d**: `acquire()` checked the stop condition only BEFORE its awaited connect, so a lock loss / cancellation that became observable WHILE connecting still let `snapshot()` / `guest()` begin a new C snapshot / guest SELECT (root's log: `report:connect → report:release(true) [held lock destroyed] → report:BEGIN → … → INTENT_NOT_FOUND`, the loss masked by the later refusal).
+
+**Fix (only `acquire()`, the common handoff for every owned client: lock, same-DB S2, snapshot, guest).** After the awaited connect AND tracker setup, before any statement or C helper:
+1. the acquired client's OWN tracker is checked: if it was lost (`error` / `end`) meanwhile, it has already been destroyed exactly once by its tracker; it is never queried; the caller stops `DB_FAILURE` (DB family: no further runner SQL, destroy-only disposal);
+2. `blocked()` is re-checked (existing cause, lock loss incl. the pre-attach flag, signal, broken guard). If stopped, the never-queried client is returned once (`tracker.dispose()` then `release()`) or, on the DB-family path, destroyed once; the observed cause (e.g. `LOCK_LOST`, `CANCELLED`) is recorded by `boundary()` as the first cause, so a later refusal can no longer hide it.
+
+Unchanged: a C snapshot that has ALREADY started is observed to its end; B's late-client rule (`observeConnect` destroys a late client once, never queried) — no duplicate release; DB-family and first-cause semantics; C, D, workers.
+
+**Regression E28** (six independent subtests; red on exact `d16b57ec` for 1–4 and 6, control 5 already green there because the statement-level check covers S1 / S2):
+1. lock loss while the P0 eligibility snapshot client connects → `REFUSED LOCK_LOST`, zero BEGIN / SELECT afterwards, the new client never queried and disposed once;
+2. lock loss while a mid-run pre-step snapshot client connects → `STOPPED LOCK_LOST` (journaled as the first cause), zero SQL / worker / transport afterwards;
+3. abort while a mid-run snapshot client connects → `STOPPED CANCELLED`, zero C SQL, healthy client returned once;
+4. abort while the guest-read client connects → `STOPPED CANCELLED`, no guest SELECT, no `STEP_STARTED`, no worker / transport;
+5. control: abort while the same-DB app client / the lock client connects → `REFUSED CANCELLED`, no S2 / no try-lock, one release;
+6. SYNTHETIC (labelled; the wrapper delivers `error` / `end` to the tracker at subscription): an acquired snapshot / guest client lost before handoff → `STOPPED DB_FAILURE`, zero queries on it, destroyed exactly once (`release(true)`), `finalize` → `destroyed`.
+
+PG wrappers forward to real disposable clients; events in 1–2 are real backend terminations from the owner session.
+
+**Validation (CLAUDE-RUN):** RED on exact `d16b57ec` (`--test-name-pattern=E28`): 1 / 6 subtests pass (control 5). GREEN, first full TAP of the corrected head: 34/34 (the E1–E28 tests plus E28's six subtests), ≈ 90 s. Units + adapters + pins 132/132; `npm test` 797/797. Full `test:db` not run; e74a not reproduced.
