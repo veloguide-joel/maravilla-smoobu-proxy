@@ -1,5 +1,7 @@
 # E7 connected-test runner — P / T / X PROBE-STACK REHEARSAL (TESTS + REPORT ONLY; OFFLINE)
 
+> **Status (pointer):** ACCEPTED OFFLINE by root at `b6603cac` (combined 113/113 root-run; no native / provider / real-readiness claim). The `VOCABULARY` omission noted in §3 is a whitelist / export nuance, not a leak; the canonical consumer whitelist is the union in `claude/e7-connected-readonly-probe-contract.md` §12. Next (docs only): `claude/e7-connected-probe-cli-contract.md` — PROPOSED owner-run CLI / preflight / credential-ingress design; not implemented, not authorized.
+
 **Branch** `feature/e7-connected-probe-stack-rehearsal`, cut from exact `27c0ea11` (Slice P ACCEPTED offline). Files: NEW `test/e7-connected-probe-stack-rehearsal.test.mjs` (R1–R4); this report; an accepted-status / report pointer in `claude/e7-connected-readonly-probe-contract.md` (§11 / §11.1 history kept). **No runtime change** (`git diff 27c0ea11 -- scripts lib db package.json` is empty). No runner, CLI, credential, env, preflight, install, PG, provider, native network, loopback, TLS, DNS, socket, merge, deploy or real message.
 
 **Accepted source heads under test (unchanged):** P `scripts/e7-connected/readonly-probe.mjs` (last changed `27c0ea11`), T `scripts/e7-connected/http-transports.mjs` (`0830f9a4`), X `scripts/e7-connected/real-exchange.mjs` (`af1b4db0`).
