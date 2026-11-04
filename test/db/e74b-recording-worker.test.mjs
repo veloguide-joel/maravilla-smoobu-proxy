@@ -614,3 +614,24 @@ test("R2 selection: an escalated read left by an EARLIER step is cited once whil
     assert.ok(r.actions.includes("STOP:READ_ROWS_AMBIGUOUS"), JSON.stringify(r.actions));
     assert.deepEqual([w.calls.retrieveReservation, (await reads(b.id, ID_T)).length], [0, 2]); }
 });
+
+test("R-C2 (REAL disposable PG): mixed history — a fresh uncited exhausted identity row AND two open same-selector rows above F → STOP:READ_ROWS_AMBIGUOUS; nothing executed, cited, created or changed by selection", async () => {
+  const b = await booking(); const w = world(b); await sleep(3);
+  const esc = await requestReadRaw(b.id, ID_T, b.rid);
+  await F.ownerManagedHistory(db.owner, `UPDATE booking.external_operations SET state = 'escalated', attempts = 10, error_code = 'READ_TRANSPORT_TIMEOUT', updated_at = now()
+    WHERE id = $1`, [esc]);
+  await requestReadRaw(b.id, ID_T, b.rid); await requestReadRaw(b.id, ID_T, b.rid);
+  const op = await recording(b.id);
+  const snap = async () => JSON.stringify(await all(`SELECT id, state, attempts, next_attempt_at, updated_at, lease_worker_id FROM booking.external_operations
+    WHERE intent_id = $1 AND op_type <> 'guest.notify' ORDER BY id`, [b.id]))
+    + await num("SELECT count(*) AS n FROM booking.provider_evidence WHERE intent_id = $1", [b.id])
+    + await num("SELECT count(*) AS n FROM booking.recording_assessments WHERE operation_id = $1", [op.id])
+    + await num("SELECT count(*) AS n FROM booking.recording_holds WHERE operation_id = $1", [op.id])
+    + await num("SELECT count(*) AS n FROM booking.reconciliation_cases WHERE intent_id = $1", [b.id]);
+  const before = await snap();
+  const r = await step(b, w);
+  assert.ok(r.actions.includes("STOP:READ_ROWS_AMBIGUOUS"), JSON.stringify(r.actions));
+  assert.deepEqual([w.calls.retrieveReservation, w.calls.listOfflineCharges, w.calls.createOfflineCharge, r.writes], [0, 0, 0, 0]);
+  assert.equal(await snap(), before, "no read / evidence / assessment / hold / case row created or changed by selection");
+  assert.equal(await num("SELECT count(*) AS n FROM booking.recording_assessments WHERE identity_read_op = $1", [esc]), 0, "the exhausted row stays uncited");
+});

@@ -118,3 +118,45 @@ test("W-6 policy: escalate() refuses every non-allowlisted code locally with NO 
   assert.equal(q, 0);
   assert.deepEqual(ctx.actions, ["STOP:CONFIG_SHAPE", "STOP:PROTECTED_RESERVATION_ID", "STOP:IDENTITY_STALE", "STOP:LABEL_INVALID", "STOP:CLOCK_SKEW", "STOP:NOT_PAYMENT_CAPTURED", "STOP:RECORDING_WORKER_CODE_INVALID"]);
 });
+
+// ---- root code review of ddda945 (R-C1 / R-C2) — FUNCTION-LEVEL controls with a STUB pool (no real database) ----
+const stubPool = (fn) => { const s = { queries: 0, connects: 0 }; s.pool = { query: async (text, values) => { s.queries += 1; return fn(text, values, s.queries); },
+  connect: async () => { s.connects += 1; throw new Error("no connect expected"); } }; return s; };
+const goodStep = (pool, o = {}) => runRecordingStep(pool, { workerId: "rw-1", env: ENV, listings: new Map([[990001, cfg()]]), executors: exec(), clock: Date.now, ...o });
+
+test("R-C1 (stub pool): a thrown connection / SQL error on the environment marker propagates as THE SAME object; exactly 1 query, 0 connects / writes / provider calls", async () => {
+  for (const make of [() => Object.assign(new Error("connection terminated"), { code: "57P01" }),
+    () => Object.assign(new Error('relation "booking.instance" does not exist'), { code: "42P01" }),
+    () => Object.assign(new Error("ENVIRONMENT_MISMATCH: lookalike text in a transport error"), { code: "ECONNRESET" })]) {
+    const err = make();
+    let calls = 0; const ex = exec({ retrieveReservation: async () => { calls += 1; }, listOfflineCharges: async () => { calls += 1; }, createOfflineCharge: async () => { calls += 1; } });
+    const s = stubPool(() => { throw err; });
+    await assert.rejects(goodStep(s.pool, { executors: ex }), (e) => e === err && e.code === err.code && e.message === err.message);
+    assert.deepEqual([s.queries, s.connects, calls], [1, 0, 0], err.code);
+  }
+});
+
+test("R-C1 (stub pool): an ACKNOWLEDGED marker that is not 'test' (or absent) is the structured refusal DATABASE_NOT_TEST after exactly 1 query", async () => {
+  for (const rows of [[{ environment: "live" }], [{ environment: "staging" }], []]) {
+    const s = stubPool(() => ({ rows, rowCount: rows.length }));
+    const r = await goodStep(s.pool);
+    assert.deepEqual([r.status, r.code, r.writes, s.queries, s.connects], ["refused", "DATABASE_NOT_TEST", 0, 1, 0], JSON.stringify(rows));
+  }
+});
+
+test("R-C2 (stub pool): selectRead — two OPEN candidates take precedence over a fresh uncited exhausted row: stop, after exactly the one candidacy query", async () => {
+  const row = (o) => ({ id: "r", state: "pending", attempts: 1, max_attempts: 10, next_attempt_at: new Date(0), created_at: new Date(), fresh_escalated: false,
+    has_evidence: false, cited: false, ...o });
+  const rows = [row({ id: "exhausted", state: "escalated", attempts: 10, fresh_escalated: true }), row({ id: "p1" }), row({ id: "p2" })];
+  const s = stubPool(() => ({ rows, rowCount: rows.length }));
+  const ctx = { pool: s.pool, clock: Date.now, workerId: "rw-1" };
+  assert.deepEqual(await _internal.selectRead(ctx, "op", "intent", "88000001", "hostaway.retrieve_reservation"), { kind: "stop", code: "READ_ROWS_AMBIGUOUS" });
+  assert.deepEqual([s.queries, s.connects], [1, 0]);
+  // controls: a single exhausted row (no open) is still cited; one exhausted + ONE open still cites the exhausted row (once-only count)
+  for (const rs of [[rows[0]], [rows[0], rows[1]]]) {
+    const t = stubPool(() => ({ rows: rs, rowCount: rs.length }));
+    assert.deepEqual(await _internal.selectRead({ pool: t.pool, clock: Date.now, workerId: "rw-1" }, "op", "intent", "88000001", "hostaway.retrieve_reservation"),
+      { kind: "cite", readId: "exhausted" });
+    assert.equal(t.queries, 1);
+  }
+});
