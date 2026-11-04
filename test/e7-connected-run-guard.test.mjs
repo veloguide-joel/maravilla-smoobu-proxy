@@ -496,3 +496,139 @@ test("P1 purity: no own timers / env / network / fs / pinned identifiers; exact 
   const imports = [...code.matchAll(/from\s+["']([^"']+)["']/g)].map((m) => m[1]).sort();
   assert.deepEqual(imports, ["./executor-adapters.mjs", "node:util"]);
 });
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// Root HOLD on 74e8f509 — R-B1 / R-B2 / R-B3 regressions
+const runs = { n: 0 };
+/** three customisations the intrinsic then would consult via SpeciesConstructor (constructor getter / data object with species getter /
+ *  data function with species getter). Each would execute caller code if then were applied. */
+const patchers = {
+  "constructor throwing getter": (p) => Object.defineProperty(p, "constructor", { get() { runs.n += 1; throw new Error("CALLER_CONSTRUCTOR"); } }),
+  "constructor data object with species getter": (p) => Object.defineProperty(p, "constructor", { value: { get [Symbol.species]() { runs.n += 1; throw new Error("CALLER_SPECIES"); } } }),
+  "constructor data function with species getter": (p) => Object.defineProperty(p, "constructor", { value: class C { static get [Symbol.species]() { runs.n += 1; throw new Error("CALLER_SPECIES_FN"); } } }),
+  "own symbol accessor": (p) => Object.defineProperty(p, Symbol("x"), { get() { runs.n += 1; return 1; } })
+};
+const patched = (name, p = new Promise(() => {})) => patchers[name](p);
+
+test("R-B1 ordinary native controls stay valid (incl. Node async_hooks own symbol DATA properties)", () => {
+  assert.equal(isNativePromise(Promise.resolve(1)), true);
+  const withSym = Promise.resolve(); Object.defineProperty(withSym, Symbol("async_id"), { value: 7 });
+  assert.equal(isNativePromise(withSym), true);
+  for (const name of Object.keys(patchers)) { runs.n = 0; assert.equal(isNativePromise(patched(name)), false, name); assert.equal(runs.n, 0, name); }
+});
+
+test("R-B1 patched INITIAL timer promise → not_started; start never called; no getter ran", async () => {
+  for (const name of Object.keys(patchers)) {
+    runs.n = 0; const f = fake(); const g = guardOf(f); let starts = 0; let cancels = 0;
+    f.plan.push(() => ({ promise: patched(name), cancel: () => { cancels += 1; } }));
+    const r = await g.observe(100, () => { starts += 1; return Promise.resolve(); });
+    assert.deepEqual([r.kind, r.code, starts, runs.n, g.armedCount()], ["not_started", "GUARD_TIMER_INVALID", 0, 0, 0], name);
+    assert.equal(cancels, 1, `${name}: the safely identified cancel was disposed`);
+  }
+});
+
+test("R-B1 patched RE-ARM timer promise after start → post-start observation_failed; op retained; no getter; no stray timer", async () => {
+  for (const name of Object.keys(patchers)) {
+    runs.n = 0; const f = fake(); const g = guardOf(f); const d = deferred();
+    const p = g.observe(100, () => d.promise); await flush();
+    f.plan.push(() => ({ promise: patched(name), cancel: () => {} }));
+    await f.fireEarly();
+    const r = await p;
+    assert.deepEqual([r.kind, r.code, r.opState, r.op === d.promise, runs.n, g.armedCount()], ["observation_failed", "GUARD_TIMER_INVALID", "pending", true, 0, 0], name);
+  }
+});
+
+test("R-B1 patched OPERATION promise → structured unobservable post-start result: no raw caller error, no getter, timer cancelled", async () => {
+  for (const name of Object.keys(patchers)) {
+    runs.n = 0; const f = fake(); const g = guardOf(f); let starts = 0;
+    let r;
+    await assert.doesNotReject(async () => { r = await g.observe(100, () => { starts += 1; return patched(name); }); });
+    assert.deepEqual([r.kind, r.started, r.code, r.op, r.opState], ["observation_failed", true, "GUARD_OPERATION_NOT_NATIVE", null, "unobservable"], name);
+    assert.deepEqual([starts, runs.n, g.armedCount(), f.cancels], [1, 0, 0, 1], name);
+  }
+});
+
+test("R-B1 patched STEP / LATE promises → TAIL unobservable (never quiescent, never unlocked); patched UNLOCK result → destroy, not unlocked", async () => {
+  for (const name of Object.keys(patchers)) {
+    runs.n = 0;
+    { const { lc, k } = setup();
+      const r = await lc.observeStep({ phase: "reservation", deadline: 75_000, ledger: createLedger(), start: () => patched(name) });
+      assert.deepEqual([r.kind, r.code, r.outstanding, lc.snapshot().tailObservable], ["observation_failed", "GUARD_OPERATION_NOT_NATIVE", "TAIL", false], name);
+      assert.equal(await stateOf(lc.finalize()), PENDING); assert.equal(k.unlocks + k.destroys, 0); }
+    { const { lc, k } = setup();
+      const r = await lc.observeStep({ phase: "capture", deadline: 75_000, ledger: createLedger(), start: () => Promise.resolve(Object.freeze({ late: patched(name) })) });
+      assert.deepEqual([r.kind, r.outstanding, lc.snapshot().tailObservable], ["fulfilled", "TAIL", false], name);
+      assert.equal((await lc.observeTail(35_000)).kind, "unobservable");
+      assert.equal(await stateOf(lc.finalize()), PENDING); assert.equal(k.unlocks + k.destroys, 0); }
+    { const { lc, k } = setup(() => patched(name, Promise.resolve(true)));
+      const d = await lc.finalize();
+      assert.equal(d.lockRelease, "destroyed", `${name}: an unobservable unlock is never reported as unlocked`); assert.deepEqual([k.unlocks, k.destroys], [1, 1]); }
+    assert.equal(runs.n, 0, name);
+  }
+});
+
+test("R-B1 patched executor result: the ORIGINAL promise is returned, counted non-native, never side-handled; no getter ran", async () => {
+  for (const name of Object.keys(patchers)) {
+    runs.n = 0; const ledger = createLedger(); const original = patched(name);
+    const w = wrapExecutors({ lookupPage: () => original }, ledger);
+    assert.equal(w.executors.lookupPage(), original);
+    const s = ledger.snapshot();
+    assert.deepEqual([s.started, s.settled, s.nonNative, runs.n], [1, 1, 1, 0], name);
+    assert.equal(await stateOf(ledger.whenDrained()), PENDING, "caller owns that promise's rejection; settlement is never fabricated");
+  }
+});
+
+test("R-B2 deliberate destroy is never a loss: synchronous end / error+end inside destroy, post-destroy events, destroy throw", () => {
+  const mk = (destroyImpl) => {
+    const H = new Map(); const c = { destroys: 0, losses: 0, unsub: 0 };
+    const t = trackClient({ subscribe: (e, h) => H.set(e, h), unsubscribe: (e, h) => { if (H.get(e) === h) { H.delete(e); c.unsub += 1; } },
+      destroy: () => { c.destroys += 1; destroyImpl(H); }, onLoss: () => { c.losses += 1; } }).tracker;
+    return { t, H, c };
+  };
+  for (const [name, impl] of [["sync end", (H) => H.get("end")()], ["sync error + end", (H) => { H.get("error")(new Error("e")); H.get("end")(); }],
+    ["sync end + error", (H) => { H.get("end")(); H.get("error")(new Error("e")); }], ["no events", () => {}]]) {
+    const { t, H, c } = mk(impl);
+    assert.equal(t.destroy(), true); assert.equal(t.destroy(), false);
+    assert.deepEqual([c.destroys, c.losses, t.state()], [1, 0, "destroyed"], name);
+    H.get("end")(); H.get("error")(new Error("later"));
+    assert.deepEqual([c.destroys, c.losses, t.state()], [1, 0, "destroyed"], `${name}: post-destroy events`);
+    t.dispose(); t.dispose(); assert.equal(c.unsub, 2); assert.equal(H.size, 0);
+  }
+  const { t, H, c } = mk(() => { throw new Error("destroy throws"); });
+  assert.equal(t.destroy(), true); assert.equal(t.destroyFailures(), 1);
+  H.get("end")(); assert.deepEqual([c.destroys, c.losses, t.state()], [1, 0, "destroyed"]);
+  // genuine external loss, both orders: destroy once, onLoss once
+  for (const order of [["error", "end"], ["end", "error"]]) {
+    const x = mk(() => {});
+    x.H.get(order[0])(new Error("ext")); x.H.get(order[1])(new Error("ext"));
+    assert.equal(x.t.destroy(), false);
+    assert.deepEqual([x.c.destroys, x.c.losses, x.t.state()], [1, 1, "lost"], order.join("+"));
+  }
+});
+
+test("R-B3 wrapper shape: own __proto__ refused (never executed); nested / hidden / symbol / accessor refused; normal factory keys preserved", () => {
+  let execRuns = 0; let getterRuns = 0;
+  const fn = () => { execRuns += 1; return Promise.resolve(); };
+  const bads = [
+    Object.defineProperty({}, "__proto__", { value: fn, enumerable: true }),
+    Object.defineProperty({ lookupPage: fn }, "__proto__", { value: fn, enumerable: true }),
+    { pricing: Object.defineProperty({ get: fn, post: fn }, "__proto__", { value: fn, enumerable: true }) },
+    { pricing: Object.defineProperty({ get: fn }, "post", { value: fn, enumerable: false }) },
+    { pricing: Object.defineProperty({ get: fn }, "post", { enumerable: true, get() { getterRuns += 1; return fn; } }) },
+    Object.defineProperty({ lookupPage: fn }, "hidden", { value: fn, enumerable: false }),
+    Object.assign({ lookupPage: fn }, { [Symbol("s")]: fn }),
+    Object.defineProperty({}, "lookupPage", { enumerable: true, get() { getterRuns += 1; return fn; } })
+  ];
+  for (const b of bads) assert.deepEqual(wrapExecutors(b, createLedger()), { ok: false, code: "EXECUTORS_INVALID" });
+  assert.deepEqual([execRuns, getterRuns], [0, 0]);
+  const label = Object.freeze({ accountRef: "a", clientSnapshotId: "b" });
+  const shapes = { reservation: { pricing: { get: fn, post: fn }, lookupPage: fn, retrieveReservation: fn, createReservation: fn },
+    recording: { retrieveReservation: fn, listOfflineCharges: fn, createOfflineCharge: fn, label } };
+  for (const [name, ex] of Object.entries(shapes)) {
+    const w = wrapExecutors(ex, createLedger());
+    assert.equal(w.ok, true, name); assert.deepEqual(Object.keys(w.executors), Object.keys(ex), name);
+    assert.equal(Object.getPrototypeOf(w.executors), Object.prototype); assert.ok(Object.isFrozen(w.executors));
+    if (ex.label) assert.equal(w.executors.label, label);
+  }
+  assert.equal(execRuns, 0);
+});

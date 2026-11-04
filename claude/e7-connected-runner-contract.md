@@ -142,11 +142,28 @@ The accepted implementation has the correct checks. Root requested no snapshot e
 - Imports: exactly `node:util` and the accepted adapter's `ExecutorRefusal`.
 - No SQL text, no worker import, no client / pool / transport / env / fs / fetch / SDK, and no timer of its own. A source pin checks this.
 
-**Native-promise rule.**
-- Every observed promise must be a genuine native `Promise`: not a proxy, prototype exactly `Promise.prototype`, no own `then`.
-- Settlement is read only through the intrinsic `Promise.prototype.then` captured at load. A caller `then`, getter or thenable is never assimilated.
+**Native-promise rule (corrected per root R-B1).**
+- Every observed promise must be an **unpatched** native `Promise`:
+  - not a proxy, and brand-checked;
+  - prototype exactly `Promise.prototype`;
+  - **no own string-keyed property**, so no own `then`, `constructor` or species customisation;
+  - every own symbol-keyed property a plain **data** property. Node's async_hooks attach own symbol data ids to promises, and those are allowed.
+- Inspection uses descriptors and keys only.
+- Settlement is read only through the intrinsic `Promise.prototype.then` captured at load.
+  - That intrinsic performs `SpeciesConstructor`: a `[[Get]]` of `p.constructor`, then `C[@@species]`.
+  - Because own `constructor` is refused, these resolve to the built-ins.
+- **Global intrinsic trust.** The module assumes same-process code has not replaced `Promise.prototype.constructor` or the `Promise[@@species]` getter. Before every attachment it re-checks both by **descriptor identity** against the values captured at load, and drift means "not native". It does **not** claim that arbitrary same-process code cannot modify built-ins. It never mutates a caller promise or a global prototype.
+- Any attachment that throws anyway is contained and reported as unobservable.
+- A caller `then`, getter or thenable is never assimilated.
+- **Caller responsibility.** A rejected or patched promise that is "not native" is **never side-handled**: no getter runs merely to attach a handler. Its rejection handling therefore stays the caller's responsibility, and the guard never fabricates its settlement.
 - A function that **throws** synchronously counts as a rejection.
 - A function that **returns** a non-native value is **unobservable**, never "not started".
+  - Initial **timer** promise: refused **before start** (`not_started: GUARD_TIMER_INVALID`).
+  - Re-armed timer: post-start `observation_failed: GUARD_TIMER_INVALID`, with the op retained.
+  - **Operation** promise: post-start `observation_failed: GUARD_OPERATION_NOT_NATIVE`, with `op:null`, `opState:"unobservable"`, the timer cancelled, and no raw caller error.
+  - **Step** / **late** promise: `TAIL` (unobservable), never quiescent and never unlocked.
+  - **Unlock** result: destroy-only, never `"unlocked"`.
+  - **Executor** result: returned identically and counted in `nonNative`; the ledger never drains.
 - Every side handler contains its own exceptions, so no derived promise can leak an unhandled rejection.
 
 **Calling convention.** Every injected callback is called with `this === undefined`, except executor wrappers, which preserve the adapter container (below).
@@ -262,7 +279,10 @@ Object.freeze({ quiescence: "observed", lockRelease, exclusionLost, lateClientsD
 - `whenDrained()` → a native promise that fulfils once `settled === started`. It **never** fulfils if any call returned a non-native value.
 
 **`wrapExecutors(executors, ledger)`:**
-- Keeps the same key set, with own enumerable data properties only.
+- Keeps the same key set, with own enumerable string-keyed data properties only.
+- An own `__proto__` key → `EXECUTORS_INVALID` (root R-B3); its value is never executed.
+- Non-enumerable, symbol and accessor keys (top level or in `pricing`) are refused.
+- The output object is built with `Object.defineProperty`, so no `[[Set]]` / prototype-setter path is used; its prototype stays `Object.prototype` and it is frozen.
 - `label` passes through **unchanged** (`===`).
 - `pricing` becomes `{ get, post }`, each wrapped with `this` = the original `pricing` object.
 - Every other key must be a non-proxy function, wrapped with `this` = the original executors object.
@@ -282,7 +302,7 @@ Object.freeze({ quiescence: "observed", lockRelease, exclusionLost, lateClientsD
 The core supplies closures over **its** client, for example `subscribe = (ev, h) => client.on(ev, h)` and `destroy = () => client.release(true)`. This module never touches a client object.
 
 - The first `error` or `end` while open → state `"lost"`, `destroy()` **once**, then `onLoss()` once. Later events are ignored.
-- `tracker.destroy()` → `true` only for the call that destroyed. A runner-initiated destroy followed by the driver's own `end` is **not** a loss.
+- `tracker.destroy()` → `true` only for the call that destroyed. The state becomes `"destroyed"` **before** the destroy callback runs (root R-B2), so an `error` / `end` emitted synchronously inside it, or delivered later, is **not** a loss. A destroy callback that throws is counted in `tracker.destroyFailures()` and still never reported as a loss.
 - `tracker.dispose()` removes both listeners, once.
 - `tracker.state()` → `"open" | "lost" | "destroyed"`.
 - A `subscribe` throw → `TRACK_SUBSCRIBE_FAILED`, destroyed once, listeners removed.
@@ -299,6 +319,15 @@ The core supplies closures over **its** client, for example `subscribe = (ev, h)
 7. After `finalize`, `snapshot().exclusion` may be `"released"`.
 
 **Clarifications.** Root clarifications 1–5 are implemented as stated in §2.2.2–§2.2.5. Clarification 6 is in §6.2 and §7.5.
+
+**Errata after root CODE HOLD on `74e8f509` (corrected on the same branch):**
+
+| Item | Gap at `74e8f509` (root probe) | Correction |
+|---|---|---|
+| R-B1 | A native promise with an own `constructor` getter passed `isNativePromise`. The intrinsic `then` ran that getter once, and the raw caller error escaped `observe` with a timer left armed | The unpatched-native rule above, plus contained attachment failure. Red / green: on `74e8` these regression tests fail; corrected, they pass with 0 getter runs |
+| R-B2 | A synchronous `end` emitted inside the destroy callback was reported as a loss (`onLoss` 1, state `"lost"`) | The state is set before the callback runs |
+| R-B3 | An own `__proto__` executor key returned `ok:true` with an output that had **no** keys (the prototype setter fired) | Refused; output built with `defineProperty` |
+| (shared) | The descriptor helper accepted non-enumerable own data properties | All exact-key inputs (deps, timers, lifecycle / lock / tracker inputs, `pricing`) now require **enumerable** own data properties |
 
 ### 2.3 `run-facts.mjs` — PROPOSED later
 

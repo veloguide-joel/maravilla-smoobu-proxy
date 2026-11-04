@@ -4,8 +4,13 @@
 // wait goes through the injected `timers.arm`, every deadline through the injected `monotonic`.
 //
 // Native-promise requirement: every promise this module observes (timer handles, operation / step / tail / unlock results, executor
-// results) must be a genuine native Promise — not a proxy, prototype exactly Promise.prototype, no own `then`. Settlement is read ONLY
-// through the intrinsic Promise.prototype.then captured at module load; no caller `then`, getter or thenable is ever assimilated.
+// results) must be an UNPATCHED native Promise: not a proxy, brand-checked, prototype exactly Promise.prototype, NO own string-keyed
+// property (so no own `then`, `constructor` or species customisation) and only plain data symbol properties (e.g. Node async_hooks ids). Settlement is read ONLY through the intrinsic
+// Promise.prototype.then captured at module load. That intrinsic performs SpeciesConstructor(p, %Promise%), i.e. a [[Get]] of
+// p.constructor and then C[@@species]; with no own `constructor` those resolve to Promise.prototype.constructor and Promise[@@species].
+// GLOBAL INTRINSIC TRUST: this module assumes same-process code has not replaced those two built-ins; it re-checks them by descriptor
+// identity against the values captured at load before every attachment, and treats any drift as "not native" (unobservable). It does
+// not claim arbitrary same-process code cannot modify built-ins. No caller `then`, getter or thenable is ever assimilated.
 // A function that throws synchronously is a rejection; a function that returns anything other than a native promise is UNOBSERVABLE
 // (never "never started", never assimilated).
 import { types } from "node:util";
@@ -17,6 +22,8 @@ const PROMISE_PROTO = Promise.prototype;
 const OBJECT_PROTO = Object.prototype;
 const REFUSAL_PROTO = ExecutorRefusal.prototype;
 const pThen = Promise.prototype.then;
+const CTOR_DESC = Object.getOwnPropertyDescriptor(Promise.prototype, "constructor");
+const SPECIES_DESC = Object.getOwnPropertyDescriptor(Promise, Symbol.species);
 const apply = Reflect.apply;
 const ownKeys = Reflect.ownKeys;
 const getDescs = Object.getOwnPropertyDescriptors;
@@ -40,20 +47,45 @@ const REFUSAL_CODE_RE = /^[A-Z_]{1,40}$/;
 // ---- safe inspection --------------------------------------------------------------------------------------------------------------
 const isFn = (f) => typeof f === "function" && !isProxy(f);
 const isPlainObj = (o) => o !== null && typeof o === "object" && !isProxy(o) && (getProto(o) === OBJECT_PROTO || getProto(o) === null);
-export function isNativePromise(p) {
-  return p !== null && typeof p === "object" && !isProxy(p) && isPromise(p) && getProto(p) === PROMISE_PROTO && getDesc(p, "then") === undefined;
+/** the two built-ins the intrinsic then consults are still the ones captured at load (descriptor identity only; nothing is called) */
+function intrinsicsIntact() {
+  const c = getDesc(PROMISE_PROTO, "constructor");
+  const sp = getDesc(NativePromise, Symbol.species);
+  return !!c && "value" in c && c.value === CTOR_DESC.value && !!sp && sp.get === SPECIES_DESC.get && sp.set === SPECIES_DESC.set;
 }
-/** own DATA properties exactly `keys` (any order) → descriptor map, else null. Never invokes a getter. */
+/** no own STRING-keyed property at all (so no own `constructor` / `then`), and every own symbol-keyed property is a plain DATA
+ *  property. Node's async_hooks attach own symbol DATA properties (async id / trigger id) to promises; those are never consulted by
+ *  the intrinsic then. Descriptor inspection only. */
+function noCustomisation(p) {
+  const d = getDescs(p);
+  for (const k of ownKeys(d)) if (typeof k === "string" || !("value" in d[k])) return false;
+  return true;
+}
+/** an UNPATCHED native promise: non-proxy, brand-checked, prototype exactly Promise.prototype, no own string keys / accessors;
+ *  intrinsics intact. Descriptor / key inspection only — no getter, constructor or species lookup runs. */
+export function isNativePromise(p) {
+  try {
+    return p !== null && typeof p === "object" && !isProxy(p) && isPromise(p) && getProto(p) === PROMISE_PROTO && noCustomisation(p)
+      && intrinsicsIntact();
+  } catch { return false; }
+}
+/** own enumerable DATA properties exactly `keys` (any order) → descriptor map, else null. Never invokes a getter. */
 function dataKeys(o, keys) {
   const d = getDescs(o);
   const ks = ownKeys(d);
   if (ks.length !== keys.length) return null;
-  for (const k of ks) if (typeof k !== "string" || !keys.includes(k) || !("value" in d[k])) return null;
+  for (const k of ks) if (typeof k !== "string" || !keys.includes(k) || !("value" in d[k]) || d[k].enumerable !== true) return null;
   return d;
 }
-/** attach side handlers through the intrinsic then; handlers never throw, so the derived promise never rejects (no unhandled leak) */
+/** attach side handlers through the intrinsic then → true, or false WITHOUT attaching when `p` is not an unpatched native promise or
+ *  the attachment itself throws (contained; callers treat false as unobservable). Handlers never throw, so the derived promise never
+ *  rejects (no unhandled leak). */
 function sideHandle(p, onFulfilled, onRejected) {
-  apply(pThen, p, [(v) => { try { onFulfilled(v); } catch { /* contained */ } }, (e) => { try { onRejected(e); } catch { /* contained */ } }]);
+  if (!isNativePromise(p)) return false;
+  try {
+    apply(pThen, p, [(v) => { try { onFulfilled(v); } catch { /* contained */ } }, (e) => { try { onRejected(e); } catch { /* contained */ } }]);
+    return true;
+  } catch { return false; }
 }
 const never = () => new NativePromise(() => {});
 
@@ -135,7 +167,7 @@ export function createGuard(deps) {
     if (st) st.wake = wake;
     const listen = (x) => sideHandle(x.promise, (v) => { x.entry.kind = "fulfilled"; x.entry.value = v; if (x === cur) wake(); },
       () => { x.entry.kind = "rejected"; if (x === cur) wake(); });
-    listen(cur);
+    if (!listen(cur)) { cancelEntry(cur.entry); breakWith("GUARD_TIMER_INVALID"); return { fault: "GUARD_TIMER_INVALID" }; }
     for (;;) {
       if ((!st || st.s === "pending") && cur.entry.kind === null) await new NativePromise((r) => { wakeR = r; });
       // ---- decision point: an op settlement ALREADY RECORDED here wins over the timer ----
@@ -154,7 +186,7 @@ export function createGuard(deps) {
       const n = armTimer(ceil(deadline - t));
       if (!n.ok) { breakWith("GUARD_TIMER_INVALID"); return { fault: "GUARD_TIMER_INVALID" }; }
       cur = n;
-      listen(cur);
+      if (!listen(cur)) { cancelEntry(cur.entry); breakWith("GUARD_TIMER_INVALID"); return { fault: "GUARD_TIMER_INVALID" }; }
     }
   }
 
@@ -194,7 +226,10 @@ export function createGuard(deps) {
       return freeze({ kind: "observation_failed", started: true, code: "GUARD_OPERATION_NOT_NATIVE", op: null, opState: "unobservable" });
     }
     const st = { s: "pending", v: undefined, r: undefined, wake: null };
-    sideHandle(op, (v) => { st.s = "fulfilled"; st.v = v; if (st.wake) st.wake(); }, (e) => { st.s = "rejected"; st.r = e; if (st.wake) st.wake(); });
+    if (!sideHandle(op, (v) => { st.s = "fulfilled"; st.v = v; if (st.wake) st.wake(); }, (e) => { st.s = "rejected"; st.r = e; if (st.wake) st.wake(); })) {
+      breakWith("GUARD_OPERATION_NOT_NATIVE"); cancelEntry(p.a.entry);
+      return freeze({ kind: "observation_failed", started: true, code: "GUARD_OPERATION_NOT_NATIVE", op: null, opState: "unobservable" });
+    }
     const out = await run(deadline, p.a, st);
     if (out.fault) {
       return freeze({ kind: "observation_failed", started: true, code: out.fault, op, opState: st.s,
@@ -278,8 +313,7 @@ function wrapFn(fn, container, key, L) {
       L.settle();
       throw e;                                           // the identical error object
     }
-    if (!isNativePromise(p)) { L.nonNative(); L.settle(); return p; }
-    sideHandle(p, () => L.settle(), (e) => { const c = refusalCode(e); if (c) L.refusal(key, c); L.settle(); });
+    if (!sideHandle(p, () => L.settle(), (e) => { const c = refusalCode(e); if (c) L.refusal(key, c); L.settle(); })) { L.nonNative(); L.settle(); }
     return p;                                            // the identical promise object
   };
 }
@@ -292,19 +326,20 @@ export function wrapExecutors(executors, ledger) {
     if (!L || !isPlainObj(executors)) return freeze({ ok: false, code: "EXECUTORS_INVALID" });
     const d = getDescs(executors);
     const out = {};
+    const put = (k, v) => Object.defineProperty(out, k, { value: v, enumerable: true, writable: false, configurable: false });   // no [[Set]], no __proto__ setter
     for (const k of ownKeys(d)) {
-      if (typeof k !== "string" || !("value" in d[k]) || d[k].enumerable !== true) return freeze({ ok: false, code: "EXECUTORS_INVALID" });
+      if (typeof k !== "string" || k === "__proto__" || !("value" in d[k]) || d[k].enumerable !== true) return freeze({ ok: false, code: "EXECUTORS_INVALID" });
       const v = d[k].value;
-      if (k === "label") { out[k] = v; continue; }
+      if (k === "label") { put(k, v); continue; }
       if (k === "pricing") {
         if (!isPlainObj(v)) return freeze({ ok: false, code: "EXECUTORS_INVALID" });
         const pd = dataKeys(v, ["get", "post"]);
         if (!pd || !isFn(pd.get.value) || !isFn(pd.post.value)) return freeze({ ok: false, code: "EXECUTORS_INVALID" });
-        out[k] = freeze({ get: wrapFn(pd.get.value, v, "pricing.get", L), post: wrapFn(pd.post.value, v, "pricing.post", L) });
+        put(k, freeze({ get: wrapFn(pd.get.value, v, "pricing.get", L), post: wrapFn(pd.post.value, v, "pricing.post", L) }));
         continue;
       }
       if (!isFn(v)) return freeze({ ok: false, code: "EXECUTORS_INVALID" });
-      out[k] = wrapFn(v, executors, k, L);
+      put(k, wrapFn(v, executors, k, L));
     }
     return freeze({ ok: true, executors: freeze(out) });
   } catch { return freeze({ ok: false, code: "EXECUTORS_INVALID" }); }
@@ -322,6 +357,7 @@ export function trackClient(input) {
     if (!d || !["subscribe", "unsubscribe", "destroy", "onLoss"].every((k) => isFn(d[k].value))) return freeze({ ok: false, code: "TRACK_INVALID" });
     const subscribe = d.subscribe.value; const unsubscribe = d.unsubscribe.value; const destroyFn = d.destroy.value; const onLoss = d.onLoss.value;
     let state = "open"; let destroyed = false; let disposed = false; let destroyFailures = 0;
+    // state is settled BEFORE the destroy callback runs, so an error / end emitted synchronously inside it is never an external loss
     const doDestroy = () => { if (destroyed) return false; destroyed = true; try { apply(destroyFn, undefined, []); } catch { destroyFailures += 1; } return true; };
     const lost = () => { if (state !== "open") return; state = "lost"; doDestroy(); try { apply(onLoss, undefined, []); } catch { /* contained */ } };
     const hErr = () => lost();
@@ -332,7 +368,7 @@ export function trackClient(input) {
       return freeze({ ok: false, code: "TRACK_SUBSCRIBE_FAILED" });
     }
     const tracker = freeze({
-      destroy: () => { const r = doDestroy(); if (r && state === "open") state = "destroyed"; return r; },
+      destroy: () => { if (destroyed) return false; if (state === "open") state = "destroyed"; return doDestroy(); },
       dispose: () => {
         if (disposed) return; disposed = true;
         try { apply(unsubscribe, undefined, ["error", hErr]); } catch { /* contained */ }
@@ -374,8 +410,10 @@ export function createLifecycle(input) {
     if (d === undefined) { s.outstanding = "NONE"; notify(); return; }
     if (!("value" in d) || !isNativePromise(d.value)) { s.outstanding = "TAIL"; s.tailObservable = false; notify(); return; }
     s.outstanding = "TAIL"; s.tailObservable = true; s.tailPromise = d.value;
-    sideHandle(d.value, () => { if (s.outstanding === "TAIL" && s.tailObservable) { s.outstanding = "NONE"; notify(); } },
-      () => { s.dbFamily = true; if (s.outstanding === "TAIL" && s.tailObservable) { s.outstanding = "NONE"; notify(); } });
+    if (!sideHandle(d.value, () => { if (s.outstanding === "TAIL" && s.tailObservable) { s.outstanding = "NONE"; notify(); } },
+      () => { s.dbFamily = true; if (s.outstanding === "TAIL" && s.tailObservable) { s.outstanding = "NONE"; notify(); } })) {
+      s.tailObservable = false; s.tailPromise = null;          // attachment impossible: unobservable, never fabricated as settled
+    }
     notify();
   }
   function rejectedTransition(ledger) {
@@ -408,7 +446,7 @@ export function createLifecycle(input) {
       try { p = apply(start, undefined, []); } catch (e) { rejectedTransition(ledger); throw e; }
       if (!isNativePromise(p)) { s.outstanding = "TAIL"; s.tailObservable = false; notify(); return p; }
       s.stepPromise = p;
-      sideHandle(p, (v) => lateValueTransition(v), () => rejectedTransition(ledger));
+      if (!sideHandle(p, (v) => lateValueTransition(v), () => rejectedTransition(ledger))) { s.outstanding = "TAIL"; s.tailObservable = false; notify(); }
       return p;
     };
     const r = await guard.observe(deadline, startOwned);
