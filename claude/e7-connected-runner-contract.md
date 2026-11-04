@@ -1,296 +1,424 @@
-# E7 local connected-test RUNNER — CONTRACT (DOCS ONLY; every implementation item PROPOSED)
+# E7 local connected-test RUNNER — CONTRACT, revision 2 (DOCS ONLY; every implementation item PROPOSED)
 
-**Branch** `feature/e7-connected-runner-contract`, cut from exact `9f13c816b2e744565539f209c6b14f57bdc5987a`. All source citations are at that head; the runtime code is unchanged since `ede4c43c`, and the adapters were accepted at `b757d6b7`.
+**Branch** `feature/e7-connected-runner-contract`.
+- Revision 1 was `36a6da15`, cut from `9f13c816`. Root DESIGN HOLD R-R1 to R-R4; revision 2 is on the same branch.
+- All source citations are at this head. The runtime is unchanged since `ede4c43c`; the adapters were accepted at `b757d6b7`.
 
-**What this is.** One concrete, reviewable design for the smallest **offline / injected-fake** orchestration foundation: a library that drives ONE booking through the accepted workers with per-step adapter factories, then stops.
+**What this is.** The smallest **offline / injected-fake** orchestration foundation. It is a library that drives ONE existing booking through the accepted workers, with per-step adapter factories, and then ends.
 
 **What it is not:**
-- a CLI, a real transport, a credential loader, Stripe ingress or a live approval;
+- a CLI, a real transport, a credential loader, Stripe ingress, a file journal or a live approval;
 - automatic cancel / refund;
-- a notification / owner-alert sender.
+- a notification / owner-alert sender;
+- general resume.
 
 Those are independent, CLOSED slices. All owner inputs stay **UNSET**. Live gates stay **CLOSED**. Protected reservations 70636076 / 71045356 / 71072615 / 71081885 stay zero-action. The historical e74a listing-lock failure stays OPEN (FIRST FULL TAP / STOP).
+
+## 0. Resolution map (root DESIGN HOLD on `36a6da15`)
+
+| Item | Resolution |
+|---|---|
+| R-R1 worker inputs | §3: explicit `listing.refFieldId`, `listing.timeZone`, `expectedRef`, `intentId` and `pricing.rateBps` in the hashed manifest. Channel 2000 is a named invariant. §3.2 is a complete per-worker input map. §3.3 covers the pilot / containment blocker. §6.2 covers phase dependencies and terminal outcomes. `paymentMethod` is always present (`null` iff no recording) |
+| R-R2 restart | §8.4. V1 has **no resume**: only an empty journal plus an eligible `payment_authorized` intent may start. Any acknowledged run → `RESTART_AMBIGUOUS` / `RUN_ENDED`. The full journal identity and chain are validated |
+| R-R3 tails / refusals | §7.2: bounded tail observation, `LATE_TAIL_OUTSTANDING`, and late evidence that may still persist. §5.3: a runner-side refusal recorder (exact-key wrappers that record codes and rethrow the identical error). §8.2: an exact action grammar |
+| R-R4 awaits / lock | §7.3: an injected monotonic source, per-boundary deadlines, timed-out awaits that end the run (no retry, no continue), and the lock-client lifecycle. Results after a DB failure report the last acknowledged counts, marked stale |
 
 ## 1. Present runtime vs proposed orchestration vs simulated tests
 
 | Layer | Status at this head |
 |---|---|
-| Workers | **Accepted code**, used unchanged: `runOrchestratorStep` (`reservation-worker.js:585`), `runCaptureStep` (`capture-worker.js:600`), `runRecordingStep` (`recording-worker.js:598`), `runCleanupStep` (`compensation-worker.js:643`). Each step does its own scoped maintenance, recovery pass, at most one claim, its own provider calls and its own bounded budget |
-| Executor adapters | **Accepted** (`scripts/e7-connected/executor-adapters.mjs`, `b757d6b7`): immutable per-factory binding, bound-id refusal, one invocation, no retry |
-| Recovery-candidate provenance | Exists **only test-locally** (`recoveryCandidate` in `test/db/e7-connected-adapter-rehearsal.test.mjs`). It does not enforce production provenance or concurrency |
+| Workers | **Accepted code**, used unchanged: `runOrchestratorStep` (`reservation-worker.js:585`), `runCaptureStep` (`capture-worker.js:600`), `runRecordingStep` (`recording-worker.js:598`), `runCleanupStep` (`compensation-worker.js:643`). Each step does its own scoped maintenance, recovery pass, at most one claim, its own provider calls and budget, and may leave a **late tail** (§7.2) |
+| Executor adapters | **Accepted** (`scripts/e7-connected/executor-adapters.mjs`, `b757d6b7`) |
+| Recovery-candidate provenance | **Test-local only** (`test/db/e7-connected-adapter-rehearsal.test.mjs`). It does not enforce production provenance or concurrency |
 | Runner (this contract) | **PROPOSED**. Nothing exists |
-| Real transports, credentials, Stripe TEST ingress, live CLI, file journal | **CLOSED**, separate slices |
+| Real transports, credentials, Stripe TEST ingress, file journal, live CLI | **CLOSED**, separate slices |
 
-## 2. Proposed files and exports (offline foundation only)
+## 2. Proposed files and exports (offline foundation)
 
-All files live under `scripts/` (excluded from upload, `.vercelignore`). They are pure orchestration with injected I/O: there is no `process.env`, no `fetch`, no file system and no SDK. The names avoid the identifiers that accepted containment tests pin (`hostaway-reservations`, `connectedTestAdapterConfig`, `allowRequest:`).
+All files live under `scripts/e7-connected/` (excluded from upload). They are pure orchestration with injected I/O: no `process.env`, `fetch`, file system, SDK, timers or scheduler of their own. They must not contain the identifiers pinned by accepted containment tests: `hostaway-reservations` (`test/hostaway-reservations.test.mjs:544–569`), `connectedTestAdapterConfig` and `allowRequest:` (`test/e4-connected-path.test.mjs:404–421`). The only accepted module they import is the adapter module (`createPhaseExecutors`, `ExecutorRefusal`).
 
-### 2.1 `scripts/e7-connected/run-manifest.mjs`
+### 2.1 `run-manifest.mjs`
 
 `validateRunManifest(input) → { ok:true, manifest, hash } | { ok:false, code }`
-- The manifest is a deep-frozen R-G1 descriptor snapshot.
-- `hash` = sha256 of `'e7-run-manifest-v1\n' + canonical JSON` (sorted keys; strings, safe integers and booleans only).
+- An R-G1 descriptor snapshot, deep-frozen.
+- `hash` = sha256 of `'e7-run-manifest-v1\n' + canonical JSON`: sorted keys, values string / safe integer / boolean / `null`, no other types.
 
-### 2.2 `scripts/e7-connected/run-facts.mjs`
+### 2.2 `run-facts.mjs`
 
-`readRunSnapshot(reportPool, intentId) → frozen facts`
-- One READ ONLY REPEATABLE READ transaction, as the report role; see §4.
+- `readRunSnapshot(reportPool, intentId, deadline) → frozen facts` (§4).
+- `readGuestBinding(appPool, intentId, deadline) → { firstName, lastName, email } | null`. The values are never journaled.
+- `deriveRecoveryCandidate(facts) → { ok:true, id, sources } | { ok:false, code }` (§5).
 
-`readGuestBinding(appPool, intentId) → { firstName, lastName, email } | null`
-- One statement, as the app role. The values are never journaled.
-
-`deriveRecoveryCandidate(facts) → { ok:true, id, sources } | { ok:false, code }`
-- See §5.
-
-### 2.3 `scripts/e7-connected/run-core.mjs`
+### 2.3 `run-core.mjs`
 
 `runConnectedTest(opts) → Promise<frozen RunResult>`
 
-`opts` must have **exactly** these keys:
+`opts` must have exactly these keys:
 
 | Key | Contents |
 |---|---|
 | `manifest` | an object that passes `validateRunManifest` |
-| `intentId` | the existing booking intent (see §6 P0) |
-| `pools` | `{ app, report }`: injected `pg` pools to the ONE disposable test DB |
-| `transports` | `{ hostaway:{send}, stripe:{send} }`: injected, passed straight to `createPhaseExecutors` |
-| `journal` | `{ append(record) → Promise<void>, read() → Promise<record[]> }`: injected, see §8 |
-| `attest` | `(checkpoint, request) → Promise<{ ok:boolean, evidenceRef?:string }>`: injected owner attestation, see §6 |
-| `clock` | `() → ms`: one real clock for all workers (recording's skew gate) |
-| `sleep` | `(ms, signal) → Promise`: injected |
-| `signal` | a genuine run-level `AbortSignal` (checked natively, as in R-A2) |
+| `intentId` | must equal `manifest.intentId`, else `REFUSED: INTENT_MISMATCH` |
+| `pools` | `{ app, report }`: injected pools to ONE disposable TEST DB |
+| `transports` | `{ hostaway:{send}, stripe:{send} }` |
+| `journal` | `{ append(record), read() }` (§8) |
+| `attest` | `(checkpoint, request, { signal }) → Promise<{ ok:boolean, evidenceRef?:string }>` |
+| `clock` | `() → wall ms`: the ONE business clock passed to every worker |
+| `monotonic` | `() → ms`: the deadlines source, never moves backwards |
+| `wait` | `(ms, signal) → Promise`: an injected timer for the inter-step `delayMs` only |
+| `signal` | a genuine run-level `AbortSignal`, inspected natively (R-A2) |
 
 Rules:
-- The options basis is validated and frozen before any await (R-G1 rules).
-- Invalid options → `{ ok:false, code:'OPTIONS_INVALID' }`, with **zero** DB, transport, journal or attest calls.
-
-`RunResult`, frozen:
+- Validation and freezing happen before any await. Invalid options → `{ ok:false, code:'OPTIONS_INVALID' }`, with zero DB, transport, journal or attest calls.
+- `RunResult` (frozen):
 
 ```js
-{ ok, outcome, stopCode?, phase, steps, writes: { create, capture, record, void, cancel }, manifestHash, journalSeq }
+{ ok, outcome, stopCode?, phase, manifestHash, journalSeq,
+  writes: { create, capture, record, void, cancel }, countsAsOf: { seq, stale:boolean },
+  tailOutstanding:boolean, ownerCleanupRequired: null | "reservedNotConfirmed" | "captured" | "confirmed",
+  finalize?: () => Promise<void> }
 ```
 
-| Field | Values |
-|---|---|
-| `outcome` | `COMPLETED_CONFIRMED`, `COMPLETED_RELEASED`, `STOPPED` or `REFUSED` |
-| `writes` | write counts as seen in committed DB rows |
+- `finalize` is present only when a tail is outstanding (§7.2).
 
-### 2.4 `scripts/e7-connected/run-journal-memory.mjs`
+### 2.4 `run-guard.mjs`
 
-`createMemoryJournal({ failAt? })` returns an in-memory journal for offline tests only, with failure injection. A real atomic file journal is a later reviewed slice (§8.4).
+The runner's own wrappers (§5.3) and the deadline helper (§7.3).
 
-## 3. Manifest (one immutable manifest per run; stable hash)
+### 2.5 `run-journal-memory.mjs`
 
-Schema `e7-run-manifest-v1`, exact keys, **no defaults anywhere**:
+`createMemoryJournal({ failAt?, preload? })`: an in-memory journal for offline tests, with failure injection and preload of partial / foreign journals. A file journal is a later, CLOSED slice.
+
+## 3. Manifest v1 and the complete worker-input map
+
+### 3.1 Schema (exact keys; no defaults; owner fields absent → `MANIFEST_OWNER_INPUT_MISSING`)
 
 | Key | Rule |
 |---|---|
 | `version` | `"e7-run-manifest-v1"` |
 | `runId` | `^[a-z0-9-]{8,64}$` |
-| `baselineCommit` | 40-hex commit the run was reviewed at |
-| `synthetic` | boolean. `true` only for offline tests: then every owner field may hold synthetic values, and both transports must be the injected fakes. `false` → every owner field below must be an explicit owner value, and this foundation refuses (`REAL_RUN_NOT_IN_THIS_SLICE`) |
-| `providerMode` | `{ hostaway: "fake" \| "real", stripe: "mock" \| "test" }`. **`"live"` → `S_LIVE_REFUSED`** (the accepted proofs refuse LIVE money: `capture-proof.js:97`, `compensation-proof.js:184`). This foundation accepts only `{hostaway:"fake", stripe:"mock"}` with `synthetic: true` |
-| `listing` | `{ id, currency }` (+ `pilotException` only in the E4 MXN form). USD direction: recording requires USD (`offline-charge-proof.js:33`); `603564` refused; `603566` only as the adapter's pilot exception, never with recording |
-| `stay` | `{ arrival, departure, guests }` |
-| `amountMinor` | positive integer; must equal the intent's `price.finalTotalMinor` |
-| `guest` | `"bound-from-db"`, the only value. The runner never accepts contact data in the manifest; the binding comes from the guest row (§4) |
-| `stripeAccountId` | `acct_…`. TEST-account verification is the capture / cleanup workers' own `accounts.retrieve` id equality (`capture-worker.js:219`); this is not Hostaway ownership |
-| `hostawayAccountLabel` | `{ accountRef, clientSnapshotId }`: **TRUST labels**, not verified account ownership |
-| `paymentMethod` | `"credit_card"` or `"other"`. Required iff recording is in scope |
-| `phases` | `{ capture: boolean, recording: boolean }`. If `providerMode.stripe === "mock"` and Hostaway is real, `recording` must be `false` (`MOCK_MONEY_RECORDING_REFUSED`) |
-| `cleanup` | `{ reservedNotConfirmed, captured, confirmed }`: each a non-empty procedure reference (owner-approved document id), or `"not-applicable"` only when the phase flags make that outcome impossible |
-| `automationsReviewed` | non-empty reference to the Hostaway / Airbnb automation check (their own guest messages / payment requests), or a synthetic marker if `synthetic` |
+| `intentId` | lowercase canonical uuid of the EXISTING intent; part of the hashed run identity |
+| `baselineCommit` | 40 hex |
+| `synthetic` | boolean. `true` = offline tests only (both transports are injected fakes; owner fields may hold synthetic values). `false` → refused in this slice (`REAL_RUN_NOT_IN_THIS_SLICE`) |
+| `providerMode` | `{ hostaway, stripe }`. This slice accepts only `{ "fake", "mock" }`. `stripe: "live"` → `S_LIVE_REFUSED` (`capture-proof.js:97`, `compensation-proof.js:184`). Any other value → `PROVIDER_MODE_NOT_IN_THIS_SLICE` |
+| `listing` | `{ id, currency, refFieldId, timeZone }`, all explicit. `currency` must be `"USD"` (`offline-charge-proof.js:33`, the USD direction). `refFieldId` is a positive integer (required by `validateAdapterConfig`, `hostaway-reservations.js:202`, and by the reservation / recording factories). `timeZone` is an IANA name, required by `compensationWorkerGate` (`LISTING_TIME_ZONE_INVALID`). The pilots 603564 / 603566 → `PILOT_NOT_IN_THIS_SLICE` (§3.3). No `pilotException` key |
+| `expectedRef` | `^MV-[A-Z0-9]{6,10}$`; must equal the intent's `ref` |
+| `stay` | `{ arrival, departure, guests }`; must equal the intent |
+| `amountMinor` | must equal the intent's `price.finalTotalMinor` |
+| `pricing` | `{ rateBps }`: integer 0–10000; must equal the intent's `price.rateBps` (`final-price.js:127`) |
+| `stripeAccountId` | `acct_…` (TEST-account check = the workers' `accounts.retrieve` id equality, `capture-worker.js:219`) |
+| `hostawayAccountLabel` | `{ accountRef, clientSnapshotId }`: **TRUST** labels, not ownership |
+| `phases` | `{ capture, recording }`, booleans. `recording: true` requires `capture: true` (`PHASE_DEPENDENCY`) |
+| `paymentMethod` | **always present.** `"credit_card"` or `"other"` iff `phases.recording`; exactly `null` otherwise (`PAYMENT_METHOD_RULE`). `null` is canonical JSON and is hashed |
+| `cleanup` | `{ reservedNotConfirmed, captured, confirmed }`, each a non-empty owner-approved procedure reference (synthetic marker if `synthetic`). There is no `"not-applicable"`: every outcome a run can leave is covered (§6.2) |
+| `automationsReviewed` | non-empty reference |
 | `checkpoints` | exactly `["CALENDAR_BASELINE", "AIRBNB_BLOCKED", "AIRBNB_REOPENED"]` |
 
-Refusal codes:
-- `MANIFEST_SHAPE`;
-- `MANIFEST_OWNER_INPUT_MISSING` (any owner field absent, empty or defaulted);
-- `S_LIVE_REFUSED`, `MOCK_MONEY_RECORDING_REFUSED`, `PILOT_RULE`, `CURRENCY_RULE`;
-- `REAL_RUN_NOT_IN_THIS_SLICE`.
+**Named invariants (fixed; not owner defaults):**
+- `channelId = 2000`, the direct channel;
+- worker env objects (below);
+- workerIds `e7r-res` / `e7r-cap` / `e7r-rec` / `e7r-cln`.
 
-A transport labelled "fake" does not make a real transport available, and a real transport is never constructed here.
+No value is inferred, read from a runtime config or env, or filled by a synthetic fallback.
 
-## 4. Persisted facts: roles, snapshot, race, exclusive run
+### 3.2 Worker inputs: every value and its source
 
-**Roles.** No owner / schema-owner access is needed:
-- The report role (`mv_booking_report`) may SELECT `intents`, `intent_transitions`, `intent_work`, `external_operations`, `reconciliation_cases`, `provider_evidence` (`0002:36–40`, `0003:709`; RLS `report_ro`, `0002:51`, `0003:720`). It has **no** guest data (`0002:35`, `:50`).
-- The guest row (`intent_guests`) is readable by the app role only (`0002:29–31`, `:49`). The reservation worker itself reads it that way (`reservation-worker.js:179`).
-
-No new API or grant is proposed. The rehearsal's owner-role SELECTs are test-only and are replaced by these roles.
-
-**Snapshot.** `readRunSnapshot` uses ONE short `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` transaction on a fresh report connection. Every fact below comes from one snapshot, and the transaction is committed and released **before** any worker step. No DB transaction is held across a worker or network call. Facts read:
-- the intent (state, version, ref, listing, dates, guests, price, payment, `hostaway_reservation_id`);
-- its operations by type (state, attempts, `result_ref`, `payload`, `dispatched_at`, error code);
-- `hostaway_reservation` evidence, joined to its read-operation type;
-- open reconciliation cases;
-- the `booking.instance` marker.
-
-**Documented race.** The snapshot is only a basis: workers may commit new facts after it, and inside the step. The runner relies on:
-- **(a)** the adapter's immutable binding, which refuses any off-scope id **before** invocation;
-- **(b)** the next snapshot, after the step, as authoritative.
-
-It never acts on a fact it has not observed in a committed snapshot.
-
-**Exclusive run (proposed, enforceable).**
-- **One runner per disposable test DB.** At start the runner takes a session-level `pg_try_advisory_lock(hashtext('e7-connected-runner'), 0)` on a dedicated report-role connection held for the whole run. Not acquired → `REFUSED: RUN_LOCK_HELD`.
-  - This lock coordinates **runners only**. It is not a DB transaction and does not fence workers.
-  - The DB must report `booking.instance = 'test'` (also asserted by every worker).
-- **Scope narrowing.** Every step passes `intentId`, a one-listing `listings` map and the phase's adapter factory. Workers' own scoped maintenance applies. The runner never calls generic or global maintenance, inbox drain, `runNotificationStep` or any owner-alert dispatch.
-- **Not claimed.** The test-local `recoveryCandidate` and this contract do not make production provenance or concurrency safe. Other writers to the same DB are out of scope by construction (disposable DB, one run).
-
-## 5. Candidate provenance before a reservation step
-
-`deriveRecoveryCandidate(snapshot)`, evaluated **before** every reservation step:
-1. **Phase.** The intent state must be `payment_authorized`, `reservation_pending` or `reservation_unknown` (`reservation-worker.js:54`). Anything else → no reservation step.
-2. **Candidates** from committed facts only:
-   - **(a)** a `hostaway.create_reservation` op with `state = succeeded` and a `result_ref`;
-   - **(b)** `hostaway_reservation` evidence from a `hostaway.lookup_reservation` read with status `found_active`, `observed.bookingRef` = the intent ref, `matchCount = 1`; its id is `external_ref`;
-   - **(c)** `intents.hostaway_reservation_id`.
-3. Distinct ids `> 1` → `STOP: CANDIDATE_CONFLICT`. Any protected id among them, or in any evidence or op payload of the intent → `STOP: PROTECTED_REFERENCE`.
-4. **Open reads.** Any open (`pending` / `in_flight`) `hostaway.retrieve_reservation` naming another id → `STOP: OPEN_READ_CONFLICT`.
-5. **Pending create.** If the create op is still `pending` (undispatched) and a candidate exists → `STOP: CANDIDATE_BEFORE_CREATE`. If it is `pending` with no candidate → creation factory (`reservation`, unbound).
-6. **One candidate** → `reservation-recovery` factory bound to it. Creation is impossible; only that id is readable.
-
-Facts first created **during** a step cannot be used beforehand. A step that needs an id not yet derivable runs with the unbound factory: its by-id read refuses with zero provider calls, and the worker records that read as a read failure, the accepted handling of executor rejections.
-
-The runner treats any such refused read in the step result as `STOP: RECOVERY_BINDING_UNAVAILABLE`. It never reruns blindly or guesses. In the accepted rehearsal this never occurred: the candidate was always derivable from facts committed by the previous step (§3 there).
-
-**Post-step audit (supporting evidence only).** Every by-id read executed in the step named the bound id, and the write counts did not exceed one per accepted op.
-
-## 6. Phases, gates and pauses
-
-The foundation starts from an **existing** intent in `payment_authorized`, whose listing / dates / guests / amount / ref match the manifest.
-- **Authorization fixture.** For offline tests, the booking up to `payment_authorized` is produced by synthetic setup with a mocked authorization, as in the accepted rehearsals. It is labelled a fixture and proves nothing about a real card.
-- **Verified TEST ingress.** A verified Stripe TEST checkout + webhook (`processVerifiedStripeEvent`, `stripe-test-webhook.js:102`) is a separate CLOSED slice.
-
-The two are never conflated: `manifest.synthetic === true` ⇒ fixture only.
-
-| # | Phase | Entry gate | Worker / bound | Exit |
+| Input | Reservation | Capture | Recording | Cleanup |
 |---|---|---|---|---|
-| P0 | Preflight | Options + manifest valid; run lock; marker `test`; intent identity = manifest; no open case; no op `outcome_unknown` / `escalated` / `in_flight`; protected-reference scan clean; journal head consistent (§8) | none | journal `RUN_STARTED` |
-| P1 | Pre-create gate | **All** cleanup procedures present for every possible outcome: reserved-not-confirmed (incl. a real reservation with no capture), captured, confirmed. `automationsReviewed` present. `attest("CALENDAR_BASELINE")` ok with an `evidenceRef` | none | — |
-| P2 | Reservation | Fresh snapshot + §5 before **each** step | `runOrchestratorStep`; ≤ 12 steps, ≤ 15 min elapsed (covers `FRESH_AFTER_DISPATCH_MS` 2 min, `recovery-plan.js:30`, and grace 2 min, `recovery.js:28`) | `reservation_confirmed` → `attest("AIRBNB_BLOCKED")`; `reservation_failed` → P5 |
-| P3 | Capture (if `phases.capture`) | Fresh snapshot: **no open case**, no unknown / escalated op. The capture worker has no open-case check of its own (no `reconciliation_cases` reference in `capture-worker.js` / `capture-proof.js`), so this gate is the runner's | `runCaptureStep`; ≤ 6 steps, ≤ 10 min | `payment_captured` |
-| P4 | Recording (if `phases.recording`) | Same gates + USD + method | `runRecordingStep`; ≤ 6 steps, ≤ 10 min | `confirmed` → `COMPLETED_CONFIRMED` |
-| P5 | Failure compensation | Only `reservation_failed` / `capture_failed` (`compensation-worker.js:50`), state-specific (`:103–107`) | `runCleanupStep`; ≤ 8 steps, ≤ 15 min | `authorization_released` / `cancelled` → `attest("AIRBNB_REOPENED")` if a reservation had existed → `COMPLETED_RELEASED` |
+| `env` (object literal built by run-core, never `process.env`) | `{ VERCEL_ENV:"development", MV_E7_RESERVATION_WORKER:"enabled", DIRECT_DISCOUNT_BPS:String(manifest.pricing.rateBps) }`. The worker derives its pricing policy from this object (`readDirectPolicyFromEnv`, `direct-policy.js:13`, `:19–31`); the value is explicit, never the default | `{ VERCEL_ENV:"development", MV_E7_CAPTURE_WORKER:"enabled" }` | `{ …, MV_E7_RECORDING_WORKER:"enabled" }` | `{ …, MV_E7_COMPENSATION_WORKER:"enabled" }` |
+| `adapterConfig` | plain `{ allowedListingIds:[listing.id], refFieldId:listing.refFieldId, channelId:2000, currency:listing.currency }`, validated **by the worker gate itself** (`reservation-worker.js:133`, `capture-worker.js:81`, `compensation-worker.js` gate). run-core does not import the pinned Hostaway adapter module | same | — | same |
+| `listings` | `Map([[id, { currency }]])` | same | `Map([[id, { accountRef, channelId:2000, currency, listingId:id, paymentMethod, refFieldId }]])` (`recording-worker.js:78–86`) | `Map([[id, { currency, timeZone }]])` |
+| `stripeAccountId` | — | `manifest.stripeAccountId` | — | same |
+| `executors` | `createPhaseExecutors`: phase `reservation` or `reservation-recovery` (§5); binding from the intent snapshot + guest row | phase `capture`; binding = intent, adopted reservation id, PI, `amountMinor`, `captureIdempotencyKey` = the open capture op's `payload.providerIdempotencyKey` | phase `recording`; binding = intent, reservation id, `capturedMinor`, `paymentMethod`, labels | phase `cleanup`; reservation id or `null`, PI, `voidIdempotencyKey` = the open void op's payload |
+| `clock` | `opts.clock` (one real clock for all four, satisfying the recording skew gate) | same | same | same |
+| `intentId` | `manifest.intentId` | same | same | same |
+| `workerId` | `e7r-res` | `e7r-cap` | `e7r-rec` | `e7r-cln` |
 
-Rules for every phase:
-- **Between steps** the runner sleeps the worker's returned `delayMs`, capped by the phase budget, and awaits the step's `late` promise (bounded by the phase budget) before the next snapshot.
-- **Run-level signal.** If it is aborted, the runner stops **between** steps (`STOPPED: CANCELLED`). It never aborts a step from outside; the step's own budgets apply.
-- **Attestations** are owner statements with evidence references. Program state is never proof of Airbnb behaviour. A declined or failed attestation → `STOPPED: OWNER_DECLINED` / `ATTESTATION_FAILED`, with no further action.
-- **A successfully reserved booking that cannot reach `confirmed`** (stop, mock money, P branch) is never "cleaned up" by the runner. It ends `STOPPED`, and the owner procedure in `manifest.cleanup.reservedNotConfirmed` applies. No automatic cancel / refund exists for a successful reserved / captured / confirmed booking, and none is designed here.
+### 3.3 Pilot listing: a genuine containment blocker (no workaround)
 
-## 7. STOP policy
+A pilot listing (603566) requires the module-private branded config minted by the pinned adapter module. Workers reject any plain object with those fields (`hostaway-reservations.js:25–28`). Producing it from run-core would add a new importer and a new `connectedTestAdapterConfig` user. Both are pinned by accepted tests:
+- `test/hostaway-reservations.test.mjs:566`;
+- `test/e4-connected-path.test.mjs:416`.
 
-Any of the following **ends the automatic run**. After it, the runner makes no further worker step, provider call, release or retry, and writes only a final journal record (if possible).
+V1 therefore refuses pilots (`PILOT_NOT_IN_THIS_SLICE`). **Smallest test-pin change, if root ever wants the pilot:** add `scripts/e7-connected/run-core.mjs` to those two pinned lists, in a separately reviewed slice. It is not proposed now.
+
+## 4. Persisted facts: roles, snapshot, race
+
+**Roles.** No owner access is needed:
+- Provenance facts are read by the report role (`mv_booking_report`): `intents`, `intent_transitions`, `intent_work`, `external_operations`, `reconciliation_cases` (`0002:36–40`, RLS `report_ro` `0002:51`) and `provider_evidence` (`0003:709`, RLS `0003:720`).
+- The report role has no guest data (`0002:35`, `:50`). The guest row is read by the app role (`0002:29–31`, `:49`), as the reservation worker itself does (`reservation-worker.js:179`).
+- No new grant or API is proposed.
+
+**Snapshot.** One `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` on a fresh report connection:
+- it contains every fact listed in §5, plus open cases, the ops of all five provider-write types with their states, and the `booking.instance` marker;
+- then `COMMIT` and release, all **before** the step.
+
+No transaction is held across a worker or network call. A failure inside the snapshot destroys that connection (`release(true)`) with no further SQL, and the run ends with `DB_FAILURE` (§7).
+
+**Race (documented).** Workers commit new facts during the step, and possibly in a late tail (§7.2) after it. A snapshot is a basis, never a guarantee. Off-scope provider ids are prevented by the adapter's immutable binding **before** invocation. The next snapshot is authoritative.
+
+## 5. Candidate provenance, factory choice and refusal observation
+
+### 5.1 `deriveRecoveryCandidate`, before every reservation step
+
+1. **Phase.** State ∈ `payment_authorized`, `reservation_pending`, `reservation_unknown` (`reservation-worker.js:54`).
+2. **Candidates:**
+   - **(a)** a `hostaway.create_reservation` op with `state = succeeded` and a `result_ref`;
+   - **(b)** lookup-read evidence with `found_active`, `observed.bookingRef = expectedRef` and `matchCount = 1` (its `external_ref`);
+   - **(c)** `intents.hostaway_reservation_id`.
+3. More than one distinct id → `CANDIDATE_CONFLICT`. Any protected id anywhere in the intent's ops / evidence → `PROTECTED_REFERENCE`.
+4. An open `hostaway.retrieve_reservation` naming another id → `OPEN_READ_CONFLICT`.
+5. A `pending` (undispatched) create and a candidate together → `CANDIDATE_BEFORE_CREATE`.
+6. **Factory:** one candidate → `reservation-recovery` bound to it; none → `reservation` (unbound).
+
+### 5.2 Same-step facts
+
+The worker may queue and claim a by-id read within the step (`reservation-worker.js:603–605`; accepted rehearsal §3.1). A read that needs an id not derivable beforehand meets the unbound factory's `RESERVATION_UNBOUND` refusal, with zero provider calls. The run then **STOPs** (§5.3); it never guesses or reruns blindly.
+
+### 5.3 Observing refusals (runner code only; no worker change)
+
+The workers swallow executor rejections. For example, `executeRead` turns a rejected `retrieveReservation` into `READ_REPLY_NOT_USABLE` / `READ:hostaway.retrieve_reservation:error` (`reservation-worker.js:238–239`). The step result never exposes the adapter's code.
+
+`run-guard.mjs` therefore wraps the factory output in **exact-key wrappers** with the same key set:
+- `pricing` is wrapped as an object with `get` / `post`;
+- recording's `label` is passed through unchanged.
+
+Each wrapper calls the adapter function with the identical arguments. If it rejects with an `ExecutorRefusal`, the wrapper records **only** `{ key, code }` (code `^[A-Z_]{1,40}$`) in a per-step list and rethrows **the identical error object**. Any other rejection is rethrown identically, unrecorded; that is the transport-failure path. The wrappers never read arguments, replies or messages, and never retry.
+
+**STOP rules after each step:**
+- any recorded refusal → `STOPPED: ADAPTER_REFUSED`, journaled with the code; `RESERVATION_UNBOUND` → `RECOVERY_BINDING_UNAVAILABLE`;
+- in addition, conservatively, any `READ:<type>:error` action → `STOPPED: READ_FAILED`. V1 does not try to tell transient errors from refusals.
+
+**Post-step audit (supporting only):** every executed by-id read named the bound id, and write counts ≤ 1 per accepted op.
+
+## 6. Phases, dependencies, terminal outcomes
+
+### 6.1 Phases
+
+| # | Phase | Entry gate | Worker, bounds | Exit |
+|---|---|---|---|---|
+| P0 | Preflight | Options + manifest valid. `opts.intentId = manifest.intentId`. Run lock acquired (§7.4). Marker `test`. **Journal empty** (§8.4). Intent `payment_authorized` and identity = manifest (ref, listing, stay, amount, `rateBps`, currency). No op of the five write types beyond the accepted pre-reservation state. No open case. Protected scan clean | none | journal `RUN_STARTED` (acknowledged) |
+| P1 | Pre-create gate | Manifest cleanup procedures for **every** outcome + `automationsReviewed`. `attest("CALENDAR_BASELINE")` ok with `evidenceRef` | none | `ATTESTED` |
+| P2 | Reservation | Snapshot + §5 before each step | `runOrchestratorStep`: ≤ 12 steps; phase ≤ 15 min monotonic | `reservation_confirmed` → `attest("AIRBNB_BLOCKED")`; `reservation_failed` → P5 |
+| P3 | Capture (iff `phases.capture`) | Snapshot: no open case; no unknown / escalated / in-flight op. The capture worker has no open-case check (`capture-worker.js` / `capture-proof.js` contain no `reconciliation_cases` reference); this gate is the runner's | `runCaptureStep`: ≤ 6 steps, ≤ 10 min | `payment_captured` |
+| P4 | Recording (iff `phases.recording`) | Same gates | `runRecordingStep`: ≤ 6 steps, ≤ 10 min | `confirmed` |
+| P5 | Failure compensation | Only `reservation_failed` / `capture_failed` (`compensation-worker.js:50`), state-specific (`:103–107`) | `runCleanupStep`: ≤ 8 steps, ≤ 15 min | `authorization_released` / `cancelled` → `attest("AIRBNB_REOPENED")` iff a reservation had existed |
+
+### 6.2 Terminal outcomes
+
+A run never reports success while leaving a standing reservation or captured money unaccounted for:
+
+| Path | `outcome` | `ok` | `ownerCleanupRequired` |
+|---|---|---|---|
+| P2 → `reservation_confirmed`, `capture: false` | `ENDED_RESERVED_NOT_CAPTURED` | true (plan end) | `reservedNotConfirmed` (a real reservation with no capture) |
+| P3 → `payment_captured`, `recording: false` | `ENDED_CAPTURED_NOT_RECORDED` | true | `captured` |
+| P4 → `confirmed` | `ENDED_CONFIRMED` | true | `confirmed` |
+| P5 → `authorization_released` / `cancelled` | `ENDED_RELEASED` | true | null (no reservation standing), or `reservedNotConfirmed` if the cleanup left one |
+| Any STOP after a reservation exists | `STOPPED` | false | the matching key by state |
+| Any STOP before a create was dispatched | `STOPPED` | false | null |
+
+No automatic cancel / refund exists for a successful reserved / captured / confirmed booking, and none is designed here.
+
+**Authorization fixture vs verified TEST ingress.** V1 starts only from an existing `payment_authorized` intent:
+- in offline tests, that intent is produced by labelled synthetic fixture setup with a mocked authorization;
+- verified Stripe TEST ingress (`processVerifiedStripeEvent`, `stripe-test-webhook.js:102`) is a separate CLOSED slice.
+
+Attestations are owner statements with evidence references; program state never proves Airbnb behaviour.
+
+## 7. STOP policy, tails, bounded awaits, lock lifecycle
+
+### 7.1 STOP codes
+
+Each code ends the automatic run. Afterwards: no further worker step, provider call, release or retry. At most one final journal append is attempted, and only if the journal itself has not failed.
 
 | Code | Trigger |
 |---|---|
-| `DB_FAILURE` | any thrown error from a DB call or a worker step (outer DB failure / COMMIT uncertainty); the original error is not kept or journaled, code only |
-| `PROTECTED_REFERENCE` | a protected id anywhere in snapshot facts or step results |
-| `CANDIDATE_CONFLICT`, `OPEN_READ_CONFLICT`, `CANDIDATE_BEFORE_CREATE`, `RECOVERY_BINDING_UNAVAILABLE` | §5 |
-| `UNKNOWN_WRITE` | any provider-write op `outcome_unknown` / `escalated`, or an `UNKNOWN:` / `*_OUTCOME_UNKNOWN` action |
-| `OPEN_CASE` | any open reconciliation case for the intent, checked after every step. **Scenario C:** `reservation_confirmed` does **not** clear `HOSTAWAY_CREATE_OUTCOME_UNKNOWN`, so the run stops before capture. A later read-only recovery or review needs a separate, explicitly approved, bounded phase in a later approval. An ended run is never resumed silently, and the runner never closes cases |
-| `STEP_REFUSED` | a worker returned `status: "refused"` (gate) |
-| `STATE_UNEXPECTED` | a state outside the phase's allowed set |
-| `BUDGET_EXHAUSTED` | step count / elapsed budget reached |
-| `JOURNAL_FAILURE` | an append failed (§8) |
-| `CANCELLED`, `OWNER_DECLINED`, `ATTESTATION_FAILED` | §6 |
+| `DB_FAILURE` | any thrown DB / worker error (outer failure / COMMIT uncertainty); code only, the error is not kept |
+| `PROTECTED_REFERENCE` | a protected id appears in the run's facts |
+| `CANDIDATE_CONFLICT`, `OPEN_READ_CONFLICT`, `CANDIDATE_BEFORE_CREATE` | §5.1 |
+| `RECOVERY_BINDING_UNAVAILABLE`, `ADAPTER_REFUSED`, `READ_FAILED` | §5.3 |
+| `UNKNOWN_WRITE` | a write op `outcome_unknown` / `escalated`, or an unknown action |
+| `OPEN_CASE` | any open case, checked after every step. **Scenario C:** `reservation_confirmed` does not clear `HOSTAWAY_CREATE_OUTCOME_UNKNOWN`, so the run stops before capture. Any later read-only recovery or review needs a separately approved, bounded phase. The runner never closes cases and never resumes |
+| `STEP_REFUSED` | a worker returned `refused` |
+| `STATE_UNEXPECTED` | — |
+| `BUDGET_EXHAUSTED` | — |
+| `JOURNAL_FAILURE` | — |
+| `CANCELLED`, `OWNER_DECLINED`, `ATTESTATION_FAILED` | — |
+| `LATE_TAIL_OUTSTANDING` | §7.2 |
+| `TIMEOUT_<BOUNDARY>` | §7.3 |
 
-**Boundary (what the runner cannot prevent).** Inside one call to an accepted step function, the worker performs its own maintenance, recovery pass, reads and at most one write, under its own fences. The runner acts only **between** steps: it cannot stop a write already inside a step, and it cannot undo one.
+**Boundary.** Inside one call to a step function, the accepted worker does its own maintenance, recovery, reads and at most one write, under its own fences. The runner acts only between steps and cannot stop or undo anything inside a step or its tail.
 
-B's `RECOVER_INTERRUPTED → reservation_unknown` is the worker's accepted behaviour. That path has no unknown write and no open case, so P2 may continue its bounded read-only recovery steps (the recovery factory makes creation impossible). C's path stops at `UNKNOWN_WRITE` / `OPEN_CASE` immediately after the create step.
+### 7.2 Asynchronous worker tails (accepted behaviour, observed only)
 
-## 8. Journal and restart
+After a timeout, the workers record a late provider result as late evidence and **never** as another provider write:
+- reservation: `reservation-worker.js:76`, `:374–377`, `lateCreateResult` `:454`;
+- capture: `capture-worker.js:447`;
+- cleanup: `compensation-worker.js:435`, `:533`;
+- recording: `observeLate`, `recording-worker.js:485–494`.
+
+The reservation, capture and cleanup tails wait on `call.raw`, which an unresolved provider promise can keep pending **forever**. Recording's tail is bounded by `lateWindowMs` 30 s (`recording-worker.js:32`). Each step result returns `late` (`Promise.allSettled(ctx.late)`).
+
+**Runner behaviour:**
+- After every step, `late` is observed with a deadline of `TAIL_OBSERVE_MS` = 35 s, monotonic. It is never awaited without bound.
+- **Settled** within the deadline → continue to the next snapshot.
+- **Not settled** → `STOPPED: LATE_TAIL_OUTSTANDING`, journaled, with `tailOutstanding: true`. The runner starts no next worker, does not reuse the step's resources as if the tail had vanished, and does **not** release the run lock.
+  - The result carries `finalize()`. The caller may call it after it decides the tail is settled or abandoned: it waits for `late` (no runner timeout; the caller owns the process lifetime), then performs the normal lock release (§7.4).
+  - The injected pools are caller-owned and never closed by the runner.
+  - The result states plainly that the tail **may still write late evidence to the DB after `runConnectedTest` returns** (never another provider write), and that the runner provides no cancellation or DB-silence guarantee the accepted worker does not provide.
+
+### 7.3 Bounded awaits
+
+All deadlines use `opts.monotonic`. There is no timer loop or scheduler outside this invocation. A timed-out await **ends the run with `TIMEOUT_<BOUNDARY>`**. It never retries and never continues after an uncertain operation. The timed-out underlying work is **not** cancelled by the timeout (observation bound ≠ work bound).
+
+| Boundary | Limit | On timeout |
+|---|---|---|
+| pool connect | 5 s | `TIMEOUT_DB_CONNECT` |
+| snapshot / guest read (per statement + txn) | 5 s | `TIMEOUT_DB_READ`; the connection is destroyed, no further SQL |
+| worker step | worker `stepBudgetMs` (45–60 s, `*_DEFAULT_TIMEOUTS`) + 30 s observation margin | `TIMEOUT_STEP`: treated like an outstanding tail; no next step, lock retained, `finalize` offered |
+| late tail | 35 s | `LATE_TAIL_OUTSTANDING` |
+| journal append / read | 5 s | `TIMEOUT_JOURNAL` → also `JOURNAL_FAILURE` semantics (no further append) |
+| attest | 30 min per checkpoint (fixed) | `TIMEOUT_ATTEST` |
+| inter-step wait | `min(delayMs, remaining phase budget)` | phase budget exhausted → `BUDGET_EXHAUSTED` |
+| phase | §6.1 | `BUDGET_EXHAUSTED` |
+
+**Run-level signal.** Checked natively before every boundary. Aborted → `CANCELLED` between steps; it is never forced into a step.
+
+### 7.4 Run lock lifecycle
+
+- **Acquire.** A dedicated client from `pools.report`. `SELECT pg_try_advisory_lock(hashtext('e7-connected-runner'), 0)`; false → `REFUSED: RUN_LOCK_HELD`, and the client is destroyed. The lock coordinates runners only; it is not a worker fence.
+- **Normal end.** `SELECT pg_advisory_unlock(…)`, then `client.release(true)`: the connection is **destroyed**, never returned to the pool with or without the lock.
+- **DB failure on the lock client, or any `DB_FAILURE` / `TIMEOUT_DB_*`.** No further SQL on that client (no unlock, rollback or release work): `client.release(true)` destroys it, and the server ends the session and its lock.
+- **Outstanding tail / step timeout.** The lock is retained until `finalize()`.
+
+### 7.5 Results after a failure
+
+There is no re-snapshot after `DB_FAILURE` or any timeout just to fill the result. `writes` are the **last acknowledged snapshot's** committed counts, with `countsAsOf: { seq, stale: true }`.
+
+## 8. Journal (V1)
 
 ### 8.1 Authority
 
-Committed DB operation state is **authoritative**. The journal is an audit / approval binding, never a retry authority. The runner never mints a new intent, key or attempt to get around uncertainty. It never replays a possibly-sent write, and never replays a phase because a journal write failed.
+DB state is authoritative. The journal is an audit / approval binding, never a retry authority:
+- no new intent, key or attempt to bypass uncertainty;
+- no replay of a possibly-sent write;
+- no phase replay because a journal write failed.
 
-### 8.2 Record format (JSONL; one record per event)
+A new manifest or runId is never authority to bypass a dispatched / unknown op or an ended run. Later action requires separately reviewed scope.
+
+### 8.2 Record
 
 ```
-{ v:1, seq, prevHash, runId, manifestHash, baselineCommit, at, event, phase?, step?, intentId,
-  state?, codes?: [..], writes?: {create,capture,record,void,cancel}, factory?: {phase, reservationId|null}, attestation?: {checkpoint, evidenceRef} }
+{ v:1, seq, prevHash, runId, intentId, manifestHash, baselineCommit, at, event, phase?, step?,
+  state?, actions?: [token], refusals?: [{key, code}], writes?, factory?: {phase, reservationId|null}, attestation?: {checkpoint, evidenceRef}, code? }
 ```
 
-- Events: `RUN_STARTED`, `STEP_STARTED`, `STEP_ENDED`, `PHASE_ENDED`, `ATTESTED`, `RUN_STOPPED`, `RUN_COMPLETED`.
-- `prevHash` is the sha256 of the previous record line, so a gap or edit is detectable.
-- **Redaction.**
-  - Allowed: codes, ids, counts, states, hashes.
-  - Never: secrets, tokens, raw provider replies, error messages, guest name / e-mail / phone, card data.
-  - Worker `actions` are reduced to the allowlisted code prefixes (`RESERVATION_*`, `CAPTURE_*`, `READ:*`, `RECOVERY:*`, `WAIT:*`, `STOP:*`, `UNKNOWN:*`).
+- `event` ∈ `RUN_STARTED`, `STEP_STARTED`, `STEP_ENDED`, `PHASE_ENDED`, `ATTESTED`, `RUN_STOPPED`, `RUN_ENDED`.
+- `prevHash` = sha256 of the previous record's canonical JSON, `"0"×64` for `seq` 1.
 
-### 8.3 Crash windows
+**Action grammar (exact; anything else is counted as `unlistedActions: n`, with no content):**
 
-| Window | Persisted | Restart behaviour |
+```
+token    := NAME ( ":" CODE )? ( "->" STATE )?  |  "READ:" OPTYPE ":" OUTCOME  |  "RECOVERY:READ:" OPTYPE  |  "RECOVERY:" EVENT
+NAME     := RESERVATION_STARTED | RESERVATION_DISPATCHED | CREATE_CLAIMED | RESERVATION_SUCCEEDED | CREATE_REF_NOT_ECHOED
+            | RESERVATION_OUTCOME_UNKNOWN | CAPTURE_CLAIMED | CAPTURE_SUCCEEDED | CAPTURE_OUTCOME_UNKNOWN | ASSESSED | CLAIMED
+            | COMPLETED | RECORDED | VOID_SUCCEEDED | ESCALATE | WAIT | STOP | UNKNOWN | SEND_ABORTED | LEASE_LOST
+CODE     := [A-Z0-9_]{1,40}
+STATE    := one of the 0001 intent states
+OPTYPE   := hostaway.lookup_reservation | hostaway.retrieve_reservation | stripe.retrieve_payment_intent | hostaway.list_offline_charges
+OUTCOME  := found | not_found | conflict | error | lease_lost
+EVENT    := RECONCILED_RESERVATION_FOUND | RECONCILED_CAPTURE_SUCCEEDED | RECONCILIATION_INCONCLUSIVE | ESCALATE:CODE
+```
+
+The final grammar is taken from the worker sources at implementation time and pinned by a test. Tokens are matched whole, never by prefix.
+
+**Redaction.** Allowed: ids, codes, counts, states, hashes, `evidenceRef`. Never: secrets, tokens, raw replies, error messages, guest name / e-mail / phone, card data.
+
+**Integrity.** The hash chain is integrity evidence **relative to a trusted head** (e.g. the owner records the final `seq` + hash). It is not authentication: someone who can rewrite the whole chain can forge it.
+
+### 8.3 Crash windows (V1: none of them resumes)
+
+| Window | DB | Next invocation |
 |---|---|---|
-| Before `STEP_STARTED` is acknowledged | DB unchanged by this step | Re-snapshot; may continue only via §8.5 |
-| After `STEP_STARTED`, during / after the worker commit, before `STEP_ENDED` | Worker effects committed (or uncertain) | DB snapshot decides. Any in-flight / unknown op or open case → `STOPPED`, never re-sent |
-| After `STEP_ENDED` | Both | Normal |
-| Journal append fails | — | `STOPPED: JOURNAL_FAILURE` immediately: no next step, no "replay to fix the journal" |
+| Before `RUN_STARTED` is acknowledged | unchanged | Journal empty or unacknowledged → see §8.4. The intent is still `payment_authorized` with no dispatched op → a fresh start is allowed only if the journal is empty |
+| After `RUN_STARTED`, anywhere until a terminal record | committed or uncertain | `RESTART_AMBIGUOUS`, **no worker invocation**, even if the DB looks successful |
+| After `RUN_STOPPED` / `RUN_ENDED` | — | `RUN_ENDED` |
+| Journal append fails mid-run | — | `JOURNAL_FAILURE` now: no further step or append |
 
-### 8.4 Persistence (later slice, CLOSED here)
+### 8.4 Start / restart rule (V1)
 
-- The file journal will be local filesystem only, append + fsync per record, in a directory chosen by the owner.
-- The first record must be the manifest hash; an existing journal for another hash → `REFUSED: MANIFEST_MISMATCH`.
-- A partial / torn last line → `REFUSED: JOURNAL_PARTIAL`, owner review.
+Before P0 work, the runner reads the journal and validates **all** records:
+- shape; `v`;
+- `seq` contiguity;
+- `prevHash` chain;
+- identical `runId`, `intentId`, `manifestHash` and `baselineCommit` throughout, equal to this manifest;
+- the event grammar and order (`RUN_STARTED` first; at most one terminal record, and it is last).
 
-### 8.5 Restart
+| Journal | Result |
+|---|---|
+| Empty, and the intent is eligible (§6.1 P0) | Start |
+| Any acknowledged `RUN_STARTED` without a terminal record | `REFUSED: RESTART_AMBIGUOUS` |
+| A terminal record | `REFUSED: RUN_ENDED` |
+| A record for another run / intent / manifest / baseline | `REFUSED: MANIFEST_MISMATCH` |
+| Torn / unparsable last record | `REFUSED: JOURNAL_PARTIAL` |
+| Chain or seq break | `REFUSED: JOURNAL_CHAIN_INVALID` |
+| A grammar violation | `REFUSED: JOURNAL_MALFORMED` |
 
-A new invocation with the same manifest hash and journal:
-- It runs P0 (§6) plus a journal-vs-DB comparison: last journal state vs DB state, and journal write counts vs committed DB counts.
-- The run continues **only** if the journal ends without `RUN_STOPPED` / `RUN_COMPLETED`, the DB shows no in-flight / unknown / escalated op, there is no open case, and the counts are consistent.
-- Otherwise → `REFUSED: RESTART_AMBIGUOUS` or `RUN_ENDED`.
-- A stopped or completed run is **never** resumed. Any later action needs a new reviewed manifest and approval.
+All refusals happen with **zero** worker, transport or attest calls. No general resume exists in V1.
 
 ## 9. Smallest OFFLINE implementation slice (for root approval; not started)
 
 **Proposed allowed files:**
-- the four `scripts/e7-connected/run-*.mjs` above;
+- `scripts/e7-connected/run-manifest.mjs`, `run-facts.mjs`, `run-guard.mjs`, `run-core.mjs`, `run-journal-memory.mjs`;
 - `test/e7-connected-run-manifest.test.mjs` (unit);
-- `test/db/e7-connected-runner.test.mjs` (disposable PG, injected fakes, memory journal);
+- `test/db/e7-connected-runner.test.mjs` (disposable PG, fakes, fixture authorization, fake monotonic / wait);
 - status pointers.
 
-No change to workers, `lib/`, SQL, fixtures, config or packages.
+No worker, `lib/`, SQL, fixture, config, package or containment-pin change.
 
-**Acceptance tests (synthetic, fetch guard, fake transports):**
-1. Manifest:
-   - every owner field missing → refused;
-   - `S-LIVE`, mock-money recording, pilot / currency rules refused;
-   - `synthetic: false` → `REAL_RUN_NOT_IN_THIS_SLICE`;
-   - stable hash; descriptor / proxy probes;
-   - zero calls on refusal.
-2. Happy chain (A) → `COMPLETED_CONFIRMED`: one write each, notify queued, journal sequence + hash chain, redaction (no guest values in the journal).
-3. Same-step recovery binding (B): no-echo → candidate (a) before the next step → recovery factory → the by-id read executed in-step → `reservation_confirmed` → capture → recording; exactly one by-id read; no second create.
-4. Open-case stop (C): `STOPPED: UNKNOWN_WRITE` / `OPEN_CASE` before any capture call (capture transport count 0); the case is left open; the run cannot be resumed.
-5. Failure void-only (D) → `COMPLETED_RELEASED`, zero Hostaway cancel / create.
-6. Thrown DB / worker error → `STOPPED: DB_FAILURE`, with no follow-up step / provider call / journal step record (asserted via counters).
-7. Restart: crash after a worker commit before `STEP_ENDED` with an unknown op → `RESTART_AMBIGUOUS`, no resend. Clean restart continues. A completed / stopped run → `RUN_ENDED`.
-8. Manifest mismatch → refused; partial journal → refused (memory-journal simulation).
-9. Protected id planted in synthetic evidence → `STOPPED: PROTECTED_REFERENCE`, zero provider calls after.
-10. Bounded steps → `BUDGET_EXHAUSTED`; run lock held → `RUN_LOCK_HELD`; run-level signal aborted between steps → `CANCELLED` (no step started).
-11. Journal append failure → `JOURNAL_FAILURE`, no next step.
+**Acceptance matrix (all synthetic; fetch guard):**
 
-**Blockers and minimal proposed changes.** None to the accepted workers.
-- The runner uses only existing step functions, the adapters, and role-appropriate SELECTs.
-- A real run additionally needs closed slices:
+| # | Case | Expected |
+|---|---|---|
+| 1 | Manifest: each owner field missing; S-LIVE; recording without capture; `paymentMethod` rule; pilots; non-USD; `synthetic:false`; non-fake modes; descriptor / proxy probes; stable hash | Refusal codes; zero calls |
+| 2 | `opts.intentId` ≠ manifest; identity mismatch (ref / stay / amount / `rateBps`) | `INTENT_MISMATCH` / P0 refusal; zero worker calls |
+| 3 | Happy chain with capture + recording | `ENDED_CONFIRMED`, `ownerCleanupRequired: confirmed`; one write each; notify queued; journal chain + redaction (no guest values) |
+| 4 | `capture:false`; `recording:false` | `ENDED_RESERVED_NOT_CAPTURED` / `ENDED_CAPTURED_NOT_RECORDED` with the matching cleanup key; never "success" without it |
+| 5 | Same-step recovery binding (no echo) | Candidate (a) before the next step; by-id read executed in-step; one create; continues |
+| 6 | Unbound-factory by-id refusal (a planted fixture that queues a by-id read with no derivable candidate) | `RECOVERY_BINDING_UNAVAILABLE` via the run-guard recorder; zero provider calls for it; identical error rethrown to the worker |
+| 7 | Applied-then-503 create (C) | `STOPPED: UNKNOWN_WRITE` / `OPEN_CASE` before any capture call; case left open |
+| 8 | Failure void-only (D) | `ENDED_RELEASED`; zero Hostaway cancel / create |
+| 9 | Thrown worker / DB error; COMMIT-loss simulation on the snapshot; lock-client failure | `DB_FAILURE`; zero follow-up step / provider call / SQL on the failed client; lock client destroyed; `countsAsOf.stale` |
+| 10 | Unresolved fake create / capture raw promise (worker timeout path) | `LATE_TAIL_OUTSTANDING`; no next step; lock retained; `finalize()` releases after the tail; a late-evidence write after return is allowed and asserted to be evidence only |
+| 11 | Hanging journal / attest / pool connect (fake monotonic) | `TIMEOUT_*`; no retry, no continue |
+| 12 | Journal failure at each event | `JOURNAL_FAILURE`; no further step or append |
+| 13 | Restart: acknowledged `RUN_STARTED` without a terminal record (even with the DB at `reservation_confirmed`); terminal record; foreign / partial / chain-broken / malformed journals | `RESTART_AMBIGUOUS` / `RUN_ENDED` / respective refusal; zero worker calls |
+| 14 | Protected id planted in synthetic evidence | `PROTECTED_REFERENCE` |
+| 15 | Run lock held | `RUN_LOCK_HELD` |
+| 16 | Step / phase budget | `BUDGET_EXHAUSTED` |
+| 17 | Run-level signal aborted between steps | `CANCELLED` |
+| 18 | Attestation declined | `OWNER_DECLINED` |
+
+**Remaining true blockers.** None for this offline slice.
+- **Pilot listing:** a containment blocker (§3.3); V1 refuses it.
+- **A real run** needs the CLOSED slices:
   - real transports with proven zero automatic retries;
   - a credential loader;
   - Stripe TEST ingress;
   - the file journal;
   - a live CLI;
-  - the read-only provider probes (cancel / offline-charge endpoints remain LIVE-UNVERIFIED);
-  - the owner decisions below.
+  - read-only provider probes (cancel / offline-charge mappings remain LIVE-UNVERIFIED);
+  - owner decisions.
 
-## 10. Owner decisions (UNSET; for the later consolidated approval, not needed for the offline slice)
+## 10. Owner decisions (UNSET; not needed for the offline slice)
 
-1. Listing and currency.
+1. Listing (with its ref field and time zone) and currency.
 2. Dates, guest and amount.
-3. Verified Stripe TEST account and Hostaway account.
-4. `paymentMethod`.
-5. Provider mode and phase scope.
-6. Hostaway / Airbnb automation scope.
-7. The cleanup procedure for every possible outcome.
+3. Pricing rate (must equal the booking's).
+4. Verified Stripe TEST account and Hostaway account.
+5. `paymentMethod`.
+6. Provider mode and phase scope.
+7. Hostaway / Airbnb automation scope.
+8. The cleanup procedure for every outcome.
 
 Routine technical choices (budgets, journal format, lock key, file layout) are root's.
