@@ -2,6 +2,8 @@
 
 **Status (2026-11-04):** root ACCEPTED `1df87d5a` as a conditional OFFLINE planning baseline (not a live approval package), with the cleanup-wording corrections applied below. The offline / injected-fake executor-adapter foundation is implemented on `feature/e7-connected-executor-adapters` (§9). Root CODE HOLD on `2aeac7e1` (R-A1 reservation recovery factory, R-A2 signal validation) → corrections in §9.6, pending root CODE re-review. Every live gate stays CLOSED; every owner input stays UNSET.
 
+**Status pointer (2026-11-04):** root ACCEPTED the executor-adapter foundation OFFLINE at `b757d6b7` (R-A1 / R-A2 closed). The adapter / worker integration rehearsal (tests + report only) is on `feature/e7-connected-adapter-rehearsal`: `claude/e7-connected-adapter-rehearsal.md`, pending root review. It is not a live approval, and owner inputs stay UNSET.
+
 **Branch** `feature/e7-connected-test-manifest`, cut from exact `62843150ad36c2db75a6819811c1d4f634ee5156`. **Runtime baseline** `ede4c43c25f9c025c540ba1f26a766eef5845556` (unchanged; not merged, deployed or live). Every source citation is at that runtime baseline.
 **What this is.** A conditional plan for ONE manually run, owner-supervised connected test, concrete enough for root design review. **What it is not:**
 - not the live approval package;
@@ -80,7 +82,7 @@ A mock authorization is never evidence of a real card payment. A TEST capture is
 | **Confirmed / captured booking** | **NOT IMPLEMENTED.** E3 never refunds or cancels captured money (`intent-state.js:547`); `runCleanupStep` does not run in `payment_captured` / `confirmed` | Two options, neither designed here: **(a)** an owner-run manual procedure. It must state: who cancels the Hostaway reservation and how; Stripe TEST refund or no refund; how the TEST-paid offline-charge row is reviewed and deleted or annotated (deletion support is UNVERIFIED); the read-only proof of each; and how the DB intent is resolved (`admin_resolve_intent`, `db/lib/admin.js:38`). **(b)** a future, separately designed automated cancel / refund path |
 | Hostaway / Airbnb automations (guest messages, payment requests, tasks, channel e-mails) | **not controlled by this code**; `guest.notify` staying queued does not suppress them | Must be verified independently (side-effect reads as in E4: charges / conversations / tasks) and listed in the approval |
 
-**G10 is not ready while §4.3 row 3 (if capture is in scope) has no chosen, written procedure.** In-run Airbnb: baseline (P0) → block after the create (P3) → reopen after the authorized cleanup (P6 or the manual procedure). Each step is attested with evidence; there is no action on existing reservations, blocked dates or prior journals.
+**G10 is not ready until the §4.3 owner cleanup requirements have a chosen, written procedure for every situation the approved test can leave behind: a successfully reserved booking that does not reach `confirmed` (including a real reservation with no capture at all, e.g. H-real / S-mock or a stopped run), and a captured or confirmed booking (if capture is in scope).** In-run Airbnb: baseline (P0) → block after the create (P3) → reopen after the authorized cleanup (P6 or the manual procedure). Each step is attested with evidence; there is no action on existing reservations, blocked dates or prior journals.
 
 ## 5. Boundaries
 
