@@ -53,6 +53,7 @@ const ENCODE = TextEncoder.prototype.encode;
 const ENCODER = new TextEncoder();
 const STR_LOWER = String.prototype.toLowerCase;
 const STR_TRIM = String.prototype.trim;
+const DECODE = decodeURIComponent;
 const PROTECTED = new Set(PROTECTED_HOSTAWAY_RESERVATION_IDS.map(String));
 const { isProxy, isUint8Array, isSharedArrayBuffer, isArrayBuffer } = types;
 const isFn = (f) => typeof f === "function" && !isProxy(f);
@@ -79,6 +80,33 @@ function nativeAborted(sig) {
 /** a handle from the primitive must offer the EventEmitter methods this module uses (trusted primitive; shape check only) */
 const handleShape = (h, extra) => h !== null && typeof h === "object" && !isProxy(h) && isFn(h.on) && isFn(h.removeListener) && isFn(h.destroy) && extra.every((k) => isFn(h[k]));
 
+// ---- protected selectors (R-X2): compared on DECODED values; the original URL is forwarded unchanged ---------------------------------
+/** does a (decoded) value select a protected reservation? digits are compared numerically-canonical (leading zeros stripped); lists
+ *  separated by comma / whitespace are checked token by token. */
+function selectsProtected(v) {
+  for (const t of v.split(/[\s,;]+/)) {
+    if (PROTECTED.has(t)) return true;
+    if (/^[0-9]+$/.test(t) && PROTECTED.has(t.replace(/^0+(?=[0-9])/, ""))) return true;
+  }
+  return false;
+}
+/** query: `?k=v(&k=v)*` only; every key and value percent-decoded strictly (malformed → refused), no repeated key, no protected value
+ *  (raw or decoded). Validation only — the request is sent with the exact original search string. */
+function querySafe(search) {
+  if (!SEARCH_RE.test(search)) return false;
+  const seen = new Set();
+  for (const kv of search.slice(1).split("&")) {
+    const parts = kv.split("=");
+    if (parts.length !== 2 || parts[0] === "") return false;
+    let k, v;
+    try { k = apply(DECODE, undefined, [parts[0]]); v = apply(DECODE, undefined, [parts[1]]); } catch { return false; }
+    if (seen.has(k)) return false;                                     // repeated keys are ambiguous selectors
+    seen.add(k);
+    if (selectsProtected(parts[1]) || selectsProtected(v)) return false;
+  }
+  return true;
+}
+
 // ---- request validation (contract §2) ------------------------------------------------------------------------------------------------
 const HEADER_SETS = freeze({
   hostaway: freeze({ GET: ["Accept", "Authorization", "Cache-control"], POST: ["Accept", "Authorization", "Cache-control", "Content-Type"], PUT: ["Accept", "Authorization", "Cache-control", "Content-Type"] }),
@@ -99,11 +127,8 @@ function validateRequest(provider, input) {
   if (r.url !== `${origin}${u.pathname}${u.search}`) return null;                     // canonical round-trip: no normalisation tricks
   if (!PATH_RE.test(u.pathname)) return null;
   const segs = u.pathname.split("/").slice(1);
-  if (segs.some((s) => s === "." || s === ".." || PROTECTED.has(s))) return null;
-  if (u.search !== "") {
-    if (!SEARCH_RE.test(u.search)) return null;
-    for (const kv of u.search.slice(1).split("&")) { const v = kv.split("=")[1] ?? ""; if (PROTECTED.has(v)) return null; }
-  }
+  if (segs.some((s) => s === "." || s === ".." || selectsProtected(s))) return null;
+  if (u.search !== "" && !querySafe(u.search)) return null;
   const h = topData(r.headers, HEADER_SETS[provider][r.method]);
   if (!h || ownKeys(h).length !== HEADER_SETS[provider][r.method].length) return null;
   for (const k of ownKeys(h)) if (typeof h[k] !== "string" || !HEADER_VALUE_RE.test(h[k])) return null;
@@ -171,6 +196,7 @@ export function createE7RealExchange(input) {
       let settled = false; let agent = null; let req = null; let res = null;
       let agentDestroyed = false; let reqDestroyed = false; let resDestroyed = false; let reqClosed = false; let resClosed = false;
       let abortListening = false; let signal = null;
+      let reqUntracked = false; let resUntracked = false;               // close observer could not be installed on that object
       const owned = [];                                                  // [emitter, event, fn] — ONLY listeners this module attached
       const chunks = []; let total = 0; let status = 0; let contentType = null;
       const settle = (ok, v) => {
@@ -184,20 +210,33 @@ export function createE7RealExchange(input) {
       const destroyAgent = () => { if (agentDestroyed || agent === null) return; agentDestroyed = true; try { apply(agent.destroy, agent, []); } catch { /* contained */ } };
       const destroyRes = () => { if (resDestroyed || res === null) return; resDestroyed = true; try { apply(res.destroy, res, []); } catch { /* contained */ } };
       const destroyReq = () => { if (reqDestroyed || req === null) return; reqDestroyed = true; try { apply(req.destroy, req, []); } catch { /* contained */ } };
-      /** the Agent is destroyed only when the request has closed AND there is no response or the response has closed */
-      const maybeDestroyAgent = () => { if (reqClosed && (res === null || resClosed)) destroyAgent(); };
+      /** the Agent is destroyed only when the request has closed (or its close cannot be observed) AND there is no response, the response
+       *  has closed, or the response's close cannot be observed */
+      const maybeDestroyAgent = () => { if ((reqClosed || reqUntracked) && (res === null || resClosed || resUntracked)) destroyAgent(); };
       function onAbort() { if (settled) return; settle(false, "EXCHANGE_ABORTED"); destroyRes(); destroyReq(); }
-      const sink = () => {};                                             // error observer kept until the owner's documented close
+      // Error observers stay until the owner's documented 'close'. When the close observer could NOT be installed ("untracked"), the
+      // object is destroyed at once and its error observer removes the module's listeners at the first 'error' (documented destroy
+      // orders emit at most one); the Agent no longer waits for that object's close.
+      const resSink = () => { if (!settled) fail("EXCHANGE_PREMATURE_CLOSE"); if (resUntracked) unlisten(res); };
       // ---------------- response handling ----------------
+      /** adopt a response: error observer FIRST, then close tracking. → true when fully tracked; false when the caller must not process it */
       function adoptResponse(r) {
         res = r;
-        listen(res, "error", sink);                                      // protection first, kept until res 'close'
-        listen(res, "close", () => { resClosed = true; if (!settled) fail("EXCHANGE_PREMATURE_CLOSE"); unlisten(res); maybeDestroyAgent(); });
+        try { listen(res, "error", resSink); }
+        catch {
+          // no error observer could be attached: treat the response as untracked; destroying is safe for Node's IncomingMessage (it emits
+          // 'error' on destroy only when a listener exists, _http_incoming v22.22.0 :439–446); a non-Node primitive emitting an unobserved
+          // 'error' here is outside scope (§9)
+          resUntracked = true; if (!settled) fail("EXCHANGE_SETUP_FAILED"); destroyRes(); destroyReq(); maybeDestroyAgent(); return false;
+        }
+        try { listen(res, "close", () => { resClosed = true; if (!settled) fail("EXCHANGE_PREMATURE_CLOSE"); unlisten(res); maybeDestroyAgent(); }); }
+        catch { resUntracked = true; if (!settled) fail("EXCHANGE_SETUP_FAILED"); destroyRes(); destroyReq(); maybeDestroyAgent(); return false; }
+        return true;
       }
       function onResponse(r) {
         if (res !== null) return;                                        // a second response event is ignored (trusted primitive)
         if (!handleShape(r, [])) { if (!settled) fail("EXCHANGE_SETUP_FAILED"); destroyReq(); return; }
-        try { adoptResponse(r); } catch { if (!settled) fail("EXCHANGE_SETUP_FAILED"); destroyReq(); return; }
+        if (!adoptResponse(r)) return;
         if (settled) { destroyRes(); return; }                           // late response after an abort / failure: never processed
         const sc = ownData(r, "statusCode");
         if (!Number.isSafeInteger(sc) || sc < 200 || sc > 599) { fail("EXCHANGE_STATUS_INVALID"); destroyRes(); destroyReq(); return; }
@@ -213,7 +252,7 @@ export function createE7RealExchange(input) {
           listen(r, "aborted", () => { if (!settled) { fail("EXCHANGE_PREMATURE_CLOSE"); destroyRes(); destroyReq(); } });
           listen(r, "data", onData);
           listen(r, "end", onEnd);
-        } catch { fail("EXCHANGE_SETUP_FAILED"); destroyRes(); destroyReq(); }
+        } catch { fail("EXCHANGE_SETUP_FAILED"); destroyRes(); destroyReq(); }   // close tracking exists: ordinary close-driven cleanup
       }
       function onData(c) {
         if (settled) return;
@@ -249,12 +288,12 @@ export function createE7RealExchange(input) {
         try { r = apply(primRequest, undefined, [options]); } catch { destroyAgent(); fail("EXCHANGE_SETUP_FAILED"); return; }   // creation started: no "not sent" claim
         if (!handleShape(r, ["end"])) { destroyAgent(); fail("EXCHANGE_SETUP_FAILED"); return; }
         req = r;
-        try { listen(req, "error", (e) => { if (!settled) fail(res === null ? "EXCHANGE_NETWORK_ERROR" : "EXCHANGE_PREMATURE_CLOSE"); }); }
+        try { listen(req, "error", () => { if (!settled) fail(res === null ? "EXCHANGE_NETWORK_ERROR" : "EXCHANGE_PREMATURE_CLOSE"); if (reqUntracked) unlisten(req); }); }
         catch { req = null; destroyAgent(); fail("EXCHANGE_SETUP_FAILED"); return; }       // no error observer on req: never destroyed here (§9 scope)
-        try {
-          listen(req, "close", () => { reqClosed = true; if (!settled && res === null) fail("EXCHANGE_PREMATURE_CLOSE"); unlisten(req); maybeDestroyAgent(); });
-          listen(req, "response", onResponse);
-        } catch { fail("EXCHANGE_SETUP_FAILED"); destroyReq(); return; }
+        try { listen(req, "close", () => { reqClosed = true; if (!settled && res === null) fail("EXCHANGE_PREMATURE_CLOSE"); unlisten(req); maybeDestroyAgent(); }); }
+        catch { reqUntracked = true; fail("EXCHANGE_SETUP_FAILED"); destroyReq(); maybeDestroyAgent(); return; }   // R-X1: no close to wait for
+        try { listen(req, "response", onResponse); }
+        catch { fail("EXCHANGE_SETUP_FAILED"); destroyReq(); return; }
         if (settled) { destroyReq(); return; }                          // a reentrant abort / error during setup
         if (nativeAborted(signal) !== false) { fail("EXCHANGE_ABORTED"); destroyReq(); return; }                  // recheck before end(): no bytes after an observed abort
         try { if (v.bodyBytes === null) apply(req.end, req, []); else apply(req.end, req, [v.bodyBytes]); }

@@ -364,3 +364,89 @@ test("X11. source pins: imports exactly node:https / node:util / compensation-pr
     /rejectUnauthorized:\s*false/, /createConnection|proxyEnv|NODE_TLS|globalAgent|\blookup\s*:/, /removeAllListeners/, /\bretry\b/i, /\bca\s*:|\bcert\s*:|\bpfx\s*:/]) assert.doesNotMatch(code, re, String(re));
   assert.match(code, /rejectUnauthorized: true/);
 });
+
+// ---- root CODE HOLD on e386af38: R-X1 / R-X2 (X12 / X13 FAIL on exact e386af38; see contract §9.1) ---------------------------------
+/** plain-EventEmitter doubles (root's probe style): attaching listener #n for event `ev` throws; destroy() emits error then close
+ *  (microtask, or synchronously). The RESPONSE double models Node's IncomingMessage rule of emitting 'error' on destroy only when an
+ *  'error' listener exists (_http_incoming v22.22.0 :439–446); labelled, not native. */
+function attachFaultPrimitive({ reqFail = null, resFail = null, sync = false, abortOnFail = null } = {}) {
+  const st = { agents: [], reqs: [] };
+  class A { constructor() { this.d = 0; st.agents.push(this); } destroy() { this.d += 1; } }
+  const em = (fail, isRes) => {
+    const e = new EventEmitter(); e.d = 0; e.closed = false; const on = e.on.bind(e);
+    e.on = (ev, fn) => { if (fail && ev === fail) { if (abortOnFail) abortOnFail.abort(); throw new Error("attach refused (fake)"); } return on(ev, fn); };
+    const go = () => { if (e.closed) return; if (!isRes || e.listenerCount("error") > 0) e.emit("error", Object.assign(new Error("x"), { code: "ECONNRESET" })); e.closed = true; e.emit("close"); };
+    e.destroy = () => { e.d += 1; if (e._d) return; e._d = true; if (sync) go(); else queueMicrotask(go); };
+    return e;
+  };
+  const request = () => {
+    const r = em(reqFail, false); r.endCalls = 0; st.reqs.push(r);
+    r.end = () => { r.endCalls += 1; queueMicrotask(() => { if (r.closed) return; const res = em(resFail, true); res.statusCode = 200; res.rawHeaders = []; res.complete = false; r.res = res; r.emit("response", res);
+      if (!res.closed && res.listenerCount("end") > 0) { res.emit("data", Buffer.from("ok")); res.complete = true; res.emit("end"); res.closed = true; res.emit("close"); r.closed = true; r.emit("close"); } }); };
+    return r;
+  };
+  return { st, primitive: { request, Agent: A } };
+}
+const allListeners = (e) => (e ? e.eventNames().reduce((n, ev) => n + e.listenerCount(ev), 0) : 0);
+const settleAll = async () => { for (let i = 0; i < 6; i++) await tick(); };
+
+test("X12 (R-X1). every request / response listener attachment failing independently (before and after close tracking; async / synchronous destroy; abort variant): one settlement, each owned resource disposed at most once, Agent destroyed, no module listener left", async () => {
+  const before = uncaught;
+  const cases = [];
+  for (const sync of [false, true]) {
+    for (const ev of ["close", "response"]) cases.push({ reqFail: ev, sync });
+    for (const ev of ["error", "close", "aborted", "data", "end"]) cases.push({ resFail: ev, sync });
+  }
+  cases.push({ reqFail: "close", abort: true }, { resFail: "close", abort: true }, { resFail: "data", abort: true });
+  for (const c of cases) {
+    const ac = new AbortController();
+    const fx = attachFaultPrimitive({ reqFail: c.reqFail ?? null, resFail: c.resFail ?? null, sync: !!c.sync, abortOnFail: c.abort ? ac : null });
+    const label = `${c.reqFail ? `req:${c.reqFail}` : `res:${c.resFail}`}${c.sync ? " sync" : ""}${c.abort ? " +abort" : ""}`;
+    const code = await codeOf(createE7RealExchange({ provider: "hostaway", primitive: fx.primitive }).exchange(HREQ({ signal: ac.signal })));
+    await settleAll();
+    const req = fx.st.reqs[0]; const res = req && req.res;
+    assert.equal(code, c.abort ? "EXCHANGE_ABORTED" : "EXCHANGE_SETUP_FAILED", label);
+    assert.deepEqual([fx.st.reqs.length, fx.st.agents.length], [1, 1], `${label}: one request, one Agent, no retry`);
+    assert.equal(fx.st.agents[0].d, 1, `${label}: Agent destroyed exactly once`);
+    assert.ok(req.d <= 1 && (!res || res.d <= 1), `${label}: destroyed at most once`);
+    if (c.reqFail === "close") assert.equal(req.endCalls, 0, `${label}: end() never called after a setup failure`);
+    if (res) assert.equal(res.d, 1, `${label}: a failed response adoption destroys that response`);
+    assert.deepEqual([allListeners(req), allListeners(res)], [0, 0], `${label}: every module listener removed (no immortal listener)`);
+    assert.equal(getEventListeners(ac.signal, "abort").length, 0, `${label}: abort listener removed`);
+  }
+  assert.equal(uncaught, before, "no uncaught error from any ordering");
+  // controls: the same doubles with no failure succeed and clean up identically
+  for (const sync of [false, true]) {
+    const fx = attachFaultPrimitive({ sync });
+    const r = await createE7RealExchange({ provider: "hostaway", primitive: fx.primitive }).exchange(HREQ());
+    await settleAll();
+    assert.deepEqual([r.status, new TextDecoder().decode(r.bytes), fx.st.agents[0].d, allListeners(fx.st.reqs[0]), allListeners(fx.st.reqs[0].res)], [200, "ok", 1, 0, 0]);
+  }
+  // residual kept honest: the FIRST request error observer cannot attach → request not destroyed (an unobserved 'error' could crash), Agent destroyed
+  { const fx = attachFaultPrimitive({ reqFail: "error" }); assert.equal(await codeOf(createE7RealExchange({ provider: "hostaway", primitive: fx.primitive }).exchange(HREQ())), "EXCHANGE_SETUP_FAILED");
+    assert.deepEqual([fx.st.reqs[0].d, fx.st.reqs[0].endCalls, fx.st.agents[0].d, allListeners(fx.st.reqs[0])], [0, 0, 1, 0]); }
+});
+
+test("X13 (R-X2). protected selectors compared on DECODED query values: fully / partially encoded, leading zeros, lists, repeated keys, malformed encoding refused with ZERO Agent / request; benign encoded values and accepted T wire URLs pass unchanged", async () => {
+  const P = String(PROTECTED_HOSTAWAY_RESERVATION_IDS[0]);
+  const enc1 = [...P].map((d) => `%3${d}`).join("");
+  const base = "https://api.hostaway.com/v1/guestPayments/charges";
+  const refused = [`${base}?reservationIds=${enc1}`, `${base}?limit=500&reservationIds=${P.slice(0, 4)}%3${P[4]}${P.slice(5)}`, `${base}?limit=500&reservationIds=0${P}`,
+    `${base}?limit=500&reservationIds=6100001%2C${P}`, `${base}?limit=500&reservationIds=6100001,${P}`, `${base}?reservationIds=6100001&reservationIds=6100002`,
+    `${base}?limit=500&reservationIds=6100001&limit=500`, `${base}?limit=500&reservationIds=%E0%A4%A`, `${base}?limit=500&reservationIds=%ZZ`, `${base}?limit=500&reservationIds`,
+    `${base}?=1`, `${base}?limit=500&reservationIds=1=2`, `https://api.hostaway.com/v1/reservations/0${P}`, `${base}?limit=500&reservationIds=${P}%20`];
+  for (const url of refused) {
+    const fx = fakePrimitive();
+    assert.equal(await codeOf(fx.ex()(HREQ({ url }))), "EXCHANGE_INPUT_INVALID", url);
+    assert.deepEqual([fx.agents.length, fx.reqs.length], [0, 0], `${url}: zero Agent / request`);
+  }
+  for (const [provider, url] of [["hostaway", `${base}?limit=500&reservationIds=6100001`], ["hostaway", `${base}?limit=500&reservationIds=%36100001`],
+    ["hostaway", `https://api.hostaway.com/v1/reservations?arrivalEndDate=${IN}&arrivalStartDate=${IN}&channelId=2000&includeResources=1&limit=100&listingId=${L}`],
+    ["stripe", `https://api.stripe.com/v1/payment_intents/${PI}?expand%5B%5D=latest_charge`]]) {
+    const fx = fakePrimitive();
+    const r = provider === "hostaway" ? HREQ({ url }) : { ...SREQ(), method: "GET", url, headers: { Authorization: `Bearer ${SKEY}`, "Stripe-Version": VERSION }, body: null };
+    const p = fx.ex(provider)(r); finish(respond(fx.reqs[0], 200, []));
+    assert.equal((await p).status, 200, url);
+    assert.equal(fx.reqs[0].options.path, url.replace(/^https:\/\/[^/]+/, ""), `${url}: forwarded exactly, no rewrite / normalisation`);
+  }
+});
