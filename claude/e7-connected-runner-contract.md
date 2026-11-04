@@ -1,7 +1,9 @@
-# E7 local connected-test RUNNER — CONTRACT, revision 2 (DOCS ONLY; every implementation item PROPOSED)
+# E7 local connected-test RUNNER — CONTRACT, revision 3 (Slice A implemented; every other implementation item PROPOSED / OPEN)
 
 **Branch** `feature/e7-connected-runner-contract`.
 - Revision 1 was `36a6da15`, cut from `9f13c816`. Root DESIGN HOLD R-R1 to R-R4; revision 2 is on the same branch.
+- Revision 2 was `08b107e4`. Root DESIGN RE-REVIEW accepted R-R1 (input map) and R-R2 (no resume) as the basis for **Slice A only**, with a rate correction, and left the async / interface questions OPEN (§11).
+- Revision 3 is on branch `feature/e7-connected-run-manifest`, cut from exact `08b107e4`. It adds **Slice A** (offline manifest validation + canonical hash: `scripts/e7-connected/run-manifest.mjs`, `test/e7-connected-run-manifest.test.mjs`) and this update. Nothing else is implemented.
 - All source citations are at this head. The runtime is unchanged since `ede4c43c`; the adapters were accepted at `b757d6b7`.
 
 **What this is.** The smallest **offline / injected-fake** orchestration foundation. It is a library that drives ONE existing booking through the accepted workers, with per-step adapter factories, and then ends.
@@ -21,7 +23,19 @@ Those are independent, CLOSED slices. All owner inputs stay **UNSET**. Live gate
 | R-R1 worker inputs | §3: explicit `listing.refFieldId`, `listing.timeZone`, `expectedRef`, `intentId` and `pricing.rateBps` in the hashed manifest. Channel 2000 is a named invariant. §3.2 is a complete per-worker input map. §3.3 covers the pilot / containment blocker. §6.2 covers phase dependencies and terminal outcomes. `paymentMethod` is always present (`null` iff no recording) |
 | R-R2 restart | §8.4. V1 has **no resume**: only an empty journal plus an eligible `payment_authorized` intent may start. Any acknowledged run → `RESTART_AMBIGUOUS` / `RUN_ENDED`. The full journal identity and chain are validated |
 | R-R3 tails / refusals | §7.2: bounded tail observation, `LATE_TAIL_OUTSTANDING`, and late evidence that may still persist. §5.3: a runner-side refusal recorder (exact-key wrappers that record codes and rethrow the identical error). §8.2: an exact action grammar |
-| R-R4 awaits / lock | §7.3: an injected monotonic source, per-boundary deadlines, timed-out awaits that end the run (no retry, no continue), and the lock-client lifecycle. Results after a DB failure report the last acknowledged counts, marked stale |
+| R-R4 awaits / lock | §7.3: an injected monotonic source, per-boundary deadlines, timed-out awaits that end the run (no retry, no continue), and the lock-client lifecycle. Results after a DB failure report the last acknowledged counts, marked stale. **Still OPEN** per the re-review: §11 B–D |
+
+**Status after the root re-review of `08b107e4` (revision 3):**
+
+| Scope | Status |
+|---|---|
+| Slice A: manifest v1 validation + canonical hash (§2.1, §3.1) | **Implemented** at this head, for root CODE review. Rate range corrected to 0..`MAX_RATE_BPS` (5000) |
+| R-R1 input map, R-R2 no-resume | Accepted as the design basis; their runtime parts (facts, core, journal) are **not** implemented |
+| Import boundary of the core (§11 A) | **OPEN** |
+| Cancellable deadline / timer interface (§11 B) | **OPEN** |
+| Outstanding step vs post-result tail; finalize semantics (§11 C) | **OPEN** |
+| Late `pool.connect`; bounded lock acquire / unlock (§11 D) | **OPEN** |
+| `run-facts`, `run-guard`, `run-core`, `run-journal-memory`, PG runner test | **Not authorized** |
 
 ## 1. Present runtime vs proposed orchestration vs simulated tests
 
@@ -35,13 +49,83 @@ Those are independent, CLOSED slices. All owner inputs stay **UNSET**. Live gate
 
 ## 2. Proposed files and exports (offline foundation)
 
-All files live under `scripts/e7-connected/` (excluded from upload). They are pure orchestration with injected I/O: no `process.env`, `fetch`, file system, SDK, timers or scheduler of their own. They must not contain the identifiers pinned by accepted containment tests: `hostaway-reservations` (`test/hostaway-reservations.test.mjs:544–569`), `connectedTestAdapterConfig` and `allowRequest:` (`test/e4-connected-path.test.mjs:404–421`). The only accepted module they import is the adapter module (`createPhaseExecutors`, `ExecutorRefusal`).
+All files live under `scripts/e7-connected/` (excluded from upload). They are pure orchestration with injected I/O: no `process.env`, `fetch`, file system, SDK, timers or scheduler of their own. They must not contain the identifiers pinned by accepted containment tests: `hostaway-reservations` (`test/hostaway-reservations.test.mjs:544–569`), `connectedTestAdapterConfig` and `allowRequest:` (`test/e4-connected-path.test.mjs:404–421`). Import boundary: Slice A imports only `node:crypto`, `MAX_RATE_BPS` (`lib/direct-pricing.js:28`) and `localDateInZone` (`lib/checkout/compensation-proof.js:64`). The import boundary of the later core is **OPEN (§11 A)**: revision 2's "only the adapter module" was wrong, because the core must call the four accepted worker entrypoints.
 
-### 2.1 `run-manifest.mjs`
+### 2.1 `run-manifest.mjs` — Slice A (IMPLEMENTED at this head)
 
-`validateRunManifest(input) → { ok:true, manifest, hash } | { ok:false, code }`
-- An R-G1 descriptor snapshot, deep-frozen.
-- `hash` = sha256 of `'e7-run-manifest-v1\n' + canonical JSON`: sorted keys, values string / safe integer / boolean / `null`, no other types.
+**Interface.** `validateRunManifest(input) → Object.freeze({ ok:true, manifest, hash }) | Object.freeze({ ok:false, code })`.
+- It never throws.
+- A refusal is exactly `{ ok, code }`: no message, no path and no caller error.
+- There are no `opts`. Nothing is defaulted.
+
+**Exports:** `validateRunManifest`, `canonicalJson`, `manifestHash`, `isRealDate`, and these constants:
+
+| Constant | Value |
+|---|---|
+| `RUN_MANIFEST_VERSION` | `"e7-run-manifest-v1"` |
+| `HASH_PREFIX` | `"e7-run-manifest-v1\n"` |
+| `MAX_AMOUNT_MINOR` | 99 999 999 (= `stripe-test-mode.js:36`) |
+| `MAX_GUESTS` | 50 (= the adapter's `plan.guests > 50` bound, `hostaway-reservations.js:244`) |
+| `MAX_NIGHTS` | 90 (= `final-price.js:57`) |
+| `PILOT_LISTING_IDS` | `[603564, 603566]` |
+| `CHECKPOINTS` | the three checkpoint names (§3.1) |
+| `PAYMENT_METHODS` | `["credit_card", "other"]` |
+| `TOP_KEYS`, `OWNER_KEYS` | the exact key sets (§3.1) |
+| `REFUSAL_PRECEDENCE` | the refusal codes in the order below |
+
+**Imports (pure only):**
+- `node:crypto` for SHA-256;
+- `MAX_RATE_BPS` from `lib/direct-pricing.js`;
+- `localDateInZone` from `lib/checkout/compensation-proof.js`, which is the worker gate's own zone check.
+
+There is no env, fetch, fs, SDK, timer, credential, pool or transport. The pinned Hostaway module is **not** imported: its `isRealDate` and guest bound are matched by local rules, and the tests check parity.
+
+**Snapshot (one pass, before any validation).** A descriptor snapshot (`Object.getOwnPropertyDescriptors` once per object) builds a frozen null-prototype copy:
+- Only own, enumerable **data** properties are copied.
+- **Refused** (`MANIFEST_SHAPE`):
+  - accessors, symbols, non-enumerable keys, own `__proto__`;
+  - prototypes other than `Object.prototype` / `null` (class instances, `Date`, boxed primitives);
+  - arrays that are not `Array.prototype`, sparse, have extra or accessor indices, or have a patched iterator;
+  - non-finite numbers and BigInt;
+  - strings over 256 characters, more than 32 keys, more than 8 array elements, or depth over 4 (which also bounds cycles).
+- Null-prototype objects and frozen inputs are accepted and hash identically.
+- No caller getter, iterator, `toJSON` or method is invoked.
+- Only introspection failure is caught (revoked proxy, throwing trap) → `MANIFEST_SHAPE`.
+
+**Proxy limitation (documented, not hidden).** A Proxy's `getOwnPropertyDescriptor`, `ownKeys` and `getPrototypeOf` traps, and `Array.isArray` on a proxied array, **do run** during the snapshot. The validator cannot promise that an arbitrary trap has no side effects. It promises only that the data it validates and hashes is the one snapshot it took, so a trap cannot change the value between validation and hashing.
+
+**Hash.** `sha256(HASH_PREFIX + canonicalJson(validatedCopy))`, hex.
+- The copy hashed is the same frozen object that was validated and is returned as `manifest`.
+- Canonical JSON uses sorted keys and supports strings, safe integers, booleans, `null` and ordered arrays.
+- `JSON.stringify` touches only primitive strings, never a caller object; `toJSON` is never consulted.
+- `intentId` is inside the hash.
+
+**Refusal precedence (deterministic, first match wins):**
+1. `MANIFEST_SHAPE` — snapshot refused, not a plain object, an extra top-level key, a missing non-owner key, a bad `providerMode` shape, or `synthetic` not boolean.
+2. `VERSION_UNSUPPORTED`.
+3. `S_LIVE_REFUSED` — `providerMode.stripe === "live"`, whatever `synthetic` is.
+4. `REAL_RUN_NOT_IN_THIS_SLICE` — `synthetic !== true`.
+5. `PROVIDER_MODE_NOT_IN_THIS_SLICE` — anything other than `{ hostaway:"fake", stripe:"mock" }`.
+6. `MANIFEST_OWNER_INPUT_MISSING` — an owner key absent, `""` or `{}`. The `paymentMethod` key must be present, and `null` counts as an explicit value. A nested owner object with wrong keys → `MANIFEST_SHAPE`.
+7. Field codes in schema order: `RUN_ID_INVALID`, `INTENT_ID_INVALID`, `BASELINE_COMMIT_INVALID`, `LISTING_ID_INVALID`, `PILOT_NOT_IN_THIS_SLICE`, `CURRENCY_RULE`, `REF_FIELD_INVALID`, `TIME_ZONE_INVALID`, `EXPECTED_REF_INVALID`, `STAY_INVALID`, `AMOUNT_INVALID`, `RATE_INVALID` (not a safe integer ≥ 0), `RATE_OUT_OF_RANGE` (> `MAX_RATE_BPS`), `STRIPE_ACCOUNT_INVALID`, `ACCOUNT_LABEL_INVALID`, `PHASE_DEPENDENCY`, `PAYMENT_METHOD_RULE`, `CLEANUP_INVALID`, `AUTOMATIONS_INVALID`, `CHECKPOINTS_INVALID`.
+
+**TRUST boundary.** A valid manifest is never permission to reach a provider:
+- `fake` / `mock` is a label. It does not prove that injected transports are fake.
+- This validator alone never enables provider access.
+- No field holds secret or contact data: there is no guest, email, key or token field, so any such key is an extra key → `MANIFEST_SHAPE`.
+
+**Tests** (`test/e7-connected-run-manifest.test.mjs`, offline, global fetch guard):
+- valid synthetic controls (null-prototype and frozen inputs);
+- every key missing, extra or of the wrong type;
+- every boundary and cross-field rule;
+- precedence;
+- key-order invariance, distinct hashes for semantic changes, and an independent recomputation of the prefixed hash;
+- post-call mutation resistance;
+- code-only refusals;
+- rate 0 / 5000 accepted, 5001 / 10000 refused, with each accepted rate mapped through `readDirectPolicyFromEnv` to `source:"env"` with the same `rateBps`;
+- constant and date parity;
+- 24 descriptor / proxy / revoked / getter / iterator / `toJSON` / exotic probes with zero caller-code runs;
+- module purity and its exact import list.
 
 ### 2.2 `run-facts.mjs`
 
@@ -65,7 +149,7 @@ All files live under `scripts/e7-connected/` (excluded from upload). They are pu
 | `attest` | `(checkpoint, request, { signal }) → Promise<{ ok:boolean, evidenceRef?:string }>` |
 | `clock` | `() → wall ms`: the ONE business clock passed to every worker |
 | `monotonic` | `() → ms`: the deadlines source, never moves backwards |
-| `wait` | `(ms, signal) → Promise`: an injected timer for the inter-step `delayMs` only |
+| `wait` | `(ms, signal) → Promise`: an injected timer for the inter-step `delayMs` only. **OPEN (§11 B):** a monotonic source alone cannot wake a hung await, so the core needs an injected cancellable deadline / timer interface |
 | `signal` | a genuine run-level `AbortSignal`, inspected natively (R-A2) |
 
 Rules:
@@ -97,21 +181,21 @@ The runner's own wrappers (§5.3) and the deadline helper (§7.3).
 |---|---|
 | `version` | `"e7-run-manifest-v1"` |
 | `runId` | `^[a-z0-9-]{8,64}$` |
-| `intentId` | lowercase canonical uuid of the EXISTING intent; part of the hashed run identity |
-| `baselineCommit` | 40 hex |
+| `intentId` | lowercase canonical uuid (`8-4-4-4-12` hex, lowercase only) of the EXISTING intent; part of the hashed run identity (existence is a core check) |
+| `baselineCommit` | exactly 40 lowercase hex |
 | `synthetic` | boolean. `true` = offline tests only (both transports are injected fakes; owner fields may hold synthetic values). `false` → refused in this slice (`REAL_RUN_NOT_IN_THIS_SLICE`) |
 | `providerMode` | `{ hostaway, stripe }`. This slice accepts only `{ "fake", "mock" }`. `stripe: "live"` → `S_LIVE_REFUSED` (`capture-proof.js:97`, `compensation-proof.js:184`). Any other value → `PROVIDER_MODE_NOT_IN_THIS_SLICE` |
-| `listing` | `{ id, currency, refFieldId, timeZone }`, all explicit. `currency` must be `"USD"` (`offline-charge-proof.js:33`, the USD direction). `refFieldId` is a positive integer (required by `validateAdapterConfig`, `hostaway-reservations.js:202`, and by the reservation / recording factories). `timeZone` is an IANA name, required by `compensationWorkerGate` (`LISTING_TIME_ZONE_INVALID`). The pilots 603564 / 603566 → `PILOT_NOT_IN_THIS_SLICE` (§3.3). No `pilotException` key |
+| `listing` | `{ id, currency, refFieldId, timeZone }`, all explicit. `currency` must be `"USD"` (`offline-charge-proof.js:33`, the USD direction). `id` is an int4 (1..2147483647). `refFieldId` is a positive int4 (required by `validateAdapterConfig`, `hostaway-reservations.js:202`, and by the reservation / recording factories). `timeZone` is an IANA name accepted by `localDateInZone` (`compensation-proof.js:64`, which is the check `compensationWorkerGate` uses for `LISTING_TIME_ZONE_INVALID`); numeric offsets are refused. The pilots 603564 / 603566 → `PILOT_NOT_IN_THIS_SLICE` (§3.3). No `pilotException` key |
 | `expectedRef` | `^MV-[A-Z0-9]{6,10}$`; must equal the intent's `ref` |
-| `stay` | `{ arrival, departure, guests }`; must equal the intent |
-| `amountMinor` | must equal the intent's `price.finalTotalMinor` |
-| `pricing` | `{ rateBps }`: integer 0–10000; must equal the intent's `price.rateBps` (`final-price.js:127`) |
-| `stripeAccountId` | `acct_…` (TEST-account check = the workers' `accounts.retrieve` id equality, `capture-worker.js:219`) |
-| `hostawayAccountLabel` | `{ accountRef, clientSnapshotId }`: **TRUST** labels, not ownership |
+| `stay` | `{ arrival, departure, guests }`: real calendar dates (years 2000–2100, the adapter's `isRealDate` rule), `arrival < departure`, ≤ 90 nights (`final-price.js:57`), guests 1..50 (adapter bound). Equality with the intent is a core check |
+| `amountMinor` | safe integer 1..99 999 999. Equality with the intent's `price.finalTotalMinor` is a core check |
+| `pricing` | `{ rateBps }`: safe integer **0..`MAX_RATE_BPS` = 5000** (`direct-pricing.js:28`; `readDirectPolicyFromEnv` refuses > 5000, `direct-policy.js:19–31`), so the manifest never validates a rate the worker policy rejects. Negative or non-integer → `RATE_INVALID`; > 5000 → `RATE_OUT_OF_RANGE`. Must equal the intent's `price.rateBps` (`final-price.js:127`; a core check, not Slice A). *Revision 2 wrongly said 0–10000.* |
+| `stripeAccountId` | `^acct_[A-Za-z0-9]{1,64}$` (TEST-account check = the workers' `accounts.retrieve` id equality, `capture-worker.js:219`) |
+| `hostawayAccountLabel` | `{ accountRef, clientSnapshotId }`, each `^[A-Za-z0-9._:-]{1,100}$`: **TRUST** labels, not ownership |
 | `phases` | `{ capture, recording }`, booleans. `recording: true` requires `capture: true` (`PHASE_DEPENDENCY`) |
 | `paymentMethod` | **always present.** `"credit_card"` or `"other"` iff `phases.recording`; exactly `null` otherwise (`PAYMENT_METHOD_RULE`). `null` is canonical JSON and is hashed |
-| `cleanup` | `{ reservedNotConfirmed, captured, confirmed }`, each a non-empty owner-approved procedure reference (synthetic marker if `synthetic`). There is no `"not-applicable"`: every outcome a run can leave is covered (§6.2) |
-| `automationsReviewed` | non-empty reference |
+| `cleanup` | `{ reservedNotConfirmed, captured, confirmed }`, each an owner-approved procedure reference `^[A-Za-z0-9._:/-]{1,128}$` (no spaces or `@`, so no contact data); a synthetic marker if `synthetic`. There is no `"not-applicable"`: every outcome a run can leave is covered (§6.2) |
+| `automationsReviewed` | a reference with the same grammar as `cleanup` |
 | `checkpoints` | exactly `["CALENDAR_BASELINE", "AIRBNB_BLOCKED", "AIRBNB_REOPENED"]` |
 
 **Named invariants (fixed; not owner defaults):**
@@ -259,7 +343,9 @@ After a timeout, the workers record a late provider result as late evidence and 
 
 The reservation, capture and cleanup tails wait on `call.raw`, which an unresolved provider promise can keep pending **forever**. Recording's tail is bounded by `lateWindowMs` 30 s (`recording-worker.js:32`). Each step result returns `late` (`Promise.allSettled(ctx.late)`).
 
-**Runner behaviour:**
+**OPEN (§11 C).** This section covers only the **post-result TAIL**: the step returned, and its `late` promise is pending. A `TIMEOUT_STEP`, where the step itself has not returned, is a different state with stronger obligations (§11 C).
+
+**Runner behaviour (post-result tail only):**
 - After every step, `late` is observed with a deadline of `TAIL_OBSERVE_MS` = 35 s, monotonic. It is never awaited without bound.
 - **Settled** within the deadline → continue to the next snapshot.
 - **Not settled** → `STOPPED: LATE_TAIL_OUTSTANDING`, journaled, with `tailOutstanding: true`. The runner starts no next worker, does not reuse the step's resources as if the tail had vanished, and does **not** release the run lock.
@@ -275,7 +361,7 @@ All deadlines use `opts.monotonic`. There is no timer loop or scheduler outside 
 |---|---|---|
 | pool connect | 5 s | `TIMEOUT_DB_CONNECT` |
 | snapshot / guest read (per statement + txn) | 5 s | `TIMEOUT_DB_READ`; the connection is destroyed, no further SQL |
-| worker step | worker `stepBudgetMs` (45–60 s, `*_DEFAULT_TIMEOUTS`) + 30 s observation margin | `TIMEOUT_STEP`: treated like an outstanding tail; no next step, lock retained, `finalize` offered |
+| worker step | worker `stepBudgetMs` (45–60 s, `*_DEFAULT_TIMEOUTS`) + 30 s observation margin | `TIMEOUT_STEP`. **OPEN (§11 C):** this is NOT a tail. The step has not returned and may still make its FIRST provider write |
 | late tail | 35 s | `LATE_TAIL_OUTSTANDING` |
 | journal append / read | 5 s | `TIMEOUT_JOURNAL` → also `JOURNAL_FAILURE` semantics (no further append) |
 | attest | 30 min per checkpoint (fixed) | `TIMEOUT_ATTEST` |
@@ -290,6 +376,7 @@ All deadlines use `opts.monotonic`. There is no timer loop or scheduler outside 
 - **Normal end.** `SELECT pg_advisory_unlock(…)`, then `client.release(true)`: the connection is **destroyed**, never returned to the pool with or without the lock.
 - **DB failure on the lock client, or any `DB_FAILURE` / `TIMEOUT_DB_*`.** No further SQL on that client (no unlock, rollback or release work): `client.release(true)` destroys it, and the server ends the session and its lock.
 - **Outstanding tail / step timeout.** The lock is retained until `finalize()`.
+- **OPEN (§11 C, D).** The unlock-after-DB-failure path, late `pool.connect` clients, the bounds on lock acquire / unlock observations, and the difference between an outstanding STEP and a post-result TAIL are not resolved. This section is not implementable as written.
 
 ### 7.5 Results after a failure
 
@@ -366,7 +453,9 @@ Before P0 work, the runner reads the journal and validates **all** records:
 
 All refusals happen with **zero** worker, transport or attest calls. No general resume exists in V1.
 
-## 9. Smallest OFFLINE implementation slice (for root approval; not started)
+## 9. Offline implementation slices
+
+**Slice A (manifest + hash) is implemented at this head (§2.1).** The rest of this section is the PROPOSED later core slice. It is **not authorized**, and it must first resolve §11.
 
 **Proposed allowed files:**
 - `scripts/e7-connected/run-manifest.mjs`, `run-facts.mjs`, `run-guard.mjs`, `run-core.mjs`, `run-journal-memory.mjs`;
@@ -399,7 +488,8 @@ No worker, `lib/`, SQL, fixture, config, package or containment-pin change.
 | 17 | Run-level signal aborted between steps | `CANCELLED` |
 | 18 | Attestation declined | `OWNER_DECLINED` |
 
-**Remaining true blockers.** None for this offline slice.
+**Remaining true blockers for the full core** (they block any core authorization):
+- the OPEN items §11 A–D: the import boundary, a cancellable deadline / timer interface, outstanding-step vs post-result-tail finalize semantics, and late-connect / lock-observation ownership.
 - **Pilot listing:** a containment blocker (§3.3); V1 refuses it.
 - **A real run** needs the CLOSED slices:
   - real transports with proven zero automatic retries;
@@ -422,3 +512,32 @@ No worker, `lib/`, SQL, fixture, config, package or containment-pin change.
 8. The cleanup procedure for every outcome.
 
 Routine technical choices (budgets, journal format, lock key, file layout) are root's.
+
+## 11. OPEN core qualifications (root re-review of `08b107e4`; requirements for the later facts / guard / core slice, NOT authorized)
+
+**A. Import boundary.**
+- Allowed: the exact four accepted worker entrypoints (§1: `runOrchestratorStep`, `runCaptureStep`, `runRecordingStep`, `runCleanupStep`) with their normal transitive imports, the adapter module (`createPhaseExecutors`, `ExecutorRefusal`), and the needed pure / constant modules and Node built-ins.
+- Still forbidden: any NEW direct importer of the pinned Hostaway module, and any change to the containment pins.
+- No worker injection loophole: workers are imported, not supplied via `opts`. No copied worker implementation.
+
+**B. Deadlines need an injected cancellable timer.**
+- Revision 2 defined `opts.wait` as inter-step-only, while run-guard needs deadline timers and has no timers of its own.
+- A fake monotonic clock cannot wake a hung await. The core needs an injected cancellable deadline / timer interface, or a documented extension of `wait`'s role, so that a deadline can race a hung await.
+- Every observation timer must be cleared when its await settles or the run ends.
+- Tests drive it with a fake timer.
+
+**C. Outstanding STEP is not a TAIL.**
+- A `TIMEOUT_STEP` means the step has not returned. It can still reach its **first** provider write after the runner returns.
+- The lock is held until the outstanding step settles **and** the `late` promise it then returns settles.
+- Counts and effects are unknown / stale. The result must not claim evidence-only effects for an unreturned step.
+- Result and finalize semantics must distinguish an outstanding STEP from a post-result TAIL.
+- After a DB failure, `finalize` must not run normal unlock SQL. It destroys the lock client locally.
+- An unresolved promise may keep `finalize` pending forever. "Abandoned" can never mean a premature unlock that makes another run look safe.
+
+**D. Late completions are owned.**
+- A timed-out `pool.connect` can resolve later. Its client is disposed locally: no SQL, no retry, no reuse.
+- Lock acquire and unlock observations are bounded too.
+- Every timeout's ownership covers late completion, with no hidden follow-up work by runner code.
+- Only the last acknowledged snapshot counts. There is no catch / finally refresh after a failure.
+
+Resolution status: all four are **OPEN**. The citations above refer to revision 2 text kept for context; Slice A (§2.1) is the only accepted implementation scope.
