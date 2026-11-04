@@ -140,9 +140,9 @@ function world({ nightly = 250 } = {}) {
 }
 
 let laneN = 0;
-async function authorizedBooking(w, { guestDomain = "mv-test.invalid" } = {}) {
+async function authorizedBooking(w, { guestDomain = "mv-test.invalid", listingId: fixedListing = null } = {}) {
   laneN += 1;
-  const listingId = 891000 + laneN;
+  const listingId = fixedListing ?? 891000 + laneN;
   const stay = { from: addDays("2026-12-01", 3 * laneN), to: addDays("2026-12-01", 3 * laneN + 2), guests: 2 };
   const base = Date.now() - 20 * MIN;
   const priced = await priceStay({ request: { listingId, ...stay }, listingConfig: { currency: "USD" }, client: w.pricing, policy: POLICY,
@@ -230,10 +230,22 @@ async function cancelledBooking(opts) {
 
 // 0016 API calls as the runtime role
 const work = (worker, bk) => app1("SELECT booking.claim_notification_work($1, $2, $3) AS r", [worker, [bk.listingId], bk.id]).then((x) => x.r);
-const snapshot = (op) => app1("SELECT booking.guest_notification_snapshot($1) AS r", [op]).then((x) => x.r);
+/** R-C1 observation contract: an explicit READ ONLY REPEATABLE READ transaction → ONE observation SELECT → COMMIT. Any query / COMMIT
+ *  error propagates unchanged (the caller stops: no invocation, no follow-up mutation, no retry). */
+async function observe(sql, params) {
+  const c = await db.app.connect();
+  try {
+    await c.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    const r = (await c.query(sql, params)).rows[0].r;
+    await c.query("COMMIT");
+    return r;
+  } catch (e) { await c.query("ROLLBACK").catch(() => {}); throw e; } finally { c.release(); }
+}
+const snapshot = (op) => observe("SELECT booking.guest_notification_snapshot($1) AS r", [op]);
 const claim = (op, worker, s, { content = SYN } = {}) => app1("SELECT booking.claim_guest_notification($1, $2, 'gn-v1', $3, $4, $5) AS r",
   [op, worker, content, s.factsHash, s.recipientHash]).then((x) => x.r);
-const presend = (op, worker) => app1("SELECT booking.guest_notification_presend($1, $2) AS r", [op, worker]).then((x) => x.r);
+const presend = (op, worker) => observe("SELECT booking.guest_notification_presend($1, $2) AS r", [op, worker]);
+const workIn = (worker, listingIds, intentId = null) => app1("SELECT booking.claim_notification_work($1, $2, $3) AS r", [worker, listingIds, intentId]).then((x) => x.r);
 const complete = (op, worker, kind, ref, code) => app1("SELECT booking.complete_guest_notification($1, $2, $3, $4, $5) AS r", [op, worker, kind, ref, code]).then((x) => x.r);
 const release = (intentId, worker) => app1("SELECT booking.release_notification_work($1, $2) AS r", [intentId, worker]).then((x) => x.r);
 const recover = (listingIds, intentId, limit = 10) => app1("SELECT booking.recover_expired_notifications($1, $2, $3) AS r", [listingIds, intentId, limit]).then((x) => x.r);
@@ -278,6 +290,111 @@ async function waitBlocked(like, { ms = 8000 } = {}) {
   return false;
 }
 const client = async (url) => { const c = new pg.Client({ connectionString: url }); await c.connect(); return c; };
+
+
+// ---------------------------------------------------------------------------------------------
+// R-C1 / R-C2 red-green controls. Narrow SQL TEST PROBES only (disposable cluster, schema owner):
+//   * OLD_* = the exact 01c6f036 function bodies, installed under a DIFFERENT name (gn_probe_*_01c6) for a red control, then dropped;
+//   * injectBarrier() re-creates a REAL 0016 function with one advisory barrier statement added, and restore() re-installs the exact
+//     original definition and checks md5(pg_get_functiondef) is identical (CREATE OR REPLACE keeps owner / ACL / security).
+const BARRIER_KEY = 774411;
+const BARRIER_SQL = `PERFORM pg_advisory_lock_shared(${BARRIER_KEY}); PERFORM pg_advisory_unlock_shared(${BARRIER_KEY});   -- TEST PROBE barrier`;
+const OLD_SNAPSHOT = String.raw`CREATE FUNCTION booking.guest_notification_snapshot(p_op uuid) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE o booking.external_operations%ROWTYPE; cls text; f jsonb; g booking.intent_guests%ROWTYPE;
+BEGIN
+  IF p_op IS NULL THEN RAISE EXCEPTION 'NOTIFY_ARGUMENT_INVALID: op' USING ERRCODE = 'invalid_parameter_value'; END IF;
+  cls := booking.guest_notification_class(p_op);
+  IF cls = 'PROTECTED' OR cls = 'NOT_NOTIFY' THEN RETURN jsonb_build_object('class', cls); END IF;
+  SELECT * INTO o FROM booking.external_operations WHERE id = p_op;
+  IF cls <> 'ELIGIBLE' THEN RETURN jsonb_build_object('class', cls); END IF;
+  f := booking.guest_notification_facts(p_op);
+  SELECT * INTO g FROM booking.intent_guests WHERE intent_id = o.intent_id;
+  RETURN jsonb_build_object('class', cls, 'code', booking.guest_notification_refusal(p_op), 'template', o.payload ->> 'template', 'facts', f,
+    'factsHash', booking.gn_hash_facts(f), 'recipientHash', booking.guest_notification_recipient_hash(o.intent_id),
+    'email', g.email, 'firstName', g.first_name);
+END $$;`;
+const OLD_PRESEND = String.raw`CREATE FUNCTION booking.guest_notification_presend(p_op uuid, p_worker text) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE o booking.external_operations%ROWTYPE; rd booking.notification_renders%ROWTYPE; i booking.intents%ROWTYPE; w booking.intent_work%ROWTYPE;
+        r text; v_t timestamptz;
+BEGIN
+  PERFORM booking.gn_check_worker(p_worker);
+  IF p_op IS NULL THEN RAISE EXCEPTION 'NOTIFY_ARGUMENT_INVALID: op' USING ERRCODE = 'invalid_parameter_value'; END IF;
+  SELECT * INTO o FROM booking.external_operations WHERE id = p_op;
+  IF o.id IS NULL OR o.op_type <> 'guest.notify' THEN RETURN jsonb_build_object('ok', false, 'code', 'NOT_NOTIFY'); END IF;
+  IF booking.guest_notification_protected(o.intent_id) THEN RETURN jsonb_build_object('ok', false, 'code', 'PROTECTED'); END IF;
+  v_t := clock_timestamp();
+  SELECT * INTO rd FROM booking.notification_renders WHERE operation_id = p_op;
+  SELECT * INTO i FROM booking.intents WHERE id = o.intent_id;
+  SELECT * INTO w FROM booking.intent_work WHERE intent_id = o.intent_id;
+  IF o.state <> 'in_flight' OR o.attempts <> 1 OR rd.operation_id IS NULL THEN RETURN jsonb_build_object('ok', false, 'code', 'NOT_IN_FLIGHT'); END IF;
+  IF o.lease_worker_id IS DISTINCT FROM p_worker OR rd.worker IS DISTINCT FROM p_worker OR o.lease_until < v_t
+     OR w.work_worker_id IS DISTINCT FROM p_worker OR w.work_lease_until IS NULL OR w.work_lease_until < v_t THEN
+    RETURN jsonb_build_object('ok', false, 'code', 'LEASE_NOT_HELD');
+  END IF;
+  IF i.version IS DISTINCT FROM rd.intent_version THEN RETURN jsonb_build_object('ok', false, 'code', 'VERSION_DRIFT'); END IF;
+  r := booking.guest_notification_refusal(p_op);
+  IF r IS NOT NULL THEN RETURN jsonb_build_object('ok', false, 'code', r); END IF;
+  IF booking.gn_hash_facts(booking.guest_notification_facts(p_op)) IS DISTINCT FROM rd.facts_hash THEN
+    RETURN jsonb_build_object('ok', false, 'code', 'FACTS_CHANGED');
+  END IF;
+  IF booking.guest_notification_recipient_hash(o.intent_id) IS DISTINCT FROM rd.recipient_hash THEN
+    RETURN jsonb_build_object('ok', false, 'code', 'RECIPIENT_CHANGED');
+  END IF;
+  RETURN jsonb_build_object('ok', true, 'code', NULL, 'dbNow', v_t, 'opLeaseUntil', o.lease_until, 'workLeaseUntil', w.work_lease_until,
+    'contentHash', rd.content_hash, 'templateVersion', rd.template_version, 'messageRef', rd.message_ref);
+END $$;`;
+const OLD_WORK = String.raw`CREATE FUNCTION booking.claim_notification_work(p_worker text, p_listing_ids integer[], p_intent uuid) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE c record; skip uuid[] := ARRAY[]::uuid[]; k integer; w uuid; v_t timestamptz;
+BEGIN
+  PERFORM booking.gn_check_worker(p_worker);
+  PERFORM booking.gn_check_scope(p_listing_ids);
+  FOR k IN 1..10 LOOP
+    SELECT o.id, o.intent_id INTO c FROM booking.external_operations o JOIN booking.intents i ON i.id = o.intent_id
+     WHERE o.op_type = 'guest.notify' AND o.state = 'pending' AND i.listing_id = ANY (p_listing_ids) AND (p_intent IS NULL OR i.id = p_intent)
+       AND NOT (o.id = ANY (skip)) AND booking.guest_notification_class(o.id) = 'ELIGIBLE'
+     ORDER BY o.created_at, o.id LIMIT 1;
+    IF c.id IS NULL THEN RETURN jsonb_build_object('status', 'idle'); END IF;
+    skip := skip || c.id;
+    IF NOT booking.gn_lock_bundle(c.intent_id, true) THEN CONTINUE; END IF;
+    SELECT intent_id INTO w FROM booking.intent_work WHERE intent_id = c.intent_id
+       AND (work_lease_until IS NULL OR work_lease_until < clock_timestamp()) FOR UPDATE SKIP LOCKED;
+    IF w IS NULL THEN CONTINUE; END IF;
+    PERFORM booking.gn_facts_advisory(c.intent_id);
+    -- fresh READ COMMITTED statements after the locks
+    IF booking.guest_notification_class(c.id) <> 'ELIGIBLE' THEN CONTINUE; END IF;
+    v_t := clock_timestamp();
+    IF EXISTS (SELECT 1 FROM booking.intent_work WHERE intent_id = c.intent_id AND work_lease_until >= v_t) THEN CONTINUE; END IF;
+    UPDATE booking.intent_work SET work_worker_id = p_worker, work_lease_until = v_t + interval '120 seconds' WHERE intent_id = c.intent_id;
+    RETURN jsonb_build_object('status', 'acquired', 'opId', c.id, 'intentId', c.intent_id, 'workLeaseUntil', v_t + interval '120 seconds');
+  END LOOP;
+  RETURN jsonb_build_object('status', 'idle');
+END $$;`;
+function probeSql(body, realName, probeName, after = null) {
+  let sql = body.replace(`CREATE FUNCTION booking.${realName}(`, `CREATE OR REPLACE FUNCTION booking.${probeName}(`);
+  assert.ok(sql.includes(probeName), "probe renamed");
+  if (after) { assert.equal(sql.split(after).length, 2, `probe anchor once: ${after}`); sql = sql.replace(after, `${after}\n  ${BARRIER_SQL}`); }
+  return sql;
+}
+async function injectBarrier(sig, after) {
+  const def = (await one("SELECT pg_get_functiondef($1::regprocedure) AS d", [sig])).d;
+  const md5 = (await one("SELECT md5(pg_get_functiondef($1::regprocedure)) AS m", [sig])).m;
+  assert.equal(def.split(after).length, 2, `barrier anchor once in ${sig}`);
+  await db.owner.query(def.replace(after, `${after}\n  ${BARRIER_SQL}`));
+  return async () => {
+    await db.owner.query(def);
+    assert.equal((await one("SELECT md5(pg_get_functiondef($1::regprocedure)) AS m", [sig])).m, md5, `${sig} restored byte-identically`);
+  };
+}
+/** the test holds the barrier exclusively; injected statements wait on it until release() */
+async function barrier() {
+  const B = await client(db.adminUrl);
+  await B.query("SELECT pg_advisory_lock($1)", [BARRIER_KEY]);
+  return { release: async () => { await B.query("SELECT pg_advisory_unlock($1)", [BARRIER_KEY]); await B.end(); } };
+}
+const hashOf = (email, first) => createHash("sha256").update(`gn-v1-recipient\n${email}\n${first}`, "utf8").digest("hex");
 
 // =============================================================================================
 test("positive lifecycle, all 3 templates (accepted-worker USD chains): ELIGIBLE → work → SQL snapshot → claim (render bound) → presend → accepted; one claim ever", async () => {
@@ -691,6 +808,156 @@ test("addendum B — work acquisition / release wait on a held evidence insert; 
   assert.equal(await digest(b), d0);
 });
 
+test("R-C1 — snapshot: READ ONLY REPEATABLE READ required; purge / reinsert barrier DURING the observation: RED on the 01c6 body (A email + B hash), GREEN now (one row); a stale observation is SNAPSHOT_STALE", async () => {
+  const bk0 = await confirmedBooking();
+  for (const begin of [null, "BEGIN ISOLATION LEVEL REPEATABLE READ", "BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY", "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY"]) {
+    for (const sql of ["SELECT booking.guest_notification_snapshot($1) AS r", "SELECT booking.guest_notification_presend($1, 'gn-x') AS r"]) {
+      const c = await db.app.connect();
+      try {
+        if (begin) await c.query(begin);
+        const e = await pgErr(() => c.query(sql, [bk0.op.id]));
+        assert.equal(e.code, "25000", `${begin}: ${sql}`); assert.match(e.message, /^NOTIFY_SNAPSHOT_CONTEXT/);
+      } finally { await c.query("ROLLBACK").catch(() => {}); c.release(); }
+    }
+  }
+  const retention = { retention: { failedAttemptDays: 30, postCheckoutDays: 30 } };
+  const purgeReinsert = async (bk, email) => {
+    await purgeGuestData(db.app, retention);
+    assert.equal(await num("SELECT count(*) AS n FROM booking.intent_guests WHERE intent_id = $1", [bk.id]), 0, "guest A purged");
+    await db.app.query(`INSERT INTO booking.intent_guests (intent_id, first_name, last_name, email, terms_version, terms_accepted_at, created_at)
+                        VALUES ($1, 'Bea', 'Fixture', $2, 'terms-2026-10', now(), now())`, [bk.id, email]);           // synthetic guest B
+  };
+  // RED control: the 01c6 snapshot body (probe), barrier between its guest-row read and its SECOND, independent hash read
+  const r1 = await releasedBooking(); await F.ageIntent(db.owner, r1.id, 400);
+  const a1 = await one("SELECT email, first_name FROM booking.intent_guests WHERE intent_id = $1", [r1.id]);
+  await db.owner.query(probeSql(OLD_SNAPSHOT, "guest_notification_snapshot", "gn_probe_snapshot_01c6", "SELECT * INTO g FROM booking.intent_guests WHERE intent_id = o.intent_id;"));
+  let red; const emailB1 = `guest.reinsert1.n${laneN}@mv-test.invalid`;
+  try {
+    const B = await barrier();
+    const pr = db.owner.query("SELECT booking.gn_probe_snapshot_01c6($1) AS r", [r1.op.id]);
+    assert.ok(await waitBlocked("gn_probe_snapshot_01c6"));
+    await purgeReinsert(r1, emailB1);
+    await B.release();
+    red = (await pr).rows[0].r;
+  } finally { await db.owner.query("DROP FUNCTION IF EXISTS booking.gn_probe_snapshot_01c6(uuid)"); }
+  assert.equal(red.email, a1.email, "RED: the returned email is guest A's");
+  assert.equal(red.recipientHash, hashOf(emailB1, "Bea"), "RED (01c6): recipient hash of guest B");
+  assert.notEqual(red.recipientHash, hashOf(red.email, red.firstName), "RED (01c6): A email / B hash returned together");
+  // GREEN: the real function, same barrier (right after its context check), observation inside READ ONLY REPEATABLE READ
+  const r2 = await releasedBooking(); await F.ageIntent(db.owner, r2.id, 400);
+  assert.equal((await work("gn-rc1", r2)).status, "acquired");
+  const a2 = await one("SELECT email, first_name FROM booking.intent_guests WHERE intent_id = $1", [r2.id]);
+  const emailB2 = `guest.reinsert2.n${laneN}@mv-test.invalid`;
+  const restore = await injectBarrier("booking.guest_notification_snapshot(uuid)", "PERFORM booking.gn_require_observation_context();");
+  let green;
+  try {
+    const B = await barrier();
+    const gp = snapshot(r2.op.id);
+    assert.ok(await waitBlocked("guest_notification_snapshot"));
+    await purgeReinsert(r2, emailB2);
+    await B.release();
+    green = await gp;
+  } finally { await restore(); }
+  assert.equal(green.email, a2.email, "GREEN: the whole observation is guest A (one snapshot)");
+  assert.equal(green.recipientHash, hashOf(green.email, green.firstName), "GREEN: the hash is of exactly the returned row");
+  const d0 = await digest(r2);
+  assert.deepEqual(await claim(r2.op.id, "gn-rc1", green), { status: "not_claimable", code: "SNAPSHOT_STALE" }, "a stale recipient observation never becomes a claim");
+  assert.equal(await digest(r2), d0);
+  // non-racing positive control (the reinsert committed BEFORE the observation): consistent guest B, claimable
+  const fresh = await snapshot(r2.op.id);
+  assert.equal(fresh.recipientHash, hashOf(emailB2, "Bea"));
+  assert.equal((await claim(r2.op.id, "gn-rc1", fresh)).status, "claimed");
+});
+
+test("R-C1 — pre-send: drift committed BEFORE the observation refuses; DURING it is the bounded-snapshot race; dbNow is taken at the END (RED on the 01c6 early clock)", async () => {
+  const lateAuth = (bk) => applyEvent(db.app, bk.id, { type: "PAYMENT_AUTHORIZED", id: `evt_gn_late_${bk.id}`, paymentIntentId: `pi_test_late_${bk.id.slice(0, 8)}`,
+    sessionId: "cs_test_gn_late", amountMinor: bk.total, currency: "usd", livemode: false, authorizationCreatedAt: Date.now(), captureBefore: Date.now() + DAY },
+  { now: Date.now(), actor: "webhook" });
+  const cases = [
+    ["protection", confirmedBooking, (bk) => dashboard(bk.id, "hostaway_reservation", PROTECTED[3], "not_found", {}, Date.now()), "PROTECTED"],
+    ["evidence", confirmedBooking, (bk) => apiEvidence(bk.id, "payment_intent", bk.piId, "succeeded", { proofVersion: "pi-proof-v3", amountReceivedMinor: bk.total, currency: "USD" }, Date.now()), "FACTS_CHANGED"],
+    ["state", releasedBooking, (bk) => lateAuth(bk), "VERSION_DRIFT"],
+    ["work lease", confirmedBooking, (bk) => release(bk.id, "gn-pd"), "LEASE_NOT_HELD"]];
+  const restore = await injectBarrier("booking.guest_notification_presend(uuid,text)", "PERFORM booking.gn_require_observation_context();");
+  try {
+    for (const [kind, mk, drift, codeBefore] of cases) {
+      // order 1: drift commits BEFORE the observation → refused (barrier not held: the injected statement passes immediately)
+      const x = await mk(); assert.equal((await acquireAndClaim(x, "gn-pd")).c.status, "claimed");
+      await drift(x);
+      assert.equal((await presend(x.op.id, "gn-pd")).code, codeBefore, `${kind}: before`);
+      // order 2: drift commits WHILE the observation is in progress → the observation is one snapshot (no mixed rows)
+      const y = await mk(); assert.equal((await acquireAndClaim(y, "gn-pd")).c.status, "claimed");
+      const B = await barrier();
+      const pp = presend(y.op.id, "gn-pd");
+      assert.ok(await waitBlocked("guest_notification_presend"));
+      await drift(y);
+      await B.release();
+      const r = await pp;
+      assert.equal(r.ok, true, `${kind}: during — bounded snapshot, the documented later race (${JSON.stringify(r)})`);
+      if (kind === "protection") {
+        const d = await digest(y);
+        assert.equal(await complete(y.op.id, "gn-pd", "accepted", "mock-pd", null), "PROTECTED", "the next locked decision sees the protection: no write");
+        assert.equal(await digest(y), d);
+      }
+    }
+    // delayed check: dbNow is captured at the END of the checks (GREEN) …
+    const z = await confirmedBooking(); assert.equal((await acquireAndClaim(z, "gn-pd")).c.status, "claimed");
+    const B = await barrier();
+    const zp = presend(z.op.id, "gn-pd");
+    assert.ok(await waitBlocked("guest_notification_presend"));
+    await sleep(1500); const tRel = Date.now(); await B.release();
+    const rz = await zp;
+    assert.equal(rz.ok, true); assert.ok(Date.parse(rz.dbNow) >= tRel - 100, "GREEN: dbNow after the delay (margin never overstated)");
+  } finally { await restore(); }
+  // … RED on the 01c6 body: dbNow taken BEFORE the delayed checks → an overstated margin
+  const q = await confirmedBooking(); assert.equal((await acquireAndClaim(q, "gn-pd")).c.status, "claimed");
+  await db.owner.query(probeSql(OLD_PRESEND, "guest_notification_presend", "gn_probe_presend_01c6", "v_t := clock_timestamp();"));
+  try {
+    const B = await barrier();
+    const qp = db.owner.query("SELECT booking.gn_probe_presend_01c6($1, 'gn-pd') AS r", [q.op.id]);
+    assert.ok(await waitBlocked("gn_probe_presend_01c6"));
+    await sleep(1500); const tRel = Date.now(); await B.release();
+    const rq = (await qp).rows[0].r;
+    assert.equal(rq.ok, true); assert.ok(Date.parse(rq.dbNow) < tRel - 1000, "RED (01c6): dbNow before the delayed checks");
+  } finally { await db.owner.query("DROP FUNCTION IF EXISTS booking.gn_probe_presend_01c6(uuid, text)"); }
+});
+
+test("R-C2 — work selection: 100 older rows with LIVE work leases + older waiting / latched / protected rows + 11 older NOT-YET-DUE rows never hide a free row (RED on the 01c6 selection)", async () => {
+  const LST = 899500; const scope = [LST];
+  const rows = [];
+  for (let k = 0; k < 115; k++) rows.push(await releasedBooking({ listingId: LST }));
+  // the 100 OLDEST rows: live work leases held by another worker (each call takes the oldest available row)
+  for (let k = 0; k < 100; k++) {
+    const r = await workIn("gn-holder", scope);
+    assert.equal(r.opId, rows[k].op.id, `lease ${k}: oldest available first`);
+  }
+  const [wait, prot, latch] = rows.slice(100, 103); const futures = rows.slice(103, 114); const future = futures[0]; const free = rows[114];
+  await db.app.query(`INSERT INTO booking.stripe_webhook_events (event_id, event_type, livemode, stripe_created_at, intent_id, received_at, status)
+                      VALUES ($1, 'charge.updated', false, now(), $2, now(), 'received')`, [`evt_gn_rc2_${laneN}`, wait.id]);
+  await dashboard(prot.id, "hostaway_reservation", PROTECTED[0], "not_found", {}, Date.now());
+  assert.equal((await workIn("gn-latcher", scope, latch.id)).status, "acquired");
+  await db.app.query("INSERT INTO booking.reconciliation_cases (id, intent_id, kind, status, opened_at, opened_by) VALUES (gen_random_uuid(), $1, 'SOME_OWNER_CASE', 'open', now(), 'test')", [latch.id]);
+  assert.equal((await claim(latch.op.id, "gn-latcher", await snapshot(latch.op.id))).status, "latched");
+  // TEST SETUP: 11 older rows not yet due (more than the 10 skips a call may spend)
+  await F.ownerManagedHistory(db.owner, "UPDATE booking.external_operations SET next_attempt_at = now() + interval '1 day' WHERE id = ANY($1)", [futures.map((x) => x.op.id)]);
+  assert.deepEqual(await Promise.all([wait, prot, latch].map((x) => klass(x.op.id))), ["WAITING", "PROTECTED", "LATCHED"]);
+  const digests0 = await Promise.all(rows.slice(0, 114).map((x) => digest(x)));
+  // RED control: the 01c6 selection (probe) returns idle — its 10 skips are spent on leased rows
+  await db.owner.query(probeSql(OLD_WORK, "claim_notification_work", "gn_probe_work_01c6"));
+  try { assert.deepEqual((await one("SELECT booking.gn_probe_work_01c6('gn-red', $1, NULL) AS r", [scope])).r, { status: "idle" }, "RED (01c6): free work hidden"); }
+  finally { await db.owner.query("DROP FUNCTION IF EXISTS booking.gn_probe_work_01c6(text, integer[], uuid)"); }
+  // GREEN: the free row is found
+  const g = await workIn("gn-free", scope);
+  assert.deepEqual([g.status, g.opId], ["acquired", free.op.id]);
+  assert.deepEqual(await Promise.all(rows.slice(0, 114).map((x) => digest(x))), digests0, "leased / waiting / protected / latched / not-yet-due rows byte-unchanged");
+  // optional intent narrowing
+  assert.equal(await release(free.id, "gn-free"), "RELEASED");
+  assert.equal((await workIn("gn-free", scope, rows[0].id)).status, "idle", "a leased row is not taken even when named");
+  assert.equal((await workIn("gn-free", scope, future.id)).status, "idle", "a not-yet-due row is not taken");
+  assert.equal((await workIn("gn-free", scope, free.id)).opId, free.op.id);
+  assert.equal((await workIn("gn-free", [LST + 1])).status, "idle", "another scope sees nothing");
+});
+
 test("R8 — protection appearing AFTER a claim: no new notification write or invocation; audit unchanged; never re-claimed; summary counts only", async () => {
   const listing = [];
   // (a) after claim, before pre-send: owner dashboard reservation evidence with a protected ref
@@ -728,9 +995,29 @@ test("expiry batch (one real 61 s wait; no lease manipulation): scoped maintenan
   const { a, b } = global.__gnProtected;
   // normal claimed rows: m1 (scoped maintenance), m2 (late completion), g1 (GENERIC recoverExpiredOperations; non-protected only — U2 residual pin)
   const m1 = await confirmedBooking(); const m2 = await releasedBooking(); const g1 = await cancelledBooking(); const m3 = await confirmedBooking();
-  for (const [x, wkr] of [[m1, "gn-e1"], [m2, "gn-e2"], [g1, "gn-e3"], [m3, "gn-e4"]]) assert.equal((await acquireAndClaim(x, wkr)).c.status, "claimed");
+  const p1 = await confirmedBooking(); const p2 = await confirmedBooking();
+  for (const [x, wkr] of [[m1, "gn-e1"], [m2, "gn-e2"], [g1, "gn-e3"], [m3, "gn-e4"], [p1, "gn-e5"], [p2, "gn-e6"]]) assert.equal((await acquireAndClaim(x, wkr)).c.status, "claimed");
+  const tClaims = Date.now();
   const dA = await digest(a); const dB = await digest(b);
-  await sleep(61 * SEC);
+  // R-C1 lease boundary: a pre-send check DELAYED across the op-lease expiry. RED (01c6 body, probe): ok:true with a dbNow before the
+  // expiry although it returns after it. GREEN (real, barrier injected): LEASE_NOT_HELD (leases re-validated at the END of the checks).
+  await sleep(Math.max(0, tClaims + 50 * SEC - Date.now()));
+  await db.owner.query(probeSql(OLD_PRESEND, "guest_notification_presend", "gn_probe_presend_01c6", "v_t := clock_timestamp();"));
+  const restoreP = await injectBarrier("booking.guest_notification_presend(uuid,text)", "PERFORM booking.gn_require_observation_context();");
+  try {
+    const B = await barrier();
+    const pRed = db.owner.query("SELECT booking.gn_probe_presend_01c6($1, 'gn-e5') AS r", [p1.op.id]);
+    const pGreen = presend(p2.op.id, "gn-e6");
+    assert.ok(await waitBlocked("gn_probe_presend_01c6")); assert.ok(await waitBlocked("guest_notification_presend"));
+    const lu1 = (await notifyOf(p1.id)).lease_until.getTime(); const lu2 = (await notifyOf(p2.id)).lease_until.getTime();
+    await sleep(Math.max(0, Math.max(lu1, lu2) + 1500 - Date.now()));
+    await B.release();
+    const red = (await pRed).rows[0].r; const tRed = Date.now();
+    const green = await pGreen;
+    assert.equal(red.ok, true); assert.ok(Date.parse(red.dbNow) < lu1 && tRed > lu1, "RED (01c6): ok:true reported for a lease that expired before it returned");
+    assert.deepEqual(green, { ok: false, code: "LEASE_NOT_HELD" }, "GREEN: lease re-validated at the end of the checks");
+  } finally { await restoreP(); await db.owner.query("DROP FUNCTION IF EXISTS booking.gn_probe_presend_01c6(uuid, text)"); }
+  await sleep(Math.max(0, tClaims + 61 * SEC - Date.now()));
   assert.equal((await presend(m2.op.id, "gn-e2")).code, "LEASE_NOT_HELD");
   assert.equal(await complete(m2.op.id, "gn-e2", "accepted", "mock-late", null), "LEASE_LOST");
   // protected noise is excluded BEFORE LIMIT: limit 1 over [a, b protected + m1] still processes m1; maintenance waits on a held evidence insert
@@ -847,6 +1134,9 @@ test("attempt-row changes serialise with notification decisions (bundle attempt 
 test("whole suite: no provider network attempt; protected ids only in fixture references", async () => {
   assert.equal(netAttempts, 0);
   assert.equal(await num("SELECT count(*) AS n FROM booking.notification_renders r JOIN booking.intents i ON i.id = r.intent_id WHERE i.hostaway_reservation_id = ANY($1)", [PROTECTED]), 0);
+  // the transaction-scoped write tokens never outlive their transaction (success, refusal and error paths all ran above)
+  assert.equal(await num("SELECT count(*) AS n FROM booking.notification_write_authority"), 0);
+  assert.equal(await num("SELECT count(*) AS n FROM pg_proc WHERE proname LIKE 'gn\\_probe\\_%'"), 0, "no test probe left behind");
 });
 
 // =============================================================================================

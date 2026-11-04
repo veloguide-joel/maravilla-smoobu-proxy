@@ -619,6 +619,8 @@ These apply to every path, including raw UPDATEs and privileged sessions.
 
 ### 6.4 Pre-send snapshot `booking.guest_notification_presend(p_op, p_worker) RETURNS jsonb`
 
+> **Corrected by R-C1 (§15.9; supersedes the STABLE wording below).** `guest_notification_snapshot` and `guest_notification_presend` run ONLY inside an explicit, caller-created `READ ONLY REPEATABLE READ` transaction; any other context is refused with `25000 NOTIFY_SNAPSHOT_CONTEXT`. The caller does: BEGIN RR READ ONLY → ONE observation SELECT → COMMIT → the final frozen-request / clock / skew / elapsed / margin checks → invoke. There is never any network inside a DB transaction, and an error stops the step with no retry. `dbNow` is captured at the END of the checks, and both leases are re-validated at that instant. The snapshot's recipient hash is the hash of the exact guest row it returns. This is a bounded snapshot: later commits are the documented race.
+
 - SECURITY DEFINER and declared **STABLE**, so every read sees the single snapshot of the calling statement.
 - **Returns:** `{ok, code, dbNow, opLeaseUntil, workLeaseUntil, contentHash, templateVersion, messageRef}`.
 - **`ok` requires:**
@@ -1207,7 +1209,7 @@ Neither stage changes E3 producers, other workers, routes, UI, config or deps.
 
 **Live provider, sender identity, recipient policy, retention and copy: CLOSED.**
 
-## 15. Stage 1 implementation map (OFFLINE; root ACCEPT of `6e3fca5f` as design + addenda A–C; pending root CODE REVIEW)
+## 15. Stage 1 implementation map (OFFLINE; root ACCEPT of `6e3fca5f` as design + addenda A–C; root CODE HOLD on `01c6f036` → corrections R-C1 to R-C3 in §15.9; pending root CODE re-review)
 
 **Branch** `feature/e7-guest-notification-fence`, cut from exact `6e3fca5f9177e5fdd34544c974b023c320fc9ce7`.
 
@@ -1405,3 +1407,93 @@ All TAP files are kept in the session scratchpad (`gnf/tap/`): `focused-final.ta
 - **Unresolvable unknown cases.** Unknown cases block purge (N2 = a).
 - **No catalogued refusal mapping.** The new `NOTIFY_*` fence codes are not in `DB_SAFETY_CODES`, so a generic helper surfaces them as raw errors.
 - **e74a.** The historical listing-lock failure stays OPEN.
+
+### 15.9 Root CODE HOLD on `01c6f036` — corrections R-C1 to R-C3 (same branch, corrections only; pending root CODE re-review)
+
+#### R-C1 — consistent observation snapshots and end-of-check timing
+
+**Mechanism.** The shared 0010 / 0011 predicates are left unmodified. The two observation functions, `guest_notification_snapshot` and `guest_notification_presend`, now REQUIRE an explicit, caller-created `READ ONLY REPEATABLE READ` transaction.
+- The first statement of each function is the private guard `gn_require_observation_context()`.
+- That guard raises `25000 NOTIFY_SNAPSHOT_CONTEXT` for anything else: autocommit, read-write RR, read-only RC, or SERIALIZABLE.
+- Under RR, every statement in the transaction reads ONE snapshot. This includes the VOLATILE shared predicates. So nothing is relabelled STABLE.
+
+**Recipient binding.** It is direct.
+- The snapshot's `recipientHash` is now `gn_recipient_hash_of(email, first_name)` of the exact guest row whose `email` / `firstName` it returns.
+- The pre-send compares the hash of the guest row it read in the same snapshot.
+- The claim still re-derives the hash from the current, KEY-SHARE-locked row. A stale observation therefore gets `SNAPSHOT_STALE`.
+
+**Pre-send timing.** `dbNow` is captured at the END of all checks. Both leases (op and work) are then re-validated against that instant (`lease_until > dbNow`). A delayed check can only shrink the reported margin, or refuse.
+
+**Caller contract** (Stage 1 PG helpers now; Stage 2 worker later):
+1. `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`.
+2. ONE observation `SELECT`.
+3. `COMMIT`.
+4. The final frozen-request, JS-clock skew, elapsed-time and margin checks.
+5. Invoke.
+
+There is never any network inside a DB transaction. A query or COMMIT error stops the step with no invocation, no follow-up mutation and no retry.
+
+**The guarantee is bounded.** The observation is one consistent snapshot. Commits after it (protection, evidence, state, a work-lease release) are the documented later race; they are caught only by the next locked decision. For example, completion refuses with `PROTECTED`. This is not current-provider truth.
+
+**Claim argument.** `claim_guest_notification` accepts a NULL expected recipient hash (a missing recipient): the refusal then latches `RECIPIENT_MISSING`. A non-NULL current hash gives `SNAPSHOT_STALE`.
+
+#### R-C2 — work selection cannot be starved
+
+`claim_notification_work` now filters out, in SQL BEFORE `ORDER BY created_at, id LIMIT 1`:
+- rows whose `intent_work` lease is still live;
+- rows not yet due (`next_attempt_at > clock_timestamp()`);
+
+This is in addition to the existing scope, class and protection filters. The locked SKIP LOCKED re-check stays authoritative, and now also re-checks dueness. No other worker or generic helper changed.
+
+**Not claimed.** Absolute fairness under row locks held indefinitely by other transactions: such a row costs one of the 10 skips per call.
+
+#### R-C3 — the authorized e72 adaptation (only the test at `e72-reservation-worker.test.mjs:375`)
+- The old raw non-canonical INSERT is now a negative assertion: it rejects with `NOTIFY_INSERT_REFUSED`.
+- The worker-isolation assertion is preserved with a REAL canonical notification. E3 queues it on a separate synthetic terminal booking, built by the accepted `F.confirmed` repo-path fixture on listing `L(70)`.
+- The reservation worker then runs 8 steps over a listing scope covering both bookings, with no intent narrowing. Reservation work proceeds, and the canonical row stays pending, undispatched and byte-identical.
+- No triggers are disabled, and no shared fixture or runtime file changed.
+
+#### Red / green evidence (CLAUDE-RUN; narrow test probes only)
+
+The `gn_probe_*_01c6` probe functions are the exact `01c6` bodies under another name. They are dropped after use; the suite asserts that none remains. Barrier injection into a real function is restored and its `md5(pg_get_functiondef)` checked identical.
+
+| Control | RED on the 01c6 body | GREEN now |
+|---|---|---|
+| Snapshot under a purge + reinsert barrier | Returns guest A's email together with guest B's recipient hash | Returns guest A consistently, with the hash of that row; the claim with it gives `SNAPSHOT_STALE`, no write; the non-racing control (reinsert before the observation) gives guest B and is claimable |
+| Pre-send delayed 1.5 s | `dbNow` more than 1 s before the delay ended (overstated margin) | `dbNow` after the delay |
+| Pre-send delayed across the op-lease expiry (inside the real 61 s expiry wait) | `ok:true`, with `dbNow` before the expiry, while returning after it | `LEASE_NOT_HELD` |
+| Pre-send drift: protection / evidence / state / work-lease release committed before the observation | — | `PROTECTED` / `FACTS_CHANGED` / `VERSION_DRIFT` / `LEASE_NOT_HELD` |
+| The same drift committed during the observation | — | `ok:true` (one snapshot, the bounded race). For protection, the next completion returns `PROTECTED` with no write |
+| Work selection: 100 older live-leased rows + older WAITING / PROTECTED / LATCHED / not-yet-due rows + one free row | `idle` | Acquires the free row; all 104 other rows byte-unchanged; intent narrowing honours leases and dueness; another scope is idle |
+| Wrong observation context (×4) | — | Refused (`25000`) |
+
+The token table is empty after all success, refusal and error paths.
+
+**Targeted mutants on the changed paths only.** 8 probes, each restored and hash-checked. The earlier 27 were not rerun.
+
+| Mutant | What it changes | Result |
+|---|---|---|
+| M28 / M29 | snapshot / pre-send context guard removed | caught |
+| M30 | snapshot recipient hash from an independent read (the 01c6 style) | **survived — equivalent** (see below) |
+| M31 | `dbNow` captured before the checks | caught |
+| M32 | end-of-check lease re-validation removed | caught |
+| M33 | live-lease filter before `LIMIT` removed | caught |
+| M34 | due filter before `LIMIT` removed | first survived (only 1 not-yet-due row); test strengthened to 11; now caught |
+| M35 | post-lock due re-check removed | **survived — equivalent** (see below) |
+
+Why the two survivors are equivalent:
+- **M30.** Inside the enforced READ ONLY REPEATABLE READ context, an independent read sees the same snapshot. The context guard itself is covered by M28.
+- **M35.** The not-yet-due filter already runs before `LIMIT`, and the notify fence freezes `next_attempt_at` after insert, so a row cannot become not-yet-due between selection and lock. The re-check is defence in depth.
+
+**Runs (CLAUDE-RUN)**
+
+| Run | Result |
+|---|---|
+| Focused (`e7-guest-notification-fence` + operations unit) | 21 / 21 |
+| `e72-reservation-worker.test.mjs` | 31 / 31 |
+| `npm test` | 695 / 695 |
+| `test:db` | **449 / 449**; the e74a listing-lock guard passed (the historical failure stays OPEN, not reproduced) |
+
+- No new mechanical pins were needed for these corrections.
+- TAP is in the session scratchpad: `gnf/tap/rc-*.tap`, `e72-adapt-*.tap`; per-mutant `gnf/mut/M28–M35.tap`.
+- **Deviation 1 of §15.6 is superseded.** The observation functions stay VOLATILE, and consistency now comes from the enforced READ ONLY REPEATABLE READ caller transaction, not from a STABLE label.

@@ -38,6 +38,8 @@ DROP FUNCTION booking.gn_hash_facts(jsonb);
 DROP FUNCTION booking.guest_notification_facts(uuid);
 DROP FUNCTION booking.gn_latest_evidence(uuid, text, text);
 DROP FUNCTION booking.guest_notification_recipient_hash(uuid);
+DROP FUNCTION booking.gn_require_observation_context();
+DROP FUNCTION booking.gn_recipient_hash_of(text, text);
 DROP FUNCTION booking.guest_notification_class(uuid);
 DROP FUNCTION booking.guest_notification_protected(uuid);
 DROP FUNCTION booking.gn_obs_bool(jsonb, text[]);

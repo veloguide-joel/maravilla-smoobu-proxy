@@ -381,15 +381,24 @@ test("crash after the send + reply record, before completion: recovery proves th
 test("only reservation-phase rows are claimed: a queued notification on the same intent is never touched", async () => {
   const w = world();
   const a = await authorizedIntent(w, L(34));
-  const h = harness(w, [L(34)]);
+  const h = harness(w, [L(34), L(70)]);                                  // the scope covers BOTH bookings below
   await h.step({ intentId: a.id });
   w.createMode = "503";
   await h.step({ intentId: a.id });                                     // reservation_unknown (+ E3 lookup read)
-  await db.app.query(`INSERT INTO booking.external_operations (id, intent_id, op_type, idempotency_key, retry_class, state, payload, source_version, max_attempts,
+  // E7 guest notification (0016): a raw NON-canonical notification row is now refused by the fence (negative assertion, not setup)
+  await assert.rejects(db.app.query(`INSERT INTO booking.external_operations (id, intent_id, op_type, idempotency_key, retry_class, state, payload, source_version, max_attempts,
      next_attempt_at, created_at, updated_at) VALUES (gen_random_uuid(), $1, 'guest.notify', $2, 'idempotent', 'pending', '{"template":"t"}', 1, 5, $3, $3, $3)`,
-    [a.id, `test-notify:${a.id}`, new Date(F.at(0))]);
-  for (let k = 0; k < 8; k++) { h.clk.t += 60 * 1000; await h.step({ intentId: a.id }); }
-  assert.deepEqual((await opsOf(a.id, "guest.notify")).map((o) => [o.state, o.dispatched_at]), [["pending", null]]);
+    [a.id, `test-notify:${a.id}`, new Date(F.at(0))]), { message: /^NOTIFY_INSERT_REFUSED/ });
+  // a REAL canonical notification queued by E3 on a separate synthetic terminal booking (accepted repo fixture path, in scope)
+  const c = await F.confirmed(db.app, { listingId: L(70) });
+  const n0 = (await opsOf(c.id, "guest.notify")).map((o) => JSON.stringify(o));
+  assert.deepEqual((await opsOf(c.id, "guest.notify")).map((o) => [o.state, o.dispatched_at, o.idempotency_key]), [["pending", null, `notify:${c.id}:booking_confirmed`]]);
+  const lookups0 = (await opsOf(a.id, "hostaway.lookup_reservation")).length;
+  for (let k = 0; k < 8; k++) { h.clk.t += 60 * 1000; await h.step(); }  // unscoped by intent: both bookings are in the listing scope
+  assert.ok((await opsOf(a.id, "hostaway.lookup_reservation")).length > lookups0 || (await loadIntent(db.app, a.id)).status !== "reservation_unknown",
+    "reservation work proceeded for the reservation-phase booking");
+  assert.deepEqual((await opsOf(c.id, "guest.notify")).map((o) => JSON.stringify(o)), n0, "the canonical notification row is byte-unchanged (pending, undispatched)");
+  assert.equal(await F.count(db.app, "SELECT count(*) AS n FROM booking.external_operations WHERE intent_id = $1 AND op_type = 'guest.notify'", [a.id]), 0);
 });
 
 test("work-lease fence: a step that outlived its intent_work lease cannot apply its event", async () => {

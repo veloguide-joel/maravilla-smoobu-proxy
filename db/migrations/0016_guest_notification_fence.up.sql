@@ -208,12 +208,31 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
 $$;
 REVOKE ALL ON FUNCTION booking.guest_notification_class(uuid) FROM PUBLIC;
 
+-- recipient hash of ONE guest row's values (R-C1: snapshot / presend hash exactly the row they return or compare). Pure.
+CREATE FUNCTION booking.gn_recipient_hash_of(p_email text, p_first_name text) RETURNS text
+LANGUAGE sql IMMUTABLE SECURITY INVOKER SET search_path = pg_catalog, booking AS $$
+  SELECT CASE WHEN p_email IS NULL OR p_first_name IS NULL THEN NULL
+              ELSE encode(sha256(convert_to('gn-v1-recipient' || E'\n' || p_email || E'\n' || p_first_name, 'UTF8')), 'hex') END
+$$;
+REVOKE ALL ON FUNCTION booking.gn_recipient_hash_of(text, text) FROM PUBLIC;
+
 -- recipient hash (SQL-derived; pseudonymous, guessable personal data — N3 offline only). NULL when the guest row is absent.
 CREATE FUNCTION booking.guest_notification_recipient_hash(p_intent uuid) RETURNS text
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
-  SELECT encode(sha256(convert_to('gn-v1-recipient' || E'\n' || g.email || E'\n' || g.first_name, 'UTF8')), 'hex')
-    FROM booking.intent_guests g WHERE g.intent_id = p_intent
+  SELECT booking.gn_recipient_hash_of(g.email, g.first_name) FROM booking.intent_guests g WHERE g.intent_id = p_intent
 $$;
+
+-- R-C1 observation context: the read-only observation functions (snapshot, presend) run ONLY inside an explicit, caller-created
+-- READ ONLY REPEATABLE READ transaction, so every statement they (and the shared VOLATILE 0010 / 0011 predicates they call) execute
+-- reads ONE transaction snapshot. A wrong context is refused before any read.
+CREATE FUNCTION booking.gn_require_observation_context() RETURNS void
+LANGUAGE plpgsql STABLE SECURITY INVOKER SET search_path = pg_catalog, booking AS $$
+BEGIN
+  IF current_setting('transaction_isolation') <> 'repeatable read' OR current_setting('transaction_read_only') <> 'on' THEN
+    RAISE EXCEPTION 'NOTIFY_SNAPSHOT_CONTEXT: call inside an explicit READ ONLY REPEATABLE READ transaction' USING ERRCODE = 'invalid_transaction_state';
+  END IF;
+END $$;
+REVOKE ALL ON FUNCTION booking.gn_require_observation_context() FROM PUBLIC;
 REVOKE ALL ON FUNCTION booking.guest_notification_recipient_hash(uuid) FROM PUBLIC;
 
 -- latest evidence of a kind / ref in the deterministic contract order (observed_at, created_at, id)
@@ -632,8 +651,12 @@ BEGIN
   PERFORM booking.gn_check_worker(p_worker);
   PERFORM booking.gn_check_scope(p_listing_ids);
   FOR k IN 1..10 LOOP
+    -- R-C2: known-held work leases and not-yet-due rows are filtered BEFORE ORDER BY / LIMIT (with scope, class and protection), so
+    -- leased / waiting / latched / protected / future rows can never hide available work; the locked recheck below stays authoritative.
     SELECT o.id, o.intent_id INTO c FROM booking.external_operations o JOIN booking.intents i ON i.id = o.intent_id
+      JOIN booking.intent_work wk ON wk.intent_id = o.intent_id
      WHERE o.op_type = 'guest.notify' AND o.state = 'pending' AND i.listing_id = ANY (p_listing_ids) AND (p_intent IS NULL OR i.id = p_intent)
+       AND o.next_attempt_at <= clock_timestamp() AND (wk.work_lease_until IS NULL OR wk.work_lease_until < clock_timestamp())
        AND NOT (o.id = ANY (skip)) AND booking.guest_notification_class(o.id) = 'ELIGIBLE'
      ORDER BY o.created_at, o.id LIMIT 1;
     IF c.id IS NULL THEN RETURN jsonb_build_object('status', 'idle'); END IF;
@@ -644,7 +667,8 @@ BEGIN
     IF w IS NULL THEN CONTINUE; END IF;
     PERFORM booking.gn_facts_advisory(c.intent_id);
     -- fresh READ COMMITTED statements after the locks
-    IF booking.guest_notification_class(c.id) <> 'ELIGIBLE' THEN CONTINUE; END IF;
+    IF booking.guest_notification_class(c.id) <> 'ELIGIBLE'
+       OR NOT EXISTS (SELECT 1 FROM booking.external_operations x WHERE x.id = c.id AND x.next_attempt_at <= clock_timestamp()) THEN CONTINUE; END IF;
     v_t := clock_timestamp();
     IF EXISTS (SELECT 1 FROM booking.intent_work WHERE intent_id = c.intent_id AND work_lease_until >= v_t) THEN CONTINUE; END IF;
     UPDATE booking.intent_work SET work_worker_id = p_worker, work_lease_until = v_t + interval '120 seconds' WHERE intent_id = c.intent_id;
@@ -669,10 +693,13 @@ BEGIN
 END $$;
 
 -- snapshot for the (future, Stage 2) renderer. VOLATILE (see refusal); no write.
+-- R-C1: runs ONLY in an explicit READ ONLY REPEATABLE READ transaction (one snapshot for every read, including the shared VOLATILE
+-- predicates); the recipient hash is computed from the SAME guest row whose email / first name are returned.
 CREATE FUNCTION booking.guest_notification_snapshot(p_op uuid) RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
 DECLARE o booking.external_operations%ROWTYPE; cls text; f jsonb; g booking.intent_guests%ROWTYPE;
 BEGIN
+  PERFORM booking.gn_require_observation_context();
   IF p_op IS NULL THEN RAISE EXCEPTION 'NOTIFY_ARGUMENT_INVALID: op' USING ERRCODE = 'invalid_parameter_value'; END IF;
   cls := booking.guest_notification_class(p_op);
   IF cls = 'PROTECTED' OR cls = 'NOT_NOTIFY' THEN RETURN jsonb_build_object('class', cls); END IF;
@@ -681,7 +708,7 @@ BEGIN
   f := booking.guest_notification_facts(p_op);
   SELECT * INTO g FROM booking.intent_guests WHERE intent_id = o.intent_id;
   RETURN jsonb_build_object('class', cls, 'code', booking.guest_notification_refusal(p_op), 'template', o.payload ->> 'template', 'facts', f,
-    'factsHash', booking.gn_hash_facts(f), 'recipientHash', booking.guest_notification_recipient_hash(o.intent_id),
+    'factsHash', booking.gn_hash_facts(f), 'recipientHash', booking.gn_recipient_hash_of(g.email, g.first_name),
     'email', g.email, 'firstName', g.first_name);
 END $$;
 
@@ -695,7 +722,7 @@ BEGIN
   PERFORM booking.gn_check_worker(p_worker);
   IF p_op IS NULL OR p_template_version IS DISTINCT FROM 'gn-v1' OR p_content_hash IS NULL OR p_content_hash !~ '^[0-9a-f]{64}$'
      OR p_expected_facts_hash IS NULL OR p_expected_facts_hash !~ '^[0-9a-f]{64}$'
-     OR p_expected_recipient_hash IS NULL OR p_expected_recipient_hash !~ '^[0-9a-f]{64}$' THEN
+     OR (p_expected_recipient_hash IS NOT NULL AND p_expected_recipient_hash !~ '^[0-9a-f]{64}$') THEN
     RAISE EXCEPTION 'NOTIFY_ARGUMENT_INVALID: claim arguments' USING ERRCODE = 'invalid_parameter_value';
   END IF;
   SELECT intent_id, op_type INTO v_intent, v_type FROM booking.external_operations WHERE id = p_op;
@@ -774,25 +801,26 @@ BEGIN
   RETURN 'LATCHED';
 END $$;
 
--- pre-send check (contract §6.4). No locks, no write. VOLATILE (deviation from the contract's STABLE: the refusal it calls reuses
--- VOLATILE 0010/0011 predicates; each statement reads all commits that precede it).
+-- pre-send check (contract §6.4 as corrected by R-C1). No locks, no write. ONLY inside an explicit READ ONLY REPEATABLE READ
+-- transaction: every check reads ONE snapshot; dbNow is captured at the END of the checks and both leases are re-validated at that
+-- instant (a delayed check can only shrink the reported margin or refuse). A bounded snapshot: later commits are the documented race.
 CREATE FUNCTION booking.guest_notification_presend(p_op uuid, p_worker text) RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
 DECLARE o booking.external_operations%ROWTYPE; rd booking.notification_renders%ROWTYPE; i booking.intents%ROWTYPE; w booking.intent_work%ROWTYPE;
-        r text; v_t timestamptz;
+        g booking.intent_guests%ROWTYPE; r text; v_t timestamptz;
 BEGIN
+  PERFORM booking.gn_require_observation_context();
   PERFORM booking.gn_check_worker(p_worker);
   IF p_op IS NULL THEN RAISE EXCEPTION 'NOTIFY_ARGUMENT_INVALID: op' USING ERRCODE = 'invalid_parameter_value'; END IF;
   SELECT * INTO o FROM booking.external_operations WHERE id = p_op;
   IF o.id IS NULL OR o.op_type <> 'guest.notify' THEN RETURN jsonb_build_object('ok', false, 'code', 'NOT_NOTIFY'); END IF;
   IF booking.guest_notification_protected(o.intent_id) THEN RETURN jsonb_build_object('ok', false, 'code', 'PROTECTED'); END IF;
-  v_t := clock_timestamp();
   SELECT * INTO rd FROM booking.notification_renders WHERE operation_id = p_op;
   SELECT * INTO i FROM booking.intents WHERE id = o.intent_id;
   SELECT * INTO w FROM booking.intent_work WHERE intent_id = o.intent_id;
+  SELECT * INTO g FROM booking.intent_guests WHERE intent_id = o.intent_id;
   IF o.state <> 'in_flight' OR o.attempts <> 1 OR rd.operation_id IS NULL THEN RETURN jsonb_build_object('ok', false, 'code', 'NOT_IN_FLIGHT'); END IF;
-  IF o.lease_worker_id IS DISTINCT FROM p_worker OR rd.worker IS DISTINCT FROM p_worker OR o.lease_until < v_t
-     OR w.work_worker_id IS DISTINCT FROM p_worker OR w.work_lease_until IS NULL OR w.work_lease_until < v_t THEN
+  IF o.lease_worker_id IS DISTINCT FROM p_worker OR rd.worker IS DISTINCT FROM p_worker OR w.work_worker_id IS DISTINCT FROM p_worker THEN
     RETURN jsonb_build_object('ok', false, 'code', 'LEASE_NOT_HELD');
   END IF;
   IF i.version IS DISTINCT FROM rd.intent_version THEN RETURN jsonb_build_object('ok', false, 'code', 'VERSION_DRIFT'); END IF;
@@ -801,8 +829,12 @@ BEGIN
   IF booking.gn_hash_facts(booking.guest_notification_facts(p_op)) IS DISTINCT FROM rd.facts_hash THEN
     RETURN jsonb_build_object('ok', false, 'code', 'FACTS_CHANGED');
   END IF;
-  IF booking.guest_notification_recipient_hash(o.intent_id) IS DISTINCT FROM rd.recipient_hash THEN
+  IF booking.gn_recipient_hash_of(g.email, g.first_name) IS DISTINCT FROM rd.recipient_hash THEN
     RETURN jsonb_build_object('ok', false, 'code', 'RECIPIENT_CHANGED');
+  END IF;
+  v_t := clock_timestamp();                                                                  -- END of the checks
+  IF o.lease_until IS NULL OR o.lease_until <= v_t OR w.work_lease_until IS NULL OR w.work_lease_until <= v_t THEN
+    RETURN jsonb_build_object('ok', false, 'code', 'LEASE_NOT_HELD');
   END IF;
   RETURN jsonb_build_object('ok', true, 'code', NULL, 'dbNow', v_t, 'opLeaseUntil', o.lease_until, 'workLeaseUntil', w.work_lease_until,
     'contentHash', rd.content_hash, 'templateVersion', rd.template_version, 'messageRef', rd.message_ref);
