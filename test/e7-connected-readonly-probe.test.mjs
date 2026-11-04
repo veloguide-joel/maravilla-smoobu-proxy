@@ -86,7 +86,7 @@ function stringsOf(v, out = []) { if (typeof v === "string") out.push(v); else i
 const KEY_VOCAB = new Set(["schema", "planHash", "metadata", "reviewedCommit", "nodeVersion", "stripeVersion", "approvalRef", "outcome", "stopCode", "stopProbe", "probes", "id", "code", "httpStatus",
   "transportCode", "elapsed", "evidence", "gates", "idMatches", "currencyUSD", "dayCount", "inWindow", "complete", "rowCount", "allScoped", "typesOk", "pageFull", "listingMatches", "status",
   "allRowsMatch", "accountIdMatches", "livemode", "latestCharge", "proofFieldsTyped", "G_AUTH_charges_read", "G_FILTER", "G_SHAPE_listing", "G_SHAPE_calendar", "G_SHAPE_lookup",
-  "G_SHAPE_reservation", "G_SHAPE_charges", "B4_pi_read", "TEST_mode_pi", ...T_ERROR_CODES]);
+  "G_SHAPE_reservation", "G_SHAPE_charges", "B4_pi_read", "TEST_mode_pi", "timerCleanup", "cancelFailed", "uncancellable", ...T_ERROR_CODES]);
 function assertRedacted(sum, plan) {
   const allowed = new Set([...VOCABULARY, plan.planHash, ...Object.values(plan.metadata)]);
   for (const s of stringsOf(sum)) assert.ok(allowed.has(s) || KEY_VOCAB.has(s) || /^[0-9]+$/.test(s), `non-whitelisted string in summary: ${s}`);
@@ -330,8 +330,11 @@ test("P5. dependency faults and transport faults: monotonic throw / non-finite /
   { let t = 100; const tb = fakeTime(); const deps = { monotonic: () => (t -= 50), timers: { arm: tb.arm } }; const { sum } = await depRun(deps); assert.equal(sum.stopCode, "PROBE_DEPENDENCY_FAILED", "backwards clock"); }
   { const tr = fakeTime(); const deps = { monotonic: tr.monotonic, timers: { arm: (ms) => { const h = tr.arm(ms); queueMicrotask(() => tr.timers.at(-1).rej(new Error("timer fault"))); return h; } } };
     const { sum } = await depRun(deps, fakeSend(() => ({ hold: true }))); assert.equal(sum.stopCode, "PROBE_DEPENDENCY_FAILED", "timer rejection"); }
-  { let cancels = 0; const tc = fakeTime(); const deps = { monotonic: tc.monotonic, timers: { arm: (ms) => { const h = tc.arm(ms); return { promise: h.promise, cancel: () => { cancels += 1; throw new Error("cancel fault"); } }; } } };
-    const { sum } = await depRun(deps); assert.deepEqual([sum.outcome, cancels], ["COMPLETED", 2], "cancel fault contained; exactly once per handle"); }
+  { // [CHANGED EXPECTATION, root HOLD R-PC2 on 0106adf5: the old assertion codified "COMPLETED, cancel fault silently contained"]
+    let cancels = 0; const tc = fakeTime(); const deps = { monotonic: tc.monotonic, timers: { arm: (ms) => { const h = tc.arm(ms); return { promise: h.promise, cancel: () => { cancels += 1; throw new Error("cancel fault"); } }; } } };
+    const { sum, h } = await depRun(deps);
+    assert.deepEqual([sum.outcome, sum.stopCode, sum.probes[0].code, sum.probes[0].evidence, sum.probes[1].code, cancels, h.calls.length, sum.timerCleanup.cancelFailed],
+      ["STOPPED", "PROBE_DEPENDENCY_FAILED", "PROBE_DEPENDENCY_FAILED", null, "AFTER_STOP", 1, 1, 1], "cancel fault after a settled reply → dependency STOP, no next send, reported"); }
   assert.equal(runReadonlyProbes({ plan: p1, hostaway: fakeSend().transport, deps: { monotonic: () => 0 } }).code, "RUN_DEPS_INVALID");
   assert.equal(runReadonlyProbes({ plan: p1, hostaway: fakeSend().transport, deps: new Proxy(fakeTime().deps(), {}) }).code, "RUN_DEPS_INVALID");
   assert.equal(runReadonlyProbes({ plan: p1, deps: fakeTime().deps() }).code, "RUN_TRANSPORT_INVALID");
@@ -402,4 +405,92 @@ test("P7. parity + source pins: copied constants equal their sources; imports ex
   for (const re of [/\bfetch\s*\(/, /node:(https?|net|tls|dns|fs|child_process|timers)/, /process\./, /setTimeout|setInterval|setImmediate|queueMicrotask/, /console\./, /\bretry\b/i,
     /http-transports|real-exchange|run-manifest|run-core|run-guard|booking-db|hostaway-reservations/]) assert.doesNotMatch(code, re, String(re));
   assert.ok(PROBE_IDS.length === 8 && CODES.probe.includes("PROBE_CONTROL_OVERLAP"));
+});
+
+// ---- root CODE HOLD on 0106adf5: R-PC1 / R-PC2 / R-PC3 (P8 FAILS on exact 0106adf5; see contract §11.1) ----------------------------
+test("P8. R-PC1 final abort handoff, R-PC2 timer-handle ownership / cancel faults, R-PC3 conditional card proof-field coverage", async () => {
+  const P1 = valid({ probes: ["P-H1"], hostaway: { ...plan0().hostaway, calendar: null, sample: null, control: null }, stripe: null, limits: { perProbeMs: 1000, runMs: 1000, tailMs: 0 } });
+  const P2 = valid({ probes: ["P-H1", "P-H2"], hostaway: { ...plan0().hostaway, sample: null, control: null }, stripe: null });
+  const never = () => ({ promise: new Promise(() => {}), cancel() {} });
+  // R-PC1: monotonic aborts the caller on its 3rd call (t0, n0, n1) → ZERO sends; on its 2nd (n0) → ZERO sends
+  for (const at of [2, 3]) {
+    const ac = new AbortController(); let calls = 0; let sends = 0;
+    const r = runReadonlyProbes({ plan: P1, hostaway: { send: () => { sends += 1; return Promise.resolve(listingR()); } }, signal: ac.signal,
+      deps: { monotonic: () => { calls += 1; if (calls === at) ac.abort(); return 0; }, timers: { arm: never } } });
+    const sum = await r.result; assert.deepEqual([sum.probes[0].code, sends], ["PROBE_CANCELLED", 0], `monotonic call #${at} aborts`);
+  }
+  { // abort inside cancel of the timer after a settled reply: the probe outcome stays the reply's; nothing more is sent
+    const ac = new AbortController(); let sends = 0;
+    const r = runReadonlyProbes({ plan: P2, hostaway: { send: () => { sends += 1; return Promise.resolve(sends === 1 ? listingR() : calendarR()); } }, signal: ac.signal,
+      deps: { monotonic: () => 0, timers: { arm: () => ({ promise: new Promise(() => {}), cancel() { ac.abort(); } }) } } });
+    const sum = await r.result; assert.deepEqual([sum.probes[0].code, sum.probes[1].code, sends], ["PROBE_OK", "PROBE_CANCELLED", 1]);
+  }
+  // R-PC2: rejected handles still cancelled once through a safely validated cancel; getters never run
+  let getterRuns = 0;
+  for (const [label, mk, cancelExpected, uncancellable] of [
+    ["thenable promise + callable cancel", (c) => ({ promise: { then() {} }, cancel() { c.n += 1; } }), 1, 0],
+    ["patched native promise", (c) => ({ promise: Object.defineProperty(new Promise(() => {}), "then", { value() {} }), cancel() { c.n += 1; } }), 1, 0],
+    ["extra key", (c) => ({ promise: new Promise(() => {}), cancel() { c.n += 1; }, extra: 1 }), 1, 0],
+    ["accessor promise", (c) => Object.defineProperty({ cancel() { c.n += 1; } }, "promise", { enumerable: true, get() { getterRuns += 1; return new Promise(() => {}); } }), 1, 0],
+    ["accessor cancel", (c) => Object.defineProperty({ promise: new Promise(() => {}) }, "cancel", { enumerable: true, get() { getterRuns += 1; return () => { c.n += 1; }; } }), 0, 1],
+    ["no cancel", () => ({ promise: new Promise(() => {}) }), 0, 1],
+    ["proxy handle", (c) => new Proxy({ promise: new Promise(() => {}), cancel() { c.n += 1; } }, {}), 0, 1]]) {
+    const c = { n: 0 }; let sends = 0;
+    const r = runReadonlyProbes({ plan: P1, hostaway: { send: () => { sends += 1; return Promise.resolve(listingR()); } }, deps: { monotonic: () => 0, timers: { arm: () => mk(c) } } });
+    const sum = await r.result;
+    assert.deepEqual([sum.stopCode, c.n, sends, sum.timerCleanup.uncancellable], ["PROBE_DEPENDENCY_FAILED", cancelExpected, 0, uncancellable], label);
+  }
+  assert.equal(getterRuns, 0, "no handle getter ran");
+  { // cancel throws after a prior caller abort: the primary cause (CANCELLED) is preserved; the fault is reported
+    // [FIRST-RUN FIX, labelled: the first version used P2 (tailMs 5000) with a timer that never fires, so finalize waited forever — the
+    //  documented "functional injected timer" assumption, not a module fault; tailMs 0 reports UNSETTLED immediately]
+    const P2t0 = valid({ probes: ["P-H1", "P-H2"], hostaway: { ...plan0().hostaway, sample: null, control: null }, stripe: null, limits: { perProbeMs: 15000, runMs: 180000, tailMs: 0 } });
+    const ac = new AbortController(); const s = fakeSend(() => ({ hold: true }));
+    const r = runReadonlyProbes({ plan: P2t0, hostaway: s.transport, signal: ac.signal, deps: { monotonic: () => 0, timers: { arm: () => ({ promise: new Promise(() => {}), cancel() { throw new Error("fault"); } }) } } });
+    await flush(); ac.abort(); const sum = await r.result;
+    assert.deepEqual([sum.stopCode, sum.probes[1].code, s.calls.length, sum.timerCleanup.cancelFailed], ["PROBE_CANCELLED", "AFTER_STOP", 1, 1]);
+    assert.equal((await r.finalize()).tail, "UNSETTLED", "the outstanding send is NOT claimed absent");
+  }
+  { // invalid handle whose cancel throws → still one dependency STOP, both faults reported, no send
+    const r = runReadonlyProbes({ plan: P1, hostaway: fakeSend().transport, deps: { monotonic: () => 0, timers: { arm: () => ({ promise: { then() {} }, cancel() { throw new Error("x"); } }) } } });
+    const sum = await r.result; assert.deepEqual([sum.stopCode, sum.timerCleanup.cancelFailed], ["PROBE_DEPENDENCY_FAILED", 1]);
+  }
+  { // finalize: the TAIL timer's cancel throws when the late settlement arrives → tail kind kept, fault counted
+    const time = fakeTime(); let armN = 0;
+    const deps = { monotonic: time.monotonic, timers: { arm: (ms) => { armN += 1; const h = time.arm(ms); return armN === 1 ? h : { promise: h.promise, cancel() { throw new Error("tail cancel fault"); } }; } } };
+    const s = fakeSend(() => ({ hold: true })); const pt = valid({ probes: ["P-H1"], hostaway: { ...plan0().hostaway, calendar: null, sample: null, control: null }, stripe: null });
+    const r = runReadonlyProbes({ plan: pt, hostaway: s.transport, deps }); await flush(); await time.advance(15000); await r.result;
+    const f = r.finalize(); await flush(); s.held[0].res(listingR()); await flush();
+    const fin = await f; assert.deepEqual([fin.tail, fin.timerCleanup.cancelFailed, r.finalize() === f], ["LATE_FULFILLED", 1, true]);
+    assert.ok(Object.isFrozen(fin) && Object.isFrozen(fin.timerCleanup));
+  }
+  // R-PC3: conditional card proof-field coverage
+  const sO = { hostaway: null };
+  const piRun = async (lc) => {
+    const plan = valid({ probes: ["P-S1", "P-S2"], ...sO }); const s = fakeSend((req) => (req.op === "paymentIntents.retrieve" ? PIOBJ({ latest_charge: lc }) : undefined));   // the exact charge object, no defaults merged
+    const r = run(plan, { s }); const sum = await r.result; assertRedacted(sum, plan); return { p: byId(sum)["P-S2"], sum };
+  };
+  const pmd = (v) => ({ payment_method_details: v });
+  for (const [label, lc, code, outcome] of [
+    ["valid positive capture_before (control)", pmd({ card: { capture_before: 1798761600 } }), "PROBE_OK", "OK"],
+    ["card {} (capture_before absent)", pmd({ card: {} }), "PROBE_PROOF_FIELDS_INCOMPLETE", "INCONCLUSIVE"],
+    ["capture_before null", pmd({ card: { capture_before: null } }), "PROBE_PROOF_FIELDS_INCOMPLETE", "INCONCLUSIVE"],
+    ["capture_before 0", pmd({ card: { capture_before: 0 } }), "PROBE_SHAPE_MISMATCH", "STOP"],
+    ["capture_before negative", pmd({ card: { capture_before: -5 } }), "PROBE_SHAPE_MISMATCH", "STOP"],
+    ["capture_before string", pmd({ card: { capture_before: "1798761600" } }), "PROBE_SHAPE_MISMATCH", "STOP"],
+    ["capture_before fraction", pmd({ card: { capture_before: 1.5 } }), "PROBE_SHAPE_MISMATCH", "STOP"],
+    ["card null", pmd({ card: null }), "PROBE_PROOF_FIELDS_INCOMPLETE", "INCONCLUSIVE"],
+    ["card string", pmd({ card: "x" }), "PROBE_SHAPE_MISMATCH", "STOP"],
+    ["non-card method", pmd({ type: "us_bank_account", us_bank_account: {} }), "PROBE_PROOF_FIELDS_INCOMPLETE", "INCONCLUSIVE"],
+    ["pmd null", pmd(null), "PROBE_PROOF_FIELDS_INCOMPLETE", "INCONCLUSIVE"],
+    ["pmd string", pmd("card"), "PROBE_SHAPE_MISMATCH", "STOP"],
+    ["pmd absent", { payment_method_details: undefined }, "PROBE_PROOF_FIELDS_INCOMPLETE", "INCONCLUSIVE"]]) {
+    const lcv = { ...lc }; if (label === "pmd absent") delete lcv.payment_method_details;
+    const base = PIOBJ(); const charge = { ...base.latest_charge }; delete charge.payment_method_details; Object.assign(charge, lcv);
+    const { p, sum } = await piRun(charge);
+    assert.deepEqual([p.outcome, p.code], [outcome, code], label);
+    if (outcome === "INCONCLUSIVE") assert.deepEqual([p.evidence.proofFieldsTyped, p.evidence.latestCharge, sum.gates.B4_pi_read, sum.gates.TEST_mode_pi], [false, "VERIFIED_TEST_CHARGE", "OPEN", "OBSERVED"], `${label}: TEST charge observed, proof coverage NOT, B4 OPEN`);
+    if (outcome === "OK") assert.deepEqual([p.evidence.proofFieldsTyped, sum.gates.B4_pi_read], [true, "OBSERVED"]);
+    if (outcome === "STOP") assert.deepEqual([sum.gates.B4_pi_read, sum.gates.TEST_mode_pi], ["OPEN", "OPEN"]);
+  }
 });

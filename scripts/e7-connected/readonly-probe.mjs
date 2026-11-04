@@ -31,7 +31,7 @@ export const CODES = Object.freeze({
   run: Object.freeze(["RUN_SHAPE", "RUN_TRANSPORT_INVALID", "RUN_DEPS_INVALID", "RUN_SIGNAL_INVALID"]),
   probe: Object.freeze(["PROBE_OK", "PROBE_AUTH_REFUSED", "PROBE_HTTP_STATUS", "PROBE_SHAPE_MISMATCH", "PROBE_LISTING_MISMATCH", "PROBE_RESERVATION_MISMATCH",
     "PROBE_FOREIGN_ROW", "PROBE_PROTECTED_SEEN", "PROBE_ACCOUNT_MISMATCH", "PROBE_LIVEMODE_REFUSED", "PROBE_INCOMPLETE", "PROBE_PAGE_FULL", "PROBE_LIMIT_REACHED",
-    "PROBE_EMPTY_SAMPLE", "PROBE_CONTROL_OVERLAP", "PROBE_CHARGE_ABSENT", "PROBE_TRANSPORT_FAILED", "PROBE_TIMEOUT", "PROBE_CANCELLED", "PROBE_BUDGET_EXHAUSTED",
+    "PROBE_EMPTY_SAMPLE", "PROBE_CONTROL_OVERLAP", "PROBE_CHARGE_ABSENT", "PROBE_PROOF_FIELDS_INCOMPLETE", "PROBE_TRANSPORT_FAILED", "PROBE_TIMEOUT", "PROBE_CANCELLED", "PROBE_BUDGET_EXHAUSTED",
     "PROBE_DEPENDENCY_FAILED", "AFTER_STOP", "PREREQ_INCONCLUSIVE"]),
   gate: Object.freeze(["OBSERVED", "SINGLE_SAMPLE", "INCONCLUSIVE", "OPEN", "NOT_PROBED"]),
   outcome: Object.freeze(["OK", "INCONCLUSIVE", "STOP", "NOT_RUN", "COMPLETED", "STOPPED"]),
@@ -39,6 +39,8 @@ export const CODES = Object.freeze({
   elapsed: Object.freeze(["LT_1S", "LT_5S", "LT_15S", "GE_15S"]),
   latestCharge: Object.freeze(["VERIFIED_TEST_CHARGE", "ABSENT"])
 });
+/** timer cleanup report keys (counts): a cancel that threw, and a rejected handle that offered no safely callable cancel */
+export const TIMER_CLEANUP_KEYS = Object.freeze(["cancelFailed", "uncancellable"]);
 /** every string a summary may contain besides planHash and the four echoed metadata labels (mechanical redaction whitelist) */
 export const VOCABULARY = Object.freeze(new Set([RESULT_SCHEMA, ...PROBE_IDS, ...Object.values(CODES).flat(), ...RESERVATION_STATUSES, ...PI_STATUSES]));
 
@@ -316,13 +318,23 @@ function checkS2(reply, plan) {
   if (od(lc, "object") !== "charge" || typeof id !== "string" || !/^ch_[A-Za-z0-9_]+$/.test(id) || !piOk || typeof od(lc, "status") !== "string"
       || typeof od(lc, "paid") !== "boolean" || typeof od(lc, "captured") !== "boolean" || !nni(od(lc, "amount")) || !nni(od(lc, "amount_captured"))
       || !nni(od(lc, "amount_refunded")) || !cur(od(lc, "currency"))) return STP("PROBE_SHAPE_MISMATCH");
-  if (has(lc, "payment_method_details")) {
-    const pmd = od(lc, "payment_method_details");
-    if (pmd !== null) {
-      if (!isPlain(pmd)) return STP("PROBE_SHAPE_MISMATCH");
-      if (has(pmd, "card")) { const card = od(pmd, "card"); if (card !== null && (!isPlain(card) || (has(card, "capture_before") && !posInt(od(card, "capture_before"))))) return STP("PROBE_SHAPE_MISMATCH"); }
-    }
-  }
+  // R-PC3 conditional proof-field rule: full coverage needs payment_method_details.card.capture_before as a positive int (the accepted
+  // capture proof reads it). Absent / null pmd, a non-card method, a null card, or an absent / null capture_before → coverage INCOMPLETE
+  // (TEST charge observed, proof fields NOT verified, B4 stays OPEN). A present-but-invalid shape (non-object pmd / card, zero, negative,
+  // non-integer, string, accessor) → STOP. No assumption that every legitimate charge is a manual card charge.
+  const incomplete = () => INC("PROBE_PROOF_FIELDS_INCOMPLETE", { status, livemode: false, latestCharge: "VERIFIED_TEST_CHARGE", proofFieldsTyped: false });
+  if (!has(lc, "payment_method_details")) return incomplete();
+  const pmd = od(lc, "payment_method_details");
+  if (pmd === null) return incomplete();
+  if (!isPlain(pmd)) return STP("PROBE_SHAPE_MISMATCH");
+  if (!has(pmd, "card")) return incomplete();
+  const card = od(pmd, "card");
+  if (card === null) return incomplete();
+  if (!isPlain(card)) return STP("PROBE_SHAPE_MISMATCH");
+  if (!has(card, "capture_before")) return incomplete();
+  const cb = od(card, "capture_before");
+  if (cb === null) return incomplete();
+  if (!posInt(cb)) return STP("PROBE_SHAPE_MISMATCH");
   return OKR({ status, livemode: false, latestCharge: "VERIFIED_TEST_CHARGE", proofFieldsTyped: true });
 }
 /** exact T input per probe, built ONLY from the frozen plan (§1) */
@@ -382,16 +394,33 @@ export function runReadonlyProbes(input) {
   let lastNow = -Infinity;
   /** finite non-decreasing monotonic; null on throw / invalid / backwards (dependency failure) */
   const now = () => { let t; try { t = apply(monotonic, undefined, []); } catch { return null; } if (typeof t !== "number" || !Number.isFinite(t) || t < lastNow) return null; lastNow = t; return t; };
-  /** arm(ms) → validated handle { promise, cancel, cancelOnce } with the promise ALREADY observed; null on any fault */
+  /** timer cleanup report (R-PC2): counts only; never raw errors */
+  const cleanup = { cancelFailed: 0, uncancellable: 0 };
+  const cleanupReport = () => freeze({ cancelFailed: cleanup.cancelFailed, uncancellable: cleanup.uncancellable });
+  /** arm(ms) → { cancelOnce } with the handle promise ALREADY observed, or null on any fault. The cleanup capability is captured FIRST
+   *  (own DATA `cancel`, non-proxy function — never a getter), so a handle rejected for any other reason is still cancelled exactly once.
+   *  Exact shape: plain object, own keys exactly { promise, cancel }, both data properties, promise an unpatched native promise.
+   *  cancelOnce() → true, or false when the cancel threw (counted in cleanup.cancelFailed; the caller decides the STOP). */
   const armTimer = (ms, onFire, onFault) => {
     let h; try { h = apply(arm, undefined, [ms]); } catch { return null; }
-    if (!isPlain(h)) return null;
-    let pd, cd; try { pd = getDesc(h, "promise"); cd = getDesc(h, "cancel"); } catch { return null; }
-    if (!pd || !("value" in pd) || !cd || !("value" in cd) || !isFn(cd.value)) return null;
-    const cancelFn = cd.value; let cancelled = false;
-    const handle = { cancelOnce: () => { if (cancelled) return; cancelled = true; try { apply(cancelFn, undefined, []); } catch { /* contained: a cancel fault is not a probe failure */ } } };
-    if (!observe(pd.value, onFire, onFault)) return null;
-    return handle;
+    let cancelFn = null;
+    if (isObj(h)) { try { const cd = getDesc(h, "cancel"); if (cd && "value" in cd && isFn(cd.value)) cancelFn = cd.value; } catch { cancelFn = null; } }
+    let cancelled = false;
+    const cancelOnce = () => {
+      if (cancelled) return true; cancelled = true;
+      if (cancelFn === null) { cleanup.uncancellable += 1; return true; }
+      try { apply(cancelFn, undefined, []); return true; } catch { cleanup.cancelFailed += 1; return false; }
+    };
+    let promise; let ok = false;
+    try {
+      if (isPlain(h) && cancelFn !== null) {
+        const d = getDescs(h); const ks = ownKeys(d);
+        ok = ks.length === 2 && typeof ks[0] === "string" && typeof ks[1] === "string" && "promise" in d && "cancel" in d && "value" in d.promise;
+        if (ok) promise = d.promise.value;
+      }
+    } catch { ok = false; }
+    if (!ok || !observe(promise, onFire, onFault)) { cancelOnce(); return null; }   // rejected handle: its validated cleanup runs once
+    return { cancelOnce };
   };
   const callerAborted = () => (signal === undefined ? false : nativeAborted(signal) !== false);
   let wake = null; const kick = () => { const w = wake; wake = null; if (w) w(); };
@@ -430,6 +459,9 @@ export function runReadonlyProbes(input) {
       if (timerFault || fired) { handle.cancelOnce(); rec("STOP", "PROBE_DEPENDENCY_FAILED"); continue; }   // fired / faulted before its deadline
       const ac = new NativeAbortController(); const sig = apply(AC_SIGNAL, ac, []);
       const abortOwn = () => { try { apply(AC_ABORT, ac, []); } catch { /* contained */ } };
+      // R-PC1 final handoff: the last injected call above (monotonic) may have aborted the caller; native re-check (captured intrinsic,
+      // no caller getter, no further injected call) IMMEDIATELY before dispatch
+      if (callerAborted()) { handle.cancelOnce(); rec("STOP", "PROBE_CANCELLED"); continue; }
       // (5) exactly one send
       let p; let settled = null;
       try { p = apply(send, undefined, [req, freeze({ signal: sig })]); }
@@ -451,7 +483,11 @@ export function runReadonlyProbes(input) {
         await new NativePromise((r) => { wake = r; });
       }
       const elapsed = bucket(Math.max(0, (lastNow === -Infinity ? n1 : lastNow) - n1));
-      if (!fired) handle.cancelOnce();                                     // a fired timer is spent: never cancelled; otherwise exactly once
+      const cancelOk = fired ? true : handle.cancelOnce();               // a fired timer is spent: never cancelled; otherwise exactly once
+      if (cause === "SETTLED" && !cancelOk) {                              // R-PC2: a cancel fault after a settled reply is a dependency STOP
+        rec("STOP", "PROBE_DEPENDENCY_FAILED", { elapsed });                 // the reply is not evaluated; no evidence retained
+        continue;
+      }
       if (cause !== "SETTLED") {
         abortOwn();
         if (settled === null) { tail.pending = true; settled = { kind: "late" }; }   // later settlement is observed by kind only
@@ -498,10 +534,10 @@ export function runReadonlyProbes(input) {
       G_FILTER: !h5 ? "NOT_PROBED" : okp("P-H5") && okp("P-H6") ? "OBSERVED" : okp("P-H5") && !pr["P-H6"] ? "SINGLE_SAMPLE" : "OPEN",
       G_SHAPE_listing: shape("P-H1"), G_SHAPE_calendar: shape("P-H2"), G_SHAPE_lookup: shape("P-H3"), G_SHAPE_reservation: shape("P-H4"), G_SHAPE_charges: shape("P-H5"),
       B4_pi_read: !pr["P-S2"] ? "NOT_PROBED" : okp("P-S2") ? "OBSERVED" : "OPEN",
-      TEST_mode_pi: !pr["P-S2"] ? "NOT_PROBED" : okp("P-S2") ? "OBSERVED" : "OPEN"
+      TEST_mode_pi: !pr["P-S2"] ? "NOT_PROBED" : okp("P-S2") || (pr["P-S2"].code === "PROBE_PROOF_FIELDS_INCOMPLETE") ? "OBSERVED" : "OPEN"   // TEST mode ≠ full proof coverage
     };
     return deepFreeze({ schema: RESULT_SCHEMA, planHash: plan.planHash, metadata: { ...plan.metadata }, outcome: stop === null ? "COMPLETED" : "STOPPED",
-      stopCode: stop, stopProbe, probes, gates });
+      stopCode: stop, stopProbe, probes, gates, timerCleanup: cleanupReport() });
   }
   function tailSettle(kind) { if (tail.state === "NONE" || tail.state === "UNSETTLED") { tail.state = kind; } tail.pending = false; if (tail.settle) { const s = tail.settle; tail.settle = null; s(); } }
   // result: never rejects (an internal fault becomes a fixed dependency failure summary)
@@ -509,7 +545,7 @@ export function runReadonlyProbes(input) {
     let inner; try { inner = drive(); } catch { inner = null; }
     const fallback = () => resolve(deepFreeze({ schema: RESULT_SCHEMA, planHash: plan.planHash, metadata: { ...plan.metadata }, outcome: "STOPPED", stopCode: "PROBE_DEPENDENCY_FAILED",
       stopProbe: null, probes: plan.probes.map((id) => ({ id, outcome: "NOT_RUN", code: "AFTER_STOP", httpStatus: null, transportCode: null, elapsed: null, evidence: null })),
-      gates: { G_AUTH_charges_read: "OPEN", G_FILTER: "OPEN", G_SHAPE_listing: "OPEN", G_SHAPE_calendar: "OPEN", G_SHAPE_lookup: "OPEN", G_SHAPE_reservation: "OPEN", G_SHAPE_charges: "OPEN", B4_pi_read: "OPEN", TEST_mode_pi: "OPEN" } }));
+      gates: { G_AUTH_charges_read: "OPEN", G_FILTER: "OPEN", G_SHAPE_listing: "OPEN", G_SHAPE_calendar: "OPEN", G_SHAPE_lookup: "OPEN", G_SHAPE_reservation: "OPEN", G_SHAPE_charges: "OPEN", B4_pi_read: "OPEN", TEST_mode_pi: "OPEN" }, timerCleanup: cleanupReport() }));
     if (!inner) { fallback(); return; }
     apply(P_THEN, inner, [resolve, fallback]);
   });
@@ -519,7 +555,7 @@ export function runReadonlyProbes(input) {
     if (finalP) return finalP;
     finalP = new NativePromise((resolve) => {
       apply(P_THEN, result, [() => {
-        const done = (state) => resolve(freeze({ tail: state }));
+        const done = (state) => resolve(freeze({ tail: state, timerCleanup: cleanupReport() }));   // a tail cancel fault is counted, tail kind unchanged
         if (tail.state === "UNOBSERVABLE") { done("UNOBSERVABLE"); return; }
         if (!tail.pending) { done(tail.state); return; }                 // NONE, or a late settlement already observed
         if (plan.limits.tailMs === 0) { done("UNSETTLED"); return; }      // tailMs = 0: report immediately, no tail timer
@@ -529,7 +565,7 @@ export function runReadonlyProbes(input) {
         const onTail = () => { if (!tail.pending) return; tail.settle = null; done("UNSETTLED"); };   // tail timer fire, early fire or timer fault: UNSETTLED, never re-armed
         th = n0 === null ? null : armTimer(plan.limits.tailMs, onTail, onTail);
         if (th === null) { tail.settle = null; done("UNSETTLED"); }
-      }, () => resolve(freeze({ tail: "UNSETTLED" }))]);
+      }, () => resolve(freeze({ tail: "UNSETTLED", timerCleanup: cleanupReport() }))]);
     });
     return finalP;
   };
