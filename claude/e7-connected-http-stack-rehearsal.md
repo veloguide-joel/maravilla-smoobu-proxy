@@ -1,0 +1,44 @@
+# E7 connected-test runner — HTTP-STACK REHEARSAL (TESTS + REPORT ONLY; OFFLINE)
+
+**Branch** `feature/e7-connected-http-stack-rehearsal`, cut from exact `0830f9a4` (Slice T ACCEPTED offline). Files: NEW `test/db/e7-connected-http-stack-rehearsal.test.mjs` (H1–H3); this report; a status / next-step pointer in `claude/e7-connected-transport-contract.md`. No runtime change: T, A–F, core, file journal, adapters, workers, lib, SQL, config, dependencies, pins and fixtures are unchanged (`git diff 0830f9a4 -- scripts lib db package.json` is empty).
+
+**What this is.** The last offline cross-layer mapping check before any design of a real exchange / wrapper. **What it is not.** Real-connection readiness or authorization. Live gates G-AUTH / G-FILTER / G-SHAPE / B4–B6 CLOSED; owner inputs UNSET; protected reservations 70636076 / 71045356 / 71072615 / 71081885 zero-action; notification / owner-alert sending CLOSED; the ONE consolidated live-run approval package still governs any real write. e74a OPEN.
+
+## 1. The stack under test
+`runConnectedTest` (accepted core) → `createPhaseExecutors` (accepted adapters, built inside the core) → `createE7HostawaySend` / `createE7StripeTestSend` (accepted T, given to the core directly as `transports.{hostaway,stripe}` — **no send wrapper**) → **INJECTED FAKE** `exchange` (`httpExchange`, test-only) → synthetic provider world (verbatim copy of the accepted rehearsal world). Real disposable local PG (`test_app` / `test_report`), the four real accepted workers, the accepted file journal in fresh 0700 temp directories.
+
+| Label | Meaning here |
+|---|---|
+| REAL | local disposable PG + logins; accepted core / guard / facts / journal validators / adapters / workers / T / file journal, unchanged |
+| SYNTHETIC | world + `payment_authorized` booking setup: byte-identical copy of `test/db/e7-connected-file-journal-rehearsal.test.mjs:43–192` (checked by diff) |
+| FAKE (test-only) | `httpExchange`: enforces the documented wire form and maps it onto the world; replies `{ status, contentType, bytes: genuine Uint8Array }`; wire violations are recorded and answered 400 (asserted zero) |
+| CREDENTIALS | explicit synthetic strings (`synthetic-hostaway-token`, a short `sk_test_` fixture); `Stripe-Version` synthetic pin `2099-01-01.synthetic` |
+| TIME | scaled real timers (K = 10 for H1 / H2, K = 1 for H3 — see §4) |
+
+**Wire enforcement in the fake exchange.** Origin; path; exact query key set and fixed values (`channelId=2000`, `limit=100`, `includeResources=1`); Stripe form bodies (`amount_to_capture=N&final_capture=true&expand%5B%5D=latest_charge`, empty cancel form); header NAMES per method; `Authorization: Bearer <synthetic>`; `Stripe-Version`; `Idempotency-Key` on Stripe POST. The charge-list route accepts ONLY `?limit=500&reservationIds=<one canonical id>` — singular, both selectors or unfiltered would be a violation. The request log stores method, path (PaymentIntent id masked), query KEY names, header NAMES and the idempotency key only; Authorization, bodies and guest values are never stored or printed.
+
+## 2. Results (CLAUDE-RUN; root cannot run PG)
+
+| Case | Result | Evidence |
+|---|---|---|
+| H1 fresh USD booking → confirmed | `ENDED_CONFIRMED`, effects known; exactly 1 create / 1 capture / 1 offline charge by WORLD, HTTP log and DB dispatches; 0 void / cancel; no case; `guest.notify` `pending`, never dispatched | wire: `GET /v1/listings/{L}`, calendar, priceDetails, H1 lookup, `POST /v1/reservations`, `GET /v1/reservations/{R}`, `GET /v1/account`, PI retrieve, PI capture, PI retrieve, `GET /v1/reservations/{R}`, `GET /v1/guestPayments/charges?[limit,reservationIds]`, `POST /v1/guestPayments/charges/{R}`, charge list again |
+| H1 S1 / TEST proofs | S1 is `GET /v1/account`, no query, headers `Authorization,Stripe-Version`; the Account fixture has NO `livemode`; PaymentIntent and latest-charge fixtures `livemode:false`; PI evidence persisted; capture op `succeeded`, 1 attempt, wire `Idempotency-Key` = the op's `providerIdempotencyKey` | — |
+| H1 H8 internal vs wire | WIRE: every charge-list request is exactly `?limit=500&reservationIds=<bound id>`. INTERNAL (unchanged accepted code): the worker's `{ reservationId, limit }` request; a COMPLETE preflight list (`requestLimit:500`) passed `assessChargeList`; every list evidence row has `external_ref` = the bound id and never the wire key; the settled evidence row keeps `reservationId` (singular); `recording_completion_binding_refusal(op, settled_evidence, NULL)` = NULL (bound) | — |
+| H1 journal / ownership | D chain valid, tail complete, `ENDED`, verdict `RUN_ENDED`; finalize `unlocked`; file close `closed` / lock `released`; no guest value or credential in the file; fresh reopen + re-invoke → `REFUSED RUN_ENDED`, zero additional exchanges, credential calls, world writes or DB rows | journal: RUN_STARTED … STEP_ENDED:recording:confirmed, PHASE_ENDED, RUN_ENDED |
+| H2 applied-then-503 create | `STOPPED OPEN_CASE`, `reservedNotConfirmed`; the accepted bounded read recovery confirmed the reservation (`reservation_confirmed`), but the create row stays `outcome_unknown` and `HOSTAWAY_CREATE_OUTCOME_UNKNOWN` stays OPEN (no manual close / owner resolve); exactly 1 create request / applied create / key; Stripe never reached (0 requests, 0 credential calls); re-invoke → `RUN_ENDED`, no second create / key | journal ends ATTESTED:AIRBNB_BLOCKED, RUN_STOPPED |
+| H3 capture held past abort | `STOPPED UNKNOWN_WRITE` in `capture`, `effectsKnown:false`, `ownerCleanupRequired:'captured'`; capture op `outcome_unknown` `CAPTURE_TIMEOUT`, 1 attempt, one key on the wire; the world DID capture; intent `capture_unknown`; 0 recording requests (no list, no charge), 0 void / cancel (no automatic cleanup write); journal ends RUN_STOPPED UNKNOWN_WRITE; re-invoke → `RUN_ENDED`, zero effects | the reply was held ≈ 20 s and fulfilled with the signal already aborted |
+
+Every opened journal handle was closed (counted; asserted equal at suite end); the report pool and the disposable cluster are closed / removed; temp directories removed; global fetch guard 0.
+
+## 3. Validation (CLAUDE-RUN)
+- **FIRST FULL TAP** `scratchpad/gnf/tap/HS-first-full.tap`: **2/3**. H1 failed on a TEST expectation: it required `observed.reservationId` on every charge-list evidence row. Run 2 (`HS-run2.tap`) showed two rows — the preflight list (counts only: `complete`, `requestLimit`, matching ids) and the post-write settled charge row (which does carry `reservationId`). Fix: assert each row by its role (labelled in the test). No runtime change. Run 3: 3/3.
+- **Assertion tightening after observation (labelled).** H3's exact outcome (`UNKNOWN_WRITE`, `CAPTURE_TIMEOUT`, `capture_unknown`, `captured`) was printed by run 1 and pinned afterwards; H3 was also retitled (§4). Run 4: 3/3.
+- Units + pins (`test/e7-connected-*.test.mjs`, `hostaway-reservations`, `e4-connected-path`): 161/161. `npm test` first run: 826/826. No full `test:db`, no mutation quota, no old PG suite rerun (no evidence warranted it). e74a not reproduced. Secret-scanner pattern: no match.
+
+## 4. Limits (stated honestly)
+- **H3 does not observe R-TC1 at this layer.** The fake exchange cannot abort the worker-owned signal (it has no controller, and worker hooks are not allowed), so the accepted worker's own `captureCallMs` (20 s) timer aborts it. That timer also settles the worker's call first (`ProviderCallTimeout` → `CAPTURE_TIMEOUT` unknown). T's post-settlement `ABORTED_IN_FLIGHT` → adapter `TRANSPORT_FAILED` then reaches only the worker's late-result path, which leaves the unknown row unchanged. A **labelled differential run** of H3 with the pre-fix T module (`b4150809`, swapped in temporarily, never committed; `HS-H3-differential-old-T-b4150809.tap`) passed identically. So H3 proves the accepted conservative policy over the full stack (no resend, no new key, no recording, effects unknown); R-TC1 itself stays proven by unit T11. K = 1 is required so the runner's step deadline (stepBudget 45 s + 30 s margin, monotonic) is later than the worker's real 20 s timer.
+- The fake exchange is trusted test code; a real exchange must itself enforce redirect refusal and the streamed byte budget (contract §2.4). Nothing here exercises TLS, DNS, real headers, real reply shapes, `jwt` vs Bearer (G-AUTH), real filter semantics (G-FILTER) or real shapes (G-SHAPE).
+- One application exchange ≠ one server-side effect; H2 / H3 show the world applied writes whose replies were lost or unusable, and the accepted policy kept them unknown.
+
+## 5. Next step (proposal only)
+Design — docs only — of the real exchange / wrapper (redirect refusal, streaming byte budget, timeouts, TLS, credential loading and the read-only probe plan for G-AUTH / G-FILTER / G-SHAPE / B4), for root DESIGN review. No real connection is authorized by this rehearsal.
