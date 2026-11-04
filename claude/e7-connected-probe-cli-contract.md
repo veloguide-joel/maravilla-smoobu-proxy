@@ -172,7 +172,7 @@ Repository at `b6603cac` as cited (closure verified by a static import scan of t
 | Malformed but closable handles are closed | An extra key, missing `read`, proxy `stat`, accessor `read` (not run) or inherited prototype → `CRED_ADAPTER_INVALID`, with close invoked exactly once and no read / stat. Test C8. |
 | UNCLOSABLE | A proxy handle, accessor / missing / non-function / proxy `close`, or a `null` / primitive handle → `CRED_ADAPTER_INVALID` + `closeState:'UNCLOSABLE'`. No cleanup is claimed, and the descriptor may remain open. Test C8. A REVOKED proxy cannot even be a fulfilment value: native resolution's `then` lookup throws, so the fake's own promise rejects → `CRED_IO` / `NOT_OPENED`. Tested and documented. |
 | Invoked once, after every started op settled | Handle operations are sequential `await`s, so when control reaches close, no owned operation is in flight. Close is invoked once after the `try / finally`, on every path once a handle was acquired, and is never retried. Test C13 shows order `read-settled → close`; test C17 shows no close while a read is pending. |
-| Primary refusal + closeState preserved | An earlier refusal stays the code, and `closeState` reports the close outcome (e.g. `CRED_CHANGED` + `CLOSE_FAILED`, `CRED_ADAPTER_INVALID` + `CLOSE_FAILED`). With no prior refusal, a close failure → `CRED_CLOSE_FAILED` / `CLOSE_FAILED`, and success and every secret are withheld. A close failure covers a rejection, a synchronous throw, a non-native promise, a thenable or a non-promise return; it is unobservable as acknowledged, so the descriptor may remain open. Test C13. |
+| Primary refusal + closeState preserved | An earlier refusal stays the code, and `closeState` reports the close outcome (e.g. `CRED_CHANGED` + `CLOSE_FAILED`, `CRED_ADAPTER_INVALID` + `CLOSE_FAILED`). With no prior refusal, a close failure → `CRED_CLOSE_FAILED` / `CLOSE_FAILED`, and success and every secret are withheld. A close failure covers a rejection, a synchronous throw, a non-native promise, a thenable, a non-promise return, or (R-C1A, §10.8) a native fulfilment with ANY value other than exactly `undefined`; it is not an acknowledged close, so the descriptor may remain open. Test C13. |
 | Late / pending open | A native `open` that never settles leaves the loader pending (documented). A native `open` that does settle is always followed by the close logic, even when the handle later fails schema checks. **Residual:** a non-native / thenable `open` result is never observed (`CRED_ADAPTER_INVALID`, `NOT_OPENED`). Anything that thenable acquired is caller-owned; it is not guessed at or destroyed. |
 | Zero-fill on ALL exit paths after allocation | `buf.fill(0)` runs in a `finally` that covers adapter-invalid handles, stat / read refusals, size / changed, decode errors and success, BEFORE close and BEFORE parse. The parse runs on the decoded string, so a close failure or parse error also leaves the buffer zeroed. Tests C1, C10, C13 and C14 assert every buffer handed to `read` is all zeros afterwards. This does NOT prove the JS string is erased (`text` is dropped as early as possible). |
 | Private capability never in safe outputs | No example in this contract shows a populated capability. Tests assert the absence of token / key / path / repo / `SENTINEL` strings from every public result and from `JSON.stringify` of the success object (`credentials` → `{}`). |
@@ -217,3 +217,21 @@ Repository at `b6603cac` as cited (closure verified by a static import scan of t
 4. Zero-fill is best effort for the module's bytes only. The decoded JS string and any adapter-internal copies are not provably erased.
 5. Built-ins other than the captured intrinsics, the Node binary, the OS, the directory namespace and same-uid / root actors are TRUST. A detected change within the check window is the strongest claim.
 6. C1 outputs evaluate the supplied snapshot / adapter replies; they are not runtime attestation. No owner environment has been verified.
+
+### 10.8 Root CODE HOLD on `29d7b63e` — correction R-C1A (same branch, fast-forward from exact `29d7b63e`)
+**Defect (root, reproduced).** §2.2 defines `close()` → native promise of `undefined`, but step 10 treated ANY native fulfilment as an acknowledged close. With an otherwise valid Hostaway-only fake file, `Promise.resolve(false)`, `Promise.resolve(17)` and `Promise.resolve({ status:'not-acknowledged' })` each released the capability with `ok:true` / `closeState:'CLOSED'`.
+
+**Correction (one expression, `probe-credential-file.mjs` step 10).** `closeState = c !== null && c.ok && c.v === undefined ? 'CLOSED' : 'CLOSE_FAILED'`. Only a native fulfilment with exactly `undefined` is an acknowledged close. Every other fulfilment value is `CLOSE_FAILED`:
+- With no earlier refusal → `CRED_CLOSE_FAILED`, and the success capability and every secret are withheld.
+- With an earlier refusal → that refusal stays primary, reported with `CLOSE_FAILED`.
+
+Close is still attempted exactly once: no retry, no guessed disposal. This evaluates the trusted adapter's contract; it is not physical proof that a descriptor was closed. Nothing else changed: no parser or API change, and `probe-env-preflight.mjs` and all other files are untouched.
+
+**Red / green.** NEW test C13b:
+- Valid control: `undefined` → `ok`, `CLOSED`, close called once.
+- Malformed fulfilments: `false`, `null`, `0`, `17`, `NaN`, `''`, `'ok'`, `'undefined'`, `{}`, `{ status:'not-acknowledged' }`, `[]`, a function, a symbol, `0n`. Each gives `CRED_CLOSE_FAILED` / `CLOSE_FAILED`, no `credentials`, sentinels absent, close called once, buffer zeroed.
+- Prior-refusal precedence: `CRED_CHANGED` and `CRED_ADAPTER_INVALID` are each kept, with `CLOSE_FAILED`. A prior refusal plus a valid `undefined` close still gives `CLOSED`.
+
+Runs:
+- **RED** with the test alone against the exact `29d7b63e` module: 21/22. C13b failed on the first malformed value (`false` → `ok:true`).
+- **GREEN after the fix, FIRST FULL TAP:** focused 22/22, units (`e7-connected-*`, `hostaway-reservations`, `e4-connected-path`) 208/208, first full `npm test` 873/873. No first-run failures.

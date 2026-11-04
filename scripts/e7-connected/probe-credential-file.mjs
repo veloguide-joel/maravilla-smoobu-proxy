@@ -276,7 +276,9 @@ async function run(input) {
   if (closeFn === null) closeState = "UNCLOSABLE";                          // no safely callable close: no cleanup claimed
   else {
     const c = await call(closeFn, []);
-    closeState = c !== null && c.ok ? "CLOSED" : "CLOSE_FAILED";            // a failed / unobservable close may leave the descriptor open
+    // acknowledged ONLY by a native fulfilment with exactly `undefined` (§2.2 schema); any other fulfilment value, a rejection or an
+    // unobservable reply is CLOSE_FAILED — evaluation of the trusted adapter's contract, not proof the descriptor is closed
+    closeState = c !== null && c.ok && c.v === undefined ? "CLOSED" : "CLOSE_FAILED";
   }
   if (primary !== null) { text = null; return fail(primary, closeState); }
   if (closeState !== "CLOSED") { text = null; return fail("CRED_CLOSE_FAILED", closeState); }   // success and every secret withheld

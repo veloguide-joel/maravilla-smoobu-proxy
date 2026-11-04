@@ -345,6 +345,28 @@ test("C13 close: exactly once, never retried, only after the last owned op settl
   assert.equal((await p).ok, true); assert.deepEqual(order, ["read-settled", "close"]);
 });
 
+test("C13b R-C1A close acknowledgment schema: ONLY a native fulfilment with exactly undefined counts as CLOSED", async () => {
+  // valid control
+  const okF = fake({ close: () => Promise.resolve(undefined) }); const okR = await run(okF);
+  assert.equal(okR.ok, true); assert.equal(okR.closeState, "CLOSED"); assert.equal(count(okF.log, "close"), 1);
+  // malformed fulfilled close replies: never an acknowledged close, never a released secret, close attempted exactly once
+  const malformed = [false, null, 0, 17, NaN, "", "ok", "undefined", {}, { status: "not-acknowledged" }, [], () => {}, Symbol("ack"), 0n];
+  for (const v of malformed) {
+    const f = fake({ close: () => Promise.resolve(v) }); const r = await run(f);
+    assertPublicFailure(r, "CRED_CLOSE_FAILED", "CLOSE_FAILED"); assert.ok(!("credentials" in r), String(typeof v));
+    assert.equal(count(f.log, "close"), 1); assert.ok(zeroed(f.bufs));
+  }
+  // prior refusal keeps primary; malformed close only changes closeState
+  for (const v of [false, 17, { status: "not-acknowledged" }]) {
+    const f = fake({ close: () => Promise.resolve(v), stat: { size: 3 } });
+    assertPublicFailure(await run(f), "CRED_CHANGED", "CLOSE_FAILED"); assert.equal(count(f.log, "close"), 1);
+    const g = fake({ close: () => Promise.resolve(v), handle: (h) => ({ ...h, x: 1 }) });
+    assertPublicFailure(await run(g), "CRED_ADAPTER_INVALID", "CLOSE_FAILED"); assert.equal(count(g.log, "close"), 1);
+  }
+  // with a prior refusal, a valid undefined close still reports CLOSED
+  assertPublicFailure(await run(fake({ close: () => Promise.resolve(undefined), stat: { size: 3 } })), "CRED_CHANGED", "CLOSED");
+});
+
 test("C14 strict object-of-strings JSON: fatal UTF-8, BOM, duplicates incl. escaped aliases, __proto__/toJSON, type confusion, live/restricted keys", async () => {
   const S = (s) => enc(s);
   const cases = [
