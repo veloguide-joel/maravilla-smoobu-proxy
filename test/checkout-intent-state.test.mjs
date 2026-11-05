@@ -4,7 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   createIntent, transition, publicStatus, isConfirmedPaid, idempotencyKeys, allowedEvents, voidKey, captureKey,
-  STATES as S, TERMINAL_STATES, EVENTS, DEFAULT_CONFIG
+  STATES as S, TERMINAL_STATES, EVENTS, DEFAULT_CONFIG, TEST_RELEASE_REASON, testReleaseEventId
 } from "../lib/checkout/intent-state.js";
 
 const T0 = Date.UTC(2026, 9, 21, 15, 0, 0);
@@ -436,4 +436,69 @@ test("pure and deterministic: same inputs give identical outputs; inputs never m
 test("no guest PII is held in the intent", () => {
   const s = JSON.stringify(toReserved());
   for (const k of ["email", "firstName", "lastName", "phone", "guestName"]) assert.ok(!s.includes(k), k);
+});
+
+// ---------- E7 checkout TEST release (TEST_RELEASE_REQUESTED) ----------
+const REL_CFG = Object.freeze({ testReleaseEnabled: true, expectedLivemode: false });
+const relEv = (i, o = {}) => ({ type: "TEST_RELEASE_REQUESTED", id: testReleaseEventId(i.id, i.payment ? i.payment.paymentIntentId : "pi_x"), paymentIntentId: i.payment ? i.payment.paymentIntentId : "pi_x", ...o });
+
+test("TEST release: off by default; only payment_authorized; exactly ONE void effect, zero Hostaway / capture effects; truthful reason; queued != released", () => {
+  assert.equal(DEFAULT_CONFIG.testReleaseEnabled, false);
+  const a = toAuthorized();
+  assert.deepEqual(transition(a, relEv(a), { now: T0 + 6 * MIN }).error, "TEST_RELEASE_DISABLED");                 // default config
+  assert.equal(transition(a, relEv(a), { now: T0 + 6 * MIN, config: { testReleaseEnabled: true, expectedLivemode: true } }).error, "TEST_RELEASE_TEST_MODE_ONLY");
+  const r = transition(a, relEv(a), { now: T0 + 6 * MIN, config: REL_CFG });
+  assert.equal(r.ok, true);
+  assert.equal(r.intent.status, S.RESERVATION_FAILED);
+  assert.equal(r.intent.reasonCode, TEST_RELEASE_REASON);
+  assert.deepEqual(r.effects, [{ type: "stripe.void_payment_intent", paymentIntentId: "pi_test_1", attempt: 1, idempotencyKey: voidKey("int_1", "pi_test_1") }]);
+  assert.equal(publicStatus(r.intent), "release_requested", "a queued void is never reported as released / not charged");
+  // replay of the same deterministic id: duplicate, no second void
+  const again = transition(r.intent, relEv(a), { now: T0 + 7 * MIN, config: REL_CFG });
+  assert.deepEqual([again.ok, again.duplicate, again.effects.length], [true, true, 0]);
+  // the ordinary verified void completes it (existing path); the guest status then becomes the existing released label
+  const done = transition(r.intent, { type: "VOID_SUCCEEDED", id: "void-ok" }, { now: T0 + 8 * MIN, config: REL_CFG });
+  assert.equal(done.intent.status, S.AUTHORIZATION_RELEASED);
+  assert.equal(publicStatus(done.intent), "unavailable_not_charged");
+  // an ordinary reservation_failed keeps its existing label
+  const rf = transition(a, { type: "RESERVATION_STARTED", workerId: "w1", recheck: { bookable: false, priceSame: true } }, { now: T0 + 6 * MIN });
+  assert.equal(publicStatus(rf.intent), "unavailable_not_charged");
+});
+
+test("TEST release: refused in every other state and on any reservation / capture / lease history, wrong PI or id, non-TEST payment", () => {
+  const cases = [[fresh(), "ILLEGAL_TRANSITION"], [toPending(), "ILLEGAL_TRANSITION"], [toDispatched(), "ILLEGAL_TRANSITION"], [toReserved(), "ILLEGAL_TRANSITION"]];
+  for (const [i, code] of cases) assert.equal(transition(i, relEv(i), { now: T0 + 9 * MIN, config: REL_CFG }).error, code, i.status);
+  const a = toAuthorized();
+  assert.equal(transition(a, relEv(a, { paymentIntentId: "pi_other" }), { now: T0 + 6 * MIN, config: REL_CFG }).error, "TEST_RELEASE_PAYMENT_MISMATCH");
+  assert.equal(transition(a, relEv(a, { id: "client-chosen" }), { now: T0 + 6 * MIN, config: REL_CFG }).error, "TEST_RELEASE_EVENT_ID");
+  assert.equal(transition(a, { ...relEv(a), id: undefined }, { now: T0 + 6 * MIN, config: REL_CFG }).error, "TEST_RELEASE_EVENT_ID");
+  const live = { ...a, payment: { ...a.payment, livemode: true } };
+  assert.equal(transition(live, relEv(a), { now: T0 + 6 * MIN, config: REL_CFG }).error, "TEST_RELEASE_PAYMENT_NOT_TEST");
+  const capped = { ...a, payment: { ...a.payment, capturedMinor: 1 } };
+  assert.equal(transition(capped, relEv(a), { now: T0 + 6 * MIN, config: REL_CFG }).error, "TEST_RELEASE_PAYMENT_NOT_TEST");
+  for (const over of [{ lease: { workerId: "w1", until: T0 + 9 * MIN } }, { dispatch: { at: T0, attempt: 1 } }, { reservation: { reservationId: "9001" } },
+    { counters: { ...a.counters, reservationAttempts: 1 } }, { counters: { ...a.counters, voidAttempts: 1 } }, { counters: { ...a.counters, captureAttempts: 1 } }]) {
+    assert.equal(transition({ ...a, ...over }, relEv(a), { now: T0 + 6 * MIN, config: REL_CFG }).error, "TEST_RELEASE_HISTORY", JSON.stringify(over));
+  }
+  // an interrupted reservation claim that was recovered (RECOVER_INTERRUPTED back to payment_authorized) still carries its attempt: refused
+  const claimed = transition(a, { type: "RESERVATION_STARTED", workerId: "w1", recheck: { bookable: true, priceSame: true } }, { now: T0 + 6 * MIN });
+  const back = transition(claimed.intent, { type: "RECOVER_INTERRUPTED" }, { now: T0 + 9 * MIN });
+  assert.equal(back.intent.status, S.PAYMENT_AUTHORIZED);
+  assert.equal(transition(back.intent, relEv(back.intent), { now: T0 + 10 * MIN, config: REL_CFG }).error, "TEST_RELEASE_HISTORY");
+});
+
+test("TEST release vs late Checkout facts: same-PI completion stays a duplicate after the request and after the release; a different PI only queues void + review", () => {
+  const a = toAuthorized();
+  const r = transition(a, relEv(a), { now: T0 + 6 * MIN, config: REL_CFG });
+  const late = transition(r.intent, { ...AUTH, id: "evt_auth_late" }, { now: T0 + 7 * MIN });
+  assert.deepEqual([late.ok, late.duplicate, late.effects.length, late.intent.status], [true, true, 0, S.RESERVATION_FAILED]);
+  const rel = transition(r.intent, { type: "VOID_SUCCEEDED", id: "void-ok" }, { now: T0 + 8 * MIN });
+  const late2 = transition(rel.intent, { ...AUTH, id: "evt_auth_late2" }, { now: T0 + 9 * MIN });
+  assert.deepEqual([late2.ok, late2.duplicate, late2.intent.status], [true, true, S.AUTHORIZATION_RELEASED]);
+  const other = transition(r.intent, { ...AUTH, id: "evt_auth_other", paymentIntentId: "pi_test_2" }, { now: T0 + 7 * MIN });
+  assert.equal(other.intent.status, S.RECONCILIATION_REQUIRED);
+  assert.deepEqual(effectTypes(other).filter((t) => t === "stripe.void_payment_intent").length, 1, "queued only; no worker processes reconciliation_required");
+  // release before any authorization: no transition, nothing fabricated
+  const p = toPending();
+  assert.equal(transition(p, { type: "TEST_RELEASE_REQUESTED", id: "test-release:int_1:pi_test_1", paymentIntentId: "pi_test_1" }, { now: T0 + 3 * MIN, config: REL_CFG }).error, "ILLEGAL_TRANSITION");
 });

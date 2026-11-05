@@ -94,3 +94,48 @@ test("refusals before any dependency: gate 404, origin 403, query 400, method 40
   assert.deepEqual([r.statusCode, r.body], [503, { code: "NOT_READY" }]);
   assert.deepEqual({ ...spies, pool: 0 }, { pool: 0, core: 0, access: 0, sdk: 0, hostaway: 0 });
 });
+
+// ---------- E7 checkout TEST release step + pinned Checkout SDK version ----------
+test("TEST release step: absent unless MV_CHECKOUT_TEST_RELEASE=enabled (same 400 UNKNOWN_STEP), exact {step} body, bearer still required; refusals touch no dependency", async () => {
+  assert.equal(intentApiGate(ENV).config.testRelease, false);
+  assert.equal(intentApiGate({ ...ENV, MV_CHECKOUT_TEST_RELEASE: "true" }).config.testRelease, false);
+  assert.equal(intentApiGate({ ...ENV, MV_CHECKOUT_TEST_RELEASE: "enabled" }).config.testRelease, true);
+  assert.deepEqual(intentApiGate({ ...ENV, MV_CHECKOUT_TEST_RELEASE: "enabled", VERCEL_ENV: "production" }), { ok: false, code: "PRODUCTION_REFUSED" });
+  const { spies, deps } = spyDeps();
+  const j = { origin: ORIGIN, "content-type": "application/json" };
+  const tok = { authorization: `Bearer ${Buffer.alloc(32, 7).toString("base64url")}` };
+  const off = createIntentApiHandler({ route: "step", env: ENV, deps });
+  const on = createIntentApiHandler({ route: "step", env: { ...ENV, MV_CHECKOUT_TEST_RELEASE: "enabled" }, deps });
+  const prod = createIntentApiHandler({ route: "step", env: { ...ENV, MV_CHECKOUT_TEST_RELEASE: "enabled", VERCEL_ENV: "production" }, deps });
+  const cases = [
+    [off, { headers: { ...j, ...tok }, body: '{"step":"release"}' }, 400, "UNKNOWN_STEP"],
+    [on, { headers: j, body: '{"step":"release"}' }, 401, "UNAUTHORIZED"],
+    [on, { headers: { ...j, ...tok }, body: '{"step":"release","paymentIntentId":"pi_x"}' }, 400, "UNKNOWN_FIELD"],
+    [on, { headers: { ...j, ...tok }, body: '{"step":"release","amountMinor":1}' }, 400, "UNKNOWN_FIELD"],
+    [prod, { headers: { ...j, ...tok }, body: '{"step":"release"}' }, 404, "NOT_FOUND"],
+    [on, { headers: { origin: "https://evil.example", "content-type": "application/json", ...tok }, body: '{"step":"release"}' }, 403, "ORIGIN_NOT_ALLOWED"]
+  ];
+  for (const [hd, req, st, code] of cases) { const r = await call(hd, req); assert.deepEqual([r.statusCode, r.body.code], [st, code], JSON.stringify(req)); }
+  assert.deepEqual(spies, { pool: 0, core: 0, access: 0, sdk: 0, hostaway: 0 });
+});
+
+test("Checkout SDK clients pin apiVersion 2026-01-28.clover (= installed stripe default), retries 0, timeout 10 s; the release core imports no worker / provider client", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { CHECKOUT_STRIPE_API_VERSION } = await import("../lib/checkout/intent-api-http.js");
+  const { WEBHOOK_STRIPE_API_VERSION } = await import("../lib/checkout/stripe-webhook-http.js");
+  assert.equal(CHECKOUT_STRIPE_API_VERSION, "2026-01-28.clover");
+  assert.equal(WEBHOOK_STRIPE_API_VERSION, CHECKOUT_STRIPE_API_VERSION);
+  const sdk = readFileSync(new URL("../node_modules/stripe/cjs/apiVersion.js", import.meta.url), "utf8");
+  assert.match(sdk, /ApiVersion = '2026-01-28\.clover'/, "installed SDK default unchanged (no package change)");
+  const http = readFileSync(new URL("../lib/checkout/intent-api-http.js", import.meta.url), "utf8");
+  const wh = readFileSync(new URL("../lib/checkout/stripe-webhook-http.js", import.meta.url), "utf8");
+  assert.ok(http.includes("new Stripe(cfg.secretKey, { apiVersion: CHECKOUT_STRIPE_API_VERSION, maxNetworkRetries: 0, timeout: 10000 })"));
+  assert.ok(wh.includes("new Stripe(gate.config.secretKey, { apiVersion: WEBHOOK_STRIPE_API_VERSION, maxNetworkRetries: 0, timeout: 10000 })"));
+  assert.equal((http.match(/new Stripe\(/g) || []).length, 1); assert.equal((wh.match(/new Stripe\(/g) || []).length, 1);
+  // Checkout keeps its card-only shape (unchanged in this slice)
+  assert.ok(readFileSync(new URL("../lib/checkout/stripe-test-mode.js", import.meta.url), "utf8").includes('payment_method_types: ["card"],'));
+  const core = readFileSync(new URL("../lib/checkout/intent-api-core.js", import.meta.url), "utf8");
+  for (const re of [/compensation-worker|reservation-worker|capture-worker|recording-worker|notification-worker/, /paymentIntents\.cancel|cancelPaymentIntent/, /hostaway-reservations/]) {
+    assert.doesNotMatch(core, re);
+  }
+});
