@@ -1,0 +1,139 @@
+# DRAFT — E7 owner cleanup of ONE released Stripe TEST authorization (doc: claude/e7-checkout-test-cleanup.md).
+# MANUAL dispatch only; default mode `preflight` = no secrets, no DB, no provider request, no dependency install (fake tests + digests + env).
+# `execute` = the accepted compensation worker for ONE named intent on the TEST DEV database: <= 1 Stripe TEST cancel of its bound
+# PaymentIntent plus bounded reads — NOT AUTHORIZED until Joel approves the exact filled package. Inputs / labels / hashes are NOT consent.
+# Secrets (environment `e7-readonly-probe`, required reviewers, execute step only): E7_STRIPE_TEST_KEY (existing) and
+# E7_DEV_BOOKING_DATABASE_URL (the DEV runtime login; owner-entered). No Hostaway secret, no webhook, no deploy, no migration.
+name: e7-checkout-test-cleanup
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "preflight (default: no secrets, no DB, no provider requests) or execute (ONE released TEST intent; NOT AUTHORIZED without Joel's explicit approval of the exact package)"
+        type: choice
+        options: [preflight, execute]
+        default: preflight
+      approval_ref:
+        description: "Approval label (non-secret; a label, never consent). Empty together with intent_id / payment_intent_id = labelled SYNTHETIC preflight only."
+        type: string
+        required: false
+        default: ""
+      intent_id:
+        description: "The ONE released TEST intent (UUID v4). Required for a REAL plan."
+        type: string
+        required: false
+        default: ""
+      payment_intent_id:
+        description: "Its bound Stripe TEST PaymentIntent (pi_...). Required for a REAL plan."
+        type: string
+        required: false
+        default: ""
+      expected_plan_hash:
+        description: "execute only: exact 64-hex planHash from a REAL-plan preflight (no default)"
+        type: string
+        required: false
+        default: ""
+      expected_closure_digest:
+        description: "execute only: exact closureDigest ce0a418a8b07ed27b6167e2b4b6fbce0e8b2e2e69dcad29318210b799e923c8f of the accepted 6d703acd closure (no default)"
+        type: string
+        required: false
+        default: ""
+      expected_runner_digest:
+        description: "execute only: exact 64-hex runnerDigest of the REVIEWED runner / workflow / test bytes (no default)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e7-checkout-test-cleanup
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    if: inputs.mode == 'preflight'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout runner (this repository, dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout accepted E7 checkout lineage (fixed commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: 6d703acdcfa205138d1ce4ba65b2ec58fc9493c9
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Preflight (no secrets, no DB, no provider requests)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_APPROVAL_REF: ${{ inputs.approval_ref }}
+          E7_INTENT_ID: ${{ inputs.intent_id }}
+          E7_PAYMENT_INTENT_ID: ${{ inputs.payment_intent_id }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+        run: node wrapper/scripts/e7-checkout-test-cleanup.mjs preflight
+
+  execute:
+    if: inputs.mode == 'execute' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: e7-readonly-probe
+    timeout-minutes: 15
+    steps:
+      - name: Checkout runner (this repository, dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout accepted E7 checkout lineage (fixed commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: 6d703acdcfa205138d1ce4ba65b2ec58fc9493c9
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Verify bindings before any install (no secrets, no DB, no provider requests)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_APPROVAL_REF: ${{ inputs.approval_ref }}
+          E7_INTENT_ID: ${{ inputs.intent_id }}
+          E7_PAYMENT_INTENT_ID: ${{ inputs.payment_intent_id }}
+          E7_EXPECTED_PLAN_HASH: ${{ inputs.expected_plan_hash }}
+          E7_EXPECTED_CLOSURE_DIGEST: ${{ inputs.expected_closure_digest }}
+          E7_EXPECTED_RUNNER_DIGEST: ${{ inputs.expected_runner_digest }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+        run: node wrapper/scripts/e7-checkout-test-cleanup.mjs verify
+      - name: Install the pinned dependency from the verified lockfile (no lifecycle scripts)
+        working-directory: tooling
+        run: npm ci --ignore-scripts --omit=dev --no-audit --no-fund
+      - name: Fetch the public Supabase CA (the runner checks its pinned SHA-256)
+        run: curl --fail --silent --show-error --proto '=https' --max-time 20 -o "$RUNNER_TEMP/prod-ca-2021.crt" https://supabase-downloads.s3-ap-southeast-1.amazonaws.com/prod/ssl/prod-ca-2021.crt
+      - name: Execute the cleanup of ONE released TEST intent (secrets scoped to this step only)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_APPROVAL_REF: ${{ inputs.approval_ref }}
+          E7_INTENT_ID: ${{ inputs.intent_id }}
+          E7_PAYMENT_INTENT_ID: ${{ inputs.payment_intent_id }}
+          E7_EXPECTED_PLAN_HASH: ${{ inputs.expected_plan_hash }}
+          E7_EXPECTED_CLOSURE_DIGEST: ${{ inputs.expected_closure_digest }}
+          E7_EXPECTED_RUNNER_DIGEST: ${{ inputs.expected_runner_digest }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_CA_FILE: ${{ runner.temp }}/prod-ca-2021.crt
+          E7_STRIPE_TEST_KEY: ${{ secrets.E7_STRIPE_TEST_KEY }}
+          E7_DEV_BOOKING_DATABASE_URL: ${{ secrets.E7_DEV_BOOKING_DATABASE_URL }}
+        run: node wrapper/scripts/e7-checkout-test-cleanup.mjs execute
