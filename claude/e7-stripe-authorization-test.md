@@ -38,9 +38,11 @@ No helper file was added. The accepted T / X / P / C1–C3, the read-only workfl
 | 4 | cancel (WRITE) | T | `POST /v1/payment_intents/<bound id>/cancel`, empty form, Idempotency-Key `e7-auth-<run_ref>-cancel` |
 | 5 | final retrieve | T | as #3 |
 
-**Primary-doc finding, at the pinned version.** The Stripe changelog for `2026-08-26.dahlia` removes the writable `payment_method_types` on PaymentIntent create, update and confirm. Passing it now returns 400 `payment_method_types_no_longer_supported`. The replacement is `allowed_payment_method_types` (added in `2026-07-29.dahlia`), so card-only is expressed as `allowed_payment_method_types[]=card`.
+**Card-only parameter (root API ruling, rev 2 wording).** Card-only is expressed as `allowed_payment_method_types[]=card`. Root accepted this OFFLINE. The support is the official addition of `allowed_payment_method_types` in `2026-07-29.dahlia` plus the current create reference. The Stripe-Version (`2026-08-26.dahlia`) and T are unchanged.
 
-- **Residual risk (can't be checked offline).** This combination with `confirm=true` and no `return_url` has not been exercised. If Stripe refuses it, the result is a 4xx `CREATE_REFUSED` with no hold. There is no retry.
+A Stripe changelog entry filed under `dahlia/2026-08-26` describes removing the writable `payment_method_types`. However, its references and Impact text cite `2026-08-26.preview`. This doc therefore does NOT assert that `2026-08-26.dahlia` rejects `payment_method_types`, because there is no version-specific evidence. That parameter is simply not used. There was no provider probe and no version upgrade.
+
+- **Residual risk (can't be checked offline, no contract loop).** This combination with `confirm=true` and no `return_url` has not been exercised. If Stripe refuses it, the result is a 4xx `CREATE_REFUSED` with no hold. There is no retry.
 - **Sources.**
   - docs.stripe.com/changelog/dahlia/2026-08-26/removes-payment-method-types-parameter-from-payment-intents-setup-intents
   - …/2026-07-29/allowed-payment-method-types-parameter
@@ -65,13 +67,33 @@ No helper file was added. The accepted T / X / P / C1–C3, the read-only workfl
   Otherwise nothing is bound and no cancel happens. Every later reply must re-match the same fields, and T also checks the object, id and livemode.
 - **Authorization verified.** The retrieve must show:
   - `status` requires_capture, `amount_capturable` 100, `amount_received` 0;
-  - an expanded `latest_charge` with `object` charge, an id matching `ch_…`, `livemode` false, `payment_intent` = the bound id, `captured` false, `amount_captured` 0, `amount` 100 usd, `amount_refunded` 0, and a boolean `paid`.
+  - an expanded `latest_charge` with `object` charge, an id matching `ch_…` (equal to any charge id already seen in the create reply), `livemode` false, `payment_intent` = the bound id, **`status` succeeded and `paid` === true** (R-AUTH1, the same facts as the accepted `capture-proof.js` still-authorized proof), `captured` false, `amount_captured` 0, `amount` 100 usd, and `amount_refunded` 0.
 - **Proof fields** (the accepted R-PC3 rule):
-  - `payment_method_details.card.capture_before` as a positive int → `COMPLETE`. It is published as `captureBefore` (epoch seconds).
+  - `payment_method_details.type` === `card` (R-AUTH1) together with `payment_method_details.card.capture_before` as a positive int → `COMPLETE`. It is published as `captureBefore` (epoch seconds). A missing type → `INCOMPLETE`. Any other type → `INVALID`.
   - absent or null → `INCOMPLETE`, reported honestly. The outcome is then `AUTH_TEST_COMPLETED_PROOF_INCOMPLETE`.
   - present but invalid → `INVALID`, and the authorization counts as NOT_VERIFIED.
 
   In every case the identity is still bound, so cleanup still runs.
+
+## Release predicate (R-AUTH2): ONE predicate for the early-canceled path AND the final readback
+
+This follows the accepted `compensation-proof.js` `piCanceledProofV3` style. A release is proven only when ALL of these hold:
+
+- the PI is bound to this run (id, livemode false, amount, currency, manual capture, exact metadata);
+- `status` is canceled;
+- `amount_received` is 0 and `amount_capturable` is 0;
+- `latest_charge` is an **expanded** charge with `object` charge and an id matching `ch_…`;
+- that id is **equal to the charge already observed for this PI** (create reply or first retrieve; the first observation wins and is never replaced);
+- the charge has `livemode` false, `payment_intent` = the bound id, `amount` 100 usd, `captured` false and `amount_captured` 0;
+- `amount_refunded` is 0 **or exactly 100**.
+
+Results:
+
+- **`VERIFIED`** when all of the above hold.
+- **`VERIFIED_NO_CHARGE`** when `latest_charge` is null and NO charge was ever observed. That is a genuinely no-charge canceled PI, reported honestly. It can never be `COMPLETED_OK`.
+- **`NOT_VERIFIED`** for anything else, including a missing, unexpanded or replaced charge after one was observed. The outcome is then `CLEANUP_NOT_VERIFIED`. There is no extra call and no retry.
+
+**Refunded = 100 is a deliberate, flagged divergence.** The accepted canceled proof is conservative and requires 0 (its residual R-REFUND). Stripe's cancel reference says that for a `requires_capture` PI "the remaining `amount_capturable` is automatically refunded". A correct release may therefore show the full amount as refunded. Partial values are never accepted. Root to rule whether to keep this or require 0 (with 0 required, a real release could report `NOT_VERIFIED`).
 
 ## Request / error / cleanup map (predeclared)
 
@@ -80,16 +102,17 @@ No helper file was added. The accepted T / X / P / C1–C3, the read-only workfl
 | key not `sk_test_…` (live, restricted, empty) | 0 | — | STOPPED_BEFORE_CREATE | none |
 | account mismatch or unknown | 1 GET | — | STOPPED_BEFORE_CREATE | none |
 | abort before create | 0–1 GET | — | STOPPED_BEFORE_CREATE | none |
-| create: transport failure, timeout, 3xx or 5xx | 2 | **none** (identity unknown; never blind-cancel) | CREATE_UNKNOWN | POSSIBLE_PI_UNKNOWN_IDENTITY; locator = run_ref + create idempotency key; dashboard search by metadata `e7_run_ref` |
-| create 4xx (e.g. 400/402) | 2 | none | CREATE_REFUSED (raw error never parsed or published) | POSSIBLE_UNAUTHORIZED_PI_NO_HOLD |
+| create: transport failure, timeout, 3xx, 5xx, **or any 4xx not listed in the next row** (e.g. 408, 409 idempotency, 429, 422, `idempotency_error`, `api_error`, unparseable body) | 2 | **none** (identity unknown; never blind-cancel) | CREATE_UNKNOWN | POSSIBLE_PI_UNKNOWN_IDENTITY; locator = run_ref + create idempotency key; dashboard search by metadata `e7_run_ref` |
+| create refusal, ONLY (status, `error.type`) ∈ {(400/401/403/404, `invalid_request_error`), (402, `card_error`)} (R-AUTH3) | 2 | none | CREATE_REFUSED, `errorCategory` INVALID_REQUEST / CARD_ERROR. Only `error.type` is read, against this fixed set; message, code, param and embedded objects are never read or published. | POSSIBLE_UNAUTHORIZED_PI_NO_HOLD |
 | create 2xx but not bound | 2 | none | CREATE_UNBOUND | POSSIBLE_PI_UNKNOWN_IDENTITY; PI id NOT published |
 | retrieve contradicts identity (fields, livemode, a live charge) | 3 | **none** | IDENTITY_CONFLICT | BOUND_PI_NOT_CANCELLED; PI id published |
 | retrieve unknown or refused | 3 + cancel + final = 5 | cancel based on the CREATE-bound status | per final readback | — |
 | status succeeded | 3 | none (no capture or refund op exists) | CAPTURED_UNEXPECTED | TEST_CHARGE_CAPTURED_NEEDS_OPERATOR |
 | status processing | 3 | none | NOT_CANCELLABLE | BOUND_PI_PROCESSING_NOT_CANCELLED |
-| status canceled | 3 | skipped | AUTH_TEST_AUTHORIZATION_NOT_VERIFIED (cleanup VERIFIED) | none |
+| status canceled at retrieve #3 | 3 | skipped; the release predicate is applied to this readback | AUTH_TEST_AUTHORIZATION_NOT_VERIFIED (cleanup VERIFIED / VERIFIED_NO_CHARGE), else CLEANUP_NOT_VERIFIED | none / BOUND_PI_STATE_UNVERIFIED |
 | requires_capture, or another cancellable status | 5 | ONE cancel, then ONE final retrieve | below | — |
-| final: canceled, received 0, capturable 0, charge not captured | 5 | VERIFIED | COMPLETED_OK / PROOF_INCOMPLETE / AUTHORIZATION_NOT_VERIFIED | none |
+| final: release predicate holds | 5 | VERIFIED (or VERIFIED_NO_CHARGE) | COMPLETED_OK / PROOF_INCOMPLETE (VERIFIED + authorization verified only) / AUTHORIZATION_NOT_VERIFIED | none |
+| final: canceled but the release predicate fails (foreign / live / replaced / missing charge, nonzero amounts, captured) | 5 | NOT_VERIFIED | CLEANUP_NOT_VERIFIED | BOUND_PI_STATE_UNVERIFIED |
 | final: still requires_capture (cancel refused or unknown) | 5 | NOT_DONE | CLEANUP_NOT_DONE | AUTHORIZATION_HELD_UNTIL_EXPIRY ($1.00 TEST hold auto-expires); PI id + cancel key |
 | final readback unknown or mismatched | 5 | UNKNOWN | CLEANUP_UNKNOWN | CANCEL_ACKED_READBACK_UNKNOWN or BOUND_PI_STATE_UNKNOWN |
 
@@ -110,6 +133,15 @@ Public output is the whitelisted result JSON on stdout plus the job summary buil
 - `run_ref` and the idempotency keys (non-secret locators).
 
 It never includes a key, header, URL, raw Stripe object, client_secret or raw error. There are no artifacts and no temp files.
+
+## Root CODE HOLD on c3e420ec, rev 2 corrections (R-AUTH1 / R-AUTH2 / R-AUTH3 + API wording)
+
+- **New isolated tests** (one per finding) with legitimate positive controls; no extra calls in any case.
+  - Red on c3e420ec: **15/18** (R-AUTH1, R-AUTH2 and R-AUTH3 each failed on its target case).
+  - Green after the fix: **18/18**.
+- **Existing tests:** A5 / A6 / A9 use the error helper, which now sends realistic `error.type` values (402 → `card_error`, otherwise `invalid_request_error`). No assertion changed.
+- **Spot checks:** four targeted mutants (paid check, preserved charge id, no-charge rule, refusal category) were each killed.
+- **Changed files:** only the runner, the test and this doc. The workflow is unchanged; the runner digest changes with the bytes.
 
 ## Offline verification
 

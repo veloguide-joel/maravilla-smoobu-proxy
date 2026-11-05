@@ -81,7 +81,7 @@ async function run(script, opts = {}) {
   assert.equal(res.exchanges, f.calls.length); assert.ok(res.exchanges <= 5);
   return { res, calls: f.calls, ops: f.calls.map((c) => c.op) };
 }
-const sendErr = (status) => () => reply(status, { error: { message: CANARY, type: "card_error", payment_intent: { id: PI, client_secret: CSECRET } } });
+const sendErr = (status, type = status === 402 ? "card_error" : "invalid_request_error") => () => reply(status, { error: { message: CANARY, type, payment_intent: { id: PI, client_secret: CSECRET } } });
 const netFail = () => Promise.reject(new Error(CANARY));
 
 test("A1. happy flow: exactly five exchanges in order; exact create request; bound PI; cancel once; cleanup verified; proof fields complete", async () => {
@@ -239,6 +239,77 @@ test("A11. plan: fixed scope / code ceiling; identity is the reviewed run_ref (n
   assert.deepEqual([r.outcome, f.calls.length], ["CORE_INVALID", 0]);
   const r2 = await A.runAuthorizationCore({ plan: built.plan, body: built.body.replace("amount=100", "amount=1000"), exchange: f.exchange, credential: () => KEY, createStripeSend: T.createE7StripeTestSend });
   assert.deepEqual([r2.outcome, f.calls.length], ["CORE_INVALID", 0]);
+});
+
+// ---- root HOLD corrections (red on c3e420ec, green after) ---------------------------------------------------------------------------
+test("R-AUTH1. authorization needs charge paid===true AND status==='succeeded'; COMPLETE proof needs payment_method_details.type 'card'; controls stay green; no extra calls", async () => {
+  const lc0 = piObj().latest_charge;
+  for (const lc of [{ ...lc0, paid: false }, { ...lc0, status: "failed" }, { ...lc0, status: "pending" }, { ...lc0, paid: false, status: "failed" }]) {
+    const { res, ops } = await run({ retrieve1: () => reply(200, piObj({ latest_charge: lc })) });
+    assert.deepEqual([res.outcome, res.retrieve.authorization, res.cleanup, ops.length], ["AUTH_TEST_AUTHORIZATION_NOT_VERIFIED", "NOT_VERIFIED", "VERIFIED", 5], JSON.stringify([lc.paid, lc.status]));
+  }
+  // card type: absent → honest INCOMPLETE (authorization still verified); a non-card type → INVALID (not verified)
+  const noType = await run({ retrieve1: () => reply(200, piObj({ latest_charge: { ...lc0, payment_method_details: { card: { capture_before: 1790000000 } } } })) });
+  assert.deepEqual([noType.res.outcome, noType.res.retrieve.proofFields, noType.res.retrieve.captureBefore], ["AUTH_TEST_COMPLETED_PROOF_INCOMPLETE", "INCOMPLETE", null]);
+  const other = await run({ retrieve1: () => reply(200, piObj({ latest_charge: { ...lc0, payment_method_details: { type: "link", card: { capture_before: 1790000000 } } } })) });
+  assert.deepEqual([other.res.outcome, other.res.retrieve.proofFields, other.res.retrieve.authorization], ["AUTH_TEST_AUTHORIZATION_NOT_VERIFIED", "INVALID", "NOT_VERIFIED"]);
+  // positive controls
+  const ok = await run();
+  assert.deepEqual([ok.res.outcome, ok.res.retrieve.proofFields, ok.ops.length], ["AUTH_TEST_COMPLETED_OK", "COMPLETE", 5]);
+  const inc = await run({ retrieve1: () => reply(200, piObj({ latest_charge: { ...lc0, payment_method_details: { type: "card", card: { brand: "visa" } } } })) });
+  assert.equal(inc.res.outcome, "AUTH_TEST_COMPLETED_PROOF_INCOMPLETE");
+});
+
+test("R-AUTH2. one strict release predicate (final AND early-canceled): foreign / live / replaced / missing / unexpanded / amount / currency / captured charge never VERIFIED", async () => {
+  const fc = canceled().latest_charge;
+  const badFinal = [{ ...fc, livemode: true, payment_intent: "pi_Foreign1" }, { ...fc, livemode: true }, { ...fc, payment_intent: "pi_Foreign1" }, { ...fc, id: "ch_Replaced1" },
+    { ...fc, object: "refund" }, { ...fc, amount: 200 }, { ...fc, currency: "mxn" }, { ...fc, captured: true }, { ...fc, amount_captured: 100 }, { ...fc, amount_refunded: 50 }, null, CH];
+  for (const lc of badFinal) {
+    const { res, ops, calls } = await run({ retrieve2: () => reply(200, canceled({ latest_charge: lc })) });
+    assert.notEqual(res.outcome, "AUTH_TEST_COMPLETED_OK", JSON.stringify(lc));
+    assert.deepEqual([res.cleanup, res.outcome, ops.length, calls.filter((c) => c.op === "cancel").length], ["NOT_VERIFIED", "CLEANUP_NOT_VERIFIED", 5, 1], JSON.stringify(lc));
+  }
+  for (const over of [{ amount_received: 100 }, { amount_capturable: 100 }]) {
+    const { res } = await run({ retrieve2: () => reply(200, canceled(over)) });
+    assert.deepEqual([res.cleanup, res.outcome], ["NOT_VERIFIED", "CLEANUP_NOT_VERIFIED"], JSON.stringify(over));
+  }
+  // early canceled path (retrieve #3 already canceled): same predicate, no cancel, no extra call
+  const earlyBad = [{ amount_received: 100, latest_charge: { ...fc, captured: true, amount_captured: 100 } }, { amount_capturable: 100 }, { latest_charge: { ...fc, payment_intent: "pi_Foreign1" } },
+    { latest_charge: { ...fc, livemode: true } }, { latest_charge: null }];
+  for (const over of earlyBad) {
+    const { res, ops } = await run({ retrieve1: () => reply(200, canceled(over)) });
+    assert.notEqual(res.cleanup, "VERIFIED", JSON.stringify(over));
+    assert.deepEqual([ops.length, res.cancel.step], [3, "SKIPPED_ALREADY_CANCELED"]);
+    assert.notEqual(res.outcome, "AUTH_TEST_COMPLETED_OK");
+  }
+  // legitimate controls: clean release; documented release of the uncaptured amount (amount_refunded = amount); clean early canceled
+  const ok = await run();
+  assert.deepEqual([ok.res.cleanup, ok.res.outcome], ["VERIFIED", "AUTH_TEST_COMPLETED_OK"]);
+  const rel = await run({ retrieve2: () => reply(200, canceled({ latest_charge: { ...fc, amount_refunded: 100, refunded: true } })) });
+  assert.deepEqual([rel.res.cleanup, rel.res.outcome], ["VERIFIED", "AUTH_TEST_COMPLETED_OK"]);
+  const early = await run({ retrieve1: () => reply(200, canceled()) });
+  assert.deepEqual([early.res.cleanup, early.ops.length], ["VERIFIED", 3]);
+  // genuinely no charge ever observed (create + retrieve + final latest_charge null): reported honestly, never COMPLETED_OK
+  const none = await run({ create: () => reply(200, piObj({ status: "requires_action", amount_capturable: 0, latest_charge: null })),
+    retrieve1: () => reply(200, piObj({ status: "requires_action", amount_capturable: 0, latest_charge: null })),
+    cancel: () => reply(200, canceled({ latest_charge: null })), retrieve2: () => reply(200, canceled({ latest_charge: null })) });
+  assert.deepEqual([none.res.cleanup, none.res.outcome, none.ops.length], ["VERIFIED_NO_CHARGE", "AUTH_TEST_AUTHORIZATION_NOT_VERIFIED", 5]);
+});
+
+test("R-AUTH3. create 4xx: only positively-safe categories are CREATE_REFUSED; 408 / 409 / 429 / idempotency / unparseable / other → CREATE_UNKNOWN, no cancel, no retry", async () => {
+  const unknown = [sendErr(408), sendErr(409, "idempotency_error"), sendErr(409, "invalid_request_error"), sendErr(429, "invalid_request_error"), sendErr(400, "idempotency_error"),
+    sendErr(402, "api_error"), sendErr(400, "card_error"), sendErr(422), sendErr(424), () => reply(400, "not json"), () => reply(402, { error: "x" })];
+  for (const h of unknown) {
+    const { res, ops, calls } = await run({ create: h });
+    assert.deepEqual([res.outcome, ops, res.residual, res.paymentIntentId, res.create.step], ["CREATE_UNKNOWN", ["account", "create"], "POSSIBLE_PI_UNKNOWN_IDENTITY", null, "UNKNOWN"]);
+    assert.equal(calls.filter((c) => c.op === "create").length, 1);
+  }
+  // ordinary validation / decline controls
+  for (const [s, t, cat] of [[400, "invalid_request_error", "INVALID_REQUEST"], [401, "invalid_request_error", "INVALID_REQUEST"], [402, "card_error", "CARD_ERROR"],
+    [403, "invalid_request_error", "INVALID_REQUEST"], [404, "invalid_request_error", "INVALID_REQUEST"]]) {
+    const { res, ops } = await run({ create: sendErr(s, t) });
+    assert.deepEqual([res.outcome, ops.length, res.create.httpStatus, res.create.errorCategory, res.residual], ["CREATE_REFUSED", 2, s, cat, "POSSIBLE_UNAUTHORIZED_PI_NO_HOLD"]);
+  }
 });
 
 // ---- hosted wiring --------------------------------------------------------------------------------------------------------------------

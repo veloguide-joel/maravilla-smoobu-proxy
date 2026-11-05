@@ -110,16 +110,20 @@ function boundPi(pi, id, runRef, c) {
 }
 const statusOf = (pi) => (isObj(pi) && PI_STATUSES.includes(pi.status) ? pi.status : null);
 /** authorization verification of a requires_capture PI (expanded latest_charge). → { verdict, proofFields, captureBefore, conflict } */
-function verifyAuthorization(pi, id, c) {
+function verifyAuthorization(pi, id, c, knownChargeId) {
   const out = { verdict: "NOT_VERIFIED", proofFields: "NOT_CHECKED", captureBefore: null, conflict: false };
   if (pi.amount_capturable !== c.amount || pi.amount_received !== 0) return out;
   const lc = own(pi, "latest_charge");
   if (!isObj(lc)) return out;                                              // null / string id / other: charge unverified
   if (lc.livemode !== false) { out.conflict = true; return out; }          // a non-TEST charge on a TEST PI: contradiction
-  if (lc.object !== "charge" || typeof lc.id !== "string" || !CH_RE.test(lc.id) || lc.payment_intent !== id || lc.captured !== false
-      || lc.amount_captured !== 0 || lc.amount !== c.amount || lc.currency !== c.currency || lc.amount_refunded !== 0 || typeof lc.paid !== "boolean") return out;
+  // R-AUTH1: the accepted still-authorized proof facts (lib/checkout/capture-proof.js stillAuthorizedV3Refusal): charge status succeeded,
+  // paid === true, not captured, nothing captured / refunded, exact amount / currency, bound to this PI
+  if (lc.object !== "charge" || typeof lc.id !== "string" || !CH_RE.test(lc.id) || lc.payment_intent !== id || lc.status !== "succeeded" || lc.paid !== true
+      || lc.captured !== false || lc.amount_captured !== 0 || lc.amount !== c.amount || lc.currency !== c.currency || lc.amount_refunded !== 0) return out;
+  if (knownChargeId !== null && lc.id !== knownChargeId) return out;     // a charge other than the one already observed for this PI
   // R-PC3 rule (accepted read-only probe): payment_method_details.card.capture_before positive int = COMPLETE; absent / null = INCOMPLETE;
-  // present but invalid = INVALID (reported, authorization NOT verified, cleanup still runs on the bound identity)
+  // present but invalid = INVALID (reported, authorization NOT verified, cleanup still runs on the bound identity). R-AUTH1: COMPLETE also
+  // needs payment_method_details.type === "card" (absent type = INCOMPLETE; any other type = INVALID).
   const absent = (v) => v === undefined || v === null;
   const incomplete = () => { out.proofFields = "INCOMPLETE"; out.verdict = "VERIFIED"; return out; };
   const invalid = () => { out.proofFields = "INVALID"; return out; };
@@ -132,8 +136,31 @@ function verifyAuthorization(pi, id, c) {
   const cb = own(card, "capture_before");
   if (absent(cb)) return incomplete();
   if (!posInt(cb)) return invalid();
+  const type = own(pmd, "type");
+  if (absent(type)) return incomplete();
+  if (type !== "card") return invalid();
   out.proofFields = "COMPLETE"; out.captureBefore = cb; out.verdict = "VERIFIED"; return out;
 }
+/** the charge id a reply carries for latest_charge (expanded object or plain id) → id | null */
+const chargeIdOf = (pi) => { const lc = own(pi, "latest_charge"); const id = isObj(lc) ? lc.id : lc; return typeof id === "string" && CH_RE.test(id) ? id : null; };
+/**
+ * R-AUTH2: ONE strict release predicate (used for the early-canceled AND the final readback), accepted compensation-proof
+ * piCanceledProofV3 style: bound PI, canceled, received / capturable zero; expanded charge object, id (= the charge already observed for
+ * this PI, if any), TEST, bound to this PI, exact amount / currency, not captured, nothing captured. Refunded: 0, or exactly the full
+ * amount (Stripe documents that canceling a requires_capture PI releases the remaining amount_capturable; see doc). A charge observed
+ * earlier that is now missing / unexpanded / replaced cannot prove release. → "VERIFIED" | "VERIFIED_NO_CHARGE" | "NOT_VERIFIED"
+ */
+function releaseProof(pi, id, runRef, c, knownChargeId) {
+  if (!boundPi(pi, id, runRef, c) || pi.status !== "canceled" || pi.amount_received !== 0 || pi.amount_capturable !== 0) return "NOT_VERIFIED";
+  const lc = own(pi, "latest_charge");
+  if (lc === null) return knownChargeId === null ? "VERIFIED_NO_CHARGE" : "NOT_VERIFIED";
+  if (!isObj(lc) || lc.object !== "charge" || typeof lc.id !== "string" || !CH_RE.test(lc.id) || (knownChargeId !== null && lc.id !== knownChargeId)
+      || lc.livemode !== false || lc.payment_intent !== id || lc.amount !== c.amount || lc.currency !== c.currency || lc.captured !== false
+      || lc.amount_captured !== 0 || !(lc.amount_refunded === 0 || lc.amount_refunded === c.amount)) return "NOT_VERIFIED";
+  return "VERIFIED";
+}
+/** R-AUTH3: a create 4xx is a definitive refusal ONLY for these (status, error.type) pairs; everything else is UNKNOWN */
+const REFUSAL_CATEGORIES = freeze({ 400: "invalid_request_error", 401: "invalid_request_error", 402: "card_error", 403: "invalid_request_error", 404: "invalid_request_error" });
 /** bounded JSON of the create reply (fatal UTF-8, ≤ 256 KiB) → value | undefined */
 function parseReply(bytes) {
   try {
@@ -151,7 +178,7 @@ const DEFINITELY_NOT_SENT_T = ["OPTIONS_INVALID", "REQUEST_NOT_ALLOWED", "CREDEN
  */
 export async function runAuthorizationCore(input) {
   const r = { schema: RESULT_SCHEMA, outcome: null, exchanges: 0, writesSent: 0, runRef: null, createIdempotencyKey: null, cancelIdempotencyKey: null,
-    paymentIntentId: null, account: "NOT_RUN", create: { step: "NOT_RUN", httpStatus: null, status: null },
+    paymentIntentId: null, account: "NOT_RUN", create: { step: "NOT_RUN", httpStatus: null, errorCategory: null, status: null },
     retrieve: { step: "NOT_RUN", status: null, authorization: "NOT_CHECKED", proofFields: "NOT_CHECKED", captureBefore: null },
     cancel: { step: "NOT_RUN" }, final: { step: "NOT_RUN", status: null, amountReceived: null, amountCapturable: null }, cleanup: "NOT_APPLICABLE", residual: "NONE" };
   const done = (outcome, residual) => { r.outcome = outcome; if (residual) r.residual = residual; return freeze(JSON.parse(JSON.stringify(r))); };
@@ -200,23 +227,33 @@ export async function runAuthorizationCore(input) {
     const st = reply && Number.isSafeInteger(reply.status) ? reply.status : null;
     r.create.httpStatus = st !== null && st >= 100 && st <= 599 ? st : null;
     if (st === null || st < 200 || (st >= 300 && st < 400) || st >= 500) { r.create.step = "UNKNOWN"; return done("CREATE_UNKNOWN", "POSSIBLE_PI_UNKNOWN_IDENTITY"); }
-    if (st >= 400) { r.create.step = "REFUSED"; return done("CREATE_REFUSED", "POSSIBLE_UNAUTHORIZED_PI_NO_HOLD"); }   // raw error never parsed / published
+    if (st >= 400) {
+      // only error.type is read (compared with a fixed set); message / code / param / any embedded object are never read or published
+      const eb = parseReply(reply.bytes); const et = isObj(eb) && isObj(eb.error) ? eb.error.type : undefined;
+      if (Object.hasOwn(REFUSAL_CATEGORIES, String(st)) && et === REFUSAL_CATEGORIES[st]) {
+        r.create.step = "REFUSED"; r.create.errorCategory = et === "card_error" ? "CARD_ERROR" : "INVALID_REQUEST";
+        return done("CREATE_REFUSED", "POSSIBLE_UNAUTHORIZED_PI_NO_HOLD");
+      }
+      r.create.step = "UNKNOWN"; return done("CREATE_UNKNOWN", "POSSIBLE_PI_UNKNOWN_IDENTITY");   // 408 / 409 / 429 / idempotency / other: not positively safe
+    }
     const pi = parseReply(reply.bytes);
     const piId = isObj(pi) && typeof pi.id === "string" && PI_RE.test(pi.id) ? pi.id : null;
     if (piId === null || !boundPi(pi, piId, runRef, c) || statusOf(pi) === null) { r.create.step = "UNBOUND"; return done("CREATE_UNBOUND", "POSSIBLE_PI_UNKNOWN_IDENTITY"); }
     r.paymentIntentId = piId; r.create.step = "OK"; r.create.status = statusOf(pi);
+    let knownChargeId = chargeIdOf(pi);                                 // charge identity is preserved across observations
 
     // ---- (3) ONE retrieve (expanded latest_charge) ------------------------------------------------------------------------------------
-    let decisionStatus = r.create.status;
+    let decisionStatus = r.create.status; let got = null;
     try {
-      const got = await send(retrieveCall(piId));
+      got = await send(retrieveCall(piId));
       if (!boundPi(got, piId, runRef, c) || statusOf(got) === null) { r.retrieve.step = "MISMATCH"; return done("IDENTITY_CONFLICT", "BOUND_PI_NOT_CANCELLED"); }
       r.retrieve.step = "OK"; r.retrieve.status = decisionStatus = statusOf(got);
       if (decisionStatus === "requires_capture") {
-        const v = verifyAuthorization(got, piId, c);
+        const v = verifyAuthorization(got, piId, c, knownChargeId);
         if (v.conflict) { r.retrieve.step = "MISMATCH"; return done("IDENTITY_CONFLICT", "BOUND_PI_NOT_CANCELLED"); }
         r.retrieve.authorization = v.verdict; r.retrieve.proofFields = v.proofFields; r.retrieve.captureBefore = v.captureBefore;
       }
+      if (knownChargeId === null) knownChargeId = chargeIdOf(got);      // first observation wins; a later different id never replaces it
     } catch (e) {
       const code = tCode(e);
       if (code === "LIVEMODE_REFUSED") { r.retrieve.step = "MISMATCH"; return done("IDENTITY_CONFLICT", "BOUND_PI_NOT_CANCELLED"); }   // never write against a live-looking object
@@ -225,8 +262,11 @@ export async function runAuthorizationCore(input) {
     }
     if (decisionStatus === "succeeded") return done("CAPTURED_UNEXPECTED", "TEST_CHARGE_CAPTURED_NEEDS_OPERATOR");
     if (decisionStatus === "processing") return done("NOT_CANCELLABLE", "BOUND_PI_PROCESSING_NOT_CANCELLED");
-    if (decisionStatus === "canceled") { r.cancel.step = "SKIPPED_ALREADY_CANCELED"; r.cleanup = r.retrieve.step === "OK" ? "VERIFIED" : "NOT_VERIFIED";
-      return done(r.retrieve.step === "OK" ? "AUTH_TEST_AUTHORIZATION_NOT_VERIFIED" : "CLEANUP_NOT_VERIFIED", r.retrieve.step === "OK" ? "NONE" : "BOUND_PI_STATE_UNVERIFIED"); }
+    if (decisionStatus === "canceled") {                                 // no cancel, no extra call; the SAME release predicate as the final readback
+      r.cancel.step = "SKIPPED_ALREADY_CANCELED";
+      r.cleanup = r.retrieve.step === "OK" ? releaseProof(got, piId, runRef, c, knownChargeId) : "NOT_VERIFIED";
+      return r.cleanup === "NOT_VERIFIED" ? done("CLEANUP_NOT_VERIFIED", "BOUND_PI_STATE_UNVERIFIED") : done("AUTH_TEST_AUTHORIZATION_NOT_VERIFIED");
+    }
 
     // ---- (4) ONE cancel of the positively bound TEST PI ---------------------------------------------------------------------------------
     r.writesSent += 1;
@@ -245,9 +285,8 @@ export async function runAuthorizationCore(input) {
       if (!boundPi(fin, piId, runRef, c) || statusOf(fin) === null) { r.final.step = "MISMATCH"; r.cleanup = "UNKNOWN"; return done("CLEANUP_UNKNOWN", "BOUND_PI_STATE_UNKNOWN"); }
       r.final.step = "OK"; r.final.status = statusOf(fin);
       r.final.amountReceived = nni(fin.amount_received) ? fin.amount_received : null; r.final.amountCapturable = nni(fin.amount_capturable) ? fin.amount_capturable : null;
-      const lc = own(fin, "latest_charge");
-      const chargeClean = lc === null || (isObj(lc) && lc.captured === false && lc.amount_captured === 0);
-      if (r.final.status === "canceled" && fin.amount_received === 0 && fin.amount_capturable === 0 && chargeClean) r.cleanup = "VERIFIED";
+      const rel = r.final.status === "canceled" ? releaseProof(fin, piId, runRef, c, knownChargeId) : "NOT_VERIFIED";
+      if (rel !== "NOT_VERIFIED") r.cleanup = rel;
       else if (r.final.status === "requires_capture") { r.cleanup = "NOT_DONE"; return done("CLEANUP_NOT_DONE", "AUTHORIZATION_HELD_UNTIL_EXPIRY"); }
       else if (r.final.status === "succeeded") { r.cleanup = "NOT_DONE"; return done("CAPTURED_UNEXPECTED", "TEST_CHARGE_CAPTURED_NEEDS_OPERATOR"); }
       else { r.cleanup = "NOT_VERIFIED"; return done("CLEANUP_NOT_VERIFIED", "BOUND_PI_STATE_UNVERIFIED"); }
@@ -255,8 +294,8 @@ export async function runAuthorizationCore(input) {
       r.final.step = "UNKNOWN"; r.cleanup = "UNKNOWN";
       return done("CLEANUP_UNKNOWN", r.cancel.step === "CANCELED" ? "CANCEL_ACKED_READBACK_UNKNOWN" : "BOUND_PI_STATE_UNKNOWN");
     }
-    // cleanup VERIFIED here
-    if (r.retrieve.authorization !== "VERIFIED") return done("AUTH_TEST_AUTHORIZATION_NOT_VERIFIED");
+    // cleanup VERIFIED / VERIFIED_NO_CHARGE here (a no-charge release can never be a completed authorization)
+    if (r.retrieve.authorization !== "VERIFIED" || r.cleanup !== "VERIFIED") return done("AUTH_TEST_AUTHORIZATION_NOT_VERIFIED");
     return done(r.retrieve.proofFields === "COMPLETE" ? "AUTH_TEST_COMPLETED_OK" : "AUTH_TEST_COMPLETED_PROOF_INCOMPLETE");
   } catch {
     r.exchanges = count;
