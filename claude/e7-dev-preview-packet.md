@@ -6,6 +6,7 @@ Status: preparation only. **Nothing here is approval.** No database query, Verce
 > - **C** (owner cleanup runner `460b2879`) is MERGED to main (`91e20666`, PR23) but **NOT activated**: no dispatch, no environment secret, no DB connection.
 > - **P** (`6d00d0d6`) is accepted, but the branch-scoped preview is **NOT deployed**; `e7-test` is NOT created.
 > - **Route B scripts 06–16 are generated and ready ONLY for root review** (`claude/evidence/e7-routeb-editor-scripts-2026-11-05.md`). They are a NEW implementation (`scripts/e7-routeb-gen.mjs`), not the historical uncommitted generator `e3ea1ffc…`. Nothing was run on any hosted database.
+> - The db-smoke execution gap is closed OFFLINE by the hosted read-only wrapper `feature/e7-dev-db-smoke-runner` `58adc5e6` (pending root review; not dispatched).
 > - Target `mxotevtiscernhqilyiu` stays **UNVERIFIED** until a separately approved read-only D1 preflight. Neither zero live data nor credential availability is assumed.
 
 **Labels.** **[obs]** observed (date / source). **[hist]** historical report only, not current state. **[repo]** read from the repo at `6d703acd`. **[owner]** needs the owner. **[gap]** needs reviewed code before use.
@@ -85,9 +86,10 @@ ROLLBACK;
 - applied history is exactly 1–5, with the five recorded checksums and environment `test` each;
 - `t0006` / `t0011` / `t0016` are NULL;
 - roles `mv_booking_admin` / `mv_booking_app` / `mv_booking_report` are NOLOGIN, and `mv_booking_app_dev` is LOGIN and a member of `mv_booking_app` only; none is superuser, BYPASSRLS or CREATEROLE;
-- **every data count is 0.**
+- **data counts: the hosted data is UNVERIFIED.** The counts are reported and recorded as the before-baseline; nothing assumes them to be 0. An unexpected data row (anything the approved run did not foresee) STOPS here for review.
+- **other logins:** `other_logins_in_booking_groups` (`pre_verify.sql`) is REPORTED. Any value other than empty needs explicit human / root review. It is never treated as an automatic all-ok authorization.
 
-Anything else (a version > 5, any data row, another login, a different checksum) stops here. The finding is reported; there is no replay and no repair.
+Anything else (a version > 5, an unexpected data row, an unreviewed other login, a different checksum) stops here. The finding is reported; there is no replay and no repair.
 
 ## 3. Step D2 — conditional DEV upgrade (only after D1 matched; reuses the existing tooling)
 
@@ -114,16 +116,19 @@ Two routes; the package picks ONE.
 - applied history exactly 1–16, with the §1 checksums (1–5 unchanged) and environment `test` each;
 - `t0006` / `t0011` / `t0016` are NOT NULL;
 - roles unchanged (same NOLOGIN groups; `mv_booking_app_dev` LOGIN, member of `mv_booking_app` only);
-- the `data_counts` row is reported and must equal the D1 counts (no data volume is assumed);
+- the `data_counts` row is reported and compared before / after: it must equal the D1 counts (no data volume is assumed); any difference STOPS;
+- `other_logins_in_booking_groups` is unchanged from D1 and stays a human / root review item;
 - the `post_verify.sql` privilege matrix, function grants and RLS checks are all `ok`.
 
 **Then:**
-- the D1 SELECTs again (history 1–16 with the table above, `env = test`, 0 data rows);
-- then the existing read-only smoke from `6d703acd`, whose privilege matrix covers through 0016, run by the owner as before:
+- the D1 SELECTs again (history 1–16 with the table above, `env = test`, the same data counts as D1);
+- then the existing read-only smoke from `6d703acd`, UNCHANGED, whose privilege matrix covers through 0016. It runs through the hosted read-only wrapper `e7-dev-db-smoke` (branch `feature/e7-dev-db-smoke-runner` `58adc5e6`, from main `91e20666`; **pending root review / merge; not dispatched**; doc `claude/e7-dev-db-smoke.md` there). The wrapper runs exactly:
   ```
-  node scripts/db-smoke.mjs --url-env BOOKING_DATABASE_URL --ca-file prod-ca-2021.crt --expect-role mv_booking_app_dev --env test   # read-only; never --write-probe
+  scripts/db-smoke.mjs --url-env E7_DEV_BOOKING_DATABASE_URL --ca-file <pinned CA> --expect-role mv_booking_app_dev --env test   # read-only; never --write-probe
   ```
-  It must pass every check, exit 0.
+  It uses the runtime-login secret `E7_DEV_BOOKING_DATABASE_URL` only (no owner terminal or credential). It reports `SMOKE_PASS` only for exit 0 and every one of the 22 expected checks passed.
+  - **The smoke is stricter than POST.** It requires empty data (only the instance row and the 51-row assessment seed). A non-empty DEV database therefore FAILS the smoke; data is never cleared or relaxed to make it pass.
+  - The catalog-only `post_verify.sql` is not proof of the runtime login or TLS. The wrapper is not proof until it is separately approved and dispatched.
 
 ## 4. Preview: branch, alias, env
 
@@ -209,13 +214,13 @@ Two routes; the package picks ONE.
 | # | action | who | stop condition |
 |---|---|---|---|
 | 1 | D1 read-only SQL on `mxotevtiscernhqilyiu` | Claude (owner's signed-in dashboard) | any value ≠ §2 baseline |
-| 2 | D2 upgrade 6 → 16 by Route B: `pre_verify.sql`, scripts 06 → 16 (hashes in the evidence note), `post_verify.sql`, then the read-only smoke | Claude (editor scripts, owner's signed-in dashboard); **[gap] the `db-smoke.mjs` run has NO execution mechanism**: it needs the runtime credential and there is no reviewed non-owner path. Not broadened here | first error or uncertain outcome (ROLLBACK, inspect read-only, never re-run); any POST check not `ok`; smoke not all PASS |
+| 2 | D2 upgrade 6 → 16 by Route B: `pre_verify.sql`, scripts 06 → 16 (hashes in the evidence note), `post_verify.sql`, then the read-only smoke | Claude (editor scripts, owner's signed-in dashboard); smoke: ONE dispatch of the `e7-dev-db-smoke` wrapper (`58adc5e6`, pending root review / merge to main; needs the owner-entered environment secret `E7_DEV_BOOKING_DATABASE_URL`, step 9) | first error or uncertain outcome (ROLLBACK, inspect read-only, never re-run); any POST check not `ok`; smoke not all PASS |
 | 3 | Push `e7-test` = reviewed head + P; confirm one READY preview for that sha | Claude (root-reviewed push) | no build / wrong sha |
 | 4 | Branch-scoped Preview env: the 9 non-secret names (§4) | Claude | — |
 | 5 | Branch-scoped Preview env secrets: `BOOKING_DATABASE_URL`, `STRIPE_TEST_SECRET_KEY` (existing approved `sk_test_`), `STRIPE_TEST_WEBHOOK_SECRET` (**owner**); `MV_RATE_LIMIT_SALT` generated without display by the approved step (concrete mechanism to be fixed in review: Claude's browser rules bar typing secret values into fields) | owner / approved step | — |
 | 6 | Stripe TEST webhook endpoint (§5) → owner enters its secret (step 5) | **owner** | — |
 | 7 | Protection path for the webhook (exception for exactly the observed `e7-test` alias, or the bypass alternative); **NOT authorized**, separate decision | per decision | any other domain listed |
 | 8 | Redeploy the `e7-test` preview once, so the env applies; read-only checks: `/checkout-test.html` 200 with the meta; `GET /api/checkout/stripe-webhook` unauthenticated → `405 METHOD_NOT_ALLOWED` (gate passed and the domain is reachable; `404 NOT_FOUND` = gate not satisfied; a Vercel login page = protection still on); `GET /api/checkout/intents` without a token → any code but `404 NOT_FOUND`. No POST, so no intent is created | Claude | 404, a login page, or a 5xx |
-| 9 | GitHub env secret for the cleanup runner's DB URL (needs C merged) | **owner** | — |
+| 9 | GitHub env secret `E7_DEV_BOOKING_DATABASE_URL` in environment `e7-readonly-probe` (the runtime login; shared by the cleanup runner and the smoke wrapper; must exist BEFORE step 2's smoke) | **owner** | — |
 
 Not in this package: any guest hold, Checkout session, void, Hostaway write, notification, production change, merge of E7 lineage to main, or removal / rotation of existing credentials.
