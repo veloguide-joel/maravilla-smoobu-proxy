@@ -1,0 +1,212 @@
+{
+  "schema": "e7-routeb-editor-scripts-v1",
+  "environment": "test",
+  "lockKey": 7302215001,
+  "timeouts": {
+    "lock": "15s",
+    "statement": "600s"
+  },
+  "from": 6,
+  "to": 16,
+  "history1to5": [
+    {
+      "version": 1,
+      "name": "booking_core",
+      "upChecksum": "f1550b3ab41cad09c0ee65295c07e483faef7d55554f18f04b1a148a0f2e045a",
+      "downChecksum": "948afbb80ab046c59bb5828bd858558a4ca4f2b608b15a8b53f34a27ab8aef7c"
+    },
+    {
+      "version": 2,
+      "name": "roles_grants",
+      "upChecksum": "f2a35ad4f92043bdb09573451ea22b6da8444da207d798ef1d0fdd60621d80b7",
+      "downChecksum": "107c2010d5d385f4b25350ce9e848f8f362d8bc4ed6374bbb959f8afd1b752cf"
+    },
+    {
+      "version": 3,
+      "name": "safety_corrections",
+      "upChecksum": "51143492f332bc771696a0c1cca241bc1fd078535f1a6e91dabd3c1b05b539f7",
+      "downChecksum": "5f6ce4613908eb4bc4601c1a10a7b7c9f54c78654190c69bbbca620c8a1907fb"
+    },
+    {
+      "version": 4,
+      "name": "capture_recovery",
+      "upChecksum": "2ffb8af83913e3090b87fbf28a264ef96f15707bdbef647f5098b39f143be472",
+      "downChecksum": "9a41c4eeb99f01470df7fa9c352b123383139a9d6cf339d9a1f785da8a1ddcab"
+    },
+    {
+      "version": 5,
+      "name": "db_clock_checkout_create",
+      "upChecksum": "d487975b8bc5f451b7ca22d0b91330cf4365b5d315a4f8dbb3f5ccac3f368637",
+      "downChecksum": "fbf0814e5b39d44eadd9728cce3ba272dfa9f59d81de146818a43c5a53fcca5d"
+    }
+  ],
+  "scripts": [
+    {
+      "version": 6,
+      "name": "api_rate_limits",
+      "file": "06_api_rate_limits.sql",
+      "upChecksum": "2ab8bd93af1671b5017ab896cb6faf0a78ab0875a3fd2c723ccbefe2a90b0183",
+      "downChecksum": "ae746d4556b9ff0699bfce998805096dc6aa4dcf212641d3153c58f546522658",
+      "scriptSha256": "bc65a1c3a2c42f26e026c773b4062fa14302cc06cd818fe05758f47da3ca5990",
+      "scriptBytes": 6763,
+      "bodyOffset": 3127,
+      "bodyLength": 3298,
+      "priorVersions": [
+        1,
+        5
+      ]
+    },
+    {
+      "version": 7,
+      "name": "capture_claim_fence",
+      "file": "07_capture_claim_fence.sql",
+      "upChecksum": "ef46bdc35d98e9a2b38a1effaf767afa07e4a77eac1cce233c6762ce02c3bd9e",
+      "downChecksum": "512b93ea7c0cf7dfce3900966ef8b0dd333dab523f6cb9f986b21b30533c1273",
+      "scriptSha256": "45fe8b9393792cd5400c996c20e01e607790cbf7e632f1f4e1f68cae75a6784d",
+      "scriptBytes": 5233,
+      "bodyOffset": 3301,
+      "bodyLength": 1586,
+      "priorVersions": [
+        1,
+        6
+      ]
+    },
+    {
+      "version": 8,
+      "name": "settled_evidence_immutable",
+      "file": "08_settled_evidence_immutable.sql",
+      "upChecksum": "2ecedc65abc1c51c4967f480df211611d987378caf81ce283b160ff849b6f903",
+      "downChecksum": "301ab430f27710e2a15c5d2d2d39e5c06f2ffe446d43469bdf63f76cfa708cd4",
+      "scriptSha256": "4bdc60c2bfc1fe76dc2aa8ed04e1f7c69bfa12ab72d3c3b763e348789a088145",
+      "scriptBytes": 5898,
+      "bodyOffset": 3485,
+      "bodyLength": 2053,
+      "priorVersions": [
+        1,
+        7
+      ]
+    },
+    {
+      "version": 9,
+      "name": "void_cancel_claim_fence",
+      "file": "09_void_cancel_claim_fence.sql",
+      "upChecksum": "868adf98dacab345fbcfdf544c09d305f26956b850836a164a3601161011bc8d",
+      "downChecksum": "cffb3d0997ccf37599b29f583d7d4ecb252804d66c292faa5815c67152b46fe5",
+      "scriptSha256": "bf7c6ab11d4776e750fb65718dd4810490d2188a9e8b9ceab184854a586057f5",
+      "scriptBytes": 6786,
+      "bodyOffset": 3656,
+      "bodyLength": 2776,
+      "priorVersions": [
+        1,
+        8
+      ]
+    },
+    {
+      "version": 10,
+      "name": "recording_evidence_link",
+      "file": "10_recording_evidence_link.sql",
+      "upChecksum": "55244bf157b527bfbb0119fcb21979996ebbad454c1a154ed926f1a64b67e727",
+      "downChecksum": "232575bca986ef123a6ac95d356ab8f42a671a17711282b30277d6a0046e09d3",
+      "scriptSha256": "9f265a8c170bba583da4012bbdde84541c1d93e02c6e64043e0aa77ba57e7a2f",
+      "scriptBytes": 37082,
+      "bodyOffset": 3833,
+      "bodyLength": 32894,
+      "priorVersions": [
+        1,
+        9
+      ]
+    },
+    {
+      "version": 11,
+      "name": "recording_owner_cases",
+      "file": "11_recording_owner_cases.sql",
+      "upChecksum": "2448821d93093c32c4cb4d5cb58aaf81a633ab5cd64b5c0025213e73fe573762",
+      "downChecksum": "79cb74d8b8345218f8e2fb840207213c59c9ee744826d5b9a2952c3ddf1d565a",
+      "scriptSha256": "b98cf534bfa1f6058552d96b7419b501dd010a435248b3ad200b28b1cf7e14a6",
+      "scriptBytes": 68249,
+      "bodyOffset": 4005,
+      "bodyLength": 63893,
+      "priorVersions": [
+        1,
+        10
+      ]
+    },
+    {
+      "version": 12,
+      "name": "recording_assessments",
+      "file": "12_recording_assessments.sql",
+      "upChecksum": "1b782b2027ed4d71f3714a97ef3f1d71829f7e552ed8da91f30c54c841a93ec1",
+      "downChecksum": "947927e827f9e715f09401bf26b114ae85ebeed0b930f0f89fc919b50c55ca19",
+      "scriptSha256": "0961e728e6a07683fc5ea66e70441eeeca20150e85af96a234f006d5c10e172e",
+      "scriptBytes": 52294,
+      "bodyOffset": 4178,
+      "bodyLength": 47765,
+      "priorVersions": [
+        1,
+        11
+      ]
+    },
+    {
+      "version": 13,
+      "name": "recording_preflight_release",
+      "file": "13_recording_preflight_release.sql",
+      "upChecksum": "d9d8b4c2c677c764a0e6e8e615feb783c37d7c3226ac5b99a2ab8d8a227db239",
+      "downChecksum": "db63c94eadbb9ea2058e1e100153a9c85a18ea4d7844c06082e5f523a3b3feb2",
+      "scriptSha256": "dc85ae7c94df7480b3466e65500224748bc5cc3b73dd01fa1fd7da79d283305d",
+      "scriptBytes": 63919,
+      "bodyOffset": 4363,
+      "bodyLength": 59193,
+      "priorVersions": [
+        1,
+        12
+      ]
+    },
+    {
+      "version": 14,
+      "name": "recording_completion_binding",
+      "file": "14_recording_completion_binding.sql",
+      "upChecksum": "a8b27725fe58719daf61810814e3e98af3e417eb2a1a2956b59e8cccc4c2e633",
+      "downChecksum": "79cee8a954732941abd21bc2ee45c8812ca13955cd3e2aeecb20ed0f59b009bf",
+      "scriptSha256": "07a6eecc8bf3d127561a401883b747a2aec4236803b2e9f1a283992df87ea626",
+      "scriptBytes": 16547,
+      "bodyOffset": 4544,
+      "bodyLength": 11638,
+      "priorVersions": [
+        1,
+        13
+      ]
+    },
+    {
+      "version": 15,
+      "name": "scoped_recording_inbox",
+      "file": "15_scoped_recording_inbox.sql",
+      "upChecksum": "79e86a3017debee9da43d45a41d313ce8658044a05b40a43f62726f7c8777365",
+      "downChecksum": "45f1b72880873099b8e55a2e726971fa8ad31028be83aca1e9c6bddf26624cb4",
+      "scriptSha256": "b784eadefd69cce305922474ff6d7af4a9bd8e86719872bc58edffdd2e3a1369",
+      "scriptBytes": 27967,
+      "bodyOffset": 4712,
+      "bodyLength": 22902,
+      "priorVersions": [
+        1,
+        14
+      ]
+    },
+    {
+      "version": 16,
+      "name": "guest_notification_fence",
+      "file": "16_guest_notification_fence.sql",
+      "upChecksum": "085fe788b7cef561bf7504c887347a4705b749b317584ab8ddcea465dd400975",
+      "downChecksum": "8f4def170b0e1733ceefc4ddae4ad6d2d73b504cefb2156951cfc88e5b675665",
+      "scriptSha256": "cec697fda937932f9e980930dcbf5bddfc00d008bd313679aa5305b66c6c5a0b",
+      "scriptBytes": 73128,
+      "bodyOffset": 4890,
+      "bodyLength": 67881,
+      "priorVersions": [
+        1,
+        15
+      ]
+    }
+  ],
+  "preVerifySha256": "14b5126dc4db77fbbfd34b174a131bb0f7d53270c8e669892234cc0da5035d77",
+  "postVerifySha256": "ca57304182f3aa8e48c97949710535399b7d52d82252f2ec663369350924e6d0"
+}

@@ -2,6 +2,12 @@
 
 Status: preparation only. **Nothing here is approval.** No database query, Vercel setting, env value, webhook, deploy or provider call was made to write this. Branch `feature/e7-dev-preview-packet` from exact accepted `6d703acdcfa205138d1ce4ba65b2ec58fc9493c9`.
 
+> **Status update 2026-11-05 (Route B package, branch `feature/e7-routeb-editor-scripts` from `48171a3f`).** Infrastructure execution stays CLOSED; all current provider approvals are consumed.
+> - **C** (owner cleanup runner `460b2879`) is MERGED to main (`91e20666`, PR23) but **NOT activated**: no dispatch, no environment secret, no DB connection.
+> - **P** (`6d00d0d6`) is accepted, but the branch-scoped preview is **NOT deployed**; `e7-test` is NOT created.
+> - **Route B scripts 06–16 are generated and ready ONLY for root review** (`claude/evidence/e7-routeb-editor-scripts-2026-11-05.md`). They are a NEW implementation (`scripts/e7-routeb-gen.mjs`), not the historical uncommitted generator `e3ea1ffc…`. Nothing was run on any hosted database.
+> - Target `mxotevtiscernhqilyiu` stays **UNVERIFIED** until a separately approved read-only D1 preflight. Neither zero live data nor credential availability is assumed.
+
 **Labels.** **[obs]** observed (date / source). **[hist]** historical report only, not current state. **[repo]** read from the repo at `6d703acd`. **[owner]** needs the owner. **[gap]** needs reviewed code before use.
 
 > **Corrections after root review of `d7476990` (2026-11-05).** Infrastructure execution stays CLOSED. No protection exception is authorized.
@@ -97,17 +103,19 @@ Two routes; the package picks ONE.
   - The runner re-verifies the history and checksums under an advisory lock before every version. It applies one transaction per migration and stops at the first error, leaving the earlier versions committed.
   - `status` runs `CREATE SCHEMA/TABLE IF NOT EXISTS` and `REVOKE ... FROM PUBLIC` on the existing bookkeeping. These are no-ops, but not strictly read-only, which is why D1 is plain SQL.
   - **[owner]** This needs the owner's migration credential (`MV_DEV_DB_URL`) in his own terminal. It is never given to Claude.
-- **Route B (PREFERRED: no owner terminal, no credential handling; the 0001–0005 precedent).** SQL-editor scripts are generated offline at `6d703acd` with the recorded generator recipe (`e2c-tools/gen-editor-scripts.mjs`, SHA-256 `e3ea1ffc…c4fb7`; evidence `claude/evidence/e2c-preflight-evidence-2026-10-21.txt`). Each script wraps one migration verbatim with the same advisory lock, prior-version checksum / environment / order guard and history INSERT.
+- **Route B (PREFERRED: no owner terminal, no credential handling; the 0001–0005 precedent).** SQL-editor scripts are generated offline by the committed NEW generator `scripts/e7-routeb-gen.mjs` (built-ins only; SHA-256 and every output hash in `claude/evidence/e7-routeb-editor-scripts-2026-11-05.md`). Each script wraps one migration verbatim in ONE transaction with the runner's advisory lock (`7302215001`), an exact prior-history guard (versions, names, up/down checksums, environment `test`), the `booking.instance = test` check, `set_config`, and the history INSERT.
   - Before any Run, root reviews each script's SHA-256, and the editor content is hash-checked.
-  - One Run per script, 06 → 16. Stop at the first error; never re-run.
-  - **[gap]** The generator is not committed, so its regeneration and hash review are an offline step before this route.
+  - `pre_verify.sql` (expects 1–5) before 06; one Run per script, 06 → 16; `post_verify.sql` (expects 1–16) after 16. All verification is read-only.
+  - **Stop at the first error, or whenever the submission / COMMIT outcome is uncertain:** run `ROLLBACK;`, then inspect history read-only. Never re-run blindly. The editor is not exactly-once.
+  - The historical generator `e3ea1ffc…` was not restored and is not claimed.
 
 **POST (after D2) expected, all of these or STOP** (re-run the §2 SELECTs; the PRE expectations for history and new tables do NOT apply):
 - `env = test`, 1 instance row;
 - applied history exactly 1–16, with the §1 checksums (1–5 unchanged) and environment `test` each;
 - `t0006` / `t0011` / `t0016` are NOT NULL;
 - roles unchanged (same NOLOGIN groups; `mv_booking_app_dev` LOGIN, member of `mv_booking_app` only);
-- every data count is still 0.
+- the `data_counts` row is reported and must equal the D1 counts (no data volume is assumed);
+- the `post_verify.sql` privilege matrix, function grants and RLS checks are all `ok`.
 
 **Then:**
 - the D1 SELECTs again (history 1–16 with the table above, `env = test`, 0 data rows);
@@ -191,7 +199,7 @@ Two routes; the package picks ONE.
 
 ## 8. Ordered finish list
 
-1. Root review of this packet → scope decision on gaps **P** and **C** (and Route A vs B; if B, the generator regeneration).
+1. Root review of this packet → scope decision on gaps **P** and **C** (and Route A vs B). Done: C merged (not activated), P accepted (not deployed), Route B chosen; the new script package awaits root review.
 2. Offline: implement C (+ tests, preflight locally); commit P on `e7-test`; root code review.
 3. Infrastructure package (below), executed once, in order, stopping at the first mismatch.
 4. Only then: one guest TEST run (authorize → release → cleanup runner → verified release), as a separate approval.
@@ -201,7 +209,7 @@ Two routes; the package picks ONE.
 | # | action | who | stop condition |
 |---|---|---|---|
 | 1 | D1 read-only SQL on `mxotevtiscernhqilyiu` | Claude (owner's signed-in dashboard) | any value ≠ §2 baseline |
-| 2 | D2 upgrade 6 → 16 by Route B (reviewed editor scripts), then the POST assertions plus the read-only smoke | Claude (editor scripts); smoke run needs the runtime credential, so it is an open item | first error; any POST assertion fails; smoke not all PASS |
+| 2 | D2 upgrade 6 → 16 by Route B: `pre_verify.sql`, scripts 06 → 16 (hashes in the evidence note), `post_verify.sql`, then the read-only smoke | Claude (editor scripts, owner's signed-in dashboard); **[gap] the `db-smoke.mjs` run has NO execution mechanism**: it needs the runtime credential and there is no reviewed non-owner path. Not broadened here | first error or uncertain outcome (ROLLBACK, inspect read-only, never re-run); any POST check not `ok`; smoke not all PASS |
 | 3 | Push `e7-test` = reviewed head + P; confirm one READY preview for that sha | Claude (root-reviewed push) | no build / wrong sha |
 | 4 | Branch-scoped Preview env: the 9 non-secret names (§4) | Claude | — |
 | 5 | Branch-scoped Preview env secrets: `BOOKING_DATABASE_URL`, `STRIPE_TEST_SECRET_KEY` (existing approved `sk_test_`), `STRIPE_TEST_WEBHOOK_SECRET` (**owner**); `MV_RATE_LIMIT_SALT` generated without display by the approved step (concrete mechanism to be fixed in review: Claude's browser rules bar typing secret values into fields) | owner / approved step | — |
