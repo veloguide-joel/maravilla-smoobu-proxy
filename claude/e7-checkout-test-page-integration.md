@@ -89,6 +89,8 @@ The Hostaway pricing credentials are already present in preview. No other prereq
 
 ### 2a. R-REFUND (repo-only decision note)
 
+> **Superseded by evidence (2026-11-05, root-verified).** A read-only GET of the existing canceled $1.00 TEST PaymentIntent (run 42091575058, job 127470681079; 2 exchanges, 0 writes, Stripe-Version `2026-01-28.clover`) reported the charge `captured:false`, `amount_captured` 0, **`amount_refunded` 0**, `refunded:false`. R-REFUND is CLOSED for this observed profile (TEST, manual capture, card, clover). **No proof change.** This is not proof for all cards or accounts, and not live readiness. The analysis below is kept as the record of the question.
+
 - **Accepted strict canceled proof** (`lib/checkout/compensation-proof.js:170-189`, `piCanceledProofV3`):
   - the PI is `canceled`, with `amount_received` 0 and `amount_capturable` 0;
   - the charge is expanded, bound, TEST, `captured:false` and `amount_captured` 0;
@@ -153,6 +155,8 @@ The Hostaway pricing credentials are already present in preview. No other prereq
   - the existing release test (`test/db/e7-checkout-test-release.test.mjs:191-200`) updated from 503 to the new code.
 
 ### 3. Prioritized finish list (sequencing corrected by root review of 5c0e1ea3)
+
+> **Status 2026-11-05.** Item 1 is done (`6d703acd`, accepted). Item 2 is done: the R-REFUND evidence above; no correction was justified. The infrastructure items (3, 4) are now the concrete execution packet `claude/e7-dev-preview-packet.md`, which also flags two required offline gaps: the preview-config commit P, and the owner-cleanup runner C (no reviewed hosted cleanup mechanism exists yet). The hosted DB state is UNKNOWN beyond the dated 0001–0005 reports.
 
 1. **Offline slice:** 2b — now implemented (next section).
 2. **R-REFUND evidence FIRST.** It must be settled BEFORE any guest Checkout hold that relies on the strict worker proof is authorized.
