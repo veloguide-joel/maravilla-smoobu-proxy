@@ -121,3 +121,8 @@ Each layer was tested separately; they are listed by what they actually prove.
 - **Loopback browser.**
   - **Fake core:** now returns the accepted details shape. Main flow: details → pay → fake Stripe → processing (neutral) → queued → verified with no notice.
   - **Uncertain pay:** after a reload, a malformed `{}` status gives "Status not confirmed". Pay stays hidden or disabled, pay count 1, stored `uncertain: "pay"`.
+
+## Status pointer
+
+- `claude/e7-checkout-test-page-integration.md` (branch `feature/e7-checkout-test-integrated`) runs this page over the REAL handler, core and repo on a disposable TEST PostgreSQL, with fake externals only.
+- No runtime defect was found.
