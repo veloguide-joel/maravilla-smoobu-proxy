@@ -139,3 +139,52 @@ test("Checkout SDK clients pin apiVersion 2026-01-28.clover (= installed stripe 
     assert.doesNotMatch(core, re);
   }
 });
+
+// ---------- POST {step:"status"} alias (UNIT MOCKS: fake pool / access / core; browser-header evidence is a separate loopback rehearsal) ----------
+function fakeStatusDeps({ allow = true, intentId = "11111111-2222-4333-8444-555555555555" } = {}) {
+  const seen = { status: 0, create: 0, pay: 0, details: 0, release: 0, hits: [] };
+  const pool = { query: async (sql) => (/booking\.instance/.test(sql) ? { rows: [{ environment: "test" }] } : { rows: [] }) };
+  return { seen, deps: {
+    createPool: () => pool,
+    loadAccess: async () => ({ rateLimitHit: async (_p, bucket) => { seen.hits.push(bucket.split(":")[0]); return allow; }, findIntentIdByTokenHash: async () => intentId }),
+    loadCore: async () => ({
+      intentStatus: async (_ctx, id) => { seen.status++; return { http: 200, body: { status: "processing", quoteExpiresAt: null, price: null, id } }; },
+      createCheckoutIntent: async () => { seen.create++; throw new Error("no"); }, payIntent: async () => { seen.pay++; throw new Error("no"); },
+      submitDetails: async () => { seen.details++; throw new Error("no"); }, releaseIntent: async () => { seen.release++; throw new Error("no"); } }),
+    loadStripe: async () => { throw new Error("no SDK"); }, loadHostaway: async () => { throw new Error("no Hostaway"); }, log: () => {} } };
+}
+test("POST {step:'status'}: same projection as GET status through the same core; Origin / bearer / exact-body / gate / rate limits unchanged; no create/pay/details/release", async () => {
+  const j = { origin: ORIGIN, "content-type": "application/json" };
+  const tok = { authorization: `Bearer ${Buffer.alloc(32, 9).toString("base64url")}` };
+  const f = fakeStatusDeps();
+  const s = createIntentApiHandler({ route: "step", env: ENV, deps: f.deps });
+  const ok = await call(s, { headers: { ...j, ...tok }, body: '{"step":"status"}' });
+  assert.deepEqual([ok.statusCode, ok.body.status], [200, "processing"]);
+  assert.deepEqual([f.seen.status, f.seen.create, f.seen.pay, f.seen.details, f.seen.release], [1, 0, 0, 0, 0]);
+  assert.deepEqual(f.seen.hits, ["unattributed", "tok"], "the same shared + per-token limits as GET status");
+  const g = createIntentApiHandler({ route: "intents", env: ENV, deps: f.deps });
+  const viaGet = await call(g, { method: "GET", headers: { origin: ORIGIN, ...tok } });
+  assert.deepEqual(viaGet.body, ok.body, "identical projection");
+  // refusals before any dependency
+  const { spies, deps } = spyDeps();
+  const s2 = createIntentApiHandler({ route: "step", env: ENV, deps });
+  const off = createIntentApiHandler({ route: "step", env: { ...ENV, MV_CHECKOUT_TEST_API: "no" }, deps });
+  const cases = [
+    [s2, { headers: { "content-type": "application/json", ...tok }, body: '{"step":"status"}' }, 403, "ORIGIN_NOT_ALLOWED"],
+    [s2, { headers: { origin: "https://evil.example", "content-type": "application/json", ...tok }, body: '{"step":"status"}' }, 403, "ORIGIN_NOT_ALLOWED"],
+    [s2, { headers: j, body: '{"step":"status"}' }, 401, "UNAUTHORIZED"],
+    [s2, { headers: { ...j, authorization: "Bearer short" }, body: '{"step":"status"}' }, 401, "UNAUTHORIZED"],
+    [s2, { headers: { ...j, ...tok }, body: '{"step":"status","token":"x"}' }, 400, "UNKNOWN_FIELD"],
+    [s2, { headers: { ...j, ...tok }, body: '{"step":"status","intentId":"x"}' }, 400, "UNKNOWN_FIELD"],
+    [off, { headers: { ...j, ...tok }, body: '{"step":"status"}' }, 404, "NOT_FOUND"]
+  ];
+  for (const [hd, req, st, code] of cases) { const r = await call(hd, req); assert.deepEqual([r.statusCode, r.body && r.body.code], [st, code], JSON.stringify(req)); }
+  assert.deepEqual(spies, { pool: 0, core: 0, access: 0, sdk: 0, hostaway: 0 });
+  // GET without Origin is still refused (no relaxation)
+  const r = await call(g, { method: "GET", headers: { ...tok } });
+  assert.deepEqual([r.statusCode, r.body.code], [403, "ORIGIN_NOT_ALLOWED"]);
+  // rate limited -> 429, core not called
+  const lim = fakeStatusDeps({ allow: false });
+  const rl = await call(createIntentApiHandler({ route: "step", env: ENV, deps: lim.deps }), { headers: { ...j, ...tok }, body: '{"step":"status"}' });
+  assert.deepEqual([rl.statusCode, rl.body.code, lim.seen.status], [429, "RATE_LIMITED", 0]);
+});

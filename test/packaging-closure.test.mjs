@@ -124,7 +124,7 @@ test("only the E5a/E6 checkout modules import the booking DB layer; nothing in l
 test(".vercelignore and public/ containment are unchanged", () => {
   assert.equal(readFileSync(join(ROOT, ".vercelignore"), "utf8"),
     "# C8: never upload internal-only trees to Vercel (defence in depth; outputDirectory \"public\" already keeps\n# everything else out of static serving). NEVER list api/ or lib/: API functions bundle their lib/ imports.\n/db\n/test\n/scripts\n");
-  assert.deepEqual(readdirSync(join(ROOT, "public")), ["robots.txt"]);
+  assert.deepEqual(readdirSync(join(ROOT, "public")).sort(), ["checkout-test.css", "checkout-test.html", "checkout-test.js", "robots.txt"]);   // exact allowlist (E7 TEST page)
   assert.deepEqual(JSON.parse(readFileSync(join(ROOT, "vercel.json"), "utf8")), { outputDirectory: "public" });
 });
 

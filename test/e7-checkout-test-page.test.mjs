@@ -1,0 +1,214 @@
+// E7 checkout TEST page — public/checkout-test.js logic with FAKE API / storage / timers / navigation (UNIT MOCKS, no DOM, no network).
+// Browser-header and rendering evidence come from a separate loopback Chromium rehearsal (claude/e7-checkout-test-page.md), not from here.
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { createApi, createController, createStore, describe, validateCheckoutUrl, POLL, STORE_KEY, API } from "../public/checkout-test.js";
+
+const TOKEN = Buffer.alloc(32, 3).toString("base64url");
+const CFG = Object.freeze({ listingId: 606998, currency: "USD", termsVersion: "terms-2026-11" });
+const PRICE = { currency: "USD", totalMinor: 37500, lines: [{ label: "3 nights", amountMinor: 37500 }] };
+
+function memStorage() { const m = new Map(); return { m, getItem: (k) => (m.has(k) ? m.get(k) : null), setItem: (k, v) => { m.set(k, String(v)); }, removeItem: (k) => { m.delete(k); } }; }
+const brokenStorage = () => ({ getItem() { throw new Error("denied"); }, setItem() { throw new Error("denied"); }, removeItem() { throw new Error("denied"); } });
+function fakeTimers() {
+  const t = { now: 1_800_000_000_000, q: [], setTimeout(fn, ms) { const id = Symbol("t"); t.q.push({ id, fn, at: t.now + ms }); return id; },
+    clearTimeout(id) { t.q = t.q.filter((x) => x.id !== id); },
+    async tick() { const x = t.q.sort((a, b) => a.at - b.at).shift(); if (!x) return false; t.now = Math.max(t.now, x.at); await x.fn(); return true; } };
+  return t;
+}
+/** scripted fake API: each method shifts a reply from its queue (default reply otherwise) and records calls */
+function fakeApi(script = {}) {
+  const calls = []; const q = { create: [], details: [], pay: [], release: [], status: [], ...script };
+  const def = { create: { kind: "reply", http: 201, body: { token: TOKEN, status: "awaiting_details", price: PRICE } },
+    details: { kind: "reply", http: 200, body: { status: "awaiting_payment" } },
+    pay: { kind: "reply", http: 200, body: { status: "awaiting_payment", checkoutUrl: "https://checkout.stripe.com/c/pay/cs_test_x#frag" } },
+    release: { kind: "reply", http: 202, body: { status: "release_requested", release: "REQUESTED" } },
+    status: { kind: "reply", http: 200, body: { status: "processing", price: PRICE } } };
+  const m = (k) => async (...a) => { calls.push([k, ...a.map((x) => (typeof x === "string" && x === TOKEN ? "<token>" : x))]); return q[k].length ? q[k].shift() : def[k]; };
+  return { calls, q, count: (k) => calls.filter((c) => c[0] === k).length, api: { create: m("create"), details: m("details"), pay: m("pay"), release: m("release"), status: m("status") } };
+}
+function rig({ storage = memStorage(), search = "", api = fakeApi(), timers = fakeTimers(), cfg = CFG } = {}) {
+  const views = []; const nav = { assigned: [], stripped: 0, assign(u) { this.assigned.push(u); }, search: () => search, stripQuery() { this.stripped++; } };
+  const c = createController({ api: api.api, store: createStore(storage), ui: { render: (v) => views.push(v) }, timers, nav, config: cfg, now: () => timers.now });
+  return { c, views, nav, api, timers, storage, last: () => views[views.length - 1], get state() { return c.state; } };
+}
+const reply = (http, body) => ({ kind: "reply", http, body });
+
+test("redirect validation: only https://checkout.stripe.com (no port / credentials); everything else refused", () => {
+  assert.equal(validateCheckoutUrl("https://checkout.stripe.com/c/pay/cs_test_1"), "https://checkout.stripe.com/c/pay/cs_test_1");
+  for (const u of ["http://checkout.stripe.com/c", "https://checkout.stripe.com.evil.example/c", "https://evil.example/https://checkout.stripe.com", "https://user:pw@checkout.stripe.com/c",
+    "https://checkout.stripe.com:8443/c", "javascript:alert(1)", "//checkout.stripe.com/c", "https://stripe.com/c", "", null, 42, "https://checkout.stripe.com/" + "a".repeat(2100)]) {
+    assert.equal(validateCheckoutUrl(u), null, String(u).slice(0, 60));
+  }
+});
+
+test("status wording: authorization is a hold, never a booking; queued release != verified release; review and unexpected 'confirmed' are explicit", () => {
+  assert.match(describe("processing").title, /not a booking/);
+  assert.equal(describe("release_requested").kind, "releaseQueued"); assert.match(describe("release_requested").title, /not released yet/);
+  assert.equal(describe("unavailable_not_charged", { releaseRequested: true }).kind, "released");
+  assert.equal(describe("unavailable_not_charged").kind, "terminal");
+  assert.equal(describe("under_review").kind, "review");
+  assert.equal(describe("confirmed").kind, "unexpected"); assert.doesNotMatch(describe("confirmed").title, /confirmed/i);
+  for (const s of ["processing", "release_requested", "under_review", "awaiting_payment"]) assert.doesNotMatch(describe(s).text + describe(s).title, /booking (is )?confirmed|reservation (is )?confirmed/i);
+  assert.equal(describe("<img src=x>").kind, "unexpected");
+});
+
+test("storage: minimum state only (token + release flag + poll times), no guest data; refused storage is survivable and reported", () => {
+  const s = memStorage(); const st = createStore(s);
+  assert.equal(st.save({ token: TOKEN, releaseRequested: false, polls: [1, 2], guest: { email: "x@example.test" }, price: PRICE }), true);
+  assert.deepEqual(Object.keys(JSON.parse(s.m.get(STORE_KEY))).sort(), ["polls", "releaseRequested", "token"]);
+  s.setItem(STORE_KEY, JSON.stringify({ token: "not-a-token" })); assert.equal(st.load(), null);
+  s.setItem(STORE_KEY, "{bad"); assert.equal(st.load(), null);
+  const b = createStore(brokenStorage());
+  assert.deepEqual([b.load(), b.save({ token: TOKEN }), b.clear()], [null, false, false]);
+});
+
+test("API client: exact same-origin paths, POST only, token only in Authorization, no credentials / referrer / redirects; network failure = unknown", async () => {
+  const seen = [];
+  const api = createApi(async (path, init) => { seen.push({ path, ...init, signal: !!init.signal }); return { status: 200, json: async () => ({ status: "processing" }) }; });
+  await api.create({ listingId: 606998, from: "2027-01-10", to: "2027-01-13", guests: 2 }); await api.status(TOKEN); await api.release(TOKEN);
+  assert.deepEqual(seen.map((x) => x.path), [API.intents, API.step, API.step]);
+  assert.ok(seen.every((x) => x.method === "POST" && x.credentials === "omit" && x.referrerPolicy === "no-referrer" && x.redirect === "error" && x.mode === "same-origin" && x.cache === "no-store" && x.signal));
+  assert.equal(seen[0].headers.Authorization, undefined);
+  assert.equal(seen[1].headers.Authorization, `Bearer ${TOKEN}`);
+  assert.deepEqual(JSON.parse(seen[1].body), { step: "status" }); assert.deepEqual(JSON.parse(seen[2].body), { step: "release" });
+  assert.ok(!seen.some((x) => x.path.includes(TOKEN) || x.body.includes(TOKEN)), "token never in a URL or body");
+  const down = createApi(async () => { throw new Error("offline"); });
+  assert.deepEqual(await down.status(TOKEN), { kind: "unknown" });
+  const html = createApi(async () => ({ status: 502, json: async () => { throw new Error("html"); } }));
+  assert.equal((await html.pay(TOKEN)).kind, "unknown");
+});
+
+test("happy flow with Stripe return + reload: create -> details (configured terms) -> pay redirect (validated) -> return hint stripped -> bounded polling -> authorized -> release request -> queued -> verified", async () => {
+  const timers = fakeTimers(); const storage = memStorage();
+  const api = fakeApi({ status: [reply(200, { status: "awaiting_payment" }), reply(200, { status: "awaiting_payment" }), reply(200, { status: "processing", price: PRICE }),
+    reply(200, { status: "release_requested" }), reply(200, { status: "unavailable_not_charged" })] });
+  const a = rig({ storage, api, timers });
+  await a.c.init();
+  assert.equal(a.last().screen, "create");
+  await a.c.create({ from: "2027-01-10", to: "2027-01-13", guests: 2 });
+  assert.deepEqual(api.calls[0], ["create", { listingId: 606998, from: "2027-01-10", to: "2027-01-13", guests: 2 }], "listing from page config; server owns price");
+  assert.equal(a.last().screen, "details"); assert.equal(a.last().price.totalMinor, 37500);
+  await a.c.details({ firstName: "A", lastName: "B", email: "a@example.test", accepted: false });
+  assert.equal(api.count("details"), 0, "terms must be accepted explicitly");
+  await a.c.details({ firstName: "A", lastName: "B", email: "a@example.test", accepted: true });
+  assert.equal(api.calls[1][2].termsVersion, "terms-2026-11");
+  assert.ok(!JSON.stringify([...storage.m.values()]).includes("a@example.test"), "no guest data stored");
+  await a.c.pay();
+  assert.deepEqual(a.nav.assigned, ["https://checkout.stripe.com/c/pay/cs_test_x#frag"]);
+  // the browser leaves for Stripe and comes back to a fresh page load with the return hint
+  const b = rig({ storage, api, timers, search: "?checkout=complete" });
+  await b.c.init();
+  assert.equal(b.nav.stripped, 1, "the query hint is stripped from the URL");
+  assert.equal(b.state.notice.code, "RETURNED_COMPLETE");
+  assert.equal(b.last().screen, "pay", "the hint never counts as authorization");
+  assert.equal(b.state.polling, true);
+  await timers.tick(); assert.equal(b.last().screen, "pay");
+  await timers.tick(); assert.equal(b.last().screen, "authorized");
+  assert.equal(b.state.polling, false, "no polling while simply authorized");
+  assert.equal(api.count("create") + api.count("pay"), 2, "a reload never creates or pays again");
+  await b.c.release();
+  assert.equal(b.last().screen, "releaseQueued"); assert.match(b.last().title, /not released yet/);
+  await timers.tick(); assert.equal(b.last().screen, "releaseQueued");
+  await timers.tick(); assert.equal(b.last().screen, "released");
+  assert.equal(api.count("release"), 1);
+  assert.equal(b.state.polling, false);
+});
+
+test("automatic status reads: <= 24 per 10 minutes per tab+token ACROSS reloads; one request at a time; 429 stops polling; manual refresh still possible", async () => {
+  const timers = fakeTimers(); const storage = memStorage();
+  createStore(storage).save({ token: TOKEN, releaseRequested: true, polls: [] });
+  const api = fakeApi(); api.q.status = Array.from({ length: 200 }, () => reply(200, { status: "release_requested" }));
+  let autos = 0;
+  for (let reload = 0; reload < 6; reload++) {              // six reloads in the same tab within the window
+    const r = rig({ storage, api, timers, search: "" });
+    await r.c.init();
+    while (r.state.polling && await timers.tick());
+    autos = api.count("status");
+  }
+  assert.equal(autos, POLL.maxAuto, "budget is shared across reloads");
+  const r = rig({ storage, api, timers });
+  await r.c.init();
+  assert.equal(api.count("status"), POLL.maxAuto); assert.equal(r.state.stopped, "BUDGET");
+  await r.c.refresh(); assert.equal(api.count("status"), POLL.maxAuto + 1, "manual refresh is allowed");
+  // after the window passes, automatic reads resume
+  timers.now += POLL.windowMs + 1;
+  const r2 = rig({ storage, api, timers }); await r2.c.init(); assert.equal(api.count("status"), POLL.maxAuto + 2);
+  // 429 stops automatic reads at once
+  const t3 = fakeTimers(); const s3 = memStorage(); createStore(s3).save({ token: TOKEN, releaseRequested: true, polls: [] });
+  const a3 = fakeApi({ status: [reply(200, { status: "release_requested" }), reply(429, { code: "RATE_LIMITED" })] });
+  const r3 = rig({ storage: s3, api: a3, timers: t3 }); await r3.c.init(); await t3.tick();
+  assert.deepEqual([r3.state.stopped, r3.state.polling, a3.count("status"), t3.q.length], ["RATE_LIMITED", false, 2, 0]);
+  // concurrency cap 1: a click while a request is in flight is ignored
+  let release; const slow = fakeApi(); slow.api.status = async () => new Promise((res) => { release = res; });
+  const r4 = rig({ storage: s3, api: slow }); const p = r4.c.refresh(); await r4.c.release(); await r4.c.refresh();
+  assert.equal(slow.count("release"), 0); release(reply(200, { status: "processing" })); await p;
+  // storage that cannot persist the budget -> no automatic reads at all
+  const brokenApi = fakeApi(); const r5 = rig({ storage: brokenStorage(), api: brokenApi }); await r5.c.init();
+  assert.equal(brokenApi.count("status"), 0);
+});
+
+test("uncertain writes are never resent; create while a token exists is refused; refused storage disables payment; malicious redirect refused", async () => {
+  const u = fakeApi({ create: [{ kind: "unknown" }] }); const a = rig({ api: u });
+  await a.c.init(); await a.c.create({ from: "2027-01-10", to: "2027-01-13", guests: 2 });
+  assert.equal(a.state.notice.code, "CREATE_UNKNOWN"); assert.equal(u.count("create"), 1); assert.equal(a.state.st, null);
+  // release / pay / details unknown -> one call, then only an explicit refresh
+  for (const [k, code] of [["release", "RELEASE_UNKNOWN"], ["pay", "PAY_UNKNOWN"], ["details", "DETAILS_UNKNOWN"]]) {
+    const s = memStorage(); createStore(s).save({ token: TOKEN, releaseRequested: false, polls: [] });
+    const f = fakeApi({ [k]: [{ kind: "unknown" }] }); const r = rig({ storage: s, api: f, search: "" });
+    if (k === "details") await r.c.details({ firstName: "A", lastName: "B", email: "a@example.test", accepted: true }); else await r.c[k]();
+    const timers = r.timers; while (await timers.tick());
+    assert.deepEqual([r.state.notice.code, f.count(k), f.count("status")], [code, 1, 0], k);
+  }
+  // a second create while this tab already holds a token: nothing sent
+  const s2 = memStorage(); createStore(s2).save({ token: TOKEN, releaseRequested: false, polls: [] });
+  const f2 = fakeApi(); const r2 = rig({ storage: s2, api: f2 }); await r2.c.create({ from: "2027-01-10", to: "2027-01-13", guests: 2 }); assert.equal(f2.count("create"), 0);
+  // storage refused at create: reported; payment never requested
+  const f3 = fakeApi(); const r3 = rig({ storage: brokenStorage(), api: f3 }); await r3.c.init();
+  await r3.c.create({ from: "2027-01-10", to: "2027-01-13", guests: 2 }); assert.equal(r3.state.notice.code, "STORAGE_UNAVAILABLE");
+  await r3.c.pay(); assert.equal(f3.count("pay"), 0);
+  // malicious / foreign checkout URL from the server: never opened
+  for (const bad of ["https://evil.example/pay", "javascript:alert(1)", "http://checkout.stripe.com/x", null]) {
+    const s4 = memStorage(); createStore(s4).save({ token: TOKEN, releaseRequested: false, polls: [] });
+    const f4 = fakeApi({ pay: [reply(200, { status: "awaiting_payment", checkoutUrl: bad })] }); const r4 = rig({ storage: s4, api: f4 });
+    await r4.c.pay(); assert.deepEqual([r4.nav.assigned, r4.state.notice.code], [[], "CHECKOUT_URL_REFUSED"], String(bad));
+  }
+  // missing terms configuration: details never sent
+  const f5 = fakeApi(); const r5 = rig({ api: f5, cfg: { ...CFG, termsVersion: "" } }); await r5.c.create({ from: "2027-01-10", to: "2027-01-13", guests: 2 });
+  await r5.c.details({ firstName: "A", lastName: "B", email: "a@example.test", accepted: true }); assert.deepEqual([f5.count("details"), r5.state.notice.code], [0, "TERMS_NOT_CONFIGURED"]);
+});
+
+test("server failures are honest: release flag off, 503, 401 lost token, under_review, unknown status text; server codes are sanitized", async () => {
+  const mk = (script) => { const s = memStorage(); createStore(s).save({ token: TOKEN, releaseRequested: false, polls: [] }); const f = fakeApi(script); return { s, f, r: rig({ storage: s, api: f }) }; };
+  let x = mk({ release: [reply(400, { code: "UNKNOWN_STEP" })] }); await x.r.c.release(); assert.equal(x.r.state.notice.code, "RELEASE_NOT_ENABLED");
+  x = mk({ release: [reply(503, { code: "UNAVAILABLE" })] }); await x.r.c.release(); assert.equal(x.r.state.notice.code, "UNAVAILABLE"); assert.equal(x.f.count("release"), 1);
+  x = mk({ release: [reply(409, { code: "<script>alert(1)</script>" })] }); await x.r.c.release(); assert.equal(x.r.state.notice.code, "UNEXPECTED_REPLY");
+  x = mk({ status: [reply(401, { code: "UNAUTHORIZED" })] }); await x.r.c.init(); assert.deepEqual([x.r.last().screen, x.r.state.notice.code], ["lost", "UNAUTHORIZED"]);
+  x = mk({ status: [reply(200, { status: "under_review" })] }); await x.r.c.init(); assert.equal(x.r.last().screen, "review"); assert.equal(x.r.state.polling, false);
+  x = mk({ status: [reply(200, { status: "confirmed" })] }); await x.r.c.init(); assert.equal(x.r.last().screen, "unexpected");
+  x = mk({ status: [reply(200, { status: "expired" })] }); await x.r.c.init(); assert.equal(x.r.last().screen, "terminal");
+  x = mk({ status: [reply(503, { code: "NOT_READY" })] }); await x.r.c.init(); assert.deepEqual([x.r.state.stopped, x.r.state.notice.code], ["ERROR", "NOT_READY"]);
+  // cancelled return hint: displayed as a hint, status still read from the server
+  const s = memStorage(); createStore(s).save({ token: TOKEN, releaseRequested: false, polls: [] });
+  const f = fakeApi({ status: [reply(200, { status: "awaiting_payment" })] }); const r = rig({ storage: s, api: f, search: "?checkout=cancelled" }); await r.c.init();
+  assert.deepEqual([r.state.notice.code, r.last().screen, f.count("status")], ["RETURNED_CANCELLED", "pay", 1]);
+  // an unrecognized query is stripped and ignored
+  const r2 = rig({ storage: s, api: fakeApi(), search: "?token=leak" }); await r2.c.init(); assert.equal(r2.nav.stripped, 1); assert.notEqual(r2.state.notice && r2.state.notice.code, "RETURNED_COMPLETE");
+});
+
+test("page source pins: same-origin only, no third-party resource, no storage outside sessionStorage, no console / innerHTML / eval; CSP + no-referrer + noindex; TEST labels", () => {
+  const js = readFileSync(new URL("../public/checkout-test.js", import.meta.url), "utf8");
+  const html = readFileSync(new URL("../public/checkout-test.html", import.meta.url), "utf8");
+  const css = readFileSync(new URL("../public/checkout-test.css", import.meta.url), "utf8");
+  for (const re of [/localStorage/, /console\./, /innerHTML|outerHTML|insertAdjacentHTML|document\.write/, /\beval\(|new Function/, /\bimport\s*\(/, /^import /m,
+    /https?:\/\/(?!checkout\.stripe\.com)[a-z]/i, /stripe\.js|js\.stripe\.com|hostaway/i]) assert.doesNotMatch(js.replace(/^\/\/.*$/gm, ""), re, String(re));
+  assert.doesNotMatch(html, /https?:\/\//, "no absolute resource in the page");
+  assert.doesNotMatch(css, /url\(|@import|https?:/);
+  assert.match(html, /Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'"/);
+  assert.match(html, /<meta name="referrer" content="no-referrer">/); assert.match(html, /noindex/);
+  assert.match(html, /<meta name="mv-test-terms-version" content="">/, "terms version is a documented deployment input, never invented");
+  assert.match(html, /TEST ONLY/); assert.match(html, /No reservation is created/);
+  assert.match(html, /data-listing-id="606998" data-currency="USD"/);
+  assert.doesNotMatch(html, /type="(password|card)"|cardnumber|cc-number|cvc/i, "no payment fields on our page");
+});

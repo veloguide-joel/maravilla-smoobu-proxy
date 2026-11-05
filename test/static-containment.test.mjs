@@ -13,8 +13,8 @@ test("vercel.json serves static files only from public/", () => {
   assert.equal(cfg.outputDirectory, "public");
 });
 
-test("public/ holds only the robots.txt that disallows crawling", () => {
-  assert.deepEqual(readdirSync(join(ROOT, "public")), ["robots.txt"]);
+test("public/ holds exactly the robots.txt that disallows crawling and the three TEST checkout page assets", () => {
+  assert.deepEqual(readdirSync(join(ROOT, "public")).sort(), ["checkout-test.css", "checkout-test.html", "checkout-test.js", "robots.txt"]);
   assert.match(readFileSync(join(ROOT, "public", "robots.txt"), "utf8"), /^User-agent: \*\nDisallow: \/\n$/);
 });
 

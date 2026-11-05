@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<!-- SETUP (deployment input, not invented here): set content to the server's MV_CHECKOUT_TERMS_VERSION. Empty = details step disabled. -->
+<meta name="mv-test-terms-version" content="">
+<title>maraVilla TEST checkout</title>
+<link rel="stylesheet" href="checkout-test.css">
+<script type="module" src="checkout-test.js"></script>
+</head>
+<body>
+<header class="banner" role="note">
+  <strong>TEST ONLY.</strong> Stripe TEST mode. No reservation is created and no real card is charged. Use a Stripe TEST card on Stripe's page.
+</header>
+<main id="mv-test-app" data-listing-id="606998" data-currency="USD">
+  <h1>maraVilla direct booking — TEST checkout</h1>
+  <p id="mv-listing" class="muted"></p>
+  <h2 id="mv-title">Loading…</h2>
+  <p id="mv-text"></p>
+  <p id="mv-notice" class="notice" hidden></p>
+  <ul id="mv-price" class="price"></ul>
+
+  <form id="mv-create" hidden>
+    <label>Arrival <input type="date" name="from" required></label>
+    <label>Departure <input type="date" name="to" required></label>
+    <label>Guests <input type="number" name="guests" min="1" max="20" value="2" required></label>
+    <button type="submit">Get server price</button>
+  </form>
+
+  <form id="mv-details" hidden>
+    <label>First name <input name="firstName" autocomplete="given-name" required></label>
+    <label>Last name <input name="lastName" autocomplete="family-name" required></label>
+    <label>Email <input type="email" name="email" autocomplete="email" required></label>
+    <label>Phone (optional) <input type="tel" name="phone" autocomplete="tel"></label>
+    <label class="check"><input type="checkbox" id="mv-terms"> <span id="mv-terms-label"></span></label>
+    <button type="submit" id="mv-details-submit">Save details</button>
+  </form>
+
+  <div id="mv-pay" hidden>
+    <button type="button" id="mv-pay-btn">Continue to Stripe TEST Checkout</button>
+  </div>
+
+  <div id="mv-release" hidden>
+    <button type="button" id="mv-release-btn">Request release of the TEST hold</button>
+  </div>
+
+  <p id="mv-polling" class="muted"></p>
+  <p class="actions">
+    <button type="button" id="mv-refresh" hidden>Refresh status</button>
+    <button type="button" id="mv-restart" class="secondary" hidden>Forget this TEST booking in this tab</button>
+  </p>
+</main>
+</body>
+</html>

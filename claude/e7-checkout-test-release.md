@@ -16,7 +16,7 @@ Branch `feature/e7-checkout-test-release` from accepted `d1e20d71`. This slice h
 - **`repo.requestTestRelease(pool, intentId, { now })`** builds the event from the DATABASE intent; no client value is used.
   - It calls `applyEvent` with the flag set for this one call. Its `inTx` runs after the intent row is version-locked and re-reads, in the established lock order:
     1. `booking.instance`, which must be `test`;
-    2. `intent_work` `FOR SHARE`: no acquired lease, live or stale;
+    2. `intent_work` `FOR SHARE`: no lease currently recorded (a non-null lease, live or expired). The refusal reflects the CURRENT acquired-lease state; it is not evidence that a lease was ever taken;
     3. `payment_attempts` `FOR SHARE`: nothing unresolved, and exactly one `completed` attempt bound to the intent's session;
     4. `external_operations` `FOR SHARE`: only the settled Checkout create and settled Stripe reads; exactly one new pending void queued;
     5. `hostaway_reservation_attempts`: none.
@@ -52,3 +52,9 @@ Running the worker against a real deployment needs a separate approved package.
 3. **A different PaymentIntent on a closed intent** only queues a void plus review (`reconciliation_required`). The compensation worker does not process that state, so the second payment is not voided automatically.
 4. **No sweeper and no guest page.** A hold the guest never releases stays until Stripe expires it. The `guest.notify` row stays queued, because no notification transport exists.
 5. **The TEST marker check** inside the transaction is code-path only. The disposable cluster is always `test`, and changing the marker would weaken a fixture.
+
+## Status pointer
+
+- The guest TEST page slice (`claude/e7-checkout-test-page.md`, branch `feature/e7-checkout-test-page` from `98883e3b`) adds `public/checkout-test.{html,js,css}`.
+- It also adds a POST `{step:"status"}` alias of GET status. Browsers send no Origin on a same-origin GET, and the Origin rule is not relaxed.
+- The release code in this note is unchanged.
