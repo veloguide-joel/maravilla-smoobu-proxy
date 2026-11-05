@@ -18,7 +18,7 @@ Branch `feature/e7-checkout-test-page` from accepted `98883e3b`. This slice has 
 2. **Details.** The guest must tick an explicit acceptance of the configured terms version.
 3. **Pay.** The pay step returns a `checkoutUrl`. The page opens it only if it is `https:` on exactly `checkout.stripe.com`, with no port and no credentials. Stripe collects the TEST card; our page has no payment fields.
 4. **Return.** `?checkout=complete|cancelled` is shown as a hint only, stripped with `history.replaceState`, and never used as evidence.
-5. **Status.** The page asks the server through POST `{step:"status"}`. `processing` is shown as "TEST authorization held — not a booking".
+5. **Status.** The page asks the server through POST `{step:"status"}`. `processing` is shown NEUTRALLY as "Processing — not a booking": a hold may exist, but this coarse status cannot show capture or release (R-UI2). `payment_authorized`, `reservation_pending` and `capture_unknown` all map to it.
 6. **Release.** "Request release" (one click) gives `release_requested`, shown as "Release requested — not released yet". Only a later `unavailable_not_charged`, in a tab that asked for a release, is shown as "Release verified". That still requires the separately approved, scoped owner cleanup worker.
 7. **Other states.** `under_review` means owner review. `confirmed` is flagged as unexpected and never shown as a booking. `expired`, `payment_failed` and unknown statuses are each stated honestly.
 
@@ -69,3 +69,26 @@ Each layer was tested separately; they are listed by what they actually prove.
 - `unavailable_not_charged` is shared by `authorization_released` and a non-TEST `reservation_failed`. The page calls it "Release verified" only when this tab requested a release.
 - Lost storage, or another tab, cannot resume a booking. The same token in two tabs has separate polling budgets, but the shared server-side rate limit still applies.
 - `confirm()` is used for "Forget this TEST booking in this tab". It only forgets locally; nothing is cancelled or released.
+
+## Root HOLD corrections on db9ef550 (R-UI1 / R-UI2)
+
+- **R-UI1 uncertainty latch.**
+  - **What counts as uncertain.** No reply, a timeout, an unreadable reply, HTTP 5xx or 408 on create, details, pay or release. That latches the action. Its typed name is kept per tab in session state (`uncertain`, with no guest or provider data); in memory only if storage is refused.
+  - **What the latch blocks.** The ordinary button stays disabled in both the controller and the DOM, and repeat clicks and reloads send nothing.
+  - **How each latch clears.** Refresh status is always a read. A latch clears only when a status proves the action resolved:
+    - details: once the status is no longer `awaiting_details`;
+    - pay: once the status is neither `awaiting_payment` nor `awaiting_details`. `awaiting_payment` proves nothing about an unknown pay;
+    - release: once the status is no longer `processing`.
+  - **Explicit resend.** If a fresh status shows the step is still allowed, an EXPLICIT resend button appears for details or release. Release repeats are server-idempotent. Pay never gets a resend.
+  - **Unknown create.** Without a bearer, the page shows an explicit "a TEST intent may already exist" acknowledgement in place of the Create button, including after a reload.
+  - **Wording.** Definite 4xx refusals say "definite refusal"; uncertainty says "unknown whether … took effect".
+- **R-UI2.**
+  - Neutral `processing` wording.
+  - Action and hint notices are tied to the status they were issued for, and any newer authoritative status clears them. "Release verified" and owner review never show the stale "queued, not done" notice.
+- **Tests on exact db9ef550 (red first).**
+  - **Red:** 5 new tests failed, 9 passed. Among the failures, the second details call was sent, and the stale notice and processing wording were confirmed.
+  - **Fix:** 4 existing assertions changed to match. The `*_UNKNOWN` codes are now `*_UNCERTAIN`; the stored keys now include `uncertain`; a release 503 is now uncertain, not a refusal.
+  - **Green:** 14/14. One of my new wording assertions was too broad: it matched "uncaptured" inside a negated phrase, so I reworded the page text.
+- **Loopback browser regression (fake core, intercepted Stripe).**
+  - **Pay answered 503:** the button stays disabled. Forced clicks and `element.click()` ×2 sent no second pay; after a reload it was still disabled, stored `uncertain: "pay"`, and pay count was 1.
+  - **Main flow:** neutral processing title; the "Release verified" screen has no notice.

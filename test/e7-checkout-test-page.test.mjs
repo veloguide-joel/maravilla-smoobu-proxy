@@ -57,7 +57,7 @@ test("status wording: authorization is a hold, never a booking; queued release !
 test("storage: minimum state only (token + release flag + poll times), no guest data; refused storage is survivable and reported", () => {
   const s = memStorage(); const st = createStore(s);
   assert.equal(st.save({ token: TOKEN, releaseRequested: false, polls: [1, 2], guest: { email: "x@example.test" }, price: PRICE }), true);
-  assert.deepEqual(Object.keys(JSON.parse(s.m.get(STORE_KEY))).sort(), ["polls", "releaseRequested", "token"]);
+  assert.deepEqual(Object.keys(JSON.parse(s.m.get(STORE_KEY))).sort(), ["polls", "releaseRequested", "token", "uncertain"]);
   s.setItem(STORE_KEY, JSON.stringify({ token: "not-a-token" })); assert.equal(st.load(), null);
   s.setItem(STORE_KEY, "{bad"); assert.equal(st.load(), null);
   const b = createStore(brokenStorage());
@@ -152,9 +152,9 @@ test("automatic status reads: <= 24 per 10 minutes per tab+token ACROSS reloads;
 test("uncertain writes are never resent; create while a token exists is refused; refused storage disables payment; malicious redirect refused", async () => {
   const u = fakeApi({ create: [{ kind: "unknown" }] }); const a = rig({ api: u });
   await a.c.init(); await a.c.create({ from: "2027-01-10", to: "2027-01-13", guests: 2 });
-  assert.equal(a.state.notice.code, "CREATE_UNKNOWN"); assert.equal(u.count("create"), 1); assert.equal(a.state.st, null);
+  assert.equal(a.state.notice.code, "CREATE_UNCERTAIN"); assert.equal(u.count("create"), 1); assert.deepEqual([a.state.st.token, a.state.st.uncertain], [null, "create"]);
   // release / pay / details unknown -> one call, then only an explicit refresh
-  for (const [k, code] of [["release", "RELEASE_UNKNOWN"], ["pay", "PAY_UNKNOWN"], ["details", "DETAILS_UNKNOWN"]]) {
+  for (const [k, code] of [["release", "RELEASE_UNCERTAIN"], ["pay", "PAY_UNCERTAIN"], ["details", "DETAILS_UNCERTAIN"]]) {
     const s = memStorage(); createStore(s).save({ token: TOKEN, releaseRequested: false, polls: [] });
     const f = fakeApi({ [k]: [{ kind: "unknown" }] }); const r = rig({ storage: s, api: f, search: "" });
     if (k === "details") await r.c.details({ firstName: "A", lastName: "B", email: "a@example.test", accepted: true }); else await r.c[k]();
@@ -182,7 +182,7 @@ test("uncertain writes are never resent; create while a token exists is refused;
 test("server failures are honest: release flag off, 503, 401 lost token, under_review, unknown status text; server codes are sanitized", async () => {
   const mk = (script) => { const s = memStorage(); createStore(s).save({ token: TOKEN, releaseRequested: false, polls: [] }); const f = fakeApi(script); return { s, f, r: rig({ storage: s, api: f }) }; };
   let x = mk({ release: [reply(400, { code: "UNKNOWN_STEP" })] }); await x.r.c.release(); assert.equal(x.r.state.notice.code, "RELEASE_NOT_ENABLED");
-  x = mk({ release: [reply(503, { code: "UNAVAILABLE" })] }); await x.r.c.release(); assert.equal(x.r.state.notice.code, "UNAVAILABLE"); assert.equal(x.f.count("release"), 1);
+  x = mk({ release: [reply(503, { code: "UNAVAILABLE" })] }); await x.r.c.release(); assert.equal(x.r.state.notice.code, "RELEASE_UNCERTAIN", "5xx after a write is uncertain, not a refusal"); assert.equal(x.f.count("release"), 1);
   x = mk({ release: [reply(409, { code: "<script>alert(1)</script>" })] }); await x.r.c.release(); assert.equal(x.r.state.notice.code, "UNEXPECTED_REPLY");
   x = mk({ status: [reply(401, { code: "UNAUTHORIZED" })] }); await x.r.c.init(); assert.deepEqual([x.r.last().screen, x.r.state.notice.code], ["lost", "UNAUTHORIZED"]);
   x = mk({ status: [reply(200, { status: "under_review" })] }); await x.r.c.init(); assert.equal(x.r.last().screen, "review"); assert.equal(x.r.state.polling, false);
@@ -211,4 +211,107 @@ test("page source pins: same-origin only, no third-party resource, no storage ou
   assert.match(html, /TEST ONLY/); assert.match(html, /No reservation is created/);
   assert.match(html, /data-listing-id="606998" data-currency="USD"/);
   assert.doesNotMatch(html, /type="(password|card)"|cardnumber|cc-number|cvc/i, "no payment fields on our page");
+});
+
+// ---------- root HOLD corrections (R-UI1 uncertainty latch, R-UI2 neutral processing + stale notices) ----------
+import { createIntent, transition, publicStatus } from "../lib/checkout/intent-state.js";   // pure, dependency-free
+const seeded = (o = {}) => { const s = memStorage(); createStore(s).save({ token: TOKEN, releaseRequested: false, polls: [], ...o }); return s; };
+
+test("R-UI1 pay: an uncertain pay (network / invalid reply / 5xx) latches; repeat clicks and reload never resend; awaiting_payment does not clear it; a resolved status does", async () => {
+  for (const unk of [{ kind: "unknown" }, { kind: "unknown", http: 502 }, reply(500, { code: "UNAVAILABLE" }), reply(503, { code: "PAYMENT_UNAVAILABLE" })]) {
+    const s = seeded();
+    const f = fakeApi({ pay: [unk], status: [reply(200, { status: "awaiting_payment" }), reply(200, { status: "awaiting_payment" }), reply(200, { status: "processing" })] });
+    const a = rig({ storage: s, api: f });
+    await a.c.pay();
+    assert.equal(a.state.notice.code, "PAY_UNCERTAIN", JSON.stringify(unk));
+    assert.equal(a.last().latch, "pay"); assert.equal(a.last().canPay, false, "the DOM keeps Pay disabled");
+    await a.c.pay(); await a.c.pay();
+    assert.equal(f.count("pay"), 1, "repeat clicks send nothing");
+    const b = rig({ storage: s, api: f }); await b.c.init();                 // reload: latch persisted, awaiting_payment proves nothing
+    assert.equal(b.last().latch, "pay"); await b.c.pay(); assert.equal(f.count("pay"), 1);
+    await b.c.refresh(); assert.equal(b.last().latch, "pay");
+    await b.c.refresh(); assert.deepEqual([b.last().latch, b.last().screen], [null, "authorized"], "processing resolves the pay latch");
+  }
+  // a definite refusal stays a refusal (no latch)
+  const f = fakeApi({ pay: [reply(409, { code: "SESSION_NOT_REUSABLE" })] }); const r = rig({ storage: seeded(), api: f });
+  await r.c.pay(); assert.deepEqual([r.state.notice.code, r.last().latch], ["SESSION_NOT_REUSABLE", null]);
+});
+
+test("R-UI1 create: unknown create (no bearer) needs an explicit acknowledgement reset, also after reload; ordinary Create stays blocked", async () => {
+  for (const unk of [{ kind: "unknown" }, reply(503, { code: "UNAVAILABLE" })]) {
+    const s = memStorage(); const f = fakeApi({ create: [unk] });
+    const a = rig({ storage: s, api: f }); await a.c.init();
+    await a.c.create({ from: "2027-01-10", to: "2027-01-13", guests: 2 });
+    assert.deepEqual([a.last().screen, a.last().latch, a.state.notice.code], ["createUncertain", "create", "CREATE_UNCERTAIN"]);
+    await a.c.create({ from: "2027-01-10", to: "2027-01-13", guests: 2 }); assert.equal(f.count("create"), 1);
+    const b = rig({ storage: s, api: f }); await b.c.init();
+    assert.equal(b.last().screen, "createUncertain"); assert.equal(f.count("status"), 0, "no bearer: nothing to read");
+    await b.c.create({ from: "2027-01-10", to: "2027-01-13", guests: 2 }); assert.equal(f.count("create"), 1);
+    b.c.acknowledgeUncertainCreate();
+    assert.equal(b.last().screen, "create");
+    await b.c.create({ from: "2027-01-10", to: "2027-01-13", guests: 2 }); assert.equal(f.count("create"), 2, "only after the explicit acknowledgement");
+  }
+});
+
+test("R-UI1 details / release: uncertain -> latched; status proving resolution clears it; still-unresolved state offers only an EXPLICIT resend (release repeat is server-idempotent)", async () => {
+  const s = seeded();
+  const f = fakeApi({ details: [{ kind: "unknown" }], status: [reply(200, { status: "awaiting_details" }), reply(200, { status: "awaiting_payment" })] });
+  const a = rig({ storage: s, api: f });
+  const d = { firstName: "A", lastName: "B", email: "a@example.test", accepted: true };
+  await a.c.details(d); await a.c.details(d); assert.equal(f.count("details"), 1);
+  assert.equal(a.last().latch, "details"); assert.equal(a.last().retry, null, "no resend offered before a status read");
+  await a.c.refresh(); assert.deepEqual([a.last().latch, a.last().retry], ["details", "details"]);
+  await a.c.details(d); assert.equal(f.count("details"), 1, "the ordinary button stays blocked");
+  await a.c.retryUncertain(d); assert.equal(f.count("details"), 2, "explicit resend");
+  await a.c.refresh(); assert.equal(a.last().latch, null);
+  // release
+  const s2 = seeded();
+  const g = fakeApi({ release: [reply(500, { code: "UNAVAILABLE" })], status: [reply(200, { status: "processing" }), reply(200, { status: "release_requested" })] });
+  const b = rig({ storage: s2, api: g });
+  await b.c.release(); await b.c.release(); assert.equal(g.count("release"), 1); assert.equal(b.state.notice.code, "RELEASE_UNCERTAIN");
+  const b2 = rig({ storage: s2, api: g }); await b2.c.init();              // reload: latch kept, status processing -> explicit resend allowed
+  assert.deepEqual([b2.last().latch, b2.last().retry], ["release", "release"]);
+  await b2.c.release(); assert.equal(g.count("release"), 1);
+  await b2.c.retryUncertain(); assert.equal(g.count("release"), 2);
+  assert.equal(b2.last().latch, null); assert.equal(b2.last().screen, "releaseQueued");
+  // storage refused: the latch still holds in memory
+  const h = fakeApi({ pay: [{ kind: "unknown" }] }); const r = rig({ storage: brokenStorage(), api: h });
+  await r.c.create({ from: "2027-01-10", to: "2027-01-13", guests: 2 }); await r.c.pay(); await r.c.pay();
+  assert.equal(h.count("pay"), 0, "payment never starts without storage");
+});
+
+test("R-UI2: 'processing' is coarse (payment_authorized, reservation_pending, capture_unknown all map to it) -> neutral wording, no authorization / uncaptured / booking claim; release request stays available", () => {
+  const T0 = Date.UTC(2026, 9, 21, 15); const M = 60000;
+  const PR = { listingId: 603566, from: "2026-12-20", to: "2026-12-24", guests: 2, nights: 4, currency: "MXN", standardTotalMinor: 640000, eligibleMinor: 640000, discountMinor: 64000,
+    finalTotalMinor: 576000, policyVersion: "direct-v1", rateBps: 1000, lines: [], charge: { currency: "mxn", amountMinor: 576000, quantity: 1 }, quoteHash: "a".repeat(64) };
+  let i = createIntent({ id: "int_1", ref: "MV-7K3Q9P", listingId: 603566, from: "2026-12-20", to: "2026-12-24", guests: 2, now: T0 });
+  const go = (ev, m) => { const r = transition(i, ev, { now: T0 + m * M }); assert.equal(r.ok, true, `${ev.type}: ${r.error}`); i = r.intent; return i; };
+  go({ type: "PRICE_CONFIRMED", price: PR }, 0); go({ type: "DETAILS_COLLECTED" }, 1); go({ type: "CHECKOUT_PREPARED", sessionId: "cs_test_1" }, 2);
+  const authorized = go({ type: "PAYMENT_AUTHORIZED", id: "e1", paymentIntentId: "pi_1", sessionId: "cs_test_1", amountMinor: 576000, currency: "mxn", livemode: false,
+    authorizationCreatedAt: T0 + 4 * M, captureBefore: T0 + 4 * M + 7 * 24 * 60 * M }, 5);
+  const pending = go({ type: "RESERVATION_STARTED", workerId: "w1", recheck: { bookable: true, priceSame: true } }, 6);
+  go({ type: "RESERVATION_DISPATCHED", workerId: "w1" }, 6);
+  go({ type: "RESERVATION_SUCCEEDED", reservation: { reservationId: 9001, listingId: 603566, from: "2026-12-20", to: "2026-12-24", totalMinor: 576000, currency: "MXN" } }, 7);
+  const captureUnknown = go({ type: "CAPTURE_OUTCOME_UNKNOWN" }, 8);
+  assert.deepEqual([authorized.status, pending.status, captureUnknown.status], ["payment_authorized", "reservation_pending", "capture_unknown"]);
+  assert.deepEqual([publicStatus(authorized), publicStatus(pending), publicStatus(captureUnknown)], ["processing", "processing", "processing"], "one coarse public status");
+  const d = describe("processing");
+  assert.doesNotMatch(d.title + d.text, /reports a card authorization|not a charge|authorization held|uncaptured|booking (is )?confirmed/i);
+  assert.match(d.text, /may/); assert.match(d.title, /not a booking/i);
+  assert.equal(d.kind, "authorized", "the guarded release request remains available (the server refuses wrong states)");
+});
+
+test("R-UI2: a newer authoritative status clears stale action notices (queued / returned / uncertain); verified or review never shows 'queued, not done'", async () => {
+  const s = seeded({ releaseRequested: false });
+  const f = fakeApi({ status: [reply(200, { status: "processing" }), reply(200, { status: "release_requested" }), reply(200, { status: "unavailable_not_charged" })] });
+  const t = fakeTimers(); const a = rig({ storage: s, api: f, timers: t, search: "?checkout=complete" });
+  await a.c.init(); assert.equal(a.state.notice.code, "RETURNED_COMPLETE");
+  await a.c.release(); assert.equal(a.state.notice.code, "RELEASE_REQUESTED");
+  await t.tick(); assert.equal(a.last().screen, "releaseQueued"); assert.equal(a.state.notice && a.state.notice.code, "RELEASE_REQUESTED");
+  await t.tick(); assert.equal(a.last().screen, "released");
+  assert.equal(a.state.notice, null, "no stale 'queued, not done' notice next to 'Release verified'");
+  const s2 = seeded({ releaseRequested: true });
+  const g = fakeApi({ release: [{ kind: "unknown" }], status: [reply(200, { status: "under_review" })] });
+  const b = rig({ storage: s2, api: g }); await b.c.release(); assert.equal(b.state.notice.code, "RELEASE_UNCERTAIN");
+  await b.c.refresh(); assert.equal(b.last().screen, "review"); assert.equal(b.state.notice, null); assert.equal(b.last().latch, null);
 });
