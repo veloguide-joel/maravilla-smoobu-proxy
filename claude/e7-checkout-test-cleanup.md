@@ -7,7 +7,7 @@ Branch `feature/e7-checkout-test-cleanup-runner`, from verified main `2090b3cc1c
 | file | role |
 |---|---|
 | `scripts/e7-checkout-test-cleanup.mjs` | runner. Inert on import. `inspect` (read-only precheck), `runCleanupCore` (injected), `runHosted` (preflight / verify / execute) |
-| `test/e7-checkout-test-cleanup.test.mjs` | 13 fake tests (always) + 4 opt-in DB tests (`E7_CLEANUP_DB_TESTS=1`: the real worker on disposable PG 17) |
+| `test/e7-checkout-test-cleanup.test.mjs` | 20 fake tests (always) + 5 opt-in DB tests (`E7_CLEANUP_DB_TESTS=1`: the real worker on disposable PG 17) |
 | `.github/workflows/e7-checkout-test-cleanup.yml` | **DRAFT**, manual only; execute is main-only, environment `e7-readonly-probe` |
 | `claude/e7-checkout-test-cleanup.md` | this note |
 
@@ -54,7 +54,18 @@ Branch `feature/e7-checkout-test-cleanup-runner`, from verified main `2090b3cc1c
   - ≤ 1 `paymentIntents.cancel` for the whole run, and only with the worker's provider key.
   - ≤ 4 account reads, ≤ 8 PaymentIntent reads (expand latest_charge), ≤ 13 exchanges.
   - Exact URLs, methods and header sets; anything else is refused before X.
-- **Run.** ≤ 8 worker steps, all for the named intent (`intentId` scope), a 6-minute deadline, and waits capped at 35 s.
+- **Run.** ≤ 8 worker steps, all for the named intent (`intentId` scope), waits capped at 35 s, and a 6-minute **admission** deadline.
+  - After the deadline, no new step, query, sleep or provider operation is admitted.
+  - In-flight provider calls receive the remaining time through a composed native signal.
+  - It is NOT a settlement guarantee: an awaited DB call inside the accepted worker is bounded only by the worker's own timeouts and the role's `statement_timeout`. The workflow `timeout-minutes` is a backstop, not a precise bound.
+- **Stop latch (R-C1).**
+  - The FIRST operator abort or admission deadline observed is latched and never cleared.
+  - It is re-checked at the executor boundary (before the accepted adapter inspects a request), at the runner's Stripe send (after the adapter's validation, so also immediately before a cancel), and at the exchange gate (the last point before bytes leave).
+  - Provider calls get `AbortSignal.any([worker signal, run signal, remaining-time signal])`, so the worker's own signal is preserved.
+  - A refusal before the cancel's exchange is a stop, not cancellation uncertainty (`cancelOutcome NONE`).
+  - A cancel already exchanged keeps an uncertain outcome (`UNKNOWN`) and is never resent; an abort racing an in-flight cancel's reply is UNKNOWN by design.
+  - Once latched: no new step, sleep, query, provider operation, post-step reload or post-check, and never `RELEASED` (outcome `ABORTED` / `DEADLINE`, or `CANCEL_OUTCOME_UNKNOWN`; code `STOP_<reason>`).
+  - Work the accepted worker already started (its own DB bookkeeping) is not retracted, and an in-flight write is not claimed to be cancelled instantly.
 - **Hostaway executors** are the accepted adapters with a send that throws before any transport; reaching it stops the run.
 - **STOP outcomes**, with no retry, rerun or new key:
   - `CANCEL_OUTCOME_UNKNOWN`: a cancel exchange that failed, timed out or got 5xx; the worker reporting `VOID_OUTCOME_UNKNOWN`; or a worker / DB / reload error after a cancel;
@@ -79,7 +90,19 @@ Branch `feature/e7-checkout-test-cleanup-runner`, from verified main `2090b3cc1c
 - **Regressions:**
   - main `test/*.test.mjs` (evidence / auth / probe, parity dir set): 46/46;
   - tooling at 6d703acd: release + e74a compensation + e74b-d1 release: 30/30.
-- **Local preflight** (clean env, no secrets): `PREFLIGHT_OK_SYNTHETIC_ONLY`, 13/13 fake. runnerDigest `7020a60b7619fb3964811539b491833fcfd4e858f2a0ddea96794e6ef6ad8db9`.
+- **Root HOLD R-C1 (on `a522bfc6`).**
+  - **RED on exact a522:** 7 new tests (R1–R7) fail while the 13 existing tests pass (20 tests: 13 pass / 7 fail).
+  - **Fix, first full TAP 17/20.** The 3 failures were test expectations:
+    - with the abort composed into the in-flight call, T discards a racing account reply, and a racing cancel reply is UNKNOWN;
+    - the R4 getter approach never ran (the adapter never runs getters), so R4 now injects the abort between the adapter's validation and the runner's send;
+    - a wrong `refusedByStop` count.
+  - Then 19/20 (a deadline-vs-abort difference in R2), then 20/20.
+  - **DB section:** 25/25 on its first run after the fake fixes. The new D5 (real worker): an abort in the account reply leaves zero cancels, and the void row is still `pending`, attempts 0.
+- **Diagnostic correction.** `inspect` no longer maps a throwing `loadIntent` to `INTENT_NOT_FOUND`: `null` = absence (SCOPE_REFUSED), and a throw = `DB_ERROR` / `PRECHECK_QUERY_FAILED` with no later query or provider call (R7).
+- **Regressions after R-C1:**
+  - main `test/*.test.mjs` 46/46;
+  - tooling release + e74a + e74b-d1: 44/44 (3 files; the earlier "30/30" covered 2 of them).
+- **Local preflight** (clean env, no secrets): `PREFLIGHT_OK_SYNTHETIC_ONLY`, 20/20 fake. runnerDigest **`eb3fc63c68b4dcf9e6a4ee7ca6992c98ee238fb50f610af66489bc5f6b2a6c62`** (supersedes `7020a60b…`).
 
 ## Limits and open points for review
 

@@ -11,7 +11,10 @@
 //     payment authorized -> TEST_RELEASE_REQUESTED (-> VOID_SUCCEEDED) qualifies; ordinary booking compensation, capture_failed,
 //     reconciliation, any Hostaway attempt / reservation / dispatch, any capture or alert is refused before any provider call.
 //   * Provider budget at the transport boundary: <= 1 cancelPaymentIntent invocation for the WHOLE run (0 unless the void row is pristine),
-//     <= 4 account reads, <= 8 PaymentIntent reads, <= 8 worker steps, one run deadline. Hostaway executors fail BEFORE any transport.
+//     <= 4 account reads, <= 8 PaymentIntent reads, <= 8 worker steps, one ADMISSION deadline (no new step / query / provider operation
+//     after it; in-flight provider calls get the remaining time via a composed native signal). Hostaway executors fail BEFORE any transport.
+//   * Stop latch: the FIRST operator abort / deadline observed is latched and re-checked at every executor, send and exchange boundary
+//     (immediately before a cancel too); after it: no new step, sleep, query, provider operation, reload or success claim.
 //   * STOP on: refusal, escalation, uncertain cancel, DB error, scope drift, budget, deadline, cancellation. No retry / rerun / new key.
 //   * Output: whitelisted codes / counts / states / flags only; never a key, URL, raw provider body, guest data or DB error text.
 import process from "node:process";
@@ -103,16 +106,17 @@ const ALLOWED_OPS = freeze(["stripe.create_checkout_session", "stripe.retrieve_c
 const ALLOWED_LEDGER = freeze(["authorization_accepted", "authorization_voided"]);
 
 /**
- * inspect(pool, plan, tooling) → { ok:false, code } | { ok:true, terminal, cancelBudget, intent }
- *   tooling = { loadIntent, voidKey, testReleaseEventId }
+ * inspect(pool, plan, tooling, guard?) → { ok:false, code } | { ok:true, terminal, cancelBudget, intent }; THROWS on any DB failure
+ *   tooling = { loadIntent, voidKey, testReleaseEventId }; guard() throws once a stop is latched (no further query starts)
  */
-export async function inspect(pool, plan, tooling) {
-  const one = async (sql, args = [plan.intentId]) => (await pool.query(sql, args)).rows;
+export async function inspect(pool, plan, tooling, guard = () => {}) {
+  const one = async (sql, args = [plan.intentId]) => { guard(); return (await pool.query(sql, args)).rows; };
   const inst = await one(Q.instance, []);
   if (inst.length !== 1 || inst[0].environment !== plan.dbEnvironment) return { ok: false, code: "DB_NOT_TEST" };
-  let intent;
-  try { intent = await tooling.loadIntent(pool, plan.intentId); } catch { return { ok: false, code: "INTENT_NOT_FOUND" }; }
-  if (!intent || intent.id !== plan.intentId) return { ok: false, code: "INTENT_NOT_FOUND" };
+  guard();
+  const intent = await tooling.loadIntent(pool, plan.intentId);      // null = acknowledged absence; a THROW is a DB failure (propagates → DB_ERROR)
+  if (intent === null || intent === undefined) return { ok: false, code: "INTENT_NOT_FOUND" };
+  if (intent.id !== plan.intentId) return { ok: false, code: "INTENT_NOT_FOUND" };
   if (intent.listingId !== plan.listingId || !intent.price || intent.price.currency !== plan.currency) return { ok: false, code: "LISTING_SCOPE" };
   const p = intent.payment;
   if (!p || p.paymentIntentId !== plan.paymentIntentId) return { ok: false, code: "PAYMENT_INTENT_SCOPE" };
@@ -173,9 +177,24 @@ export async function inspect(pool, plan, tooling) {
 export async function runCleanupCore(input) {
   const c = CONSTANTS; const B = c.budgets;
   const r = { schema: RESULT_SCHEMA, outcome: null, code: null, startState: null, finalState: null, steps: 0, actions: [], exchanges: 0,
-    accountReads: 0, piReads: 0, cancelInvocations: 0, cancelOutcome: "NONE", refusedAtTransport: 0, hostawayCalls: 0, voidOpState: null, claimReleased: null,
-    stripeVersion: c.stripeVersion, writes: { capture: 0, refund: 0, create: 0, hostaway: 0, notify: 0 } };
+    accountReads: 0, piReads: 0, cancelInvocations: 0, cancelOutcome: "NONE", refusedAtTransport: 0, refusedByStop: 0, hostawayCalls: 0, voidOpState: null, claimReleased: null,
+    stopReason: null, stripeVersion: c.stripeVersion, writes: { capture: 0, refund: 0, create: 0, hostaway: 0, notify: 0 } };
   const done = (outcome, code = null) => { r.outcome = outcome; r.code = code; return freeze(JSON.parse(JSON.stringify(r))); };
+  // ---- the stop latch: the FIRST observed reason (operator abort / admission deadline) wins and is never cleared -------------------------
+  let stopReason = null;
+  const stopped = () => {
+    if (stopReason === null) {
+      if (runSignalRef && runSignalRef.aborted) stopReason = "ABORTED";
+      else if (monoRef && monoRef() >= endsAtRef) stopReason = "DEADLINE";
+      if (stopReason !== null) r.stopReason = stopReason;
+    }
+    return stopReason;
+  };
+  class Stopped extends Error { constructor() { super("stopped"); } }
+  const guard = () => { if (stopped()) throw new Stopped(); };
+  // a latched stop decides the outcome: an exchanged cancel with no reply stays UNKNOWN; nothing becomes RELEASED after a stop
+  const stopOutcome = () => done(r.cancelOutcome === "UNKNOWN" ? "CANCEL_OUTCOME_UNKNOWN" : stopReason, `STOP_${stopReason}`);
+  let runSignalRef = null; let monoRef = null; let endsAtRef = Infinity;
   try {
     const { plan, pool, tooling, exchange, credential } = input ?? {};
     if (!plan || plan.schema !== PLAN_SCHEMA || plan.accountId !== c.accountId || plan.listingId !== c.listingId || plan.stripeVersion !== c.stripeVersion
@@ -184,24 +203,27 @@ export async function runCleanupCore(input) {
     const clock = input.clock ?? (() => Date.now());
     const mono = input.monotonic ?? (() => performance.now());
     const runSignal = input.runSignal ?? null;
-    const endsAt = mono() + B.runMs;
+    const endsAt = mono() + B.runMs;                          // ADMISSION deadline: no new step / query / provider operation once passed
+    runSignalRef = runSignal; monoRef = mono; endsAtRef = endsAt;
     const sleep = input.sleep ?? ((ms) => new Promise((res) => { const t = setTimeout(res, ms); runSignal?.addEventListener?.("abort", () => { clearTimeout(t); res(); }, { once: true }); }));
-    const aborted = () => !!(runSignal && runSignal.aborted);
     const PI = plan.paymentIntentId;
+    if (stopped()) return stopOutcome();
 
     // ---- (1) read-only precheck: persisted lineage / bindings / zero captured money / no Hostaway / exact void row / eligible state ----------
     let pre;
-    try { pre = await inspect(pool, plan, tooling); } catch { return done("DB_ERROR", "PRECHECK_QUERY_FAILED"); }
+    try { pre = await inspect(pool, plan, tooling, guard); }
+    catch (e) { return e instanceof Stopped ? stopOutcome() : done("DB_ERROR", "PRECHECK_QUERY_FAILED"); }
     if (!pre.ok) return done(["START_STATE_NOT_ELIGIBLE", "TERMINAL_INCONSISTENT"].includes(pre.code) ? "START_STATE_NOT_ELIGIBLE" : "SCOPE_REFUSED", pre.code);
     r.startState = pre.intent.status;
     if (pre.terminal) { r.finalState = pre.intent.status; r.voidOpState = "succeeded"; r.claimReleased = true; return done("ALREADY_RELEASED"); }
-    if (aborted()) return done("ABORTED", "BEFORE_PROVIDER");
+    if (stopped()) return stopOutcome();
     const voidIdem = tooling.voidKey(plan.intentId, PI);
 
-    // ---- (2) the ONE transport boundary: exact Stripe requests only, counted before they leave ---------------------------------------
+    // ---- (2) the ONE transport boundary: exact Stripe requests only, counted before they leave; the stop is re-checked at EVERY layer --------
     const allowedUrls = { account: `${STRIPE}/v1/account`, pi: `${STRIPE}/v1/payment_intents/${PI}?expand%5B%5D=latest_charge`, cancel: `${STRIPE}/v1/payment_intents/${PI}/cancel` };
     let cancelExchangeOpen = false; let cancelExchanged = false; let secondCancel = false;
     const gate = (req) => {
+      if (stopped()) { r.refusedByStop += 1; return Promise.reject(new Error("stopped")); }      // the last check before bytes leave
       const isGet = req && req.method === "GET" && req.body === null && req.headers && Object.keys(req.headers).sort().join(",") === "Authorization,Stripe-Version";
       const isCancel = req && req.method === "POST" && req.url === allowedUrls.cancel && req.body === "" && req.headers && req.headers["Idempotency-Key"] === voidIdem
         && Object.keys(req.headers).sort().join(",") === "Authorization,Content-Type,Idempotency-Key,Stripe-Version";
@@ -215,51 +237,74 @@ export async function runCleanupCore(input) {
     };
     const t = tooling.createStripeSend({ exchange: gate, credential, accountId: c.accountId, apiVersion: c.stripeVersion });
     if (!t || t.ok !== true) return done("CORE_INVALID", "TRANSPORT_INVALID");
+    /** the worker's own signal, composed with the run abort and the remaining admission time (real native signals; worker signal preserved) */
+    const composed = (sig) => {
+      const parts = [];
+      if (sig instanceof AbortSignal) parts.push(sig);
+      if (runSignal instanceof AbortSignal) parts.push(runSignal);
+      parts.push(AbortSignal.timeout(Math.max(1, Math.floor(endsAt - mono()))));
+      return AbortSignal.any(parts);
+    };
     let cancelBudget = pre.cancelBudget;
     const stripeSend = async (call, opts) => {
+      if (stopped()) { r.refusedByStop += 1; throw new Error("stopped"); }                        // after the adapter's validation, before T
+      const o = { ...(opts && typeof opts === "object" ? opts : {}), signal: composed(opts && opts.signal) };
       if (call && call.op === "paymentIntents.cancel") {
         if (cancelBudget < 1 || r.cancelInvocations >= B.cancel) { r.refusedAtTransport += 1; secondCancel = true; throw new Error("cancel budget"); }
         cancelBudget -= 1; r.cancelInvocations += 1; cancelExchangeOpen = true;
-        try { const out = await t.transport.send(call, opts); r.cancelOutcome = "REPLIED"; return out; }
-        catch (e) { r.cancelOutcome = cancelExchanged ? "UNKNOWN" : "NOT_SENT"; throw e; }   // any failure after the bytes may have left = UNKNOWN
+        try { const out = await t.transport.send(call, o); r.cancelOutcome = "REPLIED"; return out; }
+        catch (e) { r.cancelOutcome = cancelExchanged ? "UNKNOWN" : "NOT_SENT"; throw e; }   // bytes may have left = UNKNOWN; refused before = NOT_SENT
         finally { cancelExchangeOpen = false; }
       }
-      return t.transport.send(call, opts);
+      return t.transport.send(call, o);
     };
     const hostawaySend = async () => { r.hostawayCalls += 1; throw new Error("hostaway refused before transport"); };
     const bx = tooling.createPhaseExecutors({ phase: "cleanup", binding: { listingId: plan.listingId, arrivalDate: pre.intent.from, departureDate: pre.intent.to,
       ref: pre.intent.ref, reservationId: null, accountId: c.accountId, paymentIntentId: PI, voidIdempotencyKey: voidIdem }, hostaway: { send: hostawaySend }, stripe: { send: stripeSend } });
     if (!bx || bx.ok !== true) return done("SCOPE_REFUSED", "EXECUTOR_BINDING_REFUSED");
+    // executor boundary: a latched stop refuses BEFORE the adapter even inspects the worker's request
+    const executors = {};
+    for (const k of Object.keys(bx.executors)) {
+      const fn = bx.executors[k];
+      executors[k] = async (...args) => { if (stopped()) { r.refusedByStop += 1; throw new Error("stopped"); } return Reflect.apply(fn, undefined, args); };
+    }
+    freeze(executors);
     const adapterConfig = tooling.validateAdapterConfig({ allowedListingIds: [plan.listingId], refFieldId: c.refFieldId, channelId: 2000, currency: c.currency });
     const listings = new Map([[plan.listingId, { currency: c.currency, timeZone: c.listingTimeZone }]]);
     const env = { VERCEL_ENV: "development", MV_E7_COMPENSATION_WORKER: "enabled" };   // the worker's own gate labels (no process env is read)
 
     // ---- (3) bounded worker steps for the ONE named intent --------------------------------------------------------------------------
     for (;;) {
-      if (aborted()) return done("ABORTED", "BETWEEN_STEPS");
-      if (mono() >= endsAt) return done("DEADLINE");
+      if (stopped()) return stopOutcome();
       if (r.steps >= B.steps) return done("BUDGET_EXHAUSTED", "STEPS");
       r.steps += 1;
       let res;
       try {
-        res = await tooling.runCleanupStep(pool, { workerId: `e7-test-cleanup:${r.steps}`, env, adapterConfig, listings, executors: bx.executors, clock,
+        res = await tooling.runCleanupStep(pool, { workerId: `e7-test-cleanup:${r.steps}`, env, adapterConfig, listings, executors, clock,
           stripeAccountId: c.accountId, intentId: plan.intentId, timeouts: input.workerTimeouts });
-      } catch { return done(r.cancelInvocations ? "CANCEL_OUTCOME_UNKNOWN" : "DB_ERROR", "WORKER_THREW"); }
+      } catch {
+        if (stopped()) return stopOutcome();
+        return done(r.cancelInvocations ? "CANCEL_OUTCOME_UNKNOWN" : "DB_ERROR", "WORKER_THREW");
+      }
       for (const a of (res && Array.isArray(res.actions) ? res.actions : [])) r.actions.push(typeof a === "string" && CODE_RE.test(a) ? a : "REDACTED");
       if (r.actions.length > 64) r.actions = r.actions.slice(0, 64);
-      let now;
-      try { now = await tooling.loadIntent(pool, plan.intentId); } catch { return done(r.cancelInvocations ? "CANCEL_OUTCOME_UNKNOWN" : "DB_ERROR", "RELOAD_FAILED"); }
-      r.finalState = now.status;
+      if (stopped()) return stopOutcome();                  // no reload, no success claim after a stop (the worker's own bookkeeping is its own)
       if (secondCancel) return done("SECOND_CANCEL_REFUSED");
       if (r.cancelOutcome === "UNKNOWN") return done("CANCEL_OUTCOME_UNKNOWN");
       if (r.cancelOutcome === "NOT_SENT") return done("CANCEL_NOT_SENT");
       if (r.hostawayCalls > 0) return done("SCOPE_REFUSED", "HOSTAWAY_EXECUTOR_REACHED");
+      let now;
+      try { guard(); now = await tooling.loadIntent(pool, plan.intentId); }
+      catch (e) { if (e instanceof Stopped) return stopOutcome(); return done(r.cancelInvocations ? "CANCEL_OUTCOME_UNKNOWN" : "DB_ERROR", "RELOAD_FAILED"); }
+      if (!now) return done(r.cancelInvocations ? "CANCEL_OUTCOME_UNKNOWN" : "DB_ERROR", "RELOAD_FAILED");
+      r.finalState = now.status;
       if (!res || res.status === "refused") return done("WORKER_REFUSED", res && CODE_RE.test(String(res.code)) ? res.code : null);
       if (r.actions.some((a) => a.startsWith("VOID_OUTCOME_UNKNOWN") || a.startsWith("RECOVERY:VOID_OUTCOME_UNKNOWN"))) return done("CANCEL_OUTCOME_UNKNOWN", "WORKER_VOID_OUTCOME_UNKNOWN");
       if (r.actions.some((a) => a.startsWith("ESCALATE") || a.startsWith("RECOVERY:ESCALATE") || a.startsWith("SEND_ABORTED"))) return done("ESCALATED");
       if (now.status === "authorization_released") {
         let ops, cl;
-        try { ops = (await pool.query(Q.ops, [plan.intentId])).rows; cl = (await pool.query(Q.claims, [plan.intentId])).rows; } catch { return done("DB_ERROR", "POSTCHECK_FAILED"); }
+        try { guard(); ops = (await pool.query(Q.ops, [plan.intentId])).rows; guard(); cl = (await pool.query(Q.claims, [plan.intentId])).rows; }
+        catch (e) { return e instanceof Stopped ? stopOutcome() : done("DB_ERROR", "POSTCHECK_FAILED"); }
         const v = ops.filter((o) => o.op_type === "stripe.void_payment_intent");
         r.voidOpState = v.length === 1 ? v[0].state : "UNEXPECTED";
         r.claimReleased = cl.length === 1 && cl[0].released === true;
@@ -268,10 +313,12 @@ export async function runCleanupCore(input) {
       if (now.status !== "reservation_failed") return done("NOT_RELEASED", "STATE_MOVED");
       if (r.steps >= B.steps) return done("BUDGET_EXHAUSTED", "STEPS");                      // never sleep after the last allowed step
       const wait = Math.min(Number.isFinite(res.delayMs) && res.delayMs >= 0 ? res.delayMs : B.waitCapMs, B.waitCapMs);
-      if (mono() + wait >= endsAt) return done("DEADLINE");
+      if (mono() + wait >= endsAt) { stopped(); stopReason = stopReason ?? "DEADLINE"; r.stopReason = stopReason; return stopOutcome(); }
+      if (stopped()) return stopOutcome();
       if (wait > 0) await sleep(wait);
     }
   } catch {
+    if (stopReason) return stopOutcome();
     return done(r.cancelInvocations ? "CANCEL_OUTCOME_UNKNOWN" : "CORE_INVALID");
   }
 }

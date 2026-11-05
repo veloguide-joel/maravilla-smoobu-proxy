@@ -189,8 +189,8 @@ test("F3. wrong scope / binding / lineage / marker: refused BEFORE any provider 
     assert.deepEqual([res.outcome, res.code, res.exchanges, w.count()], ["SCOPE_REFUSED", code, 0, 0], code);
   }
   // an intent that is not found under the plan's id (e.g. a foreign id) and a DB read error
-  const s = fakeState(); const nf = await run({ state: s, tooling: { ...fakeTooling(s, fakeWorker(s)), loadIntent: async () => { throw new Error(CANARY); } } });
-  assert.deepEqual([nf.res.outcome, nf.res.code, nf.res.exchanges], ["SCOPE_REFUSED", "INTENT_NOT_FOUND", 0]);
+  const s = fakeState(); const nf = await run({ state: s, tooling: { ...fakeTooling(s, fakeWorker(s)), loadIntent: async () => null } });
+  assert.deepEqual([nf.res.outcome, nf.res.code, nf.res.exchanges], ["SCOPE_REFUSED", "INTENT_NOT_FOUND", 0], "acknowledged absence (null) only");
   const er = await run({ poolOpts: { failOn: "ops" } });
   assert.deepEqual([er.res.outcome, er.res.code, er.res.exchanges], ["DB_ERROR", "PRECHECK_QUERY_FAILED", 0]);
   // a void row that already left (dispatched / unknown / attempted) is NEVER re-sent by this runner
@@ -315,6 +315,103 @@ test("F9. plan: fixed ceiling; hash stable and sensitive to label / intent / Pay
   for (const over of [{ listingId: 603566 }, { accountId: "acct_OtherFake1" }, { stripeVersion: "2026-08-26.dahlia" }, { budgets: { ...C.budgets, cancel: 2 } }, { dbEnvironment: "live" }]) {
     assert.throws(() => E.buildPlan({ ...C, ...over }, { approvalRef: "x-label", intentId: IID, paymentIntentId: PI, runnerDigest: "0".repeat(64) }), { code: "CLN_INPUT_INVALID" });
   }
+});
+
+// ---- R-C1: the stop latch (operator abort / admission deadline) at every executor / send / exchange boundary ---------------------------
+const ok200 = (o) => Promise.resolve({ status: 200, contentType: "application/json", bytes: enc(o) });
+const ACCOUNT_OK = { object: "account", id: ACCT };
+const piReq = piObj("requires_capture");
+/** a step like the accepted worker's: it catches executor failures itself and returns a WAIT (so the runner, not the worker, must stop) */
+const catchingWorker = (s, calls) => fakeWorker(s, { step: async (n, o) => {
+  const sg = () => ({ signal: AbortSignal.timeout(2000) });
+  try { await o.executors.retrieveAccount(sg()); calls.push("account"); await o.executors.retrievePaymentIntent(PI, { expand: ["latest_charge"] }, sg()); calls.push("pi");
+    await o.executors.cancelPaymentIntent(PI, {}, { idempotencyKey: VOID_KEY, ...sg() }); calls.push("cancel");
+    await o.executors.retrievePaymentIntent(PI, { expand: ["latest_charge"] }, sg()); calls.push("pi2"); released(s);
+    return { status: "worked", actions: ["VOID_SUCCEEDED->authorization_released"], delayMs: 0 };
+  } catch { calls.push("refused"); return { status: "worked", actions: ["WAIT:EXECUTOR_FAILED"], delayMs: 30000 }; } } });
+
+test("R1. stop BEFORE the first provider call: an abort observed during the precheck stops the next query; zero exchanges", async () => {
+  const ac = new AbortController(); const s = fakeState(); const pool = fakePool(s);
+  const q0 = pool.query; let n = 0; pool.query = async (...a) => { n += 1; if (n === 2) ac.abort(); return q0(...a); };
+  const { res, ops, w } = await run({ state: s, pool, runSignal: ac.signal });
+  assert.deepEqual([res.outcome, res.code, res.stopReason, ops.length, w.count(), n], ["ABORTED", "STOP_ABORTED", "ABORTED", 0, 0, 2], "no query after the stop is observed");
+});
+
+test("R2. abort / deadline observed in the ACCOUNT reply: no PI read, no cancel; the run stops (no reload, no sleep, no second step)", async () => {
+  for (const kind of ["abort", "deadline"]) {
+    const ac = new AbortController(); let t = 0; const s = fakeState(); const calls = [];
+    const w = catchingWorker(s, calls); const pool = fakePool(s);
+    const out = await run({ state: s, worker: w, pool, runSignal: ac.signal, monotonic: () => t,
+      stripeScript: { account: () => { if (kind === "abort") ac.abort(); else t = C.budgets.runMs + 1; return ok200(ACCOUNT_OK); } } });
+    const want = kind === "abort" ? "ABORTED" : "DEADLINE";
+    assert.deepEqual([out.res.outcome, out.res.stopReason, out.ops, out.res.cancelInvocations, out.res.cancelOutcome, w.count(), out.slept], [want, want, ["account"], 0, "NONE", 1, 0], kind);
+    // abort: the run signal is composed into the in-flight account call, so T discards that reply too (the step's FIRST call fails);
+    // deadline (injected monotonic, not wall time): the account reply is accepted, the NEXT executor call is refused by the latch
+    assert.deepEqual(calls, kind === "abort" ? ["refused"] : ["account", "refused"]);
+    assert.deepEqual([pool.queries.filter((x) => x === "ops").length, pool.queries.filter((x) => x === "claims").length], [1, 1], "only the precheck's own reads; no post-step query");
+  }
+});
+
+test("R3. abort / deadline observed in the PI reply (after PI, before cancel): ZERO cancel invocations, never on the wire", async () => {
+  for (const kind of ["abort", "deadline"]) {
+    const ac = new AbortController(); let t = 0; const s = fakeState(); const calls = [];
+    const out = await run({ state: s, worker: catchingWorker(s, calls), runSignal: ac.signal, monotonic: () => t,
+      stripeScript: { pi: () => { if (kind === "abort") ac.abort(); else t = C.budgets.runMs + 1; return ok200(piReq); } } });
+    assert.deepEqual([out.res.outcome, out.ops, out.res.cancelInvocations, out.res.cancelOutcome, out.slept], [kind === "abort" ? "ABORTED" : "DEADLINE", ["account", "pi"], 0, "NONE", 0], kind);
+  }
+});
+
+test("R4. abort while the cancel request is being validated (after the accepted adapter passed it, before the runner's send): refused before the exchange, not uncertainty", async () => {
+  const ac = new AbortController(); const s = fakeState();
+  const w = fakeWorker(s, { step: async (n, o) => {
+    await o.executors.retrieveAccount({ signal: AbortSignal.timeout(2000) });
+    await o.executors.retrievePaymentIntent(PI, { expand: ["latest_charge"] }, { signal: AbortSignal.timeout(2000) });
+    try { await o.executors.cancelPaymentIntent(PI, {}, { idempotencyKey: VOID_KEY, signal: AbortSignal.timeout(2000) }); } catch { /* refused */ }
+    return { status: "worked", actions: ["WAIT:X"], delayMs: 30000 }; } });
+  // the abort lands exactly between the adapter's request validation and the runner's stripe send
+  const tl = { ...fakeTooling(s, w), createPhaseExecutors: (opts) => EA.createPhaseExecutors({ ...opts,
+    stripe: { send: (call, x) => { if (call.op === "paymentIntents.cancel") ac.abort(); return opts.stripe.send(call, x); } } }) };
+  const out = await run({ state: s, worker: w, tooling: tl, runSignal: ac.signal });
+  assert.deepEqual([out.res.outcome, out.ops, out.res.cancelOutcome, out.slept, w.count()], ["ABORTED", ["account", "pi"], "NONE", 0, 1]);
+  assert.ok(out.res.cancelInvocations === 0, "a refusal before the cancel exchange is not a cancellation attempt");
+});
+
+test("R5. abort with the cancel ALREADY exchanged: the outcome is UNKNOWN (never resent, no confirm read, never success), whether the abort lands with the reply or while it hangs", async () => {
+  const ac = new AbortController(); const s = fakeState(); const calls = [];
+  const a = await run({ state: s, worker: catchingWorker(s, calls), runSignal: ac.signal,
+    stripeScript: { cancel: () => { ac.abort(); return ok200(piObj("canceled")); } } });
+  // the abort is composed into the in-flight cancel, so T does not accept the racing reply: the outcome stays UNKNOWN (truthful, never re-sent)
+  assert.deepEqual([a.res.outcome, a.res.code, a.ops, a.res.cancelInvocations, a.res.cancelOutcome, a.slept], ["CANCEL_OUTCOME_UNKNOWN", "STOP_ABORTED", ["account", "pi", "cancel"], 1, "UNKNOWN", 0]);
+  assert.notEqual(a.res.outcome, "RELEASED", "a stop never becomes success");
+  const ac2 = new AbortController(); const s2 = fakeState();
+  const hang = (req) => { setTimeout(() => ac2.abort(), 5); return new Promise((_, rej) => req.signal.addEventListener("abort", () => rej(new Error("aborted")), { once: true })); };
+  const w2 = fakeWorker(s2, { step: async (n, o) => {
+    await o.executors.retrieveAccount({ signal: AbortSignal.timeout(2000) });
+    try { await o.executors.cancelPaymentIntent(PI, {}, { idempotencyKey: VOID_KEY, signal: AbortSignal.timeout(60000) }); } catch { /* aborted in flight */ }
+    return { status: "worked", actions: ["VOID:UNKNOWN"], delayMs: 0 }; } });
+  const t0 = Date.now();
+  const b = await run({ state: s2, worker: w2, runSignal: ac2.signal, stripeScript: { cancel: hang } });
+  assert.ok(Date.now() - t0 < 5000, "the composed run signal reaches the in-flight request (the worker's own 60 s signal is still honoured too)");
+  assert.deepEqual([b.res.outcome, b.res.cancelInvocations, b.res.cancelOutcome, b.ops.filter((x) => x === "cancel").length], ["CANCEL_OUTCOME_UNKNOWN", 1, "UNKNOWN", 1]);
+});
+
+test("R6. an injected worker that returns success AFTER a stop is NOT reported as RELEASED; no reload / post-check query", async () => {
+  const ac = new AbortController(); const s = fakeState(); const pool = fakePool(s);
+  const w = fakeWorker(s, { step: async (n, o) => { await o.executors.retrieveAccount({ signal: AbortSignal.timeout(2000) }); ac.abort(); released(s);
+    return { status: "worked", actions: ["VOID_SUCCEEDED->authorization_released"], delayMs: 0 }; } });
+  const loads = []; const tl = { ...fakeTooling(s, w), loadIntent: async (...a) => { loads.push(1); return fakeTooling(s, w).loadIntent(...a); } };
+  const out = await run({ state: s, worker: w, pool, tooling: tl, runSignal: ac.signal });
+  assert.deepEqual([out.res.outcome, out.res.finalState, loads.length], ["ABORTED", null, 1], "only the precheck load; no post-step reload");
+});
+
+test("R7. DB failure vs absence: a THROWING loadIntent is DB_ERROR (code only, no later query / provider call); null stays INTENT_NOT_FOUND", async () => {
+  const s = fakeState(); const pool = fakePool(s);
+  const t1 = { ...fakeTooling(s, fakeWorker(s)), loadIntent: async () => { throw new Error(`${CANARY} connection reset`); } };
+  const a = await run({ state: s, pool, tooling: t1 });
+  assert.deepEqual([a.res.outcome, a.res.code, a.res.exchanges, pool.queries], ["DB_ERROR", "PRECHECK_QUERY_FAILED", 0, ["instance"]]);
+  const s2 = fakeState(); const pool2 = fakePool(s2);
+  const b = await run({ state: s2, pool: pool2, tooling: { ...fakeTooling(s2, fakeWorker(s2)), loadIntent: async () => null } });
+  assert.deepEqual([b.res.outcome, b.res.code, b.res.exchanges, pool2.queries], ["SCOPE_REFUSED", "INTENT_NOT_FOUND", 0, ["instance"]]);
 });
 
 // ---- hosted wiring --------------------------------------------------------------------------------------------------------------------
@@ -564,6 +661,16 @@ if (process.env.E7_CLEANUP_DB_TESTS === "1") {
       assert.ok(["START_STATE_NOT_ELIGIBLE", "SCOPE_REFUSED"].includes(again.outcome), JSON.stringify(again));
       assert.equal((await claimRow(b.id)).released_at, null);
     }
+  });
+
+  test("D5. REAL worker: an abort observed in the account reply → ZERO cancel on the wire; the run stops without a success claim", async () => {
+    const b = await releasedBooking(); const ac = new AbortController();
+    const ex = (req) => { if (req.url === "https://api.stripe.com/v1/account") { const p = b.w.exchange(req); ac.abort(); return p; } return b.w.exchange(req); };
+    const r = await E.runCleanupCore({ plan: plan(b), pool: db.app, tooling: realTooling, exchange: ex, credential: () => KEY, clock: () => NOW0 + 8 * MIN, sleep: async () => {}, runSignal: ac.signal });
+    assert.deepEqual([r.outcome, r.cancelInvocations, b.w.wire.filter((x) => x === "cancel").length, r.steps], ["ABORTED", 0, 0, 1], JSON.stringify(r));
+    assert.equal((await claimRow(b.id)).released_at, null);
+    const v = await voidRow(b.id);
+    console.log(`# D5 void row after the stop: ${v.state} attempts ${v.attempts}`);
   });
 
   test("D4. wrong scope on a real row: a foreign PaymentIntent and a foreign intent id are refused with zero exchanges", async () => {
