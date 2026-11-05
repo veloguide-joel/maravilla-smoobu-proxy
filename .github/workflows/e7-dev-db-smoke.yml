@@ -1,0 +1,122 @@
+# DRAFT — E7 DEV read-only DB smoke with the DEV runtime login (doc: claude/e7-dev-db-smoke.md).
+# MANUAL dispatch only; default mode `preflight` = no secret, no DB, no network call by the wrapper, no dependency install (fake tests + digests).
+# `execute` = the ACCEPTED scripts/db-smoke.mjs at 6d703acd, UNCHANGED, read-only (never --write-probe / --loopback-rehearsal), ONCE, against
+# the TEST DEV database — NOT AUTHORIZED until the exact package is approved. Inputs / labels / hashes are NOT consent. No retry.
+# Secret (environment `e7-readonly-probe`, required reviewers, final step only): E7_DEV_BOOKING_DATABASE_URL (DEV runtime login; owner-entered).
+# No Stripe / Hostaway secret, no owner credential, no migration, no deploy.
+name: e7-dev-db-smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "preflight (default: no secret, no DB, no install) or execute (ONE read-only smoke; NOT AUTHORIZED without explicit approval of the exact package)"
+        type: choice
+        options: [preflight, execute]
+        default: preflight
+      approval_ref:
+        description: "Approval label (non-secret; a label, never consent). Empty = labelled SYNTHETIC preflight only."
+        type: string
+        required: false
+        default: ""
+      expected_plan_hash:
+        description: "execute only: exact 64-hex planHash from a REAL-plan preflight (no default)"
+        type: string
+        required: false
+        default: ""
+      expected_closure_digest:
+        description: "execute only: exact closureDigest 45b512b0498d82c329e9c05edde165e242a9910fbeac533644cf926f890af5ca of the accepted 6d703acd smoke closure (no default)"
+        type: string
+        required: false
+        default: ""
+      expected_runner_digest:
+        description: "execute only: exact 64-hex runnerDigest of the REVIEWED wrapper / workflow / test bytes (no default)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e7-dev-db-smoke
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    if: inputs.mode == 'preflight'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout wrapper (this repository, dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout accepted tooling (fixed commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: 6d703acdcfa205138d1ce4ba65b2ec58fc9493c9
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Preflight (no secret, no DB, no install; NOT connectivity evidence)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_APPROVAL_REF: ${{ inputs.approval_ref }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+        run: node wrapper/scripts/e7-dev-db-smoke.mjs preflight
+
+  execute:
+    if: inputs.mode == 'execute' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: e7-readonly-probe
+    timeout-minutes: 10
+    steps:
+      - name: Checkout wrapper (this repository, dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout accepted tooling (fixed commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: 6d703acdcfa205138d1ce4ba65b2ec58fc9493c9
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Verify bindings before any install (no secret, no DB)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_APPROVAL_REF: ${{ inputs.approval_ref }}
+          E7_EXPECTED_PLAN_HASH: ${{ inputs.expected_plan_hash }}
+          E7_EXPECTED_CLOSURE_DIGEST: ${{ inputs.expected_closure_digest }}
+          E7_EXPECTED_RUNNER_DIGEST: ${{ inputs.expected_runner_digest }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+        run: node wrapper/scripts/e7-dev-db-smoke.mjs verify
+      - name: Install the pinned dependency from the verified lockfile (no lifecycle scripts)
+        working-directory: tooling
+        run: npm ci --ignore-scripts --omit=dev --no-audit --no-fund
+      - name: Fetch the public Supabase CA (the wrapper and the smoke both check its pinned SHA-256)
+        run: curl --fail --silent --show-error --proto '=https' --max-time 20 -o "$RUNNER_TEMP/prod-ca-2021.crt" https://supabase-downloads.s3-ap-southeast-1.amazonaws.com/prod/ssl/prod-ca-2021.crt
+      - name: Execute ONE read-only smoke (the secret is scoped to this step only)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_APPROVAL_REF: ${{ inputs.approval_ref }}
+          E7_EXPECTED_PLAN_HASH: ${{ inputs.expected_plan_hash }}
+          E7_EXPECTED_CLOSURE_DIGEST: ${{ inputs.expected_closure_digest }}
+          E7_EXPECTED_RUNNER_DIGEST: ${{ inputs.expected_runner_digest }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_CA_FILE: ${{ runner.temp }}/prod-ca-2021.crt
+          E7_DEV_BOOKING_DATABASE_URL: ${{ secrets.E7_DEV_BOOKING_DATABASE_URL }}
+        run: node wrapper/scripts/e7-dev-db-smoke.mjs execute
