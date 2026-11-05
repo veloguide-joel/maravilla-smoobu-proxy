@@ -207,7 +207,7 @@ test("page source pins: same-origin only, no third-party resource, no storage ou
   assert.doesNotMatch(css, /url\(|@import|https?:/);
   assert.match(html, /Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'"/);
   assert.match(html, /<meta name="referrer" content="no-referrer">/); assert.match(html, /noindex/);
-  assert.match(html, /<meta name="mv-test-terms-version" content="">/, "terms version is a documented deployment input, never invented");
+  assert.match(html, /<meta name="mv-test-terms-version" content="test-terms-2026-11">/, "terms version is the documented TEST deployment label (not real booking terms)");
   assert.match(html, /TEST ONLY/); assert.match(html, /No reservation is created/);
   assert.match(html, /data-listing-id="606998" data-currency="USD"/);
   assert.doesNotMatch(html, /type="(password|card)"|cardnumber|cc-number|cvc/i, "no payment fields on our page");
