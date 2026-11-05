@@ -129,6 +129,19 @@ const claim = async (id) => (await q("SELECT released_at FROM booking.inventory_
 const transitions = async (id, t) => Number((await q("SELECT count(*) AS n FROM booking.intent_transitions WHERE intent_id = $1 AND event_type = $2", [id, t]))[0].n);
 const idOfToken = async (token) => (await import("../../lib/booking-db/intent-access.js")).findIntentIdByTokenHash(db.app, (await import("../../lib/checkout/intent-api-http.js")).hashToken(token));
 let stayN = 0;
+/** every durable fact the acknowledgement must leave untouched (reads and webhook bookkeeping excluded) */
+async function snapshot(id) {
+  const i = await loadIntent(db.app, id);
+  return {
+    status: i.status, version: i.version, reasonCode: i.reasonCode,
+    transitions: (await q("SELECT event_type, to_state FROM booking.intent_transitions WHERE intent_id = $1 ORDER BY version_after", [id])),
+    applied: (await q("SELECT event_id, event_type FROM booking.intent_applied_events WHERE intent_id = $1 ORDER BY applied_version", [id])),
+    claim: (await q("SELECT released_at FROM booking.inventory_claims WHERE intent_id = $1", [id])),
+    nonRead: (await ops(id)).filter((o) => !o.op_type.startsWith("stripe.retrieve_")).map((o) => `${o.op_type}:${o.state}:${o.dispatched_at}`),
+    notify: (await q("SELECT state, dispatched_at FROM booking.external_operations WHERE intent_id = $1 AND op_type = 'guest.notify' ORDER BY created_at, id", [id]))
+  };
+}
+const webhookRow = async (eventId) => (await q("SELECT status, error_code, intent_id, attempts FROM booking.stripe_webhook_events WHERE event_id = $1", [eventId]))[0];
 
 /** HTTP create -> details -> pay; then (unless pending) the guest pays and the verified completed webhook authorizes. */
 async function booking({ authorize = true } = {}) {
@@ -191,13 +204,19 @@ test("happy chain: Checkout -> verified webhook -> release REQUEST (one queued v
   // late same-PI completed webhook: duplicate, nothing queued
   const nonRead = async () => (await ops(b.id)).filter((o) => !o.op_type.startsWith("stripe.retrieve_")).map((o) => `${o.op_type}:${o.state}`);
   const before = await nonRead();
-  const late = await processVerifiedStripeEvent(db.app, b.w.event(b.sessionId, NOW0 + 9 * MIN), { stripe: b.w.stripe, now: NOW0 + 9 * MIN, accountId: ACCT, accountCache: {} });
-  // EXISTING webhook binding (unchanged): after the void, its fresh PaymentIntent read shows "canceled", so it refuses BEFORE E3
-  // (503 AUTHORIZATION_CANCELED, retryable) — no state change, nothing queued. A same-PI completion that is read while the PI is still
-  // authorized resolves as an E3 DUPLICATE (race test below). Residual: Stripe would redeliver this event until it gives up.
-  assert.deepEqual([late.http, late.code], [503, "AUTHORIZATION_CANCELED"]);
-  assert.equal((await loadIntent(db.app, b.id)).status, "authorization_released");
+  const snap0 = await snapshot(b.id);
+  const lateEv = b.w.event(b.sessionId, NOW0 + 9 * MIN);
+  const late = await processVerifiedStripeEvent(db.app, lateEv, { stripe: b.w.stripe, now: NOW0 + 9 * MIN, accountId: ACCT, accountCache: {} });
+  // E7 late canceled duplicate: bindAuthorization still refuses the canceled PaymentIntent before E3, but the authorization this intent
+  // ALREADY accepted (durably, under another event id) is recognised under lock and acknowledged: no transition, effect, claim or op.
+  assert.deepEqual(late, { http: 200, code: "DUPLICATE_CANCELED", state: "authorization_released" });
+  assert.deepEqual(await snapshot(b.id), snap0, "state, version, transitions, applied events, claim and notify unchanged");
   assert.deepEqual(await nonRead(), before, "the late webhook queues nothing but its own verified reads");
+  assert.deepEqual(await webhookRow(lateEv.id), { status: "processed", error_code: "CANCELED_DUPLICATE", intent_id: b.id, attempts: 1 });
+  // the same event id again: the permanent de-dup answers before any read
+  const readsBefore = (await ops(b.id)).length;
+  assert.deepEqual(await processVerifiedStripeEvent(db.app, lateEv, { stripe: b.w.stripe, now: NOW0 + 9 * MIN, accountId: ACCT, accountCache: {} }), { http: 200, code: "ALREADY_PROCESSED" });
+  assert.equal((await ops(b.id)).length, readsBefore, "replay: no read at all");
   assert.equal((await opsOf(b.id, "stripe.void_payment_intent")).length, 1);
   // a further release request after the release: duplicate, still one void, idle worker
   assert.equal((await call(b.h.step, { body: { step: "release" }, token: b.token })).statusCode, 202);
@@ -300,4 +319,118 @@ test("R-REFUND residual (accepted strict proof, unchanged): if the canceled char
   assert.deepEqual([i.status, i.reasonCode], ["reconciliation_required", "VOID_PROOF_NOT_STRICT"]);
   assert.equal(b.w.writes.cancelPaymentIntent, 1, "one void, never resent"); assert.equal(b.w.writes.hostaway, 0);
   assert.equal((await claim(b.id)).released_at, null, "an unproven release never frees the dates");
+});
+
+// =====================================================================================================================
+// E7 late canceled duplicate: negative bindings, lock-order race against the real void completion, same-id concurrency.
+
+/** a booking whose authorization was accepted, release-requested and VOIDED by the accepted worker (authorization_released) */
+async function released() {
+  const b = await booking();
+  F_ok(await requestTestRelease(db.app, b.id, { now: NOW0 + 6 * MIN }));
+  assert.equal((await cleanup(b, NOW0 + 8 * MIN)).status, "worked");
+  assert.equal((await loadIntent(db.app, b.id)).status, "authorization_released");
+  return b;
+}
+const lateOf = (b, deps = {}) => {
+  const ev = b.w.event(b.sessionId, NOW0 + 9 * MIN);
+  return { ev, run: (pool = db.app) => processVerifiedStripeEvent(pool, ev, { stripe: b.w.stripe, now: NOW0 + 9 * MIN, accountId: ACCT, accountCache: {}, ...deps }) };
+};
+const gate = () => { let open; const p = new Promise((r) => { open = r; }); let hit; const reached = new Promise((r) => { hit = r; }); return { wait: async () => { hit(); await p; }, open, reached }; };
+
+test("late canceled duplicate — negatives: every failed binding keeps the accepted 503 AUTHORIZATION_CANCELED (reason recorded), nothing changes", async () => {
+  const cases = [
+    // never authorized: the session completed and the PaymentIntent was canceled, but this intent never accepted it
+    ["no prior authorization", async () => {
+      const b = await booking({ authorize: false });
+      b.clock.now = NOW0 + 4 * MIN;
+      const pi = b.w.pis.get(b.w.pay(b.sessionId, b.clock.now - 30000)); pi.status = "canceled"; pi.amount_capturable = 0;
+      return { b, detail: "INTENT_PAYMENT_NOT_BOUND", state: "payment_pending" };
+    }],
+    // a DIFFERENT canceled PaymentIntent on the same (bound) session: not the accepted authorization
+    ["different PaymentIntent", async () => {
+      const b = await released(); const p = b.w.pis.get(b.piId); const other = `pi_RX${++seq}`;
+      b.w.pis.set(other, { ...clone(p), id: other, latest_charge: { ...clone(p.latest_charge), id: `ch_RX${seq}`, payment_intent: other } });
+      b.w.sessions.get(b.sessionId).payment_intent = other;
+      return { b, detail: "INTENT_PAYMENT_NOT_BOUND", state: "authorization_released" };
+    }],
+    // money disagreeing with the attempt (session, PaymentIntent and charge consistent among themselves)
+    ["money", async () => {
+      const b = await released(); const p = b.w.pis.get(b.piId); const s = b.w.sessions.get(b.sessionId);
+      p.amount += 100; p.latest_charge.amount += 100; s.amount_total += 100;
+      return { b, detail: "ATTEMPT_MONEY_MISMATCH", state: "authorization_released" };
+    }],
+    ["currency", async () => {
+      const b = await released(); const p = b.w.pis.get(b.piId); p.currency = "mxn"; p.latest_charge.currency = "mxn"; b.w.sessions.get(b.sessionId).currency = "mxn";
+      return { b, detail: "ATTEMPT_MONEY_MISMATCH", state: "authorization_released" };
+    }],
+    ["charge not TEST", async () => { const b = await released(); b.w.pis.get(b.piId).latest_charge.livemode = true; return { b, detail: "CHARGE_LIVEMODE", state: "authorization_released" }; }],
+    ["charge missing", async () => { const b = await released(); b.w.pis.get(b.piId).latest_charge = null; return { b, detail: "CHARGE_NOT_BOUND", state: "authorization_released" }; }],
+    ["charge captured", async () => { const b = await released(); b.w.pis.get(b.piId).latest_charge.amount_captured = 1; return { b, detail: "CHARGE_CAPTURED", state: "authorization_released" }; }],
+    ["amount received", async () => { const b = await released(); b.w.pis.get(b.piId).amount_received = 1; return { b, detail: "PAYMENT_INTENT_NOT_CLEANLY_CANCELED", state: "authorization_released" }; }],
+    // identity refusals that precede the canceled check: the existing binding codes, unchanged
+    ["metadata", async () => { const b = await released(); b.w.pis.get(b.piId).metadata.mv_payment_attempt_id = "aaaaaaaa-bbbb-4ccc-8ddd-000000000000";
+      return { b, code: "PAYMENT_INTENT_METADATA_MISMATCH", detail: "PAYMENT_INTENT_METADATA_MISMATCH", state: "authorization_released" }; }],
+    ["PaymentIntent not TEST", async () => { const b = await released(); b.w.pis.get(b.piId).livemode = true;
+      return { b, code: "PAYMENT_INTENT_LIVEMODE", detail: "PAYMENT_INTENT_LIVEMODE", state: "authorization_released" }; }],
+    ["account", async () => { const b = await released(); b.w.stripe.accounts.retrieve = async () => ({ object: "account", id: "acct_OTHER000" });
+      return { b, code: "ACCOUNT_MISMATCH", detail: "ACCOUNT_MISMATCH", state: "authorization_released" }; }]
+  ];
+  for (const [name, make] of cases) {
+    const { b, detail, state, code = "AUTHORIZATION_CANCELED" } = await make();
+    const snap0 = await snapshot(b.id);
+    const { ev, run } = lateOf(b);
+    const r = await run();
+    assert.deepEqual([r.http, r.code], [503, code], name);
+    assert.deepEqual(await snapshot(b.id), snap0, `${name}: nothing changed`);
+    assert.equal(snap0.status, state, name);
+    const row = await webhookRow(ev.id);
+    assert.deepEqual([row.status, row.error_code], ["failed_retryable", detail], name);
+  }
+});
+
+test("late canceled duplicate — lock order: the acknowledgement holds the intent row; the REAL void completion (VOID_SUCCEEDED) waits for it, then commits", async () => {
+  const b = await booking();
+  F_ok(await requestTestRelease(db.app, b.id, { now: NOW0 + 6 * MIN }));
+  const g = gate(); let lateP = null; let ev = null;
+  const cleanP = runCleanupStep(db.app, { workerId: "rel-cln", env: ENV_K,
+    adapterConfig: validateAdapterConfig({ allowedListingIds: [LISTING], refFieldId: 777011, channelId: 2000, currency: "USD" }),
+    listings: new Map([[LISTING, { currency: "USD", timeZone: TZ }]]), executors: b.w.cleanup, clock: () => NOW0 + 8 * MIN, stripeAccountId: ACCT, intentId: b.id,
+    hooks: { afterSend: async () => {
+      // the PaymentIntent is canceled at Stripe; the worker has not yet applied VOID_SUCCEEDED: the late completion arrives now
+      const l = lateOf(b, { hooks: { canceledAck: { beforeCommit: g.wait } } }); ev = l.ev; lateP = l.run(pool2);
+      await g.reached; // the acknowledgement holds intents FOR SHARE (+ attempt, + its webhook row) and has not committed
+    } } });
+  // observe (not assume) the worker's version-locked intent update waiting on that lock
+  let waiting = null;
+  for (let k = 0; k < 500 && !waiting; k++) { // bounded poll for an OBSERVED waiter (up to ~5 s); the assertion is the observation
+    const r = await db.owner.query(`SELECT query FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND state = 'active' AND query ILIKE '%booking.intents%FOR NO KEY UPDATE%'`);
+    if (r.rowCount) waiting = r.rows[0].query; else await new Promise((res) => setTimeout(res, 10));
+  }
+  assert.ok(waiting, "the void completion is blocked on the acknowledgement's intent row lock");
+  assert.equal((await loadIntent(db.app, b.id)).status, "reservation_failed", "still not released while it waits");
+  g.open();
+  const late = await lateP; const s = await cleanP;
+  assert.deepEqual(late, { http: 200, code: "DUPLICATE_CANCELED", state: "reservation_failed" }, "acknowledged against the committed, locked state");
+  assert.equal(s.status, "worked", JSON.stringify(s));
+  const i = await loadIntent(db.app, b.id);
+  assert.equal(i.status, "authorization_released");
+  assert.equal(await transitions(b.id, "VOID_SUCCEEDED"), 1); assert.equal(await transitions(b.id, "PAYMENT_AUTHORIZED"), 1);
+  assert.notEqual((await claim(b.id)).released_at, null);
+  assert.equal(b.w.writes.cancelPaymentIntent, 1);
+  assert.deepEqual(await webhookRow(ev.id), { status: "processed", error_code: "CANCELED_DUPLICATE", intent_id: b.id, attempts: 1 });
+});
+
+test("late canceled duplicate — same event id delivered concurrently: exactly one acknowledgement; the other reports the real final status", async () => {
+  const b = await released();
+  const g = gate();
+  const { ev, run } = lateOf(b, { hooks: { canceledAck: { afterLocks: g.wait } } });
+  const aP = run(pool2);
+  await g.reached; // A holds its share locks, has not touched the webhook row
+  const bR = await processVerifiedStripeEvent(db.app, ev, { stripe: b.w.stripe, now: NOW0 + 9 * MIN, accountId: ACCT, accountCache: {} });
+  assert.deepEqual(bR, { http: 200, code: "DUPLICATE_CANCELED", state: "authorization_released" });
+  g.open();
+  assert.deepEqual(await aP, { http: 200, code: "ALREADY_PROCESSED" }, "A finds the row already final: no second acknowledgement, no error");
+  assert.deepEqual(await webhookRow(ev.id), { status: "processed", error_code: "CANCELED_DUPLICATE", intent_id: b.id, attempts: 2 });
+  assert.equal((await loadIntent(db.app, b.id)).status, "authorization_released");
 });

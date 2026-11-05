@@ -212,10 +212,13 @@ test("one fresh intent through the page controller + REAL handler/core/repo/PG: 
   assert.deepEqual((await opsOf(id, "stripe.void_payment_intent")).map((o) => o.state), ["succeeded"]);
   assert.deepEqual((await q("SELECT op_type FROM booking.external_operations WHERE intent_id = $1 AND op_type LIKE 'hostaway.%'", [id])), []);
   const notify = await opsOf(id, "guest.notify");
+  // exactly ONE notification (E3's authorization_released effect): an exact count, so an empty set cannot pass vacuously
+  assert.equal(notify.length, 1, "exactly one guest notification row");
   assert.ok(notify.every((n) => n.state === "pending" && n.dispatched_at === null), "guest notification queued, never executed");
-  // late same-PI completed webhook after the void: the accepted 503 (canceled PI), nothing changes
+  // late same-PI completed webhook (new event id) after the void: E7 late canceled duplicate -> acknowledged, nothing changes
   const late = await processVerifiedStripeEvent(db.app, w.event(sessionId, NOW0 + 9 * MIN), { stripe: w.stripe, now: NOW0 + 9 * MIN, accountId: ACCT, accountCache: {} });
-  assert.deepEqual([late.http, late.code], [503, "AUTHORIZATION_CANCELED"]);
+  assert.deepEqual(late, { http: 200, code: "DUPLICATE_CANCELED", state: "authorization_released" });
+  assert.deepEqual((await opsOf(id, "guest.notify")).length, 1, "still exactly one notification row");
   await p.c.refresh();
   assert.deepEqual([p.last().screen, (await loadIntent(db.app, id)).status], ["released", "authorization_released"]);
   assert.ok(!srv.log.some((l) => /^(create|pay|release|details):5/.test(l)));

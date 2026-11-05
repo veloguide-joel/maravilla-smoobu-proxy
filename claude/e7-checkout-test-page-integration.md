@@ -104,7 +104,7 @@ The Hostaway pricing credentials are already present in preview. No other prereq
 - **Minimal additional evidence:**
   - one approved read of a canceled, never-captured TEST PI, made at the worker's Stripe-Version, publishing only `pi.status`, `amount_received`, `amount_capturable` and the expanded `latest_charge`'s `captured`, `amount`, `amount_captured`, `amount_refunded`, `refunded` and `status`;
   - optionally the charge's refund count and amounts (no ids beyond the charge).
-  - The protected PI `pi_3UYUIm2B9LTneQgw0mGFQdwG` stays untouched, and the consumed $1 approval does not cover this. It would need a new authorization+void run or another approved canceled TEST object.
+  - PaymentIntent `pi_3UYUIm2B9LTneQgw0mGFQdwG` is outside current authorization: the consumed $1 approval does not cover any further request. *(Corrected by root review of 5c0e1ea3: it is not protected by policy; it is simply not authorized.)* A separately approved **read-only retrieval of an existing canceled TEST PaymentIntent** may be the smallest evidence step, smaller than creating another hold.
 - **Is a code change supportable now?** No. The doc wording makes a change likely, but the proof must not move on an inference.
   - The supportable change *after* evidence is narrow. Accept `amount_refunded` equal to exactly the authorized amount only when every other canceled fact holds: `captured:false`, `amount_captured` 0, `amount_received` 0, `amount_capturable` 0, and the exact charge amount and currency. Optionally also require `refunded:true`.
   - The change would cover the canceled proof and the reconcile-gone proof only, never the captured or still-authorized proofs.
@@ -152,23 +152,49 @@ The Hostaway pricing credentials are already present in preview. No other prereq
   - `bindAuthorization` outcomes otherwise byte-identical;
   - the existing release test (`test/db/e7-checkout-test-release.test.mjs:191-200`) updated from 503 to the new code.
 
-### 3. Prioritized finish list
+### 3. Prioritized finish list (sequencing corrected by root review of 5c0e1ea3)
 
-1. **Next implementable slice (offline):** 2b exactly as above, plus its tests.
-   - When that test is touched, also give the integration test's `guest.notify` check an exact row count, because `every(...)` passes vacuously on an empty set.
-   - R-REFUND stays a documented blocker until evidence exists.
-2. **Infrastructure (reserved; owner):**
-   - hosted migrations 0006–0016 + read-only verify;
-   - Preview-scoped env (13 names) on a preview of the test branch;
-   - the webhook protection path;
-   - the Stripe TEST webhook endpoint at `2026-01-28.clover`.
-3. **ONE approval package (eventual):**
-   - a. Apply 0006–0016 to `mxotevtiscernhqilyiu` and verify.
-   - b. Owner enters the Preview env values for one test branch.
-   - c. One preview deployment of an accepted head.
-   - d. One protection bypass + one TEST webhook endpoint for that preview.
-   - e. One guest TEST run on the page with a Stripe test card (authorize → release → worker void + strict proof). It publishes the R-REFUND fields above, from the first run.
-   - f. Scoped owner cleanup.
+1. **Offline slice:** 2b — now implemented (next section).
+2. **R-REFUND evidence FIRST.** It must be settled BEFORE any guest Checkout hold that relies on the strict worker proof is authorized.
+   - Smallest step: one separately approved, read-only retrieval of an existing canceled TEST PaymentIntent with its expanded charge (fields in 2a). No provider action is prepared here.
+   - Then a reviewed proof correction **only if** the evidence justifies it; otherwise the proof stays as it is.
+3. **Infrastructure (reserved; owner):** hosted migrations 0006–0016 + read-only verify; Preview-scoped env (13 names); the webhook protection path; the Stripe TEST webhook endpoint at `2026-01-28.clover`.
+   - Existing preview deployments do not mean their runtime settings are ready: today none of the 13 names exists.
+4. **ONE approval package (eventual), in this order:**
+   - a. the read-only evidence step of item 2;
+   - b. the reviewed proof correction, only if justified;
+   - c. infrastructure (item 3: migrations + verify, owner-entered Preview values, one preview of an accepted head, one bypass + one TEST webhook endpoint);
+   - d. one guest TEST run on the page (authorize → release → worker void + strict proof);
+   - e. scoped owner cleanup.
    - Every step runs once, with no retry or fallback. It stays CLOSED until Joel approves.
+
+## Late canceled duplicate acknowledgement (OFFLINE implementation)
+
+Branch `feature/e7-late-canceled-duplicate` from exact `5c0e1ea3`. No SQL, migration, E3, worker, proof, public file, route, SDK version, dependency, config or containment change.
+
+- **Where it runs.** Only the `checkout.session.completed` authorization path, and only when the unchanged `bindAuthorization` answers exactly `AUTHORIZATION_CANCELED` (`lib/checkout/stripe-test-webhook.js`).
+- **Pure check** — `bindCanceledDuplicate` (additive, `lib/checkout/stripe-test-mode.js`):
+  - re-asserts every session / PaymentIntent / attempt / TEST / manual-capture / metadata identity explicitly, with the account verified;
+  - requires the PaymentIntent `canceled`, with `amount_received` 0 and `amount_capturable` 0;
+  - requires the expanded charge bound to that PaymentIntent, TEST, `captured:false`, `amount_captured` 0, with the same amount and currency;
+  - requires one strict integer amount and one case-normalized currency across session `amount_total`, attempt `amount_minor` (canonical digits), PaymentIntent and charge. Nothing is coerced.
+  - `amount_refunded` is ignored **only** here, because this acknowledges a notification; it never proves a release.
+- **Locked DB check** — `acknowledgeCanceledDuplicate` (`lib/booking-db/webhooks.js`), ONE short transaction in lock order `intents FOR SHARE` → `payment_attempts FOR SHARE` → `stripe_webhook_events` (the same order applyEvent + `markStripeEventProcessedInTx` use). It re-checks:
+  - the CURRENT intent payment (PaymentIntent, TEST), session and money (payment amount = price total = binding; currencies);
+  - the attempt: `completed`, same session, PaymentIntent, TEST and money;
+  - exactly one `PAYMENT_AUTHORIZED` applied under a DIFFERENT event id whose processed webhook record names the same session; this event id never applied;
+  - E3's own duplicate rule (`transition()` on the locked intent must answer duplicate). No status list is copied.
+  - Then it marks ONLY this event `processed` (`error_code CANCELED_DUPLICATE`): no `applyEvent`, transition, effect, claim change or operation beyond the existing verified read trail.
+- **Replies.**
+  - Acknowledged: `200 DUPLICATE_CANCELED`.
+  - Same event already finished by a concurrent delivery: `200 ALREADY_PROCESSED` (its real status, never a second acknowledgement).
+  - Any failed check: the accepted `503 AUTHORIZATION_CANCELED`, with the specific reason as the event's `error_code`.
+  - A failed COMMIT throws and is answered 503: success is never reported for an unacknowledged commit.
+- **Account trust boundary.** The configured TEST account is verified against the credential (`verifyAccount`) before the reads. The schema has no durable account column on `intents` or `payment_attempts`, so no persisted account binding exists to check; none was invented.
+- **Unchanged.** An active `requires_capture` completion still takes the E3 duplicate path. A different, still-held PaymentIntent still gets E3's void + review. A different canceled PaymentIntent, or a never-authorized intent, stays 503.
+- **Tests:**
+  - `test/e7-late-canceled-duplicate.test.mjs` (pure, 4);
+  - `test/db/e7-checkout-test-release.test.mjs` (+3 tests, happy chain updated): a new-id late event → `DUPLICATE_CANCELED` with state / version / transitions / applied events / claim / non-read ops / notify unchanged; a same-id replay → `ALREADY_PROCESSED` with zero reads; 11 negatives (no prior authorization, different PaymentIntent, money, currency, charge TEST / missing / captured, amount received, metadata, PaymentIntent TEST, account); the REAL worker's `VOID_SUCCEEDED` observed waiting (in `pg_stat_activity`) on the acknowledgement's intent lock, then both commit; concurrent same-id deliveries → one acknowledgement + `ALREADY_PROCESSED`;
+  - the page-integration test now expects `DUPLICATE_CANCELED` and asserts exactly one `guest.notify` row.
 
 Not claimed: connected readiness. All live, preview, merge and provider gates stay closed. Protected reservations 70636076 / 71045356 / 71072615 / 71081885 remain zero-action.
