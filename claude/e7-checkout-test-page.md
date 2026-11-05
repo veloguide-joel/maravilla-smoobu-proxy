@@ -92,3 +92,32 @@ Each layer was tested separately; they are listed by what they actually prove.
 - **Loopback browser regression (fake core, intercepted Stripe).**
   - **Pay answered 503:** the button stays disabled. Forced clicks and `element.click()` ×2 sent no second pay; after a reload it was still disabled, stored `uncertain: "pay"`, and pay count was 1.
   - **Main flow:** neutral processing title; the "Release verified" screen has no notice.
+
+## Root re-review HOLD on f7aa427e (R-UI1a / R-UI1b)
+
+- **R-UI1a: semantic reply boundary.**
+  - **Status replies.** Only a RECOGNISED public status (`KNOWN_STATUSES` = the accepted `publicStatus` values plus `release_requested`) can resolve a latch. A 200 with a missing, null, non-string or unknown status:
+    - keeps every latch;
+    - stops automatic reads (`UNREADABLE`);
+    - drops the previous label (`last = null`) and shows "Status not confirmed";
+    - blocks every ordinary action.
+  - **Write replies.** JSON alone is not success; each write must match its accepted API shape:
+    - create: `201 {token, status:"awaiting_details"}`;
+    - details: `200 {status:"awaiting_details"}`;
+    - pay: `200` with a valid Stripe `checkoutUrl`;
+    - release: `202 {status:<recognised>, release:"REQUESTED"}`.
+
+    Any other 2xx latches the action. It is never called a refusal, never resent by its ordinary button, and a bad URL is never opened. A create 201 that carries a valid bearer keeps the bearer for safe status reads, and a recognised status then resolves the latch. Without a bearer, create needs the explicit acknowledgement.
+- **Accepted details shape (found while checking the shapes above).** `details_collected` maps publicly to `awaiting_details`. The previous page would have shown the details form again after a successful save; the rehearsal's fake core had masked this by returning `awaiting_payment`.
+  - **Fix:** a session flag `detailsSaved`, a boolean only with no guest data, set only by a verified details reply or a prepared Checkout.
+  - **Uncertain details while still `awaiting_details`:** the page offers an explicit resend or an explicit Pay attempt. A definite `409 NOT_READY_FOR_PAYMENT` proves the details were not saved and re-opens the form.
+- **R-UI1b: reload budget.** Every page-load or Stripe-return status read is AUTOMATIC and spends the persisted 24-per-10-minutes budget, including a latched reload.
+  - A latched tab never polls on its own.
+  - Once the budget is exhausted, a reload sends nothing; explicit Refresh remains the manual read.
+  - Without persistable storage, a reload sends nothing automatically.
+- **Tests (exact red controls on f7aa427e).**
+  - **Red:** 14/18. The 4 new tests failed: malformed status, malformed 2xx writes, the accepted details shape, and 30 reloads.
+  - **Green:** 18/18. Two test-side updates: the stored-keys list now includes `detailsSaved`, and one new test reused the wrong storage and status script, corrected before acceptance.
+- **Loopback browser.**
+  - **Fake core:** now returns the accepted details shape. Main flow: details → pay → fake Stripe → processing (neutral) → queued → verified with no notice.
+  - **Uncertain pay:** after a reload, a malformed `{}` status gives "Status not confirmed". Pay stays hidden or disabled, pay count 1, stored `uncertain: "pay"`.

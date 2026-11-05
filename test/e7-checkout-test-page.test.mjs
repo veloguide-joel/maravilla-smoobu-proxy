@@ -21,7 +21,7 @@ function fakeTimers() {
 function fakeApi(script = {}) {
   const calls = []; const q = { create: [], details: [], pay: [], release: [], status: [], ...script };
   const def = { create: { kind: "reply", http: 201, body: { token: TOKEN, status: "awaiting_details", price: PRICE } },
-    details: { kind: "reply", http: 200, body: { status: "awaiting_payment" } },
+    details: { kind: "reply", http: 200, body: { status: "awaiting_details" } },   // ACCEPTED shape: details_collected still maps to awaiting_details
     pay: { kind: "reply", http: 200, body: { status: "awaiting_payment", checkoutUrl: "https://checkout.stripe.com/c/pay/cs_test_x#frag" } },
     release: { kind: "reply", http: 202, body: { status: "release_requested", release: "REQUESTED" } },
     status: { kind: "reply", http: 200, body: { status: "processing", price: PRICE } } };
@@ -57,7 +57,7 @@ test("status wording: authorization is a hold, never a booking; queued release !
 test("storage: minimum state only (token + release flag + poll times), no guest data; refused storage is survivable and reported", () => {
   const s = memStorage(); const st = createStore(s);
   assert.equal(st.save({ token: TOKEN, releaseRequested: false, polls: [1, 2], guest: { email: "x@example.test" }, price: PRICE }), true);
-  assert.deepEqual(Object.keys(JSON.parse(s.m.get(STORE_KEY))).sort(), ["polls", "releaseRequested", "token", "uncertain"]);
+  assert.deepEqual(Object.keys(JSON.parse(s.m.get(STORE_KEY))).sort(), ["detailsSaved", "polls", "releaseRequested", "token", "uncertain"]);
   s.setItem(STORE_KEY, JSON.stringify({ token: "not-a-token" })); assert.equal(st.load(), null);
   s.setItem(STORE_KEY, "{bad"); assert.equal(st.load(), null);
   const b = createStore(brokenStorage());
@@ -314,4 +314,91 @@ test("R-UI2: a newer authoritative status clears stale action notices (queued / 
   const g = fakeApi({ release: [{ kind: "unknown" }], status: [reply(200, { status: "under_review" })] });
   const b = rig({ storage: s2, api: g }); await b.c.release(); assert.equal(b.state.notice.code, "RELEASE_UNCERTAIN");
   await b.c.refresh(); assert.equal(b.last().screen, "review"); assert.equal(b.state.notice, null); assert.equal(b.last().latch, null);
+});
+
+// ---------- root re-review HOLD (R-UI1a semantic reply boundary, R-UI1b reload budget) ----------
+const latchedStore = (uncertain, o = {}) => seeded({ uncertain, ...o });
+const shapes = [reply(200, {}), reply(200, { status: null }), reply(200, { status: "weird_but_valid" }), reply(200, { status: 7 })];
+
+test("R-UI1a: a 200 status reply without a RECOGNISED status never resolves any latch; reads stop honestly; no previous label is reused; ordinary actions stay blocked", async () => {
+  for (const action of ["details", "pay", "release"]) {
+    for (const bad of shapes) {
+      const s = latchedStore(action);
+      const f = fakeApi({ status: [reply(200, { status: action === "release" ? "processing" : action === "pay" ? "awaiting_payment" : "awaiting_details" }), bad] });
+      const r = rig({ storage: s, api: f });
+      await r.c.init();                                   // a valid first read (the latch stays: that status proves nothing)
+      await r.c.refresh();                                // the malformed read
+      assert.equal(r.last().latch, action, `${action} ${JSON.stringify(bad.body)}`);
+      assert.deepEqual([r.last().screen, r.state.stopped, r.state.polling, r.state.last], ["unreadable", "UNREADABLE", false, null], `${action} ${JSON.stringify(bad.body)}`);
+      const before = f.calls.length;
+      await r.c.pay(); await r.c.release(); await r.c.details({ firstName: "A", lastName: "B", email: "a@example.test", accepted: true }); await r.c.retryUncertain({ accepted: true });
+      assert.equal(f.calls.length, before, `${action}: nothing sent after an unreadable status`);
+      assert.equal(createStore(s).load().uncertain, action);
+    }
+  }
+  // create latch WITH a bearer (malformed 201): only a recognised status resolves it
+  const s = memStorage(); const f = fakeApi({ create: [reply(201, { token: TOKEN })], status: [reply(200, {}), reply(200, { status: "awaiting_details" })] });
+  const r = rig({ storage: s, api: f }); await r.c.create({ from: "2027-01-10", to: "2027-01-13", guests: 2 });
+  assert.equal(r.last().latch, "create"); await r.c.refresh(); assert.equal(r.last().latch, "create");
+  await r.c.refresh(); assert.equal(r.last().latch, null);
+});
+
+test("R-UI1a: malformed 2xx mutation replies latch (never a definite refusal, never an ordinary resend, never a bad redirect); a trustworthy bearer is kept for safe status reads", async () => {
+  // create 201 without a valid bearer -> explicit acknowledgement path
+  for (const body of [{}, { token: "short", status: "awaiting_details" }, { status: "awaiting_details" }]) {
+    const f = fakeApi({ create: [reply(201, body)] }); const r = rig({ api: f }); await r.c.init();
+    await r.c.create({ from: "2027-01-10", to: "2027-01-13", guests: 2 }); await r.c.create({ from: "2027-01-10", to: "2027-01-13", guests: 2 });
+    assert.deepEqual([r.last().screen, r.last().latch, f.count("create")], ["createUncertain", "create", 1], JSON.stringify(body));
+  }
+  // create 201 with a bearer but no recognised status -> latch, bearer kept, status read allowed
+  const fc = fakeApi({ create: [reply(201, { token: TOKEN, status: "?" })], status: [reply(200, { status: "awaiting_details" })] }); const rc = rig({ api: fc });
+  await rc.c.create({ from: "2027-01-10", to: "2027-01-13", guests: 2 });
+  assert.deepEqual([rc.last().latch, rc.state.st.token === TOKEN], ["create", true]); await rc.c.create({ from: "2027-01-10", to: "2027-01-13", guests: 2 });
+  assert.equal(fc.count("create"), 1); await rc.c.refresh(); assert.equal(fc.count("status"), 1);
+  // pay 200 with a missing / invalid checkoutUrl -> latch pay, nothing opened, no resend
+  for (const body of [{ status: "awaiting_payment" }, { status: "awaiting_payment", checkoutUrl: "https://evil.example/x" }, { checkoutUrl: 5 }]) {
+    const f = fakeApi({ pay: [reply(200, body)] }); const r = rig({ storage: seeded(), api: f });
+    await r.c.pay(); await r.c.pay();
+    assert.deepEqual([r.last().latch, r.nav.assigned, f.count("pay")], ["pay", [], 1], JSON.stringify(body));
+  }
+  // details 200 without its expected status; release 202 without the REQUESTED marker / a recognised status
+  for (const body of [{}, { status: "weird" }, { status: "processing" }]) {
+    const f = fakeApi({ details: [reply(200, body)] }); const r = rig({ storage: seeded(), api: f }); const d = { firstName: "A", lastName: "B", email: "a@example.test", accepted: true };
+    await r.c.details(d); await r.c.details(d); assert.deepEqual([r.last().latch, f.count("details")], ["details", 1], JSON.stringify(body));
+  }
+  for (const body of [{}, { status: "release_requested" }, { release: "REQUESTED" }, { release: "REQUESTED", status: "weird" }]) {
+    const f = fakeApi({ release: [reply(202, body)] }); const r = rig({ storage: seeded(), api: f });
+    await r.c.release(); await r.c.release(); assert.deepEqual([r.last().latch, f.count("release")], ["release", 1], JSON.stringify(body));
+  }
+  // other 2xx codes on a write are not success either
+  const f2 = fakeApi({ release: [reply(200, { status: "release_requested", release: "REQUESTED" })] }); const r2 = rig({ storage: seeded(), api: f2 });
+  await r2.c.release(); assert.equal(r2.last().latch, "release");
+});
+
+test("accepted details success shape (status stays awaiting_details) advances to payment; an uncertain details step can be proven by a definite pay refusal", async () => {
+  const sd = seeded(); const r = rig({ storage: sd, api: fakeApi() });
+  await r.c.details({ firstName: "A", lastName: "B", email: "a@example.test", accepted: true });
+  assert.deepEqual([r.last().screen, r.last().latch], ["pay", null], "details_collected maps to awaiting_details publicly; the page still moves on");
+  const r2 = rig({ storage: sd, api: fakeApi({ status: [reply(200, { status: "awaiting_details" })] }) }); await r2.c.init();
+  assert.equal(r2.last().screen, "pay", "a reload keeps the saved-details step (session flag only, no guest data)");
+  // uncertain details + awaiting_details: explicit resend OR an explicit pay attempt; a definite NOT_READY_FOR_PAYMENT re-opens the form
+  const f = fakeApi({ details: [{ kind: "unknown" }], status: [reply(200, { status: "awaiting_details" })], pay: [reply(409, { code: "NOT_READY_FOR_PAYMENT" })] });
+  const r3 = rig({ storage: seeded(), api: f }); await r3.c.details({ firstName: "A", lastName: "B", email: "a@example.test", accepted: true }); await r3.c.refresh();
+  assert.deepEqual([r3.last().retry, r3.last().canPay], ["details", true]);
+  await r3.c.pay(); assert.deepEqual([r3.last().latch, r3.last().screen, f.count("pay")], [null, "details", 1]);
+});
+
+test("R-UI1b: every page-load / Stripe-return status read is AUTOMATIC: 30 reloads of a latched tab send <= 24 within 10 minutes; exhausted -> reload sends nothing; manual Refresh still allowed; no recurring polling while latched", async () => {
+  const t = fakeTimers(); const s = latchedStore("pay");
+  const f = fakeApi(); f.q.status = Array.from({ length: 60 }, () => reply(200, { status: "awaiting_payment" }));
+  for (let i = 0; i < 30; i++) {
+    const r = rig({ storage: s, api: f, timers: t, search: i % 2 ? "?checkout=complete" : "" }); await r.c.init();
+    assert.equal(r.state.polling, false, "no recurring polling while latched");
+  }
+  assert.equal(f.count("status"), POLL.maxAuto);
+  const r = rig({ storage: s, api: f, timers: t }); await r.c.init();
+  assert.deepEqual([f.count("status"), r.state.stopped], [POLL.maxAuto, "BUDGET"]);
+  await r.c.refresh(); assert.equal(f.count("status"), POLL.maxAuto + 1, "explicit manual read");
+  // storage that cannot persist the budget: a reload sends nothing automatically
+  const g = fakeApi(); const r2 = rig({ storage: brokenStorage(), api: g }); await r2.c.init(); assert.equal(g.count("status"), 0);
 });

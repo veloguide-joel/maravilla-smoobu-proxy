@@ -26,7 +26,10 @@ export function validateCheckoutUrl(u) {
   if (x.protocol !== "https:" || x.hostname !== "checkout.stripe.com" || x.port !== "" || x.username !== "" || x.password !== "") return null;
   return x.href;
 }
-const safeStatus = (s) => (typeof s === "string" && STATUS_RE.test(s) ? s : null);
+/** the public statuses the accepted API can return (lib/checkout/intent-state.js publicStatus + "release_requested"); anything else is unreadable */
+export const KNOWN_STATUSES = Object.freeze(["awaiting_details", "awaiting_payment", "processing", "release_requested", "unavailable_not_charged", "under_review",
+  "expired", "payment_failed", "unavailable", "not_completed_not_charged", "confirmed"]);
+const safeStatus = (s) => (typeof s === "string" && STATUS_RE.test(s) && KNOWN_STATUSES.includes(s) ? s : null);
 const safeCode = (c) => (typeof c === "string" && CODE_RE.test(c) ? c : "UNEXPECTED_REPLY");
 
 /** Guest-facing description of a server status. `released` = this tab asked for a release earlier. Never "booking confirmed". */
@@ -66,11 +69,12 @@ export function createStore(storage) {
       const v = guard(() => JSON.parse(raw), null);
       if (!v || typeof v !== "object") return null;
       const uncertain = UNCERTAIN_ACTIONS.includes(v.uncertain) ? v.uncertain : null;
-      if (!TOKEN_RE.test(v.token || "")) return uncertain === "create" && v.token === null ? { token: null, releaseRequested: false, polls: [], uncertain } : null;
-      return { token: v.token, releaseRequested: v.releaseRequested === true, polls: Array.isArray(v.polls) ? v.polls.filter(Number.isFinite).slice(-POLL.maxAuto) : [], uncertain };
+      if (!TOKEN_RE.test(v.token || "")) return uncertain === "create" && v.token === null ? { token: null, releaseRequested: false, detailsSaved: false, polls: [], uncertain } : null;
+      return { token: v.token, releaseRequested: v.releaseRequested === true, detailsSaved: v.detailsSaved === true,
+        polls: Array.isArray(v.polls) ? v.polls.filter(Number.isFinite).slice(-POLL.maxAuto) : [], uncertain };
     },
     save(s) {
-      const v = JSON.stringify({ token: s.token ?? null, releaseRequested: s.releaseRequested === true, polls: (s.polls || []).slice(-POLL.maxAuto),
+      const v = JSON.stringify({ token: s.token ?? null, releaseRequested: s.releaseRequested === true, detailsSaved: s.detailsSaved === true, polls: (s.polls || []).slice(-POLL.maxAuto),
         uncertain: UNCERTAIN_ACTIONS.includes(s.uncertain) ? s.uncertain : null });
       return guard(() => { storage.setItem(STORE_KEY, v); return storage.getItem(STORE_KEY) === v; }, false);
     },
@@ -118,16 +122,20 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
   let st = store.load();                // { token|null, releaseRequested, polls, uncertain } | null
   let busy = false; let pollTimer = null; let stopped = null; let last = null; let notice = null; let price = null; let returned = false;
   let retry = null;                     // the latched action a FRESH status shows may be explicitly resent ("details" | "release")
+  let unreadable = false;               // the LAST status reply carried no recognised status: nothing is claimed about the current state
   const storageOk = () => (st ? store.save(st) : true);
   const latch = () => (st && st.uncertain) || null;
 
   function view(extra = {}) {
-    const d = last ? describe(last, { releaseRequested: st && st.releaseRequested }) : null;
-    const screen = latch() === "create" ? "createUncertain" : st ? (d ? d.kind : "loading") : "create";
-    const title = screen === "createUncertain" ? "TEST intent outcome unknown" : d ? d.title : st ? "Checking status…" : "Start a TEST booking";
-    const text = screen === "createUncertain" ? "A create request may or may not have reached the server. This tab has no way to look it up. Acknowledge before starting another TEST booking (a second TEST intent may then exist)." : d ? d.text : "";
+    // the accepted API reports details_collected as "awaiting_details": a VERIFIED details reply in this tab (session flag) moves the page on
+    const effective = last === "awaiting_details" && st && st.detailsSaved ? "awaiting_payment" : last;
+    const d = effective && !unreadable ? describe(effective, { releaseRequested: st && st.releaseRequested }) : null;
+    const screen = latch() === "create" && !(st && st.token) ? "createUncertain" : unreadable ? "unreadable" : st ? (d ? d.kind : "loading") : "create";
+    const title = screen === "createUncertain" ? "TEST intent outcome unknown" : screen === "unreadable" ? "Status not confirmed" : d ? d.title : st ? "Checking status…" : "Start a TEST booking";
+    const text = screen === "createUncertain" ? "A create request may or may not have reached the server. This tab has no way to look it up. Acknowledge before starting another TEST booking (a second TEST intent may then exist)."
+      : screen === "unreadable" ? "The server's last reply did not contain a recognised status, so this page claims nothing about the current state. Nothing is sent automatically; use Refresh status." : d ? d.text : "";
     ui.render({ screen, title, text, price, notice, busy, polling: pollTimer !== null, pollStopped: stopped, canRefresh: !!(st && st.token) && !busy,
-      latch: latch(), retry, canPay: !busy && latch() === null && !!st && !!st.token,
+      latch: latch(), retry, canPay: !busy && !unreadable && !!st && !!st.token && (latch() === null || (latch() === "details" && retry === "details")),
       termsVersion: config.termsVersion || null, listingId: config.listingId, currency: config.currency, ...extra });
   }
   /** notices: `forStatus` ties an action / hint notice to the status it was issued for; a newer authoritative status clears it */
@@ -139,15 +147,16 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
   }
   const uncertainReply = (r) => r.kind === "unknown" || r.http >= 500 || r.http === 408;
   function setLatch(action) {
-    if (!st) st = { token: null, releaseRequested: false, polls: [], uncertain: null };
+    if (!st) st = { token: null, releaseRequested: false, detailsSaved: false, polls: [], uncertain: null };
     st.uncertain = action; retry = null; store.save(st);
   }
   function clearLatch() { if (st) { st.uncertain = null; store.save(st); } retry = null; }
   /** does a fresh status PROVE the latched action resolved? (awaiting_payment proves nothing about an unknown pay) */
   function resolveLatch(s) {
     const a = latch();
-    if (!a || a === "create") return;
-    const resolved = a === "details" ? s !== "awaiting_details" : a === "pay" ? !["awaiting_payment", "awaiting_details"].includes(s) : a === "release" ? s !== "processing" : false;
+    if (!a || s === null || !KNOWN_STATUSES.includes(s)) return;      // only a RECOGNISED status can prove anything
+    if (a === "create") { clearLatch(); if (notice && notice.latch) notice = null; return; }   // any recognised status proves the intent exists
+    const resolved = a === "details" ? !["awaiting_details"].includes(s) : a === "pay" ? !["awaiting_payment", "awaiting_details"].includes(s) : a === "release" ? s !== "processing" : false;
     if (resolved) { clearLatch(); if (notice && notice.latch) notice = null; return; }
     retry = a === "details" || a === "release" ? a : null;      // still in the step's state: an EXPLICIT resend may be offered (never for pay)
   }
@@ -188,11 +197,16 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
     }
     const r = await once(() => api.status(st.token));
     if (r === null) return;
-    if (r.kind === "unknown") { stopPolling("UNREADABLE"); setNotice({ level: "warn", code: "STATUS_UNREADABLE", text: "The server's status could not be read. Use Refresh status." }); view(); return; }
+    if (r.kind === "unknown") { stopPolling("UNREADABLE"); last = null; unreadable = true; retry = null; setNotice({ level: "warn", code: "STATUS_UNREADABLE", text: "The server's status could not be read. Use Refresh status." }); view(); return; }
     if (r.http === 429) { stopPolling("RATE_LIMITED"); setNotice({ level: "warn", code: "RATE_LIMITED", text: "Too many requests. Automatic status checks stopped; wait, then use Refresh status." }); view(); return; }
     if (r.http === 401) { stopPolling("UNAUTHORIZED"); setNotice({ level: "error", code: "UNAUTHORIZED", text: "This tab's TEST booking is no longer accepted by the server. Start over to try again." }); last = null; view({ screen: "lost" }); return; }
     if (r.http !== 200) { stopPolling("ERROR"); setNotice({ level: "warn", code: safeCode(r.body.code), text: "The status check failed. Use Refresh status." }); view(); return; }
-    const s = absorb(r); stopped = null;
+    const s = absorb(r);
+    if (s === null) {                             // HTTP 200 without a recognised status: no proof, no previous label reused
+      stopPolling("UNREADABLE"); last = null; unreadable = true; retry = null;
+      setNotice({ level: "warn", code: "STATUS_UNRECOGNISED", text: "The server's reply did not contain a recognised status. Use Refresh status." }); view(); return;
+    }
+    unreadable = false; stopped = null;
     if (notice && !notice.latch) {               // stale action / hint notices never contradict a newer authoritative status
       if (notice.forStatus === undefined) notice = { ...notice, forStatus: s };
       else if (notice.forStatus !== s) notice = null;
@@ -207,15 +221,22 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
     const r = await once(() => api.details(st.token, d));
     if (r === null) return;
     if (uncertainReply(r)) { setLatch("details"); uncertainNotice("DETAILS_UNCERTAIN", "details request"); view(); return; }
-    if (r.http !== 200) { setNotice({ level: "warn", code: safeCode(r.body.code), text: "The server refused the details (a definite refusal)." }); view(); return; }
-    clearLatch(); setNotice(null); absorb(r); view();
+    if (r.http >= 200 && r.http < 300) {
+      // accepted success shape: 200 { status: "awaiting_details" } (details_collected); anything else may follow an applied write
+      if (r.http !== 200 || safeStatus(r.body.status) !== "awaiting_details") { setLatch("details"); uncertainNotice("DETAILS_REPLY_UNEXPECTED", "details request"); view(); return; }
+      absorb(r); st.detailsSaved = true; clearLatch(); setNotice(null); view(); return;
+    }
+    setNotice({ level: "warn", code: safeCode(r.body.code), text: "The server refused the details (a definite refusal)." }); view();
   }
   async function sendRelease() {
     const r = await once(() => api.release(st.token));
     if (r === null) return;
     if (uncertainReply(r)) { setLatch("release"); uncertainNotice("RELEASE_UNCERTAIN", "release request"); view(); return; }
     if (r.http === 404 || (r.http === 400 && r.body.code === "UNKNOWN_STEP")) { setNotice({ level: "warn", code: "RELEASE_NOT_ENABLED", text: "Release requests are not enabled on this deployment." }); view(); return; }
-    if (r.http !== 202) { setNotice({ level: "warn", code: safeCode(r.body.code), text: "The server refused the release request (a definite refusal)." }); view(); return; }
+    if (r.http >= 200 && r.http < 300) {
+      // accepted success shape: 202 { status: <recognised>, release: "REQUESTED" }; anything else may follow an applied request
+      if (r.http !== 202 || r.body.release !== "REQUESTED" || safeStatus(r.body.status) === null) { setLatch("release"); uncertainNotice("RELEASE_REPLY_UNEXPECTED", "release request"); view(); return; }
+    } else { setNotice({ level: "warn", code: safeCode(r.body.code), text: "The server refused the release request (a definite refusal)." }); view(); return; }
     st.releaseRequested = true; clearLatch();
     const s = absorb(r); setNotice({ level: "info", code: "RELEASE_REQUESTED", text: "Release requested. It is queued, not done." }, s); view(); schedule(); view();
   }
@@ -231,20 +252,26 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
       returned = hint !== null;
       if (hint) setNotice({ level: "info", code: hint === "complete" ? "RETURNED_COMPLETE" : "RETURNED_CANCELLED",
         text: hint === "complete" ? "You returned from Stripe. This is only a hint: the page now asks the server what actually happened." : "You left Stripe Checkout without paying (hint only). Checking the server…" });
-      if (latch() === "create") { setNotice({ level: "warn", code: "CREATE_UNCERTAIN", latch: true, text: "The previous create request's outcome is unknown." }); view(); return; }
+      if (latch() === "create" && !st.token) { setNotice({ level: "warn", code: "CREATE_UNCERTAIN", latch: true, text: "The previous create request's outcome is unknown." }); view(); return; }
       if (latch()) uncertainNotice(`${latch().toUpperCase()}_UNCERTAIN`, `${latch()} request`);
       if (!st) { view(); return; }
       view();
-      await readStatus({ auto: !latch() });           // a latched tab reads once without spending the automatic budget
+      await readStatus({ auto: true });               // EVERY page-load / Stripe-return read is automatic (budgeted); a latched tab never polls on
     },
     async create({ from, to, guests }) {
       if (st) return;                              // never a second intent while this tab holds one (or an unknown create)
       const r = await once(() => api.create({ listingId: config.listingId, from, to, guests }));
       if (r === null) return;
       if (uncertainReply(r)) { setLatch("create"); setNotice({ level: "error", code: "CREATE_UNCERTAIN", latch: true, text: "It is unknown whether a TEST intent was created. Nothing is retried." }); view(); return; }
-      if (r.http !== 201 || !TOKEN_RE.test(r.body.token || "")) { setNotice({ level: "warn", code: safeCode(r.body.code), text: "The server refused the request (a definite refusal)." }); view(); return; }
-      st = { token: r.body.token, releaseRequested: false, polls: [], uncertain: null };
-      absorb(r);
+      if (r.http < 200 || r.http >= 300) { setNotice({ level: "warn", code: safeCode(r.body.code), text: "The server refused the request (a definite refusal)." }); view(); return; }
+      // accepted success shape: 201 { token, status: "awaiting_details", price }; a 2xx without a valid bearer / status may follow a created intent
+      const tok = r.http === 201 && TOKEN_RE.test(r.body.token || "") ? r.body.token : null;
+      if (!tok) { setLatch("create"); setNotice({ level: "error", code: "CREATE_REPLY_UNEXPECTED", latch: true, text: "The server's reply was not a usable create result; a TEST intent may exist. Nothing is retried." }); view(); return; }
+      st = { token: tok, releaseRequested: false, detailsSaved: false, polls: [], uncertain: null };
+      if (absorb(r) !== "awaiting_details") {      // bearer kept for SAFE status reads; only a recognised status resolves it
+        st.uncertain = "create"; store.save(st); last = null;
+        setNotice({ level: "warn", code: "CREATE_REPLY_UNEXPECTED", latch: true, text: "The create reply had no recognised status. Use Refresh status; nothing is resent." }); view(); return;
+      }
       if (!store.save(st)) setNotice({ level: "error", code: "STORAGE_UNAVAILABLE", text: "This tab cannot remember the TEST booking, so returning from Stripe could not resume it. Payment is disabled in this tab." });
       else setNotice(null);
       view();
@@ -252,37 +279,46 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
     /** explicit reset after an unknown create: the guest acknowledges a possible prior TEST intent */
     acknowledgeUncertainCreate() { if (latch() !== "create") return; store.clear(); st = null; last = null; price = null; setNotice(null); view(); },
     async details(form) {
-      if (!st || !st.token || latch()) return;
+      if (!st || !st.token || latch() || unreadable) return;
       if (!config.termsVersion) { setNotice({ level: "error", code: "TERMS_NOT_CONFIGURED", text: "This TEST page has no terms version configured; details cannot be sent." }); view(); return; }
       if (form.accepted !== true) { setNotice({ level: "warn", code: "TERMS_NOT_ACCEPTED", text: "Accept the TEST terms first." }); view(); return; }
       await sendDetails(detailsBody(form));
     },
     async pay() {
-      if (!st || !st.token || latch()) return;
+      if (!st || !st.token || unreadable || (latch() && !(latch() === "details" && retry === "details"))) return;
       if (!storageOk()) { setNotice({ level: "error", code: "STORAGE_UNAVAILABLE", text: "This tab cannot remember the TEST booking; payment stays disabled." }); view(); return; }
       const r = await once(() => api.pay(st.token));
       if (r === null) return;
       if (uncertainReply(r)) { setLatch("pay"); uncertainNotice("PAY_UNCERTAIN", "payment start (a Checkout session may have been prepared)"); view(); return; }
-      if (r.http !== 200) { setNotice({ level: "warn", code: safeCode(r.body.code), text: "The server refused to start payment (a definite refusal)." }); view(); return; }
-      const url = validateCheckoutUrl(r.body.checkoutUrl);
-      if (!url) { setNotice({ level: "error", code: "CHECKOUT_URL_REFUSED", text: "The returned payment address is not Stripe's hosted Checkout; this page will not open it." }); view(); return; }
+      if (r.http < 200 || r.http >= 300) {
+        if (r.http === 409 && r.body.code === "NOT_READY_FOR_PAYMENT" && latch() === "details") {   // a definite refusal PROVES the details were not saved
+          st.detailsSaved = false; clearLatch(); setNotice({ level: "warn", code: "DETAILS_NOT_SAVED", text: "The server says the details are not saved yet. Enter them again." }); view(); return;
+        }
+        setNotice({ level: "warn", code: safeCode(r.body.code), text: "The server refused to start payment (a definite refusal)." }); view(); return;
+      }
+      const url = r.http === 200 ? validateCheckoutUrl(r.body.checkoutUrl) : null;
+      if (!url) {                                   // 2xx without a usable Stripe URL: a session may exist; never opened, never resent
+        setLatch("pay"); setNotice({ level: "error", code: "CHECKOUT_URL_REFUSED", latch: true, text: "The reply carried no usable Stripe Checkout address; this page opens nothing and will not request payment again. Use Refresh status." }); view(); return;
+      }
+      if (latch() === "details") clearLatch();     // a prepared Checkout proves the details were saved
+      st.detailsSaved = true; store.save(st);
       absorb(r); view({ screen: "redirecting" });
       nav.assign(url);
     },
     async release() {
-      if (!st || !st.token || latch()) return;
+      if (!st || !st.token || latch() || unreadable) return;
       await sendRelease();
     },
     /** explicit resend of a latched details / release AFTER a fresh status showed the server still allows that step */
     async retryUncertain(form) {
-      if (!st || !st.token || !retry || retry !== latch()) return;
+      if (!st || !st.token || unreadable || !retry || retry !== latch()) return;
       if (retry === "details") {
         if (!config.termsVersion || !form || form.accepted !== true) { setNotice({ level: "warn", code: "TERMS_NOT_ACCEPTED", text: "Accept the TEST terms first." }); view(); return; }
         await sendDetails(detailsBody(form));
       } else if (retry === "release") await sendRelease();
     },
     async refresh() { stopPolling(null); await readStatus({ auto: false }); },
-    startOver() { stopPolling(null); store.clear(); st = null; last = null; price = null; retry = null; setNotice(null); view(); }
+    startOver() { stopPolling(null); store.clear(); st = null; last = null; price = null; retry = null; unreadable = false; setNotice(null); view(); }
   };
 }
 
@@ -308,7 +344,7 @@ export function startApp(doc, win) {
         for (const l of v.price.lines) { const li = doc.createElement("li"); li.textContent = `${l.label}: ${formatMoney(l.amountMinor, v.price.currency)}`; p.append(li); }
         const t = doc.createElement("li"); t.className = "total"; t.textContent = `Total (server price, TEST): ${formatMoney(v.price.totalMinor, v.price.currency)}`; p.append(t);
       }
-      show("mv-create", v.screen === "create"); show("mv-details", v.screen === "details"); show("mv-pay", v.screen === "pay");
+      show("mv-create", v.screen === "create"); show("mv-details", v.screen === "details"); show("mv-pay", v.screen === "pay" || (v.retry === "details" && v.canPay));
       show("mv-release", v.screen === "authorized"); show("mv-restart", !["create", "loading", "redirecting", "createUncertain"].includes(v.screen));
       show("mv-ack-create", v.screen === "createUncertain");
       const rb = $("mv-retry-btn"); rb.hidden = !v.retry;
