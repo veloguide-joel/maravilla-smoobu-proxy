@@ -4,6 +4,17 @@ Status: preparation only. **Nothing here is approval.** No database query, Verce
 
 **Labels.** **[obs]** observed (date / source). **[hist]** historical report only, not current state. **[repo]** read from the repo at `6d703acd`. **[owner]** needs the owner. **[gap]** needs reviewed code before use.
 
+> **Corrections after root review of `d7476990` (2026-11-05).** Infrastructure execution stays CLOSED. No protection exception is authorized.
+> - Gap C is implemented: branch `feature/e7-checkout-test-cleanup-runner` `a522bfc6`, runner `claude/e7-checkout-test-cleanup.md`.
+> - Gap P is implemented: branch `feature/e7-preview-config` `6d00d0d6`, 2 files.
+> - The deployment branch `e7-test` is NOT created.
+> - Hosted schema and the exact Vercel alias stay **unverified until observed**.
+> - §2 / §3 now have distinct PRE and POST assertions.
+> - A missing auto-preview is a diagnosable deployment issue (a separately authorized manual deploy stays possible).
+> - The salt and the CA no longer need Joel.
+> - No new restricted Stripe key: the existing approved `sk_test_` credential is owner-entered later.
+> - Route B is preferred, so there is no owner terminal; its script generation / review is a separate offline step, and nothing is executed now.
+
 ## 0. Fixed inputs
 
 | Item | Value |
@@ -63,7 +74,7 @@ SELECT (SELECT count(*) FROM booking.intents) AS intents, (SELECT count(*) FROM 
 ROLLBACK;
 ```
 
-**Expected baseline, all of these or STOP:**
+**PRE (before any upgrade) expected baseline, all of these or STOP:**
 - `env = test`, 1 instance row, PG 17.x, `btree_gist` present;
 - applied history is exactly 1–5, with the five recorded checksums and environment `test` each;
 - `t0006` / `t0011` / `t0016` are NULL;
@@ -76,7 +87,7 @@ Anything else (a version > 5, any data row, another login, a different checksum)
 
 Two routes; the package picks ONE.
 
-- **Route A (preferred; the reviewed runner itself).** The owner runs it in a private terminal with the migration credential, the same way as Smoke 1:
+- **Route A (fallback only; owner terminal).** The reviewed runner itself, run in a private terminal with the migration credential, the same way as Smoke 1:
   ```
   # from a clean checkout of 6d703acdcfa205138d1ce4ba65b2ec58fc9493c9, Node 22, CA file prod-ca-2021.crt (SHA-256 700723…f3b7)
   node scripts/db-migrate.mjs status --env test --url-env MV_DEV_DB_URL --allow-remote --ca-file prod-ca-2021.crt   # expect applied [1..5], pending [6..16]
@@ -86,12 +97,19 @@ Two routes; the package picks ONE.
   - The runner re-verifies the history and checksums under an advisory lock before every version. It applies one transaction per migration and stops at the first error, leaving the earlier versions committed.
   - `status` runs `CREATE SCHEMA/TABLE IF NOT EXISTS` and `REVOKE ... FROM PUBLIC` on the existing bookkeeping. These are no-ops, but not strictly read-only, which is why D1 is plain SQL.
   - **[owner]** This needs the owner's migration credential (`MV_DEV_DB_URL`) in his own terminal. It is never given to Claude.
-- **Route B (no credential handling; the 0001–0005 precedent).** SQL-editor scripts are generated offline at `6d703acd` with the recorded generator recipe (`e2c-tools/gen-editor-scripts.mjs`, SHA-256 `e3ea1ffc…c4fb7`; evidence `claude/evidence/e2c-preflight-evidence-2026-10-21.txt`). Each script wraps one migration verbatim with the same advisory lock, prior-version checksum / environment / order guard and history INSERT.
+- **Route B (PREFERRED: no owner terminal, no credential handling; the 0001–0005 precedent).** SQL-editor scripts are generated offline at `6d703acd` with the recorded generator recipe (`e2c-tools/gen-editor-scripts.mjs`, SHA-256 `e3ea1ffc…c4fb7`; evidence `claude/evidence/e2c-preflight-evidence-2026-10-21.txt`). Each script wraps one migration verbatim with the same advisory lock, prior-version checksum / environment / order guard and history INSERT.
   - Before any Run, root reviews each script's SHA-256, and the editor content is hash-checked.
   - One Run per script, 06 → 16. Stop at the first error; never re-run.
   - **[gap]** The generator is not committed, so its regeneration and hash review are an offline step before this route.
 
-**Verification after D2:**
+**POST (after D2) expected, all of these or STOP** (re-run the §2 SELECTs; the PRE expectations for history and new tables do NOT apply):
+- `env = test`, 1 instance row;
+- applied history exactly 1–16, with the §1 checksums (1–5 unchanged) and environment `test` each;
+- `t0006` / `t0011` / `t0016` are NOT NULL;
+- roles unchanged (same NOLOGIN groups; `mv_booking_app_dev` LOGIN, member of `mv_booking_app` only);
+- every data count is still 0.
+
+**Then:**
 - the D1 SELECTs again (history 1–16 with the table above, `env = test`, 0 data rows);
 - then the existing read-only smoke from `6d703acd`, whose privilege matrix covers through 0016, run by the owner as before:
   ```
@@ -103,7 +121,8 @@ Two routes; the package picks ONE.
 
 - **Branch.** `e7-test`, a new branch at the exact reviewed checkout head plus ONE reviewed preview-config commit (§7, [gap] P). No merge to main.
   - The alias stays short, so it is not truncated: `https://maravilla-smoobu-proxy-git-e7-test-joel-goralskis-projects.vercel.app` (58-character label). Name free [obs 2026-11-05].
-  - Verify after the push that Vercel built a READY preview for exactly that sha. Recent accepted heads had none [obs], so a missing build is a STOP, not a manual deploy.
+  - Verify after the push that Vercel built a READY preview for exactly that sha, and observe the real alias before entering any origin / return URL. The alias above is the expected form, **unverified**.
+  - Recent accepted heads had no auto-preview [obs]. A missing build is a diagnosable deployment issue: report it. A manual deploy of that exact sha needs its own approval; it is not banned.
 - **Env** (Vercel → Settings → Environment Variables, **Preview, Git branch = `e7-test` only**). Production and Development are untouched.
 
 | name | value | kind |
@@ -120,14 +139,15 @@ Two routes; the package picks ONE.
 | `BOOKING_DATABASE_URL` | `postgresql://mv_booking_app_dev.mxotevtiscernhqilyiu:<owner>@aws-0-us-east-1.pooler.supabase.com:6543/postgres` (runtime login only, transaction pooler) | **secret, [owner]** |
 | `STRIPE_TEST_SECRET_KEY` | a TEST key of `acct_1TyHE42B9LTneQgw` (`sk_test_…` or a restricted `rk_test_…`) | **secret, [owner]** |
 | `STRIPE_TEST_WEBHOOK_SECRET` | the signing secret of the §5 endpoint (`whsec_…`) | **secret, [owner]** |
-| `MV_RATE_LIMIT_SALT` | 32–256 random characters | **secret, [owner]** |
+| `MV_RATE_LIMIT_SALT` | 48 random bytes, base64 (CSPRNG) | secret, **not Joel**: generated and written by the approved infra step without display (mechanism in §9 step 5) |
 
 - **Already present and reused** [obs]: `HOSTAWAY_ACCOUNT_ID`, `HOSTAWAY_CLIENT_SECRET` (Preview + Development) for the read-only pricing of 606998; `HOSTAWAY_DIAG_KEY`, `BOOKING_UI_ORIGINS`. **Left unset:** `MV_CLIENT_ADDRESS_SOURCE` (default `none`), `BOOKING_RETENTION_*` (code defaults).
 - **Secrets, reuse vs new.**
   - The GitHub environment secret `E7_STRIPE_TEST_KEY` cannot be copied into Vercel by anyone but the owner. Its value is never read or moved.
   - The DB password of `mv_booking_app_dev` exists (set by the owner on 2026-10-22) and is reused as is; no new role.
   - The webhook secret only exists once §5 is done.
-  - Recommended: one restricted `rk_test_` key for the preview, with Checkout Sessions write and PaymentIntents read. The release request makes no provider call; the void is done by the cleanup runner (§6) with the existing GitHub key. Whether a restricted key can read `GET /v1/account` (used by `verifyAccount`) is **unverified**; if not, use an `sk_test_` key.
+  - `STRIPE_TEST_SECRET_KEY`: the existing approved `sk_test_` credential of `acct_1TyHE42B9LTneQgw`, owner-entered later (no new restricted key, no account test).
+  - The CA is public and pinned by SHA-256, so Claude enters it after the hash check.
   - No value is entered or shown by Claude.
 
 ## 5. Stripe TEST webhook and the protection path
@@ -153,7 +173,7 @@ Two routes; the package picks ONE.
   - `scripts/e7-connected/run-core.mjs` is an offline core: no CLI, transport, credential or journal.
   - Nothing runs the worker against DEV / Stripe today.
   - Without it, a released TEST authorization stays `reservation_failed`, with the void queued and the claim held, until Stripe expires the hold (about 7 days). **Not ready.**
-- **Smallest proposed slice [gap] C** (main-side runner, the evidence-runner pattern; no E7 merge to main):
+- **Implemented offline as `a522bfc6` (awaiting root code review); the design below is as proposed.** Smallest slice C (main-side runner, the evidence-runner pattern; no E7 merge to main):
   - `scripts/e7-checkout-test-cleanup.mjs` + `test/…` + DRAFT `.github/workflows/e7-checkout-test-cleanup.yml` + note.
   - The workflow checks out the accepted E7 lineage (`6d703acd` or its reviewed successor) as fixed "tooling", verifies a framed digest of the cleanup closure before import, and runs **`runCleanupStep` for ONE named intent id**, bounded to ≤ 8 steps, which is at most ONE void plus reads.
   - Executors: Stripe via accepted T (`accounts.retrieve`, `paymentIntents.retrieve` with expanded charge, `paymentIntents.cancel` with the worker's `void:` idempotency key). The Hostaway keys are refusing stubs; a release has no reservation, and a call fails closed.
@@ -163,7 +183,7 @@ Two routes; the package picks ONE.
   - **Output:** whitelisted codes, intent status, void op state, claim released yes/no, sends count.
 - Scope estimate: 4 new files on a new branch from main. Implementation awaits root scope approval.
 
-## 7. Preview-config commit P [gap] (2 files on branch `e7-test`)
+## 7. Preview-config commit P (implemented: `feature/e7-preview-config` `6d00d0d6`, from `d7476990`; root reviews separately)
 
 - `public/checkout-test.html`: `<meta name="mv-test-terms-version" content="test-terms-2026-11">`.
 - `test/e7-checkout-test-page.test.mjs:210`: the pin changes from `content=""` to exactly that value, i.e. the TEST label, documented as a deployment input.
@@ -181,12 +201,12 @@ Two routes; the package picks ONE.
 | # | action | who | stop condition |
 |---|---|---|---|
 | 1 | D1 read-only SQL on `mxotevtiscernhqilyiu` | Claude (owner's signed-in dashboard) | any value ≠ §2 baseline |
-| 2 | D2 upgrade 6 → 16 by the chosen route, then D1 again plus the read-only smoke | owner terminal (A) or Claude editor scripts (B); smoke by owner | first error; history ≠ 1–16; smoke not all PASS |
+| 2 | D2 upgrade 6 → 16 by Route B (reviewed editor scripts), then the POST assertions plus the read-only smoke | Claude (editor scripts); smoke run needs the runtime credential, so it is an open item | first error; any POST assertion fails; smoke not all PASS |
 | 3 | Push `e7-test` = reviewed head + P; confirm one READY preview for that sha | Claude (root-reviewed push) | no build / wrong sha |
 | 4 | Branch-scoped Preview env: the 9 non-secret names (§4) | Claude | — |
-| 5 | Branch-scoped Preview env: 4 secrets | **owner** | — |
+| 5 | Branch-scoped Preview env secrets: `BOOKING_DATABASE_URL`, `STRIPE_TEST_SECRET_KEY` (existing approved `sk_test_`), `STRIPE_TEST_WEBHOOK_SECRET` (**owner**); `MV_RATE_LIMIT_SALT` generated without display by the approved step (concrete mechanism to be fixed in review: Claude's browser rules bar typing secret values into fields) | owner / approved step | — |
 | 6 | Stripe TEST webhook endpoint (§5) → owner enters its secret (step 5) | **owner** | — |
-| 7 | Protection Exception for exactly the `e7-test` alias | Claude in the owner's Vercel session (or owner) | any other domain listed |
+| 7 | Protection path for the webhook (exception for exactly the observed `e7-test` alias, or the bypass alternative); **NOT authorized**, separate decision | per decision | any other domain listed |
 | 8 | Redeploy the `e7-test` preview once, so the env applies; read-only checks: `/checkout-test.html` 200 with the meta; `GET /api/checkout/stripe-webhook` unauthenticated → `405 METHOD_NOT_ALLOWED` (gate passed and the domain is reachable; `404 NOT_FOUND` = gate not satisfied; a Vercel login page = protection still on); `GET /api/checkout/intents` without a token → any code but `404 NOT_FOUND`. No POST, so no intent is created | Claude | 404, a login page, or a 5xx |
 | 9 | GitHub env secret for the cleanup runner's DB URL (needs C merged) | **owner** | — |
 
