@@ -55,13 +55,13 @@ else if (a[0] === "execute") { const cp = a[a.indexOf("--credentials") + 1]; con
   appendFileSync(ctl.record, JSON.stringify(rec) + "\\n");
   if (ctl.stderr) process.stderr.write(ctl.stderr);
   if (ctl.rawStdout !== undefined) { process.stdout.write(ctl.rawStdout); process.exit(0); }
-  const probe = (id) => ({ id: H ?? id, outcome: H ?? "OK", code: H ?? ctl.probeCode ?? "PROBE_OK", httpStatus: id === "P-H1" ? 200 : null, transportCode: H ?? null, evidence: { secret: "x" } });
+  const probe = (id) => ({ id: H ?? id, outcome: H ?? "OK", code: H ?? ctl.probeCode ?? "PROBE_OK", httpStatus: id === "P-H2" ? 200 : null, transportCode: H ?? null, evidence: { secret: "x" } });
   const ex = ctl.execEnvelope ?? {};
   const exitCode = ex.exitCode ?? 0;
   process.stdout.write(JSON.stringify({ schema: "e7-probe-cli-stdout-v1", exitCode, primaryOutcome: H ?? ex.primaryOutcome ?? "CLI_COMPLETED_OK", tailUncertain: ex.tailUncertain ?? false,
     output: { summaryFile: H ?? ex.summaryFile ?? "CLOSED_ACK", summaryCloseState: H ?? "CLOSED" }, payload: { preflight: { code: H ?? "ENV_OK" }, source: { sourceDigest: H ?? ctl.digest },
-    plan: { planHash: H ?? a[a.indexOf("--expect-plan-hash") + 1] }, credential: { code: H ?? "CRED_OK", closeState: H ?? "CLOSED" }, requestsAttempted: 2,
-    summary: { outcome: H ?? "COMPLETED", probes: [probe("P-H1"), probe("P-S1")], gates: H ? { [H]: H, G_FILTER: H } : { G_SHAPE_listing: "OBSERVED", G_FILTER: "NOT_PROBED" } },
+    plan: { planHash: H ?? a[a.indexOf("--expect-plan-hash") + 1] }, credential: { code: H ?? "CRED_OK", closeState: H ?? "CLOSED" }, requestsAttempted: 3,
+    summary: { outcome: H ?? "COMPLETED", probes: [probe("P-H2"), probe("P-S1"), probe("P-S2")], gates: H ? { [H]: H, G_FILTER: H } : { G_SHAPE_listing: "OBSERVED", G_FILTER: "NOT_PROBED" } },
     finalize: { tail: H ?? "NONE" } } }) + "\\n");
   end("execute", exitCode); }
 else process.exit(2);
@@ -93,25 +93,27 @@ const leftovers = (w) => readdirSync(w.runnerTemp);
 const clean = (r, extra = []) => { const s = JSON.stringify(r.result) + W.summaryMarkdown(r.result); for (const x of [TOKEN, KEY, "/tmp", ...extra]) assert.ok(!s.includes(x), `leak ${x}`); };
 
 test("H1 mode defaults / usage; import is inert; accepted constants are the fixed reviewed values", async () => {
-  assert.equal(W.CONSTANTS.sourceDigest, "23212caabf508f0aa929a2c3beb9f6f216b0cc3bc697cd783ba7ed203e21ce3d");
-  assert.equal(W.CONSTANTS.toolingCommit, "d1e20d71ecf15f82d2d3b74fd22eb562eaa310f8"); assert.equal(W.CONSTANTS.listingId, 606998);
-  assert.equal(W.CONSTANTS.sourceClosure.length, 13); assert.deepEqual([...W.CONSTANTS.probes], ["P-H1", "P-S1"]);
-  assert.deepEqual({ ...W.CONSTANTS.limits }, { perProbeMs: 10000, runMs: 30000, tailMs: 5000 }); assert.equal(W.CONSTANTS.stripeVersion, "2026-08-26.dahlia");
+  assert.equal(W.CONSTANTS.sourceDigest, "19b99e6f97cff5d8e405b3b52feff99f441445796b9651a719ffca046d8069f0");
+  assert.equal(W.CONSTANTS.toolingCommit, "43ef79cab2c928e2aad19e77258b4b31116ff7c0"); assert.equal(W.CONSTANTS.listingId, 606998);
+  assert.equal(W.CONSTANTS.sourceClosure.length, 13); assert.deepEqual([...W.CONSTANTS.probes], ["P-H2", "P-S1", "P-S2"]); assert.equal(W.CONSTANTS.maxRequests, 3);
+  assert.deepEqual({ ...W.CONSTANTS.calendar }, { startDate: "2027-01-18", endDate: "2027-01-20" }); assert.equal(W.CONSTANTS.paymentIntentId, "pi_3UYqhH2B9LTneQgw1Q0IoYtz");
+  assert.deepEqual({ ...W.CONSTANTS.limits }, { perProbeMs: 10000, runMs: 30000, tailMs: 5000 }); assert.equal(W.CONSTANTS.stripeVersion, "2026-01-28.clover");
   const w = world(); const d = await W.runWrapper({ env: w.env(), spawnChild: W.spawnNode, constants: w.constants });
   assert.equal(d.result.mode, "preflight");
   const u = await run(w, "bogus"); assert.equal(u.result.code, "HOSTED_USAGE"); assert.equal(u.exitCode, 1);
 });
 
-test("H2 preflight without an account: labelled SYNTHETIC plan only (listing 606998, P-H1 + P-S1, fixed limits); E1 run; no execute; children get no E7_* env and no Node flags", async () => {
+test("H2 preflight without an account: labelled SYNTHETIC plan only (listing 606998, P-H2 + P-S1 + P-S2, fixed calendar / PI / limits); E1 run; no execute; children get no E7_* env and no Node flags", async () => {
   const w = world(); const r = await run(w, "preflight");
   assert.equal(r.result.code, "PREFLIGHT_OK_SYNTHETIC_ONLY"); assert.equal(r.exitCode, 0); assert.equal(r.result.planKind, "SYNTHETIC");
   assert.equal(r.result.sourceDigest, w.digest); assert.deepEqual({ ...r.result.e1, connectivityEvidence: false }, r.result.e1); assert.equal(r.result.e1.status, 0); assert.equal(r.result.e1.pass, 1);
   const recs = w.records(); assert.deepEqual(recs.map((x) => x.argv0), ["prepare-plan", "inspect"]);
   assert.ok(recs.every((x) => x.envHasE7 === false && x.execArgvLen === 0));
-  const p = recs[0].plan; assert.equal(p.hostaway.listingId, 606998); assert.deepEqual(p.probes, ["P-H1", "P-S1"]); assert.equal(p.stripe.accountId, W.CONSTANTS.synthetic.accountId);
+  const p = recs[0].plan; assert.equal(p.hostaway.listingId, 606998); assert.deepEqual(p.probes, ["P-H2", "P-S1", "P-S2"]); assert.equal(p.stripe.accountId, W.CONSTANTS.synthetic.accountId);
   assert.equal(p.metadata.approvalRef, W.CONSTANTS.synthetic.approvalRef); assert.deepEqual(p.limits, { perProbeMs: 10000, runMs: 30000, tailMs: 5000 });
-  assert.deepEqual([p.hostaway.calendar, p.hostaway.lookup, p.hostaway.sample, p.hostaway.control, p.stripe.paymentIntentId], [null, null, null, null, null]);
-  assert.equal(p.metadata.stripeVersion, "2026-08-26.dahlia"); assert.equal(p.metadata.nodeVersion, "22.22.0");
+  assert.deepEqual([p.hostaway.calendar, p.hostaway.lookup, p.hostaway.sample, p.hostaway.control, p.stripe.paymentIntentId],
+    [{ startDate: "2027-01-18", endDate: "2027-01-20" }, null, null, null, "pi_3UYqhH2B9LTneQgw1Q0IoYtz"]);
+  assert.equal(p.metadata.stripeVersion, "2026-01-28.clover"); assert.equal(p.metadata.nodeVersion, "22.22.0");
   assert.deepEqual(leftovers(w), []); clean(r);
   const f = world({ e1Fail: true }); const rf = await run(f, "preflight"); assert.equal(rf.result.code, "HOSTED_E1_FAILED"); assert.deepEqual(f.records(), []);
 });
@@ -160,7 +162,10 @@ test("H6 planHash / env / scope mismatches refuse AFTER inspect but BEFORE any c
   const d = world({ digest: "f".repeat(64) }); const rd = await run(d, "preflight"); assert.equal(rd.result.code, "HOSTED_SOURCE_MISMATCH");     // inspect-reported digest must match too
   const i = world({ inspectExit: 4 }); assert.equal((await run(i, "preflight")).result.code, "HOSTED_INSPECT_FAILED");
   // fixed scope: a protected or changed listing / probe list refuses in the plan builder
-  for (const over of [{ listingId: 70636076 }, { probes: ["P-H1", "P-H2"] }, { probes: ["P-H1"] }])
+  for (const over of [{ listingId: 70636076 }, { probes: ["P-H1", "P-S1"] }, { probes: ["P-H2", "P-S1"] }, { probes: ["P-S1", "P-S2"] }, { probes: ["P-H2", "P-S2", "P-S1"] },
+    { probes: ["P-H1", "P-H2", "P-S1", "P-S2"] }, { maxRequests: 2 }, { maxRequests: 4 }, { calendar: { startDate: "2027-01-17", endDate: "2027-01-20" } },
+    { calendar: { startDate: "2027-01-18", endDate: "2027-01-21" } }, { calendar: null }, { paymentIntentId: "pi_3SomeOtherIntent00000" }, { paymentIntentId: null },
+    { stripeVersion: "2026-08-26.dahlia" }])
     assert.throws(() => W.buildPlan({ ...W.CONSTANTS, ...over }, ACCT, REF), (x) => x.code === "HOSTED_SCOPE_INVALID");
 });
 
@@ -173,10 +178,10 @@ test("H7 execute (FAKE CLI child): private 0600 credential file in a fresh 0700 
   assert.equal(ex.envHasE7, false); assert.equal(ex.execArgvLen, 0);
   assert.ok(ex.credPath.startsWith(`${w.runnerTemp}/`) && !ex.credPath.startsWith(w.tooling) && !ex.credPath.startsWith(w.workspace));
   assert.deepEqual(ex.args, ["execute", "--plan", "<path>", "--credentials", "<path>", "--summary-out", "<path>", "--expect-plan-hash", h, "--expect-source-digest", w.digest,
-    "--expect-requests", "2", "--approval-ref", REF]);
+    "--expect-requests", "3", "--approval-ref", REF]);
   assert.ok(!existsSync(ex.credPath)); assert.deepEqual(leftovers(w), []);                                              // job-owned temp removed
-  const e = r.result.execute; assert.equal(e.primaryOutcome, "CLI_COMPLETED_OK"); assert.equal(e.summaryFile, "CLOSED_ACK"); assert.equal(e.requestsAttempted, 2);
-  assert.deepEqual(e.probes.map((p) => p.id), ["P-H1", "P-S1"]); assert.ok(!JSON.stringify(e).includes("evidence"));     // only the reviewed projection
+  const e = r.result.execute; assert.equal(e.primaryOutcome, "CLI_COMPLETED_OK"); assert.equal(e.summaryFile, "CLOSED_ACK"); assert.equal(e.requestsAttempted, 3);
+  assert.deepEqual(e.probes.map((p) => p.id), ["P-H2", "P-S1", "P-S2"]); assert.ok(!JSON.stringify(e).includes("evidence"));     // only the reviewed projection
   clean(r, [ACCT]);
 });
 
@@ -203,7 +208,7 @@ test("H9 workflow static pins: manual dispatch only, contents:read, pinned offic
   assert.match(y, /\npermissions:\n {2}contents: read\n\n/); assert.match(y, /cancel-in-progress: false/);
   const uses = y.match(/uses: \S+/g); assert.deepEqual([...new Set(uses)].sort(), ["uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803", "uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38"]);
   assert.equal((y.match(/persist-credentials: false/g) || []).length, (y.match(/actions\/checkout@/g) || []).length);
-  assert.equal((y.match(/ref: d1e20d71ecf15f82d2d3b74fd22eb562eaa310f8/g) || []).length, 2);
+  assert.equal((y.match(/ref: 43ef79cab2c928e2aad19e77258b4b31116ff7c0/g) || []).length, 2); assert.ok(!y.includes("d1e20d71"));
   assert.equal((y.match(/node-version: "22\.22\.0"/g) || []).length, 2); assert.equal((y.match(/runs-on: ubuntu-24\.04/g) || []).length, 2);
   assert.match(y, /environment: e7-readonly-probe/); assert.match(y, /if: inputs\.mode == 'execute' && github\.ref == 'refs\/heads\/main'/);
   // secrets appear only in the last step's env block
@@ -273,7 +278,7 @@ test("R-H2 exact vocabularies: a plain-ASCII token / key planted in EVERY publis
   assert.equal(ri.result.code, "HOSTED_ENV_REFUSED"); assert.ok(!(JSON.stringify(ri.result) + W.summaryMarkdown(ri.result)).includes(TOKEN));
   // valid evidence stays useful
   const ok = world(); const h = await realPlanHash(ok); const r = await run(ok, "execute", execEnv(ok, h));
-  assert.equal(r.result.code, "EXECUTE_COMPLETED_OK"); assert.deepEqual(r.result.execute.probes.map((p) => [p.id, p.outcome, p.code]), [["P-H1", "OK", "PROBE_OK"], ["P-S1", "OK", "PROBE_OK"]]);
+  assert.equal(r.result.code, "EXECUTE_COMPLETED_OK"); assert.deepEqual(r.result.execute.probes.map((p) => [p.id, p.outcome, p.code]), [["P-H2", "OK", "PROBE_OK"], ["P-S1", "OK", "PROBE_OK"], ["P-S2", "OK", "PROBE_OK"]]);
   assert.deepEqual(r.result.execute.gates, { G_SHAPE_listing: "OBSERVED", G_FILTER: "NOT_PROBED" }); assert.equal(r.result.execute.planHash, h);
 });
 test("R-H2 parity: the copied vocabularies equal the accepted tooling exports (runs only where the accepted tooling checkout is available)", { skip: !process.env.E7_PARITY_TOOLING_DIR }, async () => {
@@ -296,4 +301,18 @@ test("R-H3 the reserved SYNTHETIC account or label can never qualify a REAL plan
     }
     const wp = world(); const rp = await run(wp, "preflight", { E7_STRIPE_ACCOUNT_ID: acct, E7_APPROVAL_REF: ref }); assert.equal(rp.result.code, "HOSTED_INPUT_INVALID"); assert.deepEqual(wp.records(), []);
   }
+});
+
+test("G6B real tooling (runs only where the accepted Clover tooling checkout is available): the wrapper's REAL plan and SYNTHETIC plan validate under the accepted validator with exactly P-H2 → P-S1 → P-S2 and Stripe-Version 2026-01-28.clover; the checkout's closure digest equals the pinned sourceDigest; Dahlia is refused", { skip: !process.env.E7_PARITY_TOOLING_DIR }, async () => {
+  const d = process.env.E7_PARITY_TOOLING_DIR;
+  const P = await import(`${d}/scripts/e7-connected/readonly-probe.mjs`);
+  assert.equal(P.STRIPE_VERSION_CANDIDATE, "2026-01-28.clover");
+  assert.equal(await W.closureDigest(d, W.CONSTANTS.sourceClosure), W.CONSTANTS.sourceDigest);
+  for (const [acct, ref] of [[ACCT, REF], [W.CONSTANTS.synthetic.accountId, W.CONSTANTS.synthetic.approvalRef]]) {
+    const v = P.validateProbePlan(W.buildPlan(W.CONSTANTS, acct, ref));
+    assert.equal(v.ok, true, v.code); assert.deepEqual([...v.plan.probes], ["P-H2", "P-S1", "P-S2"]); assert.equal(v.plan.metadata.stripeVersion, "2026-01-28.clover");
+    assert.deepEqual({ ...v.plan.hostaway.calendar }, { startDate: "2027-01-18", endDate: "2027-01-20" }); assert.equal(v.plan.stripe.paymentIntentId, "pi_3UYqhH2B9LTneQgw1Q0IoYtz");
+  }
+  const dahlia = { ...W.buildPlan(W.CONSTANTS, ACCT, REF) }; dahlia.metadata = { ...dahlia.metadata, stripeVersion: "2026-08-26.dahlia" };
+  assert.equal(P.validateProbePlan(dahlia).code, "PLAN_STRIPE_VERSION");
 });
