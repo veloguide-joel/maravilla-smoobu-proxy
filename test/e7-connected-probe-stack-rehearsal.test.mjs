@@ -35,7 +35,7 @@ after(() => {
 });
 
 // ---- SYNTHETIC values -------------------------------------------------------------------------------------------------------------
-const HTOKEN = "synthetic-hostaway-token"; const SKEY = "sk_test_Fake1"; const VERSION = "2026-08-26.dahlia";
+const HTOKEN = "synthetic-hostaway-token"; const SKEY = "sk_test_Fake1"; const VERSION = "2026-01-28.clover";
 const L = 871001; const L1 = 871001; const L2 = 871002; const R1 = "6100001"; const R2 = "6100002"; const ACCT = "acct_1SyntheticProbe"; const PI = "pi_test_syntheticProbe1";
 const SENT = ["SENTINEL_GUEST_NAME", "sentinel.guest@mv-test.invalid", "SENTINEL_TITLE", "SENTINEL_PROVIDER_TEXT"];
 const tick = () => new Promise((r) => setImmediate(r));
@@ -167,7 +167,7 @@ test("R1. default approved-inventory-shaped plan (P-H3 excluded) through P → T
     const o = req.options; const isH = o.hostname === "api.hostaway.com";
     assert.deepEqual(Object.keys(o.headers).sort(), isH ? ["Accept", "Authorization", "Cache-control"] : ["Authorization", "Stripe-Version"], "GET: no body headers / Content-Length");
     assert.equal(o.headers.Authorization, `Bearer ${isH ? HTOKEN : SKEY}`, "synthetic Bearer only");
-    if (!isH) assert.equal(o.headers["Stripe-Version"], "2026-08-26.dahlia", "the fixed proposed version header");
+    if (!isH) assert.equal(o.headers["Stripe-Version"], "2026-01-28.clover", "the fixed proposed version header");
     assert.deepEqual([o.method, o.port, o.servername, o.rejectUnauthorized, o.insecureHTTPParser, o.maxHeaderSize, req.endCalls, req.endArgs.length], ["GET", 443, o.hostname, true, false, 16384, 1, 0]);
     assert.deepEqual(o.agent.opts, { keepAlive: false, maxSockets: 1, maxCachedSessions: 0 });
   }
@@ -271,4 +271,51 @@ test("R4. evidence qualification through the full stack: card without capture_be
     assert.deepEqual([p["P-H5"].code, p["P-H6"].code, sum.gates.G_FILTER, r.fx.reqs.length], ["PROBE_OK", "PROBE_CONTROL_OVERLAP", "OPEN", 4]);
     assertSafe(sum, pl); await assertClean(r.fx);
   }
+});
+
+// ===== G6B (OFFLINE, test-only): the exact proposed hosted scope P-H2 + P-S1 + P-S2 through the REAL P → T → X stack ==============
+// Plan values = the proposed G6B package: listing 606998, calendar 2027-01-18 → 2027-01-20, the canceled Run-3 TEST PaymentIntent id.
+// Every REPLY is FAKE / SYNTHETIC (labelled): nothing here is a claim about a real provider shape for Stripe-Version 2026-01-28.clover.
+const G6B = Object.freeze({ listingId: 606998, startDate: "2027-01-18", endDate: "2027-01-20", pi: "pi_3UYqhH2B9LTneQgw1Q0IoYtz" });
+const g6bPlan = () => plan({ hostaway: { listingId: G6B.listingId, calendar: { startDate: G6B.startDate, endDate: G6B.endDate }, lookup: null, sample: null, control: null },
+  stripe: { accountId: ACCT, paymentIntentId: G6B.pi }, probes: ["P-H2", "P-S1", "P-S2"], limits: { perProbeMs: 10000, runMs: 30000, tailMs: 5000 } });
+const g6bCalendar = { status: "success", result: [G6B.startDate, "2027-01-19", G6B.endDate].map((date) => ({ date, isAvailable: 1, status: "available", minimumStay: 1, maximumStay: 90 })) };
+const g6bRoute = (o) => {
+  const u = new URL(`https://${o.hostname}${o.path}`);
+  if (o.hostname === "api.stripe.com") return { status: 200, json: u.pathname === "/v1/account" ? account : { ...piObj(), id: G6B.pi, status: "canceled", amount_capturable: 0,
+    latest_charge: { ...piObj().latest_charge, payment_intent: G6B.pi, status: "succeeded", captured: false } } };
+  if (u.pathname === `/v1/listings/${G6B.listingId}/calendar`) return { status: 200, json: g6bCalendar };
+  return { status: 404, json: { status: "fail" } };
+};
+test("R5. G6B exact scope: ≤ 3 GETs in order P-H2 → P-S1 → P-S2 (exact listing / dates / PI), Stripe-Version 2026-01-28.clover ON THE WIRE, no POST / mint / capture / booking, one request per probe, no retry; P-S1 failure stops P-S2; P-H2 failure stops both; safe summary", async () => {
+  const pl = g6bPlan();
+  assert.equal(pl.metadata.stripeVersion, "2026-01-28.clover");
+  const r = runStack(pl, g6bRoute); const sum = await r.result;
+  assert.deepEqual(r.fx.log.map((e) => `${e.method} ${e.host}${e.path}`), [
+    `GET api.hostaway.com/v1/listings/606998/calendar?endDate=2027-01-20&startDate=2027-01-18`, "GET api.stripe.com/v1/account",
+    "GET api.stripe.com/v1/payment_intents/pi_3UYqhH2B9LTneQgw1Q0IoYtz?expand%5B%5D=latest_charge"], "exactly the 3 proposed GETs, in order");
+  assert.deepEqual(r.fx.log.filter((e) => e.host === "api.stripe.com").map((e) => e.version), ["2026-01-28.clover", "2026-01-28.clover"], "the Clover header is what is SENT");
+  assert.ok(r.fx.log.every((e) => e.method === "GET" && !/accessTokens|capture|cancel|reservations|refund|charges/.test(e.path)), "no POST, token mint, capture, cancel, booking, refund");
+  assert.deepEqual([r.fx.reqs.length, r.fx.agents.length], [3, 3], "one request + one Agent per probe; no retry / follow-up");
+  assert.deepEqual(sum.probes.map((x) => x.id), ["P-H2", "P-S1", "P-S2"]);
+  assert.ok(sum.probes.every((x) => P.CODES.probe.includes(x.code)), JSON.stringify(sum.probes.map((x) => x.code)));
+  const txt = JSON.stringify(sum);
+  for (const s of [...SENT, HTOKEN, SKEY, ACCT, G6B.pi, "ch_test_1", "api.hostaway.com", "api.stripe.com", "2027-01-19"]) assert.ok(!txt.includes(s), `leak: ${s}`);
+  await assertClean(r.fx);
+  // P-S1 refused (Stripe 401) → P-S2 never dispatched
+  { const r2 = runStack(g6bPlan(), (o) => (o.path === "/v1/account" ? { status: 401, json: { error: { message: SENT[3] } } } : g6bRoute(o))); const s2 = await r2.result; const p = byId(s2);
+    assert.equal(p["P-S1"].outcome, "STOP"); assert.deepEqual([p["P-S2"].outcome, p["P-S2"].code], ["NOT_RUN", "AFTER_STOP"]);
+    assert.equal(r2.fx.reqs.length, 2); assert.ok(!r2.fx.log.some((e) => e.path.includes(G6B.pi)), "the PI was never requested"); await assertClean(r2.fx); }
+  // P-S1 account mismatch → P-S2 never dispatched
+  { const r3 = runStack(g6bPlan(), (o) => (o.path === "/v1/account" ? { status: 200, json: { ...account, id: "acct_1SomebodyElse" } } : g6bRoute(o))); const s3 = await r3.result; const p = byId(s3);
+    assert.equal(p["P-S1"].outcome, "STOP"); assert.equal(p["P-S2"].code, "AFTER_STOP"); assert.equal(r3.fx.reqs.length, 2); await assertClean(r3.fx); }
+  // P-H2 refused → nothing after it
+  { const r4 = runStack(g6bPlan(), (o) => (o.hostname === "api.hostaway.com" ? { status: 403, json: { status: "fail" } } : g6bRoute(o))); const s4 = await r4.result; const p = byId(s4);
+    assert.equal(p["P-H2"].outcome, "STOP"); assert.deepEqual([p["P-S1"].code, p["P-S2"].code], ["AFTER_STOP", "AFTER_STOP"]); assert.equal(r4.fx.reqs.length, 1); await assertClean(r4.fx); }
+  // a different PI / listing / dates is a different plan (hash changes); the plan is the only source of request values
+  const g6bInput = (o = {}) => planInput({ hostaway: { listingId: G6B.listingId, calendar: { startDate: G6B.startDate, endDate: G6B.endDate }, lookup: null, sample: null, control: null },
+    stripe: { accountId: ACCT, paymentIntentId: G6B.pi }, probes: ["P-H2", "P-S1", "P-S2"], limits: { perProbeMs: 10000, runMs: 30000, tailMs: 5000 }, ...o });
+  assert.equal(P.validateProbePlan(g6bInput()).plan.planHash, pl.planHash);
+  for (const o of [{ stripe: { accountId: ACCT, paymentIntentId: "pi_3SomeOtherIntent00000" } }, { hostaway: { ...g6bInput().hostaway, calendar: { startDate: "2027-01-17", endDate: "2027-01-20" } } }])
+    assert.notEqual(P.validateProbePlan(g6bInput(o)).plan.planHash, pl.planHash);
 });

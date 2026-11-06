@@ -15,7 +15,7 @@ export const READONLY_PROBE_VERSION = "e7-readonly-probe-v1";
 export const PLAN_VERSION = "e7-probe-plan-v1";
 export const RESULT_SCHEMA = "e7-probe-result-v1";
 export const PROBE_IDS = Object.freeze(["P-H1", "P-H2", "P-H3", "P-H4", "P-H5", "P-H6", "P-S1", "P-S2"]);
-export const STRIPE_VERSION_CANDIDATE = "2026-08-26.dahlia";
+export const STRIPE_VERSION_CANDIDATE = "2026-01-28.clover";   // = CHECKOUT_STRIPE_API_VERSION (lib/checkout/intent-api-http.js) and the accepted cleanup client version
 export const NODE_VERSION_LABELS = Object.freeze(["22.22.0", "24.22.1"]);
 export const MAX_PLAN_STRING = 253;                                   // = longest accepted T id ("pi_" + 250, http-transports.mjs:343)
 /** COPIES (parity-tested): T ERROR_CODES (http-transports.mjs:35–36), RESERVATION_STATUSES (accepted Hostaway reservation adapter in lib/, :47 — filename deliberately not named here: its importer pin counts any scripts/ file containing it), charge types

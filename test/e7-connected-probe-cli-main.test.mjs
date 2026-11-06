@@ -43,7 +43,7 @@ const tick = () => new Promise((r) => setImmediate(r));
 const flush = async (n = 20) => { for (let i = 0; i < n; i++) await tick(); };
 
 // ---- SYNTHETIC values / plan ------------------------------------------------------------------------------------------------------
-const HTOKEN = "tokFake1"; const SKEY = "sk_test_Fake1"; const VERSION = "2026-08-26.dahlia";
+const HTOKEN = "tokFake1"; const SKEY = "sk_test_Fake1"; const VERSION = "2026-01-28.clover";
 const L = 871001; const ACCT = "acct_1SyntheticProbe";
 const planInput = (o = {}) => ({ version: "e7-probe-plan-v1",
   metadata: { reviewedCommit: "27c0ea1152db904f9fdeb285d0682a28cb89ac17", nodeVersion: "22.22.0", stripeVersion: VERSION, approvalRef: "synthetic-c3" },
