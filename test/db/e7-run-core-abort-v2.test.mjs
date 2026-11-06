@@ -662,3 +662,65 @@ test("M7 source pins: exact imports; no timers / env / fs / fetch / Date of its 
 const createHashHex = (b) => createHash("sha256").update(b).digest("hex");
 // lib/booking-db/test-abort.js pin: a00952ca... -> 91724d9d... (root ruling b43935f0: the scoped hostaway_reservation evidence classification).
 const PINS = {"scripts/e7-connected/run-core.mjs":"ad1dcbb29e7cb1ce0aac71ac178d903076d4e5cc293dd17f972c04b4beaa5afe","scripts/e7-connected/run-test-abort.mjs":"d0b8465b992367999f261968f986f456d25ad6a5845b07028ad95c2cc22143a3","scripts/e7-connected/run-journal-memory-v2.mjs":"0a9ad263ac6a4f505d62e21634b0161134f5263dc4caa8dcf3d2834308df4c7a","scripts/e7-connected/run-journal-memory.mjs":"2712f01b0509d343d162b5fe7055878ade40f69d668915671441b81cbf87c700","scripts/e7-connected/run-journal-file.mjs":"265af8195dccbaae34817a9a16e2f09f4498b85638fae4abb779d5b0bd9cc4b1","scripts/e7-connected/run-manifest.mjs":"c47f72eb2b9e898bdaca2ca20ffe7cea0befab006079953133810ce5651f6a56","scripts/e7-connected/run-manifest-v2.mjs":"c19ab009b00b8c3877da53f20e436c1c6d4ac29d051ab1f21705d38fcf3cc7fd","scripts/e7-connected/run-guard.mjs":"5d92cbf8a3dfb345ac876e1140ee6a2d6a27885f8bf6dcb506a5f346024e16a9","scripts/e7-connected/run-facts.mjs":"1be04496eb6617f41f8738617682eb282f2f987cb4d3fe65039892b9eddd6887","scripts/e7-connected/executor-adapters.mjs":"2ac9460fee917305c9e8b81115f1f2f006bd434e3ab8b39835bff9ffa245608e","scripts/e7-operator/test-abort.mjs":"8abcb82ba49ed4b239d2c7a0f5251bb07d24fd95fece1c6580a4cad14532bff3","lib/booking-db/test-abort.js":"91724d9dcd6c3c514eef70b5d3f4a4458b7298106b0286a797506bd99b48f852","lib/booking-db/reservation-worker.js":"601f48f67052f5dac40b83354b9cf10d5f81950ff9fe9cbd587288d19ed05e88","lib/booking-db/compensation-worker.js":"200f954a275411f96ad98b9ee577c8a7572ff073e1ce2fd74be7a2db1c242fb5","lib/booking-db/capture-worker.js":"d94d973985ca22eed0bfc54975f1c20159c9452dd3d841f2c7114736b4f37bc2","lib/booking-db/recording-worker.js":"c924e0bd96390c8df8d7b59ac656c1bc3d62d99e84e6657f69936de50d33c5bb","lib/booking-db/notification-worker.js":"e9fe70d0e79754b2dad2ce91e3b58dc41a3c9e9751e60aa1f3d6e1b3f49dfb8e","lib/checkout/intent-state.js":"16d1af5a7ea408b1a2e62f857a0027e71d8a1aa7b69c6d4f4bf7290823115615","db/migrations/0017_cancelled_pristine_capture_release.up.sql":"880f203b11cb4d2a9fe2317d6cb9fc8e00853b8c8ba41f44026d07aae9fd510e"};
+
+const m8ZeroAbort = async (S, r, label) => {
+  assert.deepEqual([r.outcome, r.bridgeCalls, r.bridge.operatorCoreInvocations, r.bridge.requestHelperInvocations, r.bridge.receiptAck, r.bridge.dbAbortApplied],
+    ["STOPPED", 1, 0, null, null, null], `${label}: ${JSON.stringify(plainResult(r))}`);
+  assert.deepEqual([await appliedAborts(S.bk.id), await state(S.bk.id), await cleanupSteps(S), ...providerSettle(S)], [0, "reservation_confirmed", 0, 0, 0], `${label}: no helper write, no cleanup / settlement`);
+  assert.equal((await one("SELECT count(*)::int AS n FROM booking.external_operations WHERE intent_id = $1 AND op_type IN ('alert.owner','hostaway.cancel_reservation','stripe.void_payment_intent')", [S.bk.id])).n, 0, `${label}: no abort obligations queued`);
+  await assertNotifyUnsent(S.bk.id, label);
+};
+test("M8a (root review of 01673a7) the REAL report lock is lost after the start record LANDED, while its ACK returns → STOPPED_BEFORE_OPERATOR: 0 operator-core calls, start head preserved, RUN_STOPPED exclusion lost", async () => {
+  // (a) the REAL report lock is lost after the start record LANDED, while its ACK is about to return
+  for (const connection of ["disconnected", "airbnb"]) {
+    const S = await scenario({ connection, override: { ABORT_REQUEST_STARTED: async (S0, rec, real) => { const ack = await real(); await terminate(S0.report.clients[0]); return ack; } } });
+    const r = await S.run();
+    const ev = await S.events();
+    console.log(`# M8a ${connection} ${JSON.stringify([r.stopCode, r.bridge && r.bridge.outcome, r.bridge && r.bridge.code, r.journalTail, ev.slice(-3)])}`);
+    await m8ZeroAbort(S, r, `lock/${connection}`);
+    assert.deepEqual([r.stopCode, r.exclusion, r.bridge.outcome, r.journalTail], ["LOCK_LOST", "lost", "STOPPED_BEFORE_OPERATOR", "KNOWN"]);
+    assert.deepEqual(r.bridge.trustedHead, r.bridge.startAck, "the bridge's preserved last ACKed head is the start record");
+    assert.deepEqual([r.trustedHead.seq, r.bridge.startAck.seq + 1], [ev.length, ev.length], "the run's final head = the RUN_STOPPED appended right after it");
+    assert.deepEqual(ev.slice(-2), ["ABORT_REQUEST_STARTED", "RUN_STOPPED"]);
+    const last = (await S.records()).at(-1);
+    assert.deepEqual([last.code, last.exclusion, last.ownerCleanupRequired], ["LOCK_LOST", "lost", "reservedNotConfirmed"], "stop / exclusion evidence");
+    assert.equal(validateJournalV2(await S.records(), S.manifest, { trustedHead: { ...r.trustedHead } }).ok, true);
+    assert.equal((await r.finalize()).lockRelease, "lost");
+  }
+});
+
+test("M8b (root review of 01673a7) the native signal is aborted at that same boundary → STOPPED_BEFORE_OPERATOR: 0 operator-core calls", async () => {
+  // (b) the native signal is aborted at that same boundary
+  {
+    const S = await scenario({ override: { ABORT_REQUEST_STARTED: async (S0, rec, real) => { const ack = await real(); S0.ac.abort(); return ack; } } });
+    const r = await S.run();
+    console.log(`# M8b ${JSON.stringify([r.stopCode, r.bridge && r.bridge.outcome, r.bridge && r.bridge.code])}`);
+    await m8ZeroAbort(S, r, "signal");
+    assert.deepEqual([r.stopCode, r.bridge.outcome, r.journalTail], ["CANCELLED", "STOPPED_BEFORE_OPERATOR", "KNOWN"]);
+    assert.deepEqual(r.bridge.trustedHead, r.bridge.startAck);
+    assert.deepEqual((await S.events()).slice(-2), ["ABORT_REQUEST_STARTED", "RUN_STOPPED"]);
+    assert.equal(r.trustedHead.seq, r.bridge.startAck.seq + 1);
+    assert.equal((await r.finalize()).lockRelease, "unlocked");
+  }
+});
+
+test("M8c (root review of 01673a7) a stop (lock loss / signal) during the bridge's INITIAL journal read → the start append is never started", async () => {
+  // (c) stop during the bridge's INITIAL journal read (lock loss, then signal): the start append is never started
+  for (const how of ["lock", "signal"]) {
+    let armed = false;
+    const S = await scenario({ connection: how === "lock" ? "airbnb" : "disconnected", attest: { [how === "lock" ? "AIRBNB_BLOCKED" : "CALENDAR_BLOCKED"]: async (S0, req) => {
+      armed = true; return { ok: true, evidenceRef: `synthetic/${req.checkpoint.toLowerCase()}` }; } } });
+    S.hooks.read = async (S0) => { if (!armed) return; armed = false; if (how === "lock") await terminate(S0.report.clients[0]); else S0.ac.abort(); };
+    const r = await S.run();
+    const ev = await S.events();
+    console.log(`# M8c ${how} ${JSON.stringify([r.stopCode, r.bridge && r.bridge.outcome, r.bridge && r.bridge.code, ev.slice(-2)])}`);
+    await m8ZeroAbort(S, r, `read/${how}`);
+    assert.equal(S.overrideCalls.ABORT_REQUEST_STARTED ?? 0, 0, `${how}: no start append was attempted`);
+    assert.deepEqual([r.stopCode, r.bridge.outcome, r.bridge.startAck, r.journalTail], [how === "lock" ? "LOCK_LOST" : "CANCELLED", "STOPPED_START_UNACKED", null, "KNOWN"]);
+    assert.ok(/^NOT_STARTED_/.test(r.bridge.code), r.bridge.code);
+    assert.equal(r.bridge.trustedHead.seq, ev.length - 1, "the bridge's last ACKed head = the blocked attestation");
+    assert.equal(r.trustedHead.seq, ev.length, "the run's final head = the RUN_STOPPED that follows it");
+    assert.deepEqual(ev.slice(-2), [`ATTESTED:${S.K[1]}`, "RUN_STOPPED"]);
+    await r.finalize().catch(() => {});
+  }
+});

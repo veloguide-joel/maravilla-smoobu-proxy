@@ -57,7 +57,11 @@ Missing or ambiguous data gives `ABORT_EXPECTATION_UNAVAILABLE` (a stop, before 
 **Bridge call.** The bridge gets these arguments:
 - `manifest`: the frozen copy;
 - `journal`: a frozen `{append, read}` facade over the caller's journal;
-- `guard`: a frozen `{observe, now}` facade over the run's guard;
+- `guard`: a frozen `{observe, now}` facade over the run's guard. **`observe` applies the runner's stop-before-operation rule (`blocked()`: lock loss, native signal cancellation, an existing stop cause) at the ACTUAL guarded start.**
+  - `guard.observe` validates its timer, then calls `start` synchronously in the same turn (run-guard §7.2). So a stop seen there means `start` is never called.
+  - The bridge receives the established `{kind: "not_started", started: false, code: <stop cause>}`, which it reports as `NOT_STARTED_<cause>`. No unknown outcome is manufactured.
+  - This covers every bridge operation: the initial journal read, the start append, the operator core, the postcheck and the receipt append. The lock-loss state is kept, and journals are never mutated.
+  - An operation that did start stays uncertain until read evidence; it is never claimed rolled back and never retried. (Root review of 01673a7; regressions M8a–c.)
 - `trustedHead`: the run's LAST ACKED head;
 - `pool`: `pools.app`;
 - `env`: `{VERCEL_ENV:"development", MV_E7_TEST_ABORT:"enabled"}`;
@@ -92,7 +96,8 @@ The stopped result carries `bridge` (the full frozen bridge result: counters, ac
 | bridge outcome | journal tail after it | RUN_STOPPED appended? |
 |---|---|---|
 | `REFUSED_BEFORE_START` | the caller's head (nothing appended) | yes |
-| `STOPPED_START_UNACKED`, code `GUARD_NOW_*` / `NOT_STARTED_*` (append never started) | the caller's head | yes |
+| `STOPPED_START_UNACKED`, code `GUARD_NOW_*` / `NOT_STARTED_*` (append never started, incl. a stop seen by the facade during / after the initial read) | the caller's head | yes |
+| `STOPPED_BEFORE_OPERATOR`, code `NOT_STARTED_LOCK_LOST` / `NOT_STARTED_CANCELLED` (a stop after the start ACK: the core was never started) | the start ACK | yes (exclusion as observed) |
 | `STOPPED_START_UNACKED`, any other code | UNKNOWN (the start MAY have landed) | **no** |
 | `STOPPED_BEFORE_OPERATOR` / `ABORT_REFUSED` / `ABORT_NOT_THIS_RUN` / `ABORT_OUTCOME_UNKNOWN` / `ABORT_POSTCHECK_FAILED` | the start ACK | yes (allowed after ABORT_REQUEST_STARTED) |
 | `STOPPED_RECEIPT_UNACKED`, `receiptLanding NOT_ATTEMPTED` | the start ACK | yes |

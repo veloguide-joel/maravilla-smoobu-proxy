@@ -519,7 +519,13 @@ export async function runAbortRehearsalV2(input) {
     if (blocked()) return { stop: S.cause };
     const before = freeze({ ...S.head });
     const jfacade = freeze({ append: (rec) => apply(journalAppend, journal, [rec]), read: () => apply(journalRead, journal, []) });
-    const gfacade = freeze({ observe: (d, st) => guard.observe(d, st), now: () => guard.now() });
+    // the runner's stop-before-operation rule at the ACTUAL guarded start: guard.observe validates its timer and then calls `start`
+    // synchronously in the same turn (run-guard §7.2), so a stop (lock loss, native signal, existing cause) observed HERE means `start`
+    // is never called — the bridge receives the established not_started shape (started=false), never a manufactured unknown outcome.
+    const gfacade = freeze({
+      observe: (d, st) => (blocked() ? Promise.resolve(freeze({ kind: "not_started", started: false, code: S.cause || "STOPPED" })) : guard.observe(d, st)),
+      now: () => guard.now()
+    });
     S.bridgeCalls += 1;
     let raw;
     try { raw = await runTestAbortBridge({ manifest: m, operator: { ...e }, journal: jfacade, trustedHead: { ...before }, pool: pools.app, env: { ...BRIDGE_ENV }, guard: gfacade, now }); }
