@@ -215,7 +215,9 @@ test("J6 testAbortAfterReservation is bound but NOTHING pretends an abort happen
     }
     const honest = [...RESERVED, ["ATTESTED", CK[c][1]], ["RUN_ENDED", { outcome: "ENDED_RESERVED_NOT_CAPTURED", ownerCleanupRequired: "reservedNotConfirmed", writes: { ...W0, create: 1 } }]];
     const v = V2.validateJournalV2(chain(honest, id), m); assert.equal(v.ok, true, v.code);
-    assert.ok(!Object.keys(V2).some((k) => /abort/i.test(k)), "no abort API in this foundation");
+    // M2-C contract change: the journal now names the v2-local abort RECORD vocabulary, but exports no function that requests / applies an abort
+    assert.deepEqual(Object.keys(V2).filter((k) => /abort/i.test(k)).sort(), ["ABORT_QUEUED", "ABORT_REASON"], "record vocabulary only");
+    assert.ok(Object.keys(V2).filter((k) => /abort/i.test(k)).every((k) => typeof V2[k] !== "function"));
   }
 });
 
