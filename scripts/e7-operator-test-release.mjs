@@ -9,6 +9,8 @@
 //     runtime-login database URL (verify / execute only), read once and removed from the environment. Never a guest token, URL or DB message out.
 //   * Modes: preflight (no secret, no DB: digests + plan + env + the fake test suite) | bindings (no secret, no DB: every pin explicit) |
 //     verify (read-only classify) | execute (the accepted core, AT MOST ONE helper invocation, no automatic retry, no cleanup chaining).
+//   * One-call gate: execute passes the pinned core's `deps.requestTestRelease` seam a counting gate wrapping the digest-verified REAL pinned
+//     repo.requestTestRelease (never a substitute). This is a deliberate, supported runner use of that dependency seam (root review LTR-PKG).
 //   * Plan: the OUTER runner plan binds tooling / closure / runner / pg / node / DB target / CA / budget AND the full frozen INNER expectation,
 //     its own hash (expectationHash = the inner planHash) and the label. runnerPlanHash (outer) != expectationHash (inner); no hash covers itself.
 import process from "node:process";
@@ -166,7 +168,15 @@ export async function framedDigest(dir, files, prefix) {
   }
   return h.digest("hex");
 }
-export function childEnv(env, toolingDir) { const out = {}; for (const k of Object.keys(env)) if (!k.startsWith("E7_")) out[k] = env[k]; out.E7_TOOLING_DIR = toolingDir; return out; }
+/** the preflight child's environment: an explicit ALLOWLIST of OS / runtime basics + E7_TOOLING_DIR. Nothing else crosses: no credential, token,
+ *  DB URL, NODE_* option / loader hook, approval label or expectation input (the fake suite needs none of them). */
+export const CHILD_ENV_ALLOWLIST = freeze(["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TZ"]);
+export function childEnv(env, toolingDir) {
+  const out = {};
+  for (const k of CHILD_ENV_ALLOWLIST) if (Object.hasOwn(env, k) && typeof env[k] === "string" && env[k].length <= 4096 && !env[k].includes("\0")) out[k] = env[k];
+  out.E7_TOOLING_DIR = toolingDir;
+  return out;
+}
 export function spawnNode(args, { cwd, env }) {
   return new Promise((resolve) => {
     let out = ""; let outBytes = 0; let truncated = false; let child;

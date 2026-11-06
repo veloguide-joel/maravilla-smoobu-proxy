@@ -191,6 +191,32 @@ test("C1 preflight: secret-free (DB URL / any STRIPE / HOSTAWAY key refused), sy
   assert.deepEqual(Object.keys(seenEnv).filter((k) => k.startsWith("E7_")), ["E7_TOOLING_DIR"]);
 });
 
+test("C4 minimal child environment: only the OS / runtime allowlist + E7_TOOLING_DIR reach the preflight child; credentials, DB URLs, tokens, NODE_* hooks and E7 inputs never do (nor any output)", async () => {
+  const CANARIES = { CUSTOM_API_TOKEN: "CANARY_tok_1", DATABASE_URL: "postgresql://u:CANARY_db_2@h/x", GITHUB_TOKEN: "CANARY_gh_3", NODE_PATH: "/CANARY_np_4",
+    NODE_LOADER: "CANARY_ld_5", NPM_CONFIG_USERCONFIG: "/CANARY_npm_6", AWS_SECRET_ACCESS_KEY: "CANARY_aws_7" };
+  const BASICS = { PATH: "/usr/bin:/bin", HOME: "/home/runner", TMPDIR: "/tmp/r", LANG: "C.UTF-8", TZ: "UTC" };
+  // unit: the hooks the parent C1 refuses are ALSO never forwarded, whatever reaches childEnv
+  const unit = E.childEnv({ ...BASICS, ...CANARIES, NODE_OPTIONS: "--import=/CANARY_hook_8.mjs", NODE_EXTRA_CA_CERTS: "/CANARY_ca_9", E7_APPROVAL_REF: "lbl",
+    E7_EXPECTATION_JSON: "{}", E7_EXPECTED_RUNNER_PLAN_HASH: "0".repeat(64), E7_DEV_BOOKING_DATABASE_URL: DB_URL, E7_TOOLING_DIR: "/attacker" }, "/tooling");
+  assert.deepEqual(unit, { ...BASICS, E7_TOOLING_DIR: "/tooling" });
+  assert.deepEqual([...E.CHILD_ENV_ALLOWLIST], ["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TZ"]);
+  assert.deepEqual(E.childEnv({ PATH: "a\0b", HOME: "x".repeat(5000), TMP: 7 }, "/t"), { E7_TOOLING_DIR: "/t" }, "malformed values are dropped, not passed");
+  // through runHosted (real fake plan): the spawned child sees exactly the allowlist; no canary in the child env or any output
+  let seen = null; let args = null;
+  const res = await host("preflight", baseEnv({ ...BASICS, ...CANARIES, E7_WORKFLOW_SHA: "a".repeat(40) }), { spawnChild: async (a, o) => { args = a; seen = o.env; return okChild(); } });
+  assert.equal(res.result.code, "PREFLIGHT_OK_REAL_PLAN");
+  assert.deepEqual(seen, { ...BASICS, E7_TOOLING_DIR: TOOLING });
+  assert.deepEqual(args, ["--test", "--test-reporter=tap", "test/e7-operator-test-release-runner.test.mjs"]);
+  const out = JSON.stringify(res.result) + E.summaryMarkdown(res.result) + JSON.stringify(seen);
+  for (const v of Object.values(CANARIES)) assert.equal(out.includes(v.replace(/^.*CANARY/, "CANARY")), false, v);
+  // the parent C1 still refuses the hook variables before any child exists (unchanged)
+  let spawned = false;
+  for (const k of ["NODE_OPTIONS", "NODE_EXTRA_CA_CERTS"]) {
+    const r = await host("preflight", baseEnv({ [k]: "/CANARY_x" }), { spawnChild: async () => { spawned = true; return okChild(); } });
+    assert.deepEqual([r.result.code, spawned], ["OPR_ENV_REFUSED", false], k);
+  }
+});
+
 test("C2 the accepted closure is verified BEFORE any tooling import; tampered tooling / runner / layout refused; the closure list is the scanned transitive import closure; digest constant", async () => {
   let imported = false;
   const t = toolingCopy();
