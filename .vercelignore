@@ -1,0 +1,9 @@
+# Vercel deployment exclusions (Vercel ONLY; git keeps every file). PROPOSAL for root review.
+# Observed 2026-11-06: with vercel.json {} and no output directory, the three production domains serve repo-root files
+# (e.g. /scripts/e7-checkout-test-cleanup.mjs, byte-identical to git) to cookieless requests. The serverless runtime is api/
+# (+ its pg dependency); nothing below is imported by api/. GitHub Actions runners check out git, so they are unaffected.
+/scripts
+/test
+/claude
+/.github
+/README.md
