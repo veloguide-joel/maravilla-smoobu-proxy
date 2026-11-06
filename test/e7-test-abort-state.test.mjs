@@ -75,6 +75,9 @@ test("A2 TEST abort refusals: other states, wrong PI / reservation / id, non-TES
   }
 });
 
+const INVALID_DATES = Object.freeze([{ from: "2027-13-01" }, { from: "2027-00-10" }, { from: "2027-01-00" }, { to: "2027-01-99" }, { to: "2027-13-20" },
+  { to: "2027-01-00" }, { from: "2027-02-30", to: "2027-03-05" }, { from: "2027-02-29", to: "2027-03-05" }, { from: "2027-01-20", to: "2027-01-18" },
+  { from: "2027-01-18", to: "2027-01-18" }]);   // month 13 / 00, day 00 / 99, Feb rollover (2027 is not a leap year), reversed, empty stay
 const FIELDS = Object.freeze({ intentId: "00000000-0000-4000-8000-00000000ab01", expectedVersion: 7, listingId: 606998, from: "2027-01-18", to: "2027-01-20", guests: 1,
   currency: "USD", finalTotalMinor: 23000, authorizedMinor: 23000, paymentIntentId: "pi_TESTabort0001", sessionId: "cs_test_abort0001",
   attemptId: "00000000-0000-4000-8000-00000000ab02", reservationId: "61000001", approvalRef: "synthetic-abort-1" });
@@ -103,6 +106,13 @@ test("A3 expectation: exact 15 keys, typed, allowlisted listing 606998 / USD onl
     assert.equal(validAbortExpectation({ ...e, [k]: v }), false, `validAbortExpectation ${k}=${Object.prototype.toString.call(v)}`);
     assert.equal(bindAbortExpectation({ ...e, [k]: v }), null, `bind ${k}`);
     if (k !== "planHash") assert.equal(buildAbortExpectation({ ...FIELDS, [k]: v }), null, `build ${k}`);
+  }
+  // root (4dc4b4e review): regex-shaped but invalid / rolled-over / reversed dates are REFUSED (false / null), never thrown
+  for (const over of INVALID_DATES) {
+    assert.doesNotThrow(() => validAbortExpectation({ ...e, ...over }), JSON.stringify(over));
+    assert.equal(validAbortExpectation({ ...e, ...over }), false, JSON.stringify(over));
+    assert.equal(bindAbortExpectation({ ...e, ...over }), null, JSON.stringify(over));
+    assert.equal(buildAbortExpectation({ ...FIELDS, ...over }), null, JSON.stringify(over));
   }
   // buildAbortExpectation never invokes a supplied getter (and refuses it), nor reads a planHash / extra / symbol key
   let getterCalls = 0;
@@ -147,6 +157,7 @@ test("A5 bounded helper: malformed expectations cause ZERO DB calls (requestTest
   const counting = () => { const p = { calls: 0, query() { p.calls += 1; return Promise.reject(new Error("no DB in this test")); }, connect() { p.calls += 1; return Promise.reject(new Error("no DB in this test")); } }; return p; };
   const malformed = [{ ...e, paymentIntentId: [e.paymentIntentId] }, { ...e, sessionId: new String(e.sessionId) }, { ...e, intentId: [e.intentId] },
     { ...e, attemptId: [e.attemptId] }, { ...e, approvalRef: 123 }, { ...e, planHash: [e.planHash] }, Object.defineProperty({ ...e }, "guests", { get: () => 1, enumerable: true }), null, [e]];
+  for (const over of INVALID_DATES) malformed.push({ ...e, ...over });
   for (const m of malformed) {
     const pool = counting();
     assert.deepEqual(await requestTestAbort(pool, FIELDS.intentId, { now: T0, env: ENV, operator: m }), { ok: false, error: "TEST_ABORT_EXPECTATION_INVALID" });

@@ -311,11 +311,12 @@ test("D6 either leg first, and unclear outcomes: a reply alone never settles a l
   assert.equal([...w.calls, ...w2.calls].some((c) => /capture|refund/i.test(c)), false);
 });
 
-test("D7 (root a1dcea0d) the expectation is bound synchronously: mutating the caller's object while the transaction runs (inside the intent lock) cannot change what is checked or written; coerced inputs make ZERO writes", async () => {
+test("D7 (root a1dcea0d) the expectation is bound synchronously: mutating the caller's object inside applyEvent (afterLoad: after transition(), before BEGIN / the intent lock, before inTx) cannot change what is checked or written; coerced inputs make ZERO writes", async () => {
   const a = await confirmedIntent();
   const callerObj = { ...a.e };
   let mutated = false;
-  // afterLoad fires inside applyEvent AFTER the intent row is loaded/locked and BEFORE the reducer + in-transaction checks (repo.js:354 < :390)
+  // afterLoad fires inside applyEvent AFTER loadIntentRow + transition() and BEFORE BEGIN / the FOR NO KEY UPDATE intent lock (repo.js:353-354 <
+  // :364-367); it still runs BEFORE inTx (:390), so an unbound (mutable) expectation would be seen by the in-transaction checks
   const hooks = { afterLoad: async () => { callerObj.expectedVersion = 999; callerObj.paymentIntentId = "pi_ABRTmutatedX01"; callerObj.reservationId = "61999999";
     callerObj.listingId = 603566; callerObj.sessionId = "cs_test_mutatedAbort1"; mutated = true; } };
   const r = await requestTestAbort(db.app, a.id, { now: F.at(9), env: ENV, operator: callerObj, hooks });
