@@ -50,6 +50,7 @@
    - A reorder or changed byte gives `JOURNAL_CHAIN_INVALID`; corrupt fields give `JOURNAL_MALFORMED`; a torn read gives `JOURNAL_PARTIAL`.
    - Memory-only: this is never a durable or hosted gate.
 8. **Inputs.**
+   - `bindManifestV2`, which every manifest-taking API calls (`validateRecordV2`, `validateJournalV2`, `evaluateStartV2`; the constructor additionally snapshots its whole options first), takes this module's OWN snapshot of the complete manifest input BEFORE the accepted v2 validator runs. A top-level, nested or revoked Proxy, or an accessor, therefore gives `MANIFEST_INVALID` (constructor: `JOURNAL_OPTIONS_INVALID`) with zero trap or getter calls and no throw. The validator only ever sees that frozen copy (root review of 868621b; J12).
    - There is one getter-free, own-data-descriptor, bounded snapshot before any await. It is a copy of the private v1 rules (v1 stays byte-exact), and it refuses Proxies.
    - Accessors, `toJSON`, symbols and boxed values are refused code-only with 0 caller calls.
    - An accessor anywhere in the journal options gives `JOURNAL_OPTIONS_INVALID`, the same as the v1 options rule. In `validateJournalV2` the manifest is validated directly, giving `MANIFEST_INVALID`.

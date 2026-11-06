@@ -328,3 +328,44 @@ test("J11 purity / scope: exact import list; no timer / env / fs / network / DB 
   assert.deepEqual(Object.fromEntries(Object.keys(PINS).map((p) => [p, sha(p)])), PINS);
 });
 const PINS = {"scripts/e7-connected/run-manifest.mjs":"c47f72eb2b9e898bdaca2ca20ffe7cea0befab006079953133810ce5651f6a56","scripts/e7-connected/run-manifest-v2.mjs":"c19ab009b00b8c3877da53f20e436c1c6d4ac29d051ab1f21705d38fcf3cc7fd","scripts/e7-connected/run-journal-memory.mjs":"2712f01b0509d343d162b5fe7055878ade40f69d668915671441b81cbf87c700","scripts/e7-connected/run-journal-file.mjs":"265af8195dccbaae34817a9a16e2f09f4498b85638fae4abb779d5b0bd9cc4b1","scripts/e7-connected/run-core.mjs":"ad1dcbb29e7cb1ce0aac71ac178d903076d4e5cc293dd17f972c04b4beaa5afe"};
+
+test("J12 (root 868621b review) every public manifest-taking boundary refuses top-level / nested / revoked Proxy manifests with ZERO trap / getter calls and no throw; frozen and null-prototype manifest controls still accepted", () => {
+  let traps = 0;
+  const counting = (target) => new Proxy(target, { get(t, k, r) { traps += 1; return Reflect.get(t, k, r); }, getPrototypeOf(t) { traps += 1; return Reflect.getPrototypeOf(t); },
+    ownKeys(t) { traps += 1; return Reflect.ownKeys(t); }, getOwnPropertyDescriptor(t, k) { traps += 1; return Reflect.getOwnPropertyDescriptor(t, k); },
+    has(t, k) { traps += 1; return Reflect.has(t, k); } });
+  const base = manifest("airbnb");
+  const revocable = Proxy.revocable(manifest("airbnb"), {}); revocable.revoke();
+  const hostile = [
+    ["top-level", counting(manifest("airbnb"))],
+    ["nested listing", { ...base, listing: counting({ ...base.listing }) }],
+    ["nested phases", { ...base, phases: counting({ ...base.phases }) }],
+    ["nested checkpoints", { ...base, checkpoints: counting([...base.checkpoints]) }],
+    ["revoked", revocable.proxy]
+  ];
+  const id = idOf(base); const recs = chain(happy("airbnb"), id);
+  for (const [label, m] of hostile) {
+    traps = 0;
+    let r;
+    assert.doesNotThrow(() => { r = V2.bindManifestV2(m); }, label); assert.equal(r.ok, false, label); assert.equal(r.code, "MANIFEST_INVALID", label);
+    assert.doesNotThrow(() => { r = V2.validateRecordV2(recs[0], m); }, label); assert.deepEqual(r, { ok: false, code: "MANIFEST_INVALID" }, label);
+    assert.doesNotThrow(() => { r = V2.validateJournalV2([], m); }, label); assert.deepEqual(r, { ok: false, code: "MANIFEST_INVALID" }, label);
+    assert.doesNotThrow(() => { r = V2.validateJournalV2(recs, m); }, label); assert.deepEqual(r, { ok: false, code: "MANIFEST_INVALID" }, label);
+    assert.doesNotThrow(() => { r = V2.evaluateStartV2({ records: [], tail: "complete" }, m); }, label); assert.deepEqual(r, { ok: false, code: "MANIFEST_INVALID" }, label);
+    assert.doesNotThrow(() => { r = V2.createMemoryJournalV2({ manifest: m }); }, label); assert.deepEqual(r, { ok: false, code: "JOURNAL_OPTIONS_INVALID" }, `${label}: constructor keeps its options error`);
+    assert.equal(traps, 0, `${label}: zero proxy trap calls`);
+  }
+  // accepted inputs preserved: deep-frozen and null-prototype manifests bind to the SAME identity as the plain one
+  const deepFreeze = (v) => { if (v && typeof v === "object") { Object.values(v).forEach(deepFreeze); Object.freeze(v); } return v; };
+  const nul = (o) => Object.assign(Object.create(null), o);
+  const p = manifest("airbnb");
+  const nullProto = nul({ ...p, providerMode: nul(p.providerMode), listing: nul(p.listing), stay: nul(p.stay), pricing: nul(p.pricing),
+    hostawayAccountLabel: nul(p.hostawayAccountLabel), phases: nul(p.phases), cleanup: nul(p.cleanup) });
+  for (const [label, m] of [["plain", manifest("airbnb")], ["deep-frozen", deepFreeze(manifest("airbnb"))], ["null-prototype", nullProto]]) {
+    const b = V2.bindManifestV2(m); assert.equal(b.ok, true, `${label}: ${b.code}`); assert.deepEqual({ ...b.binding.identity }, id, label);
+    assert.equal(V2.validateJournalV2(recs, m).ok, true, label);
+    assert.equal(V2.evaluateStartV2({ records: [], tail: "complete" }, m).code, "EMPTY_JOURNAL", label);
+    assert.equal(V2.validateRecordV2(recs[0], m).ok, true, label);
+    assert.equal(V2.createMemoryJournalV2({ manifest: m }).ok, true, label);
+  }
+});

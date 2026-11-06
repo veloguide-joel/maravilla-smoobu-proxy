@@ -100,9 +100,14 @@ const int = (v, lo, hi) => Number.isSafeInteger(v) && v >= lo && v <= hi;
  * bindManifestV2(manifestInput) → frozen { ok:true, binding } | frozen { ok:false, code:'MANIFEST_INVALID', manifestCode }
  *   binding = { identity: { manifestVersion, connection, runId, intentId, baselineCommit, manifestHash }, checkpoints: { baseline, blocked,
  *   reopened }, phases: { capture, recording, testAbortAfterReservation } } — all from the validated frozen manifest copy and its COMPUTED hash.
+ *   The input is first copied through this module's Proxy-refusing snapshot (BAD → MANIFEST_INVALID / manifestCode MANIFEST_SNAPSHOT_REFUSED).
  */
 export function bindManifestV2(manifestInput) {
-  const v = validateRunManifestV2(manifestInput);
+  // the journal's OWN getter-free, Proxy-refusing snapshot of the COMPLETE manifest input comes first (top-level and nested Proxies, revoked
+  // Proxies, accessors refuse here with zero caller traps); the accepted v2 validator then sees ONLY that frozen copy
+  const s = safeSnap(manifestInput);
+  if (s === BAD) return freeze({ ok: false, code: "MANIFEST_INVALID", manifestCode: "MANIFEST_SNAPSHOT_REFUSED" });
+  const v = validateRunManifestV2(s);
   if (!v.ok) return freeze({ ok: false, code: "MANIFEST_INVALID", manifestCode: v.code });
   const m = v.manifest; const ck = m.checkpoints;
   return freeze({ ok: true, binding: freeze({
