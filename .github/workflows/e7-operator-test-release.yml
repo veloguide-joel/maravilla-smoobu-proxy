@@ -1,0 +1,131 @@
+# PROPOSED (packaging branch; NOT on main; NOT dispatched) — E7 operator TEST release REQUEST for ONE named intent (lost guest token recovery).
+# MANUAL dispatch only. `preflight` (default) = no secret, no DB, no dependency install (fake tests + digests + plan + env).
+# `verify` = read-only classify of the named intent on the TEST DEV database. `execute` = the accepted operator core: AT MOST ONE release-request
+# helper invocation (TEST_RELEASE_REQUESTED -> one queued void row), no automatic retry, no cleanup chaining, no provider request of any kind.
+# Inputs / labels / hashes are NOT consent. The only secret is E7_DEV_BOOKING_DATABASE_URL (the DEV runtime login; environment
+# e7-readonly-probe, required reviewers), scoped to the single verify / execute step. No Stripe or Hostaway secret, no webhook, no deploy, no migration.
+name: e7-operator-test-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "preflight (default: no secret, no DB) | verify (read-only classify) | execute (ONE release request; NOT AUTHORIZED without explicit approval of the exact package)"
+        type: choice
+        options: [preflight, verify, execute]
+        default: preflight
+      approval_ref:
+        description: "Approval label (non-secret; must equal the expectation's approvalRef). Empty together with expectation_json = labelled SYNTHETIC preflight only."
+        type: string
+        required: false
+        default: ""
+      expectation_json:
+        description: "The full frozen 14-key operator expectation as CANONICAL JSON (sorted keys, no whitespace), including its own planHash."
+        type: string
+        required: false
+        default: ""
+      expected_runner_plan_hash:
+        description: "verify / execute: exact 64-hex runnerPlanHash (OUTER plan) from a REAL-plan preflight (no default)"
+        type: string
+        required: false
+        default: ""
+      expected_closure_digest:
+        description: "verify / execute: exact closureDigest 49eb56afde380b3120835a366ea0fbf5c3c75027d480e95aa260a8200a0522bd of the accepted ab55e709 closure (no default)"
+        type: string
+        required: false
+        default: ""
+      expected_runner_digest:
+        description: "verify / execute: exact 64-hex runnerDigest of the REVIEWED runner / workflow / test bytes (no default)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e7-operator-test-release
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    if: inputs.mode == 'preflight'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout runner (this repository, dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout accepted operator core (fixed commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: ab55e7092ff0140a57d2a6eebff1e3adb1c3f039
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Preflight (no secret, no DB)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_APPROVAL_REF: ${{ inputs.approval_ref }}
+          E7_EXPECTATION_JSON: ${{ inputs.expectation_json }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+        run: node wrapper/scripts/e7-operator-test-release.mjs preflight
+
+  database:
+    if: (inputs.mode == 'verify' || inputs.mode == 'execute') && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: e7-readonly-probe
+    timeout-minutes: 15
+    steps:
+      - name: Checkout runner (this repository, dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout accepted operator core (fixed commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: ab55e7092ff0140a57d2a6eebff1e3adb1c3f039
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Verify bindings before any install (no secret, no DB)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_APPROVAL_REF: ${{ inputs.approval_ref }}
+          E7_EXPECTATION_JSON: ${{ inputs.expectation_json }}
+          E7_EXPECTED_RUNNER_PLAN_HASH: ${{ inputs.expected_runner_plan_hash }}
+          E7_EXPECTED_CLOSURE_DIGEST: ${{ inputs.expected_closure_digest }}
+          E7_EXPECTED_RUNNER_DIGEST: ${{ inputs.expected_runner_digest }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+        run: node wrapper/scripts/e7-operator-test-release.mjs bindings
+      - name: Install the pinned dependency from the verified lockfile (no lifecycle scripts)
+        working-directory: tooling
+        run: npm ci --ignore-scripts --omit=dev --no-audit --no-fund
+      - name: Fetch the public Supabase CA (the runner checks its pinned SHA-256)
+        run: curl --fail --silent --show-error --proto '=https' --max-time 20 -o "$RUNNER_TEMP/prod-ca-2021.crt" https://supabase-downloads.s3-ap-southeast-1.amazonaws.com/prod/ssl/prod-ca-2021.crt
+      - name: Run the selected mode for ONE named intent (the DB secret is scoped to this step only)
+        env:
+          E7_MODE: ${{ inputs.mode }}
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_APPROVAL_REF: ${{ inputs.approval_ref }}
+          E7_EXPECTATION_JSON: ${{ inputs.expectation_json }}
+          E7_EXPECTED_RUNNER_PLAN_HASH: ${{ inputs.expected_runner_plan_hash }}
+          E7_EXPECTED_CLOSURE_DIGEST: ${{ inputs.expected_closure_digest }}
+          E7_EXPECTED_RUNNER_DIGEST: ${{ inputs.expected_runner_digest }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_CA_FILE: ${{ runner.temp }}/prod-ca-2021.crt
+          E7_DEV_BOOKING_DATABASE_URL: ${{ secrets.E7_DEV_BOOKING_DATABASE_URL }}
+        run: node wrapper/scripts/e7-operator-test-release.mjs "$E7_MODE"
