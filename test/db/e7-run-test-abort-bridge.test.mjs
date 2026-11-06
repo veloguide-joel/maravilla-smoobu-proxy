@@ -11,7 +11,7 @@ import { claimNextOperation, completeOperation } from "../../lib/booking-db/oper
 import { runCleanupStep, OPS } from "../../lib/booking-db/compensation-worker.js";
 import { validateAdapterConfig } from "../../lib/hostaway-reservations.js";
 import { requestTestAbort } from "../../lib/booking-db/test-abort.js";
-import { buildAbortExpectation } from "../../scripts/e7-operator/test-abort.mjs";
+import { buildAbortExpectation, executeOperatorAbort } from "../../scripts/e7-operator/test-abort.mjs";
 import * as V2 from "../../scripts/e7-connected/run-journal-memory-v2.mjs";
 import { runTestAbortBridge } from "../../scripts/e7-connected/run-test-abort.mjs";
 import { validateGuardDeps, createGuard } from "../../scripts/e7-connected/run-guard.mjs";
@@ -133,8 +133,9 @@ test("B1 happy path (disconnected): start ACK → ONE helper call → verified p
   const cap0 = await capRows(a.id);
   const r = await bridge(a, jr, { operatorDeps: counted(s) });
   assert.equal(r.outcome, "ABORT_ACCEPTED_JOURNALED", JSON.stringify(r));
-  assert.deepEqual([r.cleanupPermitted, r.helperInvocations, s.n, r.operatorOutcome, r.dbAbortApplied], [true, 1, 1, "REQUESTED", true]);
+  assert.deepEqual([r.cleanupPermitted, r.operatorCoreInvocations, s.n, r.operatorOutcome, r.dbAbortApplied], [true, 1, 1, "REQUESTED", true]);
   assert.deepEqual([r.startAck.seq, r.receiptAck.seq], [jr.head.seq + 1, jr.head.seq + 2]);
+  assert.deepEqual([r.requestHelperInvocations, r.receiptLanding, r.trustedHead], [1, "ACKED", r.receiptAck], "core = 1 call, helper = 1 call; trusted head advanced ONLY on the receipt ACK");
   const pc = r.postcheck;
   assert.deepEqual([pc.appliedEvents, pc.appliedEventType, pc.intentState, pc.intentReason, pc.capture, pc.claimHeld, pc.openCases, pc.legs],
     [1, "TEST_ABORT_REQUESTED", "capture_failed", "TEST_ABORT_REQUESTED", "pending:0:false:false", true, 0, "false/false"]);
@@ -160,7 +161,7 @@ test("B1 happy path (disconnected): start ACK → ONE helper call → verified p
   assert.deepEqual([fin.ok, fin.status, fin.anchored], [true, "ENDED", true]);
   // a second bridge call on the same run can never re-request (journal no longer abort-ready)
   const again = await bridge(a, jr, { trustedHead: end, operatorDeps: counted(s) });
-  assert.deepEqual([again.outcome, again.code, again.helperInvocations, s.n], ["REFUSED_BEFORE_START", "JOURNAL_NOT_ABORT_READY", 0, 1]);
+  assert.deepEqual([again.outcome, again.code, again.operatorCoreInvocations, s.n], ["REFUSED_BEFORE_START", "JOURNAL_NOT_ABORT_READY", 0, 1]);
 });
 
 test("B2 one leg unknown (airbnb): void reply-only → reconciliation_required; claim HELD; the journal cannot end the cleanup or release; the mode's reopened is refused; zero resends", async () => {
@@ -185,13 +186,13 @@ test("B3 lost DB reply: the abort APPLIED but the reply is lost → ABORT_OUTCOM
   const a = await confirmed("disconnected"); const jr = await reservedJournal(a); const s = { n: 0 };
   const r = await bridge(a, jr, { operatorDeps: counted(s, { afterReply: () => { throw new Error("reply lost"); } }) });
   assert.equal(r.outcome, "ABORT_OUTCOME_UNKNOWN", JSON.stringify(r));
-  assert.deepEqual([r.cleanupPermitted, r.helperInvocations, s.n, r.receiptAck, r.operatorOutcome], [false, 1, 1, null, "REQUEST_OUTCOME_UNKNOWN"]);
+  assert.deepEqual([r.cleanupPermitted, r.operatorCoreInvocations, s.n, r.receiptAck, r.operatorOutcome], [false, 1, 1, null, "REQUEST_OUTCOME_UNKNOWN"]);
   assert.equal(await appliedAborts(a.id), 1, "the DB really applied it (exactly once)");
   assert.deepEqual([r.postcheck.intentState, r.postcheck.appliedEvents], ["capture_failed", 1], "diagnostic facts preserved");
   const f = V2.journalFactsV2((await jr.j.journal.read()).records, a.manifest).facts;
   assert.deepEqual([f.abortStarted, f.abortAccepted, f.cleanupEntryPermitted], [true, false, false]);
   const again = await bridge(a, jr, { trustedHead: r.startAck, operatorDeps: counted(s) });
-  assert.deepEqual([again.code, again.helperInvocations, s.n], ["JOURNAL_NOT_ABORT_READY", 0, 1], "never re-requested");
+  assert.deepEqual([again.code, again.operatorCoreInvocations, s.n], ["JOURNAL_NOT_ABORT_READY", 0, 1], "never re-requested");
 });
 
 test("B4 definite refusal (gate closed) → ABORT_REFUSED: DB unchanged, no receipt, no cleanup; a capture claimed before the bridge → refused by the accepted precheck with ZERO helper writes", async () => {
@@ -203,32 +204,109 @@ test("B4 definite refusal (gate closed) → ABORT_REFUSED: DB unchanged, no rece
   const op = await claimNextOperation(db.app, { workerId: "cap", now: F.at(9), opTypes: [OPS.CAPTURE], intentId: b.id });
   assert.ok(op && op.op_type === OPS.CAPTURE, "capture claimed (possibly sent)");
   const rb = await bridge(b, jb, { operatorDeps: counted(s2) });
-  assert.deepEqual([rb.outcome, rb.operatorOutcome, rb.code, rb.helperInvocations, s2.n, rb.cleanupPermitted], ["ABORT_REFUSED", "NOT_EXECUTED_NOT_ELIGIBLE", "CAPTURE_NOT_PRISTINE", 1, 0, false]);
+  assert.deepEqual([rb.outcome, rb.operatorOutcome, rb.code, rb.operatorCoreInvocations, s2.n, rb.cleanupPermitted], ["ABORT_REFUSED", "NOT_EXECUTED_NOT_ELIGIBLE", "CAPTURE_NOT_PRISTINE", 1, 0, false]);
+  assert.deepEqual([rb.requestHelperInvocations, rb.dbAbortApplied, rb.postcheck.appliedEvents, rb.postcheck.transition], [0, false, 0, "rows:0"], "false = OBSERVED absent at the read, not assumed");
   assert.equal(await state(b.id), "reservation_confirmed"); assert.equal(await appliedAborts(b.id), 0);
 });
 
-test("B5 receipt append rejected / hung after a VERIFIED DB abort → STOPPED_RECEIPT_UNACKED: the DB outcome is preserved for recovery, cleanup is NOT permitted, the journal refuses cleanup entry", async () => {
-  for (const mode of ["reject", "hang"]) {
-    const a = await confirmed("disconnected"); const s = { n: 0 };
-    const jr = await reservedJournal(a, { faults: { append: { 8: mode } } });                   // 6 producer appends + start (7) + receipt (8)
-    const fg = { t: 0, timers: [] };
-    const guard = createGuard(validateGuardDeps({ monotonic: () => (mode === "hang" ? fg.t : performance.now()), timers: { arm: (ms) => { let res; const promise = new Promise((x) => { res = x; });
-      const e = { due: fg.t + ms, res, live: true }; fg.timers.push(e); return { promise, cancel: () => { e.live = false; } }; } } }).deps);
-    let p = bridge(a, jr, { guard, operatorDeps: counted(s) });
-    if (mode === "hang") {
-      for (let k = 0; k < 200 && jr.j.controls.appendCalls() < 8; k++) await new Promise((x) => setTimeout(x, 10));
-      fg.t += 5_001; for (const e of fg.timers) if (e.live && e.due <= fg.t) { e.live = false; e.res(undefined); }
-    } else {
-      // real timers for reject (timers resolve via the fake list only when advanced: never needed here)
-    }
+/** a guard over a FAKE monotonic clock and a FAKE timer list: time only moves when the test advances it (bounded, never run-until-green) */
+function fakeClockGuard() {
+  const f = { t: 0, timers: [] };
+  f.guard = createGuard(validateGuardDeps({ monotonic: () => f.t, timers: { arm: (ms) => { let res; const promise = new Promise((x) => { res = x; });
+    const e = { due: f.t + ms, res, live: true }; f.timers.push(e); return { promise, cancel: () => { e.live = false; } }; } } }).deps);
+  f.advance = (ms) => { f.t += ms; for (const e of f.timers) if (e.live && e.due <= f.t) { e.live = false; e.res(undefined); } };
+  return f;
+}
+const waitFor = async (pred, label) => { for (let k = 0; k < 300; k++) { if (await pred()) return; await new Promise((x) => setTimeout(x, 10)); } assert.fail(`bounded wait expired: ${label}`); };
+
+test("B5 receipt uncertainty after a VERIFIED DB abort — reject / hang / late / landed_hang / landed-with-malformed-ACK / landed-with-lost-ACK: STOPPED_RECEIPT_UNACKED, never resent, cleanup NOT permitted, DB outcome preserved, trusted head never advances; an unACKed landed receipt is an extra tail the trusted head refuses", async () => {
+  for (const mode of ["reject", "hang", "late", "landed_hang", "badack", "lostack"]) {
+    const a = await confirmed(mode === "late" || mode === "lostack" ? "airbnb" : "disconnected"); const s = { n: 0 };
+    const injected = ["reject", "hang", "late", "landed_hang"].includes(mode);
+    const jr = await reservedJournal(a, injected ? { faults: { append: { 8: mode } } } : {});                 // 6 producer appends + start (7) + receipt (8)
+    let calls = 0;
+    const journal = injected ? jr.j.journal : Object.freeze({ read: jr.j.journal.read, append: async (rec) => { calls += 1; const ack = await jr.j.journal.append(rec);
+      if (calls === 1) return ack;                                                                             // the start record: honest ACK
+      return mode === "badack" ? { seq: ack.seq, hash: "0".repeat(64) } : undefined; } });                    // receipt LANDED; ACK malformed / lost
+    const fg = fakeClockGuard();
+    const p = bridge(a, jr, { journal, guard: fg.guard, operatorDeps: counted(s) });
+    if (["hang", "late", "landed_hang"].includes(mode)) { await waitFor(() => jr.j.controls.appendCalls() >= 8, mode); fg.advance(5_001); }
     const r = await p;
     assert.equal(r.outcome, "STOPPED_RECEIPT_UNACKED", `${mode}: ${JSON.stringify(r)}`);
-    assert.deepEqual([r.cleanupPermitted, r.dbAbortApplied, r.helperInvocations, s.n], [false, true, 1, 1], mode);
-    assert.equal(await state(a.id), "capture_failed", "the actual DB outcome stands (accepted abort)");
-    const f = V2.journalFactsV2((await jr.j.journal.read()).records, a.manifest).facts;
-    assert.deepEqual([f.abortStarted, f.abortAccepted, f.cleanupEntryPermitted], [true, false, false], mode);
-    void p; p = null;
+    assert.deepEqual([r.cleanupPermitted, r.dbAbortApplied, r.operatorCoreInvocations, r.requestHelperInvocations, s.n, r.operatorOutcome, r.receiptAck],
+      [false, true, 1, 1, 1, "REQUESTED", null], mode);
+    assert.equal(r.code, { reject: "APPEND_REJECTED", hang: "TIMEOUT", late: "TIMEOUT", landed_hang: "TIMEOUT", badack: "ACK_INVALID", lostack: "ACK_INVALID" }[mode], mode);
+    assert.equal(r.receiptLanding, "UNACKED_MAY_HAVE_LANDED", `${mode}: a started, unACKed receipt is never claimed absent`);
+    assert.deepEqual(r.trustedHead, r.startAck, `${mode}: the trusted head stays at the LAST ACKED record`);
+    assert.deepEqual([r.postcheck.intentState, r.postcheck.appliedEvents, r.postcheck.capture], ["capture_failed", 1, "pending:0:false:false"], `${mode}: recovery facts retained`);
+    assert.equal(await state(a.id), "capture_failed", "the actual DB outcome stands (accepted abort)"); assert.equal(await appliedAborts(a.id), 1);
+    if (mode === "late") assert.equal(jr.j.controls.release(8), true, "the late receipt lands AFTER the bridge stopped");
+    const recs = (await jr.j.journal.read()).records;
+    const landed = recs.at(-1).event === "ABORT_ACCEPTED";
+    assert.equal(landed, mode !== "reject" && mode !== "hang", `${mode}: observed journal reality`);
+    assert.equal(jr.j.controls.appendCalls(), 8, `${mode}: the receipt was never resent`);
+    // the consumer boundary: ONLY the trusted head (last ACK) is authority
+    const anchoredV = V2.validateJournalV2(recs, a.manifest, { trustedHead: r.trustedHead });
+    const anchoredF = V2.journalFactsV2(recs, a.manifest, { trustedHead: r.trustedHead });
+    const unanchored = V2.journalFactsV2(recs, a.manifest).facts;
+    if (landed) {
+      assert.deepEqual([anchoredV.ok, anchoredV.code, anchoredF.ok, anchoredF.code], [false, "TRUSTED_HEAD_MISMATCH", false, "TRUSTED_HEAD_MISMATCH"], `${mode}: the unACKed tail is refused`);
+      assert.equal(unanchored.cleanupEntryPermitted, true, `${mode}: an UNANCHORED view would say 'permitted' — which is exactly why it is never authority`);
+    } else {
+      assert.deepEqual([anchoredV.ok, anchoredF.facts.abortStarted, anchoredF.facts.abortAccepted, anchoredF.facts.cleanupEntryPermitted], [true, true, false, false], mode);
+    }
+    // a second bridge call can never re-request: the journal is not abort-ready from the trusted head, whatever landed
+    const again = await bridge(a, jr, { trustedHead: r.trustedHead, operatorDeps: counted(s) });
+    assert.deepEqual([again.outcome, again.operatorCoreInvocations, s.n], ["REFUSED_BEFORE_START", 0, 1], mode);
+    assert.equal(again.code, landed ? "JOURNAL_TRUSTED_HEAD_MISMATCH" : "JOURNAL_NOT_ABORT_READY", mode);
   }
+});
+
+test("B7 injected clock fault right BEFORE the receipt append, after a REAL applied abort: STOPPED_RECEIPT_UNACKED (append never started), no cleanup permission, recovery facts + start ACK retained, no top-level rejection", async () => {
+  for (const how of ["throw", "nan"]) {
+    const a = await confirmed("disconnected"); const jr = await reservedJournal(a); const s = { n: 0 };
+    const g = realGuard(); let k = 0;                                                            // now() calls: read 1, start 2, operator 3, postcheck 4, receipt 5
+    const guard = { observe: g.observe, now: () => { k += 1; if (k !== 5) return g.now(); if (how === "throw") throw new Error("clock fault"); return { ok: true, value: NaN }; } };
+    let r; await assert.doesNotReject(async () => { r = await bridge(a, jr, { guard, operatorDeps: counted(s) }); });
+    assert.deepEqual([r.outcome, r.code, r.receiptLanding, r.cleanupPermitted, r.receiptAck, r.dbAbortApplied, r.operatorOutcome, s.n, k],
+      ["STOPPED_RECEIPT_UNACKED", how === "throw" ? "GUARD_NOW_FAULT" : "GUARD_NOW_INVALID", "NOT_ATTEMPTED", false, null, true, "REQUESTED", 1, 5], how);
+    assert.deepEqual(r.trustedHead, r.startAck); assert.equal(r.startAck.seq, jr.head.seq + 1);
+    assert.equal(jr.j.controls.appendCalls(), 7, "the receipt append was never started");
+    assert.deepEqual([r.postcheck.intentState, r.postcheck.appliedEvents, r.postcheck.claimHeld], ["capture_failed", 1, true]);
+    assert.equal(await state(a.id), "capture_failed");
+    const f = V2.journalFactsV2((await jr.j.journal.read()).records, a.manifest, { trustedHead: r.trustedHead }).facts;
+    assert.deepEqual([f.abortStarted, f.abortAccepted, f.cleanupEntryPermitted], [true, false, false]);
+  }
+});
+
+test("B8 abort ALREADY applied outside this ready journal handshake (SYNTHETIC outside actor = the accepted operator core) → NOT_EXECUTED_ALREADY_REQUESTED → ABORT_NOT_THIS_RUN: ZERO requestTestAbort calls, no receipt / adoption / cleanup, applied state preserved in diagnostics", async () => {
+  const a = await confirmed("airbnb"); const jr = await reservedJournal(a); const s = { n: 0 };
+  const outside = await executeOperatorAbort(db.app, a.e, { now: F.at(8), env: ENV });               // applied OUTSIDE the handshake (never journalled)
+  assert.equal(outside.outcome, "REQUESTED"); assert.equal(await appliedAborts(a.id), 1);
+  const r = await bridge(a, jr, { operatorDeps: counted(s) });
+  assert.deepEqual([r.outcome, r.code, r.operatorOutcome, r.operatorCoreInvocations, r.requestHelperInvocations, s.n],
+    ["ABORT_NOT_THIS_RUN", "ALREADY_REQUESTED_OUTSIDE_HANDSHAKE", "NOT_EXECUTED_ALREADY_REQUESTED", 1, 0, 0], JSON.stringify(r));
+  assert.deepEqual([r.cleanupPermitted, r.receiptAck, r.receiptLanding, r.dbAbortApplied], [false, null, "NOT_ATTEMPTED", true], "applied: OBSERVED, not denied");
+  assert.deepEqual([r.postcheck.appliedEvents, r.postcheck.appliedEventType, r.postcheck.intentState, r.postcheck.intentReason, r.postcheck.claimHeld],
+    [1, "TEST_ABORT_REQUESTED", "capture_failed", "TEST_ABORT_REQUESTED", true]);
+  assert.equal(await appliedAborts(a.id), 1, "nothing resent"); assert.equal(await state(a.id), "capture_failed");
+  const recs = (await jr.j.journal.read()).records;
+  assert.equal(recs.at(-1).event, "ABORT_REQUEST_STARTED", "no receipt was written");
+  const f = V2.journalFactsV2(recs, a.manifest, { trustedHead: r.trustedHead }).facts;
+  assert.deepEqual([f.abortStarted, f.abortAccepted, f.cleanupEntryPermitted], [true, false, false]);
+  const again = await bridge(a, jr, { trustedHead: r.trustedHead, operatorDeps: counted(s) });
+  assert.deepEqual([again.code, again.operatorCoreInvocations, s.n], ["JOURNAL_NOT_ABORT_READY", 0, 0]);
+});
+
+test("B9 DUPLICATE_RECONCILED race (distinct from B8): the abort is applied by a SYNTHETIC outside actor AFTER the core's precheck but before its ONE call → duplicate → ABORT_NOT_THIS_RUN; one counted call, no receipt / cleanup, applied state preserved", async () => {
+  const a = await confirmed("disconnected"); const jr = await reservedJournal(a); const s = { n: 0 }; const outside = { n: 0 };
+  const racing = { requestTestAbort: async (...args) => { outside.n += 1; await requestTestAbort(...args); s.n += 1; return requestTestAbort(...args); } };
+  const r = await bridge(a, jr, { operatorDeps: racing });
+  assert.deepEqual([r.outcome, r.code, r.operatorOutcome, r.operatorCoreInvocations, r.requestHelperInvocations, s.n, outside.n],
+    ["ABORT_NOT_THIS_RUN", "DUPLICATE_OUTSIDE_HANDSHAKE", "DUPLICATE_RECONCILED", 1, 1, 1, 1], JSON.stringify(r));
+  assert.deepEqual([r.cleanupPermitted, r.receiptAck, r.dbAbortApplied, r.postcheck.appliedEvents, r.postcheck.intentState], [false, null, true, 1, "capture_failed"]);
+  assert.equal(await appliedAborts(a.id), 1, "applied exactly once (the outside actor's)");
+  assert.equal((await jr.j.journal.read()).records.at(-1).event, "ABORT_REQUEST_STARTED");
 });
 
 test("B6 a reply / flag alone is insufficient: a FABRICATED helper success (no DB change) and a conflicting open case planted after the reply (SYNTHETIC, owner) never yield a receipt", async () => {

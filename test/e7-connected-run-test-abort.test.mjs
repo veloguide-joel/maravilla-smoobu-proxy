@@ -150,7 +150,7 @@ test("H3 bridge refusals BEFORE the start record: input / manifest / operator bi
   for (const [label, inp, want] of cases) {
     const r = await runTestAbortBridge(inp);
     assert.equal(r.outcome, "REFUSED_BEFORE_START", label); assert.equal(r.code, want, label);
-    assert.deepEqual([r.helperInvocations, r.cleanupPermitted, r.startAck], [0, false, null], label);
+    assert.deepEqual([r.operatorCoreInvocations, r.cleanupPermitted, r.startAck], [0, false, null], label);
     if (inp.pool && inp.pool.calls !== undefined) assert.equal(inp.pool.calls, 0, label);
   }
   assert.equal(j.controls.size(), n, "nothing appended"); assert.equal(s.n, 0);
@@ -158,16 +158,16 @@ test("H3 bridge refusals BEFORE the start record: input / manifest / operator bi
   const m2 = manifest(); const j2 = V2.createMemoryJournalV2({ manifest: m2 }); let h2;
   for (const r of chain(RESERVED("disconnected").slice(0, 5), idOf(m2))) h2 = await j2.journal.append(r);
   const r2 = await runTestAbortBridge({ ...base(), manifest: m2, journal: j2.journal, trustedHead: { ...h2 } });
-  assert.deepEqual([r2.outcome, r2.code, r2.helperInvocations], ["REFUSED_BEFORE_START", "JOURNAL_NOT_ABORT_READY", 0]);
+  assert.deepEqual([r2.outcome, r2.code, r2.operatorCoreInvocations], ["REFUSED_BEFORE_START", "JOURNAL_NOT_ABORT_READY", 0]);
   // read faults: torn / rejected / hung (bounded by the guard)
   for (const [mode, want] of [["torn", "JOURNAL_READ_INVALID"], ["reject", "JOURNAL_READ_REJECTED"]]) {
     const x = await readyJournal("disconnected", { faults: { read: { 1: mode } } });
     const r = await runTestAbortBridge({ ...base(), manifest: x.m, journal: x.j.journal, trustedHead: x.head });
-    assert.deepEqual([r.outcome, r.code, r.helperInvocations], ["REFUSED_BEFORE_START", want, 0], mode);
+    assert.deepEqual([r.outcome, r.code, r.operatorCoreInvocations], ["REFUSED_BEFORE_START", want, 0], mode);
   }
   const hx = await readyJournal("disconnected", { faults: { read: { 1: "hang" } } }); const fg = fakeGuard();
   const p = runTestAbortBridge({ ...base(), manifest: hx.m, journal: hx.j.journal, trustedHead: hx.head, guard: fg.guard }); await flush(); await fg.advance(5_001);
-  const rh = await p; assert.deepEqual([rh.outcome, rh.code, rh.helperInvocations], ["REFUSED_BEFORE_START", "JOURNAL_READ_TIMEOUT", 0]);
+  const rh = await p; assert.deepEqual([rh.outcome, rh.code, rh.operatorCoreInvocations], ["REFUSED_BEFORE_START", "JOURNAL_READ_TIMEOUT", 0]);
   assert.ok(BRIDGE_OUTCOMES.includes(rh.outcome));
 });
 
@@ -179,7 +179,7 @@ test("H4 start-record append rejected / hung / late / landed-but-unacknowledged 
     const p = runTestAbortBridge({ manifest: x.m, operator: operator(), journal, trustedHead: x.head, pool, env: ENV, guard: fg.guard, now: 1_800_000_000_000, operatorDeps: spyDeps(s) });
     await flush(); await fg.advance(5_001); await fg.advance(5_001);
     const r = await p;
-    assert.equal(r.outcome, "STOPPED_START_UNACKED", mode); assert.deepEqual([r.helperInvocations, pool.calls, s.n, r.cleanupPermitted], [0, 0, 0, false], mode);
+    assert.equal(r.outcome, "STOPPED_START_UNACKED", mode); assert.deepEqual([r.operatorCoreInvocations, pool.calls, s.n, r.cleanupPermitted], [0, 0, 0, false], mode);
     const facts = V2.journalFactsV2((await x.j.journal.read()).records, x.m).facts;
     assert.equal(facts.cleanupEntryPermitted, false, mode);
     if (mode === "landed_hang" || mode === "badack") assert.equal(facts.abortStarted, true, `${mode}: the start may have landed — still no permission`);
@@ -210,5 +210,33 @@ test("H6 purity / scope: bridge imports only accepted modules; no env / fs / tim
   assert.ok(!/\b(UPDATE|INSERT|DELETE)\b/.test(src.match(/\/\*m2c:[\s\S]*?\$[0-9]/g)?.join("") ?? ""), "postcheck SQL is SELECT only");
   const sha = (p) => createHash("sha256").update(readFileSync(new URL(`../${p}`, import.meta.url))).digest("hex");
   assert.deepEqual(Object.fromEntries(Object.keys(PINS).map((p) => [p, sha(p)])), PINS);
+});
+test("H7 injected clock faults (guard.now throws / non-finite / malformed): a STRUCTURED stopped result, never a top-level rejection; before the read → refused, nothing appended; before the operator → 0 core calls, start ACK + trusted head preserved", async () => {
+  const faulty = (g, at, how) => { let k = 0; return Object.freeze({ observe: g.observe, now: () => { k += 1; if (k !== at) return g.now();
+    if (how === "throw") throw new Error("clock fault"); if (how === "nan") return { ok: true, value: NaN }; if (how === "inf") return { ok: true, value: Infinity };
+    if (how === "string") return { ok: true, value: "1" }; return null; }, calls: () => k }); };
+  for (const how of ["throw", "nan", "inf", "string", "null"]) {
+    // (a) before the initial journal read
+    const x = await readyJournal(); const pool = countingPool(); const s = { n: 0 };
+    const ga = faulty(realGuard(), 1, how);
+    let ra; await assert.doesNotReject(async () => { ra = await runTestAbortBridge({ manifest: x.m, operator: operator(), journal: x.j.journal, trustedHead: x.head, pool, env: ENV,
+      guard: { observe: ga.observe, now: ga.now }, now: 1_800_000_000_000, operatorDeps: spyDeps(s) }); }, how);
+    assert.deepEqual([ra.outcome, ra.code, ra.operatorCoreInvocations, ra.startAck, ra.cleanupPermitted], ["REFUSED_BEFORE_START",
+      how === "throw" ? "JOURNAL_READ_GUARD_NOW_FAULT" : "JOURNAL_READ_GUARD_NOW_INVALID", 0, null, false], how);
+    assert.deepEqual([x.j.controls.readCalls(), x.j.controls.size(), pool.calls, s.n], [0, x.n, 0, 0], `${how}: the read was never started`);
+    // (b) after the start ACK, before the operator core (now() call 3: read, start append, operator)
+    const y = await readyJournal("airbnb"); const pool2 = countingPool(); const s2 = { n: 0 };
+    const gb = faulty(realGuard(), 3, how);
+    const rb = await runTestAbortBridge({ manifest: y.m, operator: operator(), journal: y.j.journal, trustedHead: y.head, pool: pool2, env: ENV,
+      guard: { observe: gb.observe, now: gb.now }, now: 1_800_000_000_000, operatorDeps: spyDeps(s2) });
+    assert.deepEqual([rb.outcome, rb.code, rb.operatorCoreInvocations, rb.requestHelperInvocations, rb.cleanupPermitted, rb.dbAbortApplied, rb.postcheck],
+      ["STOPPED_BEFORE_OPERATOR", how === "throw" ? "GUARD_NOW_FAULT" : "GUARD_NOW_INVALID", 0, null, false, null, null], how);
+    assert.deepEqual([pool2.calls, s2.n, y.j.controls.appendCalls(), y.j.controls.size()], [0, 0, y.n + 1, y.n + 1], `${how}: the start record landed and was ACKed; nothing was sent`);
+    assert.deepEqual(rb.startAck, { seq: y.n + 1, hash: V2.recordHashV2((await y.j.journal.read()).records.at(-1)) });
+    assert.deepEqual(rb.trustedHead, rb.startAck, `${how}: the trusted head is the last ACKed record`);
+    const fy = V2.journalFactsV2((await y.j.journal.read()).records, y.m, { trustedHead: rb.trustedHead });
+    assert.deepEqual([fy.anchored, fy.facts.abortStarted, fy.facts.abortReady, fy.facts.cleanupEntryPermitted], [true, true, false, false], `${how}: never re-requestable from this journal`);
+    assert.ok(BRIDGE_OUTCOMES.includes(rb.outcome));
+  }
 });
 const PINS = {"scripts/e7-connected/run-manifest.mjs":"c47f72eb2b9e898bdaca2ca20ffe7cea0befab006079953133810ce5651f6a56","scripts/e7-connected/run-manifest-v2.mjs":"c19ab009b00b8c3877da53f20e436c1c6d4ac29d051ab1f21705d38fcf3cc7fd","scripts/e7-connected/run-journal-memory.mjs":"2712f01b0509d343d162b5fe7055878ade40f69d668915671441b81cbf87c700","scripts/e7-connected/run-journal-file.mjs":"265af8195dccbaae34817a9a16e2f09f4498b85638fae4abb779d5b0bd9cc4b1","scripts/e7-connected/run-core.mjs":"ad1dcbb29e7cb1ce0aac71ac178d903076d4e5cc293dd17f972c04b4beaa5afe","lib/booking-db/test-abort.js":"a00952ca8edf9c0b1960750cdd81399cde464b7e909f082f263a90b11fc6d536","scripts/e7-operator/test-abort.mjs":"8abcb82ba49ed4b239d2c7a0f5251bb07d24fd95fece1c6580a4cad14532bff3","lib/checkout/intent-state.js":"16d1af5a7ea408b1a2e62f857a0027e71d8a1aa7b69c6d4f4bf7290823115615","db/migrations/0017_cancelled_pristine_capture_release.up.sql":"880f203b11cb4d2a9fe2317d6cb9fc8e00853b8c8ba41f44026d07aae9fd510e"};

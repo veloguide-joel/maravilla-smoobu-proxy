@@ -5,8 +5,14 @@
 //
 // runTestAbortBridge(input) → Promise<frozen BridgeResult> (never rejects for a refusal):
 //   input = { manifest, operator, journal, trustedHead, pool, env, guard, now, operatorDeps? }   (plain own data properties only)
-//   outcome ∈ REFUSED_BEFORE_START | STOPPED_START_UNACKED | ABORT_REFUSED | ABORT_NOT_THIS_RUN | ABORT_OUTCOME_UNKNOWN | ABORT_POSTCHECK_FAILED
-//             | STOPPED_RECEIPT_UNACKED | ABORT_ACCEPTED_JOURNALED      (cleanupPermitted is true ONLY for the last)
+//   outcome ∈ REFUSED_BEFORE_START | STOPPED_START_UNACKED | STOPPED_BEFORE_OPERATOR | ABORT_REFUSED | ABORT_NOT_THIS_RUN | ABORT_OUTCOME_UNKNOWN
+//             | ABORT_POSTCHECK_FAILED | STOPPED_RECEIPT_UNACKED | ABORT_ACCEPTED_JOURNALED      (cleanupPermitted is true ONLY for the last)
+//   counters: operatorCoreInvocations = calls of the accepted executeOperatorAbort, counted INSIDE the guard's started callback (0 or 1);
+//             requestHelperInvocations = the core's OWN reported count of requestTestAbort calls (0 / 1), null when the core's result is unknown.
+//   dbAbortApplied: true = applied event + transition for the deterministic id OBSERVED; false = both OBSERVED absent at the read; null = not read.
+//   trustedHead: the LAST ACKNOWLEDGED journal head (seq / hash). It never advances on a lost / malformed ACK; a consumer must validate
+//             against it (an unacknowledged landed record is then an extra tail → refused) and must honour the stop, never an unanchored
+//             journalFactsV2 view. receiptLanding: NOT_ATTEMPTED | ACKED | UNACKED_MAY_HAVE_LANDED (a started, unACKed receipt is never claimed absent).
 import { types } from "node:util";
 import { bindManifestV2, journalFactsV2, recordHashV2, ABORT_QUEUED, ABORT_REASON, RECORD_VERSION_V2 } from "./run-journal-memory-v2.mjs";
 import { LIMITS } from "./run-guard.mjs";
@@ -16,7 +22,7 @@ import { executeOperatorAbort, abortPlanHash } from "../e7-operator/test-abort.m
 import { testAbortEventId } from "../../lib/checkout/intent-state.js";
 
 export const BRIDGE_VERSION = "e7-run-test-abort-bridge-v1";
-export const BRIDGE_OUTCOMES = Object.freeze(["REFUSED_BEFORE_START", "STOPPED_START_UNACKED", "ABORT_REFUSED", "ABORT_NOT_THIS_RUN", "ABORT_OUTCOME_UNKNOWN",
+export const BRIDGE_OUTCOMES = Object.freeze(["REFUSED_BEFORE_START", "STOPPED_START_UNACKED", "STOPPED_BEFORE_OPERATOR", "ABORT_REFUSED", "ABORT_NOT_THIS_RUN", "ABORT_OUTCOME_UNKNOWN",
   "ABORT_POSTCHECK_FAILED", "STOPPED_RECEIPT_UNACKED", "ABORT_ACCEPTED_JOURNALED"]);
 export const BRIDGE_LIMITS = Object.freeze({ journalMs: LIMITS.JOURNAL_MS, abortMs: LIMITS.STEP_MARGIN_MS, postcheckMs: LIMITS.SNAPSHOT_MS });
 const INPUT_KEYS = ["env", "guard", "journal", "manifest", "now", "operator", "operatorDeps", "pool", "trustedHead"];
@@ -51,10 +57,14 @@ const headCopy = (h) => { const c = dataProps(h, ["hash", "seq"]); return c && N
 
 /** the bounded observation of ONE started operation → { kind:'fulfilled', value } | { kind:'rejected' } | { kind:'uncertain', code } */
 async function bounded(guard, ms, start) {
-  const n = guard.now();
-  if (!n || n.ok !== true) return { kind: "uncertain", code: "GUARD_NOW_INVALID", started: false };
+  let n;
+  try { n = guard.now(); } catch { return { kind: "uncertain", code: "GUARD_NOW_FAULT", started: false }; }       // injected clock fault: code-only, not started
+  let value;
+  try { if (!n || typeof n !== "object" || n.ok !== true) return { kind: "uncertain", code: "GUARD_NOW_INVALID", started: false }; value = n.value; }
+  catch { return { kind: "uncertain", code: "GUARD_NOW_INVALID", started: false }; }
+  if (typeof value !== "number" || !Number.isFinite(value) || !Number.isFinite(value + ms)) return { kind: "uncertain", code: "GUARD_NOW_INVALID", started: false };
   let r;
-  try { r = await guard.observe(n.value + ms, start); } catch { return { kind: "uncertain", code: "GUARD_FAULT", started: true }; }
+  try { r = await guard.observe(value + ms, start); } catch { return { kind: "uncertain", code: "GUARD_FAULT", started: true }; }
   if (!r || typeof r !== "object") return { kind: "uncertain", code: "GUARD_FAULT", started: true };
   if (r.kind === "fulfilled") return { kind: "fulfilled", value: r.value, started: true };
   if (r.kind === "rejected") return { kind: "rejected", started: true };
@@ -97,9 +107,16 @@ async function postcheck(pool, e, rid) {
   return { ok, facts: freeze({ ...facts, queued: freeze([...facts.queued]) }) };
 }
 
+/** tri-state from OBSERVED rows only (see the header) */
+function observedApplied(facts) {
+  if (!facts || typeof facts.transition !== "string") return null;
+  if (facts.appliedEvents === 1 && facts.appliedEventType === ABORT_REASON && facts.transition.startsWith(`reservation_confirmed>capture_failed:${ABORT_REASON}:`)) return true;
+  if (facts.appliedEvents === 0 && facts.transition === "rows:0") return false;     // both OBSERVED absent at that read
+  return null;
+}
 export async function runTestAbortBridge(input) {
-  const out = { version: BRIDGE_VERSION, outcome: null, code: null, cleanupPermitted: false, helperInvocations: 0, operatorOutcome: null, startAck: null, receiptAck: null,
-    postcheck: null, dbAbortApplied: null };
+  const out = { version: BRIDGE_VERSION, outcome: null, code: null, cleanupPermitted: false, operatorCoreInvocations: 0, requestHelperInvocations: null, operatorOutcome: null,
+    startAck: null, receiptAck: null, trustedHead: null, receiptLanding: "NOT_ATTEMPTED", postcheck: null, dbAbortApplied: null };
   const done = (outcome, code = null) => { out.outcome = outcome; out.code = code; return freeze({ ...out }); };
   // ---- synchronous binding (before any await) -------------------------------------------------------------------------------------
   const inp = dataProps(input, INPUT_KEYS);
@@ -118,6 +135,7 @@ export async function runTestAbortBridge(input) {
   const guard = freeze({ observe: (d, s) => gm.observe(d, s), now: () => gm.now() });
   const head = headCopy(inp.trustedHead);
   if (!head) return done("REFUSED_BEFORE_START", "TRUSTED_HEAD_INVALID");
+  out.trustedHead = head;
   const env = envCopy(inp.env);
   if (!env) return done("REFUSED_BEFORE_START", "ENV_INVALID");
   if (!Number.isSafeInteger(inp.now) || inp.now < 0) return done("REFUSED_BEFORE_START", "CLOCK_INVALID");
@@ -143,29 +161,46 @@ export async function runTestAbortBridge(input) {
   const sa = await bounded(guard, BRIDGE_LIMITS.journalMs, () => jm.append(startRec));
   if (sa.kind !== "fulfilled" || !ackOk(sa.value, startRec)) return done("STOPPED_START_UNACKED", sa.kind === "fulfilled" ? "ACK_INVALID" : sa.kind === "rejected" ? "APPEND_REJECTED" : sa.code);
   out.startAck = freeze({ seq: startRec.seq, hash: recordHashV2(startRec) });
+  out.trustedHead = out.startAck;
   // ---- (3) the accepted operator core, at most ONCE, bounded; never resent --------------------------------------------------------
-  out.helperInvocations = 1;
-  const ex = await bounded(guard, BRIDGE_LIMITS.abortMs, () => executeOperatorAbort(pool, e, { now, env, ...(opDeps ? { deps: opDeps } : {}) }));
-  const diag = async () => { const pc = await bounded(guard, BRIDGE_LIMITS.postcheckMs, () => postcheck(pool, e, reservationId)); out.postcheck = pc.kind === "fulfilled" ? pc.value.facts : null; };
-  if (ex.kind !== "fulfilled") { await diag(); return done("ABORT_OUTCOME_UNKNOWN", ex.kind === "rejected" ? "HELPER_REJECTED" : ex.code); }
+  const ex = await bounded(guard, BRIDGE_LIMITS.abortMs, () => { out.operatorCoreInvocations += 1; return executeOperatorAbort(pool, e, { now, env, ...(opDeps ? { deps: opDeps } : {}) }); });
+  /** bounded READ-ONLY diagnostics; the tri-state dbAbortApplied comes ONLY from what was observed */
+  const diag = async () => {
+    const pc = await bounded(guard, BRIDGE_LIMITS.postcheckMs, () => postcheck(pool, e, reservationId));
+    out.postcheck = pc.kind === "fulfilled" ? pc.value.facts : null;
+    out.dbAbortApplied = observedApplied(out.postcheck);
+  };
+  if (ex.kind !== "fulfilled") {
+    if (ex.started === false && out.operatorCoreInvocations === 0) return done("STOPPED_BEFORE_OPERATOR", ex.code);   // the core was never started
+    await diag(); return done("ABORT_OUTCOME_UNKNOWN", ex.kind === "rejected" ? "HELPER_REJECTED" : ex.code);
+  }
   const xo = ex.value && typeof ex.value.outcome === "string" ? ex.value.outcome : null;
   out.operatorOutcome = xo;
-  if (xo === "REFUSED" || (xo && xo.startsWith("NOT_EXECUTED_"))) { out.dbAbortApplied = false; return done("ABORT_REFUSED", typeof ex.value.code === "string" ? ex.value.code.slice(0, 48) : null); }
+  out.requestHelperInvocations = ex.value && Number.isSafeInteger(ex.value.invocations) && ex.value.invocations >= 0 && ex.value.invocations <= 1 ? ex.value.invocations : null;
+  // the deterministic abort already exists (the core's precheck saw it; it sent NOTHING): never adopted, never a "refusal that nothing exists"
+  if (xo === "NOT_EXECUTED_ALREADY_REQUESTED") { await diag(); return done("ABORT_NOT_THIS_RUN", "ALREADY_REQUESTED_OUTSIDE_HANDSHAKE"); }
   if (xo === "DUPLICATE_RECONCILED") { await diag(); return done("ABORT_NOT_THIS_RUN", "DUPLICATE_OUTSIDE_HANDSHAKE"); }
+  if (xo === "REFUSED" || (xo && xo.startsWith("NOT_EXECUTED_"))) { await diag(); return done("ABORT_REFUSED", typeof ex.value.code === "string" ? ex.value.code.slice(0, 48) : null); }
   if (xo !== "REQUESTED") { await diag(); return done("ABORT_OUTCOME_UNKNOWN", xo || "HELPER_RESULT_INVALID"); }
   // ---- (4) bounded READ-ONLY postcheck: exact applied event / transition / state / pristine capture / queued obligations / claim ------
   const pc = await bounded(guard, BRIDGE_LIMITS.postcheckMs, () => postcheck(pool, e, reservationId));
   if (pc.kind !== "fulfilled") return done("ABORT_OUTCOME_UNKNOWN", `POSTCHECK_${pc.kind === "rejected" ? "REJECTED" : pc.code}`.slice(0, 48));
   out.postcheck = pc.value.facts;
+  out.dbAbortApplied = observedApplied(out.postcheck);
   if (!pc.value.ok) return done("ABORT_POSTCHECK_FAILED", "POSTCHECK_MISMATCH");
-  out.dbAbortApplied = true;
   // ---- (5) receipt, exact ACK before cleanup is permitted ----------------------------------------------------------------------------
   const receipt = freeze({ appliedVersion: e.expectedVersion + 1, state: "capture_failed", reason: ABORT_REASON, capture: freeze({ state: "pending", attempts: 0, dispatched: false }),
     queued: ABORT_QUEUED, claimHeld: true });
   const recRec = freeze({ ...common(head.seq + 2, out.startAck.hash, "ABORT_ACCEPTED"), abort, receipt });
   const ra = await bounded(guard, BRIDGE_LIMITS.journalMs, () => jm.append(recRec));
-  if (ra.kind !== "fulfilled" || !ackOk(ra.value, recRec)) return done("STOPPED_RECEIPT_UNACKED", ra.kind === "fulfilled" ? "ACK_INVALID" : ra.kind === "rejected" ? "APPEND_REJECTED" : ra.code);
+  if (ra.kind !== "fulfilled" || !ackOk(ra.value, recRec)) {
+    // the trusted head stays at the start ACK; a receipt MAY already be stored (late / landed / bad ACK): never claimed absent, never deleted
+    // (a rejected append is NOT proof of absence either: only a never-started append is reported as not attempted)
+    out.receiptLanding = ra.started === false ? "NOT_ATTEMPTED" : "UNACKED_MAY_HAVE_LANDED";
+    return done("STOPPED_RECEIPT_UNACKED", ra.kind === "fulfilled" ? "ACK_INVALID" : ra.kind === "rejected" ? "APPEND_REJECTED" : ra.code);
+  }
   out.receiptAck = freeze({ seq: recRec.seq, hash: recordHashV2(recRec) });
+  out.trustedHead = out.receiptAck; out.receiptLanding = "ACKED";
   out.cleanupPermitted = true;
   return done("ABORT_ACCEPTED_JOURNALED");
 }

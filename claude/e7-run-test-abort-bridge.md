@@ -43,12 +43,15 @@ v1 readers and old valid v2 chains are unchanged: a chain without these events v
 3. **Start record.**
    - Append `ABORT_REQUEST_STARTED` (`seq = head + 1`, `prevHash = head.hash`), bounded.
    - The ACK must equal exactly `{ seq, hash: recordHashV2(record) }`.
-   - On reject, timeout, malformed ACK or guard fault: `STOPPED_START_UNACKED` with **0 helper invocations**.
+   - On reject, timeout, malformed ACK or guard fault: `STOPPED_START_UNACKED` with **0 operator-core invocations**.
 4. **Invoke once.** `executeOperatorAbort(pool, expectation, { now, env })` — the accepted operator core, which calls `requestTestAbort` once and never retries — runs **at most once**, bounded (`LIMITS.STEP_MARGIN_MS`). There is no second implementation and no repo gate is bypassed.
+   - A guard clock fault before the core is started gives `STOPPED_BEFORE_OPERATOR`: 0 core calls, start ACK and trusted head kept.
 5. **Outcome.**
    - Only `REQUESTED` proceeds.
-   - `REFUSED` and `NOT_EXECUTED_*` give `ABORT_REFUSED`.
-   - `DUPLICATE_RECONCILED` gives `ABORT_NOT_THIS_RUN`: an abort applied outside this journal handshake is never adopted.
+   - `NOT_EXECUTED_ALREADY_REQUESTED` (the core's precheck already sees the deterministic abort; it sends nothing) gives `ABORT_NOT_THIS_RUN` / `ALREADY_REQUESTED_OUTSIDE_HANDSHAKE`, with read-only diagnostics. It is handled BEFORE the generic refusal branch.
+   - `DUPLICATE_RECONCILED` (the abort raced in between the core's precheck and its one call) gives `ABORT_NOT_THIS_RUN` / `DUPLICATE_OUTSIDE_HANDSHAKE`.
+   - Neither is ever adopted: an abort applied outside this journal handshake gets no receipt and no cleanup permission.
+   - `REFUSED` and the other `NOT_EXECUTED_*` give `ABORT_REFUSED`, also with read-only diagnostics.
    - Timeout, throw, `REQUEST_OUTCOME_UNKNOWN` or `POSTCHECK_MISMATCH` give `ABORT_OUTCOME_UNKNOWN`.
    - For every non-`REQUESTED` outcome: **no resend**, no receipt, no cleanup permission. Read-only diagnostic facts are returned when the postcheck runs.
 6. **Read-only postcheck** (bounded; SELECTs and `loadIntent` only). Every one of these must hold, otherwise `ABORT_POSTCHECK_FAILED`:
@@ -63,7 +66,26 @@ v1 readers and old valid v2 chains are unchanged: a chain without these events v
    - Append `ABORT_ACCEPTED` carrying those proof fields, bounded; the exact ACK is required.
    - A lost or ambiguous receipt gives `STOPPED_RECEIPT_UNACKED`. The DB outcome (accepted) is preserved in the result for recovery, and cleanup is **not** permitted.
    - Only an ACKed receipt gives `ABORT_ACCEPTED_JOURNALED` with `cleanupPermitted: true`.
+   - A started but unACKed receipt (rejected, timed out, late, landed with a hung, malformed or lost ACK) reports `receiptLanding: UNACKED_MAY_HAVE_LANDED`: it MAY already be stored and is never claimed absent. Only a receipt append that never started (a clock fault) reports `NOT_ATTEMPTED`.
+   - Landed history is never mutated or deleted, and the receipt is never resent.
 8. **The bridge never appends RUN_STOPPED / RUN_ENDED and never runs the cleanup worker.** The consumer, run-core in a later slice, decides the stop. The existing compensation worker then settles BOTH legs, each on its own proof. The pending capture row stays untouched and fenced (0007); claim release in `cancelled` relies on the 0017 local candidate.
+
+## Result fields: counters, tri-state, trusted head (corrections after root review)
+
+| field | meaning |
+|---|---|
+| `operatorCoreInvocations` | calls of the accepted `executeOperatorAbort`, counted INSIDE the guard's started callback (0 or 1). Replaces the earlier `helperInvocations`, which was set before the guard could start the call. |
+| `requestHelperInvocations` | the core's OWN reported count of `requestTestAbort` calls (0 or 1); `null` when the core's result is unknown. `NOT_EXECUTED_*` → 0. |
+| `dbAbortApplied` | `true` = the applied event AND the `reservation_confirmed → capture_failed` transition for the deterministic id were OBSERVED; `false` = both OBSERVED absent at that read; `null` = not read / inconclusive. Never `false` by assumption. |
+| `trustedHead` | the LAST ACKNOWLEDGED journal head: the caller's head → start ACK → receipt ACK. It never advances on a lost or malformed ACK. |
+| `receiptLanding` | `NOT_ATTEMPTED` / `ACKED` / `UNACKED_MAY_HAVE_LANDED` |
+
+**Clock faults.** `bounded()` catches a throwing `guard.now()` (`GUARD_NOW_FAULT`) and refuses a non-object, non-ok or non-finite result (`GUARD_NOW_INVALID`) before forming a deadline. The bridge returns a structured result, never a top-level rejection, and keeps any startAck, postcheck and DB outcome it already knows.
+
+**Consumer boundary (for the later run-core slice).**
+- A consumer must honour the bridge's stop together with `trustedHead`.
+- Validating the journal against `trustedHead` refuses an unACKed landed receipt as an extra tail (`TRUSTED_HEAD_MISMATCH`). A re-run of the bridge from that head is refused before start.
+- An UNANCHORED `journalFactsV2(...).facts.cleanupEntryPermitted` can read `true` over such a tail, so it is never authority.
 
 ## Contract decisions made during M2-C
 
