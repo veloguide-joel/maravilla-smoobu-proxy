@@ -80,6 +80,17 @@ test("H1 preflight (fake child): PREFLIGHT_OK_PACKAGING_ONLY; exact pins; accept
   assert.equal(rec.spawns[0].o.cwd, TOOLING);
   assert.deepEqual(r.tests, { status: 0, tests: 85, pass: 85, fail: 0, connectivityEvidence: false });
   assert.deepEqual(Object.keys(r).sort(), RESULT_KEYS, "whitelisted result keys only (no manifest / guest / credential dump)");
+  // the step summary renders the numeric test fields and every pin; nothing is REDACTED on a clean run
+  const md = E.summaryMarkdown(r);
+  assert.ok(md.includes("| fake-only suites (NOT connectivity) | status 0, pass 85/85, fail 0 |"), md);
+  assert.ok(md.includes(`| closureDigest (computed) | ${C.closureDigest} |`));
+  assert.ok(md.includes(`| runnerPlanHash | ${r.runnerPlanHash} |`));
+  assert.equal(md.includes("REDACTED"), false, md);
+  // hostile values are bounded: non-integer test fields and non-code strings are REDACTED, never rendered
+  const hostile = E.summaryMarkdown({ ...r, mode: "x | <script>", envCode: "a\nb", tests: { status: "0; rm", pass: 1.5, tests: -1, fail: "1" } });
+  assert.ok(hostile.includes("| fake-only suites (NOT connectivity) | status REDACTED, pass REDACTED/REDACTED, fail REDACTED |"), hostile);
+  assert.ok(hostile.includes("| mode | REDACTED |") && hostile.includes("| env | REDACTED |"));
+  assert.equal(hostile.includes("<script>") || hostile.includes("rm"), false);
 });
 
 test("H2 every mode except preflight is refused FIRST: no env read, no fs, no import, no child", async () => {
@@ -95,7 +106,8 @@ test("H2 every mode except preflight is refused FIRST: no env read, no fs, no im
 
 test("H3 credential boundary: DB / Postgres / Supabase / Stripe / Hostaway keys refused at the parent, values never echoed; nothing imported or spawned", async () => {
   const keys = ["E7_DEV_BOOKING_DATABASE_URL", "DATABASE_URL", "PGPASSWORD", "PGHOST", "SUPABASE_SERVICE_ROLE_KEY", "STRIPE_SECRET_KEY", "E7_STRIPE_TEST_KEY",
-    "STRIPE_TEST_SECRET_KEY", "E7_HOSTAWAY_TOKEN", "HOSTAWAY_CLIENT_SECRET", "hostaway_account_id"];
+    "STRIPE_TEST_SECRET_KEY", "E7_HOSTAWAY_TOKEN", "HOSTAWAY_CLIENT_SECRET", "hostaway_account_id", "PG_SERVICE_FILE", "PG_URL", "PG1", "pgpassword",
+    "POSTGRES_URL", "POSTGRES_PRISMA_URL", "E7_POSTGRES_DSN"];
   for (const k of keys) {
     const { res, rec } = await host("preflight", { [k]: `CANARY_${k}_value` });
     assert.deepEqual([res.exitCode, res.result.code], [1, "CRH_SECRET_SCOPE_VIOLATION"], k);

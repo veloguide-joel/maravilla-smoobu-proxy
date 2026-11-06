@@ -73,7 +73,7 @@ export const HOSTED_CODES = freeze(["CRH_MODE_NOT_IMPLEMENTED", "CRH_SECRET_SCOP
   "CRH_SOURCE_UNREADABLE", "CRH_SOURCE_MISMATCH", "CRH_IMPORT_REFUSED", "CRH_IMPORT_FAILED", "CRH_MANIFEST_REFUSED", "CRH_SYNTHETIC_ADOPTION_REFUSED",
   "CRH_ENV_REFUSED", "CRH_CHILD_FAILED", "CRH_TESTS_FAILED", "CRH_INTERNAL", "PREFLIGHT_OK_PACKAGING_ONLY"]);
 /** parent-boundary credential refusal: any key naming a DB / Postgres / Supabase / Stripe / Hostaway credential (values never read or echoed) */
-export const CREDENTIAL_KEY_RE = /DATABASE|^PG[A-Z]*$|SUPABASE|STRIPE|HOSTAWAY/i;
+export const CREDENTIAL_KEY_RE = /DATABASE|^PG|POSTGRES|SUPABASE|STRIPE|HOSTAWAY/i;   // ^PG: every PG-prefixed key (PGHOST, PG_URL, PG_SERVICE_FILE, PG1 …)
 export const E7_INPUTS_ALLOWED = freeze(["E7_TOOLING_DIR", "E7_WORKFLOW_SHA"]);
 const HEX40 = /^[0-9a-f]{40}$/; const HEX64 = /^[0-9a-f]{64}$/; const CODE_RE = /^[A-Za-z0-9_:.-]{1,80}$/;
 const MAX_FILE = 1048576; const MAX_TOTAL = 8388608;
@@ -193,11 +193,13 @@ export async function runHosted({ mode = "preflight", env, proc, wrapperDir, dep
 
 export function summaryMarkdown(r) {
   const s = (x) => (typeof x === "string" && CODE_RE.test(x) ? x : x === null || x === undefined ? "—" : HEX64.test(String(x)) || HEX40.test(String(x)) ? String(x) : "REDACTED");
+  const n = (x) => (Number.isSafeInteger(x) && x >= 0 ? String(x) : "REDACTED");           // bounded numeric test fields, rendered as numbers only
+  const tests = r.tests && typeof r.tests === "object" ? `status ${n(r.tests.status)}, pass ${n(r.tests.pass)}/${n(r.tests.tests)}, fail ${n(r.tests.fail)}` : null;
   const rows = [["proof", r.proof], ["mode", r.mode], ["code", r.code], ["workflow commit", r.workflowSha], ["tooling commit", r.toolingCommit],
     ["closureDigest (computed)", r.closureDigest], ["runnerDigest (computed)", r.runnerDigest], ["manifestHash (synthetic)", r.manifestHash],
     ["runnerPlanHash", r.runnerPlanHash], ["env", r.envCode],
-    ["fake-only suites (NOT connectivity)", r.tests ? `status ${r.tests.status}, pass ${r.tests.pass}/${r.tests.tests}, fail ${r.tests.fail}` : null]];
-  return `### E7 connected-runner launcher L1 — PREFLIGHT (packaging proof only)\n\n| field | value |\n|---|---|\n${rows.map(([a, b]) => `| ${a} | ${s(b)} |`).join("\n")}\n`;
+    ["fake-only suites (NOT connectivity)", { tests }]];
+  return `### E7 connected-runner launcher L1 — PREFLIGHT (packaging proof only)\n\n| field | value |\n|---|---|\n${rows.map(([a, b]) => `| ${a} | ${b && typeof b === "object" ? (b.tests ?? "—") : s(b)} |`).join("\n")}\n`;
 }
 
 if (import.meta.main === true) {
