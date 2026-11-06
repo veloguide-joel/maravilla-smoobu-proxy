@@ -11,7 +11,7 @@ import { importClosure } from "./helpers/import-closure.mjs";
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const walk = (d) => (existsSync(join(ROOT, d)) ? readdirSync(join(ROOT, d)).flatMap((n) => (statSync(join(ROOT, d, n)).isDirectory() ? walk(`${d}/${n}`) : [`${d}/${n}`])) : []);
 const MOVED = ["codec", "config", "operations", "pool", "repo", "webhooks"];
-const BOOKING_DB_FILES = [...MOVED, "intent-access", "recovery", "reservation-worker", "capture-worker", "compensation-worker", "recording-worker", "recording-inbox", "notification-worker"].sort(); // + E6 bearer-token lookup and shared rate limits; + E7.1 recovery; + E7.2/E7.3b/E7.4a/E7.4b/E7 guest-notification offline workers (not route-reachable)
+const BOOKING_DB_FILES = [...MOVED, "intent-access", "recovery", "reservation-worker", "capture-worker", "compensation-worker", "recording-worker", "recording-inbox", "notification-worker", "test-abort"].sort(); // + E6 bearer-token lookup and shared rate limits; + E7.1 recovery; + E7.2/E7.3b/E7.4a/E7.4b/E7 guest-notification offline workers; + E7 TEST abort transaction (not route-reachable)
 const WEBHOOK = "api/checkout/stripe-webhook.js";
 const INTENT_ROUTES = ["api/checkout/intents.js", "api/checkout/intent-step.js"];
 // E6 intent API closure (identical for both routes apart from the entry file); everything after the HTTP layer is lazy.
