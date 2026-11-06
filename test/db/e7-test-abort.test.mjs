@@ -310,3 +310,27 @@ test("D6 either leg first, and unclear outcomes: a reply alone never settles a l
   assert.deepEqual([w2.cancels.length, (await opsOf(b.id, OPS.CANCEL)).length], [1, 1], "no resend, no new cancel row");
   assert.equal([...w.calls, ...w2.calls].some((c) => /capture|refund/i.test(c)), false);
 });
+
+test("D7 (root a1dcea0d) the expectation is bound synchronously: mutating the caller's object while the transaction runs (inside the intent lock) cannot change what is checked or written; coerced inputs make ZERO writes", async () => {
+  const a = await confirmedIntent();
+  const callerObj = { ...a.e };
+  let mutated = false;
+  // afterLoad fires inside applyEvent AFTER the intent row is loaded/locked and BEFORE the reducer + in-transaction checks (repo.js:354 < :390)
+  const hooks = { afterLoad: async () => { callerObj.expectedVersion = 999; callerObj.paymentIntentId = "pi_ABRTmutatedX01"; callerObj.reservationId = "61999999";
+    callerObj.listingId = 603566; callerObj.sessionId = "cs_test_mutatedAbort1"; mutated = true; } };
+  const r = await requestTestAbort(db.app, a.id, { now: F.at(9), env: ENV, operator: callerObj, hooks });
+  assert.equal(mutated, true, "the caller object really changed mid-transaction");
+  assert.equal(r.ok, true, r.error);
+  assert.equal(await state(a.id), "capture_failed");
+  const ev = (await db.app.query("SELECT event_id FROM booking.intent_applied_events WHERE intent_id = $1 AND event_id LIKE 'test-abort:%'", [a.id])).rows;
+  assert.deepEqual(ev.map((x) => x.event_id), [`test-abort:${a.id}:${a.piId}:${a.rid}`], "event id from the BOUND values");
+  // coerced / boxed inputs: refused before any DB work, zero writes
+  const b = await confirmedIntent();
+  const before = await opsOf(b.id);
+  for (const over of [{ paymentIntentId: [b.e.paymentIntentId] }, { sessionId: new String(b.e.sessionId) }, { intentId: [b.e.intentId] }, { attemptId: [b.e.attemptId] },
+    { approvalRef: 123 }, { planHash: [b.e.planHash] }]) {
+    assert.deepEqual(await requestTestAbort(db.app, b.id, { now: F.at(9), env: ENV, operator: { ...b.e, ...over } }), { ok: false, error: "TEST_ABORT_EXPECTATION_INVALID" }, Object.keys(over)[0]);
+  }
+  assert.equal(await state(b.id), "reservation_confirmed");
+  assert.deepEqual(await opsOf(b.id), before, "zero writes");
+});

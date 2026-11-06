@@ -8,7 +8,7 @@
 //   reply after the call began is REQUEST_OUTCOME_UNKNOWN and is reconciled READ-ONLY here; it is never re-sent.
 import { createHash } from "node:crypto";
 import { loadIntent } from "../../lib/booking-db/repo.js";
-import { requestTestAbort, validAbortExpectation, listingAllowed, TEST_ABORT_EXPECTATION_KEYS } from "../../lib/booking-db/test-abort.js";
+import { requestTestAbort, bindAbortExpectation, ownDataSnapshot, listingAllowed, TEST_ABORT_EXPECTATION_KEYS } from "../../lib/booking-db/test-abort.js";
 import { testAbortEventId, TEST_ABORT_REASON } from "../../lib/checkout/intent-state.js";
 
 export const ABORT_PLAN_SCHEMA = "e7-operator-test-abort-plan-v1";
@@ -28,17 +28,21 @@ export function abortPlanHash(fields) {
   const { planHash, ...rest } = fields;   // eslint-disable-line no-unused-vars
   return sha(canonical({ schema: ABORT_PLAN_SCHEMA, scope: ABORT_SCOPE, ...rest }));
 }
-/** buildAbortExpectation(fields without planHash) → frozen 15-key expectation | null */
+const FIELD_KEYS = Object.freeze(TEST_ABORT_EXPECTATION_KEYS.filter((k) => k !== "planHash"));
+/** buildAbortExpectation(fields without planHash) → frozen 15-key expectation | null. The 14 input fields are snapshotted from their own
+ *  data descriptors FIRST (no getter / spread / `in` on the caller object), then every value is validated, then the hash is computed. */
 export function buildAbortExpectation(fields) {
   try {
-    if (!fields || typeof fields !== "object" || Array.isArray(fields) || Object.getPrototypeOf(fields) !== Object.prototype || "planHash" in fields) return null;
-    const e = { ...fields, planHash: "0".repeat(64) };
-    if (!validAbortExpectation(e)) return null;
-    e.planHash = abortPlanHash(fields);
-    return validAbortExpectation(e) && listingAllowed(e.listingId, e.currency) ? Object.freeze(e) : null;
+    const f = ownDataSnapshot(fields, FIELD_KEYS);
+    if (f === null) return null;
+    const probe = bindAbortExpectation({ ...f, planHash: "0".repeat(64) });   // values validated before hashing
+    if (probe === null) return null;
+    const e = bindAbortExpectation({ ...f, planHash: abortPlanHash({ ...f }) });
+    return e !== null && listingAllowed(e.listingId, e.currency) ? e : null;
   } catch { return null; }
 }
-const validWithHash = (e) => { try { return validAbortExpectation(e) && e.planHash === abortPlanHash(e); } catch { return false; } };
+/** the frozen bound copy of a hash-consistent expectation | null (synchronous) */
+const bindWithHash = (e) => { try { const b = bindAbortExpectation(e); return b !== null && b.planHash === abortPlanHash(b) ? b : null; } catch { return null; } };
 
 export const QUERIES = Object.freeze({
   applied: "/*e7ab:applied*/ SELECT applied_version FROM booking.intent_applied_events WHERE intent_id = $1 AND event_id = $2",
@@ -50,8 +54,9 @@ export const QUERIES = Object.freeze({
 const pick = (o, ks) => Object.fromEntries(ks.filter((k) => o[k] !== undefined).map((k) => [k, o[k]]));
 
 /** classify(pool, e) → frozen projection. READ-ONLY. The in-transaction checks of requestTestAbort stay authoritative. */
-export async function classify(pool, e) {
-  if (!validWithHash(e)) return Object.freeze({ class: "INVALID", code: "EXPECTATION_INVALID" });
+export async function classify(pool, input) {
+  const e = bindWithHash(input);                                         // bound BEFORE the first await
+  if (e === null) return Object.freeze({ class: "INVALID", code: "EXPECTATION_INVALID" });
   const q = (sql, params = [e.intentId]) => pool.query(sql, params).then((r) => r.rows);
   const i = await loadIntent(pool, e.intentId);
   if (!i) return Object.freeze({ class: "NOT_ELIGIBLE", code: "NOT_FOUND" });
@@ -87,9 +92,11 @@ export async function classify(pool, e) {
  * executeOperatorAbort(pool, e, { now, env, hooks?, deps? }) → frozen { outcome, code, precheck, helper, reconciled, invocations }
  *   ONE requestTestAbort call at most; never a retry. deps.requestTestAbort (tests: the call spy / gate), deps.afterReply (tests: lost reply).
  */
-export async function executeOperatorAbort(pool, e, { now, env, hooks = {}, deps = {} } = {}) {
+export async function executeOperatorAbort(pool, input, { now, env, hooks = {}, deps = {} } = {}) {
   const r = { outcome: null, code: null, precheck: null, helper: null, reconciled: null, invocations: 0 };
   const done = () => Object.freeze(JSON.parse(JSON.stringify(r)));
+  const e = bindWithHash(input);                                         // ONE bound copy for precheck, the call and the postcheck
+  if (e === null) { r.precheck = Object.freeze({ class: "INVALID", code: "EXPECTATION_INVALID" }); r.outcome = "NOT_EXECUTED_INVALID"; return done(); }
   const pre = await classify(pool, e);
   r.precheck = pre;
   if (pre.class === "INVALID") { r.outcome = "NOT_EXECUTED_INVALID"; return done(); }

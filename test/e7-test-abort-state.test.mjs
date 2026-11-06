@@ -4,8 +4,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { createIntent, transition, publicStatus, allowedEvents, voidKey, STATES as S, DEFAULT_CONFIG, EVENTS, TEST_ABORT_REASON, testAbortEventId }
   from "../lib/checkout/intent-state.js";
-import { validAbortExpectation, testAbortGate, listingAllowed, TEST_ABORT_EXPECTATION_KEYS } from "../lib/booking-db/test-abort.js";
-import { buildAbortExpectation, abortPlanHash } from "../scripts/e7-operator/test-abort.mjs";
+import { validAbortExpectation, bindAbortExpectation, requestTestAbort, testAbortGate, listingAllowed, TEST_ABORT_EXPECTATION_KEYS } from "../lib/booking-db/test-abort.js";
+import { buildAbortExpectation, abortPlanHash, classify, executeOperatorAbort } from "../scripts/e7-operator/test-abort.mjs";
 
 const T0 = Date.UTC(2026, 9, 21, 15, 0, 0);
 const MIN = 60 * 1000;
@@ -91,6 +91,27 @@ test("A3 expectation: exact 15 keys, typed, allowlisted listing 606998 / USD onl
   const g = { ...e }; delete g.approvalRef; assert.equal(validAbortExpectation(g), false);
   assert.equal(validAbortExpectation(Object.defineProperty({ ...e }, "guests", { get: () => 1, enumerable: true })), false, "accessor refused");
   assert.equal(validAbortExpectation(Object.assign(Object.create(null), e)), false, "exotic prototype refused");
+  // root a1dcea0d: RegExp.test coerces — every regex-checked field must be a PRIMITIVE string (arrays, boxed values, numbers refused)
+  const coerced = [];
+  for (const k of ["intentId", "attemptId", "paymentIntentId", "sessionId", "approvalRef", "planHash"]) {
+    coerced.push([k, [e[k]]], [k, new String(e[k])], [k, { toString: () => e[k] }]);
+  }
+  coerced.push(["approvalRef", 123], ["approvalRef", 123.5], ["approvalRef", new Number(123)], ["reservationId", 61000001], ["reservationId", [e.reservationId]],
+    ["reservationId", new String(e.reservationId)], ["currency", ["USD"]], ["currency", new String("USD")], ["from", [e.from]], ["to", new String(e.to)],
+    ["expectedVersion", new Number(7)], ["guests", "1"], ["listingId", new Number(606998)], ["finalTotalMinor", [23000]], ["authorizedMinor", new Number(23000)]);
+  for (const [k, v] of coerced) {
+    assert.equal(validAbortExpectation({ ...e, [k]: v }), false, `validAbortExpectation ${k}=${Object.prototype.toString.call(v)}`);
+    assert.equal(bindAbortExpectation({ ...e, [k]: v }), null, `bind ${k}`);
+    if (k !== "planHash") assert.equal(buildAbortExpectation({ ...FIELDS, [k]: v }), null, `build ${k}`);
+  }
+  // buildAbortExpectation never invokes a supplied getter (and refuses it), nor reads a planHash / extra / symbol key
+  let getterCalls = 0;
+  const withGetter = Object.defineProperty({ ...FIELDS }, "paymentIntentId", { get: () => { getterCalls += 1; return FIELDS.paymentIntentId; }, enumerable: true });
+  assert.equal(buildAbortExpectation(withGetter), null); assert.equal(getterCalls, 0, "no getter invoked");
+  for (const bad of [{ ...FIELDS, planHash: e.planHash }, { ...FIELDS, extra: 1 }, { ...FIELDS, [Symbol("x")]: 1 }, [FIELDS], null, "x"]) assert.equal(buildAbortExpectation(bad), null);
+  // the bound copy is frozen and independent of the caller object
+  const src = { ...e }; const b = bindAbortExpectation(src); src.paymentIntentId = "pi_TESTotherOne99"; src.expectedVersion = 99;
+  assert.ok(Object.isFrozen(b)); assert.deepEqual([b.paymentIntentId, b.expectedVersion], [e.paymentIntentId, e.expectedVersion]);
   for (const k of Object.keys(FIELDS)) {
     const changed = { ...FIELDS, [k]: k === "approvalRef" ? "synthetic-abort-2" : k === "reservationId" ? "61000009" : typeof FIELDS[k] === "number" ? FIELDS[k] + (k === "listingId" ? 0 : 1) : FIELDS[k] };
     if (k === "listingId" || k === "currency" || k === "authorizedMinor" || k === "finalTotalMinor") continue;
@@ -118,4 +139,30 @@ test("A4 static boundary: no route / guest API reaches the abort; the modules im
     for (const m of imports) assert.ok((/^\.\.?\//.test(m) || m === "node:crypto") && !/stripe|hostaway-reservations|executor|transport|exchange/.test(m), `${p}: ${m}`);
     for (const bad of ["process.env", "fetch(", "node:fs", "node:http", "node:net", "import("]) assert.equal(code.includes(bad), false, `${p}: ${bad}`);
   }
+});
+
+test("A5 bounded helper: malformed expectations cause ZERO DB calls (requestTestAbort / classify / executeOperatorAbort); the expectation is bound before the first await, so caller mutation after invocation cannot alter what is checked", async () => {
+  const e = buildAbortExpectation({ ...FIELDS });
+  const ENV = { VERCEL_ENV: "preview", MV_E7_TEST_ABORT: "enabled" };
+  const counting = () => { const p = { calls: 0, query() { p.calls += 1; return Promise.reject(new Error("no DB in this test")); }, connect() { p.calls += 1; return Promise.reject(new Error("no DB in this test")); } }; return p; };
+  const malformed = [{ ...e, paymentIntentId: [e.paymentIntentId] }, { ...e, sessionId: new String(e.sessionId) }, { ...e, intentId: [e.intentId] },
+    { ...e, attemptId: [e.attemptId] }, { ...e, approvalRef: 123 }, { ...e, planHash: [e.planHash] }, Object.defineProperty({ ...e }, "guests", { get: () => 1, enumerable: true }), null, [e]];
+  for (const m of malformed) {
+    const pool = counting();
+    assert.deepEqual(await requestTestAbort(pool, FIELDS.intentId, { now: T0, env: ENV, operator: m }), { ok: false, error: "TEST_ABORT_EXPECTATION_INVALID" });
+    assert.equal((await classify(pool, m)).class, "INVALID");
+    const x = await executeOperatorAbort(pool, m, { now: T0, env: ENV });
+    assert.deepEqual([x.outcome, x.invocations], ["NOT_EXECUTED_INVALID", 0]);
+    assert.equal(pool.calls, 0, "zero DB calls for a malformed expectation");
+  }
+  // binding happens synchronously: the FIRST DB call already sees the original intent id, and a mutation made right after invocation
+  // (before any await resolves) is not observed by the helper (its later failure path reports the bound values, not the mutated ones)
+  const seen = [];
+  const pool = { query(sql, params) { seen.push(params ? [...params] : []); return Promise.resolve({ rows: [] }); }, connect() { return Promise.reject(new Error("no tx")); } };
+  const callerObj = { ...e };
+  const pending = requestTestAbort(pool, FIELDS.intentId, { now: T0, env: ENV, operator: callerObj });
+  callerObj.intentId = "00000000-0000-4000-8000-0000000000ff"; callerObj.paymentIntentId = "pi_TESTmutated001"; callerObj.listingId = 603566;
+  const out = await pending;
+  assert.deepEqual(out, { ok: false, error: "NOT_FOUND" }, "the bound expectation (606998 / original intent) passed; the mutated listing would have been refused");
+  assert.ok(seen.length >= 1 && seen.every((p) => !p.includes("00000000-0000-4000-8000-0000000000ff")), "no DB call carried the mutated id");
 });
