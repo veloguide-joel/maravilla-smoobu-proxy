@@ -68,7 +68,7 @@ const overlaps = (listingId) => F.count(db.app, `SELECT count(*) AS n FROM booki
   ON x.id < y.id AND x.listing_id = y.listing_id AND x.stay && y.stay WHERE x.released_at IS NULL AND y.released_at IS NULL AND x.listing_id = $1`, [listingId]);
 
 // =============================================================================================
-test("guard: the helper waits on THIS listing's advisory lock before inserting its claim, then completes once it is released", async () => {
+test("guard: the helper waits on THIS listing's advisory lock before inserting its claim, then completes once it is released", async (t) => {
   const id = await F.withDetails(db.app, { listingId: L(1), from: "2027-09-01", to: "2027-09-04" });
   const hold = await holdListingLock(L(1));
   let done = false;
@@ -78,9 +78,11 @@ test("guard: the helper waits on THIS listing's advisory lock before inserting i
     .then((r) => { trace.settled = { ok: r.ok, error: r.error ?? null, reused: r.reused ?? null }; return r; },
           (e) => { trace.settled = { threw: e.code || e.name, message: String(e.message).slice(0, 160) }; throw e; })
     .finally(() => { done = true; trace.settledMs = Date.now() - tCall; });
-  // Cleanup (test-only): mark p handled AT ONCE, so an early assertion failure can never leave it as an unhandled rejection; the success
-  // path still awaits p itself below. On EVERY exit the held lock is released and p is settled (bounded) before the test ends; the
-  // ORIGINAL assertion / error propagates unchanged (the settle step never throws; a settle timeout is recorded in the trace only).
+  // Cleanup (test-only). p is marked handled AT ONCE, so an early assertion failure can never leave it as an unhandled rejection; the
+  // success path still awaits p itself below. Whatever happens in the guarded block, the lock release is ALWAYS attempted and then p is
+  // settled with a 10 s bound. Error precedence: the PRIMARY (guarded-block) error is rethrown unchanged; a release failure without a
+  // primary error fails the test itself (never swallowed); a release failure after a primary error is reported as a TAP diagnostic.
+  // A recorded "settle-timeout" is NOT proof that p settled, and the later `await p` on the success path is not itself bounded.
   p.catch(() => {});
   const settleP = async () => {
     let timer;
@@ -90,6 +92,7 @@ test("guard: the helper waits on THIS listing's advisory lock before inserting i
     trace.cleanupSettle = outcome;
   };
   let waiters;
+  let primary = null; let primaryFailed = false;
   try {
     waiters = await waitForListingWaiter(L(1), () => done, 3000, trace);
     const diag = waiters.length === 1 ? "" : ` | DIAG ${JSON.stringify({ trace, snapshot: await lockSnapshot(hold.pid) })}`;
@@ -98,7 +101,15 @@ test("guard: the helper waits on THIS listing's advisory lock before inserting i
     assert.match(waiters[0].query, /pg_advisory_xact_lock\(hashtext\('booking\.inventory_claims'\)/);
     assert.notEqual(waiters[0].pid, hold.pid);
     assert.deepEqual((await rowsOf([id])).claims, [], "no committed claim while waiting");
-  } finally { try { await hold.release(); } finally { await settleP(); } }
+  } catch (e) { primary = e; primaryFailed = true; }
+  let releaseError = null; let releaseFailed = false;
+  try { await hold.release(); } catch (e) { releaseError = e; releaseFailed = true; }
+  await settleP();                                                         // never throws; outcome recorded in trace.cleanupSettle
+  if (primaryFailed) {
+    if (releaseFailed) t.diagnostic(`cleanup: hold.release also failed after the primary error (${releaseError && (releaseError.code || releaseError.name)})`);
+    throw primary;
+  }
+  if (releaseFailed) throw releaseError;
   const r = await p;
   assert.deepEqual([r.ok, r.reused], [true, false]);
   const after = await rowsOf([id]);
