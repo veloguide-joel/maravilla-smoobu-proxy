@@ -9,6 +9,7 @@ import { startMigratedDatabase } from "./harness.mjs";
 import { createIntentApiHandler } from "../../lib/checkout/intent-api-http.js";
 import { ENV_OK } from "../e5a-fixtures.mjs";
 import { addDays } from "../../lib/bookability.js";
+import { enterCompleteWindow, assertCompleteWindow, bucketKey } from "./rate-window.mjs";
 
 let db, pool2;
 before(async () => { db = await startMigratedDatabase(); pool2 = new pg.Pool({ connectionString: db.appUrl(), max: 4 }); });
@@ -310,24 +311,36 @@ test("unknown create outcome: 502 once, then 409 unresolved on every retry; stil
 test("shared durable rate limits: per-IP creates are counted across separate workers and separate connection pools", async () => {
   const w1 = makeHandlers(); const w2 = makeHandlers({ pool: pool2 });
   const ip = "192.0.2.77";
+  const SALT = ENV.MV_RATE_LIMIT_SALT;
+  // Each burst below runs inside ONE complete fixed window (0006: floor(statement_timestamp / 600 s)), planned from the
+  // database clock, and is then proven against the real table: the scoped bucket holds exactly one window row with
+  // exactly the burst's hits. A crossed or slow burst fails; nothing is retried, loosened or skipped.
+  const BURST_MS = 20_000;
   const codes = [];
+  let win = await enterCompleteWindow(db.owner, { windowSeconds: 600, burstBudgetMs: BURST_MS });
   for (let i = 0; i < 12; i++) {
     const h = i % 2 ? w2 : w1;
     const r = await call(h.intents, { body: STAY(), ip });
     codes.push(r.statusCode);
   }
   assert.deepEqual(codes, [...Array(10).fill(201), 429, 429]);
+  await assertCompleteWindow(db.owner, bucketKey(SALT, "create_ip", ip), { ...win, hits: 12, label: "per-address create burst" });
   assert.equal((await call(w2.intents, { body: STAY(), ip: "192.0.2.78" })).statusCode, 201, "another address is unaffected");
   // per-token limit (40 / 10 min): shared too
   const a = await created(w1);
+  const { hashToken: tokenHashOf } = await import("../../lib/checkout/intent-api-http.js");
   const st = [];
+  win = await enterCompleteWindow(db.owner, { windowSeconds: 600, burstBudgetMs: BURST_MS });
   for (let i = 0; i < 42; i++) st.push((await call((i % 2 ? w2 : w1).intents, { method: "GET", token: a.token, ip: freshIp() })).statusCode);
   assert.deepEqual(st.slice(-2), [429, 429]); assert.equal(st.filter((s) => s === 200).length, 40);
+  await assertCompleteWindow(db.owner, bucketKey(SALT, "tok", tokenHashOf(a.token).toString("hex")), { ...win, hits: 42, label: "per-token status burst" });
   // per-address limit across all actions (120 / 10 min), counted before any token lookup, shared across workers
   const flood = "192.0.2.99"; const fl = [];
   const forged = (i) => { const x = Buffer.alloc(32, 0); x.writeUInt32BE(i + 1, 0); return x.toString("base64url"); };   // distinct tokens: per-token limit not involved
+  win = await enterCompleteWindow(db.owner, { windowSeconds: 600, burstBudgetMs: BURST_MS });
   for (let i = 0; i < 122; i++) fl.push((await call((i % 2 ? w2 : w1).intents, { method: "GET", token: forged(i), ip: flood })).statusCode);
   assert.equal(fl.filter((x) => x === 401).length, 120); assert.deepEqual(fl.slice(-2), [429, 429]);
+  await assertCompleteWindow(db.owner, bucketKey(SALT, "ip", flood), { ...win, hits: 122, label: "per-address flood" });
   // buckets are opaque HMACs keyed by the server salt: no address or token is stored, and an unsalted hash of a known
   // address or token does not appear either (so a leaked table cannot be matched by hashing guesses)
   const { createHash } = await import("node:crypto");
