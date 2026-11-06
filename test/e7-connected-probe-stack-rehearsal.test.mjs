@@ -35,7 +35,7 @@ after(() => {
 });
 
 // ---- SYNTHETIC values -------------------------------------------------------------------------------------------------------------
-const HTOKEN = "synthetic-hostaway-token"; const SKEY = "sk_test_Fake1"; const VERSION = "2026-08-26.dahlia";
+const HTOKEN = "synthetic-hostaway-token"; const SKEY = "sk_test_Fake1"; const VERSION = "2026-01-28.clover";
 const L = 871001; const L1 = 871001; const L2 = 871002; const R1 = "6100001"; const R2 = "6100002"; const ACCT = "acct_1SyntheticProbe"; const PI = "pi_test_syntheticProbe1";
 const SENT = ["SENTINEL_GUEST_NAME", "sentinel.guest@mv-test.invalid", "SENTINEL_TITLE", "SENTINEL_PROVIDER_TEXT"];
 const tick = () => new Promise((r) => setImmediate(r));
@@ -167,7 +167,7 @@ test("R1. default approved-inventory-shaped plan (P-H3 excluded) through P → T
     const o = req.options; const isH = o.hostname === "api.hostaway.com";
     assert.deepEqual(Object.keys(o.headers).sort(), isH ? ["Accept", "Authorization", "Cache-control"] : ["Authorization", "Stripe-Version"], "GET: no body headers / Content-Length");
     assert.equal(o.headers.Authorization, `Bearer ${isH ? HTOKEN : SKEY}`, "synthetic Bearer only");
-    if (!isH) assert.equal(o.headers["Stripe-Version"], "2026-08-26.dahlia", "the fixed proposed version header");
+    if (!isH) assert.equal(o.headers["Stripe-Version"], "2026-01-28.clover", "the fixed proposed version header");
     assert.deepEqual([o.method, o.port, o.servername, o.rejectUnauthorized, o.insecureHTTPParser, o.maxHeaderSize, req.endCalls, req.endArgs.length], ["GET", 443, o.hostname, true, false, 16384, 1, 0]);
     assert.deepEqual(o.agent.opts, { keepAlive: false, maxSockets: 1, maxCachedSessions: 0 });
   }

@@ -24,7 +24,7 @@ const L = 871001; const L1 = 871001; const L2 = 871002; const R1 = "6100001"; co
 const SENT = ["SENTINEL_GUEST_NAME", "sentinel.guest@mv-test.invalid", "SENTINEL_TITLE", "SENTINEL_PROVIDER_TEXT", "SENTINEL_LISTING_NAME"];
 const flush = async (n = 6) => { for (let i = 0; i < n; i++) await new Promise((r) => setImmediate(r)); };
 const plan0 = (o = {}) => ({ version: "e7-probe-plan-v1",
-  metadata: { reviewedCommit: "a56c2db1fe0b944cac86e9971156937e84b1c91d", nodeVersion: "22.22.0", stripeVersion: "2026-08-26.dahlia", approvalRef: "synthetic-approval-ref" },
+  metadata: { reviewedCommit: "a56c2db1fe0b944cac86e9971156937e84b1c91d", nodeVersion: "22.22.0", stripeVersion: "2026-01-28.clover", approvalRef: "synthetic-approval-ref" },
   hostaway: { listingId: L, calendar: { startDate: "2026-12-01", endDate: "2026-12-03" }, lookup: null, sample: { reservationId: R1, listingId: L1 }, control: { reservationId: R2, listingId: L2 } },
   stripe: { accountId: ACCT, paymentIntentId: PI }, probes: ["P-H1", "P-H2", "P-H4", "P-H5", "P-H6", "P-S1", "P-S2"], limits: { perProbeMs: 15000, runMs: 180000, tailMs: 5000 }, ...o });
 const valid = (o) => { const v = validateProbePlan(plan0(o)); assert.equal(v.ok, true, v.code); return v.plan; };
@@ -116,6 +116,7 @@ test("P1. plan validation: exact keys / types / ranges / enums; hostile shapes r
     ["commit", plan0({ metadata: { ...plan0().metadata, reviewedCommit: "abc" } }), "PLAN_SHAPE"], ["node label", plan0({ metadata: { ...plan0().metadata, nodeVersion: "22.22.1" } }), "PLAN_SHAPE"],
     ["stripe version endive", plan0({ metadata: { ...plan0().metadata, stripeVersion: "2026-10-28.endive" } }), "PLAN_STRIPE_VERSION"],
     ["synthetic version", plan0({ metadata: { ...plan0().metadata, stripeVersion: "2099-01-01.synthetic" } }), "PLAN_STRIPE_VERSION"],
+    ["previous dahlia candidate", plan0({ metadata: { ...plan0().metadata, stripeVersion: "2026-08-26.dahlia" } }), "PLAN_STRIPE_VERSION"],   // G6B: Clover only
     ["perProbe", plan0({ limits: { perProbeMs: 15001, runMs: 180000, tailMs: 0 } }), "PLAN_SHAPE"], ["run < probe", plan0({ limits: { perProbeMs: 15000, runMs: 14000, tailMs: 0 } }), "PLAN_SHAPE"],
     ["tail", plan0({ limits: { perProbeMs: 15000, runMs: 180000, tailMs: 10001 } }), "PLAN_SHAPE"],
     ["calendar > 31 days", plan0({ hostaway: { ...plan0().hostaway, calendar: { startDate: "2026-12-01", endDate: "2027-01-01" } } }), "PLAN_SHAPE"],
@@ -379,7 +380,7 @@ test("P6. accepted T over an injected FAKE exchange: exact wire for the default 
   };
   const exchange = async (req) => ({ status: 200, contentType: "application/json", bytes: enc(route(req)) });
   const h = createE7HostawaySend({ exchange, credential: () => "synthetic-hostaway-token" }).transport;
-  const s = createE7StripeTestSend({ exchange, credential: () => "sk_test_Fake1", accountId: ACCT, apiVersion: "2026-08-26.dahlia" }).transport;
+  const s = createE7StripeTestSend({ exchange, credential: () => "sk_test_Fake1", accountId: ACCT, apiVersion: "2026-01-28.clover" }).transport;
   const plan = valid(); const time = fakeTime();
   const r = runReadonlyProbes({ plan, hostaway: h, stripe: s, deps: time.deps() }); const sum = await r.result;
   assert.equal(sum.outcome, "COMPLETED", JSON.stringify(sum));

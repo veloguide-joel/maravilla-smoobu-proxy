@@ -36,7 +36,7 @@ after(() => {
 });
 
 // ---- SYNTHETIC values ---------------------------------------------------------------------------------------------------------------
-const HTOKEN = "tokFake1"; const SKEY = "sk_test_Fake1"; const VERSION = "2026-08-26.dahlia";
+const HTOKEN = "tokFake1"; const SKEY = "sk_test_Fake1"; const VERSION = "2026-01-28.clover";
 const L = 871001; const L1 = 871001; const L2 = 871002; const R1 = "6100001"; const R2 = "6100002"; const ACCT = "acct_1SyntheticProbe"; const PI = "pi_test_syntheticProbe1";
 const SENT = ["SENTINEL_GUEST_NAME", "sentinel.guest@mv-test.invalid", "SENTINEL_TITLE", "SENTINEL_PROVIDER_TEXT"];
 const PLAN_PATH = "/home/fake/plans/plan.json"; const CRED_PATH = "/home/fake/.config/e7/creds.json"; const OUT_DIR = "/home/fake/out"; const OUT = `${OUT_DIR}/summary.json`;
