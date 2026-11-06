@@ -1,7 +1,8 @@
 // scripts/e7-hosted-probe.mjs — thin HOSTED wrapper around the ACCEPTED E7 read-only probe CLI (tooling commit below), for a manually
 // dispatched GitHub-hosted Ubuntu runner. Node built-ins only. Doc: claude/e7-hosted-probe.md.
-//   * Modes: `preflight` (DEFAULT; no secrets, no provider request), `verify` (execute job, no secrets), `execute` (exactly TWO read-only
-//     GETs P-H1 + P-S1; NOT AUTHORIZED until Joel approves the exact filled package — this code is not consent).
+//   * Modes: `preflight` (DEFAULT; no secrets, no provider request), `verify` (execute job, no secrets), `execute` (at most THREE read-only
+//     GETs P-H2 calendar + P-S1 TEST account + P-S2 TEST PaymentIntent, in that order; P-S2 only after P-S1; G6B scope; Stripe-Version
+//     2026-01-28.clover; NOT AUTHORIZED until Joel approves the exact filled package — this code is not consent).
 //   * The accepted tooling is checked out separately; this wrapper verifies its 13-path closure bytes against the FIXED accepted
 //     sourceDigest BEFORE invoking it, and compares planHash / approvalRef / env preflight BEFORE any credential file or network.
 //   * The accepted CLI runs as separate plain `node` children (no Node flags); argv is a fixed token list (no shell); the children's env is
@@ -14,23 +15,26 @@ import { createHash } from "node:crypto";
 import { open, mkdtemp, realpath, lstat, readFile, rm, appendFile } from "node:fs/promises";
 
 export const CONSTANTS = Object.freeze({
-  toolingCommit: "d1e20d71ecf15f82d2d3b74fd22eb562eaa310f8",
-  sourceDigest: "23212caabf508f0aa929a2c3beb9f6f216b0cc3bc697cd783ba7ed203e21ce3d",
+  toolingCommit: "43ef79cab2c928e2aad19e77258b4b31116ff7c0",           // G6B Clover tooling (d1e20d71 + version constant + tests)
+  sourceDigest: "19b99e6f97cff5d8e405b3b52feff99f441445796b9651a719ffca046d8069f0",
   sourceClosure: Object.freeze(["package.json", "scripts/e7-connected/probe-cli-main.mjs", "scripts/e7-connected/probe-source-digest.mjs",
     "scripts/e7-connected/probe-command.mjs", "scripts/e7-connected/probe-env-preflight.mjs", "scripts/e7-connected/probe-credential-file.mjs",
     "scripts/e7-connected/readonly-probe.mjs", "scripts/e7-connected/http-transports.mjs", "scripts/e7-connected/real-exchange.mjs",
     "lib/checkout/compensation-proof.js", "lib/checkout/recovery-plan.js", "lib/checkout/capture-proof.js", "lib/checkout/intent-state.js"]),
   listingId: 606998,                                                  // "maraVilla TEST - DO NOT BOOK." — USD, root-verified in the Hostaway UI
   protectedIds: Object.freeze(["70636076", "71045356", "71072615", "71081885"]),
-  probes: Object.freeze(["P-H1", "P-S1"]),
+  probes: Object.freeze(["P-H2", "P-S1", "P-S2"]),
+  maxRequests: 3,
+  calendar: Object.freeze({ startDate: "2027-01-18", endDate: "2027-01-20" }),   // the Run-3 TEST stay on 606998
+  paymentIntentId: "pi_3UYqhH2B9LTneQgw1Q0IoYtz",                      // the canceled Run-3 TEST PaymentIntent (read only)
   nodeVersion: "22.22.0",
-  stripeVersion: "2026-08-26.dahlia",
+  stripeVersion: "2026-01-28.clover",
   limits: Object.freeze({ perProbeMs: 10000, runMs: 30000, tailMs: 5000 }),
   synthetic: Object.freeze({ accountId: "acct_SyntheticPreflightOnly", approvalRef: "SYNTHETIC-preflight-not-for-execute" })
 });
 export const RESULT_SCHEMA = "e7-hosted-probe-result-v1";
 /** exact public vocabularies COPIED from the accepted tooling (readonly-probe / probe-command / probe-env-preflight / probe-credential-file at
- *  d1e20d71); a parity test compares them with the accepted exports wherever that checkout is available. Every published child string must be
+ *  d1e20d71 = unchanged at 43ef79ca); a parity test compares them with the accepted exports wherever that checkout is available. Every published child string must be
  *  a member of its field's set (or an exact 64-hex digest / hash) — anything else is published as REDACTED. */
 export const VOCAB = Object.freeze({
   probeIds: Object.freeze(["P-H1", "P-H2", "P-H3", "P-H4", "P-H5", "P-H6", "P-S1", "P-S2"]),
@@ -79,13 +83,17 @@ export async function closureDigest(dir, closure) {
   }
   return h.digest("hex");
 }
-/** the plan object for this package: fixed listing / probes / limits / versions; account + label from inputs (or the labelled synthetic) */
+const G6B_PROBES = Object.freeze(["P-H2", "P-S1", "P-S2"]);
+const sameList = (a, b) => Array.isArray(a) && a.length === b.length && a.every((x, i) => x === b[i]);
+/** the plan object for this package: fixed listing / calendar / PaymentIntent / probes / limits / versions; account + label from inputs (or the labelled synthetic) */
 export function buildPlan(c, accountId, approvalRef) {
   if (!Number.isSafeInteger(c.listingId) || c.listingId < 1 || c.protectedIds.includes(String(c.listingId))) refuse("HOSTED_SCOPE_INVALID");
-  if (c.probes.length !== 2 || c.probes[0] !== "P-H1" || c.probes[1] !== "P-S1") refuse("HOSTED_SCOPE_INVALID");
+  if (!sameList(c.probes, G6B_PROBES) || c.maxRequests !== 3) refuse("HOSTED_SCOPE_INVALID");
+  if (!c.calendar || c.calendar.startDate !== "2027-01-18" || c.calendar.endDate !== "2027-01-20" || c.paymentIntentId !== "pi_3UYqhH2B9LTneQgw1Q0IoYtz"
+      || c.stripeVersion !== "2026-01-28.clover") refuse("HOSTED_SCOPE_INVALID");
   return { version: "e7-probe-plan-v1", metadata: { reviewedCommit: c.toolingCommit, nodeVersion: c.nodeVersion, stripeVersion: c.stripeVersion, approvalRef },
-    hostaway: { listingId: c.listingId, calendar: null, lookup: null, sample: null, control: null }, stripe: { accountId, paymentIntentId: null },
-    probes: [...c.probes], limits: { ...c.limits } };
+    hostaway: { listingId: c.listingId, calendar: { startDate: c.calendar.startDate, endDate: c.calendar.endDate }, lookup: null, sample: null, control: null },
+    stripe: { accountId, paymentIntentId: c.paymentIntentId }, probes: [...c.probes], limits: { ...c.limits } };
 }
 const parseLine = (s) => { try { const t = s.trim(); if (!t || t.includes("\n")) return null; const v = JSON.parse(t); return v && typeof v === "object" ? v : null; } catch { return null; } };
 /** exact membership, never a syntax rule: null / undefined → null; a member → itself; anything else → "REDACTED" */
@@ -199,7 +207,7 @@ export async function runWrapper({ mode = "preflight", env, spawnChild, constant
     if (ip.exitCode !== 10) refuse("HOSTED_INSPECT_FAILED");
     if (ip.sourceDigest !== c.sourceDigest) refuse("HOSTED_SOURCE_MISMATCH");
     if (ip.planHash !== pj.planHash) refuse("HOSTED_PLAN_HASH_MISMATCH");
-    if (!probes || probes.length !== 2 || probes[0] !== "P-H1" || probes[1] !== "P-S1" || ie.payload.plan.maxRequests !== 2) refuse("HOSTED_SCOPE_INVALID");
+    if (!sameList(probes, G6B_PROBES) || ie.payload.plan.maxRequests !== c.maxRequests) refuse("HOSTED_SCOPE_INVALID");
     if (ip.preflightCode !== "ENV_OK") refuse("HOSTED_ENV_REFUSED");
     if (mode === "preflight") { r.code = real ? "PREFLIGHT_OK_REAL_PLAN" : "PREFLIGHT_OK_SYNTHETIC_ONLY"; return finish(0); }
     if (ip.planHash !== expPlan) refuse("HOSTED_PLAN_HASH_MISMATCH");     // binding checked BEFORE any credential file or network
@@ -212,7 +220,7 @@ export async function runWrapper({ mode = "preflight", env, spawnChild, constant
     { const fh = await open(credPath, "wx", 0o600);
       try { await fh.writeFile(JSON.stringify({ hostawayToken: env.E7_HOSTAWAY_TOKEN, stripeTestKey: env.E7_STRIPE_TEST_KEY })); } finally { await fh.close(); } }
     const ex = await run([CLI, "execute", "--plan", planPath, "--credentials", credPath, "--summary-out", `${outDir}/summary.json`, "--expect-plan-hash", expPlan,
-      "--expect-source-digest", c.sourceDigest, "--expect-requests", "2", "--approval-ref", ref]);
+      "--expect-source-digest", c.sourceDigest, "--expect-requests", String(c.maxRequests), "--approval-ref", ref]);
     await rm(credPath, { force: true }).catch(() => {});                  // job-owned file only
     if (!acked(ex)) { r.execute = { childExit: safeNum(ex && ex.status), output: "UNKNOWN" }; refuse("HOSTED_CHILD_FAILED"); }
     const ee = parseLine(ex.stdout);

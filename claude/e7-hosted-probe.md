@@ -1,5 +1,7 @@
 # E7 hosted read-only probe — implementation / running / activation packet (NOT ACTIVATED, NOT AUTHORIZED)
 
+> **G6B revision (offline, review only, branch `feature/e7-hosted-probe-g6b`):** scope is now **P-H2 → P-S1 → P-S2** (≤ 3 GETs): the 606998 calendar for 2027-01-18 → 2027-01-20, the Stripe TEST account, and the canceled Run-3 TEST PaymentIntent `pi_3UYqhH2B9LTneQgw1Q0IoYtz` (`expand[]=latest_charge`). Tooling `43ef79cab2c928e2aad19e77258b4b31116ff7c0` (d1e20d71 + Stripe-Version constant `2026-01-28.clover` + tests), sourceDigest `19b99e6f97cff5d8e405b3b52feff99f441445796b9651a719ffca046d8069f0`. Where this packet below says P-H1 / 2 GETs / Dahlia / d1e20d71, the G6B values apply. No dispatch is authorized by this revision.
+
 **Status.** This prepares a temporary **GitHub-hosted Ubuntu runner**, controlled from a browser, as the execution location for the accepted read-only probe tooling. Joel needs no Mac or Linux machine and no installs.
 
 **Not activated:**
@@ -21,7 +23,7 @@
 **The workflow:**
 - **Trigger and token:** manual `workflow_dispatch` only (no push / PR / `pull_request_target` / schedule triggers); `permissions: contents: read`; `concurrency` with `cancel-in-progress: false`; no artifact or cache action.
 - **Pinned official actions** (commit SHAs verified from the public GitHub repositories; tags resolve to these commits): `actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803` (v6.1.0) and `actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38` (v6.5.0, `package-manager-cache: false`).
-- **Checkouts:** both use `persist-credentials: false`. One is the wrapper (the dispatched commit, i.e. `main` after activation). The other is the accepted tooling at the **fixed** commit `d1e20d71ecf15f82d2d3b74fd22eb562eaa310f8`, in `tooling/`. There is no ref, script or module-path input.
+- **Checkouts:** both use `persist-credentials: false`. One is the wrapper (the dispatched commit, i.e. `main` after activation). The other is the accepted tooling at the **fixed** commit `43ef79cab2c928e2aad19e77258b4b31116ff7c0` (G6B), in `tooling/`. There is no ref, script or module-path input.
 - **Inputs** reach the wrapper only through `env:`. Every `run:` line is a fixed command.
 - **Job `preflight`**, the default: no secrets, no provider request.
 - **Job `execute`:**
@@ -36,7 +38,7 @@
 2. **Layout:** `RUNNER_TEMP` must be outside both the workspace and the tooling checkout.
 3. **Tooling bytes:** the 13 closure files are hashed (regular files only, no symlink, ≤ 256 KiB each, ≤ 2 MiB total, the accepted framing) **before any tooling code runs**. The result must equal `23212caabf508f0aa929a2c3beb9f6f216b0cc3bc697cd783ba7ed203e21ce3d`. Locally, the wrapper's own function over the accepted checkout gives exactly that value.
 4. **Preflight only — E1:** `node --test --test-reporter=tap test/e7-connected-probe-cli-main.test.mjs` in the tooling checkout. These are fake / synthetic tests, **labelled not connectivity evidence**. E1 passes only with an acknowledged child (no spawn failure or signal, not truncated), status 0 and a meaningful TAP (`# tests` > 0, pass = tests, fail = 0).
-5. **Plan:** listing `606998`, `["P-H1","P-S1"]`, limits `10000 / 30000 / 5000`, `Stripe-Version 2026-08-26.dahlia`, Node `22.22.0`, `reviewedCommit` = the tooling commit.
+5. **Plan:** listing `606998`, calendar `2027-01-18 → 2027-01-20`, PaymentIntent `pi_3UYqhH2B9LTneQgw1Q0IoYtz`, `["P-H2","P-S1","P-S2"]` (maxRequests 3), limits `10000 / 30000 / 5000`, `Stripe-Version 2026-01-28.clover`, Node `22.22.0`, `reviewedCommit` = the tooling commit.
    - With no account / label, preflight builds a **labelled SYNTHETIC** plan (`acct_SyntheticPreflightOnly`, `SYNTHETIC-preflight-not-for-execute`) whose hash is reported as `planKind: SYNTHETIC` and is never usable for execute.
    - With them, it builds the **REAL** plan.
 
@@ -93,9 +95,9 @@ The https / fetch guards counted 0, and no real credential or network was used. 
    - These are setting changes and are not done here.
 4. **Preflight on the runner** (Actions → `e7-readonly-probe` → Run workflow, `mode: preflight`, inputs empty). This gives the first real runner facts: E1, the computed digest and inspect's `preflight.code`. Proxy / refused-variable presence on the runner is unknown until then. Still no provider request.
 5. Joel supplies the **Stripe TEST account id** and a **label**, then runs preflight again with them. The result is `planKind: REAL` and the `planHash`.
-6. **Fill one exact approval package:** `main` commit, tooling commit `d1e20d71`, digest, `planHash`, listing `606998`, account, label, 2 GETs, outcome semantics (owner packet §5).
+6. **Fill one exact approval package:** `main` commit, tooling commit `43ef79ca`, digest, `planHash`, listing `606998`, calendar dates, PI, account, label, ≤ 3 GETs, outcome semantics (owner packet §5).
 7. **Joel explicitly approves that exact package.**
-8. Dispatch `execute` with the exact inputs, then Joel approves the environment gate. That makes exactly 2 GETs; the evidence is the job summary / log projection.
+8. Dispatch `execute` with the exact inputs, then Joel approves the environment gate. That makes at most 3 GETs (P-S2 only after P-S1 succeeds); the evidence is the job summary / log projection.
 
 ## 3. Residuals (stated, not hidden)
 - **Runner network:** egress, proxy, TLS and refused-variable presence are **UNVERIFIED** until a run. Native X socket / TLS ordering stays a fail-closed residual.
