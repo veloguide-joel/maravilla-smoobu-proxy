@@ -685,3 +685,22 @@ if (process.env.E7_CLEANUP_DB_TESTS === "1") {
     void pg;
   });
 }
+
+test("H9. minimal child environment: only the OS / runtime allowlist + E7_TOOLING_DIR reach the preflight child; credentials, DB URLs, tokens, NODE_* hooks and E7 inputs never do (nor any output)", async () => {
+  const CANARIES = { CUSTOM_API_TOKEN: "CANARY_tok_1", DATABASE_URL: "postgresql://u:CANARY_db_2@h/x", GITHUB_TOKEN: "CANARY_gh_3", NODE_PATH: "/CANARY_np_4",
+    NODE_LOADER: "CANARY_ld_5", NPM_CONFIG_USERCONFIG: "/CANARY_npm_6", AWS_SECRET_ACCESS_KEY: "CANARY_aws_7", STRIPE_SECRET_KEY: "CANARY_sk_10" };
+  const BASICS = { PATH: "/usr/bin:/bin", HOME: "/home/runner", TMPDIR: "/tmp/r", LANG: "C.UTF-8", TZ: "UTC" };
+  const unit = E.childEnv({ ...BASICS, ...CANARIES, NODE_OPTIONS: "--import=/CANARY_hook_8.mjs", NODE_EXTRA_CA_CERTS: "/CANARY_ca_9", E7_APPROVAL_REF: "lbl",
+    E7_INTENT_ID: IID, E7_PAYMENT_INTENT_ID: PI, E7_EXPECTED_PLAN_HASH: "0".repeat(64), E7_DEV_BOOKING_DATABASE_URL: DB_URL, E7_STRIPE_TEST_KEY: "CANARY_key_11",
+    E7_CLEANUP_DB_TESTS: "1", E7_TOOLING_DIR: "/attacker" }, "/tooling");
+  assert.deepEqual(unit, { ...BASICS, E7_TOOLING_DIR: "/tooling" });
+  assert.deepEqual([...E.CHILD_ENV_ALLOWLIST], ["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TZ"]);
+  assert.deepEqual(E.childEnv({ PATH: "a\0b", HOME: "x".repeat(5000), TMP: 7 }, "/t"), { E7_TOOLING_DIR: "/t" }, "malformed values are dropped, not passed");
+  let seen = null; let args = null;
+  const res = await hosted("preflight", { ...BASICS, ...CANARIES, ...REAL }, { spawnChild: async (a, o) => { args = a; seen = o.env; return tapOk(); } });
+  assert.equal(res.result.code, "PREFLIGHT_OK_REAL_PLAN");
+  assert.deepEqual(seen, { ...BASICS, E7_TOOLING_DIR: TOOLING });
+  assert.deepEqual(args, ["--test", "--test-reporter=tap", "test/e7-checkout-test-cleanup.test.mjs"]);
+  const out = JSON.stringify(res.result) + E.summaryMarkdown(res.result) + JSON.stringify(seen);
+  for (const v of Object.values(CANARIES)) assert.equal(out.includes(v.replace(/^.*CANARY/, "CANARY")), false, v);
+});
