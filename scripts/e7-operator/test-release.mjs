@@ -16,6 +16,9 @@ export const OPERATOR_PLAN_SCHEMA = "e7-operator-test-release-plan-v1";
 export const CLASSES = Object.freeze(["ELIGIBLE", "ALREADY_REQUESTED", "ALREADY_RELEASED", "NOT_ELIGIBLE", "INVALID"]);
 export const OUTCOMES = Object.freeze(["REQUESTED", "POSTCHECK_MISMATCH", "REFUSED", "DUPLICATE_RECONCILED", "REQUEST_OUTCOME_UNKNOWN",
   "NOT_EXECUTED_ALREADY_REQUESTED", "NOT_EXECUTED_ALREADY_RELEASED", "NOT_EXECUTED_NOT_ELIGIBLE", "NOT_EXECUTED_INVALID"]);
+/** after the ONE helper invocation began, a failed follow-up read is reported with these codes; it never upgrades or erases the helper result */
+export const READ_UNAVAILABLE = Object.freeze({ postcheck: "POSTCHECK_READ_UNAVAILABLE", duplicate: "DUPLICATE_POSTCHECK_READ_UNAVAILABLE",
+  reconcile: "RECONCILE_READ_UNAVAILABLE" });
 
 export function canonical(v) {
   if (v === null || typeof v !== "object") return JSON.stringify(v);
@@ -31,11 +34,19 @@ export function operatorPlanHash(fields) {
 }
 /** buildOperatorExpectation(fields without planHash) -> the frozen 14-key expectation, or null if it does not validate. */
 export function buildOperatorExpectation(fields) {
-  if (!fields || typeof fields !== "object" || "planHash" in fields) return null;
-  const e = { ...fields, planHash: operatorPlanHash(fields) };
-  return validOperatorExpectation(e, e.intentId) ? Object.freeze(e) : null;
+  try {                                                                       // total: any exotic input is null, never a throw
+    if (!fields || typeof fields !== "object" || Array.isArray(fields) || Object.getPrototypeOf(fields) !== Object.prototype || "planHash" in fields) return null;
+    const e = { ...fields, planHash: "0".repeat(64) };
+    if (!validOperatorExpectation(e, e.intentId)) return null;            // shape first, so the hash only ever sees validated scalars
+    e.planHash = operatorPlanHash(fields);
+    return validOperatorExpectation(e, e.intentId) ? Object.freeze(e) : null;
+  } catch { return null; }
 }
-const validWithHash = (e) => validOperatorExpectation(e, e && e.intentId) && e.planHash === operatorPlanHash(e);
+const validWithHash = (e) => { try { return validOperatorExpectation(e, e && e.intentId) && e.planHash === operatorPlanHash(e); } catch { return false; } };
+/** a bounded error CLASS (SQLSTATE-like code or a fixed name), never a message */
+const errClass = (err) => (err && typeof err.code === "string" && /^[A-Za-z0-9_]{1,40}$/.test(err.code) ? err.code : (err && err.name === "RepoError" ? "RepoError" : "Error"));
+/** the known helper result, reduced to safe fields (no intent object, no message) */
+const helperSummary = (r) => (r && typeof r === "object" ? { ok: r.ok === true, duplicate: r.duplicate === true, error: typeof r.error === "string" ? r.error : null } : null);
 
 // ---- read-only SQL (narrow projections; every statement is a SELECT filtered by intent_id) ------------------------------------
 export const QUERIES = Object.freeze({
@@ -134,9 +145,13 @@ export async function classify(pool, e) {
 }
 
 /**
- * executeOperatorRelease(pool, expectation, { now, hooks?, deps? }) -> frozen { outcome, code, precheck, result?, reconciled? }
- *   ONE logical requestTestRelease call at most. deps.afterReply (tests only) runs AFTER the call returned (i.e. after commit) and may throw
- *   to model a lost reply; deps.requestTestRelease (tests only) is the call spy. Never retries.
+ * executeOperatorRelease(pool, expectation, { now, hooks?, deps? }) -> frozen { outcome, code, precheck, helper?, reconciled, ... }
+ *   ONE logical requestTestRelease call at most; never retries. deps.afterReply (tests only) runs AFTER the call returned (i.e. after commit)
+ *   and may throw to model a lost reply; deps.requestTestRelease (tests only) is the call spy.
+ *   Once the call has begun, every follow-up read is guarded: a read failure keeps the KNOWN helper result and reports
+ *   reconciled:null + a READ_UNAVAILABLE code + an error class. A committed reply whose post-check cannot be read is POSTCHECK_MISMATCH
+ *   (never REQUESTED); a definite refusal stays REFUSED with its original code; a duplicate never becomes a bare success.
+ *   A failure of the PRECHECK read (before any call) still throws: nothing was invoked.
  */
 export async function executeOperatorRelease(pool, e, { now, hooks = {}, deps = {} } = {}) {
   if (!Number.isFinite(now)) throw new TypeError("executeOperatorRelease: now required");
@@ -144,21 +159,30 @@ export async function executeOperatorRelease(pool, e, { now, hooks = {}, deps = 
   const pre = await classify(pool, e);
   if (pre.class !== "ELIGIBLE") return done(`NOT_EXECUTED_${pre.class}`, pre.code, { precheck: pre });
   const call = deps.requestTestRelease ?? requestTestRelease;
+  /** read-only follow-up; never throws */
+  const reread = async () => { try { return { ok: true, value: await classify(pool, e) }; } catch (err) { return { ok: false, errorClass: errClass(err) }; } };
   let r;
   try {
     r = await call(pool, e.intentId, { now, hooks, operator: e });
     if (deps.afterReply) await deps.afterReply(r);
   } catch (err) {
-    // the call began: the commit may or may not have happened. Never re-sent; reconciled read-only (a failure of THAT read is reported).
-    let reconciled = null;
-    try { reconciled = await classify(pool, e); } catch { reconciled = null; }
-    const errorClass = err && typeof err.code === "string" && /^[A-Za-z0-9_]{1,40}$/.test(err.code) ? err.code : (err && err.name === "RepoError" ? "RepoError" : "Error");
-    return done("REQUEST_OUTCOME_UNKNOWN", null, { precheck: pre, reconciled, errorClass });   // a class only, never a message
+    // the call began: the commit may or may not have happened. Never re-sent; reconciled read-only.
+    const rc = await reread();
+    return done("REQUEST_OUTCOME_UNKNOWN", null, { precheck: pre, helper: null, errorClass: errClass(err),     // a class only, never a message
+      reconciled: rc.ok ? rc.value : null, ...(rc.ok ? {} : { reconcileError: READ_UNAVAILABLE.reconcile, reconcileErrorClass: rc.errorClass }) });
   }
-  if (!r || r.ok !== true) return done("REFUSED", r && typeof r.error === "string" ? r.error : "UNKNOWN_REFUSAL", { precheck: pre, reconciled: await classify(pool, e) });
-  const post = await classify(pool, e);
-  if (r.duplicate) return done("DUPLICATE_RECONCILED", null, { precheck: pre, reconciled: post });
-  const ok = post.class === "ALREADY_REQUESTED" && post.releasedAtExpectedVersion === true && post.releaseVersion === e.expectedVersion + 1
-    && post.releaseActor === "admin" && post.voidState === "pending" && post.voidAttempts === 0 && post.voidDispatched === false && post.claimReleased === false;
-  return done(ok ? "REQUESTED" : "POSTCHECK_MISMATCH", null, { precheck: pre, reconciled: post });
+  const helper = helperSummary(r);
+  if (!r || r.ok !== true) {
+    const rc = await reread();
+    return done("REFUSED", r && typeof r.error === "string" ? r.error : "UNKNOWN_REFUSAL", { precheck: pre, helper,
+      reconciled: rc.ok ? rc.value : null, ...(rc.ok ? {} : { reconcileError: READ_UNAVAILABLE.reconcile, reconcileErrorClass: rc.errorClass }) });
+  }
+  const post = await reread();
+  if (!post.ok) return done("POSTCHECK_MISMATCH", r.duplicate ? READ_UNAVAILABLE.duplicate : READ_UNAVAILABLE.postcheck,
+    { precheck: pre, helper, reconciled: null, errorClass: post.errorClass });
+  if (r.duplicate) return done("DUPLICATE_RECONCILED", null, { precheck: pre, helper, reconciled: post.value });
+  const v = post.value;
+  const ok = v.class === "ALREADY_REQUESTED" && v.releasedAtExpectedVersion === true && v.releaseVersion === e.expectedVersion + 1
+    && v.releaseActor === "admin" && v.voidState === "pending" && v.voidAttempts === 0 && v.voidDispatched === false && v.claimReleased === false;
+  return done(ok ? "REQUESTED" : "POSTCHECK_MISMATCH", null, { precheck: pre, helper, reconciled: v });
 }

@@ -564,7 +564,7 @@ test("O14 every operator code refuses atomically (full owner snapshot of every b
   // INVALID is O3 (zero DB access at all)
 });
 
-test("O15 static: no token hash / guest table / bare payload / write SQL in the wrapper or the operator helpers; the wrapper closure has no provider import", () => {
+test("O15 static: the DIRECT new SQL in the wrapper / operator helper has no token hash / guest table / bare payload / write; the wrapper closure has no provider import; the INDIRECT existing loader is reported as it is", () => {
   const walk = (entry) => {
     const seen = new Set();
     const go = (f) => {
@@ -587,9 +587,85 @@ test("O15 static: no token hash / guest table / bare payload / write SQL in the 
     assert.doesNotMatch(src.replace(/payload ->> 'providerIdempotencyKey' AS provider_key, payload ->> 'paymentIntentId' AS payload_pi/g, ""), /payload\s*(?:->|,|\bFROM\b|$)|\bpayload\b(?! of)/m, `${name}: only the runner's two scalar projections`);
     assert.doesNotMatch(src, /SELECT \*/, name);
   }
+  // INDIRECT reads are NOT covered by the scan above: classify / the helper call the EXISTING loadIntent -> loadIntentRow, whose INTENT_SELECT
+  // is `SELECT *` (the full intents row, access_token_hash, ref, price_snapshot, quote_hash included) and rowToIntent returns ref + price
+  // (snapshot incl. quoteHash). The wrapper's reports carry none of them (exact report keys asserted on a real classify in O17).
+  const codec = readFileSync(join(ROOT, "lib/booking-db/codec.js"), "utf8");
+  assert.ok(codec.includes('export const INTENT_SELECT = "SELECT *, from_date::text AS from_date_s, to_date::text AS to_date_s FROM booking.intents";'));
   // every wrapper SQL statement is a SELECT filtered to the named intent (instance excepted)
   for (const [k, sql] of Object.entries(OP.QUERIES)) {
     assert.match(sql, /^\/\*e7op:\w+\*\/ SELECT /, k);
     if (k !== "instance") assert.match(sql, /WHERE intent_id = \$1/, k);
   }
+});
+
+test("O16 date validation is total: impossible month / day / leap day / out-of-range year -> INVALID / null with ZERO DB access, never a throw (helper, build, classify, execute)", async () => {
+  const b = await booking();
+  const e = await expectation(b);
+  const dead = { query: async () => { throw new Error("DB touched"); }, connect: async () => { throw new Error("DB touched"); } };
+  const fields = Object.fromEntries(Object.entries(e).filter(([k]) => k !== "planHash"));
+  const badDates = ["2027-13-01", "2027-00-01", "2027-01-32", "2027-01-00", "2027-02-29", "2027-04-31", "2019-12-31", "2100-01-01", "0000-01-01", "9999-12-31"];
+  for (const d of badDates) for (const key of ["from", "to"]) {
+    const x = { ...e, [key]: d };
+    assert.doesNotThrow(() => validOperatorExpectation(x, b.id));
+    assert.equal(validOperatorExpectation(x, b.id), false, `${key}=${d}`);
+    assert.deepEqual(await requestTestRelease(dead, b.id, { now: T_REL, operator: x }), { ok: false, error: "TEST_RELEASE_OPERATOR_INVALID" }, `${key}=${d}`);
+    assert.equal(OP.buildOperatorExpectation({ ...fields, [key]: d }), null, `${key}=${d}`);
+    assert.deepEqual([(await OP.classify(dead, x)).class, (await OP.executeOperatorRelease(dead, x, { now: T_REL })).outcome], ["INVALID", "NOT_EXECUTED_INVALID"], `${key}=${d}`);
+  }
+  // a real leap day is a real date (shape-valid; the stay check then decides)
+  assert.equal(validOperatorExpectation({ ...e, from: "2028-02-28", to: "2028-02-29" }, b.id), true);
+  // exotic inputs are INVALID / null, never throws
+  const getterBomb = { ...e }; Object.defineProperty(getterBomb, "guests", { enumerable: true, get() { throw new Error("boom"); } });
+  for (const x of [getterBomb, { ...e, guests: 10n }, { ...e, from: new String("2027-05-01") }]) {
+    assert.doesNotThrow(() => validOperatorExpectation(x, b.id));
+    assert.equal(validOperatorExpectation(x, b.id), false);
+    assert.deepEqual(await requestTestRelease(dead, b.id, { now: T_REL, operator: x }), { ok: false, error: "TEST_RELEASE_OPERATOR_INVALID" });
+    assert.equal((await OP.classify(dead, x)).class, "INVALID");
+  }
+  const bigFields = { ...fields, guests: 10n }; const circ = { ...fields }; circ.self = circ;
+  for (const f of [bigFields, circ, getterBomb, null, [], "x"]) assert.equal(OP.buildOperatorExpectation(f), null);
+});
+
+/** a pool whose reads start failing (connection-class SQLSTATE) once `arm()` is called; the helper itself always uses the real pool */
+function flakyPool() {
+  let failing = false;
+  const err = () => Object.assign(new Error("read unavailable"), { code: "08006" });
+  return { arm: () => { failing = true; }, pool: { query: (...a) => (failing ? Promise.reject(err()) : db.app.query(...a)), connect: () => (failing ? Promise.reject(err()) : db.app.connect()) } };
+}
+test("O17 follow-up read failure AFTER the one invocation keeps the known helper result: committed -> POSTCHECK_MISMATCH:POSTCHECK_READ_UNAVAILABLE (never REQUESTED); refusal -> REFUSED + original code; duplicate / unknown never success; one call, no provider call, later verify reconciles", async () => {
+  // (a) committed success, post-check read fails
+  const a = await booking(); const ea = await expectation(a); const fa = flakyPool(); let n = 0; const calls0 = a.w.calls.length;
+  const ra = await OP.executeOperatorRelease(fa.pool, ea, { now: T_REL, deps: { requestTestRelease: async (p, id, o) => { n += 1; const r = await requestTestRelease(db.app, id, o); fa.arm(); return r; } } });
+  assert.deepEqual([ra.outcome, ra.code, ra.reconciled, ra.errorClass, ra.helper], ["POSTCHECK_MISMATCH", "POSTCHECK_READ_UNAVAILABLE", null, "08006", { ok: true, duplicate: false, error: null }]);
+  assert.equal(n, 1); assert.equal(a.w.calls.length, calls0, "no provider call");
+  assert.deepEqual(await counts(a.id), { transitions: 6, voids: 1 }, "the committed release is preserved");
+  const va = await OP.classify(db.app, ea);
+  assert.deepEqual([va.class, va.releasedAtExpectedVersion, va.releaseActor], ["ALREADY_REQUESTED", true, "admin"], "a later independent verify reconciles");
+  // (b) definite refusal (lease taken at the barrier), reconciliation read fails: still REFUSED with the original code, atomic
+  const b = await booking(); const eb = await expectation(b); const fb = flakyPool(); let s0; n = 0;
+  const rb = await OP.executeOperatorRelease(fb.pool, eb, { now: T_REL, hooks: { afterLoad: once(async () => {
+    assert.equal(await RW.claimWork(pool2, { workerId: "res-o17", now: T_REL, leaseMs: 60000, states: [...RESERVATION_WORK_STATES], intentId: b.id, listingIds: [LISTING] }), b.id);
+    s0 = await fullSnap(b.id);
+  }) }, deps: { requestTestRelease: async (p, id, o) => { n += 1; const r = await requestTestRelease(db.app, id, o); fb.arm(); return r; } } });
+  assert.deepEqual([rb.outcome, rb.code, rb.reconciled, rb.reconcileError, rb.reconcileErrorClass, rb.helper],
+    ["REFUSED", "TEST_RELEASE_WORK_LEASE_HELD", null, "RECONCILE_READ_UNAVAILABLE", "08006", { ok: false, duplicate: false, error: "TEST_RELEASE_WORK_LEASE_HELD" }]);
+  assert.equal(n, 1); assert.deepEqual(await fullSnap(b.id), s0, "refusal atomic");
+  assert.equal((await OP.classify(db.app, eb)).class, "ELIGIBLE", "later verify: nothing was written");
+  // (c1) duplicate reply (stub; unreachable for the operator path, D-4), post-check read fails: not a success
+  const c = await booking(); const ec = await expectation(c); const fc = flakyPool(); const sc = await fullSnap(c.id); n = 0;
+  const rc = await OP.executeOperatorRelease(fc.pool, ec, { now: T_REL, deps: { requestTestRelease: async () => { n += 1; fc.arm(); return { ok: true, duplicate: true }; } } });
+  assert.deepEqual([rc.outcome, rc.code, rc.reconciled, rc.helper], ["POSTCHECK_MISMATCH", "DUPLICATE_POSTCHECK_READ_UNAVAILABLE", null, { ok: true, duplicate: true, error: null }]);
+  assert.equal(n, 1); assert.deepEqual(await fullSnap(c.id), sc);
+  // (c2) committed, reply lost, and the reconciliation read fails too: UNKNOWN with reconciled null; the commit stands; a later verify sees it
+  const d = await booking(); const ed = await expectation(d); const fd = flakyPool(); n = 0;
+  const rd = await OP.executeOperatorRelease(fd.pool, ed, { now: T_REL, deps: { requestTestRelease: async (p, id, o) => { n += 1; return requestTestRelease(db.app, id, o); },
+    afterReply: async () => { fd.arm(); throw new Error("reply lost"); } } });
+  assert.deepEqual([rd.outcome, rd.code, rd.helper, rd.reconciled, rd.reconcileError, rd.reconcileErrorClass], ["REQUEST_OUTCOME_UNKNOWN", null, null, null, "RECONCILE_READ_UNAVAILABLE", "08006"]);
+  assert.equal(n, 1);
+  assert.deepEqual(await counts(d.id), { transitions: 6, voids: 1 });
+  assert.equal((await OP.classify(db.app, ed)).class, "ALREADY_REQUESTED");
+  // report hygiene: classify reports carry only their declared fields (no ref / price / token / payload material from the loader)
+  assert.deepEqual(Object.keys(va).sort(), ["claimAnomaly", "claimReleased", "class", "code", "expectedVersion", "releaseActor", "releaseVersion", "releasedAtExpectedVersion",
+    "state", "version", "voidAttempts", "voidDispatched", "voidState"]);
 });
