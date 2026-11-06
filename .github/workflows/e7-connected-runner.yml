@@ -1,0 +1,49 @@
+# PROPOSED (local branch; NOT on main; NOT dispatched) — E7 hosted connected-runner LAUNCHER, slice L1: PREFLIGHT ONLY.
+# PACKAGING PROOF ONLY: digest-verifies the pinned runner tooling closure, validates a SYNTHETIC manifest with the accepted validator and runs the
+# accepted fake-only suites. No environment, no secret, no DB, no install, no provider, no booking. preflight is the only mode in L1.
+name: e7-connected-runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "preflight only (L1). Packaging proof; no secret, DB, provider or write."
+        type: choice
+        options: [preflight]
+        default: preflight
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e7-connected-runner
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    if: inputs.mode == 'preflight'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout launcher (this repository, dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout accepted runner tooling (fixed commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: 6d00d0d6c7ac63b77d703f8c212381109096723c
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Preflight (packaging proof only)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+        run: node wrapper/scripts/e7-connected-runner-hosted.mjs preflight
