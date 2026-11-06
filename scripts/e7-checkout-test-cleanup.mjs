@@ -338,7 +338,15 @@ export async function framedDigest(dir, files, prefix = "e7-probe-source-v1\n") 
 }
 export const CLOSURE_DIGEST_PREFIX = "e7-checkout-test-cleanup-closure-v1\n";
 export const RUNNER_DIGEST_PREFIX = "e7-checkout-test-cleanup-runner-v1\n";
-export function childEnv(env, toolingDir) { const out = {}; for (const k of Object.keys(env)) if (!k.startsWith("E7_")) out[k] = env[k]; out.E7_TOOLING_DIR = toolingDir; return out; }
+/** the preflight child's environment: an explicit ALLOWLIST of OS / runtime basics + E7_TOOLING_DIR. Nothing else crosses: no credential, token,
+ *  DB URL, NODE_* option / loader hook, approval label or plan input (the fake suite needs none of them). Same rule as the operator runner. */
+export const CHILD_ENV_ALLOWLIST = Object.freeze(["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TZ"]);
+export function childEnv(env, toolingDir) {
+  const out = {};
+  for (const k of CHILD_ENV_ALLOWLIST) if (Object.hasOwn(env, k) && typeof env[k] === "string" && env[k].length <= 4096 && !env[k].includes("\0")) out[k] = env[k];
+  out.E7_TOOLING_DIR = toolingDir;
+  return out;
+}
 export function spawnNode(args, { cwd, env }) {
   return new Promise((resolve) => {
     let out = ""; let outBytes = 0; let truncated = false; let child;
