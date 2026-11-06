@@ -354,6 +354,57 @@ test("expiry: verified by a session READ (evidence), then E3 CHECKOUT_EXPIRED; a
   await noHostawayOrMoneyMove(p.id);
 });
 
+test("expiry releases the checkout claim exactly once: unpaid open session -> verified expired read -> payment_expired, attempt expired, claim INTENT_PAYMENT_EXPIRED; redeliveries change nothing", async () => {
+  const w = world();
+  const { id, sessionId } = await checkoutReady(w, 52);
+  const claims = () => q1("SELECT kind, released_at IS NOT NULL AS released, release_reason FROM booking.inventory_claims WHERE intent_id = $1 ORDER BY id", [id]);
+  const nonReadOps = () => q1("SELECT op_type, state FROM booking.external_operations WHERE intent_id = $1 AND op_type NOT LIKE 'stripe.retrieve_%' ORDER BY created_at", [id]);
+  const counts = async () => ({
+    ledger: await F.count(db.app, "SELECT count(*) AS n FROM booking.payment_ledger WHERE intent_id = $1", [id]),
+    transitions: await F.count(db.app, "SELECT count(*) AS n FROM booking.intent_transitions WHERE intent_id = $1", [id]),
+    claims: await F.count(db.app, "SELECT count(*) AS n FROM booking.inventory_claims WHERE intent_id = $1", [id]),
+    cases: await F.count(db.app, "SELECT count(*) AS n FROM booking.reconciliation_cases WHERE intent_id = $1", [id])
+  });
+  assert.deepEqual(await claims(), [{ kind: "checkout", released: false, release_reason: null }]);
+  assert.deepEqual(await nonReadOps(), [{ op_type: "stripe.create_checkout_session", state: "succeeded" }]);
+
+  // negative: Stripe's event says expired but our verified read still sees the session open -> no state change, claim still held
+  const early = w.event("checkout.session.expired", sessionId, "evt_EXPCLAIM_EARLY");
+  assert.deepEqual(await deliver(w, early, F.at(40)), { http: 503, code: "SESSION_NOT_EXPIRED" });
+  assert.equal(await F.state(db.app, id), "payment_pending");
+  assert.equal((await q1("SELECT status FROM booking.payment_attempts WHERE intent_id = $1", [id]))[0].status, "open");
+  assert.deepEqual(await claims(), [{ kind: "checkout", released: false, release_reason: null }]);
+
+  // the session really expires (never paid): the signed event, re-read and verified, applies once
+  w.expire(sessionId);
+  const ev = w.event("checkout.session.expired", sessionId, "evt_EXPCLAIM1");
+  assert.deepEqual(await deliver(w, ev, F.at(41)), { http: 200, code: "EXPIRY_APPLIED", state: "payment_expired" });
+  assert.equal(await F.state(db.app, id), "payment_expired");
+  assert.equal((await q1("SELECT status FROM booking.payment_attempts WHERE intent_id = $1", [id]))[0].status, "expired");
+  assert.deepEqual(await claims(), [{ kind: "checkout", released: true, release_reason: "INTENT_PAYMENT_EXPIRED" }]);
+  assert.equal((await evRow(ev.id)).status, "processed");
+  const settled = await counts();
+  assert.deepEqual(settled, { ledger: 0, transitions: 5, claims: 1, cases: 0 });
+  const version = (await loadIntent(db.app, id)).version;
+
+  // same event id redelivered: answered before any read, nothing changes
+  const readsBefore = w.reads.length;
+  assert.deepEqual(await deliver(w, ev, F.at(42)), { http: 200, code: "ALREADY_PROCESSED" });
+  assert.equal(w.reads.length, readsBefore);
+
+  // a DISTINCT expired event for the same bound session: verified again (reads only), terminal state and claim untouched
+  const ev2 = w.event("checkout.session.expired", sessionId, "evt_EXPCLAIM2");
+  assert.deepEqual(await deliver(w, ev2, F.at(43)), { http: 200, code: "EXPIRY_APPLIED", state: "payment_expired" });
+  assert.equal((await loadIntent(db.app, id)).version, version);
+  assert.deepEqual(await counts(), settled);
+  assert.deepEqual(await claims(), [{ kind: "checkout", released: true, release_reason: "INTENT_PAYMENT_EXPIRED" }]);
+  assert.deepEqual(await nonReadOps(), [{ op_type: "stripe.create_checkout_session", state: "succeeded" }],
+    "no void, capture, Hostaway, guest.notify or alert operation: only the one settled create besides reads");
+  assert.equal(w.creates.length, 1);
+  assert.ok(w.reads.every((r) => r === "account" || r.startsWith("session:")), "expiry handling reads the session (and account) only");
+  await noHostawayOrMoneyMove(id);
+});
+
 test("other events: declined card in an open session is informational; unknown types and foreign sessions ignored; live/Connect refused unstored", async () => {
   const w = world();
   const { id, sessionId } = await checkoutReady(w, 60);
