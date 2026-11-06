@@ -29,14 +29,35 @@ const listingLockWaiters = async (listingId) => (await db.owner.query(
     WHERE l.locktype = 'advisory' AND NOT l.granted AND l.objsubid = 2 AND l.objid = $1::oid
       AND l.classid::bigint = (${KEY_SQL}::bigint & 4294967295) AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())`,
   [listingId])).rows;
-async function waitForListingWaiter(listingId, done, timeoutMs = 3000) {
+async function waitForListingWaiter(listingId, done, timeoutMs = 3000, trace = null) {
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs && !done()) {
     const w = await listingLockWaiters(listingId);
-    if (w.length) return w;
+    if (trace) { trace.polls++; trace.lastPollMs = Date.now() - t0; }
+    if (w.length) { if (trace) trace.firstWaiterMs = Date.now() - t0; return w; }
     await new Promise((r) => setTimeout(r, 10));
   }
+  if (trace) trace.loopExitMs = Date.now() - t0;
   return [];
+}
+
+// DIAGNOSTICS ONLY (no assertion depends on them). The historical guard failure lost its assertion text, so a
+// failure now carries, in its TAP message: the poll timeline, how and when the helper settled, the holder's lock,
+// and every ungranted lock plus this database's other backends (holder, app pool) with wait event and transaction / statement ages. Statement
+// texts are placeholder SQL (no parameter values) truncated to 160 characters; no guest data, tokens or secrets.
+async function lockSnapshot(holderPid) {
+  const q = async (sql, args = []) => { try { return (await db.owner.query(sql, args)).rows; } catch (e) { return [{ snapshotError: e.code || e.message }]; } };
+  return {
+    atDbClock: (await q("SELECT clock_timestamp()::text AS t"))[0]?.t,
+    holderLocks: await q(`SELECT locktype, classid::bigint AS classid, objid::bigint AS objid, objsubid, mode, granted
+      FROM pg_locks WHERE pid = $1 AND locktype = 'advisory'`, [holderPid]),
+    ungranted: await q(`SELECT pid, locktype, classid::bigint AS classid, objid::bigint AS objid, objsubid, mode, relation::regclass::text AS rel
+      FROM pg_locks WHERE NOT granted ORDER BY pid`),
+    appBackends: await q(`SELECT pid, usename, state, wait_event_type, wait_event, backend_xid IS NOT NULL AS has_xid,
+        round(extract(epoch FROM clock_timestamp() - xact_start) * 1000) AS xact_ms,
+        round(extract(epoch FROM clock_timestamp() - query_start) * 1000) AS query_ms, left(query, 160) AS query
+      FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() ORDER BY pid`)
+  };
 }
 const rowsOf = async (ids) => ({
   claims: (await db.app.query("SELECT intent_id FROM booking.inventory_claims WHERE intent_id = ANY($1) AND released_at IS NULL", [ids])).rows.map((r) => r.intent_id),
@@ -51,11 +72,17 @@ test("guard: the helper waits on THIS listing's advisory lock before inserting i
   const id = await F.withDetails(db.app, { listingId: L(1), from: "2027-09-01", to: "2027-09-04" });
   const hold = await holdListingLock(L(1));
   let done = false;
-  const p = beginPayStep(db.app, id, { now: F.at(2) }).finally(() => { done = true; });
+  const trace = { polls: 0, lastPollMs: null, firstWaiterMs: null, loopExitMs: null, settledMs: null, settled: null };
+  const tCall = Date.now();
+  const p = beginPayStep(db.app, id, { now: F.at(2) })
+    .then((r) => { trace.settled = { ok: r.ok, error: r.error ?? null, reused: r.reused ?? null }; return r; },
+          (e) => { trace.settled = { threw: e.code || e.name, message: String(e.message).slice(0, 160) }; throw e; })
+    .finally(() => { done = true; trace.settledMs = Date.now() - tCall; });
   let waiters;
   try {
-    waiters = await waitForListingWaiter(L(1), () => done);
-    assert.equal(waiters.length, 1, `helper must wait on listing ${L(1)}'s advisory lock (completed without waiting: ${done})`);
+    waiters = await waitForListingWaiter(L(1), () => done, 3000, trace);
+    const diag = waiters.length === 1 ? "" : ` | DIAG ${JSON.stringify({ trace, snapshot: await lockSnapshot(hold.pid) })}`;
+    assert.equal(waiters.length, 1, `helper must wait on listing ${L(1)}'s advisory lock (completed without waiting: ${done})${diag}`);
     assert.equal(waiters[0].usename, (await db.app.query("SELECT session_user AS u")).rows[0].u, "the waiter is an app-pool backend");
     assert.match(waiters[0].query, /pg_advisory_xact_lock\(hashtext\('booking\.inventory_claims'\)/);
     assert.notEqual(waiters[0].pid, hold.pid);
