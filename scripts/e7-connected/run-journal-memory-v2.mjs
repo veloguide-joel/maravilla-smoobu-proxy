@@ -11,6 +11,8 @@
 //   * testAbortAfterReservation is bound through the manifest hash ONLY: no abort event, transition or release is represented here; a
 //     reservation_confirmed run can never end "released" without the v1 cleanup path (which, from reservation, starts only after
 //     reservation_failed).
+//   * M2-C (claude/e7-run-test-abort-bridge.md): v2-local ABORT_REQUEST_STARTED / ABORT_ACCEPTED records; cleanup may start from
+//     reservation_confirmed ONLY after an ABORT_ACCEPTED receipt; a chain without them validates exactly as in M2-B.
 //   * Record version 2, hash domain sha256("e7-run-journal-v2\n" + canonical JSON). v1 and v2 records / journals cross-refuse; no v1 journal
 //     is relabelled, migrated or adopted.
 //   * Every caller value is copied through ONE getter-free own-enumerable-data-descriptor snapshot BEFORE any await (copied v1 rules: the v1
@@ -28,6 +30,13 @@ export const RECORD_VERSION_V2 = 2;
 export const JOURNAL_V2_HASH_PREFIX = `${RUN_JOURNAL_V2_VERSION}\n`;
 export const IDENTITY_V2_KEYS = Object.freeze(["baselineCommit", "connection", "intentId", "manifestHash", "manifestVersion", "runId"]);
 /** every checkpoint name either mode knows — used ONLY to tell a cross-mode name (CHECKPOINT_MODE_MISMATCH) from garbage; never a permission */
+/** M2-C: the v1 event vocabulary plus the two v2-local abort records */
+export const EVENTS_V2 = Object.freeze([...EVENTS, "ABORT_REQUEST_STARTED", "ABORT_ACCEPTED"]);
+export const ABORT_QUEUED = Object.freeze(["alert.owner:pending", "hostaway.cancel_reservation:pending", "stripe.void_payment_intent:pending"]);
+export const ABORT_REASON = "TEST_ABORT_REQUESTED";
+const ABORT_KEYS = ["eventId", "expectedVersion", "paymentIntentId", "planHash", "reservationId"];
+const RECEIPT_KEYS = ["appliedVersion", "capture", "claimHeld", "queued", "reason", "state"];
+const PI_RE = /^pi_[A-Za-z0-9]{8,64}$/; const RID_RE = /^[1-9][0-9]{0,11}$/;
 const KNOWN_CHECKPOINTS = Object.freeze(["CALENDAR_BASELINE", "CALENDAR_BLOCKED", "CALENDAR_REOPENED", "AIRBNB_BLOCKED", "AIRBNB_REOPENED"]);
 export { JournalError, GENESIS_HASH };
 
@@ -52,7 +61,8 @@ const EVENT_KEYS = freeze({
   RUN_STARTED: [], STEP_STARTED: ["phase", "step", "factory"],
   STEP_ENDED: ["phase", "step", "result", "state", "actions", "unlistedActions", "refusals", "writes"], PHASE_ENDED: ["phase", "state"], ATTESTED: ["attestation"],
   RUN_STOPPED: ["code", "outstanding", "effectsKnown", "exclusion", "ownerCleanupRequired", "writes"],
-  RUN_ENDED: ["outcome", "outstanding", "effectsKnown", "exclusion", "ownerCleanupRequired", "writes"]
+  RUN_ENDED: ["outcome", "outstanding", "effectsKnown", "exclusion", "ownerCleanupRequired", "writes"],
+  ABORT_REQUEST_STARTED: ["abort"], ABORT_ACCEPTED: ["abort", "receipt"]
 });
 const RE = { runId: /^[a-z0-9-]{8,64}$/, uuid: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/, hash: /^[0-9a-f]{64}$/,
   commit: /^[0-9a-f]{40}$/, code: /^[A-Z][A-Z0-9_]{0,47}$/, refusalCode: /^[A-Z_]{1,40}$/, refusalKey: /^[a-zA-Z]{1,40}(?:\.[a-z]{1,10})?$/,
@@ -114,7 +124,12 @@ export function bindManifestV2(manifestInput) {
     identity: freeze({ manifestVersion: RUN_MANIFEST_V2_VERSION, connection: m.listing.connection, runId: m.runId, intentId: m.intentId, baselineCommit: m.baselineCommit,
       manifestHash: v.hash }),
     checkpoints: freeze({ baseline: ck[0], blocked: ck[1], reopened: ck[2] }),
-    phases: freeze({ capture: m.phases.capture, recording: m.phases.recording, testAbortAfterReservation: m.phases.testAbortAfterReservation })
+    phases: freeze({ capture: m.phases.capture, recording: m.phases.recording, testAbortAfterReservation: m.phases.testAbortAfterReservation }),
+    /** M2-C: the validated stay / money facts an operator TEST-abort expectation must equal (never defaulted) */
+    facts: freeze({ listingId: m.listing.id, currency: m.listing.currency, arrival: m.stay.arrival, departure: m.stay.departure, guests: m.stay.guests,
+      amountMinor: m.amountMinor }),
+    /** M2-C: the validated FROZEN manifest copy itself, so a consumer can re-bind after an await without touching the caller's object */
+    manifest: m
   }) });
 }
 
@@ -122,7 +137,7 @@ export function bindManifestV2(manifestInput) {
 const writesOk = (w) => isRec(w) && keysExactly(w, WRITE_KEYS) && WRITE_KEYS.every((k) => int(w[k], 0, 1000));
 /** shape / field validation of ONE snapshotted v2 record (no history, no binding) → error code | null */
 function fieldCheck(r) {
-  if (!isRec(r) || typeof r.event !== "string" || !EVENTS.includes(r.event)) return "RECORD_SHAPE";
+  if (!isRec(r) || typeof r.event !== "string" || !EVENTS_V2.includes(r.event)) return "RECORD_SHAPE";
   if (!keysExactly(r, [...COMMON_KEYS, ...EVENT_KEYS[r.event]])) return "RECORD_SHAPE";
   if (r.v !== RECORD_VERSION_V2 || !int(r.seq, 1, MAX_RECORDS) || typeof r.prevHash !== "string" || !RE.hash.test(r.prevHash) || !int(r.at, 0, 8.64e15)) return "RECORD_FIELD_INVALID";
   if (r.manifestVersion !== RUN_MANIFEST_V2_VERSION || (r.connection !== "disconnected" && r.connection !== "airbnb")) return "RECORD_FIELD_INVALID";
@@ -167,9 +182,29 @@ function fieldCheck(r) {
       if (r.outcome === "ENDED_RELEASED" && r.ownerCleanupRequired !== null && r.ownerCleanupRequired !== "reservedNotConfirmed") return "RECORD_FIELD_INVALID";
       return null;
     }
+    case "ABORT_REQUEST_STARTED":
+    case "ABORT_ACCEPTED": {
+      if (!abortOk(r)) return "RECORD_FIELD_INVALID";
+      if (r.event === "ABORT_REQUEST_STARTED") return null;
+      const x = r.receipt;
+      if (!isRec(x) || !keysExactly(x, RECEIPT_KEYS) || x.appliedVersion !== r.abort.expectedVersion + 1 || x.state !== "capture_failed" || x.reason !== ABORT_REASON
+        || x.claimHeld !== true || !Array.isArray(x.queued) || x.queued.length !== ABORT_QUEUED.length || x.queued.some((q, i) => q !== ABORT_QUEUED[i])
+        || !isRec(x.capture) || !keysExactly(x.capture, ["attempts", "dispatched", "state"]) || x.capture.state !== "pending" || x.capture.attempts !== 0 || x.capture.dispatched !== false) {
+        return "RECORD_FIELD_INVALID";
+      }
+      return null;
+    }
     default: return null;
   }
 }
+/** the abort identity: exact keys, typed values, and the DETERMINISTIC event id for this record's own intent id */
+function abortOk(r) {
+  const a = r.abort;
+  return isRec(a) && keysExactly(a, ABORT_KEYS) && typeof a.planHash === "string" && RE.hash.test(a.planHash) && int(a.expectedVersion, 0, 1_000_000)
+    && typeof a.paymentIntentId === "string" && PI_RE.test(a.paymentIntentId) && typeof a.reservationId === "string" && RID_RE.test(a.reservationId)
+    && a.eventId === `test-abort:${r.intentId}:${a.paymentIntentId}:${a.reservationId}`;
+}
+const sameAbort = (a, b) => ABORT_KEYS.every((k) => a[k] === b[k]);
 const sameIdentity = (r, id) => IDENTITY_V2_KEYS.every((k) => r[k] === id[k]);
 /** binding-dependent record check: the identity, and an ATTESTED checkpoint name must be one of THIS mode's three → code | null */
 function bindingCheck(r, b) {
@@ -195,15 +230,26 @@ export const recordHashV2 = (record) => createHash("sha256").update(JOURNAL_V2_H
 
 // ---- event-order state machine (the accepted v1 rules with the mode's exact checkpoint names and the planned phases) --------------
 const initialState = () => ({ n: 0, ended: false, phase: null, phaseEnd: new Map(), lastState: Object.create(null), steps: Object.create(null), openStep: null,
-  attested: new Set() });
+  attested: new Set(), abort: null, abortAccepted: false });
 const reservationExisted = (st) => st.phaseEnd.get("reservation") === "reservation_confirmed";
 function orderStep(st, r, b) {
   const K = b.checkpoints;
   if (st.ended) return "APPEND_AFTER_TERMINAL";
   if (st.n === 0 && r.event !== "RUN_STARTED") return "ORDER_INVALID";
   if (st.n > 0 && r.event === "RUN_STARTED") return "ORDER_INVALID";
+  // M2-C: between ABORT_REQUEST_STARTED and its receipt only ABORT_ACCEPTED or RUN_STOPPED may follow
+  if (st.abort && !st.abortAccepted && r.event !== "ABORT_ACCEPTED" && r.event !== "RUN_STOPPED") return "ORDER_INVALID";
   switch (r.event) {
     case "RUN_STARTED": break;
+    case "ABORT_REQUEST_STARTED":
+      if (!b.phases.testAbortAfterReservation) return "PHASE_NOT_PLANNED";
+      if (st.openStep || st.abort || st.phase !== "reservation" || st.phaseEnd.get("reservation") !== "reservation_confirmed" || !st.attested.has(K.blocked)) return "ORDER_INVALID";
+      st.abort = r.abort;
+      break;
+    case "ABORT_ACCEPTED":
+      if (!st.abort || st.abortAccepted || st.openStep || !sameAbort(st.abort, r.abort)) return "ORDER_INVALID";
+      st.abortAccepted = true;
+      break;
     case "ATTESTED": {
       const c = r.attestation.checkpoint;
       if (st.openStep || st.attested.has(c)) return "ORDER_INVALID";
@@ -221,8 +267,10 @@ function orderStep(st, r, b) {
         else {
           if (!st.phaseEnd.has(st.phase) || st.phaseEnd.has(r.phase)) return "ORDER_INVALID";
           const from = [st.phase, st.phaseEnd.get(st.phase)];
-          const ok = r.phase === "cleanup" ? CLEANUP_ENTRY.some(([p, x]) => p === from[0] && x === from[1])
-            : ENTRY[r.phase] !== undefined && ENTRY[r.phase][0] === from[0] && ENTRY[r.phase][1] === from[1];
+          // M2-C: (reservation, reservation_confirmed) → cleanup ONLY after a journalled ABORT_ACCEPTED receipt (DB: capture_failed / TEST_ABORT_REQUESTED)
+          const abortEntry = st.abortAccepted && from[0] === "reservation" && from[1] === "reservation_confirmed";
+          const ok = r.phase === "cleanup" ? abortEntry || CLEANUP_ENTRY.some(([p, x]) => p === from[0] && x === from[1])
+            : !st.abort && ENTRY[r.phase] !== undefined && ENTRY[r.phase][0] === from[0] && ENTRY[r.phase][1] === from[1];
           if (!ok) return "ORDER_INVALID";
           if (r.phase === "capture" && !st.attested.has(K.blocked)) return "ORDER_INVALID";
         }
@@ -251,6 +299,7 @@ function orderStep(st, r, b) {
       if (st.openStep) return "ORDER_INVALID";
       const rule = OUTCOME_RULES[r.outcome];
       if ((r.outcome === "ENDED_CAPTURED_NOT_RECORDED" && !b.phases.capture) || (r.outcome === "ENDED_CONFIRMED" && !b.phases.recording)) return "PHASE_NOT_PLANNED";
+      if (st.abort && r.outcome !== "ENDED_RELEASED") return "ORDER_INVALID";      // after an abort record the DB state changed / is uncertain
       if (st.phase !== rule.phase || !st.phaseEnd.has(rule.phase)) return "ORDER_INVALID";
       if (rule.phase !== "cleanup") {
         if (st.phaseEnd.get(rule.phase) !== rule.state || !st.attested.has(K.blocked)) return "ORDER_INVALID";
@@ -271,7 +320,8 @@ function orderStep(st, r, b) {
   return null;
 }
 const cloneState = (st) => ({ ...st, phaseEnd: new Map(st.phaseEnd), lastState: Object.assign(Object.create(null), st.lastState),
-  steps: Object.assign(Object.create(null), st.steps), attested: new Set(st.attested), openStep: st.openStep ? { ...st.openStep } : null });
+  steps: Object.assign(Object.create(null), st.steps), attested: new Set(st.attested), openStep: st.openStep ? { ...st.openStep } : null,
+  abort: st.abort, abortAccepted: st.abortAccepted });
 
 // ---- whole-journal validation (pure) ----------------------------------------------------------------------------------------------
 function safeSnapList(records) {
@@ -321,6 +371,29 @@ function journalVerdict(list, b, trusted) {
   if (!head) return freeze({ ok: true, status: "EMPTY", head: null, anchored, st });
   if (st.ended) return freeze({ ok: true, status: "ENDED", head, terminal: list.at(-1).event, anchored, st });
   return freeze({ ok: true, status: "IN_PROGRESS", head, openStep: st.openStep !== null, anchored, st });
+}
+/**
+ * journalFactsV2(records, manifestInput, { trustedHead } = {}) → frozen { ok:true, status, head, anchored, facts } | frozen { ok:false, code }
+ *   facts: { reservationEnd, blockedAttested, abortStarted, abortAccepted, openStep, ended, abortReady, cleanupEntryPermitted } — derived from
+ *   the SAME validation as validateJournalV2 (a trusted producer's record; anchored only when a trusted head matched).
+ */
+export function journalFactsV2(records, manifestInput, opts) {
+  const br = bindManifestV2(manifestInput);
+  if (!br.ok) return freeze({ ok: false, code: "MANIFEST_INVALID" });
+  const th = trustedHeadOf(opts);
+  if (th.bad) return freeze({ ok: false, code: "TRUSTED_HEAD_INVALID" });
+  const list = safeSnapList(records);
+  if (list === BAD) return freeze({ ok: false, code: "JOURNAL_MALFORMED" });
+  const v = journalVerdict(list, br.binding, th.trusted);
+  if (!v.ok) return v;
+  const st = v.st; const K = br.binding.checkpoints;
+  const reservationEnd = st.phaseEnd.get("reservation") ?? null;
+  const blockedAttested = st.attested.has(K.blocked);
+  const abortReady = !st.ended && !st.openStep && !st.abort && br.binding.phases.testAbortAfterReservation && st.phase === "reservation"
+    && reservationEnd === "reservation_confirmed" && blockedAttested;
+  return freeze({ ok: true, status: v.status, head: v.head, anchored: v.anchored, facts: freeze({ reservationEnd, blockedAttested, abortStarted: st.abort !== null,
+    abortAccepted: st.abortAccepted, openStep: st.openStep !== null, ended: st.ended, abortReady,
+    cleanupEntryPermitted: !st.ended && !st.openStep && st.abortAccepted && st.phase === "reservation" }) });
 }
 const publicVerdict = (v) => { if (!v.ok) return v; const { st, ...rest } = v; void st; return freeze(rest); };
 
