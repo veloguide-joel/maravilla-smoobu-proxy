@@ -294,7 +294,10 @@ test("O5 stale guard under the lock: (a) OWNER FIXTURE bumps the version of a ST
   const a = await booking();
   const e = await expectation(a);
   const { seen } = await refusedAtomically(a, e, "TEST_RELEASE_OPERATOR_STALE", { barrier: async () => {
-    await own("UPDATE booking.intents SET version = version + 1 WHERE id = $1", [a.id]);           // OWNER FIXTURE: no runtime writer bumps without a transition
+    // OWNER FIXTURE: no runtime writer bumps without a transition. The PAYMENT_AUTHORIZED row moves with it so it stays the LATEST
+    // transition: O-f then passes and ONLY the in-lock stale guard (O-a) can refuse (mutant M1 commits here).
+    await own("UPDATE booking.intents SET version = version + 1 WHERE id = $1", [a.id]);
+    await own("UPDATE booking.intent_transitions SET version_after = version_after + 1 WHERE intent_id = $1 AND event_type = 'PAYMENT_AUTHORIZED'", [a.id]);
   } });
   assert.deepEqual(seen, [0, 1], "the lost version race reloaded once and the reload reached inTx");
   const i = await loadIntent(db.app, a.id);
