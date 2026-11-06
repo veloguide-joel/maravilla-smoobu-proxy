@@ -323,4 +323,148 @@ if (process.env.E7_OPERATOR_DB_TESTS === "1") {
       assert.equal((await db.owner.query("SELECT count(*)::int AS n FROM booking.intent_transitions")).rows[0].n, before);
     } finally { await pool.end(); }
   });
+
+  // ---- D2 (LOCAL proof only; NOT hosted CLI / pooler / TLS proof). An ELIGIBLE intent built through the REAL pinned runtime path
+  // (HTTP intent API -> pay step -> verified-webhook processing), run through the REAL runner core with the REAL pinned core + helper,
+  // as the runtime app role. FIXTURE-ONLY fakes: in-memory SDK-shaped Stripe / Hostaway OBJECTS used solely to construct the
+  // fixture (no network, no SDK, no key; fetch is refused and counted). No cleanup / worker / exchange is ever run.
+  const { createIntentApiHandler, hashToken } = await tool("lib/checkout/intent-api-http.js");
+  const { processVerifiedStripeEvent } = await tool("lib/checkout/stripe-test-webhook.js");
+  const { findIntentIdByTokenHash } = await tool("lib/booking-db/intent-access.js");
+  const { ENV_OK } = await tool("test/e5a-fixtures.mjs");
+  const { addDays } = await tool("lib/bookability.js");
+  const IS = await tool("lib/checkout/intent-state.js");
+  const { Readable } = await import("node:stream");
+  const D2_ACCT = "acct_1TyHE42B9LTneQgw";
+  const D2_ORIGIN = "https://preview.example.invalid";
+  const D2_ENV = Object.freeze({ ...ENV_OK, STRIPE_TEST_ACCOUNT_ID: D2_ACCT, MV_CHECKOUT_TEST_API: "enabled", MV_CHECKOUT_ALLOWED_ORIGIN: D2_ORIGIN,
+    MV_CHECKOUT_TEST_LISTINGS: "606998:USD", MV_RATE_LIMIT_SALT: "s".repeat(40), MV_CHECKOUT_TERMS_VERSION: "terms-2026-11", MV_CHECKOUT_TEST_RELEASE: "enabled" });
+  const NOW0 = Date.UTC(2026, 10, 2, 20, 0, 0); const MIN = 60000; const DAY = 1440 * MIN;
+  const clone = (o) => JSON.parse(JSON.stringify(o)); const sec = (ms) => Math.floor(ms / 1000); const pad = (n) => String(n).padStart(8, "0");
+  let d2seq = 0;
+  function fixtureWorld() {
+    const w = { calls: [], sessions: new Map(), pis: new Map() };
+    const strip = (x) => { const { _pim, ...rest } = x; return clone(rest); };
+    w.stripe = { accounts: { retrieve: async () => { w.calls.push("account"); return { object: "account", id: D2_ACCT }; } },
+      checkout: { sessions: { create: async (params) => { w.calls.push("session.create"); const sid = `cs_test_D2${pad(++d2seq)}`; const pd = params.line_items[0].price_data;
+        const ss = { object: "checkout.session", id: sid, livemode: false, mode: "payment", status: "open", payment_status: "unpaid", amount_total: pd.unit_amount, currency: pd.currency,
+          client_reference_id: params.client_reference_id, metadata: { ...params.metadata }, expires_at: params.expires_at, url: `https://checkout.stripe.com/c/pay/${sid}`,
+          payment_intent: null, customer_details: null, _pim: params.payment_intent_data }; w.sessions.set(sid, ss); return strip(ss); },
+        retrieve: async (sid) => { w.calls.push("session.retrieve"); return strip(w.sessions.get(sid)); } } },
+      paymentIntents: { retrieve: async (pid) => { w.calls.push("pi.retrieve"); return clone(w.pis.get(pid)); } } };
+    w.hostaway = { get: async (path, opts = {}) => { w.calls.push("hostaway.get"); const m = /^\/listings\/(\d+)(\/calendar)?$/.exec(path);
+        if (!m[2]) return { status: 200, json: { result: { id: Number(m[1]), currencyCode: "USD", personCapacity: 4, minNights: 1, maxNights: 90 } } };
+        const out = []; for (let d = opts.query.startDate; d <= opts.query.endDate; d = addDays(d, 1)) out.push({ date: d, status: "available", isAvailable: 1, minimumStay: 1, maximumStay: 90, closedOnArrival: 0, closedOnDeparture: 0 });
+        return { status: 200, json: { result: out } }; },
+      post: async (path, body) => { w.calls.push("hostaway.post"); const nights = Math.round((Date.parse(body.endingDate) - Date.parse(body.startingDate)) / DAY);
+        const comps = [{ id: 1, type: "accommodation", name: "baseRate", title: "Base rate", quantity: 1, value: 125, total: 125 * nights, isIncludedInTotalPrice: 1, isMandatory: 1, isOverriddenByUser: 0, isDeleted: 0, units: nights }];
+        return { status: 200, json: { status: "success", result: { totalPrice: comps[0].total, components: comps } } }; } };
+    w.pay = (sid, authAt) => { const ss = w.sessions.get(sid); const pid = `pi_D2${pad(++d2seq)}`;
+      ss.status = "complete"; ss.payment_intent = pid; ss.customer_details = { email: "guest@example.invalid", name: "Guest Person" };
+      w.pis.set(pid, { object: "payment_intent", id: pid, livemode: false, status: "requires_capture", capture_method: ss._pim.capture_method, amount: ss.amount_total,
+        amount_capturable: ss.amount_total, amount_received: 0, currency: ss.currency, metadata: { ...ss._pim.metadata },
+        latest_charge: { object: "charge", id: `ch_D2${pad(d2seq)}`, livemode: false, payment_intent: pid, captured: false, amount: ss.amount_total, amount_captured: 0, amount_refunded: 0,
+          currency: ss.currency, status: "succeeded", paid: true, created: sec(authAt), payment_method_details: { type: "card", card: { capture_before: sec(authAt + 7 * DAY), last4: "4242" } } } });
+      return pid; };
+    w.event = (sid, t) => ({ id: `evt_D2${pad(++d2seq)}`, object: "event", type: "checkout.session.completed", livemode: false, created: sec(t), api_version: "2026-01-28.clover",
+      data: { object: strip(w.sessions.get(sid)) } });
+    return w;
+  }
+  const httpCall = (handler, { method = "POST", body, token } = {}) => { const raw = body === undefined ? "" : JSON.stringify(body);
+    const req = Readable.from(raw ? [Buffer.from(raw)] : []); req.method = method; req.url = "/api/checkout/x";
+    req.headers = { origin: D2_ORIGIN, ...(method === "POST" ? { "content-type": "application/json" } : {}), ...(token ? { authorization: `Bearer ${token}` } : {}) };
+    const res = { statusCode: 0, headers: {}, body: null, setHeader(k, v) { this.headers[k.toLowerCase()] = v; }, end(b) { this.body = b ? JSON.parse(b) : null; } };
+    return handler(req, res).then(() => res); };
+  /** the ELIGIBLE fixture: payment_authorized through the real pinned runtime path; the guest token is then "lost" (never used again) */
+  async function eligibleBooking() {
+    const w = fixtureWorld(); const clock = { now: NOW0 };
+    const deps = { createPool: () => db.app, loadCore: async () => tool("lib/checkout/intent-api-core.js"), loadAccess: async () => tool("lib/booking-db/intent-access.js"),
+      createStripe: () => w.stripe, createHostaway: () => w.hostaway, loadStripe: async () => { throw new Error("no SDK"); }, loadHostaway: async () => { throw new Error("no Hostaway"); },
+      now: () => clock.now, log: () => {}, onError: (e) => { throw e; } };
+    const h = { intents: createIntentApiHandler({ route: "intents", env: D2_ENV, deps }), step: createIntentApiHandler({ route: "step", env: D2_ENV, deps }) };
+    const c = await httpCall(h.intents, { body: { listingId: 606998, from: "2027-03-01", to: "2027-03-04", guests: 2 } });
+    assert.equal(c.statusCode, 201, JSON.stringify(c.body));
+    const token = c.body.token; const id = await findIntentIdByTokenHash(db.app, hashToken(token));
+    clock.now += 1000;
+    assert.equal((await httpCall(h.step, { body: { step: "details", firstName: "Zanabria", lastName: "Quintessa", email: "zq.d2@example.test", termsVersion: "terms-2026-11" }, token })).statusCode, 200);
+    clock.now += 1000;
+    assert.equal((await httpCall(h.step, { body: { step: "pay" }, token })).statusCode, 200);
+    const sid = [...w.sessions.keys()][0];
+    clock.now = NOW0 + 4 * MIN;
+    const pid = w.pay(sid, clock.now - 30000);
+    assert.deepEqual(await processVerifiedStripeEvent(db.app, w.event(sid, clock.now), { stripe: w.stripe, now: clock.now, accountId: D2_ACCT, accountCache: {} }),
+      { http: 200, code: "APPLIED", state: "payment_authorized" });
+    return { w, id, pid, sid };
+  }
+  const SNAP = [["intents", "id"], ["intent_transitions", "intent_id"], ["intent_applied_events", "intent_id"], ["external_operations", "intent_id"], ["payment_ledger", "intent_id"],
+    ["inventory_claims", "intent_id"], ["payment_attempts", "intent_id"], ["stripe_webhook_events", "intent_id"], ["intent_work", "intent_id"],
+    ["hostaway_reservation_attempts", "intent_id"], ["reconciliation_cases", "intent_id"]];
+  const snap = async (iid) => { const o = {}; for (const [tb, col] of SNAP) o[tb] = (await db.owner.query(`SELECT to_jsonb(x)::text AS j FROM booking.${tb} x WHERE x.${col} = $1 ORDER BY 1`, [iid])).rows.map((r) => r.j); return o; };
+  const rows = async (sql, args) => (await db.owner.query(sql, args)).rows;
+
+  test("D2 LOCAL ELIGIBLE fixture through the REAL runner core + pinned core/helper (runtime role): verify ELIGIBLE -> execute (ONE real helper call: one admin TEST_RELEASE_REQUESTED, one pristine void, claim held) -> verify ALREADY_REQUESTED -> repeat execute ZERO calls, rows unchanged; no provider / network / cleanup", async () => {
+    const realFetch = globalThis.fetch; let netAttempts = 0;
+    globalThis.fetch = async () => { netAttempts += 1; throw new Error("network refused"); };
+    const pool = P.createBookingPool({ connectionString: db.appUrl(), max: 2 });
+    try {
+      const b = await eligibleBooking();
+      const i0 = await R.loadIntent(db.app, b.id);
+      const att = (await rows("SELECT id::text AS id FROM booking.payment_attempts WHERE intent_id = $1 AND status = 'completed'", [b.id]))[0];
+      const e = OP.buildOperatorExpectation({ intentId: b.id, expectedVersion: i0.version, listingId: 606998, from: i0.from, to: i0.to, guests: i0.guests, currency: "USD",
+        finalTotalMinor: i0.price.finalTotalMinor, authorizedMinor: i0.payment.amountMinor, paymentIntentId: b.pid, sessionId: b.sid, attemptId: att.id,
+        approvalRef: "local-d2-eligible-fixture" });
+      assert.ok(e, "the expectation binds the fixture's real identity / payment / session / attempt");
+      let helperCalls = 0;
+      const ops = { classify: OP.classify, executeOperatorRelease: OP.executeOperatorRelease,
+        requestTestRelease: async (...a) => { helperCalls += 1; return R.requestTestRelease(...a); } };   // the REAL pinned helper, counted
+      const callsAfterFixture = b.w.calls.length;
+      // (1) verify: ELIGIBLE at exactly the expected version
+      const v1 = await E.runOperatorCore({ mode: "verify", expectation: e, pool, now: NOW0 + 6 * MIN, ops });
+      assert.deepEqual([v1.outcome, v1.reconciled.class, v1.reconciled.code, v1.reconciled.state, v1.reconciled.version, v1.invocations],
+        ["VERIFIED", "ELIGIBLE", null, "payment_authorized", e.expectedVersion, 0]);
+      const before = await snap(b.id);
+      // (2) execute: exactly ONE real helper invocation -> REQUESTED
+      const x = await E.runOperatorCore({ mode: "execute", expectation: e, pool, now: NOW0 + 6 * MIN, ops });
+      assert.deepEqual([x.phase, x.outcome, x.code, x.invocations, x.refusedInvocations, helperCalls], ["AFTER_INVOCATION", "REQUESTED", null, 1, 0, 1]);
+      assert.deepEqual(x.helper, { ok: true, duplicate: false, error: null });
+      assert.deepEqual([x.reconciled.class, x.reconciled.releaseActor, x.reconciled.releaseVersion, x.reconciled.releasedAtExpectedVersion, x.reconciled.voidState, x.reconciled.claimReleased],
+        ["ALREADY_REQUESTED", "admin", e.expectedVersion + 1, true, "pending", false]);
+      // exact DB changes: the intent row, ONE transition, ONE applied event, ONE void op; nothing else in any bound table
+      const after = await snap(b.id);
+      for (const tb of ["payment_ledger", "inventory_claims", "payment_attempts", "stripe_webhook_events", "hostaway_reservation_attempts", "reconciliation_cases"]) {
+        assert.deepEqual(after[tb], before[tb], `${tb} unchanged by the release request`);
+      }
+      assert.equal(after.intent_transitions.length, before.intent_transitions.length + 1);
+      assert.equal(after.intent_applied_events.length, before.intent_applied_events.length + 1);
+      assert.equal(after.external_operations.length, before.external_operations.length + 1);
+      const i1 = await R.loadIntent(db.app, b.id);
+      assert.deepEqual([i1.status, i1.version, i1.reasonCode, i1.payment.capturedMinor], ["reservation_failed", e.expectedVersion + 1, "TEST_RELEASE_REQUESTED", 0]);
+      assert.deepEqual(await rows(`SELECT version_after, from_state, to_state, event_type, event_id, reason_code, actor FROM booking.intent_transitions
+        WHERE intent_id = $1 AND version_after > $2 ORDER BY version_after`, [b.id, e.expectedVersion]),
+        [{ version_after: e.expectedVersion + 1, from_state: "payment_authorized", to_state: "reservation_failed", event_type: "TEST_RELEASE_REQUESTED",
+          event_id: IS.testReleaseEventId(b.id, b.pid), reason_code: "TEST_RELEASE_REQUESTED", actor: "admin" }]);
+      assert.deepEqual(await rows(`SELECT event_id, event_type, applied_version FROM booking.intent_applied_events WHERE intent_id = $1 AND applied_version > $2`, [b.id, e.expectedVersion]),
+        [{ event_id: IS.testReleaseEventId(b.id, b.pid), event_type: "TEST_RELEASE_REQUESTED", applied_version: e.expectedVersion + 1 }]);
+      assert.deepEqual(await rows(`SELECT op_type, state, attempts, dispatched_at, idempotency_key, payload ->> 'providerIdempotencyKey' AS pk, payload ->> 'paymentIntentId' AS ppi
+        FROM booking.external_operations WHERE intent_id = $1 AND op_type = 'stripe.void_payment_intent'`, [b.id]),
+        [{ op_type: "stripe.void_payment_intent", state: "pending", attempts: 0, dispatched_at: null, idempotency_key: `void:${b.id}:v${e.expectedVersion + 1}`,
+          pk: IS.voidKey(b.id, b.pid), ppi: b.pid }]);
+      assert.deepEqual(await rows("SELECT kind, (released_at IS NULL) AS held FROM booking.inventory_claims WHERE intent_id = $1", [b.id]), [{ kind: "authorized", held: true }],
+        "the claim stays held pending the SEPARATE cleanup");
+      assert.deepEqual(await rows("SELECT op_type FROM booking.external_operations WHERE intent_id = $1 AND (op_type LIKE 'hostaway.%' OR op_type = 'stripe.capture_payment_intent')", [b.id]), []);
+      // (3) verify again: ALREADY_REQUESTED, admin, at expectedVersion + 1, pristine void, claim held (no anomaly)
+      const v2 = await E.runOperatorCore({ mode: "verify", expectation: e, pool, now: NOW0 + 7 * MIN, ops });
+      assert.deepEqual([v2.outcome, v2.reconciled.class, v2.reconciled.releaseActor, v2.reconciled.releasedAtExpectedVersion, v2.reconciled.voidState, v2.reconciled.voidAttempts,
+        v2.reconciled.voidDispatched, v2.reconciled.claimReleased, v2.reconciled.claimAnomaly, v2.invocations],
+        ["VERIFIED", "ALREADY_REQUESTED", "admin", true, "pending", 0, false, false, false, 0]);
+      // (4) repeat execute: classified ALREADY_REQUESTED before any call -> ZERO helper invocations; every bound row byte-equal
+      const s2 = await snap(b.id);
+      const x2 = await E.runOperatorCore({ mode: "execute", expectation: e, pool, now: NOW0 + 8 * MIN, ops });
+      assert.deepEqual([x2.phase, x2.outcome, x2.invocations, x2.precheck.class, helperCalls], ["BEFORE_INVOCATION", "NOT_EXECUTED_ALREADY_REQUESTED", 0, "ALREADY_REQUESTED", 1]);
+      assert.deepEqual(await snap(b.id), s2, "repeat execute changed nothing");
+      // no provider object touched after the fixture, no network, no cleanup
+      assert.equal(b.w.calls.length, callsAfterFixture, "no SDK-shaped fixture object used by the runner / core");
+      assert.equal(netAttempts, 0);
+    } finally { globalThis.fetch = realFetch; await pool.end(); }
+  });
 }
