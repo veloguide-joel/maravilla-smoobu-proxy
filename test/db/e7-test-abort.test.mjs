@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import { startMigratedDatabase } from "./harness.mjs";
 import * as F from "./fixtures.mjs";
 import { applyEvent, loadIntent, recordHostawayCreateResult } from "../../lib/booking-db/repo.js";
-import { claimNextOperation, completeOperation } from "../../lib/booking-db/operations.js";
+import { claimNextOperation, completeOperation, requestRead, recordProviderEvidence } from "../../lib/booking-db/operations.js";
 import { runCleanupStep, OPS } from "../../lib/booking-db/compensation-worker.js";
 import { validateAdapterConfig } from "../../lib/hostaway-reservations.js";
 import { requestTestAbort, TEST_ABORT_CODES } from "../../lib/booking-db/test-abort.js";
@@ -31,11 +31,12 @@ const nextStay = () => { stayN += 1; return { listingId: LISTING, currency: "USD
 const hex8 = () => randomUUID().replace(/-/g, "").slice(0, 12);
 
 /** a reservation_confirmed TEST intent on 606998 / USD with ONE pending, never-dispatched capture row (accepted E3 transitions only) */
-async function confirmedIntent() {
+async function confirmedIntent(o = {}) {
   const stay = nextStay();
   const p = await F.pending(db.app, stay);
   const piId = `pi_ABRT${hex8()}`;
   F.ok(await applyEvent(db.app, p.id, F.authEvent(p.sessionId, piId, 5, { currency: "usd" }), { now: F.at(5), actor: "webhook" }));
+  if (o.beforeCreate) await o.beforeCreate(p);                                    // e.g. the pre-create by-ref lookup, BEFORE the create claim (F.at(6))
   F.ok(await applyEvent(db.app, p.id, { type: "RESERVATION_STARTED", workerId: "w1", recheck: { bookable: true, priceSame: true } }, { now: F.at(6), actor: "worker", workerId: "w1" }));
   F.ok(await applyEvent(db.app, p.id, { type: "RESERVATION_DISPATCHED", workerId: "w1" }, { now: F.at(6), actor: "worker", workerId: "w1" }));
   const rid = F.nextReservationId() + 61000000;
@@ -334,4 +335,100 @@ test("D7 (root a1dcea0d) the expectation is bound synchronously: mutating the ca
   }
   assert.equal(await state(b.id), "reservation_confirmed");
   assert.deepEqual(await opsOf(b.id), before, "zero writes");
+});
+
+/** a REAL read through the accepted runtime APIs (requestRead → claim → complete → recordProviderEvidence): observed_at = that read's completed_at */
+async function readEvidence(intentId, { opType, ref, at, kind, externalRef, status, observed }) {
+  const opId = await requestRead(db.app, intentId, opType, ref, { now: at });
+  const op = await claimNextOperation(db.app, { workerId: "w-read", now: at, intentId, opId });
+  assert.equal(op && op.id, opId);
+  F.ok(await completeOperation(db.app, opId, { workerId: "w-read", now: at, outcome: { status: "succeeded" } }));
+  const r = await recordProviderEvidence(db.app, { readOpId: opId, kind, externalRef, status, observed });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  return opId;
+}
+/** SYNTHETIC (owner-planted, labelled): a row the accepted record_provider_evidence REFUSES (it binds the selector), bound to a REAL succeeded read;
+ *  used only to prove the helper ALSO refuses such a mis-bound row if one ever existed. observed_at = that read's completed_at. */
+async function plantMisbound(intentId, { opType, ref, at, kind, externalRef, status, observed }) {
+  const opId = await requestRead(db.app, intentId, opType, ref, { now: at });
+  assert.equal((await claimNextOperation(db.app, { workerId: "w-read", now: at, intentId, opId })).id, opId);
+  F.ok(await completeOperation(db.app, opId, { workerId: "w-read", now: at, outcome: { status: "succeeded" } }));
+  await assert.rejects(recordProviderEvidence(db.app, { readOpId: opId, kind, externalRef, status, observed }).then((r) => { if (!r.ok) throw new Error(r.error || "refused"); }),
+    "the accepted DB API refuses this binding");
+  await db.owner.query(`INSERT INTO booking.provider_evidence (id, intent_id, kind, source, external_ref, status, observed, observed_at, read_operation_id, recorded_by_role, recorded_session_user, created_at)
+    SELECT $1, $2, $3, 'hostaway_api', $4, $5, $6::jsonb, o.completed_at, o.id, 'test', 'test', now() FROM booking.external_operations o WHERE o.id = $7`,
+    [randomUUID(), intentId, kind, externalRef, status, JSON.stringify(observed), opId]);
+}
+const LOOKUP = "hostaway.lookup_reservation"; const RETRIEVE = "hostaway.retrieve_reservation";
+const preCreateAbsence = (at = F.at(5)) => async (p) => {
+  const ref = (await loadIntent(db.app, p.id)).ref;
+  await readEvidence(p.id, { opType: LOOKUP, ref, at, kind: "hostaway_reservation", externalRef: ref, status: "not_found", observed: { bookingRef: ref, matchCount: 0 } });
+};
+const boundObserved = (a, over = {}) => ({ reservationId: a.rid, listingId: LISTING, from: a.stay.from, to: a.stay.to, totalMinor: a.e.finalTotalMinor, currency: "USD", status: "new", ...over });
+const evRows = async (id) => (await db.app.query("SELECT kind, source, external_ref, status, observed, observed_at, read_operation_id FROM booking.provider_evidence WHERE intent_id = $1 ORDER BY created_at, id", [id])).rows;
+
+test("D8 (root b43935f0) hostaway_reservation history: ALLOWED = the pre-create by-ref not_found (bound lookup, before the ONE create dispatch) and a bound found_active for the exact reservation; history rows preserved unchanged", async () => {
+  // P1 the pre-create absence, then the accepted abort; the absence row stays exactly as recorded (tolerated history, never proof of anything now)
+  const a = await confirmedIntent({ beforeCreate: preCreateAbsence() });
+  const ev0 = await evRows(a.id);
+  assert.deepEqual(ev0.map((x) => `${x.kind}:${x.status}:${x.external_ref === a.ref}`), ["hostaway_reservation:not_found:true"]);
+  const r = await requestTestAbort(db.app, a.id, { now: F.at(9), env: ENV, operator: a.e });
+  assert.equal(r.ok, true, JSON.stringify(r)); assert.equal(await state(a.id), "capture_failed");
+  assert.deepEqual(await evRows(a.id), ev0, "the not_found history row is unchanged");
+  // P2 a bound found_active by-id retrieve AND a bound by-ref lookup match (matchCount 1), both for the exact reservation + identity
+  const b = await confirmedIntent({ beforeCreate: preCreateAbsence() });
+  await readEvidence(b.id, { opType: RETRIEVE, ref: b.rid, at: F.at(8), kind: "hostaway_reservation", externalRef: b.rid, status: "found_active", observed: boundObserved(b) });
+  await readEvidence(b.id, { opType: LOOKUP, ref: b.ref, at: F.at(8), kind: "hostaway_reservation", externalRef: b.rid, status: "found_active",
+    observed: { bookingRef: b.ref, matchCount: 1, ...boundObserved(b, { bookingRef: b.ref }) } });
+  const rb = await requestTestAbort(db.app, b.id, { now: F.at(9), env: ENV, operator: b.e });
+  assert.equal(rb.ok, true, JSON.stringify(rb)); assert.equal(await state(b.id), "capture_failed");
+});
+
+test("D9 (root b43935f0) every other hostaway_reservation / payment / offline-charge evidence class is TEST_ABORT_EVIDENCE_CONFLICT with ZERO E3 / event / outbox change (fresh disposable intent per case; append-only rows never rewritten)", async () => {
+  const cases = [
+    ["cancelled for the bound reservation", async (a) => readEvidence(a.id, { opType: RETRIEVE, ref: a.rid, at: F.at(8), kind: "hostaway_reservation", externalRef: a.rid, status: "cancelled", observed: {} })],
+    ["not_found for the reservation id", async (a) => readEvidence(a.id, { opType: RETRIEVE, ref: a.rid, at: F.at(8), kind: "hostaway_reservation", externalRef: a.rid, status: "not_found", observed: {} })],
+    ["POST-create not_found for the same booking ref", async (a) => readEvidence(a.id, { opType: LOOKUP, ref: a.ref, at: F.at(8), kind: "hostaway_reservation", externalRef: a.ref, status: "not_found", observed: { bookingRef: a.ref, matchCount: 0 } })],
+    ["not_found completed AT the create dispatch (ambiguous order)", null, preCreateAbsence(F.at(6))],
+    ["not_found whose external_ref differs from the lookup's ref (mismatched read binding)", null, async (p) => {
+      const ref = (await loadIntent(db.app, p.id)).ref;
+      await readEvidence(p.id, { opType: LOOKUP, ref, at: F.at(5), kind: "hostaway_reservation", externalRef: "MV-NOT-THIS-REF", status: "not_found", observed: { bookingRef: ref, matchCount: 0 } }); }],
+    ["not_found with an observed bookingRef of another booking", null, async (p) => {
+      const ref = (await loadIntent(db.app, p.id)).ref;
+      await plantMisbound(p.id, { opType: LOOKUP, ref, at: F.at(5), kind: "hostaway_reservation", externalRef: ref, status: "not_found", observed: { bookingRef: "MV-OTHER", matchCount: 0 } }); }],
+    ["not_found recorded from a by-id retrieve (not the by-ref lookup)", null, async (p) => {
+      const ref = (await loadIntent(db.app, p.id)).ref;
+      await plantMisbound(p.id, { opType: RETRIEVE, ref: "61000001", at: F.at(5), kind: "hostaway_reservation", externalRef: ref, status: "not_found", observed: { bookingRef: ref, matchCount: 0 } }); }],
+    ["found_active for ANOTHER reservation", async (a) => readEvidence(a.id, { opType: RETRIEVE, ref: "61999998", at: F.at(8), kind: "hostaway_reservation", externalRef: "61999998", status: "found_active", observed: boundObserved(a, { reservationId: "61999998" }) })],
+    ["found_active, contradictory total", async (a) => readEvidence(a.id, { opType: RETRIEVE, ref: a.rid, at: F.at(8), kind: "hostaway_reservation", externalRef: a.rid, status: "found_active", observed: boundObserved(a, { totalMinor: a.e.finalTotalMinor + 100 }) })],
+    ["found_active, contradictory stay", async (a) => readEvidence(a.id, { opType: RETRIEVE, ref: a.rid, at: F.at(8), kind: "hostaway_reservation", externalRef: a.rid, status: "found_active", observed: boundObserved(a, { to: addDays(a.stay.to, 1) }) })],
+    ["found_active, contradictory listing", async (a) => readEvidence(a.id, { opType: RETRIEVE, ref: a.rid, at: F.at(8), kind: "hostaway_reservation", externalRef: a.rid, status: "found_active", observed: boundObserved(a, { listingId: 603566 }) })],
+    ["found_active, contradictory currency", async (a) => readEvidence(a.id, { opType: RETRIEVE, ref: a.rid, at: F.at(8), kind: "hostaway_reservation", externalRef: a.rid, status: "found_active", observed: boundObserved(a, { currency: "MXN" }) })],
+    ["found_active, contradictory bookingRef", async (a) => readEvidence(a.id, { opType: RETRIEVE, ref: a.rid, at: F.at(8), kind: "hostaway_reservation", externalRef: a.rid, status: "found_active", observed: boundObserved(a, { bookingRef: "MV-OTHER" }) })],
+    ["found_active, retrieve of a DIFFERENT id recorded under the bound id", async (a) => plantMisbound(a.id, { opType: RETRIEVE, ref: "61999997", at: F.at(8), kind: "hostaway_reservation", externalRef: a.rid, status: "found_active", observed: boundObserved(a) })],
+    ["SYNTHETIC owner-planted dashboard row (missing read binding)", async (a) => db.owner.query(`INSERT INTO booking.provider_evidence (id, intent_id, kind, source, external_ref, status, observed, observed_at, attested_by, reference, recorded_by_role, recorded_session_user, created_at)
+      VALUES ($1, $2, 'hostaway_reservation', 'hostaway_dashboard', $3, 'not_found', $4::jsonb, now(), 'test-owner', 'SYNTHETIC unbound row', 'test', 'test', now())`, [randomUUID(), a.id, a.ref, JSON.stringify({ bookingRef: a.ref, matchCount: 0 })])],
+    ["payment_intent evidence for ANOTHER PI", async (a) => readEvidence(a.id, { opType: "stripe.retrieve_payment_intent", ref: "pi_ABRTotherPI0001", at: F.at(8), kind: "payment_intent", externalRef: "pi_ABRTotherPI0001", status: "requires_capture", observed: {} })],
+    ["payment_intent observed captured", async (a) => readEvidence(a.id, { opType: "stripe.retrieve_payment_intent", ref: a.piId, at: F.at(8), kind: "payment_intent", externalRef: a.piId, status: "succeeded", observed: {} })],
+    ["payment_intent observed canceled", async (a) => readEvidence(a.id, { opType: "stripe.retrieve_payment_intent", ref: a.piId, at: F.at(8), kind: "payment_intent", externalRef: a.piId, status: "canceled", observed: {} })],
+    // a REAL offline-charge read is already refused one gate earlier (its op type is not tolerated history): still zero effects
+    ["offline-charge evidence via a real read (earlier history gate)", async (a) => readEvidence(a.id, { opType: "hostaway.list_offline_charges", ref: a.rid, at: F.at(8), kind: "hostaway_offline_charges", externalRef: a.rid, status: "listed", observed: { matchingChargeCount: 0, matchingChargeIds: [] } }), null, "TEST_ABORT_OPERATION_HISTORY"],
+    ["SYNTHETIC owner-planted attested offline-charge row (reaches the evidence gate)", async (a) => db.owner.query(`INSERT INTO booking.provider_evidence (id, intent_id, kind, source, external_ref, status, observed, observed_at, attested_by, reference, recorded_by_role, recorded_session_user, created_at)
+      VALUES ($1, $2, 'hostaway_offline_charges', 'hostaway_dashboard', $3, 'listed', '{"matchingChargeCount":0,"matchingChargeIds":[]}'::jsonb, now(), 'test-owner', 'SYNTHETIC attested row', 'test', 'test', now())`, [randomUUID(), a.id, a.rid])]
+  ];
+  const ran = [];
+  for (const [label, after, beforeCreate, want = "TEST_ABORT_EVIDENCE_CONFLICT"] of cases) {
+    let a;
+    try { a = await confirmedIntent(beforeCreate ? { beforeCreate } : {}); if (after) await after(a); }
+    catch (err) { ran.push(`${label}: SETUP_REFUSED_BY_ACCEPTED_API ${String(err && (err.code || err.message)).slice(0, 80)}`); continue; }
+    const s0 = await snap(a.id); const ev0 = await evRows(a.id);
+    assert.ok(ev0.length >= 1, label);
+    const r = await requestTestAbort(db.app, a.id, { now: F.at(9), env: ENV, operator: a.e });
+    assert.deepEqual([r.ok, r.error], [false, want], label);
+    assert.deepEqual(await snap(a.id), s0, `${label}: zero E3 / event / outbox change`);
+    assert.deepEqual(await evRows(a.id), ev0, `${label}: evidence unchanged`);
+    ran.push(`${label}: ${want === "TEST_ABORT_EVIDENCE_CONFLICT" ? "CONFLICT" : want}`);
+  }
+  console.log(`# D9 ${JSON.stringify(ran)}`);
+  assert.deepEqual(ran.filter((x) => !x.endsWith(": CONFLICT") && !x.endsWith(": TEST_ABORT_OPERATION_HISTORY")), [], "every disallowed class was represented and refused");
 });

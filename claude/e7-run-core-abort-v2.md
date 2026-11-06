@@ -1,6 +1,6 @@
 # E7 M2-D — v2 reservation → intentional TEST abort → cleanup consumer (OFFLINE, LOCAL, inert)
 
-> **STATUS: BLOCKED on an accepted-contract contradiction (§8). Nothing was relaxed.** With the accepted helper unchanged, every real-worker lifecycle stops at the bridge with `ABORT_REFUSED / TEST_ABORT_EVIDENCE_CONFLICT`, fail-closed. A minimal helper proposal is in §8 for root; it is NOT applied on this branch.
+> **STATUS: LOCAL CANDIDATE, UNACCEPTED. The local protocol proof passes; this is NOT hosted readiness.** The §8 blocker was resolved by the root-authorized (b43935f0) scoped helper correction. The focused final checks pass on disposable local PG with fake providers. Hosted durable journal, owner secrets and real-manifest acceptance stay parked.
 
 `scripts/e7-connected/run-core-abort-v2.mjs` exports `runAbortRehearsalV2(opts)`. It is a new, separate core.
 
@@ -115,26 +115,41 @@ The owner cleanup key is conservative: `reservedNotConfirmed` once a reservation
 - 0017 is applied only to disposable local PG.
 - The v1 core is untouched; its suite is not rerun (no v1 source change).
 
-## 8. BLOCKER: the accepted helper's evidence rule vs the accepted reservation worker and schema
+## 8. Helper evidence classification (was the BLOCKER at a82e551; corrected per root ruling b43935f0)
 
-**The rule.** `lib/booking-db/test-abort.js:179` (accepted, pinned `a00952ca…`) refuses ANY `hostaway_reservation` evidence row unless `external_ref === reservationId && status === "new"`.
+**The defect at a82e551.** `lib/booking-db/test-abort.js` required `status === "new"` for every `hostaway_reservation` evidence row. The schema (`booking.validate_evidence`, 0003:85–88) allows only `found_active`, `cancelled` or `not_found`. The accepted reservation worker always records its pre-create by-ref absence as `not_found` (`reservation-worker.js:214–221`). So every real-worker intent was refused with `TEST_ABORT_EVIDENCE_CONFLICT`. The a82e551 TAP (3/7) is preserved.
 
-**Why it can never be met.**
-- The schema allows only `found_active`, `cancelled` or `not_found` for that kind (`db/migrations/0003_safety_corrections.up.sql:85–88`). So `"new"` can never occur, and every such row refuses.
-- The accepted reservation worker ALWAYS records its pre-create by-ref lookup as evidence `{kind: hostaway_reservation, external_ref: <booking ref>, status: not_found, observed: {bookingRef, matchCount: 0}}` (`lib/booking-db/reservation-worker.js:214–221`).
-- Observed on disposable PG at the blocked point (`diag.txt`): `[{"kind":"hostaway_reservation","external_ref":"MV-T00001","status":"not_found","source":"hostaway_api"}]`.
+**The correction** (helper only; no migration, worker, grant or access-control change) is `reservationEvidenceAllowed()`.
 
-**Why the helper's own suites missed it.** They (e7-test-abort, M2-C B1–B9) build `reservation_confirmed` through `recordHostawayCreateResult` with no lookup, so no evidence row exists.
+Every row must meet all of these:
+- `source = hostaway_api`;
+- `read_operation_id` names a read of THIS intent with `state = succeeded`;
+- `observed_at` equals that read's `completed_at` (what `record_provider_evidence` stamps);
+- the observed keys are within the worker's normalized set.
 
-**Minimal proposal (root decision; helper change; one condition).** Accept exactly two shapes and keep every other row a conflict (cancelled, a foreign ref or id, offline charges, a non-`requires_capture` PI):
-- `found_active` for the bound reservation id;
-- the pre-create `not_found` for the DB intent's own booking ref.
+Exactly two classes are allowed:
+1. **`found_active` for exactly `e.reservationId`.** The read is either a by-id retrieve of that id, or a by-ref lookup of this intent's ref with `matchCount 1`. The observed reservation id, listing, stay, total and currency must match the bound expectation, and `bookingRef` too when present.
+2. **The PRE-CREATE by-ref `not_found` for exactly the DB intent's ref.**
+   - The read is a lookup whose payload ref is that ref, with observed `{bookingRef: ref, matchCount: 0}` and nothing else.
+   - It completed strictly BEFORE the one create's `dispatched_at`. Both timestamps come from the same injected worker clock; evidence `created_at` is never used.
+   - An equal or later completion is post-create or ambiguous, and refuses.
+   - This row is tolerated history ONLY. It is never proof of present absence, cancellation, void or release.
 
-```js
-if (x.kind === "hostaway_reservation" && !((x.external_ref === e.reservationId && x.status === "found_active")
-  || (x.external_ref === before.ref && x.status === "not_found"))) fail("TEST_ABORT_EVIDENCE_CONFLICT");
-```
+Everything else is a conflict:
+- `cancelled`;
+- `not_found` for the reservation id;
+- post-create `not_found`;
+- a foreign, missing or mismatched read binding;
+- `found_active` for another reservation, or with a contradictory stay, total, listing, currency or booking ref;
+- payment evidence that is not `requires_capture` for the bound PI;
+- any offline-charge evidence.
 
-**Proof.** In a THROWAWAY copy (not on any branch) with only that change, this suite passes 6/7. The only failure is M7, which pins the helper's accepted bytes and fails by design.
+Every earlier gate is unchanged. A real offline-charge read is still refused one gate earlier, by the operation-history gate.
 
-If accepted, the proposal is a separate root-reviewed helper slice. After it, the M7 pin and this note are updated. No M2-D code change is expected.
+**Pins.** `test-abort.js` changed from `a00952ca…` to `91724d9d…`. The M2-D M7 and bridge H6 pin expectations were updated for that file ONLY, with the reason in a comment.
+
+**Coverage.**
+- Helper PG D8 (allowed classes): the history is preserved.
+- Helper PG D9 (every disallowed class, one fresh intent per case): zero E3, event, outbox or evidence change.
+  - The mis-bound rows that the accepted `record_provider_evidence` already refuses are SYNTHETIC owner-planted, bound to real succeeded reads.
+- M2-D M1, through the REAL reservation worker: its real pre-create absence row is the ONLY reservation evidence at the abort, and it is unchanged at the end. The compensation worker's own later reads are appended after it.
