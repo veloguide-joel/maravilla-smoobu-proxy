@@ -78,6 +78,17 @@ test("guard: the helper waits on THIS listing's advisory lock before inserting i
     .then((r) => { trace.settled = { ok: r.ok, error: r.error ?? null, reused: r.reused ?? null }; return r; },
           (e) => { trace.settled = { threw: e.code || e.name, message: String(e.message).slice(0, 160) }; throw e; })
     .finally(() => { done = true; trace.settledMs = Date.now() - tCall; });
+  // Cleanup (test-only): mark p handled AT ONCE, so an early assertion failure can never leave it as an unhandled rejection; the success
+  // path still awaits p itself below. On EVERY exit the held lock is released and p is settled (bounded) before the test ends; the
+  // ORIGINAL assertion / error propagates unchanged (the settle step never throws; a settle timeout is recorded in the trace only).
+  p.catch(() => {});
+  const settleP = async () => {
+    let timer;
+    const outcome = await Promise.race([p.then(() => "settled", () => "rejected"),
+      new Promise((res) => { timer = setTimeout(() => res("settle-timeout"), 10000); })]);
+    clearTimeout(timer);
+    trace.cleanupSettle = outcome;
+  };
   let waiters;
   try {
     waiters = await waitForListingWaiter(L(1), () => done, 3000, trace);
@@ -87,7 +98,7 @@ test("guard: the helper waits on THIS listing's advisory lock before inserting i
     assert.match(waiters[0].query, /pg_advisory_xact_lock\(hashtext\('booking\.inventory_claims'\)/);
     assert.notEqual(waiters[0].pid, hold.pid);
     assert.deepEqual((await rowsOf([id])).claims, [], "no committed claim while waiting");
-  } finally { await hold.release(); }
+  } finally { try { await hold.release(); } finally { await settleP(); } }
   const r = await p;
   assert.deepEqual([r.ok, r.reused], [true, false]);
   const after = await rowsOf([id]);
