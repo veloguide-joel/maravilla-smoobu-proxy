@@ -347,3 +347,89 @@ test("U11 source pins: the new module imports only the accepted v1 codec/adapter
   assert.deepEqual(Object.fromEntries(Object.keys(PINS).map((p) => [p, sha(p)])), PINS);
 });
 const PINS = {"scripts/e7-connected/run-journal-file.mjs":"265af8195dccbaae34817a9a16e2f09f4498b85638fae4abb779d5b0bd9cc4b1","scripts/e7-connected/run-journal-memory-v2.mjs":"0a9ad263ac6a4f505d62e21634b0161134f5263dc4caa8dcf3d2834308df4c7a","scripts/e7-connected/run-journal-memory.mjs":"2712f01b0509d343d162b5fe7055878ade40f69d668915671441b81cbf87c700","scripts/e7-connected/run-manifest.mjs":"c47f72eb2b9e898bdaca2ca20ffe7cea0befab006079953133810ce5651f6a56","scripts/e7-connected/run-manifest-v2.mjs":"c19ab009b00b8c3877da53f20e436c1c6d4ac29d051ab1f21705d38fcf3cc7fd","scripts/e7-connected/run-core.mjs":"ad1dcbb29e7cb1ce0aac71ac178d903076d4e5cc293dd17f972c04b4beaa5afe","scripts/e7-connected/run-core-abort-v2.mjs":"d8cfdc22c82986202a220dce217a177034f8ff65db2d3f04fac94db855b17c02","scripts/e7-connected/run-test-abort.mjs":"d0b8465b992367999f261968f986f456d25ad6a5845b07028ad95c2cc22143a3","scripts/e7-connected/run-guard.mjs":"5d92cbf8a3dfb345ac876e1140ee6a2d6a27885f8bf6dcb506a5f346024e16a9","lib/booking-db/test-abort.js":"91724d9dcd6c3c514eef70b5d3f4a4458b7298106b0286a797506bd99b48f852"};
+
+/** LABELLED short-write wrapper over the REAL node fs: journal / head writes are capped at `cap` bytes per call (a valid POSITIVE short
+ *  count, written for real); `then(tag, n)` may turn the n-th call for a tag into "zero" (returns 0, writes nothing) or "reject". */
+function shortFs(cap, then = () => null) {
+  const real = createNodeFsAdapter(); const calls = []; const log = []; const n = {};
+  const tagOf = (p) => (p.endsWith(".lock") ? "lock" : p.includes("e7-head-v2") ? "head" : p.includes("e7-journal-v2") ? "journal" : "other");
+  const wrap = (t, h) => Object.freeze({
+    write: async (buf, off, len) => {
+      if (t !== "journal" && t !== "head") return h.write(buf, off, len);
+      n[t] = (n[t] ?? 0) + 1; const f = then(t, n[t]);
+      if (f === "zero") { calls.push({ t, off, len, wrote: 0 }); log.push(`${t}:write0`); return { bytesWritten: 0 }; }
+      if (f === "reject") { calls.push({ t, off, len, wrote: "reject" }); log.push(`${t}:writeX`); throw Object.assign(new Error("EIO"), { code: "EIO" }); }
+      const r = await h.write(buf, off, Math.min(len, cap)); calls.push({ t, off, len, wrote: r.bytesWritten }); log.push(`${t}:write`); return r;
+    },
+    sync: async () => { log.push(`${t}:sync`); return h.sync(); }, read: (...a) => h.read(...a), stat: () => h.stat(), close: () => h.close() });
+  return { calls, log, adapter: Object.freeze({ platform: real.platform, uid: real.uid, realpath: real.realpath, lstat: real.lstat, unlink: real.unlink, openDir: real.openDir,
+    open: async (p, kind) => wrap(tagOf(p), await real.open(p, kind)) }) };
+}
+
+test("U12 (root review of 01a9425) a valid POSITIVE short write is normal progress: the remaining bytes continue at the advanced offset (no duplicate prefix), bounded; both fsyncs still precede the ACK; exact bytes, valid chain + head on recovery", async () => {
+  const d = dirs(); const f = shortFs(7);
+  const op = await openFileJournalV2({ journalDir: d.j, headDir: d.h, manifest: M, fsAdapter: f.adapter });
+  assert.equal(op.ok, true, JSON.stringify(op));
+  const recs = chain(READY8(), ID); const acks = [];
+  for (const r of recs) {
+    const mark = f.log.length; const c0 = f.calls.length;
+    acks.push(await op.journal.append(r)); f.log.push("ACK");
+    const jl = Buffer.byteLength(`${canon(r)}\n`); const hl = Buffer.byteLength(`${canon({ v: 2, runId: M.runId, manifestHash: ID.manifestHash, seq: r.seq, hash: H2(r) })}\n`);
+    for (const [t, total] of [["journal", jl], ["head", hl]]) {
+      const cs = f.calls.slice(c0).filter((c) => c.t === t);
+      assert.equal(cs.length, Math.ceil(total / 7), `${t} seq ${r.seq}: bounded continuation (one call per 7 bytes)`);
+      cs.forEach((c, i) => { assert.equal(c.off, 7 * i, `${t} offset progression`); assert.equal(c.len, total - 7 * i, `${t} remaining length`); assert.equal(c.wrote, Math.min(7, total - 7 * i)); });
+    }
+    const seg = f.log.slice(mark).filter((x) => x !== "journal:write" && x !== "head:write");
+    assert.deepEqual(seg, ["journal:sync", "head:sync", "ACK"], `seq ${r.seq}: journal fsync then head fsync then ACK`);
+    const order = f.log.slice(mark); assert.ok(order.lastIndexOf("journal:write") < order.indexOf("journal:sync") && order.indexOf("journal:sync") < order.indexOf("head:write"));
+  }
+  assert.deepEqual(acks.map((a) => ({ ...a })), recs.map(ACK));
+  const p = paths(d);
+  assert.equal(readFileSync(p.j, "utf8"), recs.map((r) => `${canon(r)}\n`).join(""), "exact journal bytes — no duplicated prefix");
+  assert.equal(readFileSync(p.h, "utf8"), recs.map((r) => `${canon({ v: 2, runId: M.runId, manifestHash: ID.manifestHash, seq: r.seq, hash: H2(r) })}\n`).join(""), "exact head bytes");
+  assert.equal((await op.journal.read()).records.length, recs.length);
+  await op.close();
+  const rec = await readJournalForRecoveryV2({ journalDir: d.j, headDir: d.h, manifest: M, trustedHead: ACK(recs.at(-1)) });
+  assert.deepEqual([rec.relation, rec.suppliedHead, rec.records, rec.headRecords, rec.journalTail, rec.headTail], ["AT_ESCROW_HEAD", "MATCH_TIP", 8, 8, "complete", "complete"]);
+  assert.deepEqual({ ...rec.permission }, { ...NO_PERMISSION });
+  assert.equal((await openFileJournalV2({ journalDir: d.j, headDir: d.h, manifest: M })).code, "JOURNAL_EXISTS");
+});
+
+test("U13 (root review of 01a9425) positive short progress THEN zero / rejection: no ACK, poisoned, the persisted prefix is preserved (never repaired / truncated), later append and read refused — journal AND head", async () => {
+  for (const [t, how] of [["journal", "zero"], ["journal", "reject"], ["head", "zero"], ["head", "reject"]]) {
+    const label = `${t}:${how}`;
+    const d = dirs(); const recs = chain(READY7(), ID);
+    const firstLen = (x) => Buffer.byteLength(t === "journal" ? `${canon(x)}\n` : `${canon({ v: 2, runId: M.runId, manifestHash: ID.manifestHash, seq: x.seq, hash: H2(x) })}\n`);
+    const callsFor1 = Math.ceil(firstLen(recs[0]) / 7);
+    const failAt = callsFor1 + 3;                                         // the 2nd record: 2 positive 7-byte calls, then the failure
+    const f = shortFs(7, (tt, k) => (tt === t && k === failAt ? how : null));
+    const op = await openFileJournalV2({ journalDir: d.j, headDir: d.h, manifest: M, fsAdapter: f.adapter });
+    assert.deepEqual({ ...(await op.journal.append(recs[0])) }, ACK(recs[0]), label);
+    // code labels (runtime byte-exact): a ZERO head write → HEAD_IO_FAILED; a REJECTED write (journal or head) reaches the generic catch →
+    // JOURNAL_IO_FAILED. Behaviour is identical: no ACK, poisoned.
+    await assert.rejects(op.journal.append(recs[1]), (e) => e.code === (t === "head" && how === "zero" ? "HEAD_IO_FAILED" : "JOURNAL_IO_FAILED"), label);
+    // fsyncs observed: open (1 each) + record 1 (1 each) + record 2's journal fsync only when its journal line completed
+    assert.deepEqual([f.log.filter((x) => x === "journal:sync").length, f.log.filter((x) => x === "head:sync").length], t === "journal" ? [2, 2] : [3, 2], `${label}: no fsync after the failed write`);
+    assert.equal(op.status().state, "failed", `${label}: poisoned`);
+    await assert.rejects(op.journal.append(recs[1]), (e) => e.code === "JOURNAL_FAILED", label);
+    await assert.rejects(op.journal.read(), (e) => e.code === "JOURNAL_FAILED", label);
+    const p = paths(d);
+    const l1j = `${canon(recs[0])}\n`; const l2j = `${canon(recs[1])}\n`;
+    const h1 = `${canon({ v: 2, runId: M.runId, manifestHash: ID.manifestHash, seq: 1, hash: H2(recs[0]) })}\n`;
+    const h2 = `${canon({ v: 2, runId: M.runId, manifestHash: ID.manifestHash, seq: 2, hash: H2(recs[1]) })}\n`;
+    if (t === "journal") {
+      assert.equal(readFileSync(p.j, "utf8"), l1j + l2j.slice(0, 14), `${label}: exactly the persisted 14-byte prefix, never truncated or repaired`);
+      assert.equal(readFileSync(p.h, "utf8"), h1, `${label}: the head never advanced`);
+    } else {
+      assert.equal(readFileSync(p.j, "utf8"), l1j + l2j, `${label}: the journal line was complete + fsynced`);
+      assert.equal(readFileSync(p.h, "utf8"), h1 + h2.slice(0, 14), `${label}: exactly the persisted head prefix`);
+    }
+    await op.close();
+    const rec = await readJournalForRecoveryV2({ journalDir: d.j, headDir: d.h, manifest: M });
+    assert.deepEqual([rec.relation, rec.records], t === "journal" ? ["AT_ESCROW_HEAD", 1] : ["JOURNAL_AHEAD_1", 2], `${label}: ${JSON.stringify(rec)}`);
+    assert.ok(rec.unresolved.includes(t === "journal" ? "TORN_JOURNAL_TAIL" : "TORN_HEAD_TAIL"), label);
+    assert.deepEqual({ ...rec.permission }, { ...NO_PERMISSION });
+    assert.equal(readFileSync(p.j, "utf8").length > 0, true);
+  }
+});

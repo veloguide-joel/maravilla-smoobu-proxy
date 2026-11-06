@@ -65,7 +65,19 @@ The manifest is bound once with `bindManifestV2`, and that frozen copy is used t
 3. Write the head line, then fsync the head file.
 4. Return the ACK `{ seq, hash }`.
 
-**Any failure** (a short or zero write, a write or sync rejection, an identity change): no ACK, and the handle is POISONED (`JOURNAL_FAILED` for every later append or read). Nothing is truncated, repaired or retried.
+**Write progress (root review of 01a9425).** One file write is a bounded loop over the accepted `bytesWritten` contract.
+- A valid POSITIVE short count (1 ≤ k ≤ remaining) is normal progress. The remaining bytes continue at the advanced offset, with no duplicate prefix. The loop is bounded by the line length in calls.
+- This is completion of ONE local file write, never a resend of a provider operation.
+- A zero, negative, non-integer or out-of-range count, or a rejected write, ends the write. Any bytes already written stay on disk as a torn prefix, never truncated or repaired.
+
+**Any failure** (a zero, invalid or out-of-range write count; a write or sync rejection; an identity change): no ACK, and the handle is POISONED (`JOURNAL_FAILED` for every later append or read). Nothing is truncated, repaired or retried.
+
+**Code labels.**
+- A zero or invalid count on the head write gives `HEAD_IO_FAILED`.
+- A rejected write on either file, and any journal-write failure, give `JOURNAL_IO_FAILED`.
+- Behaviour is identical in every case.
+
+Covered by U12 (positive short progress for both files) and U13 (positive progress, then zero or rejection, for both files).
 
 **What is durable after an ACK is the bytes and names, NOT the fact that the ACK was observed.**
 - No persisted bit records ACK delivery, and none is invented.
