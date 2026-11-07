@@ -38,7 +38,11 @@ export const HISTORICAL_EXCLUSIONS = Object.freeze({
     Object.freeze({ label: "run2", intentId: "48b59c0d-1c8c-4f32-ad91-08dbab1e8e3c", paymentIntentId: null, reservationId: null }),
     Object.freeze({ label: "run3", intentId: "cc53bc11-565d-4e9b-8be1-95f3febc8a39", paymentIntentId: "pi_3UYqhH2B9LTneQgw1Q0IoYtz", reservationId: null })
   ]),
-  otherPaymentIntentIds: Object.freeze(["pi_3UYUIm2B9LTneQgw0mGFQdwG"])
+  otherPaymentIntentIds: Object.freeze(["pi_3UYUIm2B9LTneQgw0mGFQdwG"]),
+  /** NOT runs: pre-existing intents whose actor is NOT established (root live evidence 2026-11-07); identifiers explicit, never inferred */
+  unattributedIntents: Object.freeze([
+    Object.freeze({ label: "priced-only-2026-11-06T18:16:48Z", intentId: "9f42214b-99f4-413a-9f43-d340faeedfd3", paymentIntentId: null, reservationId: null })
+  ])
 });
 export const ALLOWED_OPS = Object.freeze(["hostaway.lookup_by_ref", "hostaway.get_reservation_created", "hostaway.get_listing", "hostaway.get_calendar",
   "hostaway.price_details", "hostaway.create_reservation", "hostaway.cancel_reservation_created", "stripe.accounts.retrieve",
@@ -177,7 +181,8 @@ export function validateRunPlanV1(planInput, opts) {
     if (typeof x.intentId !== "string" || !UUID_RE.test(x.intentId) || typeof x.paymentIntentId !== "string" || !PI_RE.test(x.paymentIntentId)
       || typeof x.expectedRef !== "string" || !REF_RE.test(x.expectedRef)) return R("BINDING_ID_INVALID");
     const ex = HISTORICAL_EXCLUSIONS;
-    if (ex.runs.some((r) => r.intentId === x.intentId) || ex.runs.some((r) => r.paymentIntentId !== null && r.paymentIntentId === x.paymentIntentId)
+    const listed = [...ex.runs, ...ex.unattributedIntents];
+    if (listed.some((r) => r.intentId === x.intentId) || listed.some((r) => r.paymentIntentId !== null && r.paymentIntentId === x.paymentIntentId)
       || ex.otherPaymentIntentIds.includes(x.paymentIntentId)) return R("BINDING_EXCLUDED");
     if (!isRealDate(x.stay.arrival) || !isRealDate(x.stay.departure)) return R("BINDING_DATES_INVALID");
     const nights = days(x.stay.arrival, x.stay.departure);
