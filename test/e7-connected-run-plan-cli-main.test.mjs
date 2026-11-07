@@ -199,3 +199,25 @@ test("C5 hostile proc / argv inputs refuse code-only (no throw, no echo); boot i
   // importing the module does nothing (this test process imported it at the top; no output / exit happened)
   assert.equal(typeof CLI.main, "function");
 });
+
+const PROC_TRACER = join(ROOT, "test/fixtures/e7-g3a-process-tracer.mjs");
+/** the REAL native boot (import.meta.main) under a process-property tracer: names of INSPECT-only process properties read BY THE CLI */
+function procTrace(args, cliPath = CLI_PATH) {
+  const r = spawnSync(process.execPath, ["--import", pathToFileURL(PROC_TRACER).href, cliPath, ...args], { env: CLEAN_ENV, encoding: "utf8", timeout: 60_000 });
+  const m = r.stderr.match(/^E7PROC (.*)$/m);
+  const lines = r.stdout.split("\n").filter(Boolean);
+  return { status: r.status, out: lines.length === 1 ? JSON.parse(lines[0]) : null, seen: m ? JSON.parse(m[1]) : null, stderr: r.stderr };
+}
+test("C6 (root review of 079e8da) the REAL native boot: execute / unknown / malformed inspect read NONE of process.platform / versions / execArgv / env / getuid; the INSPECT control reads them only AFTER mode selection", () => {
+  const d = tmp("g3a-boot-"); const f = planFile(d, "plan.json", canonicalText(planFor(Date.now())));
+  for (const [args, outcome, status] of [[["execute"], "EXECUTE_NOT_IMPLEMENTED", 5], [["execute", "--plan", f], "EXECUTE_NOT_IMPLEMENTED", 5], [["unknown"], "USAGE", 2],
+    [[], "USAGE", 2], [["inspect", "--plan", "rel/plan.json"], "USAGE", 2], [["inspect", "--plan", f, "--extra"], "USAGE", 2]]) {
+    const r = procTrace(args);
+    assert.deepEqual([r.status, r.out && r.out.outcome], [status, outcome], `${JSON.stringify(args)}: ${r.stderr}`);
+    assert.deepEqual(r.seen, [], `${JSON.stringify(args)}: no INSPECT-only process property read by the CLI`);
+  }
+  // control: the instrumentation DOES see the CLI's reads on INSPECT (the preload adds an exec flag → the accepted env evaluation refuses, after the reads)
+  const c = procTrace(["inspect", "--plan", f]);
+  assert.equal(c.status, 4); assert.equal(c.out.result.code, "ENV_REFUSED");
+  assert.deepEqual([...new Set(c.seen)].sort(), ["env", "execArgv", "getuid", "platform", "versions"], `inspect control: ${JSON.stringify(c.seen)}`);
+});

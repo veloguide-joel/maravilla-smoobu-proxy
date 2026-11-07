@@ -29,6 +29,15 @@ G3b (execute wiring) is NOT part of this slice.
 
 **`execute` / unknown modes refuse FIRST.** They make no `env` read, no `getuid`, no platform probe, no adapter, no import, no file / dir / credential / network / pool / transport / journal access. Tests count every `proc` member touch and hook call, and run a child process under an fs tracer.
 
+**Native boot (root review of 079e8da).** The candidate's `import.meta.main` call built `main`'s `proc` argument EAGERLY: it read `process.platform`, `versions`, `execArgv`, `env` and `getuid` before argv was inspected. Root reproduced this in a real child boot.
+
+The fix: `nativeProc()` now gives plain fields only for what a refusal needs (`argv`, `stdout`, `exit`, `setExitCode`). Every INSPECT-only capability — `platform`, `versions`, `execArgv`, `env`, `getuid`, `fsConstants` — is a LAZY getter, read only after INSPECT is selected. Outputs, exit codes and the import allowlist are unchanged.
+
+Regression C6 runs the REAL native boot under a TEST-ONLY process-property tracer. The tracer records property NAMES only, and only when the immediate caller frame is the CLI. The checks:
+- execute / unknown / malformed inspect read none of those properties;
+- an INSPECT control reads all five, after mode selection;
+- failing-before: on 079e8da, C6 shows all five read by `execute`.
+
 **INSPECT steps:**
 1. The platform / constants check uses the accepted `nativeSupported`; failure → `BOOT_UNSUPPORTED` (exit 3).
 2. The accepted adapters are created with a no-op terminal gate.
@@ -70,6 +79,9 @@ G3b (execute wiring) is NOT part of this slice.
 - **Results.**
   - Failures are PUBLIC and code-only: `{ ok:false, code, slot: "app"|"report"|null, closeState }`.
   - Success is PRIVATE: `{ ok:true, logins: { app, report } }`. Each login has an enumerable `role` and a NON-ENUMERABLE `connectionString`.
+  - The PRIVATE success INTENTIONALLY carries the connection strings, for the eventual consumer.
+  - Non-enumerability only keeps them out of default `JSON.stringify` / `util.inspect` output. It is NOT secrecy against deliberate field access or `inspect(…, { showHidden: true })`.
+  - Public failures and all CLI / evidence output stay code-only.
   - No URL, user, password, host or hash ever appears in a result, a code or a thrown error.
 - **Imports:** `node:util` only. No `pg`, no fs, no process.
 

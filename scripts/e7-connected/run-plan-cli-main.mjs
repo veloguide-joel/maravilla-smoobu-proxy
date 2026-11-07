@@ -92,9 +92,26 @@ async function run(proc, hooks) {
   }
 }
 
-// ---- the ONLY top-level effect -----------------------------------------------------------------------------------------------------
-if (import.meta.main === true) {
-  main({ argv: process.argv, platform: process.platform, versions: process.versions, execArgv: process.execArgv, env: process.env,
-    getuid: typeof process.getuid === "function" ? () => process.getuid() : undefined, fsConstants: FS_CONSTANTS, stdout: process.stdout,
-    exit: (c) => process.exit(c), setExitCode: (c) => { process.exitCode = c; }, now: () => Date.now() }, defaultHooks());
+/**
+ * the native `proc` for main(): ONLY argv / stdout / exit / setExitCode are plain fields (what a refusal needs); every INSPECT-only
+ * capability (platform, versions, execArgv, env, getuid, fsConstants, now) is a LAZY getter, so `execute` / unknown / malformed modes —
+ * decided from argv first — never touch those process properties (root review of 079e8da).
+ */
+export function nativeProc() {
+  return Object.freeze({
+    argv: process.argv,
+    get platform() { return process.platform; },
+    get versions() { return process.versions; },
+    get execArgv() { return process.execArgv; },
+    get env() { return process.env; },
+    get getuid() { return typeof process.getuid === "function" ? () => process.getuid() : undefined; },
+    get fsConstants() { return FS_CONSTANTS; },
+    stdout: process.stdout,
+    exit: (c) => process.exit(c),
+    setExitCode: (c) => { process.exitCode = c; },
+    now: () => Date.now()
+  });
 }
+
+// ---- the ONLY top-level effect -----------------------------------------------------------------------------------------------------
+if (import.meta.main === true) main(nativeProc(), defaultHooks());
