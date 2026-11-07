@@ -124,29 +124,34 @@ test("0018 failing-before control (OLD function via down→17): the unqualified 
   }
 });
 
-test("0018 caller regression: an is_privileged()-gated guard still REFUSES an app write (insufficient_privilege) even with a shadow, and does NOT refuse the owner on the privilege gate — rolled back, nothing persisted", async () => {
-  // app: direct INSERT into a guarded table => resolutions_guard calls the FIXED is_privileged() => false => refuse (42501)
-  const app = new pg.Client({ connectionString: db.appUrl() }); await app.connect();
+test("0018 guard-evaluation control (DISPOSABLE scaffold isolates the guard from table ACL): a BEFORE INSERT trigger running the EXACT booking.resolutions_guard() refuses an app insert with 42501 FROM THE GUARD (is_privileged()=false) and admits the owner — app is explicitly granted INSERT on the scaffold so the refusal cannot be a table-ACL denial; no protected booking table is written; scaffold dropped", async () => {
+  // NOTE (root 3ab11ddf B): app has NO INSERT on booking.reconciliation_resolutions, so inserting THERE yields 42501 at the table-ACL
+  // layer BEFORE the trigger — which would NOT demonstrate guard evaluation. This scaffold table grants app INSERT, so the only thing
+  // that can still refuse is the guard's is_privileged() call. It is DISPOSABLE test scaffolding, not a claim about production ACLs.
+  await db.owner.query("CREATE TABLE public._e7_guard_probe (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), consumed_at timestamptz, consumed_version integer)");
+  await db.owner.query("CREATE TRIGGER _e7_guard_probe_guard BEFORE INSERT OR UPDATE OR DELETE ON public._e7_guard_probe FOR EACH ROW EXECUTE FUNCTION booking.resolutions_guard()");
+  await db.owner.query("GRANT INSERT ON public._e7_guard_probe TO mv_booking_app");   // app CAN insert at the table-ACL layer
   try {
-    await app.query("CREATE TEMP TABLE pg_namespace (nspname name, nspowner oid)").catch(() => {});
-    await app.query("INSERT INTO pg_namespace (nspname, nspowner) SELECT 'booking', r.oid FROM pg_catalog.pg_roles r WHERE r.rolname = current_user").catch(() => {});
-    await app.query("BEGIN");
-    let code = null;
-    try { await app.query("INSERT INTO booking.reconciliation_resolutions (id) VALUES (gen_random_uuid())"); }
-    catch (e) { code = e.code; }
-    await app.query("ROLLBACK");
-    assert.equal(code, "42501", "app write refused by the guard's is_privileged() gate (insufficient_privilege), shadow notwithstanding");
-  } finally { await app.end(); }
-  // owner: the same insert passes the privilege gate (is_privileged() true); it may then fail a NOT NULL / CHECK, but NOT with 42501
-  const owner = new pg.Client({ connectionString: db.adminUrl }); await owner.connect();
-  try {
-    await owner.query("BEGIN");
-    let code = null;
-    try { await owner.query("INSERT INTO booking.reconciliation_resolutions (id) VALUES (gen_random_uuid())"); }
-    catch (e) { code = e.code; }
-    await owner.query("ROLLBACK");
-    assert.notEqual(code, "42501", "owner passes the is_privileged() gate (a later NOT NULL / CHECK is fine; not a privilege refusal)");
-  } finally { await owner.end(); }
+    const app = new pg.Client({ connectionString: db.appUrl() }); await app.connect();
+    try {
+      await app.query("BEGIN");
+      let code = null, msg = null;
+      try { await app.query("INSERT INTO public._e7_guard_probe DEFAULT VALUES"); } catch (e) { code = e.code; msg = e.message; }
+      await app.query("ROLLBACK");
+      assert.equal(code, "42501", "app insert refused BY THE GUARD (app holds INSERT on the scaffold, so 42501 is is_privileged()=false, not a table ACL)");
+      assert.match(msg || "", /owner functions/, "the refusal carries resolutions_guard's own message — the guard ran and evaluated is_privileged()");
+    } finally { await app.end(); }
+    const owner = new pg.Client({ connectionString: db.adminUrl }); await owner.connect();
+    try {
+      await owner.query("BEGIN");
+      await owner.query("INSERT INTO public._e7_guard_probe DEFAULT VALUES");          // guard runs as owner => is_privileged() true => RETURN NEW
+      const n = (await owner.query("SELECT count(*)::int AS n FROM public._e7_guard_probe")).rows[0].n;
+      await owner.query("ROLLBACK");
+      assert.equal(n, 1, "owner insert admitted by the guard (is_privileged()=true); rolled back");
+    } finally { await owner.end(); }
+  } finally {
+    await db.owner.query("DROP TABLE IF EXISTS public._e7_guard_probe");               // scaffold removed; nothing in booking.* touched
+  }
 });
 
 test("0018 caller-context control (current_user-based, not just owner-login): is_privileged() is TRUE inside a schema-owner SECURITY DEFINER caller invoked BY THE APP ROLE, and FALSE inside an INVOKER caller invoked by the app role — the exact effective-user semantics the guards rely on", async () => {
