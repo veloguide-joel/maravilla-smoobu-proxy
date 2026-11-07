@@ -472,7 +472,8 @@ async function launch(o = {}) {
   const t0 = performance.now();
   S.clock = () => Math.floor(Math.min(bk.base + 10 * SEC + (performance.now() - t0) * 10, Date.now() - 5 * SEC)) + (S.jump ?? 0);
   S.stdin = new PassThrough(); const stderr = new PassThrough(); stderr.setEncoding("utf8");
-  const answer = o.answer ?? ((S0, p) => `ATTEST ${p.runId} ${p.checkpoint} synthetic/${p.checkpoint.toLowerCase()}`);
+  // CHANGED (root review of 128ac08, H1): the owner reply carries the prompt's FRESH token — `ATTEST <runId> <checkpoint> <token> <evidenceRef>`
+  const answer = o.answer ?? ((S0, p) => `ATTEST ${p.runId} ${p.checkpoint} ${p.token} synthetic/${p.checkpoint.toLowerCase()}`);
   stderr.on("data", (c) => { S.err.push(c); for (const l of String(c).split("\n")) { const m = /^E7ATTEST (.*)$/.exec(l); if (!m) continue; const p = JSON.parse(m[1]); S.prompts.push(p);
     Promise.resolve(o.onPrompt ? o.onPrompt(S, p) : null).then((x) => { if (x === "NO_ANSWER") return; const a = answer(S, p); if (a !== null) for (const line of [].concat(a)) S.stdin.write(`${line}\n`); }); } });
   S.flags = o.flags ?? ["execute", "--package", S.packagePath, "--plan", S.planPath, "--expect-package-hash", pk.input.expected.packageHash,
@@ -576,10 +577,11 @@ test("E3 stop / lock loss at the actual boundaries: first SIGINT during the base
 });
 
 test("E4 attestation binds the exact run / checkpoint: other-run / other-checkpoint / malformed lines are ignored, DECLINE → OWNER_DECLINED; unknown host-cancel / void send → exactly ONE send, never resent", async () => {
-  { const S = await launch({ answer: (S0, p) => [`ATTEST synthetic-other-run ${p.checkpoint} synthetic/x`, `ATTEST ${p.runId} SOME_OTHER synthetic/x`, `ATTEST ${p.runId} ${p.checkpoint} bad ref`,
-      `ATTEST ${p.runId} ${p.checkpoint} synthetic/${p.checkpoint.toLowerCase()}`] });
+  { const S = await launch({ answer: (S0, p) => [`ATTEST synthetic-other-run ${p.checkpoint} ${p.token} synthetic/x`, `ATTEST ${p.runId} SOME_OTHER ${p.token} synthetic/x`,
+      `ATTEST ${p.runId} ${p.checkpoint} ${p.token} bad ref`, `ATTEST ${p.runId} ${p.checkpoint} synthetic/no-token`, `ATTEST ${p.runId} ${p.checkpoint} ${"0".repeat(32)} synthetic/wrong-token`,
+      `ATTEST ${p.runId} ${p.checkpoint} ${p.token} synthetic/${p.checkpoint.toLowerCase()}`] });
     const line = await S.run(); assert.equal(line.outcome, "EXECUTE_ENDED", S.out.join("")); }
-  { const S = await launch({ answer: (S0, p) => (p.checkpoint === "CALENDAR_BLOCKED" ? `DECLINE ${p.runId} ${p.checkpoint}` : `ATTEST ${p.runId} ${p.checkpoint} synthetic/ok`) });
+  { const S = await launch({ answer: (S0, p) => (p.checkpoint === "CALENDAR_BLOCKED" ? `DECLINE ${p.runId} ${p.checkpoint} ${p.token}` : `ATTEST ${p.runId} ${p.checkpoint} ${p.token} synthetic/ok`) });
     const line = await S.run();
     assert.deepEqual([line.outcome, line.result.run.stopCode, line.result.run.bridgeCalls], ["EXECUTE_STOPPED", "OWNER_DECLINED", 0], S.out.join(""));
     assert.deepEqual(writesAt(S), [1, 0, 0, 0, 0], "one create; declined before the abort → nothing else"); }
@@ -618,4 +620,30 @@ test("E5 refusals BEFORE sensitive access (in-process native path): wrong native
     const line = await S.run();
     assert.deepEqual([line.outcome, line.result.refused], ["EXECUTE_REFUSED", { stage: "journal", code: "JOURNAL_EXISTS" }], "creation-only: never reopen / resume");
     assert.deepEqual(line.result.teardown.pools, { app: "ended", report: "ended" }); assert.deepEqual(writesAt(S), [0, 0, 0, 0, 0]); }
+});
+
+test("E6 (root review of 128ac08, H1) after the baseline, PRE-QUEUED future inputs (same chunk as the baseline reply, old-form and old-token) cannot advance BLOCKED / REOPENED: no abort / host-cancel / void until a FRESH reply to each prompt; then ENDED_RELEASED with exactly one of each send", async () => {
+  const seen = {};
+  const S = await launch({ answer: (S0, p) => {
+    if (p.checkpoint === "CALENDAR_BASELINE") {
+      const fut = ["CALENDAR_BLOCKED", "CALENDAR_REOPENED"].flatMap((cp) => [`ATTEST ${p.runId} ${cp} synthetic/prequeued`, `ATTEST ${p.runId} ${cp} ${p.token} synthetic/prequeued`]);
+      return [[`ATTEST ${p.runId} ${p.checkpoint} ${p.token} synthetic/baseline`, ...fut].join("\n")];   // ONE chunk: the reply + future lines
+    }
+    return null;                                                                                          // BLOCKED / REOPENED answered below, late
+  }, onPrompt: async (S0, p) => {
+    if (p.checkpoint === "CALENDAR_BASELINE") return null;
+    await sleep(1500);                                                                                    // nothing may move while unanswered
+    seen[p.checkpoint] = { writes: writesAt(S0), state: await state(S0.bk.id), aborts: Number((await one("SELECT count(*)::int AS n FROM booking.intent_applied_events WHERE intent_id = $1 AND event_type = 'TEST_ABORT_REQUESTED'", [S0.bk.id])).n) };
+    S0.stdin.write(`ATTEST ${p.runId} ${p.checkpoint} ${p.token} synthetic/fresh-${p.checkpoint.toLowerCase()}\n`);
+    return "NO_ANSWER";
+  } });
+  const line = await S.run();
+  assert.equal(line.outcome, "EXECUTE_ENDED", S.out.join(""));
+  assert.deepEqual(seen.CALENDAR_BLOCKED, { writes: [1, 0, 0, 0, 0], state: "reservation_confirmed", aborts: 0 }, "BLOCKED unanswered: no abort, no cleanup send");
+  assert.deepEqual(seen.CALENDAR_REOPENED.writes, [1, 1, 1, 0, 0], "REOPENED unanswered: cleanup done, run not ended");
+  assert.deepEqual(writesAt(S), [1, 1, 1, 0, 0]); assert.deepEqual(line.result.run.release, { state: "cancelled", reason: "TEST_ABORT_REQUESTED", legs: "true/true", claimsHeld: 0 });
+  assert.equal(await claimsHeld(S.bk.id), 0);
+  // the journal records the FRESH evidence refs, never the pre-queued ones
+  const j = readFileSync(join(S.jd, `e7-journal-r1-${S.pk.plan.runId}.jsonl`), "utf8");
+  assert.ok(!j.includes("prequeued") && j.includes("synthetic/fresh-calendar_blocked") && j.includes("synthetic/fresh-calendar_reopened") && j.includes("synthetic/baseline"));
 });

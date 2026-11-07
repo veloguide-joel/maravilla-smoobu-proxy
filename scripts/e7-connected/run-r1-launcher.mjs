@@ -7,7 +7,7 @@
 //     journal close → pool end → ONE sanitized result.
 //   * Nothing secret is placed in any result / error / output; owner values are passed only as capabilities (credential closures, pool configs).
 //   * No retry, fallback, adoption, resume or repair. Accepted core / bridge / workers / journals / transports / pool are used unchanged.
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { runReservationAbortR1 } from "./run-core-abort-v2.mjs";
 import { bindRunPackageR1Journal, bindingKindV2 } from "./run-journal-memory-v2.mjs";
 import { openFileJournalR1 } from "./run-journal-file-v2.mjs";
@@ -134,36 +134,57 @@ async function endAll(pools, proc) {
 }
 
 /**
- * createStdinAttest({ stdin, stderr, signal }) → attest(checkpoint, request, { signal }) for the accepted core.
- *   Prompt (stderr, no secret): `E7ATTEST {"runId","checkpoint","intentId","manifestHash","connection"}`.
- *   The OWNER answers one line on stdin: `ATTEST <runId> <checkpoint> <evidenceRef>` or `DECLINE <runId> <checkpoint>`; lines for any other
- *   run / checkpoint are ignored (counted). Nothing is ever fabricated: no answer → the core's own ATTEST_MS bound / the run signal stops it.
+ * createStdinAttest({ stdin, stderr }) → { attest, stats } — the native owner-attestation adapter for the accepted core (root review of 128ac08, H1).
+ *   * ONE active prompt at a time, each with a FRESH unpredictable token. The prompt (stderr, no secret) is
+ *     `E7ATTEST {"runId","checkpoint","intentId","manifestHash","connection","token","reply"}` and states the exact reply forms:
+ *       `ATTEST <runId> <checkpoint> <token> <evidenceRef>`  |  `DECLINE <runId> <checkpoint> <token>`
+ *   * An answer is accepted ONLY while its prompt is active and only with that prompt's run / checkpoint / token. Input arriving while NO prompt
+ *     is active (before the first, between checkpoints, after the match in the same chunk) is DROPPED, never queued; a partial line buffered
+ *     before a prompt is discarded when the prompt is issued; lines and the partial buffer are bounded. Old tokens never match a new prompt.
+ *   * The token prevents stale / pre-queued adoption; it does NOT authenticate the truth of the owner's evidence. Nothing is fabricated: no
+ *     answer → the core's own ATTEST_MS bound / the run signal; an abort rejects (listener attached BEFORE the prompt is written).
  */
-export function createStdinAttest({ stdin, stderr }) {
-  let buf = ""; const waiters = new Set(); const lines = [];
-  stdin.setEncoding && stdin.setEncoding("utf8");
-  stdin.on("data", (c) => { buf += String(c); let i; while ((i = buf.indexOf("\n")) >= 0) { const l = buf.slice(0, i).replace(/\r$/, ""); buf = buf.slice(i + 1); lines.push(l); for (const w of [...waiters]) w(); } });
-  const stats = { ignored: 0 };
+export const MAX_ATTEST_LINE = 512;
+export function createStdinAttest({ stdin, stderr, token: tokenFn = () => randomBytes(16).toString("hex") }) {
+  let partial = ""; let overflow = false; let active = null;
+  const stats = { dropped: 0, mismatched: 0 };
+  const bump = (k) => { if (stats[k] < 1_000_000) stats[k] += 1; };
+  const onLine = (l) => {
+    if (active === null) { bump("dropped"); return; }
+    const p = l.split(" "); const a = active;
+    if (p[0] === "ATTEST" && p.length === 5 && p[1] === a.runId && p[2] === a.checkpoint && p[3] === a.token && EVIDENCE_REF_RE.test(p[4])) { a.finish({ ok: true, evidenceRef: p[4] }); return; }
+    if (p[0] === "DECLINE" && p.length === 4 && p[1] === a.runId && p[2] === a.checkpoint && p[3] === a.token) { a.finish({ ok: false }); return; }
+    bump("mismatched");
+  };
+  if (typeof stdin.setEncoding === "function") stdin.setEncoding("utf8");
+  stdin.on("data", (c) => {
+    let s = String(c);
+    while (s.length) {
+      const i = s.indexOf("\n");
+      if (i < 0) { if (!overflow) { partial += s; if (partial.length > MAX_ATTEST_LINE) { partial = ""; overflow = true; } } return; }
+      const piece = s.slice(0, i); s = s.slice(i + 1);
+      if (overflow) { overflow = false; partial = ""; bump("dropped"); continue; }          // the over-long line is dropped whole
+      const line = (partial + piece).replace(/\r$/, ""); partial = "";
+      if (line.length > MAX_ATTEST_LINE) { bump("dropped"); continue; }
+      onLine(line);
+    }
+  });
   const attest = (checkpoint, request, opts) => new Promise((resolve, reject) => {
     const sig = opts && opts.signal;
-    // the abort listener is attached BEFORE the prompt is written (a stop arriving during / right after the prompt is never missed —
-    // FIRST TAP diagnosis: a synchronous stderr consumer could abort inside the write, before a later listener existed)
+    if (active !== null) { reject(new Error("attest-busy")); return; }                 // never two waiters
+    if (sig && sig.aborted) { reject(new Error("aborted")); return; }
     let finished = false;
-    const done = () => { finished = true; waiters.delete(check); if (sig) sig.removeEventListener("abort", onAbort); };
-    const onAbort = () => { if (finished) return; done(); reject(new Error("aborted")); };
-    if (sig) { if (sig.aborted) { reject(new Error("aborted")); return; } sig.addEventListener("abort", onAbort, { once: true }); }
-    const check = () => {
-      while (!finished && lines.length) {
-        const l = lines.shift(); const p = l.split(" ");
-        if (p[0] === "ATTEST" && p.length === 4 && p[1] === request.runId && p[2] === checkpoint && EVIDENCE_REF_RE.test(p[3])) { done(); resolve({ ok: true, evidenceRef: p[3] }); return; }
-        if (p[0] === "DECLINE" && p.length === 3 && p[1] === request.runId && p[2] === checkpoint) { done(); resolve({ ok: false }); return; }
-        stats.ignored += 1;
-      }
-    };
-    waiters.add(check);
-    try { stderr.write(`E7ATTEST ${JSON.stringify({ runId: request.runId, checkpoint, intentId: request.intentId, manifestHash: request.manifestHash, connection: request.connection })}\n`); } catch { /* prompt best effort */ }
-    if (sig && sig.aborted) { onAbort(); return; }
-    check();
+    const a = { runId: request.runId, checkpoint, token: String(tokenFn()) };
+    const end = () => { finished = true; if (active === a) active = null; if (sig) sig.removeEventListener("abort", onAbort); };
+    a.finish = (v) => { if (finished) return; end(); resolve(v); };
+    const onAbort = () => { if (finished) return; end(); reject(new Error("aborted")); };
+    if (sig) sig.addEventListener("abort", onAbort, { once: true });                 // BEFORE the prompt is written
+    partial = ""; overflow = false;                                                    // a pre-prompt partial line is never part of an answer
+    active = a;
+    const reply = `ATTEST ${a.runId} ${checkpoint} ${a.token} <evidenceRef>  |  DECLINE ${a.runId} ${checkpoint} ${a.token}`;
+    try { stderr.write(`E7ATTEST ${JSON.stringify({ runId: request.runId, checkpoint, intentId: request.intentId, manifestHash: request.manifestHash, connection: request.connection, token: a.token, reply })}\n`); }
+    catch { /* prompt best effort */ }
+    if (sig && sig.aborted) onAbort();
   });
   return { attest, stats };
 }

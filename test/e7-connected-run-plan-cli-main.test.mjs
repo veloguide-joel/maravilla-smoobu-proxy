@@ -195,7 +195,7 @@ test("C5 hostile proc / argv inputs refuse code-only (no throw, no echo); boot i
   const src = readFileSync(CLI_PATH, "utf8");
   assert.deepEqual([...src.matchAll(/^import\s[\s\S]*?from\s+"([^"]+)";/gm)].map((x) => x[1]), ["node:process", "node:fs", "node:url"], "static imports: built-ins only");
   // G3b CHANGED ASSERTION (§5): + the launcher and two built-ins, imported only on the verified execute path
-  assert.deepEqual([...src.matchAll(/import\(\s*"([^"]+)"\s*\)/g)].map((x) => x[1]).sort(), ["./probe-cli-main.mjs", "./run-plan-command.mjs", "./run-plan-v1.mjs", "./run-r1-launcher.mjs", "node:crypto", "node:fs/promises"], "fixed dynamic specifiers only");
+  assert.deepEqual([...src.matchAll(/import\(\s*"([^"]+)"\s*\)/g)].map((x) => x[1]).sort(), ["./probe-cli-main.mjs", "./probe-env-preflight.mjs", "./run-plan-command.mjs", "./run-plan-v1.mjs", "./run-r1-launcher.mjs", "node:crypto", "node:fs/promises"], "fixed dynamic specifiers only");   // + probe-env-preflight (root review of 128ac08, H2: accepted env evaluation before the launcher / pg import)
   const code = src.replace(/\/\/.*$/gm, "");
   // G3b CHANGED ASSERTION (§5): "credential" (a flag name) and "setTimeout" (native timers) may now appear; the CLI still never names the consumer / pg / https / DB reader
   // (the reviewed NATIVE_EXEC_SOURCES / NATIVE_EXTERNALS literal lists NAME closure paths as DATA — they are removed before this scan)

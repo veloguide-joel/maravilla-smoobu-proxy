@@ -123,3 +123,62 @@ The command is `execute` followed by **all 13 flags**, each exactly once, in any
 - The real https exchange, a remote TLS database and real Stripe / Hostaway are NOT exercised.
 - File-journal ACK loss / unknown tail is not re-injected through the launcher. The launcher passes the accepted file journal through unchanged; that behaviour is covered by the accepted M2-E F2 / F3 and G2b G7 suites.
 - A second signal exits 130 without teardown (tail uncertain, nothing repaired), by design.
+
+## 8. Root review of 128ac08 — corrections (H1, H2) and rulings
+
+### H1 — owner attestation adapter (`createStdinAttest`)
+
+**Gap (reproduced).** The candidate QUEUED input lines that arrived while no checkpoint prompt was active, and later adopted them as answers. Root's exact-helper scenario reproduced this; A1, run against 128ac08, resolved all three checkpoints with `synthetic/early` and zero post-prompt replies.
+
+**Fix.**
+- **One active prompt at a time.** Each prompt carries a FRESH 128-bit random token.
+- **Prompt.** `E7ATTEST {runId, checkpoint, intentId, manifestHash, connection, token, reply}`. It shows the exact reply forms: `ATTEST <runId> <checkpoint> <token> <evidenceRef>` and `DECLINE <runId> <checkpoint> <token>`.
+- **Acceptance.** An answer is accepted only while its prompt is active, and only with that prompt's run, checkpoint AND token.
+- **Dropped input.**
+  - Input that arrives while no prompt is active is DROPPED, never queued: before the first prompt, between checkpoints, or after a match in the same chunk.
+  - A partial line buffered before a prompt is discarded when the prompt is issued.
+  - Lines are capped at 512 characters, and an over-long line is dropped whole. The counters are bounded.
+- **Concurrency.** A second concurrent waiter is refused.
+- **Abort.** The abort listener is attached before the prompt is written, and an abort during the write is still caught.
+- **Limit.** The token stops stale or pre-queued adoption. It does NOT authenticate the truth of the owner's evidence.
+- **Unchanged:** the core / journal protocol.
+
+### H2 — `pg@8.18.0` optional-peer branch
+
+**Gap.** `!!process.env.NODE_PG_FORCE_NATIVE` at `pg` import makes `pg` require `./native`, which requires the OPTIONAL peer `pg-native`. That peer lies outside the lock's dependencies / optionalDependencies traversal, and so outside the native digest.
+
+Reproduced (H2a) on the candidate in a real child, with a labelled synthetic peer copy and an unchanged digest:
+- values "1" and "0" load the peer;
+- value "" does not (pg's own truthiness).
+
+**Fix (bootstrap only).**
+- **Presence-only refusal.** If `NODE_PG_FORCE_NATIVE` is present, with any value, the run refuses as `BOOT_ENV_REFUSED` / `PG_NATIVE_SELECTOR_PRESENT`. This happens right after grammar + platform / uid, BEFORE closure verification and before any import that can load `pg` (H2b).
+- **Env evaluation moved earlier.** The ACCEPTED, unchanged env evaluation (`probe-env-preflight`, node:util only, part of the verified closure) now runs in the CLI after closure verification and BEFORE the launcher import. The accepted refused variables and exec flags therefore stop the run before the dependency graph is evaluated. The accepted modules and the env snapshot are unchanged.
+
+**Audit of other resolution inputs for this exact pg load:**
+- `NODE_OPTIONS` / exec flags (`--require`, `--import`, `--conditions`, loaders) are refused by the accepted evaluation, now before the pg import. A flag given to the very `node` command still runs before any user code; that is TRUST.
+- `NODE_PATH` affects only bare specifiers that are not found locally. `pg` and its 14 runtime packages resolve from the verified `node_modules`, and the only unpinned bare `require` (`pg-native`) is now fenced, so `NODE_PATH` is not reachable on this path.
+- `PG*` connection variables (`PGHOST`, `PGSSLMODE`, …) do not override the explicit connection string or the explicit `ssl` object that the accepted pool passes. The accepted pool also fails closed on effective host / TLS.
+
+**Supported driver / install assumption.** The pure-JS `pg@8.18.0` from the reviewed lock, installed in the verified `node_modules`, with NO `pg-native` usage. The native digest is complete for that path only. A runtime-selectable unpinned peer is fenced, not covered.
+
+### Rulings recorded (documentation and inputs only)
+
+- **TLS.** The accepted `createBookingPool` TLS policy is unchanged. The eventual owner login files omit URL `sslmode` and supply an explicit verified CA (`--db-ca`).
+- **Stripe version.** `--stripe-api-version` stays typed and is reviewed per run. The intended future pin is `2026-01-28.clover` (matching accepted checkout / cleanup and the observed G6B). That is not a claim of general provider parity and not approval of a run.
+- **Teardown.** The accepted `result.finalize()` and `journal.close()` may stay pending until real quiescence; ONLY `pool.end()` has the 10 s bound. A second signal exits 130 with uncertainty. No timeout releases the lock or resources before quiescence.
+
+### Changed assertions (this correction)
+
+| test | change | reason |
+|---|---|---|
+| DB E1 / E4 replies | the reply carries the prompt token; E4 adds no-token and wrong-token lines | H1 protocol |
+| G3a C5 dynamic import list | + `./probe-env-preflight.mjs` | H2 ordering |
+
+### Failing-before attribution
+
+| test | on 128ac08 | meaning |
+|---|---|---|
+| A1 / A2 | red | A1 shows `synthetic/early` adopted |
+| H2a | candidate loads the synthetic peer for "1" and "0" | reproduces H2 |
+| DB E6 | red only because the candidate does not accept the new token reply (baseline `TIMEOUT_ATTEST`) | protocol incompatibility, NOT an H1 discriminator; A1 is the discriminator |

@@ -161,3 +161,129 @@ test("N4 REAL child boot past verification, refusals in the reviewed order: pack
   }
   assert.deepEqual(readdirSync(x.f.jd), [], "no journal created by any refusal");
 });
+
+// =================================================================================================================================
+// root review of 128ac08 — H1: the native owner-attestation adapter (createStdinAttest), exact helper, synthetic EventEmitter stdin
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+const L = await import("../scripts/e7-connected/run-r1-launcher.mjs");
+function attestRig() {
+  const stdin = new EventEmitter(); const prompts = []; const stderr = { write: (s) => { for (const l of String(s).split("\n")) { const m = /^E7ATTEST (.*)$/.exec(l); if (m) prompts.push(JSON.parse(m[1])); } return true; } };
+  const { attest, stats } = L.createStdinAttest({ stdin, stderr });
+  const send = (s) => stdin.emit("data", s);
+  const req = (cp) => ({ runId: "synthetic-review-run", intentId: "00000000-0000-4000-8000-0000000000f1", manifestHash: "a".repeat(64), connection: "disconnected", checkpoint: cp });
+  return { attest, stats, send, prompts, req };
+}
+const settledWithin = async (p, ms) => Promise.race([p.then((v) => ({ v }), (e) => ({ e })), new Promise((r) => setTimeout(() => r("PENDING"), ms))]);
+const CPS = ["CALENDAR_BASELINE", "CALENDAR_BLOCKED", "CALENDAR_REOPENED"];
+
+test("A1 (root H1 scenario, failing-before on 128ac08) answers sent BEFORE any prompt are DROPPED: three sequential checkpoints stay pending until a FRESH token-bound reply to each prompt", async () => {
+  const R0 = attestRig();
+  for (const cp of CPS) R0.send(`ATTEST synthetic-review-run ${cp} synthetic/early\n`);                       // the root's exact pre-prompt lines (old form)
+  for (const cp of CPS) R0.send(`ATTEST synthetic-review-run ${cp} ${"0".repeat(32)} synthetic/early\n`);      // and token-shaped guesses
+  for (const cp of CPS) {
+    const p = R0.attest(cp, R0.req(cp), {});
+    assert.equal(await settledWithin(p, 60), "PENDING", `${cp}: no pre-prompt / inter-checkpoint input adopted`);
+    const pr = R0.prompts.at(-1);
+    assert.deepEqual([pr.runId, pr.checkpoint, pr.intentId, pr.manifestHash, pr.connection], ["synthetic-review-run", cp, "00000000-0000-4000-8000-0000000000f1", "a".repeat(64), "disconnected"]);
+    assert.ok(/^[0-9a-f]{32}$/.test(pr.token) && pr.reply.includes(`ATTEST synthetic-review-run ${cp} ${pr.token} <evidenceRef>`), "prompt shows the exact reply form");
+    R0.send(`ATTEST synthetic-review-run ${cp} ${pr.token} synthetic/fresh-${cp.toLowerCase()}\n`);
+    assert.deepEqual((await settledWithin(p, 200)).v, { ok: true, evidenceRef: `synthetic/fresh-${cp.toLowerCase()}` });
+  }
+  assert.equal(new Set(R0.prompts.map((x) => x.token)).size, 3, "a fresh token per prompt");
+  assert.ok(R0.stats.dropped >= 6);
+});
+
+test("A2 same-chunk future replies, split-line prefixes before a prompt, old-token reuse, other run / checkpoint / malformed — never adopted; DECLINE / abort-before / abort-during; one active waiter; bounded lines", async () => {
+  // same-chunk: the fresh baseline reply + guessed future replies in ONE chunk → only the baseline resolves; blocked stays pending
+  { const R0 = attestRig(); const p1 = R0.attest(CPS[0], R0.req(CPS[0]), {}); const t1 = R0.prompts.at(-1).token;
+    R0.send(`ATTEST synthetic-review-run ${CPS[0]} ${t1} synthetic/a\nATTEST synthetic-review-run ${CPS[1]} ${t1} synthetic/future\nATTEST synthetic-review-run ${CPS[1]} synthetic/future\n`);
+    assert.deepEqual((await settledWithin(p1, 100)).v, { ok: true, evidenceRef: "synthetic/a" });
+    const p2 = R0.attest(CPS[1], R0.req(CPS[1]), {});
+    assert.equal(await settledWithin(p2, 60), "PENDING", "future lines from the same chunk were dropped, not queued");
+    R0.send(`ATTEST synthetic-review-run ${CPS[1]} ${t1} synthetic/old-token\n`);                              // the PREVIOUS prompt's token
+    assert.equal(await settledWithin(p2, 60), "PENDING", "an old token never matches a new prompt");
+    const t2 = R0.prompts.at(-1).token; assert.notEqual(t2, t1);
+    R0.send(`ATTEST other-run ${CPS[1]} ${t2} synthetic/x\nATTEST synthetic-review-run ${CPS[2]} ${t2} synthetic/x\nATTEST synthetic-review-run ${CPS[1]} ${t2} bad ref\nATTEST synthetic-review-run ${CPS[1]} ${t2}\n`);
+    assert.equal(await settledWithin(p2, 60), "PENDING", "other run / checkpoint / malformed refused");
+    R0.send(`DECLINE synthetic-review-run ${CPS[1]} ${t2}\n`);
+    assert.deepEqual((await settledWithin(p2, 100)).v, { ok: false }, "a fresh DECLINE is the owner's decline"); }
+  // a split line whose PREFIX arrived before the prompt is discarded (the suffix alone is malformed)
+  { const R0 = attestRig(); R0.send("ATTEST synthetic-review-run CALENDAR_BASELINE ");
+    const p = R0.attest(CPS[0], R0.req(CPS[0]), {}); const t = R0.prompts.at(-1).token;
+    R0.send(`${t} synthetic/spliced\n`);
+    assert.equal(await settledWithin(p, 60), "PENDING", "pre-prompt prefix never joins a post-prompt suffix");
+    R0.send(`ATTEST synthetic-review-run ${CPS[0]} ${t} synthetic/whole\n`); assert.deepEqual((await settledWithin(p, 100)).v, { ok: true, evidenceRef: "synthetic/whole" });
+    // a reply split ACROSS chunks AFTER the prompt is fine (normal terminal input)
+    const q = R0.attest(CPS[1], R0.req(CPS[1]), {}); const u = R0.prompts.at(-1).token;
+    R0.send(`ATTEST synthetic-review-run ${CPS[1]} `); R0.send(`${u} synthetic/split\n`);
+    assert.deepEqual((await settledWithin(q, 100)).v, { ok: true, evidenceRef: "synthetic/split" }); }
+  // abort before the prompt, abort during the wait; one active waiter; an over-long line is dropped whole
+  { const R0 = attestRig(); const ac = new AbortController(); ac.abort();
+    assert.ok((await settledWithin(R0.attest(CPS[0], R0.req(CPS[0]), { signal: ac.signal }), 50)).e, "abort before → rejection, no prompt");
+    assert.equal(R0.prompts.length, 0);
+    const ac2 = new AbortController(); const p = R0.attest(CPS[0], R0.req(CPS[0]), { signal: ac2.signal });
+    assert.ok((await settledWithin(R0.attest(CPS[1], R0.req(CPS[1]), {}), 50)).e, "a second concurrent waiter is refused");
+    const t = R0.prompts.at(-1).token;
+    R0.send(`${"x".repeat(600)}\nATTEST synthetic-review-run ${CPS[0]} ${t} ${"y".repeat(700)}\n`);
+    assert.equal(await settledWithin(p, 60), "PENDING");
+    ac2.abort(); assert.ok((await settledWithin(p, 100)).e, "abort during the wait → rejection (never a fabricated decline)");
+    R0.send(`ATTEST synthetic-review-run ${CPS[0]} ${t} synthetic/late\n`);                                     // after the abort: no active prompt → dropped
+    assert.ok(R0.stats.dropped >= 2); }
+  // abort raised SYNCHRONOUSLY inside the prompt write (the 128ac08 race fix is preserved)
+  { const stdin = new PassThrough(); const ac = new AbortController();
+    const { attest } = L.createStdinAttest({ stdin, stderr: { write: () => { ac.abort(); return true; } } });
+    assert.ok((await settledWithin(attest(CPS[0], { runId: "r-1234567", intentId: "i", manifestHash: "h", connection: "disconnected" }, { signal: ac.signal }), 100)).e); }
+});
+
+// =================================================================================================================================
+// root review of 128ac08 — H2: pg@8.18.0 selects ./native → the OPTIONAL peer pg-native when !!NODE_PG_FORCE_NATIVE (outside the native digest)
+function treeWithSyntheticPeer({ candidateCommit = null } = {}) {
+  const tree = tmp("g3b-peer-");
+  for (const top of ["scripts", "lib", "package.json", "package-lock.json"]) cpSync(join(ROOT, top), join(tree, top), { recursive: true });
+  mkdirSync(join(tree, "node_modules"));
+  for (const k of indepDigest(ROOT).pkgs) cpSync(join(ROOT, k), join(tree, k), { recursive: true, dereference: true });
+  if (candidateCommit) for (const f of ["scripts/e7-connected/run-plan-cli-main.mjs", "scripts/e7-connected/run-r1-launcher.mjs"])
+    writeFileSync(join(tree, f), spawnSync("git", ["-C", ROOT, "show", `${candidateCommit}:${f}`], { encoding: "utf8", maxBuffer: 1 << 26 }).stdout);
+  // LABELLED TEST-ONLY synthetic optional peer: NOT the real pg-native; prints a marker when loaded, then throws
+  mkdirSync(join(tree, "node_modules/pg-native"));
+  writeFileSync(join(tree, "node_modules/pg-native/package.json"), JSON.stringify({ name: "pg-native", version: "3.0.1", main: "index.js" }));
+  writeFileSync(join(tree, "node_modules/pg-native/index.js"), "process.stderr.write('E7_SYNTHETIC_PG_NATIVE_LOADED\\n'); throw new Error('synthetic peer');\n");
+  return tree;
+}
+const bootEnv = (args, cli, envExtra, trace = false) => {
+  const r = spawnSync(process.execPath, [...(trace ? ["--import", pathToFileURL(FS_TRACER).href] : []), cli, ...args], { env: { PATH: process.env.PATH, ...envExtra }, encoding: "utf8", timeout: 60_000 });
+  for (const bad of [CANARY, HTOKEN, SKEY]) assert.ok(!r.stdout.includes(bad) && !r.stderr.includes(bad));
+  const last = r.stdout.trim().split("\n").at(-1);
+  return { status: r.status, out: last ? JSON.parse(last) : null, stderr: r.stderr, peerLoaded: r.stderr.includes("E7_SYNTHETIC_PG_NATIVE_LOADED"),
+    trace: trace ? JSON.parse(/^E7TRACE (.*)$/m.exec(r.stderr)[1]) : null };
+};
+
+test("H2a (failing-before, candidate 128ac08) the synthetic optional peer IS reached through pg when NODE_PG_FORCE_NATIVE is truthy, although the native digest still matches", () => {
+  const tree = treeWithSyntheticPeer({ candidateCommit: "128ac08b05964c6d09975fd5884b2dfa62e83cb4" });
+  const x = fixture(tree); const d = indepDigest(tree).digest; const cli = join(tree, "scripts/e7-connected/run-plan-cli-main.mjs");
+  for (const [v, loaded] of [["1", true], ["0", true], ["", false]]) {
+    const r = bootEnv(argsOf(x, { "--expect-native-digest": d }), cli, { NODE_PG_FORCE_NATIVE: v });
+    assert.equal(r.peerLoaded, loaded, `NODE_PG_FORCE_NATIVE=${JSON.stringify(v)}: candidate ${loaded ? "loads" : "does not load"} the unpinned peer (pg truthiness)`);
+    console.log(`# H2a candidate NODE_PG_FORCE_NATIVE=${JSON.stringify(v)} → ${r.out && r.out.outcome}${r.out && r.out.result && r.out.result.refused ? `/${r.out.result.refused.code}` : ""} peerLoaded=${r.peerLoaded}`);
+  }
+});
+
+test("H2b (fix) presence of NODE_PG_FORCE_NATIVE (\"\", \"0\", \"1\") → BOOT_ENV_REFUSED before ANY launcher / adapter / pg / peer resolution and before owner files / pools / journal; absence control reaches the existing ordered refusal; the accepted env evaluation now precedes the launcher import", () => {
+  const tree = treeWithSyntheticPeer(); const x = fixture(tree); const d = indepDigest(tree).digest; const cli = join(tree, "scripts/e7-connected/run-plan-cli-main.mjs");
+  for (const v of ["", "0", "1"]) {
+    const r = bootEnv(argsOf(x, { "--expect-native-digest": d }), cli, { NODE_PG_FORCE_NATIVE: v }, true);
+    assert.deepEqual([r.status, r.out.outcome, r.out.code, r.peerLoaded], [4, "BOOT_ENV_REFUSED", "PG_NATIVE_SELECTOR_PRESENT", false], `${JSON.stringify(v)}: ${r.stdout}`);
+    assert.ok(!r.trace.resolved.some((s) => /run-r1-launcher|probe-cli-main|probe-env-preflight|(^|\/)pg($|\/)|pg-native/.test(s)), `${JSON.stringify(v)}: nothing resolved: ${r.trace.resolved}`);
+    assert.ok(!r.trace.calls.some((c) => c.includes(x.f.provider) || c.includes(x.f.app) || c.includes(x.f.jd)), "no owner file / dir touched");
+  }
+  { const r = bootEnv(argsOf(x, { "--expect-native-digest": d }), cli, {});
+    assert.deepEqual([r.status, r.out.outcome, r.out.result.refused, r.peerLoaded], [4, "EXECUTE_REFUSED", { stage: "pool", code: "POOL_CONFIG_REFUSED" }, false], "absence control → the existing ordered refusal"); }
+  // the accepted env evaluation BEFORE the launcher import: an exec flag (the tracer preload) / NODE_OPTIONS stop the run before pg can load
+  { const r = bootEnv(argsOf(x, { "--expect-native-digest": d }), cli, {}, true);
+    assert.deepEqual([r.out.outcome, r.out.code], ["BOOT_ENV_REFUSED", "ENV_EXEC_FLAGS"]);
+    assert.ok(!r.trace.resolved.some((s) => /run-r1-launcher|(^|\/)pg($|\/)/.test(s)), `launcher / pg never resolved: ${r.trace.resolved}`); }
+  { const r = bootEnv(argsOf(x, { "--expect-native-digest": d }), cli, { NODE_OPTIONS: "" });
+    assert.deepEqual([r.out.outcome, r.out.code], ["BOOT_ENV_REFUSED", "ENV_VARIABLE_REFUSED"]); }
+  assert.deepEqual(readdirSync(x.f.jd), [], "no journal created");
+});

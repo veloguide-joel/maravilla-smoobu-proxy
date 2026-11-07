@@ -15,7 +15,10 @@ import { fileURLToPath } from "node:url";
 
 export const CLI_SCHEMA = "e7-run-plan-native-cli-v1";
 export const EXIT_CODES = Object.freeze({ INSPECT_OK: 0, DEPS_INVALID: 1, BOOT_IMPORT_FAILED: 1, BOOT_INTERNAL: 1, USAGE: 2, BOOT_UNSUPPORTED: 3, PLAN_REFUSED: 4,
-  EXECUTE_NOT_IMPLEMENTED: 5, OUTPUT_FAILED: 9, EXECUTE_ENDED: 0, EXECUTE_REFUSED: 4, NATIVE_CLOSURE_REFUSED: 4, EXECUTE_STOPPED: 6, EXECUTE_FAILED: 1, SIGNAL_TERMINAL: 130 });
+  EXECUTE_NOT_IMPLEMENTED: 5, OUTPUT_FAILED: 9, EXECUTE_ENDED: 0, EXECUTE_REFUSED: 4, NATIVE_CLOSURE_REFUSED: 4, EXECUTE_STOPPED: 6, EXECUTE_FAILED: 1, SIGNAL_TERMINAL: 130, BOOT_ENV_REFUSED: 4 });
+/** G3b root review of 128ac08 (H2): env names whose mere PRESENCE selects an unreviewed module path inside the verified dependency set —
+ *  pg@8.18.0 lib/index.js requires ./native → the OPTIONAL peer `pg-native` (outside the native closure) when !!NODE_PG_FORCE_NATIVE */
+export const BOOT_REFUSED_ENV = Object.freeze(["NODE_PG_FORCE_NATIVE"]);
 /** G3b: the reviewed NATIVE EXECUTION source closure (sorted): the scanned static + dynamic relative import graph of this CLI and the launcher,
  *  ∪ RUN_PLAN_CLOSURE ∪ R1_EXECUTOR_CLOSURE (read as binder data) ∪ the two manifests. Independently re-scanned by the test suite. */
 export const NATIVE_EXEC_SOURCES = Object.freeze([
@@ -81,7 +84,7 @@ export function executeFlagsOf(tokens) {
 const REPO_ROOT = (() => { const p = fileURLToPath(new URL("../../", import.meta.url)); return p.length > 1 && p.endsWith("/") ? p.slice(0, -1) : p; })();
 export function defaultHooks() {
   return freeze({ importCommand: () => import("./run-plan-command.mjs"), importNative: () => import("./probe-cli-main.mjs"),
-    importLimits: () => import("./run-plan-v1.mjs"), importLauncher: () => import("./run-r1-launcher.mjs"), repoRoot: REPO_ROOT });
+    importLimits: () => import("./run-plan-v1.mjs"), importLauncher: () => import("./run-r1-launcher.mjs"), importEnvPreflight: () => import("./probe-env-preflight.mjs"), repoRoot: REPO_ROOT });
 }
 
 /**
@@ -206,23 +209,32 @@ async function execute(proc, hooks, flags, emit, exitOnce) {
   let uid = null;
   try { if (typeof proc.getuid === "function") { const u = proc.getuid(); if (Number.isSafeInteger(u) && u >= 0) uid = u; } } catch { uid = null; }
   if (uid === null) return say("BOOT_UNSUPPORTED");
+  // ---- (H2) presence-only bootstrap env fence, BEFORE any import that can load pg (regardless of the value: pg's truthiness is not the policy)
+  let envObj;
+  try { envObj = proc.env; if (BOOT_REFUSED_ENV.some((k) => Object.hasOwn(envObj, k))) return say("BOOT_ENV_REFUSED", { code: "PG_NATIVE_SELECTOR_PRESENT" }); }
+  catch { return say("BOOT_ENV_REFUSED", { code: "ENV_UNREADABLE" }); }
   // ---- NATIVE EXECUTION CLOSURE verification BEFORE any non-built-in import ----------------------------------------------------
   const entries = await readNativeClosure(hooks.repoRoot, fsc);
   if (entries === null) return say("NATIVE_CLOSURE_REFUSED", { code: "NATIVE_CLOSURE_UNREADABLE" });
   const digest = await nativeClosureDigest(entries);
   if (digest !== flags.expectNativeDigest) return say("NATIVE_CLOSURE_REFUSED", { code: "NATIVE_DIGEST_MISMATCH", nativeDigest: digest });
   // ---- verified: fixed-specifier imports of the accepted adapters and the launcher ---------------------------------------------
-  let N; let L;
-  try { N = await hooks.importNative(); L = await hooks.importLauncher(); } catch { return say("BOOT_IMPORT_FAILED"); }
-  if (typeof N.createNativeAdapters !== "function" || typeof L.runR1Launch !== "function") return say("BOOT_IMPORT_FAILED");
+  // (H2) the ACCEPTED env evaluation (verified, node:util only) now runs BEFORE the launcher import — i.e. before pg can load — so the accepted
+  // refused variables (NODE_OPTIONS, …) and exec flags stop the run before the dependency graph is evaluated
+  let N; let E; let L;
+  try { N = await hooks.importNative(); E = await hooks.importEnvPreflight(); } catch { return say("BOOT_IMPORT_FAILED"); }
+  if (typeof N.createNativeAdapters !== "function" || typeof E.evaluateProbeEnvironment !== "function") return say("BOOT_IMPORT_FAILED");
+  const present = freeze(Object.fromEntries(N.PRESENT_KEYS.map((k) => [k, Object.hasOwn(envObj, k)])));
+  const envSnapshot = freeze({ schema: "e7-probe-env-snapshot-v1", nodeVersion: String(proc.versions.node), platform, execArgvCount: proc.execArgv.length, uidAvailable: true, present });
+  const ev = E.evaluateProbeEnvironment(envSnapshot);
+  if (!ev.ok) return say("BOOT_ENV_REFUSED", { code: ev.code, nativeDigest: digest });
+  try { L = await hooks.importLauncher(); } catch { return say("BOOT_IMPORT_FAILED"); }
+  if (typeof L.runR1Launch !== "function") return say("BOOT_IMPORT_FAILED");
   // ---- signals: first SIGINT / SIGTERM → the run's AbortSignal (accepted boundary); second → terminal exit 130 (tail uncertain) --------
   const ac = new AbortController(); let signals = 0;
   const onSig = () => { signals += 1; if (signals === 1) { try { ac.abort(); } catch { /* contained */ } return; } exitOnce(EXIT_CODES.SIGNAL_TERMINAL); };
   try { proc.onSignal("SIGINT", onSig); proc.onSignal("SIGTERM", onSig); } catch { return say("EXECUTE_FAILED"); }
   const nat = N.createNativeAdapters({ platform, uid, constants: fsc, gate: () => {} });
-  const env = proc.env;
-  const present = freeze(Object.fromEntries(N.PRESENT_KEYS.map((k) => [k, Object.hasOwn(env, k)])));
-  const envSnapshot = freeze({ schema: "e7-probe-env-snapshot-v1", nodeVersion: String(proc.versions.node), platform, execArgvCount: proc.execArgv.length, uidAvailable: true, present });
   const { attest } = L.createStdinAttest({ stdin: proc.stdin, stderr: proc.stderr });
   let out;
   try { out = await L.runR1Launch({ flags, nat, proc, hooks: hooks.launch || null, signal: ac.signal, attest, repoRoot: hooks.repoRoot, envSnapshot }); }
