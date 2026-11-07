@@ -146,7 +146,9 @@ test("C3 refusal / exit-code parity table (child process + in-process parity): u
 
 test("C4 execute / unknown / usage refuse FIRST: no fs call beyond Node's own entry-file load and no module beyond the three static built-ins (child tracer); in-process: no proc member but argv / stdout / exit read, no hook called", async () => {
   const d = tmp("g3a-exe-"); const f = planFile(d, "plan.json", canonicalText(planFor(Date.now())));
-  for (const [args, outcome, status] of [[["execute"], "EXECUTE_NOT_IMPLEMENTED", 5], [["execute", "--plan", f, "--expect-source-digest", "0".repeat(64)], "EXECUTE_NOT_IMPLEMENTED", 5],
+  // G3b CHANGED ASSERTION (contract claude/e7-g3b-native-execute.md §5): execute is now implemented ONLY through its full 13-flag grammar; an
+  // incomplete execute is USAGE (exit 2) — the zero-access refusal-before-access checks below are unchanged.
+  for (const [args, outcome, status] of [[["execute"], "USAGE", 2], [["execute", "--plan", f, "--expect-source-digest", "0".repeat(64)], "USAGE", 2],
     [["unknown"], "USAGE", 2], [[], "USAGE", 2], [["inspect", "--plan", "rel"], "USAGE", 2]]) {
     const r = cli(args, { trace: true });
     assert.deepEqual([r.status, r.out.outcome, r.out.executable], [status, outcome, false], JSON.stringify(args));
@@ -162,7 +164,7 @@ test("C4 execute / unknown / usage refuse FIRST: no fs call beyond Node's own en
     assert.equal(r.status, 4, "tracer adds an exec flag → the accepted env evaluation refuses (ENV_EXEC_FLAGS)"); assert.equal(r.out.result.code, "ENV_REFUSED");
     assert.ok(r.trace.resolved.some((s) => s.endsWith("run-plan-command.mjs")) && r.trace.resolved.some((s) => s.endsWith("probe-cli-main.mjs"))); }
   // in-process: every proc member read is counted; execute / unknown touch only argv, stdout, setExitCode, exit
-  for (const [argv, outcome] of [[["execute"], "EXECUTE_NOT_IMPLEMENTED"], [["nope"], "USAGE"]]) {
+  for (const [argv, outcome] of [[["execute"], "USAGE"], [["nope"], "USAGE"]]) {   // G3b changed assertion (see above)
     const touched = new Set(); let hookCalls = 0; let line = null;
     const base = { argv: ["node", "cli", ...argv], platform: "linux", versions: process.versions, execArgv: [], env: {}, getuid: () => 0, fsConstants: FS_CONSTANTS,
       stdout: { once: () => {}, write: (s, cb) => { line = s; cb(); return true; } }, exit: () => {}, setExitCode: () => {}, now: () => 1 };
@@ -192,9 +194,13 @@ test("C5 hostile proc / argv inputs refuse code-only (no throw, no echo); boot i
     assert.deepEqual([code, writes], [9, 1]); }
   const src = readFileSync(CLI_PATH, "utf8");
   assert.deepEqual([...src.matchAll(/^import\s[\s\S]*?from\s+"([^"]+)";/gm)].map((x) => x[1]), ["node:process", "node:fs", "node:url"], "static imports: built-ins only");
-  assert.deepEqual([...src.matchAll(/import\(\s*"([^"]+)"\s*\)/g)].map((x) => x[1]).sort(), ["./probe-cli-main.mjs", "./run-plan-command.mjs", "./run-plan-v1.mjs"], "fixed dynamic specifiers only");
+  // G3b CHANGED ASSERTION (§5): + the launcher and two built-ins, imported only on the verified execute path
+  assert.deepEqual([...src.matchAll(/import\(\s*"([^"]+)"\s*\)/g)].map((x) => x[1]).sort(), ["./probe-cli-main.mjs", "./probe-env-preflight.mjs", "./run-plan-command.mjs", "./run-plan-v1.mjs", "./run-r1-launcher.mjs", "node:crypto", "node:fs/promises"], "fixed dynamic specifiers only");   // + probe-env-preflight (root review of 128ac08, H2: accepted env evaluation before the launcher / pg import)
   const code = src.replace(/\/\/.*$/gm, "");
-  for (const bad of ["runReservationAbortR1", "run-core-abort", "pg", "fetch(", "https", "credential", "readDbLoginFiles", "setTimeout", "writeFile"]) assert.ok(!code.includes(bad), bad);
+  // G3b CHANGED ASSERTION (§5): "credential" (a flag name) and "setTimeout" (native timers) may now appear; the CLI still never names the consumer / pg / https / DB reader
+  // (the reviewed NATIVE_EXEC_SOURCES / NATIVE_EXTERNALS literal lists NAME closure paths as DATA — they are removed before this scan)
+  const codeNoLists = code.replace(/export const NATIVE_EXEC_SOURCES = Object\.freeze\(\[[\s\S]*?\]\);/, "").replace(/export const NATIVE_EXTERNALS = Object\.freeze\(\[[^\]]*\]\);/, "");
+  for (const bad of ["runReservationAbortR1", "run-core-abort", "\"pg\"", "fetch(", "https", "readDbLoginFiles", "writeFile"]) assert.ok(!codeNoLists.includes(bad), bad);
   assert.equal((code.match(/import\.meta\.main === true/g) || []).length, 1, "the only top-level effect");
   // importing the module does nothing (this test process imported it at the top; no output / exit happened)
   assert.equal(typeof CLI.main, "function");
@@ -210,7 +216,9 @@ function procTrace(args, cliPath = CLI_PATH) {
 }
 test("C6 (root review of 079e8da) the REAL native boot: execute / unknown / malformed inspect read NONE of process.platform / versions / execArgv / env / getuid; the INSPECT control reads them only AFTER mode selection", () => {
   const d = tmp("g3a-boot-"); const f = planFile(d, "plan.json", canonicalText(planFor(Date.now())));
-  for (const [args, outcome, status] of [[["execute"], "EXECUTE_NOT_IMPLEMENTED", 5], [["execute", "--plan", f], "EXECUTE_NOT_IMPLEMENTED", 5], [["unknown"], "USAGE", 2],
+  // G3b CHANGED ASSERTION (contract claude/e7-g3b-native-execute.md §5): execute is now implemented ONLY through its full 13-flag grammar; an
+  // incomplete execute is USAGE (exit 2) — the zero-access refusal-before-access checks below are unchanged.
+  for (const [args, outcome, status] of [[["execute"], "USAGE", 2], [["execute", "--plan", f], "USAGE", 2], [["unknown"], "USAGE", 2],
     [[], "USAGE", 2], [["inspect", "--plan", "rel/plan.json"], "USAGE", 2], [["inspect", "--plan", f, "--extra"], "USAGE", 2]]) {
     const r = procTrace(args);
     assert.deepEqual([r.status, r.out && r.out.outcome], [status, outcome], `${JSON.stringify(args)}: ${r.stderr}`);
