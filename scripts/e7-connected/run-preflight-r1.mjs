@@ -30,8 +30,8 @@ export const BASELINE_CAP = 200;
 /** origin file → its SHA-256 at the reviewed base (what each copy came from is named in the comment) */
 export const COPIED_ORIGINS = Object.freeze({
   "scripts/e7-connected/run-core.mjs": "ad1dcbb29e7cb1ce0aac71ac178d903076d4e5cc293dd17f972c04b4beaa5afe",          // SAME_DB SQL, checkSameDatabase
-  "scripts/e7-connected/run-core-abort-v2.mjs": "d8cfdc22c82986202a220dce217a177034f8ff65db2d3f04fac94db855b17c02",  // P0 / phase budgets, WRITE_TYPES, P0 eligibility
-  "scripts/e7-connected/run-test-abort.mjs": "d0b8465b992367999f261968f986f456d25ad6a5845b07028ad95c2cc22143a3",     // BRIDGE_LIMITS
+  "scripts/e7-connected/run-core-abort-v2.mjs": "1658dd9b0228d83174f4646c7fe09039592a57d09791e0c8d1c0301143460819",  // P0 / phase budgets, WRITE_TYPES, P0 eligibility
+  "scripts/e7-connected/run-test-abort.mjs": "57d97e1806fbaad83f76cf0b794cb45893a95d36456ad09b5acb7fd8b2f62b21",     // BRIDGE_LIMITS
   "lib/booking-db/reservation-worker.js": "601f48f67052f5dac40b83354b9cf10d5f81950ff9fe9cbd587288d19ed05e88",       // DEFAULT_TIMEOUTS
   "lib/booking-db/recovery.js": "17aa5a665d32cbe959e7daa4c2baffd01a00645e454eb69218938696dfa8dfc7"                  // completed payment-attempt SELECT
 });

@@ -8,13 +8,13 @@
 //   * SQL text here: the v1 lock / same-DB statements (imported) and ONE release-proof claim read (SQL_CLAIM_HELD).
 //   * Cleanup is entered ONLY through the consumer gate (§4): an ACKed receipt anchored by the journal read against that exact head.
 import { types } from "node:util";
-import { bindManifestV2, validateRecordV2, recordHashV2, evaluateStartV2, journalFactsV2, GENESIS_HASH } from "./run-journal-memory-v2.mjs";
+import { bindManifestV2, validateRecordBound, recordHashV2, evaluateStartBound, journalFactsBound, GENESIS_HASH } from "./run-journal-memory-v2.mjs";
 import { projectActions, PHASE_END_STATES } from "./run-journal-memory.mjs";
 import { validateGuardDeps, createGuard, createLifecycle, createLedger, wrapExecutors, trackClient, LIMITS } from "./run-guard.mjs";
 import { readRunSnapshot, readGuestBinding, deriveRecoveryCandidate } from "./run-facts.mjs";
 import { createPhaseExecutors } from "./executor-adapters.mjs";
 import { checkSameDatabase, SQL, LOCK_KEY } from "./run-core.mjs";
-import { runTestAbortBridge } from "./run-test-abort.mjs";
+import { runTestAbortBridgeBound } from "./run-test-abort.mjs";
 import { buildAbortExpectation } from "../e7-operator/test-abort.mjs";
 import { loadIntent } from "../../lib/booking-db/repo.js";
 import { runOrchestratorStep, DEFAULT_TIMEOUTS } from "../../lib/booking-db/reservation-worker.js";
@@ -146,7 +146,7 @@ export async function runAbortRehearsalV2(input) {
   // ---------------- options + manifest binding (one getter-free snapshot, before any await) ----------------
   let o;
   try { o = plainData(input, OPTION_KEYS); } catch { o = null; }
-  const invalid = (code = "OPTIONS_INVALID") => freeze({ ok: false, outcome: "REFUSED", stopCode: code, phase: "P0", finalize: () => Promise.resolve(freeze({ quiescence: "observed", lockRelease: "not_acquired" })) });
+  const invalid = invalidResult;
   if (!o) return invalid();
   const br = bindManifestV2(o.manifest);
   if (!br.ok) return invalid(br.manifestCode || "MANIFEST_INVALID");
@@ -154,6 +154,17 @@ export async function runAbortRehearsalV2(input) {
   const P = B.phases;
   if (!(P.testAbortAfterReservation === true && P.capture === false && P.recording === false) || manifest.synthetic !== true
     || manifest.providerMode.hostaway !== "fake" || manifest.providerMode.stripe !== "mock") return invalid("PHASE_PLAN_UNSUPPORTED");
+  return runAbortFlowV2(o, B);
+}
+const invalidResult = (code = "OPTIONS_INVALID") => freeze({ ok: false, outcome: "REFUSED", stopCode: code, phase: "P0", finalize: () => Promise.resolve(freeze({ quiescence: "observed", lockRelease: "not_acquired" })) });
+/**
+ * M2-G2a: the accepted flow body, moved VERBATIM out of runAbortRehearsalV2 (options already snapshotted, `B` a BOUND binding). NOT exported
+ * and takes NO hooks: a future R1 consumer is a sibling wrapper in THIS module selecting fixed fences by the binding kind (contract §1).
+ * Journal / bridge calls go through the *Bound seam with this same binding (identical values to re-binding the manifest).
+ */
+async function runAbortFlowV2(o, B) {
+  const invalid = invalidResult;
+  const manifest = B.manifest;                                             // the ONE frozen validated copy; the caller's object is never read again
   if (o.intentId !== manifest.intentId) return invalid("INTENT_MISMATCH");
   let pools, journalAppend, journalRead;
   try {
@@ -261,7 +272,7 @@ export async function runAbortRehearsalV2(input) {
     if (!S.journalOk) return false;
     const at = businessNow();
     if (at === null) { S.journalOk = false; stop("CLOCK_INVALID"); return false; }
-    const vr = validateRecordV2({ v: 2, seq: S.head.seq + 1, prevHash: S.head.hash, ...identity, at, event, ...body }, manifest);
+    const vr = validateRecordBound({ v: 2, seq: S.head.seq + 1, prevHash: S.head.hash, ...identity, at, event, ...body }, B);
     if (!vr.ok) { S.journalOk = false; stop("JOURNAL_RECORD_INVALID"); return false; }
     const terminal = event === "RUN_STOPPED" || event === "RUN_ENDED";
     const r = await observeMapped(LIMITS.JOURNAL_MS, () => apply(journalAppend, journal, [vr.record]), { rejected: "JOURNAL_FAILURE", timeout: "TIMEOUT_JOURNAL" });
@@ -362,7 +373,7 @@ export async function runAbortRehearsalV2(input) {
     if (blocked()) return refused();
     const jr = await observeMapped(LIMITS.JOURNAL_MS, () => apply(journalRead, journal, []), { rejected: "JOURNAL_FAILURE", timeout: "TIMEOUT_JOURNAL" });
     if (jr.fail) { stop(jr.fail); return refused(); }
-    const v = evaluateStartV2(jr.value, manifest, trustedStart === null ? undefined : { trustedHead: trustedStart });
+    const v = evaluateStartBound(jr.value, B, trustedStart === null ? undefined : { trustedHead: trustedStart });
     S.anchored = v.anchored === true;
     if (!v.ok) { stop(v.code); return refused(); }
   }
@@ -528,7 +539,7 @@ export async function runAbortRehearsalV2(input) {
     });
     S.bridgeCalls += 1;
     let raw;
-    try { raw = await runTestAbortBridge({ manifest: m, operator: { ...e }, journal: jfacade, trustedHead: { ...before }, pool: pools.app, env: { ...BRIDGE_ENV }, guard: gfacade, now }); }
+    try { raw = await runTestAbortBridgeBound({ binding: B, operator: { ...e }, journal: jfacade, trustedHead: { ...before }, pool: pools.app, env: { ...BRIDGE_ENV }, guard: gfacade, now }); }
     catch { raw = null; }
     const bv = bridgeView(raw);
     S.bridge = bv;
@@ -545,7 +556,7 @@ export async function runAbortRehearsalV2(input) {
       if (blocked()) return { stop: S.cause };
       const jr = await observeMapped(LIMITS.JOURNAL_MS, () => apply(journalRead, journal, []), { rejected: "JOURNAL_FAILURE", timeout: "TIMEOUT_JOURNAL" });
       const rec = jr.fail ? null : plainData(jr.value, ["records", "tail"]);
-      const jf = rec && rec.tail === "complete" ? journalFactsV2(rec.records, m, { trustedHead: { ...bv.receiptAck } }) : null;
+      const jf = rec && rec.tail === "complete" ? journalFactsBound(rec.records, B, { trustedHead: { ...bv.receiptAck } }) : null;
       const anchored = !!(jf && jf.ok && jf.anchored && jf.status === "IN_PROGRESS" && jf.facts.abortAccepted && jf.facts.cleanupEntryPermitted);
       if (!anchored) { S.journalOk = false; S.journalTail = "UNKNOWN"; return stop(jr.fail || "ABORT_GATE_FAILED"); }   // the journal disagrees / unread
       S.unfinished = false;
