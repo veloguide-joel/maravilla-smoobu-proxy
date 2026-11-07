@@ -69,6 +69,11 @@ with `$1 = LOCK_KEY` (imported from the accepted `run-core.mjs`).
 - The client is destroyed exactly once (`release(true)`). A client that arrives after a connect timeout or interrupt is destroyed on arrival.
 - It never unlocks, terminates, adopts or deletes anything, and never echoes an error.
 
+**Lifecycle hardening (root de6285b5 H1/H2 review, correction commit atop the first P3 commit):**
+- A tracked `failed` flag: an observed client `error` event vetoes clearance — it finishes `LOCK_PRECHECK_UNAVAILABLE` and destroys once, even if a queued query result (e.g. `n = 0`) resolves afterwards. A late result is never allowed to clear after an observed failure, interrupt, or settle (`stopped()` guard in the query continuation).
+- No connect / query call is started after a stop. `stopped()` (= settled ∨ failed ∨ aborted) is re-checked immediately AFTER each timer is armed and immediately BEFORE each `pool.connect()` / `client.query()`. A stop that fires synchronously *inside* `setTimer` (an abort callback running during the arm) clears that just-armed timer and returns without starting the call — so neither connect nor query runs past a synchronous abort, and no timer is left armed.
+- A `setTimer` throw returns a structured `LOCK_PRECHECK_UNAVAILABLE` refusal rather than hanging or rejecting; `clearTimer` failures are swallowed. No new core/guard abstraction is introduced.
+
 **P3 is a snapshot diagnostic only.**
 - It is not evidence that grants execution, and it is not a cure for pooler lock retention.
 - The accepted lock algorithm, core and guard are unchanged.

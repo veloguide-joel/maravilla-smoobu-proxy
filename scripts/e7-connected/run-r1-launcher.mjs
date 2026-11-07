@@ -80,32 +80,53 @@ export const LOCK_PRECHECK_QUERY_MS = 5_000;
  */
 export function lockPrecheck(pool, { proc, K = 1, signal } = {}) {
   return new Promise((resolve) => {
-    let settled = false; let client = null; let timer = null; let destroyed = false;
-    const onErr = () => {};
+    // settled: a result was resolved. failed: the client reported an error (observed failure vetoes any later clearance).
+    let settled = false; let failed = false; let client = null; let timer = null; let destroyed = false;
+    const aborted = () => !!(signal && signal.aborted);
+    const stopped = () => settled || failed || aborted();                       // true => never start a connect / query
+    const clearTimer = () => { if (timer !== null) { try { proc.clearTimer(timer); } catch { /* */ } timer = null; } };
     const destroy = (c) => { if (!c || (c === client && destroyed)) return; if (c === client) destroyed = true; try { c.removeListener?.("error", onErr); } catch { /* */ } try { c.release(true); } catch { /* */ } };
     const finish = (code) => {
       if (settled) return; settled = true;
-      if (timer !== null) { try { proc.clearTimer(timer); } catch { /* */ } timer = null; }
-      if (signal) signal.removeEventListener("abort", onAbort);
+      clearTimer();
+      if (signal) { try { signal.removeEventListener("abort", onAbort); } catch { /* */ } }
       destroy(client);
       resolve(freeze({ code }));
     };
-    const onAbort = () => finish("LOCK_PRECHECK_INTERRUPTED");
-    const arm = (ms) => { timer = proc.setTimer(() => { timer = null; finish("LOCK_PRECHECK_UNAVAILABLE"); }, Math.max(0, ms / K)); };
-    if (signal) { if (signal.aborted) { finish("LOCK_PRECHECK_INTERRUPTED"); return; } signal.addEventListener("abort", onAbort, { once: true }); }
+    function onAbort() { finish("LOCK_PRECHECK_INTERRUPTED"); }
+    // an observed client error vetoes clearance and disposes exactly once, even if a queued query result arrives afterwards
+    function onErr() { if (settled) return; failed = true; finish("LOCK_PRECHECK_UNAVAILABLE"); }
+    // arm a bound; returns true only if it is safe to proceed. A timer-setup throw, or a stop that fires SYNCHRONOUSLY during
+    // setTimer (e.g. an abort callback), finishes here and returns false — so no connect / query is started after a stop.
+    const arm = (ms) => {
+      let id;
+      try { id = proc.setTimer(() => { timer = null; finish("LOCK_PRECHECK_UNAVAILABLE"); }, Math.max(0, ms / K)); }
+      catch { finish("LOCK_PRECHECK_UNAVAILABLE"); return false; }
+      if (settled) { try { proc.clearTimer(id); } catch { /* */ } timer = null; return false; }   // finished synchronously during setTimer
+      timer = id; return true;
+    };
+    const stopCode = () => (aborted() ? "LOCK_PRECHECK_INTERRUPTED" : "LOCK_PRECHECK_UNAVAILABLE");
+    if (aborted()) { finish("LOCK_PRECHECK_INTERRUPTED"); return; }
+    if (signal) { try { signal.addEventListener("abort", onAbort, { once: true }); } catch { /* */ } }
+    // ---- connect: arm, re-check AFTER timer setup and immediately BEFORE the connect call ----
+    if (!arm(LOCK_PRECHECK_CONNECT_MS)) return;
+    if (stopped()) { finish(stopCode()); return; }
     let p;
-    try { if (signal && signal.aborted) { finish("LOCK_PRECHECK_INTERRUPTED"); return; } arm(LOCK_PRECHECK_CONNECT_MS); p = Promise.resolve(pool.connect()); }
+    try { p = Promise.resolve(pool.connect()); }
     catch { finish("LOCK_PRECHECK_UNAVAILABLE"); return; }
     p.then((c) => {
-      if (settled) { destroy(c); return; }                                     // late arrival after timeout / interrupt
+      if (stopped()) { destroy(c); return; }                                   // late arrival after a stop: dispose, never query
       client = c; try { c.on?.("error", onErr); } catch { /* */ }
-      if (timer !== null) { proc.clearTimer(timer); timer = null; }
-      if (signal && signal.aborted) { finish("LOCK_PRECHECK_INTERRUPTED"); return; }
+      if (stopped()) { finish(stopCode()); return; }                           // an error could have fired on / before attach
+      clearTimer();
+      // ---- query: arm, re-check AFTER timer setup and immediately BEFORE the query call ----
+      if (!arm(LOCK_PRECHECK_QUERY_MS)) return;
+      if (stopped()) { finish(stopCode()); return; }
       let q;
-      try { arm(LOCK_PRECHECK_QUERY_MS); q = Promise.resolve(c.query(LOCK_PRECHECK_SQL, [LOCK_KEY])); }
+      try { q = Promise.resolve(c.query(LOCK_PRECHECK_SQL, [LOCK_KEY])); }
       catch { finish("LOCK_PRECHECK_UNAVAILABLE"); return; }
       q.then((res) => {
-        if (settled) return;
+        if (stopped()) return;                                                 // settled / observed failure / abort: never clear on a late result
         const rows = res && Array.isArray(res.rows) ? res.rows : null;
         const n = rows && rows.length === 1 && rows[0] && typeof rows[0] === "object" ? rows[0].n : undefined;
         if (!Number.isSafeInteger(n) || n < 0) { finish("LOCK_PRECHECK_UNAVAILABLE"); return; }

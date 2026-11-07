@@ -130,3 +130,33 @@ test("P3 lockPrecheck interruption: aborted before connect → no connect; abort
     assert.deepEqual(await L.lockPrecheck(pool, { proc: fakeProc(), K, signal: ac.signal }), { code: "LOCK_PRECHECK_INTERRUPTED" });
     assert.deepEqual([c.queries.length, c.releases], [0, [true]], "no SQL after an interrupted connect"); }
 });
+
+// a proc whose Nth setTimer call fires `act()` SYNCHRONOUSLY (the real timer then returns normally) — reproduces root's H2
+const abortingProc = (nth, act) => { let n = 0; let id = 0; const live = new Map();
+  return { live, setTimer: (fn, ms) => { const k = ++id; if (++n === nth) act(); live.set(k, setTimeout(() => { live.delete(k); fn(); }, ms)); return k; },
+    clearTimer: (k) => { clearTimeout(live.get(k)); live.delete(k); } }; };
+
+test("P3 H1 (failing-before: observed client error + late success) a client 'error' emitted during query, then the query RESOLVES rows[{n:0}], must NOT clear: => LOCK_PRECHECK_UNAVAILABLE, destroyed exactly once, no timer left", async () => {
+  const proc = fakeProc();
+  const c = new EventEmitter(); c.queries = []; c.releases = [];
+  c.query = (sql, params) => { c.queries.push({ sql, params }); c.emit("error", new Error("backend lost")); return Promise.resolve({ rows: [{ n: 0 }] }); };
+  c.release = (d) => { c.releases.push(d); };
+  const r = await L.lockPrecheck(fakePool(async () => c), { proc, K });
+  assert.deepEqual(r, { code: "LOCK_PRECHECK_UNAVAILABLE" }, "observed failure vetoes the queued CLEAR");
+  assert.deepEqual([c.queries.length, c.releases], [1, [true]], "query issued once; destroyed exactly once");
+  assert.equal(proc.live.size, 0, "no timer left armed");
+  await sleep(20); assert.deepEqual([r.code, c.releases], ["LOCK_PRECHECK_UNAVAILABLE", [true]], "the late resolve changes nothing, no second release");
+});
+
+test("P3 H2 (failing-before: synchronous abort during a timer arm) no connect/query starts after the stop: abort in the connect-bound arm → zero connects; abort in the query-bound arm → connect once, zero queries; both INTERRUPTED, destroyed once, no timer left", async () => {
+  { const ac = new AbortController(); const proc = abortingProc(1, () => ac.abort());     // abort during the CONNECT-bound setTimer
+    const pool = fakePool(async () => fakeClient(async () => ({ rows: [{ n: 0 }] })));
+    const r = await L.lockPrecheck(pool, { proc, K, signal: ac.signal });
+    assert.deepEqual([r.code, pool.connects], ["LOCK_PRECHECK_INTERRUPTED", 0], "no connect started after a synchronous abort in the connect arm");
+    assert.equal(proc.live.size, 0, "no timer left armed"); }
+  { const ac = new AbortController(); const proc = abortingProc(2, () => ac.abort());     // abort during the QUERY-bound setTimer (connect already done)
+    const c = fakeClient(async () => ({ rows: [{ n: 0 }] }));
+    const r = await L.lockPrecheck(fakePool(async () => c), { proc, K, signal: ac.signal });
+    assert.deepEqual([r.code, c.queries.length, c.releases], ["LOCK_PRECHECK_INTERRUPTED", 0, [true]], "connect happened, no query started after the synchronous abort; destroyed once");
+    assert.equal(proc.live.size, 0, "no timer left armed"); }
+});
