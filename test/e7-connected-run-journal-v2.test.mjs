@@ -317,11 +317,12 @@ test("J10 hostile inputs: refused code-only without running getters / toJSON; mu
   assert.throws(() => { "use strict"; rd.records.push(recs[2]); }, TypeError);
 });
 
+// M2-G2b: J11 import list + "./run-binding-r1.mjs" (the R1 binder is re-derived inside the journal; contract claude/e7-run-real-r1-g2.md §9)
 test("J11 purity / scope: exact import list; no timer / env / fs / network / DB / worker / abort; accepted v1 manifest, journals, run-core bytes unchanged", () => {
   const src = readFileSync(new URL("../scripts/e7-connected/run-journal-memory-v2.mjs", import.meta.url), "utf8");
   const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
   assert.deepEqual([...code.matchAll(/^import\s[\s\S]*?from\s+"([^"]+)";/gm)].map((x) => x[1]),
-    ["node:crypto", "node:util", "./run-manifest.mjs", "./run-manifest-v2.mjs", "./run-journal-memory.mjs"]);
+    ["node:crypto", "node:util", "./run-manifest.mjs", "./run-manifest-v2.mjs", "./run-binding-r1.mjs", "./run-journal-memory.mjs"]);
   const stripped = code.replace(/"[^"]*"/g, "");
   for (const bad of ["process.", "fetch(", "setTimeout", "setInterval", "import(", "require(", "globalThis", "applyEvent", "requestTestAbort"]) {
     assert.equal(stripped.includes(bad), false, bad);

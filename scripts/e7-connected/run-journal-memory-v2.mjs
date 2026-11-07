@@ -22,6 +22,7 @@ import { createHash } from "node:crypto";
 import { types } from "node:util";
 import { canonicalJson } from "./run-manifest.mjs";
 import { validateRunManifestV2, RUN_MANIFEST_V2_VERSION } from "./run-manifest-v2.mjs";
+import { bindRunPackageR1, R1_IDENTITY_VERSION } from "./run-binding-r1.mjs";
 import { INTENT_STATES, EVENTS, STEP_PHASES, FACTORY_PHASES, STEP_RESULTS, OUTCOMES, CLEANUP_KEYS, WRITE_KEYS, PHASE_END_STATES, MAX_RECORDS, MAX_ACTIONS,
   MAX_RAW_ACTIONS, MAX_REFUSALS, MAX_STEP, GENESIS_HASH, isActionToken, JournalError, FAULT_MODES, READ_FAULT_MODES } from "./run-journal-memory.mjs";
 
@@ -29,6 +30,10 @@ export const RUN_JOURNAL_V2_VERSION = "e7-run-journal-v2";
 export const RECORD_VERSION_V2 = 2;
 export const JOURNAL_V2_HASH_PREFIX = `${RUN_JOURNAL_V2_VERSION}\n`;
 export const IDENTITY_V2_KEYS = Object.freeze(["baselineCommit", "connection", "intentId", "manifestHash", "manifestVersion", "runId"]);
+/** M2-G2b: the R1 journal domain — R1 records carry manifestVersion "e7-run-package-r1" (manifestHash = packageHash) and hash under THIS prefix */
+export const RUN_JOURNAL_R1_VERSION = "e7-run-journal-r1";
+export const JOURNAL_R1_HASH_PREFIX = `${RUN_JOURNAL_R1_VERSION}\n`;
+const R1_RUN_STARTED_KEYS = Object.freeze(["executorDigest", "preflightDigest"]);
 /** every checkpoint name either mode knows — used ONLY to tell a cross-mode name (CHECKPOINT_MODE_MISMATCH) from garbage; never a permission */
 /** M2-C: the v1 event vocabulary plus the two v2-local abort records */
 export const EVENTS_V2 = Object.freeze([...EVENTS, "ABORT_REQUEST_STARTED", "ABORT_ACCEPTED"]);
@@ -109,6 +114,9 @@ const int = (v, lo, hi) => Number.isSafeInteger(v) && v >= lo && v <= hi;
 // M2-G2a binding SEAM: a module-private brand. ONLY binders inside THIS module add to it (G2a: bindManifestV2 alone), so a copied,
 // spread, JSON-round-tripped or hand-built binding-shaped object is never accepted by the *Bound entrypoints (BINDING_UNVERIFIED).
 const BOUND = new WeakSet();
+const KIND = new WeakMap();                                             // binding → "v2" | "r1" (set ONLY by this module's binders)
+/** bindingKindV2(b) → "v2" | "r1" for a BOUND binding, null otherwise (a kind is never read from the object's own fields) */
+export const bindingKindV2 = (b) => (b !== null && typeof b === "object" && BOUND.has(b) ? KIND.get(b) : null);
 /** isBoundBindingV2(b) → true iff `b` is a binding minted by this module's verified binder (never by shape / version string) */
 export const isBoundBindingV2 = (b) => b !== null && typeof b === "object" && BOUND.has(b);
 /**
@@ -136,7 +144,43 @@ export function bindManifestV2(manifestInput) {
     /** M2-C: the validated FROZEN manifest copy itself, so a consumer can re-bind after an await without touching the caller's object */
     manifest: m
   });
-  BOUND.add(binding);
+  BOUND.add(binding); KIND.set(binding, "v2");
+  return freeze({ ok: true, binding });
+}
+
+/**
+ * M2-G2b: bindRunPackageR1Journal(r1Input, execClock) → frozen { ok:true, binding } | frozen { ok:false, code:'R1_BINDING_INVALID', binderCode }
+ *   The ONLY way an R1 binding is minted: it RE-DERIVES through the accepted pure bindRunPackageR1 (package recompute + reviewed pins + closure
+ *   snapshots + fresh execution clock). r1Input = { packageBytes, planBytes, foundationSources, executorSources, envSnapshot, expected } (own data
+ *   properties; the binder snapshots / owns everything). The binding has the v2 binding SHAPE plus `r1` evidence; its kind is "r1", its identity
+ *   version "e7-run-package-r1" and manifestHash the package hash. A copied object or version string never becomes one.
+ */
+const R1_INPUT_KEYS = ["envSnapshot", "executorSources", "expected", "foundationSources", "packageBytes", "planBytes"];
+export function bindRunPackageR1Journal(r1Input, execClock) {
+  const bad = (binderCode) => freeze({ ok: false, code: "R1_BINDING_INVALID", binderCode });
+  let o;
+  try {
+    if (r1Input === null || typeof r1Input !== "object" || types.isProxy(r1Input) || (getProto(r1Input) !== OBJECT_PROTO && getProto(r1Input) !== null)) return bad("R1_INPUT_INVALID");
+    const d = getDescs(r1Input); const ks = ownKeys(d);
+    if (ks.length !== R1_INPUT_KEYS.length || !ks.every((k) => typeof k === "string" && R1_INPUT_KEYS.includes(k) && "value" in d[k] && d[k].enumerable === true)) return bad("R1_INPUT_INVALID");
+    o = Object.fromEntries(R1_INPUT_KEYS.map((k) => [k, d[k].value]));
+  } catch { return bad("R1_INPUT_INVALID"); }
+  const br = bindRunPackageR1({ ...o, execClock });
+  if (!br.ok) return bad(br.code);
+  const R = br.binding; const sc = R.scope; const L = sc.listing;
+  const binding = freeze({
+    identity: freeze({ ...R.identity }),
+    checkpoints: freeze({ ...R.checkpoints }),
+    phases: freeze({ ...R.phases }),
+    facts: freeze({ listingId: L.id, currency: L.currency, arrival: sc.stay.arrival, departure: sc.stay.departure, guests: sc.stay.guests, amountMinor: sc.amountMinor }),
+    /** the scope VIEW the shared flow reads (exactly its fields); not a manifest, carries no synthetic / provider-mode fields */
+    manifest: freeze({ kind: "r1-scope", runId: R.identity.runId, intentId: sc.intentId, expectedRef: sc.expectedRef,
+      listing: freeze({ id: L.id, currency: L.currency, refFieldId: L.refFieldId, timeZone: L.timeZone, connection: L.connection }),
+      stay: freeze({ ...sc.stay }), amountMinor: sc.amountMinor, pricing: freeze({ rateBps: sc.rateBps }), stripeAccountId: sc.stripeAccountId }),
+    r1: freeze({ packageHash: R.packageHash, foundationDigest: R.foundationDigest, executorDigest: R.executorDigest, execClock: R.execClock, evaluatedAt: R.evaluatedAt,
+      paymentIntentId: sc.paymentIntentId, exclusions: R.exclusions })
+  });
+  BOUND.add(binding); KIND.set(binding, "r1");
   return freeze({ ok: true, binding });
 }
 const UNVERIFIED = freeze({ ok: false, code: "BINDING_UNVERIFIED" });
@@ -144,11 +188,14 @@ const UNVERIFIED = freeze({ ok: false, code: "BINDING_UNVERIFIED" });
 // ---- record validation ------------------------------------------------------------------------------------------------------------
 const writesOk = (w) => isRec(w) && keysExactly(w, WRITE_KEYS) && WRITE_KEYS.every((k) => int(w[k], 0, 1000));
 /** shape / field validation of ONE snapshotted v2 record (no history, no binding) → error code | null */
-function fieldCheck(r) {
+function fieldCheck(r, kind = "v2") {
   if (!isRec(r) || typeof r.event !== "string" || !EVENTS_V2.includes(r.event)) return "RECORD_SHAPE";
-  if (!keysExactly(r, [...COMMON_KEYS, ...EVENT_KEYS[r.event]])) return "RECORD_SHAPE";
+  // M2-G2b: the record shape / identity version is fixed by the BINDING's kind (never by the record): v2 bindings keep the v2 rules exactly
+  const r1 = kind === "r1";
+  if (!keysExactly(r, [...COMMON_KEYS, ...(r1 && r.event === "RUN_STARTED" ? R1_RUN_STARTED_KEYS : EVENT_KEYS[r.event])])) return "RECORD_SHAPE";
   if (r.v !== RECORD_VERSION_V2 || !int(r.seq, 1, MAX_RECORDS) || typeof r.prevHash !== "string" || !RE.hash.test(r.prevHash) || !int(r.at, 0, 8.64e15)) return "RECORD_FIELD_INVALID";
-  if (r.manifestVersion !== RUN_MANIFEST_V2_VERSION || (r.connection !== "disconnected" && r.connection !== "airbnb")) return "RECORD_FIELD_INVALID";
+  if (r.manifestVersion !== (r1 ? R1_IDENTITY_VERSION : RUN_MANIFEST_V2_VERSION) || (r.connection !== "disconnected" && r.connection !== "airbnb")) return "RECORD_FIELD_INVALID";
+  if (r1 && r.event === "RUN_STARTED" && !(typeof r.preflightDigest === "string" && RE.hash.test(r.preflightDigest) && typeof r.executorDigest === "string" && RE.hash.test(r.executorDigest))) return "RECORD_FIELD_INVALID";
   if (typeof r.runId !== "string" || !RE.runId.test(r.runId) || typeof r.intentId !== "string" || !RE.uuid.test(r.intentId)
     || typeof r.manifestHash !== "string" || !RE.hash.test(r.manifestHash) || typeof r.baselineCommit !== "string" || !RE.commit.test(r.baselineCommit)) return "RECORD_FIELD_INVALID";
   switch (r.event) {
@@ -217,6 +264,8 @@ const sameIdentity = (r, id) => IDENTITY_V2_KEYS.every((k) => r[k] === id[k]);
 /** binding-dependent record check: the identity, and an ATTESTED checkpoint name must be one of THIS mode's three → code | null */
 function bindingCheck(r, b) {
   if (!sameIdentity(r, b.identity)) return "IDENTITY_MISMATCH";
+  // M2-G2b: an R1 RUN_STARTED binds THIS binding's verified executor digest
+  if (KIND.get(b) === "r1" && r.event === "RUN_STARTED" && r.executorDigest !== b.r1.executorDigest) return "IDENTITY_MISMATCH";
   if (r.event === "ATTESTED") {
     const c = r.attestation.checkpoint; const k = b.checkpoints;
     if (c !== k.baseline && c !== k.blocked && c !== k.reopened) return "CHECKPOINT_MODE_MISMATCH";
@@ -235,11 +284,13 @@ export function validateRecordBound(input, binding) { return isBoundBindingV2(bi
 function recordVerdict(input, b) {
   const r = safeSnap(input);
   if (r === BAD) return freeze({ ok: false, code: "RECORD_SHAPE" });
-  const c = fieldCheck(r) || bindingCheck(r, b);
+  const c = fieldCheck(r, KIND.get(b)) || bindingCheck(r, b);
   return c ? freeze({ ok: false, code: c }) : freeze({ ok: true, record: r });
 }
 /** recordHashV2(validatedRecord) = sha256("e7-run-journal-v2\n" + canonicalJson(record)) */
-export const recordHashV2 = (record) => createHash("sha256").update(JOURNAL_V2_HASH_PREFIX + canonicalJson(record), "utf8").digest("hex");
+//  M2-G2b: a record whose identity version is the R1 one hashes under the R1 domain; every v2 record is hashed EXACTLY as before
+export const recordHashV2 = (record) => createHash("sha256").update((record !== null && typeof record === "object" && record.manifestVersion === R1_IDENTITY_VERSION
+  ? JOURNAL_R1_HASH_PREFIX : JOURNAL_V2_HASH_PREFIX) + canonicalJson(record), "utf8").digest("hex");
 
 // ---- event-order state machine (the accepted v1 rules with the mode's exact checkpoint names and the planned phases) --------------
 const initialState = () => ({ n: 0, ended: false, phase: null, phaseEnd: new Map(), lastState: Object.create(null), steps: Object.create(null), openStep: null,
@@ -365,7 +416,8 @@ function trustedHeadOf(opts) {
 }
 /** verdict over a snapshotted list with a binding (shared by validateJournalV2 and the journal) */
 function journalVerdict(list, b, trusted) {
-  for (const [i, r] of list.entries()) if (fieldCheck(r)) return freeze({ ok: false, code: "JOURNAL_MALFORMED", at: i + 1 });
+  const kind = KIND.get(b);
+  for (const [i, r] of list.entries()) if (fieldCheck(r, kind)) return freeze({ ok: false, code: "JOURNAL_MALFORMED", at: i + 1 });
   for (const [i, r] of list.entries()) if (!sameIdentity(r, b.identity)) return freeze({ ok: false, code: "MANIFEST_MISMATCH", at: i + 1 });
   for (const [i, r] of list.entries()) if (bindingCheck(r, b)) return freeze({ ok: false, code: "CHECKPOINT_MODE_MISMATCH", at: i + 1 });
   let prev = GENESIS_HASH;
@@ -476,7 +528,25 @@ export function createMemoryJournalV2(input) {
   if (o === BAD || !isRec(o) || !Object.keys(o).every((k) => ["manifest", "preload", "faults"].includes(k))) return freeze({ ok: false, code: "JOURNAL_OPTIONS_INVALID" });
   const br = bindManifestV2(o.manifest);
   if (!br.ok) return freeze({ ok: false, code: "MANIFEST_INVALID" });
-  const b = br.binding;
+  return memoryJournal(o, br.binding);
+}
+/** M2-G2b: createMemoryJournalBound({ binding, preload?, faults? }) — the SAME memory journal for a BOUND binding (v2 or r1); TEST-ONLY faults as v2 */
+export function createMemoryJournalBound(input) {
+  let binding; let rest;
+  try {
+    if (input === null || typeof input !== "object" || types.isProxy(input) || (getProto(input) !== OBJECT_PROTO && getProto(input) !== null)) return freeze({ ok: false, code: "JOURNAL_OPTIONS_INVALID" });
+    const d = getDescs(input); const ks = ownKeys(d);
+    if (!ks.every((k) => typeof k === "string" && ["binding", "preload", "faults"].includes(k) && "value" in d[k] && d[k].enumerable === true) || !("binding" in d)) return freeze({ ok: false, code: "JOURNAL_OPTIONS_INVALID" });
+    binding = d.binding.value;
+    rest = Object.fromEntries(ks.filter((k) => k !== "binding").map((k) => [k, d[k].value]));
+  } catch { return freeze({ ok: false, code: "JOURNAL_OPTIONS_INVALID" }); }
+  if (!isBoundBindingV2(binding)) return UNVERIFIED;
+  const o = safeSnap(rest);
+  if (o === BAD || !isRec(o)) return freeze({ ok: false, code: "JOURNAL_OPTIONS_INVALID" });
+  return memoryJournal(o, binding);
+}
+function memoryJournal(o, b) {
+  const kind = KIND.get(b);
   const stored = [];
   if (o.preload !== undefined) {
     if (!Array.isArray(o.preload) || o.preload.length > MAX_RECORDS) return freeze({ ok: false, code: "JOURNAL_OPTIONS_INVALID" });
@@ -501,7 +571,7 @@ export function createMemoryJournalV2(input) {
     const callNo = appendCalls;
     const r = safeSnap(record);                                 // ONE frozen copy, before any await
     if (r === BAD) return reject("RECORD_INVALID");
-    const fc = fieldCheck(r);
+    const fc = fieldCheck(r, kind);
     if (fc) return reject(fc === "ACTION_INVALID" ? "ACTION_INVALID" : "RECORD_INVALID");
     if (inFlight) return reject("APPEND_IN_FLIGHT");
     const bc = bindingCheck(r, b);

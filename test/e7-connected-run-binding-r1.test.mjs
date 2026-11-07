@@ -133,10 +133,17 @@ test("B4 executor closure = scanned G1 roots + manifests; tamper / missing / ext
   const fx = fixture();
   assert.equal(R.executorDigestR1(EXEC), indepDigest(EXEC));
   const mod = (fn) => { const e = EXEC.map((x) => ({ path: x.path, bytes: new Uint8Array(x.bytes) })); fn(e); return e; };
-  // tamper a NON-overlapping executor file → digest mismatch (pinned digest is the clean one)
-  const nonOverlap = R.R1_EXECUTOR_CLOSURE.findIndex((p) => !RUN_PLAN_CLOSURE.includes(p));
-  assert.ok(nonOverlap >= 0);
-  assert.equal(bind({ ...fx.input, executorSources: mod((e) => { e[nonOverlap].bytes[0] ^= 1; }) }).code, "R1_EXECUTOR_DIGEST_MISMATCH");
+  // M2-G2b (contract claude/e7-run-real-r1-g2.md §8.4 / §9): the R1 consumer imports the binder + preflight, so EVERY executor path is now also a
+  // foundation path (no non-overlapping executor file exists any more). The executor pin and the overlap / recompute rules still discriminate:
+  assert.ok(R.R1_EXECUTOR_CLOSURE.every((p) => RUN_PLAN_CLOSURE.includes(p)), "executor closure ⊆ foundation closure");
+  assert.equal(bind({ ...fx.input, expected: { ...fx.input.expected, executorDigest: "0".repeat(64) } }).code, "R1_EXECUTOR_DIGEST_MISMATCH");
+  {
+    // an executor file tampered in BOTH snapshots, with a re-pinned executor digest → the accepted foundation recompute refuses
+    const i = R.R1_EXECUTOR_CLOSURE.indexOf("scripts/e7-connected/run-preflight-r1.mjs"); const fi = RUN_PLAN_CLOSURE.indexOf("scripts/e7-connected/run-preflight-r1.mjs");
+    const ex = mod((e) => { e[i].bytes[0] ^= 1; });
+    const fo = FOUND.map((x, k) => (k === fi ? { path: x.path, bytes: ex[i].bytes } : x));
+    assert.equal(bind({ ...fx.input, executorSources: ex, foundationSources: fo, expected: { ...fx.input.expected, executorDigest: indepDigest(ex) } }).code, "R1_RECOMPUTE_REFUSED");
+  }
   for (const [k, s] of Object.entries({ missing: EXEC.slice(1), extra: [...EXEC, { path: "x.js", bytes: enc.encode("x") }], reorder: [EXEC[1], EXEC[0], ...EXEC.slice(2)],
     renamed: mod((e) => { e[0] = { path: `./${e[0].path}`, bytes: e[0].bytes }; }), buffer: mod((e) => { e[0] = { path: e[0].path, bytes: Buffer.from(e[0].bytes) }; }),
     proxy: new Proxy(EXEC, {}), empty: [] }))
