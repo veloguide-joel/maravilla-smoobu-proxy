@@ -8,7 +8,9 @@
 //   * SQL text here: the v1 lock / same-DB statements (imported) and ONE release-proof claim read (SQL_CLAIM_HELD).
 //   * Cleanup is entered ONLY through the consumer gate (§4): an ACKed receipt anchored by the journal read against that exact head.
 import { types } from "node:util";
-import { bindManifestV2, validateRecordBound, recordHashV2, evaluateStartBound, journalFactsBound, GENESIS_HASH } from "./run-journal-memory-v2.mjs";
+import { bindManifestV2, bindRunPackageR1Journal, bindingKindV2, validateRecordBound, recordHashV2, evaluateStartBound, journalFactsBound, GENESIS_HASH } from "./run-journal-memory-v2.mjs";
+import { runPreflightR1, readExclusionBaselineR1, exclusionIdentifiers, AUTOMATIC_WORK_BUDGET_MS, PHASE_BUDGET_MS, SQL_BEGIN, SQL_COMMIT } from "./run-preflight-r1.mjs";
+import { canonicalJson } from "./run-manifest.mjs";
 import { projectActions, PHASE_END_STATES } from "./run-journal-memory.mjs";
 import { validateGuardDeps, createGuard, createLifecycle, createLedger, wrapExecutors, trackClient, LIMITS } from "./run-guard.mjs";
 import { readRunSnapshot, readGuestBinding, deriveRecoveryCandidate } from "./run-facts.mjs";
@@ -38,6 +40,12 @@ const WRITE_TYPES = Object.freeze({ "hostaway.create_reservation": "create", "st
 const KEY_RANK = Object.freeze({ null: 0, reservedNotConfirmed: 1, captured: 2, confirmed: 3 });
 const OPTION_KEYS = Object.freeze(["attest", "clock", "intentId", "journal", "manifest", "monotonic", "pools", "signal", "timers", "transports", "trustedHead"]);
 const HEX64 = /^[0-9a-f]{64}$/;
+/** M2-G2b: R1 consumer options = the v2 option keys with `manifest` replaced by `r1` (the reviewed bindRunPackageR1 input, never a binding) */
+const OPTION_KEYS_R1 = Object.freeze(["attest", "clock", "intentId", "journal", "monotonic", "pools", "r1", "signal", "timers", "transports", "trustedHead"]);
+const R1_INPUT_KEYS = Object.freeze(["envSnapshot", "executorSources", "expected", "foundationSources", "packageBytes", "planBytes"]);
+/** M2-G2b G fence: the automatic work still ahead AFTER the reservation phase (the accepted preflight budget minus P0, its journal and the
+ *  reservation phase); a reservation step may start only while min(captureBefore, authorizationDeadline) − now > step budget + margin + this */
+export const R1_AFTER_RESERVATION_BUDGET_MS = AUTOMATIC_WORK_BUDGET_MS - P0_BUDGET_MS - LIMITS.JOURNAL_MS - PHASE_BUDGET_MS.reservation;
 
 // ---- helpers COPIED VERBATIM from run-core.mjs:48–113 (getter-free options, facts helpers, conservative key) ---------------------
 const freeze = Object.freeze;
@@ -156,6 +164,29 @@ export async function runAbortRehearsalV2(input) {
     || manifest.providerMode.hostaway !== "fake" || manifest.providerMode.stripe !== "mock") return invalid("PHASE_PLAN_UNSUPPORTED");
   return runAbortFlowV2(o, B);
 }
+/**
+ * M2-G2b: runReservationAbortR1(opts) → Promise<frozen RunResult> — the THIN R1 consumer (contract claude/e7-run-real-r1-g2.md §8). The R1 binding is
+ * minted ONLY by the journal module re-deriving through the accepted bindRunPackageR1 at a FRESH business clock; then the SAME private flow runs
+ * with the fixed R1 fences selected by the binding's module-recorded kind. No manifest, no synthetic fallback, no hook parameter.
+ */
+export async function runReservationAbortR1(input) {
+  let o;
+  try { o = plainData(input, OPTION_KEYS_R1); } catch { o = null; }
+  if (!o || !isFn(o.clock)) return invalidResult();
+  let r1;
+  try { r1 = plainData(o.r1, R1_INPUT_KEYS); } catch { r1 = null; }
+  if (!r1) return invalidResult("R1_INPUT_INVALID");
+  r1 = freeze(r1);                                                         // the references are fixed here; the bytes are re-proved by every re-derivation
+  let t; try { t = apply(o.clock, undefined, []); } catch { t = null; }
+  if (!Number.isSafeInteger(t) || t < 1) return invalidResult("CLOCK_INVALID");
+  const br = bindRunPackageR1Journal(r1, t);
+  if (!br.ok) return invalidResult(br.binderCode || "R1_BINDING_INVALID");
+  const B = br.binding;
+  if (bindingKindV2(B) !== "r1") return invalidResult("BINDING_UNVERIFIED");
+  const P = B.phases;
+  if (!(P.testAbortAfterReservation === true && P.capture === false && P.recording === false)) return invalidResult("PHASE_PLAN_UNSUPPORTED");
+  return runAbortFlowV2(freeze({ ...o, r1 }), B);
+}
 const invalidResult = (code = "OPTIONS_INVALID") => freeze({ ok: false, outcome: "REFUSED", stopCode: code, phase: "P0", finalize: () => Promise.resolve(freeze({ quiescence: "observed", lockRelease: "not_acquired" })) });
 /**
  * M2-G2a: the accepted flow body, moved VERBATIM out of runAbortRehearsalV2 (options already snapshotted, `B` a BOUND binding). NOT exported
@@ -164,6 +195,7 @@ const invalidResult = (code = "OPTIONS_INVALID") => freeze({ ok: false, outcome:
  */
 async function runAbortFlowV2(o, B) {
   const invalid = invalidResult;
+  const R1 = bindingKindV2(B) === "r1";                                    // M2-G2b: fixed by the module-private brand, never by caller data
   const manifest = B.manifest;                                             // the ONE frozen validated copy; the caller's object is never read again
   if (o.intentId !== manifest.intentId) return invalid("INTENT_MISMATCH");
   let pools, journalAppend, journalRead;
@@ -188,6 +220,8 @@ async function runAbortFlowV2(o, B) {
   const S = { phase: "P0", started: false, head: { seq: 0, hash: GENESIS_HASH }, journalOk: true, journalTerminal: "not_attempted", journalTail: "KNOWN", anchored: false,
     lastFacts: null, countsSeq: 0, rejected: false, stale: false, lockLostEarly: false, lockClient: null, outcome: null, unfinished: false,
     phaseDeadline: Infinity, cleanupEntryKey: null, cause: null, bridge: null, bridgeCalls: 0, release: null };
+  /** M2-G2b R1-only diagnostics / basis (absent from v2 results) */
+  const R = { preflight: null, refence: null, priceBasis: null, fences: 0, authDeadline: null, expiredAtCleanup: null, exclusionAfter: "not_attempted", exclusionRead: null };
   const stop = (code) => { lc.stop(code); if (!S.cause) S.cause = code; return { stop: code }; };
   const dbStop = (code) => { lc.markDbFamily(); S.stale = true; return stop(code); };
   const nowOr = () => { const n = guard.now(); return n.ok ? n.value : null; };
@@ -310,7 +344,13 @@ async function runAbortFlowV2(o, B) {
       anchored: S.anchored, writes: freeze(facts ? countWrites(facts) : W0()), countsAsOf: freeze({ seq: S.countsSeq, stale: S.stale }),
       effectsKnown: !S.stale && ls.outstanding === "NONE" && !ls.dbFamily, outstanding: ls.outstanding, outstandingPhase: ls.outstandingPhase,
       tailObservable: ls.tailObservable, exclusion: ls.exclusion === "released" ? "held" : ls.exclusion, bridgeCalls: S.bridgeCalls, bridge: S.bridge, release: S.release,
-      ownerCleanupRequired: null, finalize: () => lc.finalize(), ...extra });
+      ownerCleanupRequired: null, finalize: () => lc.finalize(), ...(R1 ? { r1: r1View(outcomeKind, extra) } : {}), ...extra });
+  }
+  /** M2-G2b: changed / unread exclusion re-read is NEVER fully clean */
+  function r1View(outcomeKind, extra) {
+    const fullyClean = outcomeKind === "ENDED" && (extra.ok !== false) && R.exclusionAfter === "equal";
+    return freeze({ kind: "r1", packageHash: B.r1.packageHash, executorDigest: B.r1.executorDigest, preflight: R.preflight, refence: R.refence, fences: R.fences,
+      expiredAtCleanup: R.expiredAtCleanup, exclusionAfter: R.exclusionAfter, exclusionRead: R.exclusionRead, fullyClean });
   }
   const refused = () => result("REFUSED", { outcome: "REFUSED", ownerCleanupRequired: null });
   /** a STOP after RUN_STARTED: ONE terminal append only when the tail is KNOWN and the journal healthy; conservative key */
@@ -391,7 +431,18 @@ async function runAbortFlowV2(o, B) {
       && i.finalTotalMinor === m.amountMinor && i.rateBps === m.pricing.rateBps && i.currency === m.listing.currency && typeof i.stripePaymentIntentId === "string";
     if (!same) { stop("INTENT_IDENTITY_MISMATCH"); return refused(); }
   }
-  if (!(await append("RUN_STARTED", {}))) return result("STOPPED", { outcome: "STOPPED", ownerCleanupRequired: null });
+  if (R1) {
+    // M2-G2b: a FRESH G1 preflight INSIDE P0 (same lock held, after same-DB / empty journal / eligibility), at the business clock; a copied
+    // verdict is never an input. Its package / executor digests must equal THIS binding's; then the DB price basis for the later fences.
+    const pv = await preflightR1();
+    if (pv.view) R.preflight = pv.view;                                   // the verdict's diagnostic view is kept on refusal too
+    if (pv.stop) return refused();
+    const fi = await freshIntent(); if (fi.stop) return refused();
+    const c = intentIdentityR1(fi.intent);
+    if (c) { stop(c); return refused(); }
+    try { R.priceBasis = canonicalJson(fi.intent.price); } catch { stop("QUOTE_CHANGED"); return refused(); }
+  }
+  if (!(await append("RUN_STARTED", R1 ? { preflightDigest: R.preflight.preflightDigest, executorDigest: B.r1.executorDigest } : {}))) return result("STOPPED", { outcome: "STOPPED", ownerCleanupRequired: null });
   S.started = true;
   S.phaseDeadline = Infinity;
 
@@ -399,6 +450,14 @@ async function runAbortFlowV2(o, B) {
   S.phase = "P1";
   { const rb = boundary(); if (rb) return stopped(); }
   { const a = await attestCheckpoint(K.baseline); if (a && a.stop) return stopped(); }
+  if (R1) {
+    // M2-G2b G fence after the (unbounded) owner baseline attestation: the FULL accepted preflight again (fresh PI / account / quote / calendar /
+    // ref lookup / exclusion baseline / margin) before any reservation work; the exclusion baseline must be unchanged
+    const pv = await preflightR1();
+    if (pv.view) R.refence = pv.view;
+    if (pv.stop) return stopped();
+    if (pv.view.baselineDigest !== R.preflight.baselineDigest) { stop("EXCLUSION_BASELINE_CHANGED"); return stopped(); }
+  }
 
   const m = manifest; const id = m.listing.id;
   const adapterConfig = () => ({ allowedListingIds: [id], refFieldId: m.listing.refFieldId, channelId: 2000, currency: "USD" });
@@ -460,10 +519,12 @@ async function runAbortFlowV2(o, B) {
       const ledger = createLedger();
       const wrapped = wrapExecutors(built.executors, ledger);
       if (!wrapped.ok) return stop("EXECUTORS_INVALID");
+      if (R1) { const fc = await fenceR1(phase, facts.intent, L); if (fc) return fc; }   // M2-G2b: fresh DB authorization / identity, before STEP_STARTED
       if (blocked()) return { stop: S.cause };                // R-E1b: re-checked after prepare / guest read, before STEP_STARTED
       if (!(await append("STEP_STARTED", { phase, step, factory: { phase: prep.factoryPhase, reservationId: prep.reservationId } }))) return { stop: S.cause };
       S.unfinished = true;                                    // cleared only by a valid post-step snapshot + an acknowledged STEP_ENDED
       if (blocked()) return { stop: S.cause };                // R-E1b: and IMMEDIATELY before the worker is invoked (no start after a detected stop)
+      if (R1 && phase === "reservation" && !marginOk(L)) return stop("AUTHORIZATION_MARGIN_INSUFFICIENT");   // M2-G2b: fresh clock at the actual start
       const sd = nowOr(); if (sd === null) return stop(guardCode());
       const r = await lc.observeStep({ phase, deadline: Math.min(sd + L.stepBudgetMs + LIMITS.STEP_MARGIN_MS, S.phaseDeadline), ledger, start: () => { S.stale = true; return prep.run(wrapped.executors); } });   // R-E2: an invoked step can change facts
       if (r.kind !== "fulfilled") {
@@ -526,6 +587,7 @@ async function runAbortFlowV2(o, B) {
     if (s.facts.intent.state !== "reservation_confirmed") return stop("STATE_UNEXPECTED");
     const e = abortExpectation(s.facts, m);
     if (e === null) return stop("ABORT_EXPECTATION_UNAVAILABLE");
+    if (R1) { const fc = await fenceR1("abort", s.facts.intent, null); if (fc) return fc; }   // M2-G2b: identity fence (never blocked by expiry)
     const now = businessNow(); if (now === null) return stop("CLOCK_INVALID");
     if (blocked()) return { stop: S.cause };
     const before = freeze({ ...S.head });
@@ -598,6 +660,107 @@ async function runAbortFlowV2(o, B) {
     return null;
   }
 
+  // ---------------- M2-G2b R1 helpers (used ONLY when the binding kind is r1) ----------------
+  /** the accepted G1 preflight over THIS run's pools / injected transports / guard / stop state; never a supplied verdict */
+  async function preflightR1() {
+    if (blocked()) return { stop: S.cause };
+    const hs = dataMethod(transports.hostaway, "send"); const ss = dataMethod(transports.stripe, "send");
+    if (!hs || !ss) return stop("TRANSPORT_INVALID");
+    const v = await runPreflightR1({ bind: o.r1, pools: { app: pools.app, report: pools.report },
+      transports: { hostaway: freeze({ send: (...a) => apply(hs, transports.hostaway, a) }), stripe: freeze({ send: (...a) => apply(ss, transports.stripe, a) }) },
+      guard, blocked: () => blocked(), clock });
+    const view = freeze({ code: v.code, step: v.step, counts: v.counts, dbUncertainty: v.dbUncertainty, transportUncertainty: v.transportUncertainty,
+      preflightDigest: v.preflightDigest ?? null, baselineDigest: v.baselineDigest ?? null, marginMs: v.marginMs ?? null, binderCode: v.binderCode ?? null });
+    if (S.cause) return { stop: S.cause, view };
+    if (v.ok !== true || v.code !== "PREFLIGHT_OK") { stop(`PREFLIGHT_${v.code}`.slice(0, 48)); return { stop: S.cause, view }; }
+    if (v.packageHash !== B.r1.packageHash || v.executorDigest !== B.r1.executorDigest || typeof v.preflightDigest !== "string" || !HEX64.test(v.preflightDigest)
+      || typeof v.baselineDigest !== "string" || !HEX64.test(v.baselineDigest)) { stop("PREFLIGHT_BINDING_MISMATCH"); return { stop: S.cause, view }; }
+    return { view };
+  }
+  /** ONE accepted loadIntent on a fresh app client (bounded; failure is a DB-family stop) */
+  async function freshIntent() {
+    const h = await acquire(pools.app, () => {});
+    if (h.pre) return { stop: S.cause };
+    if (h.fail) return dbStop(h.fail);
+    const r = await observeMapped(LIMITS.STATEMENT_MS, () => loadIntent(h.client, identity.intentId), { rejected: "DB_FAILURE", timeout: "TIMEOUT_DB_READ" });
+    if (r.fail) { h.tracker.destroy(); return dbStop(r.fail); }
+    h.release();
+    return { intent: r.value };
+  }
+  /** the exact R1 scope identity of a loadIntent result + the P0 DB price basis */
+  function intentIdentityR1(I) {
+    const sc = B.manifest; const pay = I && I.payment;
+    if (!I || I.id !== identity.intentId || I.ref !== sc.expectedRef || I.listingId !== sc.listing.id || I.from !== sc.stay.arrival || I.to !== sc.stay.departure
+      || I.guests !== sc.stay.guests) return "INTENT_IDENTITY_MISMATCH";
+    if (!pay || pay.paymentIntentId !== B.r1.paymentIntentId || pay.livemode !== false || pay.amountMinor !== sc.amountMinor
+      || String(pay.currency || "").toUpperCase() !== sc.listing.currency || !Number.isSafeInteger(pay.captureBefore) || !Number.isSafeInteger(pay.authorizationDeadline)) return "PAYMENT_STATE_INVALID";
+    if (!I.price || I.price.finalTotalMinor !== sc.amountMinor || I.price.rateBps !== sc.pricing.rateBps) return "QUOTE_CHANGED";
+    if (R.priceBasis !== null) { let c; try { c = canonicalJson(I.price); } catch { c = null; } if (c !== R.priceBasis) return "QUOTE_CHANGED"; }
+    return null;
+  }
+  /** strict authorization margin at a FRESH business clock: Stripe's own captureBefore and the DB deadline, the EARLIER one (no policy extension) */
+  function marginOk(L) {
+    const t = businessNow();
+    if (t === null || R.authDeadline === null) return false;
+    const m = R.authDeadline - t;
+    return Number.isSafeInteger(m) && m > L.stepBudgetMs + LIMITS.STEP_MARGIN_MS + R1_AFTER_RESERVATION_BUDGET_MS;
+  }
+  /**
+   * G fence (fresh DB read) before STEP_STARTED / the bridge: same version + state as the basis snapshot, exact identity / price / PI; reservation
+   * steps ALSO need the strict margin. Cleanup and the TEST abort are NOT blocked by expiry (they only release); their sends keep the accepted
+   * proof / state / idempotency fences of the workers / bridge. Expiry at cleanup is recorded, never presumed harmless.
+   */
+  async function fenceR1(where, basisIntent, L) {
+    const fi = await freshIntent(); if (fi.stop) return fi;
+    R.fences += 1;
+    const I = fi.intent;
+    if (!I || I.version !== basisIntent.version || I.status !== basisIntent.state) return stop("FACTS_MOVED");
+    const c = intentIdentityR1(I); if (c) return stop(c);
+    R.authDeadline = Math.min(I.payment.captureBefore, I.payment.authorizationDeadline);
+    if (where === "reservation") { if (!marginOk(L)) return stop("AUTHORIZATION_MARGIN_INSUFFICIENT"); }
+    else if (where === "cleanup" && R.expiredAtCleanup === null) { const t = businessNow(); R.expiredAtCleanup = t === null ? null : t >= R.authDeadline; }
+    return null;
+  }
+  /**
+   * post-cleanup exclusion re-read (DIAGNOSTIC): equal / changed / unread; ONE RR READ ONLY transaction on a fresh report client.
+   * Client ownership (root review of cc5e6cf): ANY rejected / timed-out / not-started / lost operation — incl. BEGIN and COMMIT — destroys the
+   * client ONCE and issues NO further SQL (no COMMIT / ROLLBACK); the client is released for reuse ONLY after a successful COMMIT. An
+   * ACKNOWLEDGED refusal from the accepted baseline reader with every statement settled (cap / malformed rows / run-intent reference) closes
+   * its read-only transaction with COMMIT. Never a booking effect: the run's release proof / outcome are untouched; the read's own
+   * uncertainty is reported in r1.exclusionRead.
+   */
+  async function exclusionRereadR1() {
+    R.exclusionAfter = "unread";
+    const X = { at: "connect", code: null, disposition: "not_acquired", uncertainty: "none" };
+    const done = () => { R.exclusionRead = freeze({ ...X }); };
+    const h = await acquire(pools.report, () => {});
+    if (h.pre || h.fail) { X.code = h.fail || S.cause || "STOPPED"; return done(); }
+    let dead = false;
+    const destroyOnce = () => { if (!dead) { dead = true; h.tracker.destroy(); X.disposition = "destroyed"; } };
+    /** one statement; the FIRST non-success destroys the client and every later call issues nothing */
+    const run = async (at, sql, p) => {
+      if (dead) return { ok: false, code: "CLIENT_DESTROYED" };
+      X.at = at;
+      if (h.tracker.state() !== "open") { X.code = "CLIENT_LOST"; destroyOnce(); return { ok: false, code: "CLIENT_LOST" }; }
+      const r = await statement(h, sql, p);
+      if (r.value !== undefined && h.tracker.state() === "open") return { ok: true, rows: rowsOf(r.value) };
+      X.code = r.fail || (r.pre ? (S.cause || "STOPPED") : "CLIENT_LOST");
+      if (r.fail === "TIMEOUT_DB_READ" || r.fail === "BUDGET_EXHAUSTED" || (r.fail && r.fail.startsWith("GUARD"))) X.uncertainty = "statement_may_still_run";
+      destroyOnce();
+      return { ok: false, code: "DB_FAILURE" };
+    };
+    try {
+      const b0 = await run("begin", SQL_BEGIN, []); if (!b0.ok) return done();
+      const bl = await readExclusionBaselineR1({ statement: (sql, p) => run("baseline", sql, p), ids: exclusionIdentifiers(B.r1.exclusions), currentIntentId: identity.intentId });
+      if (dead) return done();                                              // a DB-family fault inside the read: no COMMIT / ROLLBACK
+      if (!bl.ok) X.code = bl.code;                                         // acknowledged refusal: every statement settled
+      const cm = await run("commit", SQL_COMMIT, []); if (!cm.ok) return done();
+      h.release(); X.disposition = "released"; X.at = "done";
+      if (bl.ok) R.exclusionAfter = bl.baselineDigest === R.preflight.baselineDigest ? "equal" : "changed";
+      return done();
+    } catch { X.code = X.code || "INTERNAL"; destroyOnce(); return done(); }
+  }
+
   // P2 — reservation
   let r = await runPhase("reservation");
   if (r.stop) return stopped();
@@ -607,6 +770,7 @@ async function runAbortFlowV2(o, B) {
     const c = await runPhase("cleanup");
     if (c.stop) return stopped();
     if (c.ended !== "authorization_released") { stop("STATE_UNEXPECTED"); return stopped(); }
+    if (R1) await exclusionRereadR1();
     return ended("ENDED_RELEASED", null);
   }
   { const rb = boundary(); if (rb) return stopped(); }
@@ -619,6 +783,7 @@ async function runAbortFlowV2(o, B) {
   if (c.stop) return stopped();
   if (c.ended !== "cancelled") { stop("STATE_UNEXPECTED"); return stopped(); }
   { const rp = await releaseProof(); if (rp && rp.stop) return stopped(); }
+  if (R1) await exclusionRereadR1();
   { const rb = boundary(); if (rb) return stopped(); }
   { const a = await attestCheckpoint(K.reopened); if (a && a.stop) return stopped(); }
   return ended("ENDED_RELEASED", null);

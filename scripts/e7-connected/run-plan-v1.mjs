@@ -52,11 +52,11 @@ export const RUN_PLAN_CLOSURE = Object.freeze([
   "lib/checkout/server-pricer.js", "lib/direct-policy.js", "lib/direct-pricing.js", "lib/hostaway-calendar.js", "lib/hostaway-reservations.js", "lib/hostaway.js",
   "lib/public-api.js", "lib/quote-public.js", "package-lock.json", "package.json", "scripts/e7-connected/executor-adapters.mjs", "scripts/e7-connected/http-transports.mjs",
   "scripts/e7-connected/probe-credential-file.mjs", "scripts/e7-connected/probe-env-preflight.mjs", "scripts/e7-connected/probe-source-digest.mjs",
-  "scripts/e7-connected/real-exchange.mjs", "scripts/e7-connected/run-core-abort-v2.mjs", "scripts/e7-connected/run-core.mjs", "scripts/e7-connected/run-facts.mjs",
+  "scripts/e7-connected/real-exchange.mjs", "scripts/e7-connected/run-binding-r1.mjs", "scripts/e7-connected/run-core-abort-v2.mjs", "scripts/e7-connected/run-core.mjs", "scripts/e7-connected/run-facts.mjs",
   "scripts/e7-connected/run-guard.mjs", "scripts/e7-connected/run-journal-file-v2.mjs", "scripts/e7-connected/run-journal-file.mjs",
   "scripts/e7-connected/run-journal-memory-v2.mjs", "scripts/e7-connected/run-journal-memory.mjs", "scripts/e7-connected/run-manifest-v2.mjs",
   "scripts/e7-connected/run-manifest.mjs", "scripts/e7-connected/run-plan-command.mjs", "scripts/e7-connected/run-plan-v1.mjs",
-  "scripts/e7-connected/run-test-abort.mjs", "scripts/e7-operator/test-abort.mjs"]);
+  "scripts/e7-connected/run-preflight-r1.mjs", "scripts/e7-connected/run-test-abort.mjs", "scripts/e7-operator/test-abort.mjs"]);
 export const P_CHECKS = Object.freeze(["schema", "hashDomains", "sourceClosure", "sourceDigest", "environmentSnapshot", "stripeTestMode", "listingAllowed", "phasesExact",
   "allowedOpsExact", "checkpointsExact", "deadlineCaps", "stayRules", "exclusionsExact", "binding"]);
 export const L_CHECKS = Object.freeze(["dbSameInstanceTestMarkerAppAndReport", "intentPaymentAuthorizedExactBinding", "exclusionRowsUnchanged", "stripeAccountTestMode",

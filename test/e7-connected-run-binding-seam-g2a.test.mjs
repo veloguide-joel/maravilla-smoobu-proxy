@@ -256,7 +256,8 @@ test("G2a-S1 seam: *Bound APIs accept ONLY bindings minted by this module; copie
 test("G2a-S2 extraction boundary: the core flow is NOT exported, takes no hooks; public entrypoints / constants unchanged; synthetic gates retained", async () => {
   const core = await import("../scripts/e7-connected/run-core-abort-v2.mjs");
   const oldCore = await load(dirs[0], "scripts/e7-connected/run-core-abort-v2.mjs");
-  assert.deepEqual(Object.keys(core).sort(), Object.keys(oldCore).sort(), "same export names");
+  // M2-G2b (contract §9): the old export names + EXACTLY the two intended R1 exports; every old constant still byte-equal below
+  assert.deepEqual(Object.keys(core).sort(), [...Object.keys(oldCore), "R1_AFTER_RESERVATION_BUDGET_MS", "runReservationAbortR1"].sort(), "old export names + the two G2b R1 exports");
   for (const k of Object.keys(oldCore)) if (typeof oldCore[k] !== "function") assert.equal(ser(core[k]), ser(oldCore[k]), `constant ${k}`);
   assert.ok(!("runAbortFlowV2" in core));
   const src = readFileSync(join(ROOT, "scripts/e7-connected/run-core-abort-v2.mjs"), "utf8");
@@ -266,8 +267,14 @@ test("G2a-S2 extraction boundary: the core flow is NOT exported, takes no hooks;
   assert.equal(v2src, execFileSync("git", ["-C", ROOT, "show", `${BASE}:scripts/e7-connected/run-manifest-v2.mjs`], { encoding: "utf8" }), "v2 validator byte-exact");
   // the four changed modules are the ONLY changed runtime files vs the base (plus the G1 preflight's two mechanical origin pins)
   const changed = execFileSync("git", ["-C", ROOT, "diff", "--name-only", BASE, "--", "scripts", "lib", "db", ".github"], { encoding: "utf8" }).trim().split("\n").filter(Boolean).sort();
+  // M2-G2b (contract §9): + run-plan-v1.mjs, whose ONLY change is the two foundation-closure paths the R1 consumer now imports
   assert.deepEqual(changed, ["scripts/e7-connected/run-core-abort-v2.mjs", "scripts/e7-connected/run-journal-file-v2.mjs", "scripts/e7-connected/run-journal-memory-v2.mjs",
-    "scripts/e7-connected/run-preflight-r1.mjs", "scripts/e7-connected/run-test-abort.mjs"]);
+    "scripts/e7-connected/run-plan-v1.mjs", "scripts/e7-connected/run-preflight-r1.mjs", "scripts/e7-connected/run-test-abort.mjs"]);
+  const planDiff = execFileSync("git", ["-C", ROOT, "diff", "-U0", BASE, "--", "scripts/e7-connected/run-plan-v1.mjs"], { encoding: "utf8" }).split("\n").filter((l) => /^[+-][^+-]/.test(l));
+  const added = (sign) => planDiff.filter((l) => l[0] === sign).join("\n").match(/"[^"]+"/g);
+  assert.deepEqual([...new Set(added("+"))].filter((x) => !(added("-") || []).includes(x)).sort(), ['"scripts/e7-connected/run-binding-r1.mjs"', '"scripts/e7-connected/run-preflight-r1.mjs"'],
+    "run-plan-v1: only the two closure paths added");
+  assert.deepEqual((added("-") || []).filter((x) => !added("+").includes(x)), [], "run-plan-v1: nothing removed");
   const pf = execFileSync("git", ["-C", ROOT, "diff", "-U0", BASE, "--", "scripts/e7-connected/run-preflight-r1.mjs"], { encoding: "utf8" });
   const changedLines = pf.split("\n").filter((l) => /^[+-][^+-]/.test(l));
   assert.equal(changedLines.length, 4, "exactly the two origin-pin lines changed in the G1 preflight");

@@ -10,7 +10,7 @@ import { randomBytes } from "node:crypto";
 import { types } from "node:util";
 import { canonicalJson } from "./run-manifest.mjs";
 import { parseJournalBytes, encodeRecordLine, createNodeFsAdapter, MAX_LINE_BYTES, MAX_FILE_BYTES, LOCK_BYTES, POSIX_PLATFORMS } from "./run-journal-file.mjs";
-import { bindManifestV2, validateRecordBound, validateJournalBound, journalFactsBound, recordHashV2, GENESIS_HASH } from "./run-journal-memory-v2.mjs";
+import { bindManifestV2, bindingKindV2, validateRecordBound, validateJournalBound, journalFactsBound, recordHashV2, GENESIS_HASH } from "./run-journal-memory-v2.mjs";
 
 export const RUN_JOURNAL_FILE_V2_VERSION = "e7-run-journal-file-v2";
 export const journalFileNameV2 = (runId) => `e7-journal-v2-${runId}.jsonl`;
@@ -18,6 +18,10 @@ export const headFileNameV2 = (runId) => `e7-head-v2-${runId}.jsonl`;
 export const RELATIONS = Object.freeze(["GENESIS_EMPTY", "AT_ESCROW_HEAD", "JOURNAL_AHEAD_1", "HEAD_AHEAD", "GAP_GT_1", "HASH_MISMATCH", "HEAD_IDENTITY_MISMATCH",
   "JOURNAL_INVALID", "JOURNAL_MISSING", "HEAD_MISSING", "BOTH_MISSING", "CORRUPT", "UNSAFE"]);
 export const NO_PERMISSION = Object.freeze({ newRun: false, resume: false, adopt: false, cleanup: false, send: false });
+/** M2-G2b: the R1 file journal — SAME mechanics (one implementation below), distinct file names, head-line domain and report version */
+export const RUN_JOURNAL_FILE_R1_VERSION = "e7-run-journal-file-r1";
+export const journalFileNameR1 = (runId) => `e7-journal-r1-${runId}.jsonl`;
+export const headFileNameR1 = (runId) => `e7-head-r1-${runId}.jsonl`;
 
 const freeze = Object.freeze;
 const apply = Reflect.apply;
@@ -156,7 +160,12 @@ function makeLock(fs, K, path) {
   return { acquire, release, held: () => ident !== null };
 }
 
-const headLine = (identity, seq, hash) => Buffer.from(`${canonicalJson({ v: 2, runId: identity.runId, manifestHash: identity.manifestHash, seq, hash })}\n`, "utf8");
+const headLine = (identity, seq, hash, v) => Buffer.from(`${canonicalJson({ v, runId: identity.runId, manifestHash: identity.manifestHash, seq, hash })}\n`, "utf8");
+/** the per-kind file format: v2 values are EXACTLY the pre-G2b constants */
+const FORMAT = freeze({
+  v2: freeze({ journalName: journalFileNameV2, headName: headFileNameV2, headV: 2, version: RUN_JOURNAL_FILE_V2_VERSION }),
+  r1: freeze({ journalName: journalFileNameR1, headName: headFileNameR1, headV: "r1", version: RUN_JOURNAL_FILE_R1_VERSION })
+});
 
 // =================================================================================================================================
 /**
@@ -168,7 +177,20 @@ export async function openFileJournalV2(input) {
   if (!o) return refuse("JOURNAL_OPTIONS_INVALID");
   const b = bindManifestV2(o.manifest);
   if (!b.ok) return refuse(b.manifestCode || "MANIFEST_INVALID");
-  const binding = b.binding; const identity = binding.identity;
+  return openBound(o, b.binding, FORMAT.v2);
+}
+/**
+ * M2-G2b: openFileJournalR1({ journalDir, headDir, binding, fsAdapter? }) — the SAME creation-only dual-file writer for an R1 binding minted by
+ * bindRunPackageR1Journal (BINDING_UNVERIFIED for anything else: v2 bindings, copies, hand-built objects). Same never-rejects result shape.
+ */
+export async function openFileJournalR1(input) {
+  const o = safe(() => plainData(input, ["journalDir", "headDir", "binding"], ["fsAdapter"]));
+  if (!o) return refuse("JOURNAL_OPTIONS_INVALID");
+  if (bindingKindV2(o.binding) !== "r1") return refuse("BINDING_UNVERIFIED");
+  return openBound(o, o.binding, FORMAT.r1);
+}
+async function openBound(o, binding, FMT) {
+  const identity = binding.identity;
   const fs = "fsAdapter" in o ? snapAdapter(o.fsAdapter) : createNodeFsAdapter();
   if (!fs) return refuse("JOURNAL_OPTIONS_INVALID");
   if (!POSIX_PLATFORMS.includes(fs.platform)) return refuse("JOURNAL_PLATFORM_UNSUPPORTED");
@@ -177,7 +199,7 @@ export async function openFileJournalV2(input) {
   const jd = await K.checkDir(journalDir); if (jd.code) return refuse(jd.code);
   const hd = await K.checkDir(headDir); if (hd.code) return refuse(hd.code);
   if (sameNode(jd.stat, hd.stat) || journalDir === headDir) return refuse("JOURNAL_DIR_ALIAS");
-  const jPath = join(journalDir, journalFileNameV2(identity.runId)); const hPath = join(headDir, headFileNameV2(identity.runId));
+  const jPath = join(journalDir, FMT.journalName(identity.runId)); const hPath = join(headDir, FMT.headName(identity.runId));
   const jLock = makeLock(fs, K, `${jPath}.lock`); const hLock = makeLock(fs, K, `${hPath}.lock`);
   const cleanupLocks = async () => { const h = await hLock.release(); const j = await jLock.release(); return h === "failed" || j === "failed" ? "failed" : "released_own"; };
 
@@ -235,7 +257,7 @@ export async function openFileJournalV2(input) {
     let line; try { line = encodeRecordLine(r); } catch { return fail("RECORD_INVALID"); }
     if (line.length > MAX_LINE_BYTES) return fail("LINE_TOO_LONG");
     if (F.j.known.length + line.length > MAX_FILE_BYTES) return fail("JOURNAL_FULL");
-    const hash = recordHashV2(r); const hl = headLine(identity, r.seq, hash);
+    const hash = recordHashV2(r); const hl = headLine(identity, r.seq, hash, FMT.headV);
     S.busy = "append";
     return track((async () => {
       try {
@@ -318,7 +340,18 @@ export async function readJournalForRecoveryV2(input) {
   if (!o) return out({ ok: false, code: "RECOVERY_OPTIONS_INVALID" });
   const b = bindManifestV2(o.manifest);
   if (!b.ok) return out({ ok: false, code: b.manifestCode || "MANIFEST_INVALID" });
-  const binding = b.binding; const identity = binding.identity;
+  return recoverBound(o, b.binding, FORMAT.v2, out);
+}
+/** M2-G2b: readJournalForRecoveryR1({ journalDir, headDir, binding, trustedHead?, fsAdapter? }) — the SAME diagnostics; permission ALWAYS none */
+export async function readJournalForRecoveryR1(input) {
+  const out = (o) => freeze({ version: RUN_JOURNAL_FILE_R1_VERSION, permission: NO_PERMISSION, ...o });
+  const o = safe(() => plainData(input, ["journalDir", "headDir", "binding"], ["fsAdapter", "trustedHead"]));
+  if (!o) return out({ ok: false, code: "RECOVERY_OPTIONS_INVALID" });
+  if (bindingKindV2(o.binding) !== "r1") return out({ ok: false, code: "BINDING_UNVERIFIED" });
+  return recoverBound(o, o.binding, FORMAT.r1, out);
+}
+async function recoverBound(o, binding, FMT, out) {
+  const identity = binding.identity;
   let supplied = null;
   if ("trustedHead" in o && o.trustedHead !== null) {
     const t = safe(() => plainData(o.trustedHead, ["hash", "seq"]));
@@ -334,7 +367,7 @@ export async function readJournalForRecoveryV2(input) {
   const jd = await K.checkDir(o.journalDir); if (jd.code) return unsafe(jd.code);
   const hd = await K.checkDir(o.headDir); if (hd.code) return unsafe(hd.code);
   if (sameNode(jd.stat, hd.stat) || o.journalDir === o.headDir) return unsafe("JOURNAL_DIR_ALIAS");
-  const jPath = join(o.journalDir, journalFileNameV2(identity.runId)); const hPath = join(o.headDir, headFileNameV2(identity.runId));
+  const jPath = join(o.journalDir, FMT.journalName(identity.runId)); const hPath = join(o.headDir, FMT.headName(identity.runId));
   const presence = freeze({ journal: await presenceOf(K, jPath), head: await presenceOf(K, hPath), journalLock: await presenceOf(K, `${jPath}.lock`), headLock: await presenceOf(K, `${hPath}.lock`) });
   const jf = await readOnlyFile(fs, K, jPath); const hf = await readOnlyFile(fs, K, hPath);
   if (jf.code || hf.code) return out({ ...base, presence, relation: (jf.code || hf.code) === "CORRUPT" ? "CORRUPT" : "UNSAFE", detail: `${jf.code || "ok"}/${hf.code || "ok"}`, unresolved: freeze(["DISK_UNREADABLE"]) });
@@ -348,7 +381,7 @@ export async function readJournalForRecoveryV2(input) {
   // head lines: exact shape, this identity, contiguous seq from 1
   const heads = [];
   for (const [i, x] of ph.records.entries()) {
-    const ok = x && typeof x === "object" && !Array.isArray(x) && Object.keys(x).sort().join() === HEAD_KEYS.join() && x.v === 2 && x.runId === identity.runId
+    const ok = x && typeof x === "object" && !Array.isArray(x) && Object.keys(x).sort().join() === HEAD_KEYS.join() && x.v === FMT.headV && x.runId === identity.runId
       && x.manifestHash === identity.manifestHash && x.seq === i + 1 && typeof x.hash === "string" && HEX64.test(x.hash);
     if (!ok) return out({ ...base, presence, ...tails, relation: "HEAD_IDENTITY_MISMATCH", unresolved: freeze(["HEAD_UNTRUSTED"]) });
     heads.push(x);
