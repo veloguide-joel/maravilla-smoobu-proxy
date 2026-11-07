@@ -1,5 +1,7 @@
 -- e7-0018-readback-v1.sql — PURE READ-ONLY. Run it BEFORE and AFTER the 0018 apply wrapper and compare the two JSON results by eye / hash.
--- It writes nothing, takes no lock, and returns no guest field or credential. Owner/app/admin may run it (it only reads catalogs + counts).
+-- It writes nothing, takes no lock, and returns no guest field or credential. SCHEMA-OWNER ONLY in practice: although it only reads catalogs +
+-- counts, it reads booking_migrations.applied, and app/admin/report have no USAGE on schema booking_migrations (0001), so only the owner can run it.
+-- NOTE: editing this header changes this file's sha256; the artifact actually run PRE/POST on 2026-11-07 was the prior byte-identical-body version with sha256 6cd135205ad41b92525465841de10af3d86ec3ff938825f0f51cd71ea59815af. The SELECT below is unchanged.
 -- Expected BEFORE: is_privileged.prosrc_sha256 = 701fade9…20c69, proconfig = null, acl = the exact owner/app/admin set, migrations.max = 17.
 -- Expected AFTER:  is_privileged.prosrc_sha256 = a14a1dc5…fb9d, proconfig = ["search_path=pg_catalog, pg_temp"], acl UNCHANGED, migrations.max = 18
 --                  with exactly one added v18 row; every OTHER booking function fingerprint and every booking table row fingerprint IDENTICAL.
