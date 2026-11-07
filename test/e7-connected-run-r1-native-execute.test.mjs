@@ -106,8 +106,8 @@ function fixture(root = ROOT) {
   assert.ok(built.ok, built.code);
   const d = tmp("g3b-boot-");
   const f = { package: put(d, "package.json", `${canonicalJson(built.package)}\n`), plan: put(d, "plan.json", planBytes), provider: put(d, "provider.json", JSON.stringify({ hostawayToken: HTOKEN, stripeTestKey: SKEY })),
-    app: put(d, "app.json", JSON.stringify({ schema: "e7-db-login-v1", role: "mv_booking_app", connectionString: `postgresql://u_app:${CANARY}@db.synthetic.invalid:5432/postgres` })),
-    report: put(d, "report.json", JSON.stringify({ schema: "e7-db-login-v1", role: "mv_booking_report", connectionString: `postgresql://u_rep:${CANARY}@db.synthetic.invalid:5432/postgres` })),
+    app: put(d, "app.json", JSON.stringify({ schema: "e7-db-login-v1", role: "mv_booking_app", connectionString: `postgresql://u_app:${CANARY}@db.mxotevtiscernhqilyiu.supabase.co:5432/postgres` })),
+    report: put(d, "report.json", JSON.stringify({ schema: "e7-db-login-v1", role: "mv_booking_report", connectionString: `postgresql://u_rep:${CANARY}@db.mxotevtiscernhqilyiu.supabase.co:5432/postgres` })),
     jd: join(d, "j"), hd: join(d, "h") };
   mkdirSync(f.jd, { mode: 0o700 }); mkdirSync(f.hd, { mode: 0o700 });
   return { f, built, executorDigest: R.executorDigestR1(EXEC), intent: plan.binding.intentId };
@@ -160,6 +160,53 @@ test("N4 REAL child boot past verification, refusals in the reviewed order: pack
     assert.equal(r.out.result.run, null);
   }
   assert.deepEqual(readdirSync(x.f.jd), [], "no journal created by any refusal");
+});
+
+test("N5 (root de6285b5 P1/P2) REAL child boot: endpoint policy refuses BEFORE the CA read and ANY pool (6543 / 6432 / other host / IP literal / loopback without the in-process seam / mixed / missing or wrong pooler suffix / suffix on direct / other db); the exact session-pooler shape passes to the next accepted gate; the loopback seam is unreachable from argv / env", () => {
+  const x = fixture(); const d = dirname(x.f.app);
+  const login = (name, role, url) => put(d, name, JSON.stringify({ schema: "e7-db-login-v1", role, connectionString: url }));
+  const P = "aws-0-us-east-1.pooler.supabase.com"; const DH = "db.mxotevtiscernhqilyiu.supabase.co"; const SUF = ".mxotevtiscernhqilyiu";
+  const pair = (a, r) => ({ "--db-app": login(`a-${createHash("sha256").update(a).digest("hex").slice(0, 8)}.json`, "mv_booking_app", a.replace("PW", CANARY)),
+    "--db-report": login(`r-${createHash("sha256").update(r).digest("hex").slice(0, 8)}.json`, "mv_booking_report", r.replace("PW", CANARY)) });
+  const both = (h, ua, ur, rest = ":5432/postgres") => pair(`postgresql://${ua}:PW@${h}${rest}`, `postgresql://${ur}:PW@${h}${rest}`);
+  const refusedCases = [
+    ["pooler transaction port 6543", both(P, `u_app${SUF}`, `u_rep${SUF}`, ":6543/postgres")],
+    ["direct port 6543", both(DH, "u_app", "u_rep", ":6543/postgres")],
+    ["port 6432", both(P, `u_app${SUF}`, `u_rep${SUF}`, ":6432/postgres")],
+    ["other project host", both("db.aaaaaaaaaaaaaaaaaaaa.supabase.co", "u_app", "u_rep")],
+    ["other region pooler", both("aws-0-eu-west-1.pooler.supabase.com", `u_app${SUF}`, `u_rep${SUF}`)],
+    ["IPv4 literal", both("10.1.2.3", "u_app", "u_rep")],
+    ["IPv6 literal", both("[2600:1f18::1]", "u_app", "u_rep")],
+    ["loopback without the in-process seam", both("127.0.0.1", "u_app", "u_rep")],
+    ["pooler missing suffix", both(P, "u_app", "u_rep")],
+    ["pooler wrong suffix", both(P, "u_app.aaaaaaaaaaaaaaaaaaaa", "u_rep.aaaaaaaaaaaaaaaaaaaa")],
+    ["suffix on direct", both(DH, `u_app${SUF}`, `u_rep${SUF}`)],
+    ["other database", both(DH, "u_app", "u_rep", ":5432/booking")],
+    ["pooler with one slot unsuffixed (same host text)", pair(`postgresql://u_app${SUF}:PW@${P}:5432/postgres`, `postgresql://u_rep:PW@${P}:5432/postgres`)]
+  ];
+  for (const [label, over] of refusedCases) {
+    const r = boot(argsOf(x, { ...over, "--db-ca": join(d, "missing-ca.pem") }));
+    assert.deepEqual([r.status, r.out.outcome, r.out.result.refused, r.out.result.run], [4, "EXECUTE_REFUSED", { stage: "db-endpoint", code: "ENDPOINT_MODE_REFUSED" }, null], `${label}: ${JSON.stringify(r.out)}`);
+    assert.ok(!JSON.stringify(r.out).includes("supabase") && !JSON.stringify(r.out).includes("u_app"), `${label}: no host / user text in the result`);
+  }
+  // mixed endpoints (different host / port / db text) are refused EARLIER by the accepted login reader, still before the CA read and any pool
+  // (diagnosed in this slice's second TAP; the policy's own mixed-mode refusal is proven in the pure matrix of e7-connected-native-endpoint-policy)
+  { const r = boot(argsOf(x, { ...pair(`postgresql://u_app:PW@${DH}:5432/postgres`, `postgresql://u_rep${SUF}:PW@${P}:5432/postgres`), "--db-ca": join(d, "missing-ca.pem") }));
+    assert.deepEqual([r.status, r.out.result.refused], [4, { stage: "db-login-pair", code: "DB_TARGET_TEXT_MISMATCH" }], "mixed direct / pooler"); }
+  // controls: both exact shapes pass the policy and reach the NEXT accepted gate (missing CA file → CA_READ_FAILED; no DNS / connect)
+  for (const [label, over] of [["direct", both(DH, "u_app", "u_rep")], ["session pooler", both(P, `u_app${SUF}`, `u_rep${SUF}`)]]) {
+    const r = boot(argsOf(x, { ...over, "--db-ca": join(d, "missing-ca.pem") }));
+    assert.deepEqual([r.status, r.out.result.refused], [4, { stage: "db-ca", code: "CA_READ_FAILED" }], `${label}: ${JSON.stringify(r.out)}`);
+    const r2 = boot(argsOf(x, over));
+    assert.deepEqual(r2.out.result.refused, { stage: "pool", code: "POOL_CONFIG_REFUSED" }, `${label}: remote without CA still refused by the accepted pool`);
+  }
+  assert.deepEqual(readdirSync(x.f.jd), [], "no journal created by any refusal");
+  // the loopback seam is IN-PROCESS only: the native boot passes defaultHooks() (no `launch`), and nothing outside the launcher names the seam
+  assert.equal(CLI.defaultHooks().launch, undefined);
+  for (const f of ["scripts/e7-connected/run-plan-cli-main.mjs", "scripts/e7-connected/probe-cli-main.mjs", "scripts/e7-connected/probe-env-preflight.mjs"])
+    assert.ok(!readFileSync(join(ROOT, f), "utf8").includes("loopbackEndpointsForTests"), `${f} never names the seam`);
+  const launcherSrc = readFileSync(join(ROOT, "scripts/e7-connected/run-r1-launcher.mjs"), "utf8");
+  assert.ok(!/process\.(env|argv)/.test(launcherSrc), "the launcher reads no process env / argv");
 });
 
 // =================================================================================================================================

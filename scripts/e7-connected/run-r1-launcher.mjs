@@ -19,12 +19,101 @@ import { evaluateProbeEnvironment } from "./probe-env-preflight.mjs";
 import { RUN_PLAN_CLOSURE, MAX_SOURCE_FILE_BYTES, MAX_SOURCE_TOTAL_BYTES, MAX_PLAN_BYTES } from "./run-plan-v1.mjs";
 import { R1_EXECUTOR_CLOSURE, MAX_PACKAGE_BYTES } from "./run-binding-r1.mjs";
 import { createBookingPool } from "../../lib/booking-db/pool.js";
+import { LOCK_KEY } from "./run-core.mjs";
 
 export const LAUNCH_RESULT_SCHEMA = "e7-r1-launch-result-v1";
 export const MAX_CA_BYTES = 65_536;
 export const POOL_MAX = Object.freeze({ app: 4, report: 4 });
 export const POOL_END_BOUND_MS = 10_000;
 export const EVIDENCE_REF_RE = /^[A-Za-z0-9._:/-]{1,128}$/;              // = the accepted journal's attestation evidenceRef rule
+// ---- P1/P2 endpoint policy (contract claude/e7-native-endpoint-policy.md; root de6285b5 B) — the ONLY two accepted DEV endpoints -----------
+export const DEV_PROJECT_REF = "mxotevtiscernhqilyiu";
+export const ENDPOINTS = freezeDeep({
+  direct: { host: "db.mxotevtiscernhqilyiu.supabase.co", port: "5432", database: "postgres", userSuffix: "" },
+  "session-pooler": { host: "aws-0-us-east-1.pooler.supabase.com", port: "5432", database: "postgres", userSuffix: ".mxotevtiscernhqilyiu" }
+});
+const ROLE_NAME_RE = /^[a-z_][a-z0-9_]{0,62}$/;
+const LOOPBACK_TEST_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+function freezeDeep(o) { for (const v of Object.values(o)) if (v && typeof v === "object") freezeDeep(v); return Object.freeze(o); }
+/** pure text classification of ONE login URL → mode name | null (no DNS / connect; nothing echoed) */
+function endpointModeOf(connectionString, loopbackForTests) {
+  let u; try { u = new URL(connectionString); } catch { return null; }
+  if (u.protocol !== "postgres:" && u.protocol !== "postgresql:") return null;
+  const segs = u.pathname.split("/");
+  if (segs.length !== 2 || segs[0] !== "") return null;
+  const database = segs[1]; const user = u.username;
+  for (const [mode, e] of Object.entries(ENDPOINTS)) {
+    if (u.hostname !== e.host || u.port !== e.port || database !== e.database) continue;
+    if (e.userSuffix === "") return ROLE_NAME_RE.test(user) ? mode : null;
+    if (!user.endsWith(e.userSuffix)) return null;
+    return ROLE_NAME_RE.test(user.slice(0, -e.userSuffix.length)) ? mode : null;
+  }
+  if (loopbackForTests === true && LOOPBACK_TEST_HOSTS.has(u.hostname) && ROLE_NAME_RE.test(user) && database !== "") return `loopback-test\0${u.hostname}\0${u.port}\0${database}`;
+  return null;
+}
+/**
+ * checkEndpointPolicy(logins, { loopbackForTests }) → { ok:true, mode } | { ok:false, code:"ENDPOINT_MODE_REFUSED" }.
+ *   Both slots must classify to the SAME accepted mode (same host / port / database). loopbackForTests is an IN-PROCESS seam only.
+ */
+export function checkEndpointPolicy(logins, opts) {
+  const lb = !!(opts && opts.loopbackForTests === true);
+  const no = freeze({ ok: false, code: "ENDPOINT_MODE_REFUSED" });
+  try {
+    const a = endpointModeOf(logins.app.connectionString, lb); const r = endpointModeOf(logins.report.connectionString, lb);
+    if (a === null || r === null || a !== r) return no;
+    return freeze({ ok: true, mode: a.startsWith("loopback-test") ? "loopback-test" : a });
+  } catch { return no; }
+}
+
+// ---- P3 report-lock pre-check (read-only snapshot diagnostic; P0 stays decisive) --------------------------------------------------------
+export const LOCK_PRECHECK_SQL = "SELECT count(*)::int AS n FROM pg_catalog.pg_locks l"
+  + " WHERE l.locktype = 'advisory' AND l.granted"
+  + " AND l.database = (SELECT d.oid FROM pg_catalog.pg_database d WHERE d.datname = pg_catalog.current_database())"
+  + " AND l.classid = ((pg_catalog.hashtext($1)::bigint + 4294967296) % 4294967296)::oid"
+  + " AND l.objid = 0::oid AND l.objsubid = 2";
+export const LOCK_PRECHECK_CONNECT_MS = 10_000;
+export const LOCK_PRECHECK_QUERY_MS = 5_000;
+/**
+ * lockPrecheck(pool, { proc, K, signal }) → Promise<{ code }>, never rejects. code ∈ LOCK_PRECHECK_CLEAR | RUN_LOCK_PRESENT_BEFORE_START |
+ *   LOCK_PRECHECK_UNAVAILABLE | LOCK_PRECHECK_INTERRUPTED. ONE client, ONE statement, destroyed exactly once (release(true)); a client that
+ *   arrives late is destroyed on arrival; no SQL after a failed / unknown step; never unlocks / terminates / adopts; no error text kept.
+ */
+export function lockPrecheck(pool, { proc, K = 1, signal } = {}) {
+  return new Promise((resolve) => {
+    let settled = false; let client = null; let timer = null; let destroyed = false;
+    const onErr = () => {};
+    const destroy = (c) => { if (!c || (c === client && destroyed)) return; if (c === client) destroyed = true; try { c.removeListener?.("error", onErr); } catch { /* */ } try { c.release(true); } catch { /* */ } };
+    const finish = (code) => {
+      if (settled) return; settled = true;
+      if (timer !== null) { try { proc.clearTimer(timer); } catch { /* */ } timer = null; }
+      if (signal) signal.removeEventListener("abort", onAbort);
+      destroy(client);
+      resolve(freeze({ code }));
+    };
+    const onAbort = () => finish("LOCK_PRECHECK_INTERRUPTED");
+    const arm = (ms) => { timer = proc.setTimer(() => { timer = null; finish("LOCK_PRECHECK_UNAVAILABLE"); }, Math.max(0, ms / K)); };
+    if (signal) { if (signal.aborted) { finish("LOCK_PRECHECK_INTERRUPTED"); return; } signal.addEventListener("abort", onAbort, { once: true }); }
+    let p;
+    try { if (signal && signal.aborted) { finish("LOCK_PRECHECK_INTERRUPTED"); return; } arm(LOCK_PRECHECK_CONNECT_MS); p = Promise.resolve(pool.connect()); }
+    catch { finish("LOCK_PRECHECK_UNAVAILABLE"); return; }
+    p.then((c) => {
+      if (settled) { destroy(c); return; }                                     // late arrival after timeout / interrupt
+      client = c; try { c.on?.("error", onErr); } catch { /* */ }
+      if (timer !== null) { proc.clearTimer(timer); timer = null; }
+      if (signal && signal.aborted) { finish("LOCK_PRECHECK_INTERRUPTED"); return; }
+      let q;
+      try { arm(LOCK_PRECHECK_QUERY_MS); q = Promise.resolve(c.query(LOCK_PRECHECK_SQL, [LOCK_KEY])); }
+      catch { finish("LOCK_PRECHECK_UNAVAILABLE"); return; }
+      q.then((res) => {
+        if (settled) return;
+        const rows = res && Array.isArray(res.rows) ? res.rows : null;
+        const n = rows && rows.length === 1 && rows[0] && typeof rows[0] === "object" ? rows[0].n : undefined;
+        if (!Number.isSafeInteger(n) || n < 0) { finish("LOCK_PRECHECK_UNAVAILABLE"); return; }
+        finish(n === 0 ? "LOCK_PRECHECK_CLEAR" : "RUN_LOCK_PRESENT_BEFORE_START");
+      }, () => finish("LOCK_PRECHECK_UNAVAILABLE"));
+    }, () => finish("LOCK_PRECHECK_UNAVAILABLE"));
+  });
+}
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const freeze = Object.freeze;
 
@@ -50,7 +139,8 @@ const refused = (stage, code, pools) => freeze({ stage, code, result: sanitize(n
 /**
  * runR1Launch({ flags, nat, proc, hooks, signal, attest, repoRoot }) → Promise<{ stage, code, result }>; never rejects.
  *   flags: the CLI's validated execute flags. nat: the accepted native adapters (probe-cli-main). attest: the native stdin attestation callback.
- *   hooks (IN-PROCESS ONLY, never selectable from argv / env): { exchanges?, timeScale? } — default real https exchanges, real time.
+ *   hooks (IN-PROCESS ONLY, never selectable from argv / env): { exchanges?, timeScale?, loopbackEndpointsForTests? } — default real https
+ *   exchanges, real time, and ONLY the two exact DEV endpoints (direct / session pooler).
  */
 export async function runR1Launch(input) {
   const { flags, nat, proc, hooks, signal, attest, repoRoot } = input;
@@ -78,6 +168,9 @@ export async function runR1Launch(input) {
   if (!pc.ok) return refused("provider-credentials", pc.code);
   const db = await readDbLoginFiles({ appPath: flags.dbApp, reportPath: flags.dbReport, repoRoot, fs: nat.credentialFs });
   if (!db.ok) return refused(`db-login-${db.slot ?? "pair"}`, db.code);
+  // ---- (3b) P1/P2 endpoint policy: exact DEV direct OR exact DEV session pooler, same for both slots; BEFORE the CA read and ANY pool -----
+  const ep = checkEndpointPolicy(db.logins, { loopbackForTests: !!(hooks && hooks.loopbackEndpointsForTests === true) });
+  if (!ep.ok) return refused("db-endpoint", ep.code);
   let caPem = null;
   if (flags.dbCa !== "none") {
     try {
@@ -98,11 +191,14 @@ export async function runR1Launch(input) {
   const ts = xs.ok ? createE7StripeTestSend({ exchange: xs.exchange, credential: () => creds.stripeTestKey, accountId: B.manifest.stripeAccountId, apiVersion: flags.stripeApiVersion }) : xs;
   const endPools = () => endAll(pools, proc);
   if (!th.ok || !ts.ok) { const pe = await endPools(); return refused("transport", "TRANSPORT_OPTIONS_INVALID", pe); }
+  const K = hooks && Number.isSafeInteger(hooks.timeScale) && hooks.timeScale > 0 ? hooks.timeScale : 1;
+  // ---- (4b) P3 read-only report-lock pre-check (both endpoint modes); BEFORE the journal and the core; P0 remains decisive -------------
+  const lp = await lockPrecheck(pools.report, { proc, K, signal });
+  if (lp.code !== "LOCK_PRECHECK_CLEAR") { const pe = await endPools(); return refused("lock-precheck", lp.code, pe); }
   // ---- (5) creation-only R1 file + head journal (explicit owner dirs; never reopen / resume / repair) ---------------------------------
   const fj = await openFileJournalR1({ journalDir: flags.journalDir, headDir: flags.headDir, binding: B });
   if (!fj.ok) { const pe = await endPools(); return freeze({ stage: "journal", code: fj.code, result: sanitize(null, { refused: { stage: "journal", code: fj.code }, teardown: { pools: pe } }) }); }
   // ---- (6) the accepted consumer (lock, same-DB / TEST / roles, fresh preflight, fences, bridge, cleanup, release, exclusion re-read) --
-  const K = hooks && Number.isSafeInteger(hooks.timeScale) && hooks.timeScale > 0 ? hooks.timeScale : 1;
   const t0 = proc.monotonic(); const mono = () => (proc.monotonic() - t0) * K;
   const timers = freeze({ arm: (ms) => { let id; const promise = new Promise((res) => { id = proc.setTimer(res, Math.max(0, ms / K)); }); return { promise, cancel: () => proc.clearTimer(id) }; } });
   let r = null;

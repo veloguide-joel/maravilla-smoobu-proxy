@@ -36,6 +36,8 @@ import * as R from "../../scripts/e7-connected/run-binding-r1.mjs";
 import { readJournalForRecoveryR1 } from "../../scripts/e7-connected/run-journal-file-v2.mjs";
 import { bindRunPackageR1Journal } from "../../scripts/e7-connected/run-journal-memory-v2.mjs";
 import * as CLI from "../../scripts/e7-connected/run-plan-cli-main.mjs";
+import * as L from "../../scripts/e7-connected/run-r1-launcher.mjs";                  // ADDED (de6285b5 P3): exported pre-check SQL for the mapping proofs
+import { LOCK_KEY } from "../../scripts/e7-connected/run-core.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const ABORT_LISTING = 606998;
@@ -484,7 +486,7 @@ async function launch(o = {}) {
     fsConstants: FS_CONSTANTS, stdin: S.stdin, stderr, onSignal: (n, fn) => { S.sig[n] = fn; }, monotonic: () => performance.now(),
     setTimer: (fn, ms) => setTimeout(fn, ms), clearTimer: (id) => clearTimeout(id),
     stdout: { once: () => {}, write: (s, cb) => { S.out.push(s); cb(); return true; } }, exit: (c) => { if (S.code === null) S.code = c; }, setExitCode: () => {}, now: () => S.clock() };
-  S.hooks = { ...CLI.defaultHooks(), launch: { exchanges: { hostaway: S.t.x.hostaway, stripe: S.t.x.stripe }, timeScale: 10 } };
+  S.hooks = { ...CLI.defaultHooks(), launch: { exchanges: { hostaway: S.t.x.hostaway, stripe: S.t.x.stripe }, timeScale: 10, loopbackEndpointsForTests: true } };   // CHANGED (de6285b5): disposable-PG loopback seam, IN-PROCESS only
   S.run = async () => { await CLI.main(S.proc, S.hooks); S.line = S.out.length === 1 ? JSON.parse(S.out[0]) : null; return S.line; };
   S.cleanup = async () => {};
   LIVE.push(S);
@@ -612,7 +614,7 @@ test("E5 refusals BEFORE sensitive access (in-process native path): wrong native
     assert.deepEqual(line.result.refused, { stage: "pool", code: "POOL_CONFIG_REFUSED" }, "the accepted pool refuses URL TLS overrides (owner files must omit sslmode)");
     assert.deepEqual(await appPids(), pids0); assert.deepEqual(writesAt(S), [0, 0, 0, 0, 0]); }
   { const S = await launch(); const files = ownerDir("g3b-remote-");
-    const remote = (role, user) => put(files, `${role}.json`, JSON.stringify({ schema: "e7-db-login-v1", role, connectionString: `postgresql://${user}:${CANARY}@db.synthetic.invalid:5432/postgres` }));
+    const remote = (role, user) => put(files, `${role}.json`, JSON.stringify({ schema: "e7-db-login-v1", role, connectionString: `postgresql://${user}:${CANARY}@db.mxotevtiscernhqilyiu.supabase.co:5432/postgres` }));   // CHANGED (de6285b5): the exact DEV direct shape, so the accepted pool gate stays the decider
     S.flags[S.flags.indexOf("--db-app") + 1] = remote("mv_booking_app", "u_app"); S.flags[S.flags.indexOf("--db-report") + 1] = remote("mv_booking_report", "u_rep"); S.proc.argv = ["node", "cli", ...S.flags];
     const line = await S.run(); noLeak(S, "remote");
     assert.deepEqual(line.result.refused, { stage: "pool", code: "POOL_CONFIG_REFUSED" }, "remote without --db-ca refused at construction (no DNS / connect)"); }
@@ -647,3 +649,61 @@ test("E6 (root review of 128ac08, H1) after the baseline, PRE-QUEUED future inpu
   const j = readFileSync(join(S.jd, `e7-journal-r1-${S.pk.plan.runId}.jsonl`), "utf8");
   assert.ok(!j.includes("prequeued") && j.includes("synthetic/fresh-calendar_blocked") && j.includes("synthetic/fresh-calendar_reopened") && j.includes("synthetic/baseline"));
 });
+
+// =================================================================================================================================
+// ADDED (root de6285b5 P3): the report-lock pre-check against REAL Postgres sessions (disposable PG; no Supabase / Supavisor emulation claimed)
+const holdOn = async (url, sql, params) => { const c = new pg.Client({ connectionString: url }); await c.connect(); const r = await c.query(sql, params); return { c, r, pid: (await c.query("SELECT pg_backend_pid() AS p")).rows[0].p }; };
+const precheckN = async (key) => { const c = await reportPool.connect(); try { return (await c.query(L.LOCK_PRECHECK_SQL, [key])).rows[0].n; } finally { c.release(true); } };
+const heldBy = async (pid) => Number((await one("SELECT count(*)::int AS n FROM pg_locks WHERE pid = $1 AND locktype = 'advisory' AND granted", [pid])).n);
+
+test("E7 P3 mapping proofs on real sessions: two-int4 (hashtext(key), 0) ⇒ classid = unsigned hashtext, objid 0, objsubid 2 — incl. a NEGATIVE hashtext key; bigint form, key2 ≠ 0, unrelated key and another database never match", async () => {
+  const h = Number((await one("SELECT hashtext($1) AS h", [LOCK_KEY])).h);
+  // independent JS mapping of the pinned key, checked against the catalog row of a real holder
+  { const H = await holdOn(db.adminUrl, "SELECT pg_try_advisory_lock(hashtext($1), 0) AS ok", [LOCK_KEY]); assert.equal(H.r.rows[0].ok, true);
+    const row = await one("SELECT classid::bigint AS c, objid::bigint AS o, objsubid AS s, database = (SELECT oid FROM pg_database WHERE datname = current_database()) AS here FROM pg_locks WHERE pid = $1 AND locktype = 'advisory'", [H.pid]);
+    assert.deepEqual([Number(row.c), Number(row.o), row.s, row.here], [(h + 2 ** 32) % 2 ** 32, 0, 2, true], `pinned key mapping (hashtext=${h})`);
+    assert.equal(await precheckN(LOCK_KEY), 1, "exact holder seen"); await H.c.end(); }
+  assert.equal(await precheckN(LOCK_KEY), 0, "gone after the holder's session ends");
+  // a key with a NEGATIVE and one with a POSITIVE hashtext (found in-DB, then each proven through the exact pre-check SQL)
+  const neg = (await one("SELECT k FROM (SELECT 'e7-neg-' || g AS k FROM generate_series(1, 200) g) s WHERE hashtext(k) < 0 ORDER BY k LIMIT 1")).k;
+  const pos = (await one("SELECT k FROM (SELECT 'e7-pos-' || g AS k FROM generate_series(1, 200) g) s WHERE hashtext(k) > 0 ORDER BY k LIMIT 1")).k;
+  for (const k of [neg, pos]) {
+    const hk = Number((await one("SELECT hashtext($1) AS h", [k])).h);
+    const H = await holdOn(db.adminUrl, "SELECT pg_try_advisory_lock(hashtext($1), 0) AS ok", [k]);
+    const row = await one("SELECT classid::bigint AS c FROM pg_locks WHERE pid = $1 AND locktype = 'advisory'", [H.pid]);
+    assert.equal(Number(row.c), hk < 0 ? hk + 2 ** 32 : hk, `${k}: unsigned reinterpretation (hashtext=${hk})`);
+    assert.deepEqual([await precheckN(k), await precheckN(LOCK_KEY)], [1, 0], `${k}: matched exactly; the pinned key is not`); await H.c.end();
+  }
+  assert.ok(Number((await one("SELECT hashtext($1) AS h", [neg])).h) < 0);
+  // false-match exclusions for the pinned key
+  for (const [label, sql] of [["bigint form of the same hash", "SELECT pg_try_advisory_lock(hashtext($1)::bigint) AS ok"], ["key2 = 1", "SELECT pg_try_advisory_lock(hashtext($1), 1) AS ok"],
+    ["swapped (0, hashtext)", "SELECT pg_try_advisory_lock(0, hashtext($1)) AS ok"], ["shared lock same key", "SELECT pg_try_advisory_lock_shared(hashtext($1), 0) AS ok"]]) {
+    const H = await holdOn(db.adminUrl, sql, [LOCK_KEY]); assert.equal(H.r.rows[0].ok, true, label);
+    const n = await precheckN(LOCK_KEY); await H.c.end();
+    if (label === "shared lock same key") assert.equal(n, 1, "a SHARED holder of the exact key is still a holder (fail closed)");
+    else assert.equal(n, 0, `${label}: not matched`);
+  }
+  { const H = await holdOn(db.adminUrl, "SELECT pg_try_advisory_lock(hashtext('e7-unrelated-key'), 0) AS ok", []); assert.equal(await precheckN(LOCK_KEY), 0, "unrelated key"); await H.c.end(); }
+  { const adm = new pg.Client({ connectionString: db.adminUrl }); await adm.connect(); await adm.query("CREATE DATABASE e7_other_db"); await adm.end();
+    const u = new URL(db.adminUrl); u.pathname = "/e7_other_db";
+    const H = await holdOn(u.toString(), "SELECT pg_try_advisory_lock(hashtext($1), 0) AS ok", [LOCK_KEY]); assert.equal(H.r.rows[0].ok, true);
+    assert.equal(Number((await one("SELECT count(*)::int AS n FROM pg_locks WHERE pid = $1 AND locktype = 'advisory'", [H.pid])).n), 1, "the other-database lock is visible cluster-wide");
+    assert.equal(await precheckN(LOCK_KEY), 0, "…but never matched for the CURRENT database"); await H.c.end(); }
+});
+
+test("E8 P3 in the native launch: a second REAL session holding the exact run key ⇒ lock-precheck RUN_LOCK_PRESENT_BEFORE_START; holder untouched; NO journal / provider / operator prompt / write; pools ended; then, holder released, the same files reach the accepted P0 path", async () => {
+  const H = await holdOn(db.adminUrl, "SELECT pg_try_advisory_lock(hashtext($1), 0) AS ok", [LOCK_KEY]); assert.equal(H.r.rows[0].ok, true);
+  try {
+    const S = await launch(); const line = await S.run(); noLeak(S, "held");
+    assert.deepEqual([S.code, line.outcome, line.result.refused, line.result.run], [4, "EXECUTE_REFUSED", { stage: "lock-precheck", code: "RUN_LOCK_PRESENT_BEFORE_START" }, null], JSON.stringify(line));
+    assert.deepEqual(line.result.teardown, { pools: { app: "ended", report: "ended" } });
+    assert.equal(await heldBy(H.pid), 1, "the holder still holds (never unlocked / terminated / adopted)");
+    assert.equal(Number((await one("SELECT count(*)::int AS n FROM pg_stat_activity WHERE pid = $1", [H.pid])).n), 1, "holder backend alive");
+    assert.deepEqual([readdirSync(S.jd), readdirSync(S.hd)], [[], []], "no journal / head file created");
+    assert.deepEqual([S.t.x.log.length, S.prompts.length, writesAt(S)], [0, 0, [0, 0, 0, 0, 0]], "zero provider calls, zero operator prompts, zero writes");
+    assert.equal(await state(S.bk.id), "payment_authorized", "intent untouched");
+  } finally { await H.c.end(); }
+  const S2 = await launch(); const line2 = await S2.run(); noLeak(S2, "released");
+  assert.deepEqual([S2.code, line2.outcome, line2.result.run.outcome], [0, "EXECUTE_ENDED", "ENDED_RELEASED"], "no holder → the accepted P0 / core path");
+});
+
