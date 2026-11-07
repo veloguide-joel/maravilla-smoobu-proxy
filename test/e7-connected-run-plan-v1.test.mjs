@@ -453,3 +453,66 @@ test("T12 whitelisted refusal output: fixed keys and codes, no echo of plan, env
   assert.ok(runPlanCommand({ argv: ["inspect"], deps: deps() }) instanceof Promise);
   assert.deepEqual([...P.PLAN_CODES].filter((c, i, a) => a.indexOf(c) !== i), [], "unique codes");
 });
+
+// ---------------------------------------------------------------------------------------------------------------------------------------
+// T13 (root M2-F review of 32e8b04): an OWN enumerable data key "__proto__" must be PRESERVED by the snapshot (never routed through the legacy
+// prototype setter) and then REFUSED by exact-key validation; it must never collapse onto the clean plan / package hash.
+const PROTO_VALUES = [["null", () => null], ["object", () => ({ x: 1 })]];
+const withProto = (o, v) => Object.defineProperty(o, "__proto__", { value: v, enumerable: true, writable: true, configurable: true });
+const PROTO_SITES = { top: (p) => p, environment: (p) => p.environment, stripe: (p) => p.environment.stripe, db: (p) => p.environment.db, listing: (p) => p.listing,
+  phases: (p) => p.phases, deadlines: (p) => p.deadlines, stayRules: (p) => p.stayRules, baseline: (p) => p.baseline, exclusions: (p) => p.exclusions,
+  run: (p) => p.exclusions.runs[0], binding: (p) => p.binding, stay: (p) => p.binding.stay, quote: (p) => p.binding.quote };
+/** canonical BYTES with "__proto__" spliced in as a key of the object at `site` (JSON.parse creates an OWN property) */
+const protoBytes = (site, json) => {
+  // MARK sorts immediately after "__proto__" (no other key starts with "__"), so the splice stays canonical
+  const MARK = "__proto__x"; const p = plan(); PROTO_SITES[site](p)[MARK] = 0;
+  const text = `${canonicalJson(p)}\n`.replace(`"${MARK}":0`, `"__proto__":${json}`);
+  return enc.encode(text);
+};
+
+test("T13 own __proto__ keys: preserved by snapshotData, refused by exact-key validation, never hash-collapsed (plan, nested, options, env, bytes, command)", async () => {
+  const protoBefore = Reflect.ownKeys(Object.prototype).length; let getters = 0;
+  // the snapshot keeps the key as an own data property; the copy's prototype is untouched
+  for (const [label, val] of PROTO_VALUES) {
+    const s = P.snapshotData(JSON.parse(`{"__proto__":${JSON.stringify(val())},"a":1}`));
+    assert.ok(s !== null, label); assert.deepEqual(Object.keys(s).sort(), ["__proto__", "a"], label);
+    assert.ok(Object.hasOwn(s, "__proto__"), label); assert.equal(Object.getPrototypeOf(s), Object.prototype, `${label}: copy prototype unchanged`);
+    assert.ok(Object.isFrozen(s));
+    assert.equal(canonicalJson(s), `{"__proto__":${JSON.stringify(val())},"a":1}`);
+  }
+  const clean = P.planHashV1(V(plan()).plan);
+  // validator: every schema object refuses an own __proto__ (direct object input)
+  for (const [site, at_] of Object.entries(PROTO_SITES)) for (const [label, val] of PROTO_VALUES) {
+    const p = plan(); withProto(at_(p), val());
+    const r = V(p); assert.equal(r.ok, false, `${site}/${label} refused`);
+    assert.notEqual(r.code, "PLAN_OK");
+  }
+  // the four sites root reproduced, with their exact refusal codes
+  const expectCode = { top: "PLAN_SHAPE", listing: "LISTING_INVALID", binding: "BINDING_SHAPE", exclusions: "EXCLUSIONS_NOT_EXACT" };
+  for (const [site, c] of Object.entries(expectCode)) for (const [, val] of PROTO_VALUES) { const p = plan(); withProto(PROTO_SITES[site](p), val()); assert.equal(code(p), c, site); }
+  // options and env snapshot
+  for (const [, val] of PROTO_VALUES) {
+    assert.equal(P.validateRunPlanV1(plan(), withProto({ planClock: NOW }, val())).code, "CLOCK_INVALID");
+    assert.equal(build({ envSnapshot: withProto(ENV(), val()) }).code, "ENV_REFUSED");
+    const e = ENV(); withProto(e.present, val()); assert.equal(build({ envSnapshot: e }).code, "ENV_REFUSED");
+  }
+  // canonical BYTES through the builder and the inspect command: refused, whitelisted, nothing leaked, no hash
+  for (const site of Object.keys(PROTO_SITES)) for (const [label, val] of PROTO_VALUES) {
+    const b = protoBytes(site, JSON.stringify(val()));
+    assert.equal(P.parsePlanBytes(b).ok, true, `${site}/${label}: bytes are canonical (not a parse refusal)`);
+    const r = build({ planBytes: b }); assert.equal(r.ok, false, `${site}/${label} builder`); assert.ok(!("planHash" in r) && !("packageHash" in r));
+    const o = await runPlanCommand({ argv: ["inspect"], deps: deps({ readPlanFile: async () => b }) });
+    assert.equal(o.outcome, "PLAN_REFUSED", `${site}/${label} command`); assert.equal(o.code, r.code);
+    assert.deepEqual(Object.keys(o).sort(), ["code", "executable", "outcome", "permissions", "schema"]);
+    assert.equal(o.executable, false); assert.ok(Object.values(o.permissions).every((v) => v === false));
+    assert.ok(!JSON.stringify(o).includes("__proto__"));
+  }
+  const envP = withProto(ENV(), null);
+  const oe = await runPlanCommand({ argv: ["inspect"], deps: deps({ envSnapshot: envP }) }); assert.equal(oe.code, "ENV_REFUSED");
+  // controls: clean plain and null-prototype plans still validate, hash identically and are frozen; no getter ran; Object.prototype unchanged
+  const np = Object.assign(Object.create(null), plan()); np.listing = Object.assign(Object.create(null), np.listing);
+  const vn = V(np); assert.equal(vn.ok, true); assert.equal(P.planHashV1(vn.plan), clean); assert.ok(Object.isFrozen(vn.plan) && Object.isFrozen(vn.plan.listing));
+  const ok = await runPlanCommand({ argv: ["inspect"], deps: deps() }); assert.equal(ok.outcome, "INSPECT_OK"); assert.equal(ok.planHash, clean);
+  const g = plan(); Object.defineProperty(g, "__proto__", { get() { getters++; return null; }, enumerable: true, configurable: true }); assert.equal(code(g), "PLAN_SHAPE");
+  assert.equal(getters, 0); assert.equal(Reflect.ownKeys(Object.prototype).length, protoBefore); assert.equal(Object.getPrototypeOf({}), Object.prototype);
+});

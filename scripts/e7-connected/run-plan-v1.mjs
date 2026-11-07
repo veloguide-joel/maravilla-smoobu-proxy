@@ -74,6 +74,7 @@ export const PLAN_CODES = Object.freeze(["PLAN_OK", "PLAN_BYTES_INVALID", "PLAN_
 
 const freeze = Object.freeze;
 const getProto = Object.getPrototypeOf;
+const defineProp = Object.defineProperty;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const RUN_ID_RE = /^[a-z0-9-]{8,64}$/;
 const COMMIT_RE = /^[0-9a-f]{40}$/;
@@ -110,7 +111,9 @@ export function snapshotData(v) {
     }
     const p = getProto(x); if (p !== Object.prototype && p !== null) throw 0;
     const out = {};
-    for (const k of keys) { if (typeof k !== "string") throw 0; const e = d[k]; if (!("value" in e) || e.enumerable !== true) throw 0; out[k] = walk(e.value, depth + 1); }
+    // defineProperty, never `out[k] =`: an own "__proto__" key must stay an own data key (the legacy setter would drop it and re-prototype the copy)
+    for (const k of keys) { if (typeof k !== "string") throw 0; const e = d[k]; if (!("value" in e) || e.enumerable !== true) throw 0;
+      defineProp(out, k, { value: walk(e.value, depth + 1), enumerable: true, writable: true, configurable: true }); }
     return freeze(out);
   };
   try { return walk(v, 0); } catch { return null; }
