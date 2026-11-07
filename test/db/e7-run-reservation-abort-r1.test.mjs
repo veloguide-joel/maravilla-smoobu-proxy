@@ -434,6 +434,19 @@ function r1InputFor(bk, planClock, { connection = "disconnected", over = () => {
   return { plan, built, input: { packageBytes: new TextEncoder().encode(`${canonicalJson(built.package)}\n`), planBytes, foundationSources: FOUND, executorSources: EXEC,
     envSnapshot: ENV(), expected: { packageHash: built.packageHash, executorDigest: R.executorDigestR1(EXEC) } } };
 }
+/** LABELLED STAND-IN for the FOURTH, non-run exclusion (exact ledger id; actor not established): priced-only through the accepted path
+ *  (CREATED → PRICE_CONFIRMED, no session / PI / claim). It is a disposable-DB stand-in, never the shared row. */
+const UNATTRIBUTED = HISTORICAL_EXCLUSIONS.unattributedIntents[0];
+let unattributedMade = false;
+async function ensureUnattributedStandIn(listingId, from, to) {
+  if (unattributedMade) return UNATTRIBUTED.intentId;
+  const now = Date.now() - 2 * DAY;
+  await createIntentRecord(db.app, { id: UNATTRIBUTED.intentId, ref: F.nextRef(), accessTokenHash: F.tokenHash(), environment: "test", now, listingId, from, to, guests: 2 });
+  F.ok(await applyEvent(db.app, UNATTRIBUTED.intentId, { type: "PRICE_CONFIRMED", price: F.priceFor({ listingId, from, to, guests: 2, currency: "USD" }) }, { now, actor: "guest" }), "stand-in price");
+  unattributedMade = true;
+  return UNATTRIBUTED.intentId;
+}
+
 let historical = null;
 /** labelled historical STAND-INS (exact ledger Run1 / Run3 intent ids) so the exclusion baseline fingerprints real rows; Run2 stays absent */
 async function ensureHistorical() {
@@ -442,7 +455,8 @@ async function ensureHistorical() {
   for (const [id, n] of [[RUN1.intentId, 1], [RUN3.intentId, 3]])
     await createIntentRecord(db.app, { id, ref: F.nextRef(), accessTokenHash: F.tokenHash(), environment: "test", now: base, listingId: ABORT_LISTING,
       from: addDays("2028-01-01", 5 * n), to: addDays("2028-01-01", 5 * n + 2), guests: 2 });
-  historical = { ids: [RUN1.intentId, RUN3.intentId] };
+  const u = await ensureUnattributedStandIn(ABORT_LISTING, addDays("2028-01-01", 20), addDays("2028-01-01", 24));   // the fourth (non-run) identity
+  historical = { ids: [RUN1.intentId, RUN3.intentId, u] };
   return historical;
 }
 /** DECOYS (labelled): eligible maintenance work OUTSIDE the run's one intent (same listing, a planted foreign lease, another listing) */
@@ -688,6 +702,9 @@ test("G4 changes AFTER attestation and BEFORE the worker: quote / authorization 
     await stopAt(S, r, "PREFLIGHT_PAYMENT_INTENT_PROOF_FAILED", "PI voided outside during attestation"); }
   { const S = await r1Scenario(during(async () => { await touchStandIn(RUN1.intentId); }));
     const r = await S.run(); await stopAt(S, r, "EXCLUSION_BASELINE_CHANGED", "exclusion row touched during attestation");
+    assert.notEqual(r.r1.refence.baselineDigest, r.r1.preflight.baselineDigest); }
+  { const S = await r1Scenario(during(async () => { await touchStandIn(UNATTRIBUTED.intentId); }));   // the FOURTH (non-run) identity drifts after attestation
+    const r = await S.run(); await stopAt(S, r, "EXCLUSION_BASELINE_CHANGED", "fourth (unattributed) intent touched during attestation");
     assert.notEqual(r.r1.refence.baselineDigest, r.r1.preflight.baselineDigest); }
   // between the post-attest preflight fence and STEP_STARTED (after the guest read of the first reservation step): the DB fence
   // the third guest read = the first reservation step's prepare (after P0 preflight #1 and the post-attest preflight #2)

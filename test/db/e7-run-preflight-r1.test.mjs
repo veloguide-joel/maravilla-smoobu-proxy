@@ -492,6 +492,19 @@ test("D4 ownership: connect timeout (late client destroyed, never queried), stat
     await sleep(50); assert.equal(L.ht.x.heldAborted, true); assert.equal(L.ht.x.log.filter((e) => e.path === "/v1/reservations").length, 0); }
 });
 
+/** LABELLED STAND-IN for the FOURTH, non-run exclusion (exact ledger id; actor not established): priced-only through the accepted path
+ *  (CREATED → PRICE_CONFIRMED, no session / PI / claim). It is a disposable-DB stand-in, never the shared row. */
+const UNATTRIBUTED = HISTORICAL_EXCLUSIONS.unattributedIntents[0];
+let unattributedMade = false;
+async function ensureUnattributedStandIn(listingId, from, to) {
+  if (unattributedMade) return UNATTRIBUTED.intentId;
+  const now = Date.now() - 2 * DAY;
+  await createIntentRecord(db.app, { id: UNATTRIBUTED.intentId, ref: F.nextRef(), accessTokenHash: F.tokenHash(), environment: "test", now, listingId, from, to, guests: 2 });
+  F.ok(await applyEvent(db.app, UNATTRIBUTED.intentId, { type: "PRICE_CONFIRMED", price: F.priceFor({ listingId, from, to, guests: 2, currency: "USD" }) }, { now, actor: "guest" }), "stand-in price");
+  unattributedMade = true;
+  return UNATTRIBUTED.intentId;
+}
+
 test("D5 exclusion baseline: existing-row changes with EQUAL counts detected; append / delete; explicit ABSENT; protected ref in the run intent; cap", async () => {
   const H = await ensureHistorical();
   const w = world(); const bk = await authorizedBooking(w); const clock = Date.now();
@@ -525,7 +538,8 @@ test("D5 exclusion baseline: existing-row changes with EQUAL counts detected; ap
     const r = await P.readExclusionBaselineR1({ statement: async (sql, p) => ({ ok: true, rows: (await c.query(sql, p)).rows }), ids: P.exclusionIdentifiers(HISTORICAL_EXCLUSIONS), currentIntentId: bk.id });
     await c.query(P.SQL_COMMIT);
     assert.equal(r.ok, true);
-    assert.deepEqual(r.baseline.identifiers.intents.map((x) => [x.id, x.presence]), [[RUN1.intentId, "PRESENT"], [RUN2.intentId, "ABSENT"], [RUN3.intentId, "PRESENT"]]);
+    assert.deepEqual(r.baseline.identifiers.intents.map((x) => [x.id, x.presence]), [[RUN1.intentId, "PRESENT"], [RUN2.intentId, "ABSENT"], [RUN3.intentId, "PRESENT"],
+      [UNATTRIBUTED.intentId, "ABSENT"]]);                                                     // the fourth (non-run) identity is covered: explicit ABSENT here
     assert.deepEqual([...r.baseline.identifiers.paymentIntentIds], [RUN3.paymentIntentId, PATH_A_PI]);
     assert.deepEqual([...r.baseline.identifiers.reservationIds], ["70636076", "71045356", "71072615", "71081885"]);
     const fams = new Set(r.baseline.rows.map((x) => x.family));
@@ -545,6 +559,39 @@ test("D5 exclusion baseline: existing-row changes with EQUAL counts detected; ap
     SELECT $1, 1000 + g, 'created', 'created', 'SYNTHETIC', 'guest', now(), now() FROM generate_series(1, ${P.BASELINE_CAP + 1}) g`, [RUN1.intentId]);
   const vc = await lane(bk, w, { clock }).run(); assert.equal(vc.code, "BASELINE_LIMIT_EXCEEDED"); assertVerdictShape(vc);
   await F.ownerManagedHistory(db.owner, "DELETE FROM booking.intent_transitions WHERE intent_id = $1 AND version_after > 1000", [RUN1.intentId]);
+});
+
+test("D5b fourth (unattributed, non-run) intent: covered by the baseline — appearance, unchanged equality, equal-count content changes; PRESENT identity; never a run", async () => {
+  await ensureHistorical();
+  const w = world(); const bk = await authorizedBooking(w); const clock = Date.now();
+  const digest = async () => { const v = await lane(bk, w, { clock }).run(); assert.equal(v.code, "PREFLIGHT_OK", v.code); return v.baselineDigest; };
+  const a0 = await digest();
+  await ensureUnattributedStandIn(LISTING, "2027-10-01", "2027-10-05");
+  const d0 = await digest(); assert.notEqual(d0, a0, "the fourth intent's appearance changes the baseline");
+  assert.equal(await digest(), d0, "an UNCHANGED fourth intent preserves equality");
+  const n = async () => (await db.owner.query(`SELECT (SELECT count(*) FROM booking.intent_transitions WHERE intent_id = $1)::int AS tr,
+    (SELECT count(*) FROM booking.intent_applied_events WHERE intent_id = $1)::int AS ap, (SELECT count(*) FROM booking.intent_work WHERE intent_id = $1)::int AS wk`, [UNATTRIBUTED.intentId])).rows[0];
+  const c0 = await n(); assert.ok(c0.tr >= 2 && c0.wk === 1, JSON.stringify(c0));      // the accepted guest PRICE_CONFIRMED path writes no applied-event row
+  await F.ownerManagedHistory(db.owner, "UPDATE booking.intent_transitions SET reason_code = 'SYNTHETIC_U' WHERE id = (SELECT id FROM booking.intent_transitions WHERE intent_id = $1 ORDER BY id LIMIT 1)", [UNATTRIBUTED.intentId]);
+  const d1 = await digest(); assert.notEqual(d1, d0, "transition content change at equal counts detected"); assert.deepEqual(await n(), c0);
+  await F.ownerManagedHistory(db.owner, "UPDATE booking.intent_work SET next_action_at = next_action_at + interval '1 second' WHERE intent_id = $1", [UNATTRIBUTED.intentId]);
+  const d2 = await digest(); assert.notEqual(d2, d1, "work row content change detected"); assert.deepEqual(await n(), c0);
+  await F.ownerManagedHistory(db.owner, "UPDATE booking.intents SET updated_at = updated_at + interval '1 second' WHERE id = $1", [UNATTRIBUTED.intentId]);
+  const d3 = await digest(); assert.notEqual(d3, d2, "intent row content change detected");
+  const c = await reportPool.connect();
+  try {
+    await c.query(P.SQL_BEGIN);
+    const r = await P.readExclusionBaselineR1({ statement: async (sql, p) => ({ ok: true, rows: (await c.query(sql, p)).rows }), ids: P.exclusionIdentifiers(HISTORICAL_EXCLUSIONS), currentIntentId: bk.id });
+    await c.query(P.SQL_COMMIT);
+    assert.equal(r.ok, true);
+    assert.deepEqual(r.baseline.identifiers.intents.at(-1), { id: UNATTRIBUTED.intentId, presence: "PRESENT" });
+    assert.deepEqual([...r.baseline.identifiers.paymentIntentIds], [RUN3.paymentIntentId, PATH_A_PI], "no PI inferred for the non-run record");
+    assert.deepEqual([...r.baseline.identifiers.reservationIds], ["70636076", "71045356", "71072615", "71081885"], "no reservation inferred");
+    const fams = new Set(r.baseline.rows.filter((x) => x.intentId === UNATTRIBUTED.intentId).map((x) => x.family));
+    for (const f of ["intents", "intent_transitions", "intent_work"]) assert.ok(fams.has(f), f);
+  } finally { c.release(); }
+  assert.ok(!HISTORICAL_EXCLUSIONS.runs.some((x) => x.intentId === UNATTRIBUTED.intentId) && UNATTRIBUTED.label !== "run4");
+  assert.equal((await loadIntent(db.app, UNATTRIBUTED.intentId)).status, "price_confirmed", "stand-in never advanced / adopted");
 });
 
 test("D6 hostile / malformed preflight input → INPUT_INVALID with ZERO starts and zero getter calls; caller mutation after the call is irrelevant", async () => {

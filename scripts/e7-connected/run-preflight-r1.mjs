@@ -199,7 +199,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const strList = (a, re) => Array.isArray(a) && a.length <= 32 && a.every((x) => typeof x === "string" && re.test(x)) && new Set(a).size === a.length;
 /** exclusion identifiers from the binding's exact planner exclusions (null = did not exist → not an identifier) */
 export function exclusionIdentifiers(exclusions) {
-  const runs = exclusions.runs;
+  const runs = [...exclusions.runs, ...exclusions.unattributedIntents];           // non-run entries folded in (explicit ids; nulls filtered below)
   return freeze({ intentIds: freeze(runs.map((r) => r.intentId)),
     paymentIntentIds: freeze([...runs.map((r) => r.paymentIntentId).filter((x) => x !== null), ...exclusions.otherPaymentIntentIds]),
     reservationIds: freeze([...exclusions.protectedReservationIds, ...runs.map((r) => r.reservationId).filter((x) => x !== null)]) });

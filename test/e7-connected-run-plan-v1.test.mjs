@@ -40,8 +40,12 @@ const LEDGER_EXCLUSIONS = {
     { label: "run2", intentId: "48b59c0d-1c8c-4f32-ad91-08dbab1e8e3c", paymentIntentId: null, reservationId: null },
     { label: "run3", intentId: "cc53bc11-565d-4e9b-8be1-95f3febc8a39", paymentIntentId: "pi_3UYqhH2B9LTneQgw1Q0IoYtz", reservationId: null }
   ],
-  otherPaymentIntentIds: ["pi_3UYUIm2B9LTneQgw0mGFQdwG"]
+  otherPaymentIntentIds: ["pi_3UYUIm2B9LTneQgw0mGFQdwG"],
+  // NOT a run (root live evidence 2026-11-07; actor not established): explicit nulls, nothing inferred
+  unattributedIntents: [{ label: "priced-only-2026-11-06T18:16:48Z", intentId: "9f42214b-99f4-413a-9f43-d340faeedfd3", paymentIntentId: null, reservationId: null }]
 };
+/** the pre-2026-11-07 (stale) 3-run list: must now be refused */
+const STALE_EXCLUSIONS = (() => { const x = JSON.parse(JSON.stringify(LEDGER_EXCLUSIONS)); delete x.unattributedIntents; return x; })();
 const OPS = ["hostaway.lookup_by_ref", "hostaway.get_reservation_created", "hostaway.get_listing", "hostaway.get_calendar", "hostaway.price_details",
   "hostaway.create_reservation", "hostaway.cancel_reservation_created", "stripe.accounts.retrieve", "stripe.paymentIntents.retrieve_bound", "stripe.paymentIntents.cancel_bound"];
 const CK = { disconnected: ["CALENDAR_BASELINE", "CALENDAR_BLOCKED", "CALENDAR_REOPENED"], airbnb: ["CALENDAR_BASELINE", "AIRBNB_BLOCKED", "AIRBNB_REOPENED"] };
@@ -400,7 +404,8 @@ test("T9 numeric / time / date / currency / timezone negatives (future and stale
 
 test("T10 historical exclusions: mandatory, exact (from the ledger), absence explicit; bindings intersecting them refused; dates/amount are not identity", () => {
   assert.deepEqual(clone(P.HISTORICAL_EXCLUSIONS), LEDGER_EXCLUSIONS);
-  const ids = [...LEDGER_EXCLUSIONS.runs.flatMap((r) => [r.intentId, r.paymentIntentId]).filter(Boolean), ...LEDGER_EXCLUSIONS.otherPaymentIntentIds, ...LEDGER_EXCLUSIONS.protectedReservationIds];
+  const ids = [...[...LEDGER_EXCLUSIONS.runs, ...LEDGER_EXCLUSIONS.unattributedIntents].flatMap((r) => [r.intentId, r.paymentIntentId]).filter(Boolean),
+    ...LEDGER_EXCLUSIONS.otherPaymentIntentIds, ...LEDGER_EXCLUSIONS.protectedReservationIds];
   assert.equal(new Set(ids).size, ids.length, "no duplicate / ambiguous historical id");
   assert.ok(LEDGER_EXCLUSIONS.runs.every((r) => r.reservationId === null), "no Hostaway reservation existed for Run1/2/3 (explicit null)");
   const C = (f) => code(mut(f));
@@ -409,16 +414,33 @@ test("T10 historical exclusions: mandatory, exact (from the ledger), absence exp
     (p) => { p.exclusions.runs[2].paymentIntentId = null; }, (p) => { p.exclusions.otherPaymentIntentIds = []; }, (p) => { p.exclusions.protectedReservationIds.pop(); },
     (p) => { p.exclusions.protectedReservationIds = p.exclusions.protectedReservationIds.map(Number); }, (p) => { p.exclusions = null; }, (p) => { delete p.exclusions.otherPaymentIntentIds; },
     (p) => { p.exclusions.runs[0].sessionId = "cs_test_unknown"; }, (p) => { p.exclusions.extra = []; }];
-  omit.forEach((f, i) => assert.equal(C(f), "EXCLUSIONS_NOT_EXACT", `#${i}`));
+  // the fourth (non-run) record: drop / empty / change / relabel / move into runs / add an inferred id / the stale 3-run list
+  const fourth = [(p) => { delete p.exclusions.unattributedIntents; }, (p) => { p.exclusions.unattributedIntents = []; }, (p) => { p.exclusions.unattributedIntents = null; },
+    (p) => { p.exclusions.unattributedIntents[0].intentId = "9f42214b-99f4-413a-9f43-d340faeedfd4"; }, (p) => { p.exclusions.unattributedIntents[0].label = "run4"; },
+    (p) => { p.exclusions.runs.push({ label: "run4", ...p.exclusions.unattributedIntents.pop() }); },
+    (p) => { p.exclusions.runs.push({ label: "run4", intentId: p.exclusions.unattributedIntents[0].intentId, paymentIntentId: null, reservationId: null }); delete p.exclusions.unattributedIntents; },
+    (p) => { p.exclusions.unattributedIntents[0].paymentIntentId = "pi_3INFERREDINFERRED"; }, (p) => { p.exclusions.unattributedIntents[0].reservationId = "71999999"; },
+    (p) => { p.exclusions.unattributedIntents[0].sessionId = "cs_test_inferred"; }, (p) => { delete p.exclusions.unattributedIntents[0].paymentIntentId; },
+    (p) => { p.exclusions.unattributedIntents.push(clone(p.exclusions.unattributedIntents[0])); }, (p) => { p.exclusions = clone(STALE_EXCLUSIONS); }];
+  [...omit, ...fourth].forEach((f, i) => assert.equal(C(f), "EXCLUSIONS_NOT_EXACT", `#${i}`));
+  assert.ok(LEDGER_EXCLUSIONS.unattributedIntents.every((r) => r.paymentIntentId === null && r.reservationId === null), "nothing inferred for the non-run record");
+  assert.ok(!LEDGER_EXCLUSIONS.runs.some((r) => r.intentId === LEDGER_EXCLUSIONS.unattributedIntents[0].intentId), "not labelled a run");
   for (const r of LEDGER_EXCLUSIONS.runs) assert.equal(C((p) => { p.binding.intentId = r.intentId; }), "BINDING_EXCLUDED", r.label);
   assert.equal(C((p) => { p.binding.paymentIntentId = "pi_3UYqhH2B9LTneQgw1Q0IoYtz"; }), "BINDING_EXCLUDED", "run3 PI");
   assert.equal(C((p) => { p.binding.paymentIntentId = "pi_3UYUIm2B9LTneQgw0mGFQdwG"; }), "BINDING_EXCLUDED", "path-A PI");
+  // a binding to the fourth (non-run) intent is refused even with otherwise FRESH synthetic quote / authorization inputs; a fresh NEW id is the control
+  assert.equal(C((p) => { p.binding.intentId = "9f42214b-99f4-413a-9f43-d340faeedfd3"; }), "BINDING_EXCLUDED", "fourth (unattributed) intent");
+  assert.equal(C((p) => { p.binding.intentId = "9f42214b-99f4-413a-9f43-d340faeedfd3"; p.binding.paymentIntentId = "pi_SYNTHETICFRESH00f9"; p.binding.expectedRef = "SYN-REF-0099"; }),
+    "BINDING_EXCLUDED", "fourth intent with fresh synthetic PI / ref");
+  assert.equal(C((p) => { p.binding.intentId = "00000000-0000-4000-8000-0000000000f9"; p.binding.paymentIntentId = "pi_SYNTHETICFRESH00f9"; p.binding.expectedRef = "SYN-REF-0099"; }),
+    "OK", "control: a fresh NEW id with the same fresh inputs is accepted");
   // Run3-like stay and amount (2027-01-18 → 20, 23000) with FRESH synthetic ids/timestamps is not refused by identity (clock earlier so lead days hold)
   const early = Date.parse("2026-12-01T18:00:00.000Z"); const e = (ms) => new Date(early - ms).toISOString();
   const p3 = mut((p) => { p.createdAt = e(MIN); p.binding.quote.quotedAt = e(10 * MIN); p.binding.authorizedAt = e(5 * MIN);
     p.binding.stay = { arrival: "2027-01-18", departure: "2027-01-20", guests: 2 }; });
   assert.equal(code(p3, early), "OK");
-  assert.ok(Object.isFrozen(P.HISTORICAL_EXCLUSIONS.runs[2]));
+  assert.ok(Object.isFrozen(P.HISTORICAL_EXCLUSIONS.runs[2]) && Object.isFrozen(P.HISTORICAL_EXCLUSIONS.unattributedIntents)
+    && Object.isFrozen(P.HISTORICAL_EXCLUSIONS.unattributedIntents[0]));
 });
 
 test("T11 v1 / v2 manifest cross-refusal", () => {

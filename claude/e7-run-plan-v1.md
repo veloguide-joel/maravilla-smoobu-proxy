@@ -130,6 +130,13 @@ There is NO reservation id in a binding: this is a create-only plan.
 | run3 | `cc53bc11-565d-4e9b-8be1-95f3febc8a39` | `pi_3UYqhH2B9LTneQgw1Q0IoYtz` | `null` (hostaway null; 0 Hostaway calls) |
 
 Also:
+- `unattributedIntents` (NOT runs; added 2026-11-07 from root's live evidence, see `claude/e7-unattributed-intent-exclusion.md`):
+
+  | label | intentId | paymentIntentId | reservationId |
+  |---|---|---|---|
+  | priced-only-2026-11-06T18:16:48Z | `9f42214b-99f4-413a-9f43-d340faeedfd3` | `null` (no session / PI) | `null` |
+
+  Ref MV-K2CSGCBB, `price_confirmed` v1, quote expired. Its actor is NOT established, and it is not labelled a run. A binding to it is refused, and its rows are part of the exclusion baseline.
 - `otherPaymentIntentIds`: `pi_3UYUIm2B9LTneQgw0mGFQdwG` (the path-A TEST authorization/void).
 - `protectedReservationIds`: 70636076, 71045356, 71072615, 71081885 (always zero-action).
 
