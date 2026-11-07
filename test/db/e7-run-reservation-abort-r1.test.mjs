@@ -836,3 +836,73 @@ test("G10 the R1 FILE journal under the real consumer: full lifecycle round-trip
   const heads = readFileSync(join(S.hd, `e7-head-r1-${S.jbinding.identity.runId}.jsonl`), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
   assert.equal(heads.length, n); assert.ok(heads.every((h, i) => h.v === "r1" && h.seq === i + 1));
 });
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// root review of cc5e6cf: the POST-CLEANUP exclusion re-read's client ownership. Faults are ARMED at the cleanup PHASE_ENDED append (after the
+// last report snapshot of the run; the release proof uses the app pool), so the FIRST report client acquired after arming is the re-read's.
+const FAM = P.BASELINE_FAMILIES.map((f) => f.sql);
+async function rereadScenario(arm) {
+  const S = await r1Scenario({ hooks: { PHASE_ENDED: async (S0, rec) => { if (rec.phase === "cleanup") { S0.armIdx = S0.report.clients.length; await arm(S0); } } } });
+  const r = await S.run();
+  const c = S.report.clients[S.armIdx];
+  assert.ok(c, "the re-read acquired a client");
+  const sql = S.report.log.filter((x) => x.via === c.id).map((x) => x.sql);
+  const rel = c.events.filter((e) => e.startsWith("release"));
+  return { S, r, c, sql, rel };
+}
+/** the booking result is the run's own: release proved, claim released, no resend, ENDED_RELEASED kept (unless the run itself was stopped) */
+async function bookingKept(S, r, label, outcome = "ENDED_RELEASED") {
+  assert.equal(r.outcome, outcome, `${label}: ${JSON.stringify(plainResult(r))}`);
+  assert.deepEqual({ ...r.release }, { state: "cancelled", reason: "TEST_ABORT_REQUESTED", legs: "true/true", claimsHeld: 0 }, `${label}: release proof kept`);
+  assert.deepEqual([await state(S.bk.id), await claimsHeld(S.bk.id), await appliedAborts(S.bk.id)], ["cancelled", 0, 1], `${label}: DB outcome kept`);
+  assert.deepEqual(writesAt(S), [1, 1, 1, 0, 0], `${label}: no resend`);
+  await assertNotifyUnsent(S.bk.id, label);
+}
+const BEGIN = P.SQL_BEGIN; const COMMIT = P.SQL_COMMIT;
+
+test("G11 post-cleanup exclusion re-read ownership: reject / hang / late / loss / stop mid-transaction, BEGIN reject, COMMIT hang → destroyed ONCE, NO further SQL, never released; unread + not fully clean; booking outcome kept. Controls: healthy equal → COMMIT + release(); acknowledged refusal → COMMIT + release()", async (t) => {
+  const destroyedOnly = (x, label) => { assert.deepEqual(x.rel, ["release(true)"], `${label}: exactly one destroy, no release(): ${JSON.stringify(x.c.events)}`); };
+  const unread = (x, label, at, uncertainty = "none") => {
+    assert.deepEqual([x.r.r1.exclusionAfter, x.r.r1.fullyClean, x.r.r1.exclusionRead.disposition, x.r.r1.exclusionRead.at, x.r.r1.exclusionRead.uncertainty],
+      ["unread", false, "destroyed", at, uncertainty], `${label}: ${JSON.stringify(x.r.r1.exclusionRead)}`);
+  };
+  // (1) a baseline statement REJECTED → [BEGIN, F0] only
+  await t.test("G11.1 a baseline statement REJECTED → [BEGIN, F0] only", async () => { const x = await rereadScenario((S0) => { S0.report.addFault({ kind: "query", sql: FAM[0], mode: "reject" }); });
+    assert.deepEqual(x.sql, [BEGIN, FAM[0]], "reject: no COMMIT / ROLLBACK / SELECT after the failure"); destroyedOnly(x, "reject"); unread(x, "reject", "baseline");
+    await bookingKept(x.S, x.r, "reject"); await x.r.finalize(); });
+  // (2) a baseline statement HANGS → the bounded observation times out; destroyed, statement may still run
+  await t.test("G11.2 a baseline statement HANGS → the bounded observation times out; destro", async () => { const x = await rereadScenario((S0) => { S0.report.addFault({ kind: "query", sql: FAM[3], mode: "hang" }); });
+    assert.deepEqual(x.sql, [BEGIN, ...FAM.slice(0, 4)], "hang: nothing after the hung statement"); destroyedOnly(x, "hang");
+    unread(x, "hang", "baseline", "statement_may_still_run"); assert.equal(x.r.r1.exclusionRead.code, "TIMEOUT_DB_READ");
+    await bookingKept(x.S, x.r, "hang"); await x.r.finalize(); });
+  // (3) a baseline statement settles LATE (after the bound) → same as a timeout; its late reply changes nothing
+  await t.test("G11.3 a baseline statement settles LATE (after the bound) → same as a timeou", async () => { const x = await rereadScenario((S0) => { S0.report.addFault({ kind: "query", sql: FAM[5], mode: "after", fn: async () => { await sleep(LIMITS.STATEMENT_MS / 10 + 400); } }); });
+    await sleep(600);
+    assert.deepEqual(x.sql, [BEGIN, ...FAM.slice(0, 6)]); destroyedOnly(x, "late"); unread(x, "late", "baseline", "statement_may_still_run");
+    await bookingKept(x.S, x.r, "late"); await x.r.finalize(); });
+  // (4) the re-read client is LOST mid-transaction (backend terminated by the owner after F1) → the tracker's one destroy; no further SQL
+  await t.test("G11.4 the re-read client is LOST mid-transaction (backend terminated by the ", async () => { const x = await rereadScenario((S0) => { S0.report.addFault({ kind: "query", sql: FAM[1], mode: "after", fn: async (client) => { await terminate(client); } }); });
+    assert.deepEqual(x.sql, [BEGIN, FAM[0], FAM[1]], "loss: nothing issued on the lost client"); destroyedOnly(x, "loss"); unread(x, "loss", "baseline");
+    await bookingKept(x.S, x.r, "loss"); await x.r.finalize(); });
+  // (5) the run is STOPPED (native signal) mid-transaction → no further SQL, destroyed; the run reports the stop, the booking outcome stays proved
+  await t.test("G11.5 the run is STOPPED (native signal) mid-transaction → no further SQL, d", async () => { const x = await rereadScenario((S0) => { S0.report.addFault({ kind: "query", sql: FAM[1], mode: "after", fn: async () => { S0.ac.abort(); } }); });
+    assert.deepEqual(x.sql, [BEGIN, FAM[0], FAM[1]], "stop: nothing after the stop"); destroyedOnly(x, "stop"); unread(x, "stop", "baseline");
+    assert.equal(x.r.stopCode, "CANCELLED"); await bookingKept(x.S, x.r, "stop", "STOPPED"); assert.equal(x.r.r1.fullyClean, false); await x.r.finalize(); });
+  // (6) BEGIN itself rejected → destroyed, nothing else
+  await t.test("G11.6 BEGIN itself rejected → destroyed, nothing else", async () => { const x = await rereadScenario((S0) => { S0.report.addFault({ kind: "query", sql: BEGIN, mode: "reject" }); });
+    assert.deepEqual(x.sql, [BEGIN]); destroyedOnly(x, "begin"); unread(x, "begin", "begin"); await bookingKept(x.S, x.r, "begin"); await x.r.finalize(); });
+  // (7) COMMIT hangs → a COMMIT timeout is itself uncertain: destroyed, no ROLLBACK, unread
+  await t.test("G11.7 COMMIT hangs → a COMMIT timeout is itself uncertain: destroyed, no ROL", async () => { const x = await rereadScenario((S0) => { S0.report.addFault({ kind: "query", sql: COMMIT, mode: "hang" }); });
+    assert.deepEqual(x.sql, [BEGIN, ...FAM, COMMIT]); destroyedOnly(x, "commit"); unread(x, "commit", "commit", "statement_may_still_run");
+    await bookingKept(x.S, x.r, "commit"); await x.r.finalize(); });
+  // CONTROL (8) healthy → [BEGIN, every family, COMMIT], released ONCE for reuse, equal, fully clean
+  await t.test("G11.8 healthy → [BEGIN, every family, COMMIT], released ONCE for reuse, equa", async () => { const x = await rereadScenario(() => {});
+    assert.deepEqual(x.sql, [BEGIN, ...FAM, COMMIT]); assert.deepEqual(x.rel, ["release()"], "healthy: released once, never destroyed");
+    assert.deepEqual([x.r.r1.exclusionAfter, x.r.r1.fullyClean, x.r.r1.exclusionRead.disposition, x.r.r1.exclusionRead.code], ["equal", true, "released", null]);
+    await bookingKept(x.S, x.r, "healthy"); await x.r.finalize(); });
+  // CONTROL (9) ACKNOWLEDGED refusal (a settled statement whose rows the accepted reader refuses) → its read-only transaction is closed with COMMIT
+  await t.test("G11.9 ACKNOWLEDGED refusal (a settled statement whose rows the accepted read", async () => { const x = await rereadScenario((S0) => { S0.report.addFault({ kind: "query", sql: FAM[0], mode: "mutate", fn: (res) => ({ ...res, rows: [{ key: "k", intent_id: null, fingerprint: "nothex" }] }) }); });
+    assert.deepEqual(x.sql, [BEGIN, FAM[0], COMMIT]); assert.deepEqual(x.rel, ["release()"]);
+    assert.deepEqual([x.r.r1.exclusionAfter, x.r.r1.fullyClean, x.r.r1.exclusionRead.disposition, x.r.r1.exclusionRead.code], ["unread", false, "released", "DB_RESULT_INVALID"]);
+    await bookingKept(x.S, x.r, "acknowledged refusal"); await x.r.finalize(); });
+});

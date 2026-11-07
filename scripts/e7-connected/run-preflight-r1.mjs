@@ -30,7 +30,7 @@ export const BASELINE_CAP = 200;
 /** origin file → its SHA-256 at the reviewed base (what each copy came from is named in the comment) */
 export const COPIED_ORIGINS = Object.freeze({
   "scripts/e7-connected/run-core.mjs": "ad1dcbb29e7cb1ce0aac71ac178d903076d4e5cc293dd17f972c04b4beaa5afe",          // SAME_DB SQL, checkSameDatabase
-  "scripts/e7-connected/run-core-abort-v2.mjs": "a4924d5b43b842efadbb06e8c4788273a42e7f252b4098a1210ea998572caacd",  // P0 / phase budgets, WRITE_TYPES, P0 eligibility
+  "scripts/e7-connected/run-core-abort-v2.mjs": "2b686e1e3bcbe2a5f837412d4a0a6a2c9864ebf232e2bd58bef67c8f36087771",  // P0 / phase budgets, WRITE_TYPES, P0 eligibility
   "scripts/e7-connected/run-test-abort.mjs": "57d97e1806fbaad83f76cf0b794cb45893a95d36456ad09b5acb7fd8b2f62b21",     // BRIDGE_LIMITS
   "lib/booking-db/reservation-worker.js": "601f48f67052f5dac40b83354b9cf10d5f81950ff9fe9cbd587288d19ed05e88",       // DEFAULT_TIMEOUTS
   "lib/booking-db/recovery.js": "17aa5a665d32cbe959e7daa4c2baffd01a00645e454eb69218938696dfa8dfc7"                  // completed payment-attempt SELECT

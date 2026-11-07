@@ -221,7 +221,7 @@ async function runAbortFlowV2(o, B) {
     lastFacts: null, countsSeq: 0, rejected: false, stale: false, lockLostEarly: false, lockClient: null, outcome: null, unfinished: false,
     phaseDeadline: Infinity, cleanupEntryKey: null, cause: null, bridge: null, bridgeCalls: 0, release: null };
   /** M2-G2b R1-only diagnostics / basis (absent from v2 results) */
-  const R = { preflight: null, refence: null, priceBasis: null, fences: 0, authDeadline: null, expiredAtCleanup: null, exclusionAfter: "not_attempted" };
+  const R = { preflight: null, refence: null, priceBasis: null, fences: 0, authDeadline: null, expiredAtCleanup: null, exclusionAfter: "not_attempted", exclusionRead: null };
   const stop = (code) => { lc.stop(code); if (!S.cause) S.cause = code; return { stop: code }; };
   const dbStop = (code) => { lc.markDbFamily(); S.stale = true; return stop(code); };
   const nowOr = () => { const n = guard.now(); return n.ok ? n.value : null; };
@@ -350,7 +350,7 @@ async function runAbortFlowV2(o, B) {
   function r1View(outcomeKind, extra) {
     const fullyClean = outcomeKind === "ENDED" && (extra.ok !== false) && R.exclusionAfter === "equal";
     return freeze({ kind: "r1", packageHash: B.r1.packageHash, executorDigest: B.r1.executorDigest, preflight: R.preflight, refence: R.refence, fences: R.fences,
-      expiredAtCleanup: R.expiredAtCleanup, exclusionAfter: R.exclusionAfter, fullyClean });
+      expiredAtCleanup: R.expiredAtCleanup, exclusionAfter: R.exclusionAfter, exclusionRead: R.exclusionRead, fullyClean });
   }
   const refused = () => result("REFUSED", { outcome: "REFUSED", ownerCleanupRequired: null });
   /** a STOP after RUN_STARTED: ONE terminal append only when the tail is KNOWN and the journal healthy; conservative key */
@@ -721,21 +721,44 @@ async function runAbortFlowV2(o, B) {
     else if (where === "cleanup" && R.expiredAtCleanup === null) { const t = businessNow(); R.expiredAtCleanup = t === null ? null : t >= R.authDeadline; }
     return null;
   }
-  /** post-cleanup exclusion re-read (DIAGNOSTIC): equal / changed / unread; one RR READ ONLY transaction on a fresh report client */
+  /**
+   * post-cleanup exclusion re-read (DIAGNOSTIC): equal / changed / unread; ONE RR READ ONLY transaction on a fresh report client.
+   * Client ownership (root review of cc5e6cf): ANY rejected / timed-out / not-started / lost operation — incl. BEGIN and COMMIT — destroys the
+   * client ONCE and issues NO further SQL (no COMMIT / ROLLBACK); the client is released for reuse ONLY after a successful COMMIT. An
+   * ACKNOWLEDGED refusal from the accepted baseline reader with every statement settled (cap / malformed rows / run-intent reference) closes
+   * its read-only transaction with COMMIT. Never a booking effect: the run's release proof / outcome are untouched; the read's own
+   * uncertainty is reported in r1.exclusionRead.
+   */
   async function exclusionRereadR1() {
     R.exclusionAfter = "unread";
+    const X = { at: "connect", code: null, disposition: "not_acquired", uncertainty: "none" };
+    const done = () => { R.exclusionRead = freeze({ ...X }); };
     const h = await acquire(pools.report, () => {});
-    if (h.pre || h.fail) return;
-    let inTx = false; let ok = false;
+    if (h.pre || h.fail) { X.code = h.fail || S.cause || "STOPPED"; return done(); }
+    let dead = false;
+    const destroyOnce = () => { if (!dead) { dead = true; h.tracker.destroy(); X.disposition = "destroyed"; } };
+    /** one statement; the FIRST non-success destroys the client and every later call issues nothing */
+    const run = async (at, sql, p) => {
+      if (dead) return { ok: false, code: "CLIENT_DESTROYED" };
+      X.at = at;
+      if (h.tracker.state() !== "open") { X.code = "CLIENT_LOST"; destroyOnce(); return { ok: false, code: "CLIENT_LOST" }; }
+      const r = await statement(h, sql, p);
+      if (r.value !== undefined && h.tracker.state() === "open") return { ok: true, rows: rowsOf(r.value) };
+      X.code = r.fail || (r.pre ? (S.cause || "STOPPED") : "CLIENT_LOST");
+      if (r.fail === "TIMEOUT_DB_READ" || r.fail === "BUDGET_EXHAUSTED" || (r.fail && r.fail.startsWith("GUARD"))) X.uncertainty = "statement_may_still_run";
+      destroyOnce();
+      return { ok: false, code: "DB_FAILURE" };
+    };
     try {
-      const run = async (sql, p) => { const r = await statement(h, sql, p); return r.value !== undefined ? { ok: true, rows: rowsOf(r.value) } : { ok: false, code: "DB_FAILURE" }; };
-      const b0 = await run(SQL_BEGIN, []); if (!b0.ok) return;
-      inTx = true;
-      const bl = await readExclusionBaselineR1({ statement: run, ids: exclusionIdentifiers(B.r1.exclusions), currentIntentId: identity.intentId });
-      const cm = await run(SQL_COMMIT, []); if (!cm.ok) return;
-      inTx = false; ok = true;
-      R.exclusionAfter = bl.ok ? (bl.baselineDigest === R.preflight.baselineDigest ? "equal" : "changed") : "unread";
-    } catch { /* unread */ } finally { if (ok) h.release(); else h.tracker.destroy(); void inTx; }
+      const b0 = await run("begin", SQL_BEGIN, []); if (!b0.ok) return done();
+      const bl = await readExclusionBaselineR1({ statement: (sql, p) => run("baseline", sql, p), ids: exclusionIdentifiers(B.r1.exclusions), currentIntentId: identity.intentId });
+      if (dead) return done();                                              // a DB-family fault inside the read: no COMMIT / ROLLBACK
+      if (!bl.ok) X.code = bl.code;                                         // acknowledged refusal: every statement settled
+      const cm = await run("commit", SQL_COMMIT, []); if (!cm.ok) return done();
+      h.release(); X.disposition = "released"; X.at = "done";
+      if (bl.ok) R.exclusionAfter = bl.baselineDigest === R.preflight.baselineDigest ? "equal" : "changed";
+      return done();
+    } catch { X.code = X.code || "INTERNAL"; destroyOnce(); return done(); }
   }
 
   // P2 — reservation

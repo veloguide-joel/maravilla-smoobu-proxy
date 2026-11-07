@@ -198,6 +198,44 @@ Unchanged: no G3, no credentials, no runner / dirs (owner-parked), shared 0017 u
 - **Origin pins.** `run-preflight-r1.mjs` `COPIED_ORIGINS` updates the `run-core-abort-v2.mjs` pin. The copied VALUES (P0 / phase budgets, WRITE_TYPES, eligibility) are unchanged and still asserted by G1 P0 against the live module. `run-test-abort.mjs` is byte-unchanged in G2b.
 - **No other runtime file changes:** workers, helpers, reducers, migrations, access control, transports, guard, facts, the planner logic, and the G1 binder / preflight logic.
 
+### 8.5 Root review of cc5e6cf: who owns the client during the exclusion re-read
+
+**Gap (reproduced).** In cc5e6cf, `exclusionRereadR1` mapped every failed `statement()` result to `{ ok:false }` and then ran `COMMIT` anyway. If that COMMIT succeeded, it RELEASED the client for reuse — even though a baseline statement had been rejected or had timed out and might still be running.
+
+Disposable-PG regression G11.1–G11.4, run against cc5e6cf, observed `[BEGIN, F0…, COMMIT]` followed by a release.
+
+**Fix.** The fix is confined to that one function. Its local runner now gives each statement an explicit disposition:
+- The FIRST operation that is not a success — rejected, timed out, not started (stop), or a lost client, at BEGIN, in the baseline, or at COMMIT — destroys the client ONCE through its tracker. No further SQL is issued: no COMMIT, no ROLLBACK.
+- A lost client is detected BEFORE the next statement would be issued.
+- The client is released for reuse ONLY after a successful COMMIT.
+- An ACKNOWLEDGED refusal from the accepted reader, where every statement settled (cap / malformed rows / run-intent reference), closes its read-only transaction with COMMIT and is then released.
+- A timeout or guard fault records `uncertainty: "statement_may_still_run"`.
+
+**Reporting.** The result gains `r1.exclusionRead = { at, code, disposition, uncertainty }`. `exclusionAfter` stays `unread` and `fullyClean` stays false on any failure.
+
+**Unchanged.** The booking outcome — release proof, legs, claim, ENDED_RELEASED — is never changed by the diagnostic read. DB-family marking is not applied, because the read is read-only and has no booking effect. v2 behaviour is unchanged. The accepted guard, workers, helpers and migrations are untouched.
+
+**Evidence (G11, real disposable PG).** Each case records per-client SQL and release / destroy events.
+
+| case | SQL issued | expected disposition / result |
+|---|---|---|
+| (1) baseline reject | `[BEGIN, F0]` | exactly one `release(true)`, no `release()`; unread, not fully clean |
+| (2) baseline hang | `[BEGIN, F0..F3]` | timeout; same disposition; `statement_may_still_run` |
+| (3) baseline late | same as hang | same as hang |
+| (4) backend terminated mid-transaction | nothing after the loss | tracker's single destroy |
+| (5) signal stop mid-transaction | nothing after the stop | destroyed; run STOPPED, booking proof kept |
+| (6) BEGIN reject | `[BEGIN]` | destroyed |
+| (7) COMMIT hang | `[BEGIN, every family, COMMIT]` | destroyed, uncertain, unread |
+| CONTROL (8) healthy | `[BEGIN, every family, COMMIT]` | `release()` once, equal, fully clean |
+| CONTROL (9) acknowledged refusal | `[BEGIN, F0, COMMIT]` | `release()` once, unread |
+
+In every case the booking outcome, claims and legs are kept and nothing is resent.
+
+**Failing-before against cc5e6cf** (TAP retained):
+- 1–4 fail on the SQL assertion: COMMIT is issued after the failure, then the client is released.
+- 5–7 already showed correct SQL and disposition in cc5e6cf, and fail there only on the new diagnostic field.
+- The controls fail there only on the new diagnostic field.
+
 ## 9. Changed test assertions (each explained)
 
 | test | assertion | change and reason |
@@ -236,8 +274,10 @@ Unchanged: no G3, no credentials, no runner / dirs (owner-parked), shared 0017 u
 
 | pin | starting value (G2a, 85cf7b11) | G2b value |
 |---|---|---|
-| foundation `sourceDigestV1` (`RUN_PLAN_CLOSURE`) | `5d3fa10178f27930e816421106d34925976f68bfdf440d1e4f8b7f3720159ed1` (48 paths) | `b783c9476e6f9984cad29122f6f6c43876d3c1388dcd804c992207be7ccd5ec8` (50 paths) |
-| G1 `executorDigestR1` (`R1_EXECUTOR_CLOSURE`) | `a1329f7d6ec45b1323395cc25ff28d08943931dbc5d8a0e5ce1a4183d305377c` (30 paths) | `6935b50741e089cdc2616ff2cd89850582cdc7b8fd49632e5f5ad5193230aca0` (30 paths) |
+| foundation `sourceDigestV1` (`RUN_PLAN_CLOSURE`) | `5d3fa10178f27930e816421106d34925976f68bfdf440d1e4f8b7f3720159ed1` (48 paths) | cc5e6cf: `b783c947…5ec8` → after the §8.5 fix: `cdb00be067b06ea7ed94faf645fad65317d66b297400315c5f6cbf8c4cc703e1` (50 paths) |
+| G1 `executorDigestR1` (`R1_EXECUTOR_CLOSURE`) | `a1329f7d6ec45b1323395cc25ff28d08943931dbc5d8a0e5ce1a4183d305377c` (30 paths) | cc5e6cf: `6935b507…aca0` → after the §8.5 fix: `897d369f24d18ffce446a318d6eff82b8215ea8fb3921b95dffecea90bf11ea7` (30 paths) |
+
+The cc5e6cf values no longer apply: the §8.5 fix changed `run-core-abort-v2.mjs` and therefore the preflight's core origin pin.
 
 Changed runtime files: SHA-256 values are in the bundle `PINS.txt`, computed on the commit tree. No module embeds either digest (G1 B4 "no self-hash" retained).
 
