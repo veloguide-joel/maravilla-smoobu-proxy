@@ -106,6 +106,11 @@ const keysExactly = (o, ks) => { const a = Object.keys(o).sort(); const b = [...
 const int = (v, lo, hi) => Number.isSafeInteger(v) && v >= lo && v <= hi;
 
 // ---- binding: derived ONLY from a validated v2 manifest ----------------------------------------------------------------------------
+// M2-G2a binding SEAM: a module-private brand. ONLY binders inside THIS module add to it (G2a: bindManifestV2 alone), so a copied,
+// spread, JSON-round-tripped or hand-built binding-shaped object is never accepted by the *Bound entrypoints (BINDING_UNVERIFIED).
+const BOUND = new WeakSet();
+/** isBoundBindingV2(b) → true iff `b` is a binding minted by this module's verified binder (never by shape / version string) */
+export const isBoundBindingV2 = (b) => b !== null && typeof b === "object" && BOUND.has(b);
 /**
  * bindManifestV2(manifestInput) → frozen { ok:true, binding } | frozen { ok:false, code:'MANIFEST_INVALID', manifestCode }
  *   binding = { identity: { manifestVersion, connection, runId, intentId, baselineCommit, manifestHash }, checkpoints: { baseline, blocked,
@@ -120,7 +125,7 @@ export function bindManifestV2(manifestInput) {
   const v = validateRunManifestV2(s);
   if (!v.ok) return freeze({ ok: false, code: "MANIFEST_INVALID", manifestCode: v.code });
   const m = v.manifest; const ck = m.checkpoints;
-  return freeze({ ok: true, binding: freeze({
+  const binding = freeze({
     identity: freeze({ manifestVersion: RUN_MANIFEST_V2_VERSION, connection: m.listing.connection, runId: m.runId, intentId: m.intentId, baselineCommit: m.baselineCommit,
       manifestHash: v.hash }),
     checkpoints: freeze({ baseline: ck[0], blocked: ck[1], reopened: ck[2] }),
@@ -130,8 +135,11 @@ export function bindManifestV2(manifestInput) {
       amountMinor: m.amountMinor }),
     /** M2-C: the validated FROZEN manifest copy itself, so a consumer can re-bind after an await without touching the caller's object */
     manifest: m
-  }) });
+  });
+  BOUND.add(binding);
+  return freeze({ ok: true, binding });
 }
+const UNVERIFIED = freeze({ ok: false, code: "BINDING_UNVERIFIED" });
 
 // ---- record validation ------------------------------------------------------------------------------------------------------------
 const writesOk = (w) => isRec(w) && keysExactly(w, WRITE_KEYS) && WRITE_KEYS.every((k) => int(w[k], 0, 1000));
@@ -220,9 +228,14 @@ function bindingCheck(r, b) {
 export function validateRecordV2(input, manifestInput) {
   const br = bindManifestV2(manifestInput);
   if (!br.ok) return freeze({ ok: false, code: "MANIFEST_INVALID" });
+  return recordVerdict(input, br.binding);
+}
+/** validateRecordBound(input, binding) — validateRecordV2 for a BOUND binding (BINDING_UNVERIFIED otherwise) */
+export function validateRecordBound(input, binding) { return isBoundBindingV2(binding) ? recordVerdict(input, binding) : UNVERIFIED; }
+function recordVerdict(input, b) {
   const r = safeSnap(input);
   if (r === BAD) return freeze({ ok: false, code: "RECORD_SHAPE" });
-  const c = fieldCheck(r) || bindingCheck(r, br.binding);
+  const c = fieldCheck(r) || bindingCheck(r, b);
   return c ? freeze({ ok: false, code: c }) : freeze({ ok: true, record: r });
 }
 /** recordHashV2(validatedRecord) = sha256("e7-run-journal-v2\n" + canonicalJson(record)) */
@@ -380,6 +393,11 @@ function journalVerdict(list, b, trusted) {
 export function journalFactsV2(records, manifestInput, opts) {
   const br = bindManifestV2(manifestInput);
   if (!br.ok) return freeze({ ok: false, code: "MANIFEST_INVALID" });
+  return factsVerdict(records, br, opts);
+}
+/** journalFactsBound(records, binding, opts?) — journalFactsV2 for a BOUND binding (BINDING_UNVERIFIED otherwise) */
+export function journalFactsBound(records, binding, opts) { return isBoundBindingV2(binding) ? factsVerdict(records, { binding }, opts) : UNVERIFIED; }
+function factsVerdict(records, br, opts) {
   const th = trustedHeadOf(opts);
   if (th.bad) return freeze({ ok: false, code: "TRUSTED_HEAD_INVALID" });
   const list = safeSnapList(records);
@@ -405,16 +423,27 @@ const publicVerdict = (v) => { if (!v.ok) return v; const { st, ...rest } = v; v
 export function validateJournalV2(records, manifestInput, opts) {
   const br = bindManifestV2(manifestInput);
   if (!br.ok) return freeze({ ok: false, code: "MANIFEST_INVALID" });
+  return journalPublic(records, br.binding, opts);
+}
+/** validateJournalBound(records, binding, opts?) — validateJournalV2 for a BOUND binding (BINDING_UNVERIFIED otherwise) */
+export function validateJournalBound(records, binding, opts) { return isBoundBindingV2(binding) ? journalPublic(records, binding, opts) : UNVERIFIED; }
+function journalPublic(records, b, opts) {
   const th = trustedHeadOf(opts);
   if (th.bad) return freeze({ ok: false, code: "TRUSTED_HEAD_INVALID" });
   const list = safeSnapList(records);
   if (list === BAD) return freeze({ ok: false, code: "JOURNAL_MALFORMED" });
-  return publicVerdict(journalVerdict(list, br.binding, th.trusted));
+  return publicVerdict(journalVerdict(list, b, th.trusted));
 }
 
 /** evaluateStartV2(readResult, manifestInput, { trustedHead } = {}) → the v1 start verdicts (EMPTY_JOURNAL is the only start-permitting one,
  *  and only subject to the core's separate DB eligibility check; RESTART_AMBIGUOUS / RUN_ENDED / JOURNAL_PARTIAL / refusal codes otherwise) */
-export function evaluateStartV2(readResult, manifestInput, opts) {
+export function evaluateStartV2(readResult, manifestInput, opts) { return startVerdict(readResult, (records) => validateJournalV2(records, manifestInput, opts)); }
+/** evaluateStartBound(readResult, binding, opts?) — evaluateStartV2 for a BOUND binding (BINDING_UNVERIFIED otherwise) */
+export function evaluateStartBound(readResult, binding, opts) {
+  if (!isBoundBindingV2(binding)) return UNVERIFIED;
+  return startVerdict(readResult, (records) => journalPublic(records, binding, opts));
+}
+function startVerdict(readResult, validate) {
   let rr;
   try {
     if (readResult === null || typeof readResult !== "object" || types.isProxy(readResult) || (getProto(readResult) !== OBJECT_PROTO && getProto(readResult) !== null)) return freeze({ ok: false, code: "READ_RESULT_INVALID" });
@@ -425,7 +454,7 @@ export function evaluateStartV2(readResult, manifestInput, opts) {
   } catch { return freeze({ ok: false, code: "READ_RESULT_INVALID" }); }
   if (rr.tail === "torn") return freeze({ ok: false, code: "JOURNAL_PARTIAL" });
   if (rr.tail !== "complete") return freeze({ ok: false, code: "READ_RESULT_INVALID" });
-  const v = validateJournalV2(rr.records, manifestInput, opts);
+  const v = validate(rr.records);
   if (!v.ok) return freeze({ ok: false, code: v.code });
   if (v.status === "EMPTY") return freeze({ ok: true, code: "EMPTY_JOURNAL", dbEligibilityRequired: true, anchored: v.anchored });
   if (v.status === "ENDED") return freeze({ ok: false, code: "RUN_ENDED", anchored: v.anchored });

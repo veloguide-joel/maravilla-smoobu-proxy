@@ -10,7 +10,7 @@ import { randomBytes } from "node:crypto";
 import { types } from "node:util";
 import { canonicalJson } from "./run-manifest.mjs";
 import { parseJournalBytes, encodeRecordLine, createNodeFsAdapter, MAX_LINE_BYTES, MAX_FILE_BYTES, LOCK_BYTES, POSIX_PLATFORMS } from "./run-journal-file.mjs";
-import { bindManifestV2, validateRecordV2, validateJournalV2, journalFactsV2, recordHashV2, GENESIS_HASH } from "./run-journal-memory-v2.mjs";
+import { bindManifestV2, validateRecordBound, validateJournalBound, journalFactsBound, recordHashV2, GENESIS_HASH } from "./run-journal-memory-v2.mjs";
 
 export const RUN_JOURNAL_FILE_V2_VERSION = "e7-run-journal-file-v2";
 export const journalFileNameV2 = (runId) => `e7-journal-v2-${runId}.jsonl`;
@@ -168,7 +168,7 @@ export async function openFileJournalV2(input) {
   if (!o) return refuse("JOURNAL_OPTIONS_INVALID");
   const b = bindManifestV2(o.manifest);
   if (!b.ok) return refuse(b.manifestCode || "MANIFEST_INVALID");
-  const manifest = b.binding.manifest; const identity = b.binding.identity;
+  const binding = b.binding; const identity = binding.identity;
   const fs = "fsAdapter" in o ? snapAdapter(o.fsAdapter) : createNodeFsAdapter();
   if (!fs) return refuse("JOURNAL_OPTIONS_INVALID");
   if (!POSIX_PLATFORMS.includes(fs.platform)) return refuse("JOURNAL_PLATFORM_UNSUPPORTED");
@@ -225,12 +225,12 @@ export async function openFileJournalV2(input) {
 
   function append(record) {
     const g = gate("append"); if (g) return fail(g);
-    const vr = validateRecordV2(record, manifest);
+    const vr = validateRecordBound(record, binding);               // G2a: the SAME binding (BOUND by bindManifestV2 above), not a re-bind
     if (!vr.ok) return fail(vr.code || "RECORD_INVALID");
     const r = vr.record;
     const expSeq = S.head ? S.head.seq + 1 : 1; const expPrev = S.head ? S.head.hash : GENESIS_HASH;
     if (r.seq !== expSeq || r.prevHash !== expPrev) return fail("CHAIN_MISMATCH");
-    const vj = validateJournalV2([...S.history, r], manifest);
+    const vj = validateJournalBound([...S.history, r], binding);
     if (!vj.ok) return fail(vj.code || "ORDER_INVALID");
     let line; try { line = encodeRecordLine(r); } catch { return fail("RECORD_INVALID"); }
     if (line.length > MAX_LINE_BYTES) return fail("LINE_TOO_LONG");
@@ -318,7 +318,7 @@ export async function readJournalForRecoveryV2(input) {
   if (!o) return out({ ok: false, code: "RECOVERY_OPTIONS_INVALID" });
   const b = bindManifestV2(o.manifest);
   if (!b.ok) return out({ ok: false, code: b.manifestCode || "MANIFEST_INVALID" });
-  const manifest = b.binding.manifest; const identity = b.binding.identity;
+  const binding = b.binding; const identity = binding.identity;
   let supplied = null;
   if ("trustedHead" in o && o.trustedHead !== null) {
     const t = safe(() => plainData(o.trustedHead, ["hash", "seq"]));
@@ -354,7 +354,7 @@ export async function readJournalForRecoveryV2(input) {
     heads.push(x);
   }
   const recs = pj.records; const n = recs.length; const m = heads.length;
-  const vj = validateJournalV2(recs, manifest);
+  const vj = validateJournalBound(recs, binding);
   if (!vj.ok) return out({ ...base, effects: n ? "UNKNOWN_FROM_DISK" : "NO_RECORD_ON_DISK", presence, ...tails, relation: "JOURNAL_INVALID", detail: vj.code, unresolved: freeze(["JOURNAL_UNTRUSTED"]) });
   const hashes = recs.map((r) => recordHashV2(r));
   for (let i = 0; i < Math.min(n, m); i++) if (hashes[i] !== heads[i].hash) return out({ ...base, presence, ...tails, relation: "HASH_MISMATCH", at: i + 1, unresolved: freeze(["REPLACED_OR_EDITED"]) });
@@ -366,7 +366,7 @@ export async function readJournalForRecoveryV2(input) {
   else relation = "GAP_GT_1";
   const refusal = relation === "HEAD_AHEAD" || relation === "GAP_GT_1";
   const anchor = m > 0 ? freeze({ seq: m, hash: heads[m - 1].hash }) : null;
-  const facts = n ? journalFactsV2(recs, manifest).facts : null;
+  const facts = n ? journalFactsBound(recs, binding).facts : null;
   // supplied (separately retained) trusted head: checked against the JOURNAL chain, never replaced by the head-file tip
   let suppliedHead = "NOT_SUPPLIED";
   if (supplied) suppliedHead = supplied.seq > n ? "AHEAD_OF_FILES" : hashes[supplied.seq - 1] !== supplied.hash ? "NOT_IN_CHAIN" : supplied.seq === n ? "MATCH_TIP" : "IN_CHAIN_BEHIND_TIP";

@@ -14,7 +14,7 @@
 //             against it (an unacknowledged landed record is then an extra tail → refused) and must honour the stop, never an unanchored
 //             journalFactsV2 view. receiptLanding: NOT_ATTEMPTED | ACKED | UNACKED_MAY_HAVE_LANDED (a started, unACKed receipt is never claimed absent).
 import { types } from "node:util";
-import { bindManifestV2, journalFactsV2, recordHashV2, ABORT_QUEUED, ABORT_REASON, RECORD_VERSION_V2 } from "./run-journal-memory-v2.mjs";
+import { bindManifestV2, isBoundBindingV2, journalFactsBound, recordHashV2, ABORT_QUEUED, ABORT_REASON, RECORD_VERSION_V2 } from "./run-journal-memory-v2.mjs";
 import { LIMITS } from "./run-guard.mjs";
 import { bindAbortExpectation } from "../../lib/booking-db/test-abort.js";
 import { loadIntent } from "../../lib/booking-db/repo.js";
@@ -27,6 +27,9 @@ export const BRIDGE_OUTCOMES = Object.freeze(["REFUSED_BEFORE_START", "STOPPED_S
 export const BRIDGE_LIMITS = Object.freeze({ journalMs: LIMITS.JOURNAL_MS, abortMs: LIMITS.STEP_MARGIN_MS, postcheckMs: LIMITS.SNAPSHOT_MS });
 const INPUT_KEYS = ["env", "guard", "journal", "manifest", "now", "operator", "operatorDeps", "pool", "trustedHead"];
 const REQUIRED = ["env", "guard", "journal", "manifest", "now", "operator", "pool", "trustedHead"];
+/** M2-G2a: runTestAbortBridgeBound takes a BOUND binding (minted by run-journal-memory-v2's verified binder) in place of `manifest` */
+const BOUND_INPUT_KEYS = ["binding", "env", "guard", "journal", "now", "operator", "operatorDeps", "pool", "trustedHead"];
+const BOUND_REQUIRED = ["binding", "env", "guard", "journal", "now", "operator", "pool", "trustedHead"];
 const freeze = Object.freeze;
 const HEX64 = /^[0-9a-f]{64}$/;
 
@@ -114,16 +117,19 @@ function observedApplied(facts) {
   if (facts.appliedEvents === 0 && facts.transition === "rows:0") return false;     // both OBSERVED absent at that read
   return null;
 }
-export async function runTestAbortBridge(input) {
+export function runTestAbortBridge(input) { return bridgeRun(input, false); }
+/** runTestAbortBridgeBound(input) — the SAME bridge for a BOUND binding; anything else → REFUSED_BEFORE_START / BINDING_UNVERIFIED (G2a seam) */
+export function runTestAbortBridgeBound(input) { return bridgeRun(input, true); }
+async function bridgeRun(input, viaBinding) {
   const out = { version: BRIDGE_VERSION, outcome: null, code: null, cleanupPermitted: false, operatorCoreInvocations: 0, requestHelperInvocations: null, operatorOutcome: null,
     startAck: null, receiptAck: null, trustedHead: null, receiptLanding: "NOT_ATTEMPTED", postcheck: null, dbAbortApplied: null };
   const done = (outcome, code = null) => { out.outcome = outcome; out.code = code; return freeze({ ...out }); };
   // ---- synchronous binding (before any await) -------------------------------------------------------------------------------------
-  const inp = dataProps(input, INPUT_KEYS);
-  if (!inp || !REQUIRED.every((k) => k in inp)) return done("REFUSED_BEFORE_START", "INPUT_INVALID");
-  const br = bindManifestV2(inp.manifest);
-  if (!br.ok) return done("REFUSED_BEFORE_START", "MANIFEST_INVALID");
-  const b = br.binding;
+  const inp = dataProps(input, viaBinding ? BOUND_INPUT_KEYS : INPUT_KEYS);
+  if (!inp || !(viaBinding ? BOUND_REQUIRED : REQUIRED).every((k) => k in inp)) return done("REFUSED_BEFORE_START", "INPUT_INVALID");
+  let b;
+  if (viaBinding) { if (!isBoundBindingV2(inp.binding)) return done("REFUSED_BEFORE_START", "BINDING_UNVERIFIED"); b = inp.binding; }
+  else { const br = bindManifestV2(inp.manifest); if (!br.ok) return done("REFUSED_BEFORE_START", "MANIFEST_INVALID"); b = br.binding; }
   if (b.phases.testAbortAfterReservation !== true || b.phases.capture !== false || b.phases.recording !== false) return done("REFUSED_BEFORE_START", "MANIFEST_NOT_ABORT_PLAN");
   const e = bindAbortExpectation(inp.operator);
   if (!e || e.planHash !== abortPlanHash(e)) return done("REFUSED_BEFORE_START", "OPERATOR_EXPECTATION_INVALID");
@@ -142,13 +148,13 @@ export async function runTestAbortBridge(input) {
   const now = inp.now; const pool = inp.pool;
   let opDeps = undefined;
   if (inp.operatorDeps !== undefined) { const d = dataProps(inp.operatorDeps, ["requestTestAbort", "afterReply"]); if (!d) return done("REFUSED_BEFORE_START", "INPUT_INVALID"); opDeps = freeze({ ...d }); }
-  const manifest = b.manifest;                                        // the VALIDATED FROZEN copy: never the caller's object after an await
+  // the VALIDATED FROZEN binding (never the caller's object after an await); the journal read is anchored through it (G2a)
   // ---- (1) read + anchor the journal ------------------------------------------------------------------------------------------------
   const rd = await bounded(guard, BRIDGE_LIMITS.journalMs, () => jm.read());
   if (rd.kind !== "fulfilled") return done("REFUSED_BEFORE_START", `JOURNAL_READ_${rd.kind === "rejected" ? "REJECTED" : rd.code}`.slice(0, 48));
   const rr = dataProps(rd.value, ["records", "tail"]);
   if (!rr || rr.tail !== "complete") return done("REFUSED_BEFORE_START", "JOURNAL_READ_INVALID");
-  const jf = journalFactsV2(rr.records, manifest, { trustedHead: head });
+  const jf = journalFactsBound(rr.records, b, { trustedHead: head });
   if (!jf.ok) return done("REFUSED_BEFORE_START", `JOURNAL_${jf.code}`.slice(0, 48));
   if (!jf.anchored || jf.status !== "IN_PROGRESS" || !jf.facts.abortReady) return done("REFUSED_BEFORE_START", "JOURNAL_NOT_ABORT_READY");
   // the reservation id is the operator's; the journal holds no provider id — requestTestAbort binds it to the DATABASE intent authoritatively
