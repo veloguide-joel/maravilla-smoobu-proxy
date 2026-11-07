@@ -1,6 +1,8 @@
 # Migration 0018 — schema-qualify `booking.is_privileged()` (root security-fix approval, 2026-11-07). Contract (LOCAL; disposable PG only)
 
-**Base / branch.** Base e7-test `814a0b9526e2e3e40831bddf905b2d17c285f64e`; isolated branch `feature/e7-is-privileged-qualify`, not pushed. Companion to the static finding in `scratchpad/secinv/e7-is-privileged-search-path-finding-2026-11-07.md` (status: STATIC, the bypass was NOT reproduced by me; no exploit executed). This slice implements the approved fix and tests the **boolean contract only** — no protected booking write and no guard-bypass demonstration.
+**Base / branch.** Base e7-test `814a0b9526e2e3e40831bddf905b2d17c285f64e`; isolated branch `feature/e7-is-privileged-qualify`, not pushed. Companion to the finding in `scratchpad/secinv/e7-is-privileged-search-path-finding-2026-11-07.md`.
+
+**Reproduction status (updated by this slice; supersedes the companion report's earlier "STATIC / not reproduced" wording, which is now historical).** The **function-level boolean flip is now reproduced** on a disposable cluster: PostgreSQL permits an app-role `CREATE TEMP TABLE pg_namespace`, and the OLD unqualified `is_privileged()` then returns `true` for the app role, while the fixed function returns `false`. A **full end-to-end protected-write guard bypass was NOT demonstrated** (out of scope by ruling); this slice tests the **boolean contract and caller context only** — no protected booking write.
 
 ## The weakness (recap, one line)
 `booking.is_privileged()` (0003) reads `pg_namespace` **unqualified** and has **no** `SET search_path`. Per PostgreSQL, `pg_temp` (when unlisted) is searched first for relation names, so a session temp relation named `pg_namespace` can be resolved before `pg_catalog.pg_namespace`. `pg_get_userbyid` is a function name and is never searched in `pg_temp`.

@@ -41,7 +41,8 @@ async function probe(url, { searchPath, shadow } = {}) {
 async function funcCatalog() {
   const r = await db.owner.query(`SELECT p.prosrc, p.proconfig, p.provolatile, p.prosecdef,
       p.proowner::regrole::text AS owner, COALESCE(p.proacl::text, '<null>') AS acl,
-      p.prorettype::regtype::text AS rettype, p.proargtypes::text AS argtypes, l.lanname AS lang
+      p.prorettype::regtype::text AS rettype, p.proargtypes::text AS argtypes, l.lanname AS lang,
+      encode(sha256(convert_to(p.prosrc, 'UTF8')), 'hex') AS prosrcsha
     FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_language l ON l.oid = p.prolang
     WHERE p.oid = 'booking.is_privileged()'::regprocedure`);
   return r.rows[0];
@@ -87,6 +88,10 @@ test("0018 catalog compare + down restores the 0003 body byte-exact: up changes 
     // down restored the 0003 body (prosrc) exactly — compare to the on-disk 0003 statement body
     const base0003 = "\n  SELECT current_user::text = (SELECT pg_get_userbyid(nspowner)::text FROM pg_namespace WHERE nspname = 'booking')\n";
     assert.equal(at17.prosrc, base0003, "0018 down restores the 0003 prosrc byte-for-byte");
+    // provenance cross-check: the restored body matches root's read-only LIVE helper prosrc SHA256 (proves down == the live definition)
+    assert.equal(at17.prosrcsha, "701fade99915db198c1aff0eee3e94d7106c314480ee5863321739444ba20c69", "restored prosrc SHA256 == root's live helper baseline");
+    assert.equal(at17.owner, "postgres", "owner is the migrator (postgres on disposable; root's live baseline: owner postgres)");
+    assert.equal(at18.owner, "postgres", "0018 up keeps the owner");
   } finally {
     await withAdmin((c) => migrateUp(c, { env: "test", to: 18 }));             // restore the fixed function for any later run
   }
@@ -142,4 +147,24 @@ test("0018 caller regression: an is_privileged()-gated guard still REFUSES an ap
     await owner.query("ROLLBACK");
     assert.notEqual(code, "42501", "owner passes the is_privileged() gate (a later NOT NULL / CHECK is fine; not a privilege refusal)");
   } finally { await owner.end(); }
+});
+
+test("0018 caller-context control (current_user-based, not just owner-login): is_privileged() is TRUE inside a schema-owner SECURITY DEFINER caller invoked BY THE APP ROLE, and FALSE inside an INVOKER caller invoked by the app role — the exact effective-user semantics the guards rely on", async () => {
+  // the owner creates two trivial wrappers over booking.is_privileged(): one SECURITY DEFINER (runs as the owner), one INVOKER (runs as the caller)
+  await db.owner.query("CREATE FUNCTION public._e7_ctx_definer() RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT booking.is_privileged() $$");
+  await db.owner.query("CREATE FUNCTION public._e7_ctx_invoker() RETURNS boolean LANGUAGE sql STABLE SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS $$ SELECT booking.is_privileged() $$");
+  await db.owner.query("REVOKE EXECUTE ON FUNCTION public._e7_ctx_definer(), public._e7_ctx_invoker() FROM PUBLIC");
+  await db.owner.query("GRANT EXECUTE ON FUNCTION public._e7_ctx_definer(), public._e7_ctx_invoker() TO mv_booking_app");
+  const app = new pg.Client({ connectionString: db.appUrl() }); await app.connect();
+  try {
+    const u = (await app.query("SELECT current_user AS u")).rows[0].u;
+    assert.equal(u, "test_app", "the calling session is the runtime app role");
+    const d = (await app.query("SELECT public._e7_ctx_definer() AS p")).rows[0].p;
+    const i = (await app.query("SELECT public._e7_ctx_invoker() AS p")).rows[0].p;
+    assert.equal(d, true, "inside a schema-owner SECURITY DEFINER caller (effective current_user = owner) is_privileged() is TRUE — the intended privileged path");
+    assert.equal(i, false, "inside an INVOKER caller invoked by the app role (effective current_user = app) is_privileged() is FALSE");
+  } finally {
+    await app.end();
+    await db.owner.query("DROP FUNCTION IF EXISTS public._e7_ctx_definer(), public._e7_ctx_invoker()");   // scaffolding removed; nothing persisted in booking
+  }
 });
