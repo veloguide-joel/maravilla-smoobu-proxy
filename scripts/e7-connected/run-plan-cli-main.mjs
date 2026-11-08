@@ -34,7 +34,7 @@ export const NATIVE_EXEC_SOURCES = Object.freeze([
   "scripts/e7-connected/readonly-probe.mjs", "scripts/e7-connected/real-exchange.mjs", "scripts/e7-connected/run-binding-r1.mjs",
   "scripts/e7-connected/run-core-abort-v2.mjs", "scripts/e7-connected/run-core.mjs", "scripts/e7-connected/run-facts.mjs",
   "scripts/e7-connected/run-guard.mjs", "scripts/e7-connected/run-journal-file-v2.mjs", "scripts/e7-connected/run-journal-file.mjs",
-  "scripts/e7-connected/run-journal-memory-v2.mjs", "scripts/e7-connected/run-journal-memory.mjs", "scripts/e7-connected/run-manifest-v2.mjs",
+  "scripts/e7-connected/run-journal-memory-v2.mjs", "scripts/e7-connected/run-journal-memory.mjs", "scripts/e7-connected/run-lock-precheck.mjs", "scripts/e7-connected/run-manifest-v2.mjs",
   "scripts/e7-connected/run-manifest.mjs", "scripts/e7-connected/run-plan-cli-main.mjs", "scripts/e7-connected/run-plan-command.mjs",
   "scripts/e7-connected/run-plan-v1.mjs", "scripts/e7-connected/run-preflight-r1.mjs", "scripts/e7-connected/run-r1-launcher.mjs",
   "scripts/e7-connected/run-test-abort.mjs", "scripts/e7-operator/test-abort.mjs"]);

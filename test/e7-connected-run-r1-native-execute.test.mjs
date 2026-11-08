@@ -39,10 +39,18 @@ function scan(starts) {
   return { files: [...seen.keys()].sort(), external: [...ext].sort() };
 }
 function indepDigest(root) {
+  // Historical controls replace the CLI with an earlier revision. Hash that tree's
+  // own literal manifests, rather than the current test process's imported CLI.
+  const cliSource = readFileSync(join(root, "scripts/e7-connected/run-plan-cli-main.mjs"), "utf8");
+  const listOf = (name) => {
+    const m = cliSource.match(new RegExp(`${name} = Object\\.freeze\\(\\[([\\s\\S]*?)\\]\\)`));
+    assert.ok(m, `${name}: literal manifest in fixture CLI`);
+    return JSON.parse(`[${m[1]}]`);
+  };
   const lock = JSON.parse(readFileSync(join(root, "package-lock.json"), "utf8"));
-  const pkgs = new Set(); const q = CLI.NATIVE_EXTERNALS.map((n) => `node_modules/${n}`);
+  const pkgs = new Set(); const q = listOf("NATIVE_EXTERNALS").map((n) => `node_modules/${n}`);
   while (q.length) { const k = q.pop(); if (pkgs.has(k)) continue; pkgs.add(k); const e = lock.packages[k]; for (const d of Object.keys({ ...(e.dependencies || {}), ...(e.optionalDependencies || {}) })) if (lock.packages[`node_modules/${d}`]) q.push(`node_modules/${d}`); }
-  const files = [...CLI.NATIVE_EXEC_SOURCES];
+  const files = listOf("NATIVE_EXEC_SOURCES");
   const walk = (rel) => { for (const d of readdirSync(join(root, rel), { withFileTypes: true })) { const p = `${rel}/${d.name}`; if (d.isDirectory()) walk(p); else if (d.isFile()) files.push(p); else throw new Error(`special ${p}`); } };
   for (const k of pkgs) walk(k);
   files.sort();

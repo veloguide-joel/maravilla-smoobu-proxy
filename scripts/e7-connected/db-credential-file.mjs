@@ -342,3 +342,37 @@ async function runDb(input) {
   const login = (x) => { const l = Object.create(null); l.role = x.role; Object.defineProperty(l, "connectionString", { value: x.connectionString, enumerable: false }); return freeze(l); };
   return freeze({ ok: true, logins: freeze({ app: login(out.app), report: login(out.report) }) });
 }
+
+// ===== ADDITIVE (feature/e7-p3-lock-precheck): report-only single-slot ingress for the P3 precheck CLI =====
+// Reuses readOne + parseCredentialJson + loginOf VERBATIM (same reviewed security + URL policy as readDbLoginFiles).
+// It does NOT modify readDbLoginFiles, the LABELLED-COPY segments, or any policy. No app-credential requirement;
+// no cross-slot (same-DB / identical / target) checks — a single slot has nothing to cross-check.
+async function runOneDb(input) {
+  const o = dataExactly(input, ["fs", "path", "repoRoot", "slot"]);
+  if (!o) return failSlot("DB_INPUT_INVALID", null, "NOT_OPENED");
+  if (o.slot !== "app" && o.slot !== "report") return failSlot("DB_INPUT_INVALID", null, "NOT_OPENED");
+  if (!canonical(o.path, false) || !canonical(o.repoRoot, true)) return failSlot("DB_INPUT_INVALID", null, "NOT_OPENED");
+  const fs = dataExactly(o.fs, ["lstat", "open", "platform", "realpath", "uid"]);
+  if (!fs || typeof fs.platform !== "string" || !Number.isSafeInteger(fs.uid) || fs.uid < 0 || fs.uid > 0xffffffff || !isFn(fs.lstat) || !isFn(fs.realpath) || !isFn(fs.open)) return failSlot("CRED_ADAPTER_INVALID", null, "NOT_OPENED");
+  const r = await readOne({ path: o.path, repoRoot: o.repoRoot }, fs);
+  if (!r.ok) return failSlot(r.code, o.slot, r.closeState);
+  let text = r.text;
+  const parsed = parseCredentialJson(text); text = null;
+  if (!parsed.ok) return failSlot(parsed.code, o.slot, "CLOSED");
+  const lg = loginOf(parsed, o.slot); parsed.obj.clear();
+  if (!lg.ok) return failSlot(lg.code, o.slot, "CLOSED");
+  const l = Object.create(null); l.role = lg.role; Object.defineProperty(l, "connectionString", { value: lg.connectionString, enumerable: false });
+  return freeze({ ok: true, slot: o.slot, login: freeze(l) });
+}
+/**
+ * readOneDbLogin({ path, repoRoot, fs, slot }) → native Promise<frozen result>; never rejects. REPORT-ONLY P3 ingress.
+ *   PUBLIC failure { ok:false, code, slot, closeState }. PRIVATE success { ok:true, slot, login:{ role, <non-enumerable> connectionString } }.
+ *   TEXT checks only; no connection / pool / DNS; nothing secret in any failure.
+ */
+export function readOneDbLogin(input) {
+  return new NativePromise((resolve) => {
+    let inner;
+    try { inner = runOneDb(input); } catch { resolve(failSlot("CRED_INPUT_INVALID", null, "NOT_OPENED")); return; }
+    apply(P_THEN, inner, [resolve, () => resolve(failSlot("CRED_IO", null, "NOT_OPENED"))]);
+  });
+}
