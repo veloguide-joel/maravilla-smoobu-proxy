@@ -34,12 +34,13 @@ export const POOL_END_BOUND_MS = 10_000;
 export const OVERALL_DEADLINE_MS = LOCK_PRECHECK_CONNECT_MS + LOCK_PRECHECK_QUERY_MS + 2_000;
 export const POOL_MAX = 1;
 export const STATEMENT_TIMEOUT_MS = LOCK_PRECHECK_QUERY_MS;
-// R1: the DIRECT DEV endpoint + the exact report identity this CLI accepts (drift-guarded in the test against run-r1-launcher.mjs ENDPOINTS
-// and db-credential-file.mjs SLOT_ROLES). The pooler host is intentionally NOT accepted here.
+// The file's role label is mv_booking_report (a NOLOGIN permission role). The existing DEV login below inherits only that role;
+// its LOGIN/INHERIT flags, membership, and absence of administrative flags were verified from DEV catalogs on 2026-11-10.
+// The endpoint remains drift-guarded against the launcher. The pooler host is intentionally NOT accepted here.
 export const DIRECT_HOST = "db.mxotevtiscernhqilyiu.supabase.co";
 export const REQUIRED_PORT = "5432";
 export const REQUIRED_DB_PATH = "/postgres";
-export const REQUIRED_REPORT_USER = "mv_booking_report";
+export const REQUIRED_REPORT_USER = "mv_booking_report_dev";
 export const EXIT = Object.freeze({
   CLEAR: 0, INTERNAL: 1, USAGE: 2, PLATFORM_OR_CA: 3, CRED_OR_CONNSTRING: 4, PRECHECK_UNAVAILABLE: 6, INTERRUPTED: 7, RUN_LOCK_PRESENT: 8, HELD: 9, CLEANUP_UNCONFIRMED: 10
 });
