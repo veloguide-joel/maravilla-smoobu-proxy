@@ -53,7 +53,9 @@ test("gate refuses pooler / port / db / user / encoded-user / host-ambiguity / q
     [`postgresql://${REQUIRED_REPORT_USER}:pw@${DIRECT_HOST}:5432/postgres2`]: "ENDPOINT_DB_REFUSED",
     [`postgresql://postgres:pw@${DIRECT_HOST}:5432/postgres`]: "ENDPOINT_USER_REFUSED",
     [`postgresql://mv_booking_app:pw@${DIRECT_HOST}:5432/postgres`]: "ENDPOINT_USER_REFUSED",
-    [`postgresql://mv%5Fbooking%5Freport:pw@${DIRECT_HOST}:5432/postgres`]: "ENDPOINT_USER_REFUSED", // percent-encoded user refused
+    [`postgresql://mv_booking_report:pw@${DIRECT_HOST}:5432/postgres`]: "ENDPOINT_USER_REFUSED", // permission role is NOLOGIN, not the DEV login
+    [`postgresql://mv_booking_app_dev:pw@${DIRECT_HOST}:5432/postgres`]: "ENDPOINT_USER_REFUSED",
+    [`postgresql://mv%5Fbooking%5Freport%5Fdev:pw@${DIRECT_HOST}:5432/postgres`]: "ENDPOINT_USER_REFUSED", // percent-encoded user refused
     [`postgresql://${REQUIRED_REPORT_USER}:pw@${DIRECT_HOST}:5432/postgres?sslmode=require`]: "CONNSTRING_REJECTED",
     [`postgresql://${REQUIRED_REPORT_USER}:pw@${DIRECT_HOST}:5432/postgres#x`]: "CONNSTRING_REJECTED",
     [`postgresql://${REQUIRED_REPORT_USER}:pw@${DIRECT_HOST}@evil.example.com:5432/postgres`]: "ENDPOINT_HOST_REFUSED", // userinfo @ ambiguity
@@ -66,7 +68,9 @@ test("every gate refusal in the CLI means makePool and connect are NEVER called"
     "postgresql://mv_booking_report.mxotevtiscernhqilyiu:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres",
     `postgresql://${REQUIRED_REPORT_USER}:pw@${DIRECT_HOST}:6543/postgres`,
     `postgresql://postgres:pw@${DIRECT_HOST}:5432/postgres`,
-    `postgresql://mv%5Fbooking%5Freport:pw@${DIRECT_HOST}:5432/postgres`,
+    `postgresql://mv_booking_report:pw@${DIRECT_HOST}:5432/postgres`,
+    `postgresql://mv_booking_app_dev:pw@${DIRECT_HOST}:5432/postgres`,
+    `postgresql://mv%5Fbooking%5Freport%5Fdev:pw@${DIRECT_HOST}:5432/postgres`,
     `postgresql://${REQUIRED_REPORT_USER}:pw@${DIRECT_HOST}:5432/postgres?sslmode=require`
   ];
   for (const cs of bad) {
@@ -83,6 +87,21 @@ test("every gate refusal in the CLI means makePool and connect are NEVER called"
 test("a correct report URL passes the gate and runs the precheck", async () => {
   const r = await runP3Precheck({ argv: args(["--confirm-prereqs-met"]), deps: deps({ makePool: () => fakePool({ n: 0 }) }) });
   assert.equal(r.result.code, "LOCK_PRECHECK_CLEAR"); assert.equal(r.exit, EXIT.CLEAR);
+});
+
+test("real report-file ingress accepts the distinct DEV login and report permission-role label without network", async () => {
+  const cs = `postgresql://mv_booking_report_dev:dummy@${DIRECT_HOST}:5432/postgres`;
+  const { dir, path } = writeLogin(cs);
+  let pools = 0;
+  try {
+    const r = await runP3Precheck({
+      argv: ["--report-login", path, "--ca", CA_PATH, "--repo-root", REPO_ROOT, "--confirm-prereqs-met"],
+      deps: { makePool: (cfg) => { pools++; assert.equal(cfg.connectionString, cs); return fakePool(); } }
+    });
+    assert.equal(r.exit, EXIT.CLEAR);
+    assert.equal(r.result.cleanup, "POOL_ENDED");
+    assert.equal(pools, 1);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 // ---------- REAL reader → REAL pool config flow (zero-param compatibility; the TLS conflict) ----------
@@ -213,14 +232,16 @@ test("output is sanitized: no connection string / host / password / role ever em
   for (const secretish of ["postgresql://", "mv_booking_report", "pw@", DIRECT_HOST, "password"]) assert.equal(s.includes(secretish), false, `must not leak ${secretish}`);
   assert.equal(result.schema, SCHEMA);
 });
-test("R1 drift guard: CLI constants match launcher ENDPOINTS.direct and SLOT_ROLES.report", () => {
+test("R1 drift guard: direct endpoint is pinned; the DEV login is distinct from the report permission-role label", () => {
   const src = readFileSync(join(HERE, "run-r1-launcher.mjs"), "utf8");
   const direct = src.match(/direct:\s*\{\s*host:\s*"([^"]+)",\s*port:\s*"([^"]+)",\s*database:\s*"([^"]+)"/);
   assert.ok(direct, "could not find ENDPOINTS.direct");
   assert.equal(DIRECT_HOST, direct[1]);
   assert.equal(REQUIRED_PORT, direct[2]);
   assert.equal(REQUIRED_DB_PATH, "/" + direct[3]);
-  assert.equal(REQUIRED_REPORT_USER, SLOT_ROLES.report);
+  assert.equal(SLOT_ROLES.report, "mv_booking_report");
+  assert.equal(REQUIRED_REPORT_USER, "mv_booking_report_dev");
+  assert.notEqual(REQUIRED_REPORT_USER, SLOT_ROLES.report);
 });
 test("CA fixture digest equals the pinned value", () => { assert.equal(createHash("sha256").update(CA_BYTES).digest("hex"), CA_SHA256_PIN); });
 test("importing the CLI opens no socket (no-connect-on-import)", () => {
