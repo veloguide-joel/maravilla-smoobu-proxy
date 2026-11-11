@@ -1,0 +1,156 @@
+# E7 runner A: ONE intentional TEST abort of ONE confirmed, never-captured TEST reservation + the accepted two-leg cleanup.
+# MANUAL dispatch only; default mode `preflight` = no secrets, no DB, no provider request, no dependency install (fake tests + digests + env).
+# Reviewed execute requires exact bindings, main and the existing environment gate; tooling = merged guard bf44bf0d (PR #53).
+# Execution was enabled by the separately reviewed ROOT change. Inputs / labels / hashes
+# are NOT consent. Secrets (environment `e7-readonly-probe`, required reviewers, execute step only): E7_STRIPE_TEST_KEY, E7_HOSTAWAY_TOKEN,
+# E7_DEV_BOOKING_DATABASE_URL. No webhook, no deploy, no migration, no capture / refund / create / record / notify, no account or key change.
+name: e7-test-abort-cleanup
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "preflight (default: no secrets, no DB, no provider requests) or execute (exact reviewed bindings and owner-approved TEST cleanup only)"
+        type: choice
+        options: [preflight, execute]
+        default: preflight
+      approval_ref:
+        description: "Approval label (non-secret; a label, never consent). All five plan inputs empty = labelled SYNTHETIC preflight only."
+        type: string
+        required: false
+        default: ""
+      intent_id:
+        description: "The ONE confirmed TEST intent (UUID v4)."
+        type: string
+        required: false
+        default: ""
+      payment_intent_id:
+        description: "Its bound Stripe TEST PaymentIntent (pi_...)."
+        type: string
+        required: false
+        default: ""
+      reservation_id:
+        description: "Its bound Hostaway reservation id (decimal; protected ids refused)."
+        type: string
+        required: false
+        default: ""
+      expected_version:
+        description: "The intent's exact current version (the abort is refused at any other version)."
+        type: string
+        required: false
+        default: ""
+      expected_plan_hash:
+        description: "execute only: exact 64-hex planHash from a REAL-plan preflight (no default)"
+        type: string
+        required: false
+        default: ""
+      expected_closure_digest:
+        description: "execute only: exact closureDigest of the pinned tooling closure (no default)"
+        type: string
+        required: false
+        default: ""
+      expected_runner_digest:
+        description: "execute only: exact 64-hex runnerDigest of the REVIEWED runner / workflow / test bytes (no default)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e7-test-abort-cleanup
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    if: inputs.mode == 'preflight'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout runner (this repository, dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout merged E7 guard tooling (fixed commit bf44bf0d)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: bf44bf0da9b0f7b3fdf8dfbcfdb7136b36ad05df
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Preflight (no secrets, no DB, no provider requests)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_APPROVAL_REF: ${{ inputs.approval_ref }}
+          E7_INTENT_ID: ${{ inputs.intent_id }}
+          E7_PAYMENT_INTENT_ID: ${{ inputs.payment_intent_id }}
+          E7_RESERVATION_ID: ${{ inputs.reservation_id }}
+          E7_EXPECTED_VERSION: ${{ inputs.expected_version }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+        run: node wrapper/scripts/e7-test-abort-cleanup.mjs preflight
+
+  execute:
+    if: inputs.mode == 'execute' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: e7-readonly-probe
+    timeout-minutes: 15
+    steps:
+      - name: Checkout runner (this repository, dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout merged E7 guard tooling (fixed commit bf44bf0d)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: bf44bf0da9b0f7b3fdf8dfbcfdb7136b36ad05df
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Verify bindings before any install (no secrets, no DB, no provider requests; requires exact reviewed bindings)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_APPROVAL_REF: ${{ inputs.approval_ref }}
+          E7_INTENT_ID: ${{ inputs.intent_id }}
+          E7_PAYMENT_INTENT_ID: ${{ inputs.payment_intent_id }}
+          E7_RESERVATION_ID: ${{ inputs.reservation_id }}
+          E7_EXPECTED_VERSION: ${{ inputs.expected_version }}
+          E7_EXPECTED_PLAN_HASH: ${{ inputs.expected_plan_hash }}
+          E7_EXPECTED_CLOSURE_DIGEST: ${{ inputs.expected_closure_digest }}
+          E7_EXPECTED_RUNNER_DIGEST: ${{ inputs.expected_runner_digest }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+        run: node wrapper/scripts/e7-test-abort-cleanup.mjs verify
+      - name: Install the pinned dependency from the verified lockfile (no lifecycle scripts)
+        working-directory: tooling
+        run: npm ci --ignore-scripts --omit=dev --no-audit --no-fund
+      - name: Fetch the public Supabase CA (the runner checks its pinned SHA-256)
+        run: curl --fail --silent --show-error --proto '=https' --max-time 20 -o "$RUNNER_TEMP/prod-ca-2021.crt" https://supabase-downloads.s3-ap-southeast-1.amazonaws.com/prod/ssl/prod-ca-2021.crt
+      - name: Execute ONE abort + bounded cleanup (secrets scoped to this step only)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_APPROVAL_REF: ${{ inputs.approval_ref }}
+          E7_INTENT_ID: ${{ inputs.intent_id }}
+          E7_PAYMENT_INTENT_ID: ${{ inputs.payment_intent_id }}
+          E7_RESERVATION_ID: ${{ inputs.reservation_id }}
+          E7_EXPECTED_VERSION: ${{ inputs.expected_version }}
+          E7_EXPECTED_PLAN_HASH: ${{ inputs.expected_plan_hash }}
+          E7_EXPECTED_CLOSURE_DIGEST: ${{ inputs.expected_closure_digest }}
+          E7_EXPECTED_RUNNER_DIGEST: ${{ inputs.expected_runner_digest }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_CA_FILE: ${{ runner.temp }}/prod-ca-2021.crt
+          E7_STRIPE_TEST_KEY: ${{ secrets.E7_STRIPE_TEST_KEY }}
+          E7_HOSTAWAY_TOKEN: ${{ secrets.E7_HOSTAWAY_TOKEN }}
+          E7_DEV_BOOKING_DATABASE_URL: ${{ secrets.E7_DEV_BOOKING_DATABASE_URL }}
+        run: node wrapper/scripts/e7-test-abort-cleanup.mjs execute
