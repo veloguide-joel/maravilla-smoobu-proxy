@@ -13,8 +13,13 @@
 //   * Flow: precheck (read-only) -> fresh proofs -> ONE abort invocation -> verified capture_failed / TEST_ABORT_REQUESTED lineage -> fresh
 //     proofs -> bounded runCleanupStep -> full postcheck (both settlement legs, both ops, claim released, capture never dispatched) + fresh
 //     provider readback (PI canceled, reservation cancelled).
-//   * Transport fence (target-only): Hostaway GET /v1/reservations/<rid> and ONE PUT /v1/reservations/<rid>/statuses/cancelled; Stripe GET
-//     account, GET the bound PI, ONE POST cancel of the bound PI with the E3 void key. Everything else is refused before bytes leave.
+//   * Transport fence (target-only): Hostaway GET /v1/reservations/<rid>, the accepted by-ref lookup page for THIS listing / arrival date
+//     (exact parameter set, page budget), and ONE PUT /v1/reservations/<rid>/statuses/cancelled; Stripe GET account, GET the bound PI, ONE
+//     POST cancel of the bound PI with the E3 void key. Everything else is refused before bytes leave.
+//   * PI proofs are the ACCEPTED v3 proofs of the pinned tooling (stillAuthorizedV3Refusal before, piCanceledProofV3 after). A reservation
+//     whose by-id read does not echo the booking ref is accepted ONLY when the read-only by-ref lookup finds exactly it (else refused BEFORE
+//     the abort: a cleanup the worker cannot prove is never queued).
+//   * DB budget: every statement on the one counted pool (runner reads + operator abort + worker), pinned ceiling from the PG integration.
 //     No capture, refund, create, record, notify; no account / key change. Finite run time, step, read and exchange budgets.
 //   * STOP on: refusal, escalation, any uncertain write (abort / cancel / void), DB error, scope drift, budget, deadline, cancellation.
 //     No retry, no rerun, no new key. Output: whitelisted codes / counts / states / flags only.
@@ -24,6 +29,9 @@ import { createHash } from "node:crypto";
 import { lstat, readFile, realpath, appendFile } from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+// measured on disposable PG16 with the REAL operator + worker (test I1): 240 (ref echoed) / 272 (ref not echoed + lookups) statements for a 2-step
+// happy path; ceiling = ~2.2x the larger, leaving room for the worker's idle / retry steps inside the 8-step cap. Fail-closed past it.
+const DB_QUERY_CEILING = 600;
 export const CONSTANTS = Object.freeze({
   // the MERGED guard (PR #53 merge bf44bf0d on e7-test; tree bf67c761 = reviewed ae2b7cc2: d06b9250 guard + ROOT stager fix outside this closure)
   toolingCommit: "bf44bf0da9b0f7b3fdf8dfbcfdb7136b36ad05df",
@@ -45,14 +53,18 @@ export const CONSTANTS = Object.freeze({
   listingId: 606998, currency: "USD", refFieldId: 105433, listingTimeZone: "America/Mexico_City",
   stripeVersion: "2026-01-28.clover",
   protectedReservationIds: Object.freeze(["70636076", "71045356", "71072615", "71081885"]),
-  budgets: Object.freeze({ steps: 8, abort: 1, hostawayCancel: 1, stripeCancel: 1, hostawayReads: 8, accountReads: 4, piReads: 10, exchanges: 24,
-    dbReads: 80, runMs: 10 * 60 * 1000, waitCapMs: 35 * 1000 }),
+  // dbQueries = EVERY statement on the runner's pool: pool.query + every connected-client query (runner reads, the operator abort, the worker,
+  // BEGIN / COMMIT / ROLLBACK included), counted once at that boundary. Ceiling evidenced by the disposable-PG integration (test I1 prints it).
+  // provider read ceilings: 3 runner proof rounds (before abort / before cleanup / readback) + the worker's per-step reads over <= 8 steps;
+  // lookups: <= 5 pages per lookupByRef, <= 3 runner + <= 2 worker lookups. Measured happy paths are printed by integration test I1.
+  budgets: Object.freeze({ steps: 8, abort: 1, hostawayCancel: 1, stripeCancel: 1, hostawayReads: 12, lookupPages: 25, accountReads: 12, piReads: 16, exchanges: 64,
+    dbQueries: DB_QUERY_CEILING, runMs: 10 * 60 * 1000, waitCapMs: 35 * 1000 }),
   dbEnvironment: "test", dbProjectRef: "mxotevtiscernhqilyiu",
   nodeVersion: "22.22.0",
   synthetic: Object.freeze({ approvalRef: "SYNTHETIC-preflight-not-for-execute", intentId: "00000000-0000-4000-8000-000000000000",
     paymentIntentId: "pi_SYNTHETICnotForExecute0", reservationId: "1", expectedVersion: 1 })
 });
-export const PLAN_SCHEMA = "e7-test-abort-cleanup-plan-v1";
+export const PLAN_SCHEMA = "e7-test-abort-cleanup-plan-v2";
 export const RESULT_SCHEMA = "e7-test-abort-cleanup-result-v1";
 export const OUTCOMES = Object.freeze(["CLEANED", "SCOPE_REFUSED", "START_STATE_NOT_ELIGIBLE", "PROVIDER_PROOF_FAILED", "ABORT_REFUSED",
   "ABORT_OUTCOME_UNKNOWN", "ABORT_POSTCHECK_MISMATCH", "WORKER_REFUSED", "ESCALATED", "HOSTAWAY_CANCEL_OUTCOME_UNKNOWN", "VOID_OUTCOME_UNKNOWN",
@@ -95,7 +107,7 @@ export function buildPlan(c, { approvalRef, intentId, paymentIntentId, reservati
   const plan = { schema: PLAN_SCHEMA, toolingCommit: c.toolingCommit, toolingStatus: c.toolingStatus, closureDigest: c.closureDigest, runnerDigest,
     pgVersion: c.pgVersion, stripeVersion: c.stripeVersion, accountId: c.accountId, listingId: c.listingId, currency: c.currency, refFieldId: c.refFieldId,
     dbEnvironment: c.dbEnvironment, dbProjectRef: c.dbProjectRef, intentId, paymentIntentId, reservationId, expectedVersion, approvalRef, budgets: { ...c.budgets },
-    operations: ["db.test_abort<=1", "hostaway.get_reservation(rid)", "hostaway.cancel_reservation(rid)<=1", "stripe.accounts.retrieve", "stripe.paymentIntents.retrieve(pi)",
+    operations: ["db.test_abort<=1", "hostaway.get_reservation(rid)", "hostaway.lookup_by_ref(606998,arrival)", "hostaway.cancel_reservation(rid)<=1", "stripe.accounts.retrieve", "stripe.paymentIntents.retrieve(pi)",
       "stripe.paymentIntents.cancel(pi)<=1"],
     writes: { abortEvent: 1, hostawayCancelMax: 1, stripeCancelMax: 1, capture: 0, refund: 0, create: 0, record: 0, notify: 0, account: 0, keys: 0 } };
   return freeze({ plan: deepFreeze(plan), planHash: sha(canonical(plan)) });
@@ -118,6 +130,8 @@ export const QUERIES = Q;
 const START_OPS = freeze(["stripe.create_checkout_session", "stripe.retrieve_checkout_session", "stripe.retrieve_payment_intent", "hostaway.create_reservation",
   "hostaway.lookup_reservation", "hostaway.retrieve_reservation", "stripe.capture_payment_intent"]);
 const AFTER_ABORT_OPS = freeze([...START_OPS, "hostaway.cancel_reservation", "stripe.void_payment_intent", "alert.owner"]);
+/** the terminal E3 transition (-> cancelled) QUEUES one guest.notify row (intent-state.js: not_completed_not_charged); the runner never sends it */
+const POST_CLEANUP_OPS = freeze([...AFTER_ABORT_OPS, "guest.notify"]);
 const one = (rows, t) => rows.filter((o) => o.op_type === t);
 const pristine = (o) => o && o.state === "pending" && o.attempts === 0 && o.dispatched === false;
 
@@ -152,7 +166,8 @@ export function checkStart(f, plan, c = CONSTANTS) {
   if (caps.length !== 1 || !pristine(caps[0])) return no("CAPTURE_NOT_PRISTINE");
   if (creates.length !== 1 || creates[0].state !== "succeeded") return no("CREATE_HISTORY");
   if (f.claims.length !== 1 || f.claims[0].listing_id !== c.listingId || f.claims[0].released !== false) return no("CLAIM_UNEXPECTED");
-  if (!f.legs[0] || f.legs[0].c !== false || f.legs[0].a !== false) return no("LEGS_UNEXPECTED");
+  // accepted state machine: both settlement legs are NULL (not yet opened) before the abort; any other pair is refused
+  if (f.legs.length !== 1 || f.legs[0].c !== null || f.legs[0].a !== null) return no("LEGS_UNEXPECTED");
   return { ok: true, intent: i, attemptId: done[0].id };
 }
 /** the verified post-abort lineage (capture_failed / TEST_ABORT_REQUESTED, both legs pending pristine, capture untouched, claim held) */
@@ -171,6 +186,7 @@ export function checkAborted(f, plan, tooling, c = CONSTANTS) {
   if (caps.length !== 1 || caps[0].dispatched !== false || caps[0].attempts !== 0) return no("CAPTURE_TOUCHED");
   if (f.claims.length !== 1 || f.claims[0].released !== false) return no("CLAIM");
   if (f.hx.length !== 1 || f.hx[0].rid !== plan.reservationId) return no("RESERVATION_HISTORY");
+  if (f.legs.length !== 1 || f.legs[0].c !== false || f.legs[0].a !== false) return no("LEGS_NOT_OPEN");   // the abort opens both legs exactly
   return { ok: true };
 }
 /** full postcheck: both settlement legs, both write ops succeeded, capture never dispatched, claim released */
@@ -180,26 +196,35 @@ export function checkCleaned(f, plan) {
   const out = { state: i ? i.status : null, legReservationCancelled: f.legs[0] ? f.legs[0].c : null, legAuthorizationSettled: f.legs[0] ? f.legs[0].a : null,
     cancelOp: cancel.length === 1 ? cancel[0].state : "UNEXPECTED", voidOp: voids.length === 1 ? voids[0].state : "UNEXPECTED",
     captureDispatched: caps.length === 1 ? caps[0].dispatched : null, claimReleased: f.claims.length === 1 ? f.claims[0].released : null };
+  const queued = f.ops.filter((o) => o.op_type === "guest.notify" || o.op_type === "alert.owner");
+  out.notificationsQueuedOnly = queued.every(pristine);
+  out.guestNotifyQueued = one(f.ops, "guest.notify").length;
   out.ok = out.state === "cancelled" && out.legReservationCancelled === true && out.legAuthorizationSettled === true && out.cancelOp === "succeeded"
-    && out.voidOp === "succeeded" && out.captureDispatched === false && out.claimReleased === true && f.ops.every((o) => AFTER_ABORT_OPS.includes(o.op_type));
+    && out.voidOp === "succeeded" && out.captureDispatched === false && out.claimReleased === true && out.notificationsQueuedOnly === true
+    && out.guestNotifyQueued <= 1 && f.ops.every((o) => POST_CLEANUP_OPS.includes(o.op_type));
   return freeze(out);
 }
 
 // =================================================================================================================================
 // fresh provider proofs (pure checks over normalized replies)
-/** Stripe PI: the bound, uncaptured TEST authorization (before) or canceled (after); amount = the DB authorization */
-export function piProof(pi, plan, intent, phase) {
-  if (!pi || pi.object !== "payment_intent" || pi.id !== plan.paymentIntentId || pi.livemode !== false || pi.currency !== "usd") return "PI_IDENTITY";
-  if (pi.amount !== intent.payment.amountMinor || pi.capture_method !== "manual") return "PI_AMOUNT_OR_METHOD";
-  if (phase === "before") return pi.status === "requires_capture" && pi.amount_capturable === intent.payment.amountMinor && !(pi.amount_received > 0) ? null : "PI_STATUS";
-  return pi.status === "canceled" && !(pi.amount_received > 0) ? null : "PI_NOT_CANCELED";
+/** Stripe PI through the ACCEPTED v3 proofs of the pinned tooling (no looser runner-local predicate):
+ *  before = stillAuthorizedV3Refusal (identity incl. metadata intent + attempt, manual, amount = price, requires_capture, received 0,
+ *  capturable full, expanded TEST charge bound to the PI, succeeded, paid, uncaptured, amount, captured 0, refunded 0, currency, capture_before);
+ *  after = piCanceledProofV3 (canceled, received 0, capturable 0, expanded bound TEST charge uncaptured / captured 0 / refunded 0, freshness). */
+export function piProof(pi, { tooling, intent, attemptId, phase, now, notBefore, accountVerified }) {
+  const observed = tooling.paymentIntentProofObservationV3(pi, { accountVerified: accountVerified === true });
+  const ev = { id: "runner-readback", kind: "payment_intent", readOpType: "stripe.retrieve_payment_intent", requestRef: intent.payment.paymentIntentId,
+    externalRef: intent.payment.paymentIntentId, status: observed.status, observed, observedAt: now };
+  const code = phase === "before" ? tooling.stillAuthorizedV3Refusal(ev, intent, attemptId) : tooling.piCanceledProofV3(ev, intent, attemptId, { now, notBefore });
+  return code === null ? null : `PI_${String(code).slice(0, 60)}`;
 }
-/** Hostaway reservation by id: same id / listing / stay / total / currency / channel; active (before) or cancelled (after); ref absent or ours */
+/** Hostaway reservation by id: same id / listing / stay / total / currency / channel; active (before) or cancelled (after); ref absent or ours.
+ *  An ABSENT ref is only accepted together with a by-ref lookup that finds exactly this reservation (refProof below), never alone. */
 export function reservationProof(res, plan, intent, phase) {
   if (!res || String(res.reservationId) !== plan.reservationId || res.listingId !== plan.listingId || res.from !== intent.from || res.to !== intent.to) return "RES_IDENTITY";
   if (res.totalMinor !== intent.price.finalTotalMinor || res.currency !== plan.currency || res.channelId !== 2000) return "RES_AMOUNT";
   if (!(res.bookingRef === null || res.bookingRef === intent.ref)) return "RES_REF";
-  if (phase === "before") return ["new", "modified"].includes(res.status) ? null : "RES_NOT_ACTIVE";
+  if (phase === "before") return res.status === "new" ? null : "RES_NOT_ACTIVE";       // = compensation-proof ACTIVE_RESERVATION_STATUS
   return res.status === "cancelled" ? null : "RES_NOT_CANCELLED";
 }
 
@@ -209,12 +234,14 @@ export function reservationProof(res, plan, intent, phase) {
  * runAbortCleanupCore({ plan, pool, tooling, exchanges:{ stripe, hostaway }, credentials:{ stripe, hostaway }, clock?, monotonic?, sleep?, runSignal?,
  *   workerTimeouts? }) → frozen result. Never throws.
  *   tooling = { executeOperatorAbort, buildAbortExpectation, runCleanupStep, loadIntent, voidKey, testAbortEventId, createPhaseExecutors,
- *     createStripeSend, createHostawaySend, validateAdapterConfig, unwrapEnvelope, normalizeReservation }
+ *     createStripeSend, createHostawaySend, validateAdapterConfig, unwrapEnvelope, normalizeReservation, lookupByRef,
+ *     paymentIntentProofObservationV3, stillAuthorizedV3Refusal, piCanceledProofV3 }
+ *   The operator abort, the worker and the runner's own reads ALL receive the same counted pool (countedPool below).
  */
 export async function runAbortCleanupCore(input) {
   const c = CONSTANTS; const B = c.budgets;
   const r = { schema: RESULT_SCHEMA, outcome: null, code: null, startState: null, finalState: null, abortInvocations: 0, abortOutcome: null, steps: 0, actions: [],
-    exchanges: 0, hostawayReads: 0, accountReads: 0, piReads: 0, dbReads: 0, hostawayCancelInvocations: 0, hostawayCancelOutcome: "NONE",
+    exchanges: 0, hostawayReads: 0, lookupPages: 0, accountReads: 0, piReads: 0, dbQueries: 0, dbBudgetRefused: 0, hostawayCancelInvocations: 0, hostawayCancelOutcome: "NONE",
     stripeCancelInvocations: 0, stripeCancelOutcome: "NONE", refusedAtTransport: 0, refusedByStop: 0, proofs: [], postcheck: null, providerReadback: null,
     stopReason: null, stripeVersion: c.stripeVersion, writes: { capture: 0, refund: 0, create: 0, record: 0, notify: 0 } };
   const done = (outcome, code = null) => { r.outcome = outcome; r.code = code; return freeze(JSON.parse(JSON.stringify(r))); };
@@ -249,9 +276,20 @@ export async function runAbortCleanupCore(input) {
     const PI = plan.paymentIntentId; const RID = plan.reservationId;
     if (stopped()) return stopOutcome();
 
-    // ---- counted, stop-guarded DB reads ------------------------------------------------------------------------------------------
-    const q = async (sql, args = [plan.intentId]) => { guard(); if (r.dbReads >= B.dbReads) throw new Error("db budget"); r.dbReads += 1; return (await pool.query(sql, args)).rows; };
-    q.loadIntent = async (id) => { guard(); if (r.dbReads >= B.dbReads) throw new Error("db budget"); r.dbReads += 1; return tooling.loadIntent(pool, id); };
+    // ---- ONE counted pool for everything: pool.query AND every connected-client .query (checked-out clients only; the real pool's own
+    //      internal connect behind pool.query is not re-counted). Past the ceiling every new statement is refused (fail closed).
+    const count = () => { if (r.dbQueries >= B.dbQueries) { r.dbBudgetRefused += 1; throw new Error("db query budget"); } r.dbQueries += 1; };
+    const countedPool = new Proxy(pool, { get(tg, k) {
+      if (k === "query") return (...a) => { count(); return tg.query(...a); };
+      if (k === "connect") return async (...a) => {
+        const cl = await tg.connect(...a);
+        return new Proxy(cl, { get(ct, ck) {
+          if (ck === "query") return (...qa) => { count(); return ct.query(...qa); };
+          const v = ct[ck]; return typeof v === "function" ? v.bind(ct) : v; } });
+      };
+      const v = tg[k]; return typeof v === "function" ? v.bind(tg) : v; } });
+    const q = async (sql, args = [plan.intentId]) => { guard(); return (await countedPool.query(sql, args)).rows; };
+    q.loadIntent = async (id) => { guard(); return tooling.loadIntent(countedPool, id); };
     const read = async () => readFacts(q, plan, tooling);
 
     // ---- (1) read-only precheck ----------------------------------------------------------------------------------------------------
@@ -281,13 +319,30 @@ export async function runAbortCleanupCore(input) {
       r.exchanges += 1;
       return exchanges.stripe(req);
     };
+    // the ONE by-ref lookup shape the accepted lookupByRef builds for THIS intent: listing 606998, direct channel, arrival = the bound stay
+    // date (start = end), limit 100, includeResources 1, optional positive afterId cursor; nothing else (exact parameter set)
+    const isLookupUrl = (url) => {
+      let u; try { u = new URL(url); } catch { return false; }
+      if (u.origin !== HOSTAWAY || u.pathname !== "/v1/reservations" || u.hash !== "") return false;
+      const keys = [...u.searchParams.keys()];
+      if (new Set(keys).size !== keys.length) return false;
+      const base = ["arrivalEndDate", "arrivalStartDate", "channelId", "includeResources", "limit", "listingId"];
+      const sorted = [...keys].sort().join(",");
+      if (sorted !== base.join(",") && sorted !== ["afterId", ...base].sort().join(",")) return false;
+      const g = (k) => u.searchParams.get(k);
+      return g("listingId") === String(plan.listingId) && g("channelId") === "2000" && g("arrivalStartDate") === intent0.from && g("arrivalEndDate") === intent0.from
+        && g("limit") === "100" && g("includeResources") === "1" && (!u.searchParams.has("afterId") || RID_RE.test(g("afterId")));
+    };
     const hostawayGate = (req) => {
       if (stopped()) { r.refusedByStop += 1; return Promise.reject(new Error("stopped")); }
       if (!req || !req.headers || r.exchanges >= B.exchanges) { r.refusedAtTransport += 1; return Promise.reject(new Error("gate")); }
-      const isGet = req.method === "GET" && req.url === urls.res && req.body === null && hkeys(req.headers) === "Accept,Authorization,Cache-control";
+      const plainGet = req.method === "GET" && req.body === null && hkeys(req.headers) === "Accept,Authorization,Cache-control";
+      const isGet = plainGet && req.url === urls.res;
+      const isLookup = plainGet && isLookupUrl(req.url);
       const isCancel = req.method === "PUT" && req.url === urls.resCancel && req.body === "{\"cancelledBy\":\"host\"}"
         && hkeys(req.headers) === "Accept,Authorization,Cache-control,Content-Type";
       if (isGet && r.hostawayReads < B.hostawayReads) r.hostawayReads += 1;
+      else if (isLookup && r.lookupPages < B.lookupPages) r.lookupPages += 1;
       else if (isCancel && fence.hostawayCancelOpen) fence.hostawayCancelExchanged = true;
       else { r.refusedAtTransport += 1; return Promise.reject(new Error("gate")); }
       r.exchanges += 1;
@@ -306,19 +361,36 @@ export async function runAbortCleanupCore(input) {
     const adapterConfig = tooling.validateAdapterConfig({ allowedListingIds: [plan.listingId], refFieldId: c.refFieldId, channelId: 2000, currency: c.currency });
 
     // ---- fresh provider proof round (reads only; any failure = STOP before the next write) --------------------------------------------
+    let abortAt = null;
+    const lookupSend = (req, signal) => th.transport.send({ method: req.method, path: `/v1${req.path}`, query: req.query }, { signal });
     const proofRound = async (label, intent, phase) => {
       guard();
       const acct = await ts.transport.send({ op: "accounts.retrieve" }, { signal: composed(null) });
-      if (!acct || acct.id !== c.accountId) return "ACCOUNT";
+      if (!acct || acct.object !== "account" || acct.id !== c.accountId) return "ACCOUNT";
       guard();
       const pi = await ts.transport.send({ op: "paymentIntents.retrieve", id: PI, params: { expand: ["latest_charge"] } }, { signal: composed(null) });
-      const pe = piProof(pi, plan, intent, phase); if (pe) return pe;
+      const now = clock();
+      const pe = piProof(pi, { tooling, intent, attemptId: st.attemptId, phase, now, notBefore: phase === "before" ? now : abortAt, accountVerified: true });
+      if (pe) return pe;
       guard();
       const h = await th.transport.send({ method: "GET", path: `/v1/reservations/${RID}`, query: {} }, { signal: composed(null) });
-      if (!h || h.httpStatus !== 200) return "RES_HTTP";
+      if (!h || h.httpStatus !== 200) return `RES_HTTP_${h && Number.isSafeInteger(h.httpStatus) ? h.httpStatus : "X"}`;
       let n; try { const u = tooling.unwrapEnvelope(h.json); if (!u || u.ok !== true) return "RES_ENVELOPE"; n = tooling.normalizeReservation(u.result, adapterConfig); } catch { return "RES_MALFORMED"; }
       if (!n || n.ok !== true) return "RES_MALFORMED";
       const re = reservationProof(n.reservation, plan, intent, phase); if (re) return re;
+      if (n.reservation.bookingRef === null) {
+        // ref NOT echoed by id: the accepted worker needs a unique by-ref match to prove (and later confirm) this reservation. Prove it HERE,
+        // read-only, so a cleanup that cannot be completed is never queued; anything but exactly this one reservation refuses.
+        guard();
+        let lk;
+        try {
+          lk = await tooling.lookupByRef({ ref: intent.ref, listingId: plan.listingId, arrivalDate: intent.from, departureDate: intent.to }, adapterConfig,
+            (req) => lookupSend(req, composed(null)), { maxPages: 5 });
+        } catch { lk = { outcome: "error" }; }
+        if (stopped()) throw new Stopped();
+        if (!lk || lk.outcome !== "found" || String(lk.reservation.reservationId) !== RID) return `REF_UNPROVABLE_${lk && typeof lk.outcome === "string" ? lk.outcome : "error"}`;
+        const le = reservationProof({ ...lk.reservation, bookingRef: null }, plan, intent, phase); if (le) return `LOOKUP_${le}`;
+      }
       r.proofs.push(label);
       return null;
     };
@@ -337,8 +409,8 @@ export async function runAbortCleanupCore(input) {
       intentId: plan.intentId, listingId: plan.listingId, paymentIntentId: PI, reservationId: RID, sessionId: intent0.checkout.sessionId, to: intent0.to });
     if (!expectation) return done("SCOPE_REFUSED", "EXPECTATION_INVALID");
     let ab;
-    r.abortInvocations += 1;
-    try { ab = await tooling.executeOperatorAbort(pool, expectation, { now: clock(), env: { VERCEL_ENV: "development", MV_E7_TEST_ABORT: "enabled" } }); }
+    r.abortInvocations += 1; abortAt = clock();
+    try { ab = await tooling.executeOperatorAbort(countedPool, expectation, { now: clock(), env: { VERCEL_ENV: "development", MV_E7_TEST_ABORT: "enabled" } }); }
     catch { r.abortOutcome = "UNKNOWN"; return done("ABORT_OUTCOME_UNKNOWN", "OPERATOR_THREW"); }
     const ao = ab && typeof ab.outcome === "string" ? ab.outcome : null;
     if (!ab || ab.invocations !== 1 || ao === "REQUEST_OUTCOME_UNKNOWN" || ao === null) { r.abortOutcome = "UNKNOWN"; return done("ABORT_OUTCOME_UNKNOWN", ao); }
@@ -402,7 +474,7 @@ export async function runAbortCleanupCore(input) {
       r.steps += 1;
       let res;
       try {
-        res = await tooling.runCleanupStep(pool, { workerId: `e7-test-abort-cleanup:${r.steps}`, env, adapterConfig, listings, executors, clock,
+        res = await tooling.runCleanupStep(countedPool, { workerId: `e7-test-abort-cleanup:${r.steps}`, env, adapterConfig, listings, executors, clock,
           stripeAccountId: c.accountId, intentId: plan.intentId, timeouts: input.workerTimeouts });
       } catch { if (stopped()) return stopOutcome(); return failOutcome(r.hostawayCancelInvocations || r.stripeCancelInvocations ? "NOT_CLEANED" : "DB_ERROR", "WORKER_THREW"); }
       for (const a of (res && Array.isArray(res.actions) ? res.actions : [])) r.actions.push(typeof a === "string" && CODE_RE.test(a) ? a : "REDACTED");
@@ -568,15 +640,16 @@ export async function runHosted({ mode = "preflight", env, proc, wrapperDir, dep
 }
 async function defaultImportTooling(dir) {
   const u = (p) => pathToFileURL(`${dir}/${p}`).href;
-  const [W, R, IS, EA, T, X, P, HR, OA] = await Promise.all([import(u("lib/booking-db/compensation-worker.js")), import(u("lib/booking-db/repo.js")),
+  const [W, R, IS, EA, T, X, P, HR, OA, CP, KP] = await Promise.all([import(u("lib/booking-db/compensation-worker.js")), import(u("lib/booking-db/repo.js")),
     import(u("lib/checkout/intent-state.js")), import(u("scripts/e7-connected/executor-adapters.mjs")), import(u("scripts/e7-connected/http-transports.mjs")),
     import(u("scripts/e7-connected/real-exchange.mjs")), import(u("lib/booking-db/pool.js")), import(u("lib/hostaway-reservations.js")),
-    import(u("scripts/e7-operator/test-abort.mjs"))]);
+    import(u("scripts/e7-operator/test-abort.mjs")), import(u("lib/checkout/capture-proof.js")), import(u("lib/checkout/compensation-proof.js"))]);
   return { X, createBookingPool: P.createBookingPool,
     tooling: { executeOperatorAbort: OA.executeOperatorAbort, buildAbortExpectation: OA.buildAbortExpectation, runCleanupStep: W.runCleanupStep,
       loadIntent: R.loadIntent, voidKey: IS.voidKey, testAbortEventId: IS.testAbortEventId, createPhaseExecutors: EA.createPhaseExecutors,
       createStripeSend: T.createE7StripeTestSend, createHostawaySend: T.createE7HostawaySend, validateAdapterConfig: HR.validateAdapterConfig,
-      unwrapEnvelope: HR.unwrapEnvelope, normalizeReservation: HR.normalizeReservation } };
+      unwrapEnvelope: HR.unwrapEnvelope, normalizeReservation: HR.normalizeReservation, lookupByRef: HR.lookupByRef,
+      paymentIntentProofObservationV3: CP.paymentIntentProofObservationV3, stillAuthorizedV3Refusal: CP.stillAuthorizedV3Refusal, piCanceledProofV3: KP.piCanceledProofV3 } };
 }
 
 export function summaryMarkdown(r) {
@@ -586,7 +659,8 @@ export function summaryMarkdown(r) {
     ["fake tests (NOT connectivity)", r.tests ? `status ${r.tests.status}, pass ${r.tests.pass}/${r.tests.tests}, fail ${r.tests.fail}` : null],
     ["outcome / code", k ? `${k.outcome} / ${k.code ?? "—"}` : null], ["state start → final", k ? `${k.startState ?? "—"} → ${k.finalState ?? "—"}` : null],
     ["abort invocations / outcome", k ? `${k.abortInvocations} / ${k.abortOutcome ?? "—"}` : null], ["steps", k ? k.steps : null],
-    ["exchanges (Hostaway / account / PI reads)", k ? `${k.exchanges} (${k.hostawayReads} / ${k.accountReads} / ${k.piReads})` : null],
+    ["exchanges (Hostaway by-id / lookup pages / account / PI reads)", k ? `${k.exchanges} (${k.hostawayReads} / ${k.lookupPages} / ${k.accountReads} / ${k.piReads})` : null],
+    ["DB statements (all, incl. operator + worker) / refused by budget", k ? `${k.dbQueries} / ${k.dbBudgetRefused}` : null],
     ["Hostaway cancel invocations / outcome", k ? `${k.hostawayCancelInvocations} / ${k.hostawayCancelOutcome}` : null],
     ["Stripe cancel invocations / outcome", k ? `${k.stripeCancelInvocations} / ${k.stripeCancelOutcome}` : null],
     ["refused at transport / by stop", k ? `${k.refusedAtTransport} / ${k.refusedByStop}` : null], ["proofs", k ? k.proofs.join(" ") : null],
