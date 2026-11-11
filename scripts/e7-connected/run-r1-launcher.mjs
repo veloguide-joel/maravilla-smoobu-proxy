@@ -7,6 +7,10 @@
 //     journal close → pool end → ONE sanitized result.
 //   * Nothing secret is placed in any result / error / output; owner values are passed only as capabilities (credential closures, pool configs).
 //   * No retry, fallback, adoption, resume or repair. Accepted core / bridge / workers / journals / transports / pool are used unchanged.
+//   * T1b (root ruling, V1): `acquiredClientEnd` is a SEPARATE, scoped OBSERVATION frozen at each pool-end SETTLEMENT. It counts only clients
+//     that SUCCESSFULLY connected (public pool 'connect') and whether each one's client 'end' EVENT had been seen by then. It never claims a
+//     raw socket close, a server backend exit or a lock release; failed / pending acquisitions are unobservable (E2 stays OPEN). It adds no
+//     wait, timer, 'error' listener or wrapper; `teardown.pools`, exits and scheduling are unchanged.
 import { createHash, randomBytes } from "node:crypto";
 import { runReservationAbortR1 } from "./run-core-abort-v2.mjs";
 import { bindRunPackageR1Journal, bindingKindV2 } from "./run-journal-memory-v2.mjs";
@@ -25,6 +29,43 @@ export const LAUNCH_RESULT_SCHEMA = "e7-r1-launch-result-v1";
 export const MAX_CA_BYTES = 65_536;
 export const POOL_MAX = Object.freeze({ app: 4, report: 4 });
 export const POOL_END_BOUND_MS = 10_000;
+// ---- T1b: scoped acquired-client end OBSERVATION (public events only; no wait / timer / 'error' listener / wrapping) ----------------------
+export const ACQUIRED_CLIENT_END_SCOPE = "ACQUIRED_ONLY";
+export const ACQUIRED_CLIENT_END_STATUS = Object.freeze(["NONE_ACQUIRED", "ALL_ACQUIRED_END_OBSERVED", "SOME_ACQUIRED_END_UNOBSERVED", "NOT_OBSERVED"]);
+/**
+ * observeAcquiredClients(pool) → { settle() → frozen snapshot }. Attaches ONE public pool 'connect' listener; for each NEW client identity a
+ * client once('end') marker. settle() freezes the snapshot exactly once (later calls return the same object), removes ONLY its own listeners
+ * and ignores every later event. Any instrumentation fault (attach / record / detach) → status NOT_OBSERVED with null counts; it never
+ * throws into, nor masks, the caller's own path. NONE_ACQUIRED is VACUOUS (no successful acquisition was observed — not "all closed").
+ */
+export function observeAcquiredClients(pool) {
+  const seen = new Map();                                              // client → its own 'end' marker fn (identity-unique)
+  const ended = new Set();
+  let faulted = false; let snap = null;
+  const onConnect = (c) => {
+    if (snap !== null) return;
+    try {
+      if (c === null || typeof c !== "object" || seen.has(c)) return;  // acquired reuse / duplicate emit: counted once
+      const mark = () => { if (snap === null) ended.add(c); };
+      seen.set(c, mark);
+      c.once("end", mark);
+    } catch { faulted = true; }
+  };
+  try { pool.on("connect", onConnect); } catch { faulted = true; }
+  return {
+    settle() {
+      if (snap !== null) return snap;
+      const acquired = seen.size; const endObserved = ended.size;
+      try { pool.removeListener("connect", onConnect); } catch { faulted = true; }
+      for (const [c, mark] of seen) { try { c.removeListener("end", mark); } catch { faulted = true; } }
+      snap = faulted
+        ? freeze({ scope: ACQUIRED_CLIENT_END_SCOPE, acquired: null, endObserved: null, status: "NOT_OBSERVED" })
+        : freeze({ scope: ACQUIRED_CLIENT_END_SCOPE, acquired, endObserved,
+          status: acquired === 0 ? "NONE_ACQUIRED" : endObserved === acquired ? "ALL_ACQUIRED_END_OBSERVED" : "SOME_ACQUIRED_END_UNOBSERVED" });
+      return snap;
+    }
+  };
+}
 export const EVIDENCE_REF_RE = /^[A-Za-z0-9._:/-]{1,128}$/;              // = the accepted journal's attestation evidenceRef rule
 // ---- P1/P2 endpoint policy (contract claude/e7-native-endpoint-policy.md; root de6285b5 B) — the ONLY two accepted DEV endpoints -----------
 export const DEV_PROJECT_REF = "mxotevtiscernhqilyiu";
@@ -88,7 +129,7 @@ function sanitize(r, extra) {
   } : null;
   return JSON.parse(JSON.stringify({ schema: LAUNCH_RESULT_SCHEMA, executable: run !== null, run, ...extra }));
 }
-const refused = (stage, code, pools) => freeze({ stage, code, result: sanitize(null, { refused: { stage, code }, ...(pools ? { teardown: { pools } } : {}) }) });
+const refused = (stage, code, pools, ace) => freeze({ stage, code, result: sanitize(null, { refused: { stage, code }, ...(pools ? { teardown: { pools } } : {}), ...(ace ? { acquiredClientEnd: ace } : {}) }) });
 
 /**
  * runR1Launch({ flags, nat, proc, hooks, signal, attest, repoRoot }) → Promise<{ stage, code, result }>; never rejects.
@@ -134,24 +175,28 @@ export async function runR1Launch(input) {
     } catch { return refused("db-ca", "CA_READ_FAILED"); }
   }
   // ---- (4) construction (NO connect / NO request): accepted pool (verified TLS for remote; loopback plain), accepted X → T -------------
-  const pools = {};
+  const pools = {}; const observers = {};
   try {
-    for (const slot of ["app", "report"]) pools[slot] = createBookingPool({ connectionString: db.logins[slot].connectionString, caPem, max: POOL_MAX[slot] });
+    for (const slot of ["app", "report"]) {
+      pools[slot] = createBookingPool({ connectionString: db.logins[slot].connectionString, caPem, max: POOL_MAX[slot] });
+      observers[slot] = observeAcquiredClients(pools[slot]);          // T1b: BEFORE any connect / P3 (fault-contained; never throws)
+    }
   } catch { for (const p of Object.values(pools)) p.end().catch(() => {}); return refused("pool", "POOL_CONFIG_REFUSED"); }   // accepted pool errors carry no URL; dropped anyway
   const creds = pc.credentials;
   const exch = (provider) => (hooks && hooks.exchanges ? { ok: true, exchange: hooks.exchanges[provider] } : createE7RealExchange({ provider }));
   const xh = exch("hostaway"); const xs = exch("stripe");
   const th = xh.ok ? createE7HostawaySend({ exchange: xh.exchange, credential: () => creds.hostawayToken }) : xh;
   const ts = xs.ok ? createE7StripeTestSend({ exchange: xs.exchange, credential: () => creds.stripeTestKey, accountId: B.manifest.stripeAccountId, apiVersion: flags.stripeApiVersion }) : xs;
-  const endPools = () => endAll(pools, proc);
-  if (!th.ok || !ts.ok) { const pe = await endPools(); return refused("transport", "TRANSPORT_OPTIONS_INVALID", pe); }
+  const ace = {};
+  const endPools = () => endAll(pools, proc, observers, ace);
+  if (!th.ok || !ts.ok) { const pe = await endPools(); return refused("transport", "TRANSPORT_OPTIONS_INVALID", pe, ace); }
   const K = hooks && Number.isSafeInteger(hooks.timeScale) && hooks.timeScale > 0 ? hooks.timeScale : 1;
   // ---- (4b) P3 read-only report-lock pre-check (both endpoint modes); BEFORE the journal and the core; P0 remains decisive -------------
   const lp = await lockPrecheck(pools.report, { proc, K, signal });
-  if (lp.code !== "LOCK_PRECHECK_CLEAR") { const pe = await endPools(); return refused("lock-precheck", lp.code, pe); }
+  if (lp.code !== "LOCK_PRECHECK_CLEAR") { const pe = await endPools(); return refused("lock-precheck", lp.code, pe, ace); }
   // ---- (5) creation-only R1 file + head journal (explicit owner dirs; never reopen / resume / repair) ---------------------------------
   const fj = await openFileJournalR1({ journalDir: flags.journalDir, headDir: flags.headDir, binding: B });
-  if (!fj.ok) { const pe = await endPools(); return freeze({ stage: "journal", code: fj.code, result: sanitize(null, { refused: { stage: "journal", code: fj.code }, teardown: { pools: pe } }) }); }
+  if (!fj.ok) { const pe = await endPools(); return freeze({ stage: "journal", code: fj.code, result: sanitize(null, { refused: { stage: "journal", code: fj.code }, teardown: { pools: pe }, acquiredClientEnd: ace }) }); }
   // ---- (6) the accepted consumer (lock, same-DB / TEST / roles, fresh preflight, fences, bridge, cleanup, release, exclusion re-read) --
   const t0 = proc.monotonic(); const mono = () => (proc.monotonic() - t0) * K;
   const timers = freeze({ arm: (ms) => { let id; const promise = new Promise((res) => { id = proc.setTimer(res, Math.max(0, ms / K)); }); return { promise, cancel: () => proc.clearTimer(id) }; } });
@@ -167,20 +212,27 @@ export async function runR1Launch(input) {
   const teardown = { finalize: fin ? { quiescence: fin.quiescence ?? null, lockRelease: fin.lockRelease ?? null } : "unknown",
     journal: jc ? { fileClose: jc.fileClose, headLock: jc.headLock, journalLock: jc.journalLock } : "unknown", pools: pe };
   const code = r === null ? "CONSUMER_FAILED" : r.outcome;
-  return freeze({ stage: "run", code, result: sanitize(r, { teardown, journalFiles: { journal: "e7-journal-r1", head: "e7-head-r1", runIdHash: createHash("sha256").update(B.identity.runId).digest("hex").slice(0, 16) } }) });
+  return freeze({ stage: "run", code, result: sanitize(r, { teardown, acquiredClientEnd: ace, journalFiles: { journal: "e7-journal-r1", head: "e7-head-r1", runIdHash: createHash("sha256").update(B.identity.runId).digest("hex").slice(0, 16) } }) });
 }
 
-/** end both pools, each bounded; an unsettled end is reported "unknown" (never reused: the process exits after the one result line) */
-async function endAll(pools, proc) {
+/** end both pools, each bounded; an unsettled end is reported "unknown" (never reused: the process exits after the one result line).
+ *  T1b: at the SAME settlement (ended / end_failed / unknown) the slot's acquired-client observation is frozen into `ace[slot]`. */
+export async function endAll(pools, proc, observers, ace) {
   const out = {};
   for (const [slot, p] of Object.entries(pools)) {
     out[slot] = await new Promise((resolve) => {
-      let done = false; const fin = (v) => { if (!done) { done = true; resolve(v); } };
+      let done = false; const fin = (v) => { if (!done) { done = true; snapshotSlot(observers, ace, slot); resolve(v); } };
       const id = proc.setTimer(() => fin("unknown"), POOL_END_BOUND_MS);
       p.end().then(() => { proc.clearTimer(id); fin("ended"); }, () => { proc.clearTimer(id); fin("end_failed"); });
     });
   }
   return out;
+}
+
+function snapshotSlot(observers, ace, slot) {
+  if (!ace || !observers) return;
+  try { const o = observers[slot]; ace[slot] = o ? o.settle() : freeze({ scope: ACQUIRED_CLIENT_END_SCOPE, acquired: null, endObserved: null, status: "NOT_OBSERVED" }); }
+  catch { ace[slot] = freeze({ scope: ACQUIRED_CLIENT_END_SCOPE, acquired: null, endObserved: null, status: "NOT_OBSERVED" }); }
 }
 
 /**

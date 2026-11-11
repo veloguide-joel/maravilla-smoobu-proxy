@@ -501,6 +501,21 @@ const writesAt = (S) => [S.t.x.count("hostaway", "POST", /^\/v1\/reservations$/)
   S.t.x.count("stripe", "POST", /\/cancel$/), S.t.x.count("stripe", "POST", /\/capture$/), S.t.x.count("hostaway", "POST", /^\/v1\/guestPayments\/charges/)];
 const appPids = async () => (await all("SELECT pid FROM pg_stat_activity WHERE application_name = 'maravilla-booking'")).map((r) => r.pid);
 const noLeak = (S, label) => { const all = [...S.out, ...S.err].join(""); assert.equal(scrub(all), null, `${label}: no secret / login text in stdout / stderr`); };
+// T1b integration: validate the separate observation through REAL launcher output, without turning a client event into backend-exit proof.
+const assertAcquiredEnds = (line, slots) => {
+  const observations = line.result.acquiredClientEnd;
+  assert.deepEqual(Object.keys(observations).sort(), ["app", "report"]);
+  for (const slot of ["app", "report"]) {
+    const o = observations[slot];
+    assert.deepEqual(Object.keys(o).sort(), ["acquired", "endObserved", "scope", "status"]);
+    assert.equal(o.scope, "ACQUIRED_ONLY");
+    assert.ok(Number.isSafeInteger(o.acquired) && o.acquired >= 0);
+    assert.ok(Number.isSafeInteger(o.endObserved) && o.endObserved >= 0 && o.endObserved <= o.acquired);
+    assert.equal(o.status, o.acquired === 0 ? "NONE_ACQUIRED" : o.endObserved === o.acquired ? "ALL_ACQUIRED_END_OBSERVED" : "SOME_ACQUIRED_END_UNOBSERVED");
+    if (slots[slot] === "none") assert.equal(o.acquired, 0, `${slot}: no successful client was acquired`);
+    else assert.ok(o.acquired > 0, `${slot}: successful acquisition was observed`);
+  }
+};
 
 // =================================================================================================================================
 test("E1 the native execute wiring end-to-end in BOTH modes: verified native closure → bound package → owner files → accepted pools / T / creation-only R1 file journal → runReservationAbortR1 → ENDED_RELEASED fully clean; exact sends; honest teardown; no secret in output", async () => {
@@ -521,6 +536,7 @@ test("E1 the native execute wiring end-to-end in BOTH modes: verified native clo
     assert.ok(S.prompts.every((p) => p.intentId === S.bk.id && p.manifestHash === S.pk.built.packageHash && p.connection === connection));
     assert.deepEqual(line.result.teardown, { finalize: { quiescence: "observed", lockRelease: "unlocked" }, journal: { fileClose: "closed", headLock: "released", journalLock: "released" },
       pools: { app: "ended", report: "ended" } });
+    assertAcquiredEnds(line, { app: "some", report: "some" });
     assert.deepEqual([await state(S.bk.id), await claimsHeld(S.bk.id)], ["cancelled", 0]); await assertNotifyUnsent(S.bk.id, connection);
     assert.deepEqual(await appPids(), [], "no launcher connection left open");
     // the creation-only R1 journal on disk: R1 names, diagnostic recovery = the run's head, no permission
@@ -551,6 +567,8 @@ test("E2 accepted live gates still decide (URL text is not privilege evidence): 
     assert.deepEqual(writesAt(S), [0, 0, 0, 0, 0], `${label}: no provider write`);
     assert.equal(await state(S.bk.id), "payment_authorized", label);
     assert.deepEqual(line.result.teardown.pools, { app: "ended", report: "ended" }, label);
+    // P0 rejects a non-report report login BEFORE it attempts the app connection (run-core-abort-v2 c1 gate).
+    assertAcquiredEnds(line, { app: o.reportUser === "g3b_app2" ? "none" : "some", report: "some" });
     assert.deepEqual(await appPids(), [], `${label}: no connection left open`);
   }
 });
@@ -697,6 +715,7 @@ test("E8 P3 in the native launch: a second REAL session holding the exact run ke
     const S = await launch(); const line = await S.run(); noLeak(S, "held");
     assert.deepEqual([S.code, line.outcome, line.result.refused, line.result.run], [4, "EXECUTE_REFUSED", { stage: "lock-precheck", code: "RUN_LOCK_PRESENT_BEFORE_START" }, null], JSON.stringify(line));
     assert.deepEqual(line.result.teardown, { pools: { app: "ended", report: "ended" } });
+    assertAcquiredEnds(line, { app: "none", report: "some" });
     assert.equal(await heldBy(H.pid), 1, "the holder still holds (never unlocked / terminated / adopted)");
     assert.equal(Number((await one("SELECT count(*)::int AS n FROM pg_stat_activity WHERE pid = $1", [H.pid])).n), 1, "holder backend alive");
     assert.deepEqual([readdirSync(S.jd), readdirSync(S.hd)], [[], []], "no journal / head file created");

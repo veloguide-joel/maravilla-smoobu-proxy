@@ -460,9 +460,12 @@ test("O1 offline HELD path is unchanged: connected false, no observation, connec
   assert.equal(r.result.code, "VALIDATED_HELD"); assert.equal(r.result.connected, false); assert.equal(r.exit, EXIT.HELD); assert.equal(pool.connects, 0);
 });
 
-test("O1 scope pin: leaf / launcher / pool / reader bytes are unchanged from merged cc37fad4", () => {
+// Historical O1 scope: the leaf / pool / reader stay byte-identical to merged cc37fad4 (O1 changed none of them). The launcher pin is NOT an
+// O1-unchanged claim any more: the later, separately reviewed T1b slice (root ruling V1, commit e991fcc7) intentionally changed
+// run-r1-launcher.mjs 40aad553… → 14c6ecbb…; it is pinned here to that exact reviewed T1b byte image.
+test("O1 scope pin: leaf / pool / reader unchanged from merged cc37fad4 (historical O1); launcher pinned to the reviewed T1b change", () => {
   const pins = { "scripts/e7-connected/run-lock-precheck.mjs": "579f619d4580481a1ec5f8c524832b72cd1ce0e0fc2503e7d6a839ebab20416d",
-    "scripts/e7-connected/run-r1-launcher.mjs": "40aad5537340457dd21e7020d42b8a03cd05db28a2938ca1bc46574d88cfee67",
+    "scripts/e7-connected/run-r1-launcher.mjs": "14c6ecbb8a48dca14c4bf2e061d957eead39a8a799735008faef614495b46d81",   // T1b (was 40aad553… at cc37fad4)
     "lib/booking-db/pool.js": "c8b615d98f85602b42d5bc722395cb25cc51e36d4fd1eeb272fa7bce9b5dabeb",
     "scripts/e7-connected/db-credential-file.mjs": "f7f79dbc1b59507893f0bf9e518faf511d1ae8189d47fac94377e3a6fb81643a" };
   for (const [rel, h] of Object.entries(pins)) assert.equal(createHash("sha256").update(readFileSync(join(REPO_ROOT, rel))).digest("hex"), h, rel);
