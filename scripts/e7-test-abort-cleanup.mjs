@@ -1,8 +1,8 @@
-// scripts/e7-test-abort-cleanup.mjs — E7 RUNNER A (DRAFT, OFFLINE): ONE intentional TEST abort of ONE confirmed, never-captured TEST
+// scripts/e7-test-abort-cleanup.mjs — E7 reviewed TEST abort + cleanup runner: ONE intentional TEST abort of ONE confirmed, never-captured TEST
 // reservation, then the accepted two-leg cleanup (Hostaway cancel <= 1, Stripe void <= 1) on the TEST DEV database.
-// OFFLINE slice: code is NOT consent. Nothing here authorizes a dispatch, a DB connection or a provider request.
-//   * EXECUTE IS CLOSED IN CODE: CONSTANTS.executeEnabled === false. verify / execute refuse ATC_EXECUTE_CLOSED until a separately reviewed
-//     change opens it (and Joel approves the exact filled package). Tooling = the MERGED guard commit bf44bf0d (PR #53, e7-test).
+// Code is NOT consent. Nothing here authorizes a dispatch, a DB connection or a provider request.
+//   * Execution enabled after ROOT review: exact plan / source / runner pins, main ref and the existing environment gate are required.
+//     Operate only within the owner-approved bound TEST cleanup. Tooling = the MERGED guard commit bf44bf0d (PR #53, e7-test).
 //   * Inert on import (`import.meta.main` guard): no env / fs / network / DB / timer until a mode runs.
 //   * Reuses the accepted lineage at ONE fixed tooling commit (checked out separately): executeOperatorAbort (-> requestTestAbort, ONE call),
 //     runCleanupStep, createPhaseExecutors('cleanup'), createE7HostawaySend, createE7StripeTestSend, createE7RealExchange, pool, repo,
@@ -36,7 +36,7 @@ export const CONSTANTS = Object.freeze({
   // the MERGED guard (PR #53 merge bf44bf0d on e7-test; tree bf67c761 = reviewed ae2b7cc2: d06b9250 guard + ROOT stager fix outside this closure)
   toolingCommit: "bf44bf0da9b0f7b3fdf8dfbcfdb7136b36ad05df",
   toolingStatus: "MERGED",
-  executeEnabled: false,
+  executeEnabled: true,
   closure: Object.freeze(["package.json", "package-lock.json",
     "lib/bookability.js", "lib/booking-db/codec.js", "lib/booking-db/compensation-worker.js", "lib/booking-db/config.js", "lib/booking-db/operations.js",
     "lib/booking-db/pool.js", "lib/booking-db/recovery.js", "lib/booking-db/repo.js", "lib/booking-db/reservation-worker.js", "lib/booking-db/test-abort.js",
@@ -575,7 +575,7 @@ export async function runHosted({ mode = "preflight", env, proc, wrapperDir, dep
     if (anyReal && (!APPROVAL_RE.test(ref) || !UUID_RE.test(iid) || !PI_RE.test(pid) || !RID_RE.test(rid) || !/^[1-9][0-9]{0,6}$/.test(ver))) refuse("ATC_INPUT_INVALID");
     if (ref === c.synthetic.approvalRef || iid === c.synthetic.intentId || pid === c.synthetic.paymentIntentId) refuse("ATC_INPUT_INVALID");
     if (mode !== "preflight") {
-      if (c.executeEnabled !== true || c.toolingStatus !== "MERGED" || !HEX64.test(String(c.closureDigest))) refuse("ATC_EXECUTE_CLOSED");   // closed in code
+      if (c.executeEnabled !== true || c.toolingStatus !== "MERGED" || !HEX64.test(String(c.closureDigest))) refuse("ATC_EXECUTE_CLOSED");   // explicit enable + merged-tooling fence
       if (!anyReal || !HEX64.test(expPlan) || !HEX64.test(expClo) || !HEX64.test(expRun)) refuse("ATC_INPUT_INCOMPLETE");
       if (env.GITHUB_REF !== "refs/heads/main") refuse("ATC_REF_NOT_MAIN");
       if (expClo !== c.closureDigest) refuse("ATC_SOURCE_MISMATCH");

@@ -6,6 +6,7 @@
 //     cleanup worker (they drive the REAL executors). SYNTHETIC keys / tokens. Nothing here is connectivity evidence.
 //   * node:https request / Agent and fetch are guarded and must count ZERO at the end.
 import { test, after } from "node:test";
+import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import https from "node:https";
 import { syncBuiltinESMExports } from "node:module";
@@ -250,8 +251,8 @@ test("A8 DB failure during precheck → DB_ERROR, nothing sent", async () => {
 });
 
 // ---------------------------------------------------------------------------------------------------------------------------------
-test("C1 code ceiling + closed execute: merged tooling bf44bf0d, executeEnabled false; plan carries exact pins and zero capture/refund/create/record/notify", () => {
-  assert.equal(C.executeEnabled, false); assert.equal(C.toolingStatus, "MERGED"); assert.equal(C.toolingCommit, "bf44bf0da9b0f7b3fdf8dfbcfdb7136b36ad05df");
+test("C1 code ceiling + reviewed execute: merged tooling bf44bf0d, executeEnabled true; plan carries exact pins and zero capture/refund/create/record/notify", () => {
+  assert.equal(C.executeEnabled, true); assert.equal(C.toolingStatus, "MERGED"); assert.equal(C.toolingCommit, "bf44bf0da9b0f7b3fdf8dfbcfdb7136b36ad05df");
   const wf = readFileSync(join(ROOT, ".github/workflows/e7-test-abort-cleanup.yml"), "utf8");
   assert.deepEqual([...wf.matchAll(/^\s+ref: ([0-9a-f]{40})$/gm)].map((m) => m[1]), [C.toolingCommit, C.toolingCommit], "both jobs check out the pinned tooling");
   assert.equal((wf.match(/secrets\./g) || []).length, 3, "secrets appear only in the execute step");
@@ -294,18 +295,79 @@ test("H1 hosted: preflight (no secrets) passes on the pinned closure; any secret
   assert.equal(x.result.code, "ATC_INPUT_INVALID");
 });
 
-test("H2 hosted: verify / execute are CLOSED in code (even with complete inputs and secrets) — no DB pool, no tooling import, no provider exchange", async () => {
-  let imported = 0;
-  for (const mode of ["verify", "execute"]) {
-    const x = await E.runHosted({ mode, env: realEnv({ GITHUB_REF: "refs/heads/main", E7_EXPECTED_PLAN_HASH: "a".repeat(64), E7_EXPECTED_CLOSURE_DIGEST: C.closureDigest,
-      E7_EXPECTED_RUNNER_DIGEST: "b".repeat(64), E7_STRIPE_TEST_KEY: "sk_test_x", E7_HOSTAWAY_TOKEN: "t", E7_DEV_BOOKING_DATABASE_URL: "postgres://x" }),
-      proc: PROC, wrapperDir: ROOT, deps: { importTooling: async () => { imported += 1; throw new Error("no"); } } });
-    assert.equal(x.result.code, mode === "verify" ? "ATC_SECRET_SCOPE_VIOLATION" : "ATC_EXECUTE_CLOSED", mode);
-    assert.equal(x.exitCode, 1);
+async function boundHostedEnv() {
+  const runnerDigest = await E.framedDigest(ROOT, C.runnerFiles, E.RUNNER_DIGEST_PREFIX);
+  const built = E.buildPlan(C, { approvalRef: "label-1", intentId: IID, paymentIntentId: PI, reservationId: RID, expectedVersion: VER, runnerDigest });
+  return realEnv({ GITHUB_REF: "refs/heads/main", E7_EXPECTED_PLAN_HASH: built.planHash,
+    E7_EXPECTED_CLOSURE_DIGEST: C.closureDigest, E7_EXPECTED_RUNNER_DIGEST: runnerDigest });
+}
+const syntheticHostedSecrets = () => ({ E7_STRIPE_TEST_KEY: "sk_test_SYNTHETICcanary", E7_HOSTAWAY_TOKEN: "SYNTHETICtokenCanary",
+  E7_DEV_BOOKING_DATABASE_URL: "postgresql://mv_booking_app_dev.mxotevtiscernhqilyiu:SYNTHETICpassword@aws-0-us-east-1.pooler.supabase.com:6543/postgres" });
+
+test("H2 hosted: enabled verify validates real pins without importing execution tooling; drift / ref / secret guards refuse before execution", async () => {
+  const env = await boundHostedEnv(); let imports = 0;
+  const deps = { importTooling: async () => { imports += 1; throw new Error("execution forbidden in verify"); } };
+  const x = await E.runHosted({ mode: "verify", env: { ...env }, proc: PROC, wrapperDir: ROOT, deps });
+  assert.equal(x.result.code, "VERIFY_OK", JSON.stringify(x.result)); assert.equal(x.exitCode, 0); assert.equal(x.result.core, null);
+  for (const [over, code] of [
+    [{ GITHUB_REF: "refs/heads/e7-test" }, "ATC_REF_NOT_MAIN"],
+    [{ E7_EXPECTED_PLAN_HASH: "0".repeat(64) }, "ATC_PLAN_HASH_MISMATCH"],
+    [{ E7_EXPECTED_RUNNER_DIGEST: "0".repeat(64) }, "ATC_RUNNER_MISMATCH"],
+    [{ E7_EXPECTED_CLOSURE_DIGEST: "0".repeat(64) }, "ATC_SOURCE_MISMATCH"],
+    [{ E7_EXPECTED_PLAN_HASH: "" }, "ATC_INPUT_INCOMPLETE"],
+    [{ E7_STRIPE_TEST_KEY: "sk_test_SYNTHETIC" }, "ATC_SECRET_SCOPE_VIOLATION"]]) {
+    const y = await E.runHosted({ mode: "verify", env: { ...env, ...over }, proc: PROC, wrapperDir: ROOT, deps });
+    assert.equal(y.result.code, code); assert.equal(y.exitCode, 1);
   }
-  const x = await E.runHosted({ mode: "verify", env: realEnv({ GITHUB_REF: "refs/heads/main" }), proc: PROC, wrapperDir: ROOT, deps: {} });
-  assert.equal(x.result.code, "ATC_EXECUTE_CLOSED");
-  assert.equal(imported, 0);
+  assert.equal(imports, 0);
+});
+
+test("H4 hosted: execute wires the exact plan, pool and credential callbacks once, wipes secrets and closes pool on success / stop / throw", async () => {
+  const bound = await boundHostedEnv(); const ca = Buffer.from("SYNTHETIC certificate fixture");
+  for (const ending of ["CLEANED", "VOID_OUTCOME_UNKNOWN", "THROW"]) {
+    const env = { ...bound, ...syntheticHostedSecrets() }; const calls = { imports: 0, pool: 0, core: 0, end: 0, signals: 0 };
+    const pool = { end: async () => { calls.end += 1; } }; const exchanges = {};
+    let heldCredentials;
+    const proc = { ...PROC, once: () => { calls.signals += 1; }, off: () => { calls.signals -= 1; } };
+    const x = await E.runHosted({ mode: "execute", env, proc, wrapperDir: ROOT, deps: {
+      readPgVersion: async () => C.pgVersion, readCa: async () => ca, caSha256: createHash("sha256").update(ca).digest("hex"),
+      importTooling: async () => { calls.imports += 1; return {
+        X: { createE7RealExchange: ({ provider }) => { const exchange = () => { throw new Error("no real exchange"); }; exchanges[provider] = exchange; return { ok: true, exchange }; } },
+        tooling: { synthetic: true }, createBookingPool: (opts) => { calls.pool += 1;
+          assert.equal(opts.connectionString, syntheticHostedSecrets().E7_DEV_BOOKING_DATABASE_URL); assert.equal(opts.max, 2); assert.equal(opts.caPem, ca.toString()); return pool; }
+      }; },
+      runCore: async (args) => { calls.core += 1;
+        assert.equal(args.plan.intentId, IID); assert.equal(args.plan.paymentIntentId, PI); assert.equal(args.plan.reservationId, RID);
+        assert.equal(args.plan.expectedVersion, VER); assert.equal(args.plan.approvalRef, "label-1");
+        assert.equal(args.pool, pool); assert.deepEqual(args.exchanges, exchanges); assert.equal(args.tooling.synthetic, true);
+        assert.equal(args.runSignal.aborted, false); heldCredentials = args.credentials;
+        assert.equal(args.credentials.stripe(), syntheticHostedSecrets().E7_STRIPE_TEST_KEY);
+        assert.equal(args.credentials.hostaway(), syntheticHostedSecrets().E7_HOSTAWAY_TOKEN);
+        if (ending === "THROW") throw new Error("synthetic core failure");
+        return { outcome: ending, code: "SYNTHETIC" };
+      }
+    } });
+    assert.equal(x.result.code, ending === "THROW" ? "ATC_INTERNAL" : "EXECUTE_DONE");
+    assert.equal(x.exitCode, ending === "CLEANED" ? 0 : 1); assert.deepEqual(calls, { imports: 1, pool: 1, core: 1, end: 1, signals: 0 });
+    assert.equal(heldCredentials.stripe(), null); assert.equal(heldCredentials.hostaway(), null);
+    for (const k of Object.keys(syntheticHostedSecrets())) { assert.equal(Object.hasOwn(env, k), false); assert.equal(JSON.stringify(x).includes(syntheticHostedSecrets()[k]), false); }
+  }
+});
+
+test("H5 hosted: missing secrets / dependency / DB target / CA / pins refuse before pool or core", async () => {
+  const bound = await boundHostedEnv(); const ca = Buffer.from("SYNTHETIC CA"); let imports = 0;
+  const baseDeps = { readPgVersion: async () => C.pgVersion, readCa: async () => ca,
+    caSha256: createHash("sha256").update(ca).digest("hex"), importTooling: async () => { imports += 1; throw new Error("must not import"); } };
+  for (const [over, depOver, code] of [
+    [{ E7_HOSTAWAY_TOKEN: "" }, {}, "ATC_CREDENTIALS_MISSING"],
+    [{}, { readPgVersion: async () => "0.0.0" }, "ATC_DEPENDENCY_MISMATCH"],
+    [{ E7_DEV_BOOKING_DATABASE_URL: "postgresql://wrong:fake@localhost:5432/postgres" }, {}, "ATC_DB_TARGET_INVALID"],
+    [{}, { caSha256: "0".repeat(64) }, "ATC_CA_INVALID"],
+    [{ E7_EXPECTED_PLAN_HASH: "0".repeat(64) }, {}, "ATC_PLAN_HASH_MISMATCH"]]) {
+    const x = await E.runHosted({ mode: "execute", env: { ...bound, ...syntheticHostedSecrets(), ...over }, proc: PROC, wrapperDir: ROOT, deps: { ...baseDeps, ...depOver } });
+    assert.equal(x.result.code, code); assert.equal(x.exitCode, 1);
+  }
+  assert.equal(imports, 0);
 });
 
 test("H3 hosted: a drifted tooling byte is refused before any import (closure digest)", async () => {

@@ -1,6 +1,6 @@
 # DRAFT — E7 runner A: ONE intentional TEST abort of ONE confirmed, never-captured TEST reservation + the accepted two-leg cleanup.
 # MANUAL dispatch only; default mode `preflight` = no secrets, no DB, no provider request, no dependency install (fake tests + digests + env).
-# `execute` is CLOSED IN CODE (scripts/e7-test-abort-cleanup.mjs CONSTANTS.executeEnabled = false); tooling = merged guard bf44bf0d (PR #53).
+# Reviewed execute requires exact bindings, main and the existing environment gate; tooling = merged guard bf44bf0d (PR #53).
 # A separately reviewed change is required before verify / execute can pass. Inputs / labels / hashes
 # are NOT consent. Secrets (environment `e7-readonly-probe`, required reviewers, execute step only): E7_STRIPE_TEST_KEY, E7_HOSTAWAY_TOKEN,
 # E7_DEV_BOOKING_DATABASE_URL. No webhook, no deploy, no migration, no capture / refund / create / record / notify, no account or key change.
@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "preflight (default: no secrets, no DB, no provider requests) or execute (CLOSED in code until a reviewed repin; NOT AUTHORIZED without Joel's explicit approval)"
+        description: "preflight (default: no secrets, no DB, no provider requests) or execute (exact reviewed bindings and owner-approved TEST cleanup only)"
         type: choice
         options: [preflight, execute]
         default: preflight
@@ -119,7 +119,7 @@ jobs:
         with:
           node-version: "22.22.0"
           package-manager-cache: false
-      - name: Verify bindings before any install (no secrets, no DB, no provider requests; refuses while execute is closed in code)
+      - name: Verify bindings before any install (no secrets, no DB, no provider requests; requires exact reviewed bindings)
         env:
           E7_TOOLING_DIR: ${{ github.workspace }}/tooling
           E7_APPROVAL_REF: ${{ inputs.approval_ref }}
