@@ -1,7 +1,7 @@
 # DRAFT — E7 runner A: ONE intentional TEST abort of ONE confirmed, never-captured TEST reservation + the accepted two-leg cleanup.
 # MANUAL dispatch only; default mode `preflight` = no secrets, no DB, no provider request, no dependency install (fake tests + digests + env).
-# `execute` is CLOSED IN CODE (scripts/e7-test-abort-cleanup.mjs CONSTANTS.executeEnabled = false; tooling pin PROVISIONAL d06b9250 = guard
-# candidate PR #53, unmerged). A reviewed repin to the MERGED guard commit is required before verify / execute can pass. Inputs / labels / hashes
+# `execute` is CLOSED IN CODE (scripts/e7-test-abort-cleanup.mjs CONSTANTS.executeEnabled = false); tooling = merged guard bf44bf0d (PR #53).
+# A separately reviewed change is required before verify / execute can pass. Inputs / labels / hashes
 # are NOT consent. Secrets (environment `e7-readonly-probe`, required reviewers, execute step only): E7_STRIPE_TEST_KEY, E7_HOSTAWAY_TOKEN,
 # E7_DEV_BOOKING_DATABASE_URL. No webhook, no deploy, no migration, no capture / refund / create / record / notify, no account or key change.
 name: e7-test-abort-cleanup
@@ -73,11 +73,11 @@ jobs:
         with:
           path: wrapper
           persist-credentials: false
-      - name: Checkout E7 guard tooling (fixed commit; PROVISIONAL until the reviewed merged repin)
+      - name: Checkout merged E7 guard tooling (fixed commit bf44bf0d)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: d06b925055dc73dd077525ea0bb789dbb2e8cf6d
+          ref: bf44bf0da9b0f7b3fdf8dfbcfdb7136b36ad05df
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0
@@ -107,11 +107,11 @@ jobs:
         with:
           path: wrapper
           persist-credentials: false
-      - name: Checkout E7 guard tooling (fixed commit; PROVISIONAL until the reviewed merged repin)
+      - name: Checkout merged E7 guard tooling (fixed commit bf44bf0d)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: d06b925055dc73dd077525ea0bb789dbb2e8cf6d
+          ref: bf44bf0da9b0f7b3fdf8dfbcfdb7136b36ad05df
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0

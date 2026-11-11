@@ -1,8 +1,8 @@
 // scripts/e7-test-abort-cleanup.mjs — E7 RUNNER A (DRAFT, OFFLINE): ONE intentional TEST abort of ONE confirmed, never-captured TEST
 // reservation, then the accepted two-leg cleanup (Hostaway cancel <= 1, Stripe void <= 1) on the TEST DEV database.
 // OFFLINE slice: code is NOT consent. Nothing here authorizes a dispatch, a DB connection or a provider request.
-//   * EXECUTE IS CLOSED IN CODE: CONSTANTS.executeEnabled === false and CONSTANTS.toolingCommit is PROVISIONAL (the unmerged guard candidate).
-//     verify / execute refuse ATC_EXECUTE_CLOSED until a reviewed repin to the MERGED guard commit + its closure digest (a new reviewed diff).
+//   * EXECUTE IS CLOSED IN CODE: CONSTANTS.executeEnabled === false. verify / execute refuse ATC_EXECUTE_CLOSED until a separately reviewed
+//     change opens it (and Joel approves the exact filled package). Tooling = the MERGED guard commit bf44bf0d (PR #53, e7-test).
 //   * Inert on import (`import.meta.main` guard): no env / fs / network / DB / timer until a mode runs.
 //   * Reuses the accepted lineage at ONE fixed tooling commit (checked out separately): executeOperatorAbort (-> requestTestAbort, ONE call),
 //     runCleanupStep, createPhaseExecutors('cleanup'), createE7HostawaySend, createE7StripeTestSend, createE7RealExchange, pool, repo,
@@ -25,9 +25,9 @@ import { lstat, readFile, realpath, appendFile } from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 export const CONSTANTS = Object.freeze({
-  // PROVISIONAL: guard candidate rev2 (draft PR #53, unmerged). Must be replaced by the MERGED commit in a reviewed repin before any execute.
-  toolingCommit: "d06b925055dc73dd077525ea0bb789dbb2e8cf6d",
-  toolingStatus: "PROVISIONAL_UNMERGED",
+  // the MERGED guard (PR #53 merge bf44bf0d on e7-test; tree bf67c761 = reviewed ae2b7cc2: d06b9250 guard + ROOT stager fix outside this closure)
+  toolingCommit: "bf44bf0da9b0f7b3fdf8dfbcfdb7136b36ad05df",
+  toolingStatus: "MERGED",
   executeEnabled: false,
   closure: Object.freeze(["package.json", "package-lock.json",
     "lib/bookability.js", "lib/booking-db/codec.js", "lib/booking-db/compensation-worker.js", "lib/booking-db/config.js", "lib/booking-db/operations.js",
@@ -37,7 +37,7 @@ export const CONSTANTS = Object.freeze({
     "lib/hostaway-calendar.js", "lib/hostaway-reservations.js", "lib/hostaway.js", "lib/public-api.js", "lib/quote-public.js",
     "scripts/e7-connected/executor-adapters.mjs", "scripts/e7-connected/http-transports.mjs", "scripts/e7-connected/probe-env-preflight.mjs",
     "scripts/e7-connected/real-exchange.mjs", "scripts/e7-operator/test-abort.mjs"]),
-  // framed SHA-256 of `closure` at the PROVISIONAL d06b9250 (test C2 recomputes it); replaced with the merged commit's digest at repin
+  // framed SHA-256 of `closure` at bf44bf0d (test C2 recomputes it; byte-identical at d06b9250 / ae2b7cc2: the stager files are outside it)
   closureDigest: "90f4d544a30a9d004f9dfbf9e811b31e58f5b7373503687f6b5941a8f347e188",
   pgVersion: "8.18.0",
   runnerFiles: Object.freeze(["scripts/e7-test-abort-cleanup.mjs", ".github/workflows/e7-test-abort-cleanup.yml", "test/e7-test-abort-cleanup.test.mjs"]),

@@ -228,8 +228,11 @@ test("A8 DB failure during precheck → DB_ERROR, nothing sent", async () => {
 });
 
 // ---------------------------------------------------------------------------------------------------------------------------------
-test("C1 code ceiling + closed execute: PROVISIONAL tooling, executeEnabled false; plan carries exact pins and zero capture/refund/create/record/notify", () => {
-  assert.equal(C.executeEnabled, false); assert.equal(C.toolingStatus, "PROVISIONAL_UNMERGED");
+test("C1 code ceiling + closed execute: merged tooling bf44bf0d, executeEnabled false; plan carries exact pins and zero capture/refund/create/record/notify", () => {
+  assert.equal(C.executeEnabled, false); assert.equal(C.toolingStatus, "MERGED"); assert.equal(C.toolingCommit, "bf44bf0da9b0f7b3fdf8dfbcfdb7136b36ad05df");
+  const wf = readFileSync(join(ROOT, ".github/workflows/e7-test-abort-cleanup.yml"), "utf8");
+  assert.deepEqual([...wf.matchAll(/^\s+ref: ([0-9a-f]{40})$/gm)].map((m) => m[1]), [C.toolingCommit, C.toolingCommit], "both jobs check out the pinned tooling");
+  assert.equal((wf.match(/secrets\./g) || []).length, 3, "secrets appear only in the execute step");
   const p = plan();
   assert.deepEqual([p.intentId, p.paymentIntentId, p.reservationId, p.expectedVersion, p.approvalRef], [IID, PI, RID, VER, "SYNTHETIC-test-abort-cleanup"]);
   assert.deepEqual(p.writes, { abortEvent: 1, hostawayCancelMax: 1, stripeCancelMax: 1, capture: 0, refund: 0, create: 0, record: 0, notify: 0, account: 0, keys: 0 });
