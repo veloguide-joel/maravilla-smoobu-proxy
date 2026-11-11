@@ -1,7 +1,7 @@
-# DRAFT — E7 runner A: ONE intentional TEST abort of ONE confirmed, never-captured TEST reservation + the accepted two-leg cleanup.
+# E7 runner A: ONE intentional TEST abort of ONE confirmed, never-captured TEST reservation + the accepted two-leg cleanup.
 # MANUAL dispatch only; default mode `preflight` = no secrets, no DB, no provider request, no dependency install (fake tests + digests + env).
 # Reviewed execute requires exact bindings, main and the existing environment gate; tooling = merged guard bf44bf0d (PR #53).
-# A separately reviewed change is required before verify / execute can pass. Inputs / labels / hashes
+# Execution was enabled by the separately reviewed ROOT change. Inputs / labels / hashes
 # are NOT consent. Secrets (environment `e7-readonly-probe`, required reviewers, execute step only): E7_STRIPE_TEST_KEY, E7_HOSTAWAY_TOKEN,
 # E7_DEV_BOOKING_DATABASE_URL. No webhook, no deploy, no migration, no capture / refund / create / record / notify, no account or key change.
 name: e7-test-abort-cleanup
