@@ -35,14 +35,14 @@ const safeCode = (c) => (typeof c === "string" && CODE_RE.test(c) ? c : "UNEXPEC
 /** Guest-facing description of a server status. `released` = this tab asked for a release earlier. Never "booking confirmed". */
 export function describe(status, { releaseRequested = false } = {}) {
   switch (status) {
-    case "awaiting_details": return { kind: "details", title: "Enter guest details", text: "The price shown is set by the server. Nothing is held yet." };
-    case "awaiting_payment": return { kind: "pay", title: "Ready for TEST payment", text: "Continue to Stripe's hosted TEST Checkout. If you already paid, the server has not confirmed the authorization yet." };
+    case "awaiting_details": return { kind: "details", title: "Enter guest details", text: "Review the total below, then enter your guest details. Nothing is held yet." };
+    case "awaiting_payment": return { kind: "pay", title: "Ready for TEST payment", text: "Next: continue to Stripe TEST Checkout and use a TEST card. If you have already returned from Stripe, use Refresh status instead of making another payment." };
     // "processing" is a COARSE public status (payment_authorized, reservation_pending, capture_unknown, ... all map to it): no positive
     // authorization / uncaptured claim can be made from it
     case "processing": return { kind: "authorized", title: "Processing — not a booking",
-      text: "The server is processing this TEST intent. A TEST card authorization may be held; this status alone cannot show whether it has been captured or released. No reservation is created by this page and nothing is confirmed. You can request the release; the server refuses it if the intent is not releasable." };
+      text: "Next: keep this tab open and follow the test operator’s instructions. Do not make another TEST payment. A TEST card authorization may be held; this status alone cannot show whether it has been captured or released. This page does not create a reservation or confirm a booking. Request release only when you want to end this test; the server checks whether release is allowed." };
     case "release_requested": return { kind: "releaseQueued", title: "Release requested — not released yet",
-      text: "The release request is recorded and a void is queued. The TEST hold stays until the separate cleanup worker (run by the owner) verifies the release." };
+      text: "Your release request is queued, not finished. Next: wait for the test operator to run cleanup. Refresh status checks the result; it does not release the hold. The TEST hold stays until cleanup verifies the release." };
     case "unavailable_not_charged": return releaseRequested
       ? { kind: "released", title: "Release verified — not charged", text: "The server reports the TEST authorization released. A bank may still show a temporary hold for a while." }
       : { kind: "terminal", title: "Not charged", text: "The server reports this TEST intent closed without a charge." };
