@@ -14,7 +14,7 @@
 </head>
 <body>
 <header class="banner" role="note">
-  <strong>TEST ONLY.</strong> Stripe TEST mode. No reservation is created and no real card is charged. Use a Stripe TEST card on Stripe's page.
+  <strong>TEST ONLY.</strong> Stripe TEST mode. No reservation is created by this page. A separately approved test run may create and cancel one. No real card is charged. Use a Stripe TEST card on Stripe's page.
 </header>
 <main id="mv-test-app" data-listing-id="606998" data-currency="USD">
   <h1>maraVilla direct booking — TEST checkout</h1>
@@ -28,7 +28,7 @@
     <label>Arrival <input type="date" name="from" required></label>
     <label>Departure <input type="date" name="to" required></label>
     <label>Guests <input type="number" name="guests" min="1" max="20" value="2" required></label>
-    <button type="submit" id="mv-create-submit">Get server price</button>
+    <button type="submit" id="mv-create-submit">Get TEST price</button>
   </form>
 
   <form id="mv-details" hidden>
@@ -37,7 +37,7 @@
     <label>Email <input type="email" name="email" autocomplete="email" required></label>
     <label>Phone (optional) <input type="tel" name="phone" autocomplete="tel"></label>
     <label class="check"><input type="checkbox" id="mv-terms"> <span id="mv-terms-label"></span></label>
-    <button type="submit" id="mv-details-submit">Save details</button>
+    <button type="submit" id="mv-details-submit">Save details and continue</button>
   </form>
 
   <div id="mv-pay" hidden>

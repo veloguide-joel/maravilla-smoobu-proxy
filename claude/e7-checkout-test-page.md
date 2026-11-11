@@ -2,6 +2,20 @@
 
 Branch `feature/e7-checkout-test-page` from accepted `98883e3b`. This slice has not been merged or deployed. It made no provider, credential, environment or dashboard action.
 
+## Current operator guidance — 2026-11-11
+
+The implementation and deployment notes below are a historical record of the original slice. The current page is deployed to the TEST preview; PR #55 updates its wording without changing API calls, payment handling, polling or retry guards.
+
+| Page stage | What to do next |
+|---|---|
+| Dates and guests | Select the approved stay and guest count, then click **Get TEST price**. Review the displayed total. |
+| Guest details | Enter the approved contact, review the terms, then click **Save details and continue**. This shows the separate Stripe checkout button. |
+| Ready for TEST payment | Click **Continue to Stripe TEST Checkout** once. If already returned from Stripe, use **Refresh status**, rather than making another payment. |
+| Processing — not a booking | Keep the tab open and follow the test operator's instructions. This coarse status does not prove authorization, capture, release or a confirmed booking. |
+| Release requested — not released yet | Wait for the reviewed cleanup. **Refresh status** reads the result; it does not release the hold. |
+
+The page itself does not create a reservation. A separately approved runner can create and cancel a TEST reservation. Do not click release, forget the tab, restart or make another payment during an active run unless the operator directs it. No new checkout is needed merely to review this wording.
+
 ## Files
 
 | file | role |
