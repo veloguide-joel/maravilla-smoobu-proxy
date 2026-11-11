@@ -1,6 +1,6 @@
 # E7 checkout TEST page — implementation note (OFFLINE)
 
-Branch `feature/e7-checkout-test-page` from accepted `98883e3b`. This slice has not been merged or deployed. It made no provider, credential, environment or dashboard action.
+**HISTORICAL (original slice record; superseded by "Current operator guidance" below — PR #55 merged to e7-test as 8f65f9bd and deployed to the TEST preview):** Branch `feature/e7-checkout-test-page` from accepted `98883e3b`. This slice has not been merged or deployed. It made no provider, credential, environment or dashboard action.
 
 ## Current operator guidance — 2026-11-11
 

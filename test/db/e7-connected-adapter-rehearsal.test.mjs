@@ -425,8 +425,10 @@ test("B. missing ref echo: create returns the qualifying no-echo shape → accep
   assert.equal(writesOf(w).createReservation, 1, "no second create"); assert.equal(L.t.count(/^POST \/v1\/reservations$/), 1);
   assert.equal(L.log.flatMap((x) => x.actions).filter((a) => /RECOVERY_MODE_NO_CREATE|RESERVATION_DISPATCHED/.test(a)).length, 1, "only the original dispatch");
   const tail = (await eventsOf(bk.id)).slice(5);
-  assert.deepEqual(tail, ["RESERVATION_STARTED->reservation_pending", "RESERVATION_DISPATCHED->reservation_pending", "RECOVER_INTERRUPTED->reservation_unknown",
-    "RECONCILED_RESERVATION_FOUND->reservation_confirmed"], "exact accepted transitions: interrupted-reservation recovery, then reconciled by fresh by-ref + by-id proof");
+  // E7 lease/freshness fix (2026-11-11): the handed-off create is no longer relabelled WORKER_INTERRUPTED by the lease-expiry maintenance;
+  // the SAME fresh by-ref + by-id proof now confirms it as RESERVATION_SUCCEEDED (was RECOVER_INTERRUPTED -> RECONCILED_RESERVATION_FOUND).
+  assert.deepEqual(tail, ["RESERVATION_STARTED->reservation_pending", "RESERVATION_DISPATCHED->reservation_pending",
+    "RESERVATION_SUCCEEDED->reservation_confirmed"], "exact transitions: no interrupted-worker relabel; confirmed by fresh by-ref + by-id proof");
   assert.deepEqual(byId.map((o) => [o.state, o.attempts]), [["succeeded", 1]], "exactly ONE by-id read, executed once");
   assert.deepEqual(await openCases(bk.id), [], "no owner case on the ref-not-echoed path");
   console.log(`# B ledger: ${(await pathOf(bk.id)).join(" > ")}`);

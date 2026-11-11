@@ -91,8 +91,11 @@ test("crash at the provider-result boundary (result recorded, transition not app
   assert.equal(att.hostaway_reservation_id, "77002");
   assert.equal(att.state, "dispatched");
   await recoverInterruptedReservations(db.app, { now: F.at(30) });
-  assert.equal(await F.state(db.app, d.id), "reservation_unknown", "never back to payment_authorized once dispatched");
-  F.ok(await applyEvent(db.app, d.id, { type: "RECONCILED_RESERVATION_FOUND", reservation: F.reservationFor({ listingId: 740005 }, 77002) }, { now: F.at(31), actor: "reconciler" }));
+  // E7 lease/freshness fix (2026-11-11): a dispatched create already completed `succeeded` with a consistent result_ref is NOT an
+  // interrupted worker any more: it stays reservation_pending (never back to payment_authorized) and the evidence path (recovery
+  // pass + fresh reads; e72 LF8) applies RESERVATION_SUCCEEDED. Applied by hand here, as the reconciler would.
+  assert.equal(await F.state(db.app, d.id), "reservation_pending", "never back to payment_authorized once dispatched; not relabelled interrupted");
+  F.ok(await applyEvent(db.app, d.id, { type: "RESERVATION_SUCCEEDED", reservation: F.reservationFor({ listingId: 740005 }, 77002) }, { now: F.at(31), actor: "reconciler" }));
   assert.equal(await F.state(db.app, d.id), "reservation_confirmed");
   // first recorded result wins: a second, different result cannot overwrite the evidence
   assert.equal((await recordHostawayCreateResult(db.app, d.id, { httpStatus: 201, reservation: F.reservationFor({ listingId: 740005 }, 99999) }, { now: F.at(32) })).recorded, false);
