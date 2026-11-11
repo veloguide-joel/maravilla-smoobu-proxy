@@ -432,3 +432,192 @@ test("D9 (root b43935f0) every other hostaway_reservation / payment / offline-ch
   console.log(`# D9 ${JSON.stringify(ran)}`);
   assert.deepEqual(ran.filter((x) => !x.endsWith(": CONFLICT") && !x.endsWith(": TEST_ABORT_OPERATION_HISTORY")), [], "every disallowed class was represented and refused");
 });
+
+// ---- E7 r02 candidate: recovered (reconciled_found) reservation provenance ------------------------------------------------------------
+/** the r02-shaped lineage, through accepted APIs only: STARTED (2-min lease) → DISPATCHED → create reply WITHOUT the booking ref → the ONE
+ *  create op SUCCEEDED with result_ref = the provider id (ref-not-echoed path) → lease expires → RECOVER_INTERRUPTED (queues the by-ref
+ *  lookup) → that lookup + a by-id retrieve succeed with bound found_active evidence → RECONCILED_RESERVATION_FOUND → reservation_confirmed.
+ *  o.resultRef overrides the create result_ref; o.noFoundActive skips the found_active evidence (records nothing for the reads). */
+async function reconciledIntent(o = {}) {
+  const stay = nextStay();
+  const p = await F.pending(db.app, stay);
+  const piId = `pi_ABRT${hex8()}`;
+  F.ok(await applyEvent(db.app, p.id, F.authEvent(p.sessionId, piId, 5, { currency: "usd" }), { now: F.at(5), actor: "webhook" }));
+  F.ok(await applyEvent(db.app, p.id, { type: "RESERVATION_STARTED", workerId: "w1", recheck: { bookable: true, priceSame: true } }, { now: F.at(6), actor: "worker", workerId: "w1" }));
+  F.ok(await applyEvent(db.app, p.id, { type: "RESERVATION_DISPATCHED", workerId: "w1" }, { now: F.at(6), actor: "worker", workerId: "w1" }));
+  const rid = F.nextReservationId() + 61000000;
+  const ref = (await loadIntent(db.app, p.id)).ref;
+  const op = await F.claimOp(db.app, p.id, "hostaway.create_reservation", F.at(6));
+  await recordHostawayCreateResult(db.app, p.id, { httpStatus: 201, reservation: { ...F.reservationFor(stay, rid), bookingRef: null } }, { now: F.at(7) });
+  F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(7), outcome: { status: "succeeded", resultRef: o.resultRef ?? rid } }));
+  F.ok(await applyEvent(db.app, p.id, { type: "RECOVER_INTERRUPTED", id: `recover:${p.id}:test` }, { now: F.at(9), actor: "reconciler" }));
+  assert.equal(await state(p.id), "reservation_unknown");
+  const observed = { reservationId: String(rid), listingId: LISTING, from: stay.from, to: stay.to, totalMinor: (await loadIntent(db.app, p.id)).price.finalTotalMinor, currency: "USD", status: "new" };
+  // the RECOVERY lookup queued by RECOVER_INTERRUPTED, then a by-id retrieve (both real reads through the accepted APIs)
+  const lk = await claimNextOperation(db.app, { workerId: "w-rec", now: F.at(10), intentId: p.id, opTypes: [LOOKUP] });
+  assert.ok(lk, "recovery lookup queued");
+  F.ok(await completeOperation(db.app, lk.id, { workerId: "w-rec", now: F.at(10), outcome: { status: "succeeded" } }));
+  if (!o.noFoundActive) {
+    F.ok(await recordProviderEvidence(db.app, { readOpId: lk.id, kind: "hostaway_reservation", externalRef: String(rid), status: "found_active",
+      observed: { bookingRef: ref, matchCount: 1, ...observed, bookingRef: ref } }));
+    if (!o.noById) await readEvidence(p.id, { opType: RETRIEVE, ref: String(rid), at: F.at(10), kind: "hostaway_reservation", externalRef: String(rid), status: "found_active", observed });
+  }
+  F.ok(await applyEvent(db.app, p.id, { type: "RECONCILED_RESERVATION_FOUND", id: `recon:${p.id}:test`, reservation: F.reservationFor(stay, rid) }, { now: F.at(11), actor: "reconciler" }));
+  const i = await loadIntent(db.app, p.id);
+  assert.equal(i.status, "reservation_confirmed");
+  const att = (await db.app.query("SELECT state, hostaway_reservation_id FROM booking.hostaway_reservation_attempts WHERE intent_id = $1", [p.id])).rows;
+  assert.deepEqual(att.map((x) => [x.state, String(x.hostaway_reservation_id)]), [["reconciled_found", String(rid)]]);
+  const pa = (await db.app.query("SELECT id::text AS id FROM booking.payment_attempts WHERE intent_id = $1 AND status = 'completed'", [p.id])).rows[0].id;
+  const e = buildAbortExpectation({ intentId: p.id, expectedVersion: i.version, listingId: LISTING, from: stay.from, to: stay.to, guests: i.guests, currency: "USD",
+    finalTotalMinor: i.price.finalTotalMinor, authorizedMinor: i.payment.amountMinor, paymentIntentId: piId, sessionId: p.sessionId, attemptId: pa,
+    reservationId: String(rid), approvalRef: "synthetic-abort-reconciled" });
+  assert.ok(e, "expectation builds");
+  return { id: p.id, piId, rid: String(rid), stay, e, intent: i, ref, paymentAttemptId: pa };
+}
+
+test("D10 (r02 candidate) RECOVERED reservation: reconciled_found + the ONE succeeded create (result_ref = id) + bound found_active → ONE abort event, same effects as D1; then the accepted cleanup settles BOTH legs once", async () => {
+  const a = await reconciledIntent();
+  const s0 = await snap(a.id);
+  assert.equal((await classify(db.app, a.e)).class, "ELIGIBLE");
+  const r = await requestTestAbort(db.app, a.id, { now: F.at(12), env: ENV, operator: a.e });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  const i = await loadIntent(db.app, a.id);
+  assert.deepEqual([i.status, i.reasonCode, i.version], ["capture_failed", TEST_ABORT_REASON, s0.version.version + 1]);
+  const after1 = await snap(a.id);
+  const added = after1.ops.filter((x) => !s0.ops.includes(x) || after1.ops.filter((y) => y === x).length > s0.ops.filter((y) => y === x).length);
+  assert.deepEqual(added.sort(), ["alert.owner:pending:0:true", "hostaway.cancel_reservation:pending:0:true", "stripe.void_payment_intent:pending:0:true"]);
+  assert.deepEqual((await opsOf(a.id, OPS.CAPTURE)).map((o) => [o.state, o.attempts, o.dispatched_at]), [["pending", 0, null]]);
+  const again = await requestTestAbort(db.app, a.id, { now: F.at(13), env: ENV, operator: a.e });
+  assert.deepEqual([again.ok, again.duplicate], [true, true]);
+  // the accepted two-leg cleanup, unchanged
+  const w = world(); attachWorld(w, a);
+  const h = harness(w);
+  for (let k = 0; k < 10 && (await state(a.id)) !== "cancelled"; k++) { await h.step({ intentId: a.id }); h.clk.t += MIN; }
+  assert.equal(await state(a.id), "cancelled");
+  assert.deepEqual([w.voids.length, w.cancels.length], [1, 1]);
+  assert.deepEqual(w.cancels, [`/v1/reservations/${a.rid}/statuses/cancelled`]);
+  assert.equal(await claimHeld(a.id), false);
+  assert.equal(w.calls.some((c) => /capture|refund/i.test(c)), false);
+});
+
+test("D11 (r02 candidate) recovered provenance still refuses with ZERO writes: no found_active evidence; create result_ref ≠ bound id; found_active for another id; and the original 'succeeded'-only RED is now the only behaviour change", async () => {
+  // (a) reconciled_found but NO bound found_active evidence
+  const a = await reconciledIntent({ noFoundActive: true });
+  let s0 = await snap(a.id);
+  let r = await requestTestAbort(db.app, a.id, { now: F.at(12), env: ENV, operator: a.e });
+  assert.deepEqual([r.ok, r.error], [false, "TEST_ABORT_RESERVATION_HISTORY"]); assert.deepEqual(await snap(a.id), s0);
+  // (a2) reconciled_found with ONLY the by-ref lookup found_active (no post-create by-id retrieve proof)
+  const a2 = await reconciledIntent({ noById: true });
+  s0 = await snap(a2.id);
+  r = await requestTestAbort(db.app, a2.id, { now: F.at(12), env: ENV, operator: a2.e });
+  assert.deepEqual([r.ok, r.error], [false, "TEST_ABORT_RESERVATION_HISTORY"]); assert.deepEqual(await snap(a2.id), s0);
+  // (b) the create's own result_ref is ANOTHER id, built through the accepted APIs (no catch: the fixture MUST build, the guard MUST refuse)
+  const b = await reconciledIntent({ resultRef: 61999990 });
+  assert.equal((await db.app.query("SELECT result_ref FROM booking.external_operations WHERE intent_id = $1 AND op_type = 'hostaway.create_reservation'", [b.id])).rows[0].result_ref, "61999990");
+  s0 = await snap(b.id);
+  r = await requestTestAbort(db.app, b.id, { now: F.at(12), env: ENV, operator: b.e });
+  assert.deepEqual([r.ok, r.error], [false, "TEST_ABORT_RESERVATION_HISTORY"]); assert.deepEqual(await snap(b.id), s0);
+  // (b2) independent SYNTHETIC owner-fault fixture: a fully valid recovered intent whose create result_ref is then rewritten by the owner role
+  //      (labelled, triggers disabled only for this planted state) → the candidate guard alone must refuse, zero writes
+  const b2 = await reconciledIntent();
+  await db.owner.query("ALTER TABLE booking.external_operations DISABLE TRIGGER USER");
+  try { await db.owner.query("UPDATE booking.external_operations SET result_ref = '61999991' WHERE intent_id = $1 AND op_type = 'hostaway.create_reservation'", [b2.id]); }
+  finally { await db.owner.query("ALTER TABLE booking.external_operations ENABLE TRIGGER USER"); }
+  s0 = await snap(b2.id);
+  r = await requestTestAbort(db.app, b2.id, { now: F.at(12), env: ENV, operator: b2.e });
+  assert.deepEqual([r.ok, r.error], [false, "TEST_ABORT_RESERVATION_HISTORY"]); assert.deepEqual(await snap(b2.id), s0);
+  // (c) an extra found_active for ANOTHER reservation → evidence conflict
+  const c = await reconciledIntent();
+  await readEvidence(c.id, { opType: RETRIEVE, ref: "61999998", at: F.at(11), kind: "hostaway_reservation", externalRef: "61999998", status: "found_active",
+    observed: boundObserved(c, { reservationId: "61999998" }) });
+  s0 = await snap(c.id);
+  r = await requestTestAbort(db.app, c.id, { now: F.at(12), env: ENV, operator: c.e });
+  assert.deepEqual([r.ok, r.error], [false, "TEST_ABORT_EVIDENCE_CONFLICT"]); assert.deepEqual(await snap(c.id), s0);
+  // (d) other attempt states still refuse (owner-planted SYNTHETIC: escalated / outcome_unknown)
+  for (const st of ["escalated", "outcome_unknown"]) {
+    const d = await confirmedIntent();
+    await db.owner.query("ALTER TABLE booking.hostaway_reservation_attempts DISABLE TRIGGER USER");
+    try { await db.owner.query("UPDATE booking.hostaway_reservation_attempts SET state = $2 WHERE intent_id = $1", [d.id, st]); }
+    finally { await db.owner.query("ALTER TABLE booking.hostaway_reservation_attempts ENABLE TRIGGER USER"); }
+    s0 = await snap(d.id);
+    r = await requestTestAbort(db.app, d.id, { now: F.at(9), env: ENV, operator: d.e });
+    assert.deepEqual([r.ok, r.error], [false, "TEST_ABORT_RESERVATION_HISTORY"], st); assert.deepEqual(await snap(d.id), s0, st);
+  }
+});
+
+test("D12 (r02 candidate, ROOT F1) positivity comes ONLY from the one validated evidence read; ZERO writes otherwise", async () => {
+  const EVQ = "SELECT kind, source, external_ref, status, observed, observed_at, read_operation_id FROM booking.provider_evidence WHERE intent_id = $1";
+  const insertById = async (a, opId, observed, c = db.owner) => c.query(`INSERT INTO booking.provider_evidence (id, intent_id, kind, source, external_ref, status, observed, observed_at, read_operation_id, recorded_by_role, recorded_session_user, created_at)
+      SELECT $1, $2, 'hostaway_reservation', 'hostaway_api', $3, 'found_active', $4::jsonb, o.completed_at, o.id, 'test', 'test', now() FROM booking.external_operations o WHERE o.id = $5`,
+      [randomUUID(), a.id, a.rid, JSON.stringify(observed), opId]);
+  const succeededRetrieve = async (a) => {                                     // a REAL succeeded post-create by-id retrieve of the bound id (allowed history)
+    const opId = await requestRead(db.app, a.id, RETRIEVE, a.rid, { now: F.at(10) });
+    assert.equal((await claimNextOperation(db.app, { workerId: "w-read", now: F.at(10), intentId: a.id, opId })).id, opId);
+    F.ok(await completeOperation(db.app, opId, { workerId: "w-read", now: F.at(10), outcome: { status: "succeeded" } }));
+    return opId;
+  };
+  const hooked = (onEv) => ({ query: (...q) => db.app.query(...q), connect: async () => {
+    const cl = await db.app.connect();
+    return new Proxy(cl, { get(tg, k) {
+      if (k === "query") return async (...q) => { const res = await tg.query(...q); return typeof q[0] === "string" && q[0] === EVQ ? await onEv(res) : res; };
+      const v = tg[k]; return typeof v === "function" ? v.bind(tg) : v; } });
+  } });
+
+  // (a) DB fence: an evidence insert concurrent with the open abort transaction (issued right after its evidence read) cannot
+  //     commit inside the window; it waits on the abort transaction, which refuses and writes nothing.
+  {
+    const a = await reconciledIntent({ noById: true });
+    const opId = await succeededRetrieve(a);
+    const s0 = await snap(a.id);
+    let fence = null;
+    const r = await requestTestAbort(hooked(async (res) => {
+      if (fence === null) {
+        const oc = await db.owner.connect();
+        try { await oc.query("BEGIN"); await oc.query("SET LOCAL lock_timeout = '1500ms'"); await insertById(a, opId, boundObserved(a), oc); await oc.query("COMMIT"); fence = "committed"; }
+        catch (err) { await oc.query("ROLLBACK").catch(() => {}); fence = err.code; } finally { oc.release(); }
+      }
+      return res;
+    }), a.id, { now: F.at(12), env: ENV, operator: a.e });
+    assert.equal(fence, "55P03", "the concurrent insert is blocked by the open abort transaction (lock_not_available)");
+    assert.deepEqual([r.ok, r.error], [false, "TEST_ABORT_RESERVATION_HISTORY"]); assert.deepEqual(await snap(a.id), s0);
+  }
+
+  // (b) code binding, independent of that fence: the by-id found_active row is COMMITTED and visible to every later statement of the
+  //     abort transaction, but absent from the one validated evidence read (SYNTHETIC snapshot gap) → refusal, ZERO writes.
+  //     Against candidate 778b19cd (second pos query) this case was accepted: that is the F1 RED.
+  for (const variant of ["matching-identity", "conflicting-identity"]) {
+    const a = await reconciledIntent({ noById: true });
+    const opId = await succeededRetrieve(a);
+    await insertById(a, opId, variant === "matching-identity" ? boundObserved(a) : boundObserved(a, { totalMinor: a.e.finalTotalMinor + 100 }));
+    const s0 = await snap(a.id);
+    let hid = 0;
+    const r = await requestTestAbort(hooked(async (res) => {
+      const rows = res.rows.filter((x) => String(x.read_operation_id) !== String(opId)); hid += res.rows.length - rows.length; return { ...res, rows, rowCount: rows.length };
+    }), a.id, { now: F.at(12), env: ENV, operator: a.e });
+    assert.equal(hid, 1, `${variant}: the committed row was withheld from the validated read only`);
+    assert.deepEqual([r.ok, r.error], [false, "TEST_ABORT_RESERVATION_HISTORY"], variant);
+    assert.deepEqual(await snap(a.id), s0, `${variant}: zero E3 / op / claim change`);
+    // unhooked: the same row is classified on its own merits (conflict → EVIDENCE_CONFLICT; matching → the one accepted abort)
+    const r2 = await requestTestAbort(db.app, a.id, { now: F.at(13), env: ENV, operator: a.e });
+    if (variant === "conflicting-identity") assert.deepEqual([r2.ok, r2.error], [false, "TEST_ABORT_EVIDENCE_CONFLICT"]);
+    else assert.equal(r2.ok, true, JSON.stringify(r2));
+  }
+});
+
+test("D13 (r02 candidate) new positive path: identity / timestamp / order refusals (fresh intent per case; ZERO writes)", async () => {
+  const cases = [
+    ["by-id found_active with contradictory total", (a) => readEvidence(a.id, { opType: RETRIEVE, ref: a.rid, at: F.at(10), kind: "hostaway_reservation", externalRef: a.rid, status: "found_active", observed: boundObserved(a, { totalMinor: a.e.finalTotalMinor + 1 }) }), "TEST_ABORT_EVIDENCE_CONFLICT"],
+    ["by-id found_active with contradictory stay", (a) => readEvidence(a.id, { opType: RETRIEVE, ref: a.rid, at: F.at(10), kind: "hostaway_reservation", externalRef: a.rid, status: "found_active", observed: boundObserved(a, { to: addDays(a.stay.to, 1) }) }), "TEST_ABORT_EVIDENCE_CONFLICT"],
+    ["by-id found_active completed BEFORE the create dispatch", (a) => readEvidence(a.id, { opType: RETRIEVE, ref: a.rid, at: F.at(5), kind: "hostaway_reservation", externalRef: a.rid, status: "found_active", observed: boundObserved(a) }), "TEST_ABORT_RESERVATION_HISTORY"],
+    ["by-id found_active completed AT the create dispatch (not strictly after)", (a) => readEvidence(a.id, { opType: RETRIEVE, ref: a.rid, at: F.at(6), kind: "hostaway_reservation", externalRef: a.rid, status: "found_active", observed: boundObserved(a) }), "TEST_ABORT_RESERVATION_HISTORY"],
+    ["by-id cancelled for the bound id", (a) => readEvidence(a.id, { opType: RETRIEVE, ref: a.rid, at: F.at(10), kind: "hostaway_reservation", externalRef: a.rid, status: "cancelled", observed: {} }), "TEST_ABORT_EVIDENCE_CONFLICT"]
+  ];
+  for (const [label, add, want] of cases) {
+    const a = await reconciledIntent({ noById: true });
+    await add(a);
+    const s0 = await snap(a.id);
+    const r = await requestTestAbort(db.app, a.id, { now: F.at(12), env: ENV, operator: a.e });
+    assert.deepEqual([r.ok, r.error], [false, want], label);
+    assert.deepEqual(await snap(a.id), s0, `${label}: zero writes`);
+  }
+});

@@ -27,7 +27,8 @@ export const TEST_ABORT_LISTINGS_COPY = Object.freeze([Object.freeze({ listingId
 /** COPIED constant (origin lib/booking-db/reservation-worker.js:69 PROTECTED_HOSTAWAY_RESERVATION_IDS) */
 export const PROTECTED_RESERVATION_IDS_COPY = Object.freeze(["70636076", "71045356", "71072615", "71081885"]);
 export const CONSTANT_ORIGINS = Object.freeze({
-  "lib/booking-db/test-abort.js": "91724d9dcd6c3c514eef70b5d3f4a4458b7298106b0286a797506bd99b48f852",
+  // origin pin 91724d9d... -> 2638df7d... (root review of r02 candidate 49e7fe4e, F1/F2; exact, no loosening)
+  "lib/booking-db/test-abort.js": "2638df7d3cceab9b0720c2ea1c7fa53d439900ef7392d944ef3663c331ebcc86",
   "lib/booking-db/reservation-worker.js": "601f48f67052f5dac40b83354b9cf10d5f81950ff9fe9cbd587288d19ed05e88"
 });
 /** exact historical identifiers from the accepted ledger; null = the identifier did NOT exist (explicit, never guessed) */
