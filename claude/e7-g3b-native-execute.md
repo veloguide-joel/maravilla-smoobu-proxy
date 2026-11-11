@@ -39,7 +39,7 @@ The command is `execute` followed by **all 13 flags**, each exactly once, in any
 1. **Grammar** (pure).
 2. **Platform and uid** (lazy native reads), linux / darwin only.
 3. **Native execution closure.** Built-ins only (`node:fs/promises`, `node:crypto`, loaded by fixed specifier); no non-built-in module has been imported yet.
-   - **Sources.** `NATIVE_EXEC_SOURCES` is a literal sorted list of 56 paths in the CLI. It is:
+   - **Sources.** `NATIVE_EXEC_SOURCES` is a literal sorted list of **57** paths in the CLI (56 at G3b; PR #46 added `run-lock-precheck.mjs`; re-counted at b6dd661a with the CLI's own `readNativeClosure`). It is:
      - the scanned static + dynamic relative import graph of `run-plan-cli-main.mjs` and `run-r1-launcher.mjs`;
      - ∪ `RUN_PLAN_CLOSURE` and `R1_EXECUTOR_CLOSURE`, which the binder reads as data;
      - ∪ `package.json` and `package-lock.json`.
@@ -47,7 +47,7 @@ The command is `execute` followed by **all 13 flags**, each exactly once, in any
      The test suite re-scans it independently.
    - **Dependencies.** `NATIVE_EXTERNALS = ["pg"]` (the scanned bare specifiers). The CLI takes the transitive runtime packages from the lock's `packages` map — 14 packages today. It reads the lock bytes from the closure, so the lock is covered by the same digest. Every regular file in those package directories is hashed; a symlink or special entry refuses.
    - **Read rules.** Every read is `O_RDONLY|O_NOFOLLOW`, regular-file, size-bounded, with total and count caps.
-   - **Digest** = SHA-256(`"e7-native-exec-closure-v1\n"` ‖ for each entry sorted by path: `path NUL len NUL bytes NUL`). Today it covers 56 source files + 141 dependency files.
+   - **Digest** = SHA-256(`"e7-native-exec-closure-v1\n"` ‖ for each entry sorted by path: `path NUL len NUL bytes NUL`). At b6dd661a it covers 57 source files + 141 dependency files (14 packages), re-counted with the CLI's own `readNativeClosure`. Any launcher / closure-source change changes the digest; a digest is pinned only for the FINAL reviewed merged source on the documented install.
    - **Match.** The digest must equal `--expect-native-digest`, else `NATIVE_CLOSURE_REFUSED` / `NATIVE_DIGEST_MISMATCH` (exit 4). The computed digest is reported; it is not secret.
    - **No self-hash trick.** No module embeds the digest; it arrives on argv from the reviewed package.
    - **Not covered (TRUST):** the Node binary, OS, CA store and filesystem namespace. Directory ancestors are TRUST, as in the accepted reader.
@@ -62,6 +62,12 @@ The command is `execute` followed by **all 13 flags**, each exactly once, in any
    - **e.** `openFileJournalR1` with the explicit owner dirs, using the journal-minted binding. It is creation-only, and an existing file refuses.
    - **f.** `runReservationAbortR1`. This is where the same advisory lock, same-DB / TEST / app / report role checks (live), the fresh P0 + post-attestation preflight, the fences, the M8 bridge, receipt / trusted-head cleanup authority, the release proof and the exclusion re-read all happen, unchanged.
    - **g.** Teardown, each step with an honest disposition: `result.finalize()` → journal `close()` → each pool `end()` bounded to 10 s (an unsettled end is reported `unknown`; the process exits after the one line, so nothing is reused).
+     - `teardown.pools` is the LOGICAL `pool.end()` disposition (`ended` / `end_failed` / `unknown`). It is not a socket-close or backend-exit claim: pg-pool resolves `end()` before a client's `'end'` event (accepted E2 enabling mechanism).
+     - **T1b (root ruling V1).** A separate additive `acquiredClientEnd: { app, report }` per slot: `{ scope: "ACQUIRED_ONLY", acquired, endObserved, status }`. It is frozen at that slot's pool-end SETTLEMENT (`ended` / `end_failed` / `unknown`, including the timeout), with no wait and no new timer.
+       - It counts only clients that SUCCESSFULLY connected (public pool `'connect'`, attached right after each pool's construction, before any connect / P3), and whether each one's client `'end'` EVENT was seen by then.
+       - `NONE_ACQUIRED` is VACUOUS: it does not mean "all closed". `ALL_ACQUIRED_END_OBSERVED` is client-event evidence only, never a raw socket close or a server backend exit. `NOT_OBSERVED` (null counts) = an instrumentation fault, contained.
+       - Failed or pending acquisitions are unobservable through the public API. **The E2 lingering-PID cause stays OPEN.**
+       - The observer adds no `'error'` listener and no wrapper, removes only its own listeners at settlement, and later events never mutate the snapshot. `teardown`, exits and scheduling are unchanged.
 6. **Output.** ONE stdout line containing whitelisted codes / counts / digests only, plus `teardown`. No URL, password, token, key, path, guest or provider text.
    - Exit codes: 0 `ENDED_RELEASED`, 6 STOPPED, 4 refused / REFUSED, 1 failure.
    - The pool's own errors never carry the URL, and the launcher drops them anyway.
@@ -123,6 +129,14 @@ The command is `execute` followed by **all 13 flags**, each exactly once, in any
 - The real https exchange, a remote TLS database and real Stripe / Hostaway are NOT exercised.
 - File-journal ACK loss / unknown tail is not re-injected through the launcher. The launcher passes the accepted file journal through unchanged; that behaviour is covered by the accepted M2-E F2 / F3 and G2b G7 suites.
 - A second signal exits 130 without teardown (tail uncertain, nothing repaired), by design.
+
+### Guard `exclusion: "released"` — precise meaning by path (docs only; guard code / enum unchanged)
+The accepted guard (`run-guard.mjs` finalize) sets `exclusion = "released"` on every path that ends with destroying the lock client. The evidence behind that label differs by `lockRelease`:
+- **`unlocked`**: an explicit `pg_advisory_unlock` on the lock client returned `true`, then the client was destroyed. The server confirmed the lock release on that session.
+- **`destroyed`** (DB-family failure or broken guard; no unlock attempted): release is only INITIATED by destroying the client. On the direct endpoint the session lock disappears WHEN the backend session ends, so this is conditional on actual backend termination, not proof (network delay and the OPEN E2 lingering-PID observation apply).
+- **`destroyed_after_unlock_timeout` / `destroyed_after_unlock_failure`**: the unlock was not confirmed. The same conditional meaning applies; an unlock that returned `false` additionally flags `exclusionLost`.
+- **Session pooler:** reset semantics are unknown, so none of the destroy-based labels is meaningful there (endpoint policy P4). Activation is pinned to direct.
+- For FUTURE acquisition: the next run's P3 pre-check is a read-only snapshot, and its P0 try-lock is decisive. For `unlocked`, the server-confirmed `true` already evidences that session's release. For the destroy-only / unconfirmed-unlock paths, the release remains unconfirmed until backend termination; no later observation retroactively proves when it happened.
 
 ## 8. Root review of 128ac08 — corrections (H1, H2) and rulings
 
