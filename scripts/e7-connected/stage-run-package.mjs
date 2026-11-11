@@ -12,7 +12,7 @@
 //   * Writes exactly two files: O_CREAT|O_EXCL|O_NOFOLLOW requested 0600; the NEW fd must then fstat as a regular own-uid nlink-1 file with
 //     mode EXACTLY 0600 (rev2, ROOT F2: an inherited restrictive umask is refused, never chmod-repaired) BEFORE any byte is written. No
 //     overwrite / chmod / repair / adopt / cleanup / retry: after the first create, every failure is *_LEFT_IN_PLACE.
-//   * Baseline note: FIXED.repoCommit is the unchanged reviewed EXECUTION baseline (2810ca60) the plan declares; it is NOT a claim about the
+//   * Baseline note: FIXED.repoCommit is the reviewed reconciled-reservation EXECUTION baseline (d06b9250) the plan declares; it is NOT a claim about the
 //     current Git HEAD of the checkout this helper is published in. The foundation sourceDigest is what binds the actual bytes.
 //   * NOT part of any reviewed closure (native / foundation / executor lists unchanged); no execute mode.
 import { createHash } from "node:crypto";
@@ -32,7 +32,8 @@ export const REQUIRED_NODE = "v22.22.0";
 export const MAX_FACTS_B64 = 4096;
 export const MAX_FACTS_JSON = 3072;
 export const FIXED = Object.freeze({
-  repoCommit: "2810ca602f0b13fdee7c1ed2437d018981844ccc", sourceDigest: "1057b487935b2d95f6f3db0cecda6615c16d0d252736253de88551c5e0d438db",
+  // PR #53 changes the abort guard and its source pin. Future packages bind those reviewed bytes; existing packages are never rewritten.
+  repoCommit: "d06b925055dc73dd077525ea0bb789dbb2e8cf6d", sourceDigest: "bc13a5f74e1eea258a2f3f22bc5f62ea41cd0f5b926ee2d2c8816da9c045bb0d",
   stripeAccountId: "acct_1TyHE42B9LTneQgw", hostawayAccountRef: "201434", clientSnapshotId: "provider-file-h1-20261111",
   listing: Object.freeze({ id: 606998, currency: "USD", refFieldId: 105433, timeZone: "America/Mexico_City", connection: "disconnected" }),
   deadlines: Object.freeze({ quoteMaxAgeMinutes: 30, authorizationMaxAgeHours: 1 }), stayRules: Object.freeze({ minLeadDays: 7, maxNights: 1 }) });
