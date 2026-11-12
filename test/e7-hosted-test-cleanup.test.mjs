@@ -129,7 +129,10 @@ function exchanges(w, o = {}) {
     }
     if (p.startsWith("/v1/refunds/")) return reply(200, refundObj(w, o.refundGetOver ?? {}));
     if (p.startsWith("/v1/refunds?")) return reply(200, { object: "list", url: "/v1/refunds", has_more: false, data: w.piRefunded ? [refundObj(w)] : [] });
-    return reply(200, piObj(w));
+    const base = piObj(w); const n = (w.piReads = (w.piReads ?? 0) + 1);
+    if (o.prePiMutate && n === 1) return reply(200, o.prePiMutate(base));                                   // the FIRST PI read = the runner's pre-request proof read
+    if (o.finalPiMutate && w.status === "cancelled") return reply(200, o.finalPiMutate(base));             // a PI read after the worker finished = the runner's final readback
+    return reply(200, base);
   };
   const hostaway = (req) => {
     const p = req.url.replace("https://api.hostaway.com", ""); w.calls.push(`H:${req.method} ${p}`);
@@ -140,8 +143,13 @@ function exchanges(w, o = {}) {
       if (o.cancelLost) { if (o.cancelLandedAnyway) w.resStatus = "cancelled"; return Promise.reject(new Error("socket reset")); }
       w.resStatus = "cancelled"; return reply(200, { status: "success", result: resObj(w) });
     }
-    if (req.method === "GET" && p.startsWith("/v1/reservations?")) return reply(200, { status: "success", result: new URL(req.url).searchParams.has("afterId") ? [] : [resObj({ ...w, echoRef: true })] });
-    if (req.method === "GET" && /^\/v1\/reservations\/\d+$/.test(p)) return reply(200, { status: "success", result: resObj(w, p.split("/").pop()) });
+    if (req.method === "GET" && p.startsWith("/v1/reservations?")) {
+      w.lookupPages = (w.lookupPages ?? 0) + 1;
+      const page = new URL(req.url).searchParams.has("afterId") ? [] : (o.lookupResult ? o.lookupResult(w) : [resObj({ ...w, echoRef: true })]);
+      return reply(200, { status: "success", result: page });
+    }
+    if (req.method === "GET" && /^\/v1\/reservations\/\d+$/.test(p)) { const n = (w.resReads = (w.resReads ?? 0) + 1); const obj = resObj(w, p.split("/").pop());
+      return reply(200, { status: "success", result: o.preResMutate && n === 1 ? o.preResMutate(obj) : obj }); }
     return reply(404, { status: "fail" });
   };
   return { stripe, hostaway };
@@ -176,7 +184,7 @@ function fakeWorker(w, o = {}) {
     assert.deepEqual([...listings.keys()], [606998]); assert.deepEqual(Object.keys(executors).sort(), [...EX.PHASE_KEYS].sort());
     assert.ok(signal instanceof AbortSignal && Number.isFinite(deadlineAt) && /^e7-hosted-tc:/.test(workerId));
     const sig = AbortSignal.timeout(5000); const actions = []; const cancel = rowOf(w, CAN); const refund = rowOf(w, RFD);
-    const out = (extra = {}) => ({ status: "worked", intentId: IID, actions, calls: [], sends: 0, cancelSends: 0, refundSends: 0, stop: null, facts: null, delayMs: o.delayMs ?? 30000, late: Promise.resolve([]), ...extra });
+    const out = (extra = {}) => { w.signalAbortedAtEnd = signal.aborted; return { status: "worked", intentId: IID, actions, calls: [], sends: 0, cancelSends: 0, refundSends: 0, stop: null, facts: null, delayMs: o.delayMs ?? 30000, late: Promise.resolve([]), ...extra }; };
     try {
       if (o.foreignRead) await executors.retrieveReservation({ method: "GET", path: `/v1/reservations/${C.protectedReservationIds[0]}`, query: {} }, { signal: sig });
       if (o.wait) { actions.push("WAIT:FAKE"); return out(); }
@@ -227,7 +235,7 @@ function fakeWorker(w, o = {}) {
 }
 const toolingFor = (w, o = {}) => ({ runTestCleanupStep: o.worker ?? fakeWorker(w, o), requestTestCleanup: o.request ?? fakeRequest(w, o), loadIntent: async () => intentOf(w),
   createTestCleanupExecutors: EX.createTestCleanupExecutors, createStripeSend: TT.createE7StripeTestCleanupSend, createHostawaySend: T.createE7HostawaySend, validateAdapterConfig: HR.validateAdapterConfig,
-  unwrapEnvelope: HR.unwrapEnvelope, normalizeReservation: HR.normalizeReservation, paymentIntentProofObservationV3: CP.paymentIntentProofObservationV3, piIdentityOk: RP.piIdentityOk,
+  unwrapEnvelope: HR.unwrapEnvelope, normalizeReservation: HR.normalizeReservation, lookupByRef: HR.lookupByRef, activeReservationProof: CO.activeReservationProof, paymentIntentProofObservationV3: CP.paymentIntentProofObservationV3, piIdentityOk: RP.piIdentityOk,
   rawPiPreSendRefusal: TP.rawPiPreSendRefusal, refundObservation: TP.refundObservation, arrivalStrictlyFuture: CO.arrivalStrictlyFuture, refundKey: IS.refundKey, publicStatus: IS.publicStatus,
   LOCK_KEY: LK.LOCK_KEY, LOCK_PRECHECK_SQL: LK.LOCK_PRECHECK_SQL });
 function core(w, o = {}) {
@@ -265,8 +273,8 @@ test("A1 happy path (FAKE DB / request / worker, REAL transports + executors + p
 });
 
 test("A2 strict provider proofs gate the request: partly refunded / disputed charge / wrong account / PI identity / cancelled reservation / past arrival / 401 → PROVIDER_PROOF_FAILED with ZERO request, ZERO worker, ZERO writes", async () => {
-  for (const [label, mutate, o, code] of [["refunded", (w) => { w.piRefunded = 1; }, {}, "RAW_CHARGE_AMOUNT_REFUNDED"], ["disputed", (w) => { w.disputed = true; }, {}, "RAW_CHARGE_DISPUTED"],
-    ["other account", () => {}, { otherAccount: true }, null], ["cancelled at the provider", (w) => { w.resStatus = "cancelled"; }, {}, "RESERVATION_NOT_ACTIVE"],
+  for (const [label, mutate, o, code] of [["refunded", (w) => { w.piRefunded = 1; }, {}, "CHARGE_ALREADY_REFUNDED"], ["disputed", (w) => { w.disputed = true; }, {}, "RAW_CHARGE_DISPUTED"],
+    ["other account", () => {}, { otherAccount: true }, null], ["cancelled at the provider", (w) => { w.resStatus = "cancelled"; }, {}, "RESERVATION_BY_ID_RESERVATION_NOT_ACTIVE"],
     ["past arrival", () => {}, { clockBase: Date.UTC(2028, 0, 15) }, "ARRIVAL_NOT_IN_FUTURE"], ["401", () => {}, { hostawayStatus: 401 }, "RESERVATION_READ_401"],
     ["wrong metadata", () => {}, { wrapExchanges: (x) => ({ hostaway: x.hostaway, stripe: (req) => (req.method === "GET" && /payment_intents/.test(req.url)
       ? Promise.resolve({ status: 200, contentType: "application/json", bytes: enc({ ...piObj(world()), metadata: { mv_intent_id: "other" } }) }) : x.stripe(req)) }) }, "PAYMENT_INTENT_IDENTITY"]]) {
@@ -339,8 +347,147 @@ test("A4 real lock semantics: held elsewhere → LOCK_NOT_ACQUIRED, zero provide
     assert.deepEqual([r.outcome, r.code, w.requestCalls, w.workerCalls], ["LOCK_LOST", "BACKEND_HOP", 0, 0], JSON.stringify(r)); }
   { const w = world();  // the error is observed as the worker's PI read resolves (before the cancel): the cancel transport is vetoed
     const r = await core(w, { wrapExchanges: (x) => ({ hostaway: x.hostaway, stripe: async (req) => { const out = await x.stripe(req); if (w.workerCalls > 0 && /payment_intents\/pi_/.test(req.url) && req.method === "GET") w.lockClient.errorFn(new Error("SYNTHETIC_PRIVATE_ERROR_CANARY")); return out; } }) });
-    assert.deepEqual([r.outcome, r.code, r.cancelInvocations, posts(w).length, r.lockSession, r.lock, w.lockReleased], ["LOCK_LOST", "STOP_LOCK_SESSION_ERROR", 0, 0, "error_observed", "session_error_connection_destroyed", "destroyed"], JSON.stringify(r));
+    assert.deepEqual([r.outcome, r.code, r.cancelInvocations, posts(w).length, r.lockSession, r.lock, w.lockReleased, w.signalAbortedAtEnd], ["LOCK_LOST", "STOP_LOCK_SESSION_ERROR", 0, 0, "error_observed", "session_error_connection_destroyed", "destroyed", true], JSON.stringify(r));
     assert.equal(JSON.stringify(r).includes("CANARY"), false, "no raw error text"); }
+});
+
+test("F1 (ROOT 5881490593) complete state-independent v3 PI proof BEFORE the request: each single contradictory / missing field of the expanded PI + charge refuses with ZERO request / worker / writes (controls pass)", async () => {
+  const mut = (f) => (pi) => { const x = JSON.parse(JSON.stringify(pi)); f(x); return x; };
+  const cases = [
+    ["charge.payment_intent foreign", mut((x) => { x.latest_charge.payment_intent = "pi_OTHER000000"; }), "CHARGE_NOT_BOUND"],
+    ["amount_capturable 1", mut((x) => { x.amount_capturable = 1; }), "AMOUNT_CAPTURABLE_NOT_ZERO"],
+    ["amount_received short", mut((x) => { x.amount_received = AMT - 1; }), "AMOUNT_RECEIVED_NOT_CAPTURED"],
+    ["pi amount", mut((x) => { x.amount = AMT + 1; }), "PAYMENT_INTENT_IDENTITY"],
+    ["pi status", mut((x) => { x.status = "requires_capture"; }), "PI_NOT_SUCCEEDED"],
+    ["pi currency", mut((x) => { x.currency = "mxn"; }), "PAYMENT_INTENT_IDENTITY"],
+    ["capture_method automatic", mut((x) => { x.capture_method = "automatic"; }), "PAYMENT_INTENT_IDENTITY"],
+    ["metadata intent", mut((x) => { x.metadata.mv_intent_id = "other"; }), "PAYMENT_INTENT_IDENTITY"],
+    ["metadata attempt", mut((x) => { x.metadata.mv_payment_attempt_id = "other"; }), "PAYMENT_INTENT_IDENTITY"],
+    ["pi livemode", mut((x) => { x.livemode = true; }), null],                                                         // the isolated transport refuses LIVEMODE_REFUSED before the proof (READ_FAILED)
+    ["charge not expanded", mut((x) => { x.latest_charge = CH; }), "CHARGE_NOT_EXPANDED"],
+    ["charge id foreign", mut((x) => { x.latest_charge.id = "ch_OTHER0000000000"; }), "CHARGE_ID_MISMATCH"],
+    ["charge object", mut((x) => { x.latest_charge.object = "refund"; }), "CHARGE_NOT_EXPANDED"],
+    ["charge livemode", mut((x) => { x.latest_charge.livemode = true; }), "CHARGE_NOT_TEST_MODE"],
+    ["charge status", mut((x) => { x.latest_charge.status = "pending"; }), "CHARGE_STATUS"],
+    ["charge paid false", mut((x) => { x.latest_charge.paid = false; }), "CHARGE_NOT_PAID"],
+    ["charge captured false", mut((x) => { x.latest_charge.captured = false; }), "CHARGE_NOT_CAPTURED"],
+    ["charge amount", mut((x) => { x.latest_charge.amount = AMT - 1; }), "CHARGE_AMOUNT"],
+    ["charge amount_captured", mut((x) => { x.latest_charge.amount_captured = AMT - 1; }), "CHARGE_AMOUNT_CAPTURED"],
+    ["charge currency", mut((x) => { x.latest_charge.currency = "mxn"; }), "CHARGE_CURRENCY"],
+    ["charge amount_refunded", mut((x) => { x.latest_charge.amount_refunded = 1; }), "CHARGE_ALREADY_REFUNDED"],
+    ["charge refunded flag", mut((x) => { x.latest_charge.refunded = true; }), "RAW_CHARGE_REFUNDED"],
+    ["charge disputed", mut((x) => { x.latest_charge.disputed = true; }), "RAW_CHARGE_DISPUTED"],
+    ["charge dispute present", mut((x) => { x.latest_charge.dispute = { id: "dp_x" }; }), "RAW_CHARGE_DISPUTE_PRESENT"],
+    ["charge refunds list non-empty", mut((x) => { x.latest_charge.refunds = { object: "list", data: [{ id: "re_x" }], has_more: false }; }), "RAW_CHARGE_REFUNDS_PRESENT"],
+    ["disputed missing", mut((x) => { delete x.latest_charge.disputed; }), "RAW_CHARGE_DISPUTED"],
+    ["refunded missing", mut((x) => { delete x.latest_charge.refunded; }), "RAW_CHARGE_REFUNDED"]];
+  for (const [label, prePiMutate, code] of cases) {
+    const w = world(); const r = await core(w, { prePiMutate });
+    assert.equal(r.outcome, "PROVIDER_PROOF_FAILED", `${label}: ${JSON.stringify(r)}`);
+    if (code) assert.equal(r.code, code, label); else assert.equal(r.code, "READ_FAILED", label);
+    assert.deepEqual([w.requestCalls, w.workerCalls, posts(w).length, r.requestInvocations, w.status], [0, 0, 0, 0, "payment_captured"], label);
+  }
+  { const w = world(); const r = await core(w, { prePiMutate: (pi) => pi }); assert.equal(r.outcome, "TEST_CLEANUP_COMPLETED", "control"); }
+  // the adapter itself, in isolation: state-independent (payment_captured AND cancelled intents), both phases
+  const okPi = piObj({ piRefunded: 0, disputed: false }); const obs = CP.paymentIntentProofObservationV3(okPi, { accountVerified: true });
+  const ev = { id: "x", kind: "payment_intent", readOpType: "stripe.retrieve_payment_intent", requestRef: PI, externalRef: PI, status: obs.status, observed: obs, observedAt: 1 };
+  for (const status of ["payment_captured", "cancelled", "test_cleanup_pending"]) {
+    const intent = { ...intentOf(world()), status };
+    assert.equal(E.piCapturedV3Refusal(ev, { intent, attemptId: ATTEMPT, chargeId: CH, capturedMinor: AMT, currency: "USD", phase: "unrefunded" }, RP.piIdentityOk), null, status);
+    assert.equal(E.piCapturedV3Refusal(ev, { intent, attemptId: ATTEMPT, chargeId: CH, capturedMinor: AMT, currency: "USD", phase: "fully_refunded" }, RP.piIdentityOk), "CHARGE_NOT_FULLY_REFUNDED", status);
+    assert.equal(E.piCapturedV3Refusal(ev, { intent, attemptId: ATTEMPT, chargeId: CH, capturedMinor: AMT, currency: "USD", phase: "other" }, RP.piIdentityOk), "PHASE_INVALID");
+    assert.equal(E.piCapturedV3Refusal({ ...ev, observed: { ...obs, proofVersion: "pi-proof-v2" } }, { intent, attemptId: ATTEMPT, chargeId: CH, capturedMinor: AMT, currency: "USD", phase: "unrefunded" }, RP.piIdentityOk), "V3_OBSERVATION_REQUIRED");
+  }
+  // parity with the ACCEPTED proof where the accepted one CAN judge (a test_cleanup_pending intent): the same verdict on every v3-visible mutant;
+  // the RAW-only mutants (refunded flag / dispute / refunds list / missing booleans) are invisible to BOTH v3 proofs and are caught by the raw safeguards
+  const pending = { ...intentOf(world()), status: "test_cleanup_pending", settlement: { reservationCancelled: false, authorizationSettled: false } };
+  for (const [label, m] of cases) {
+    const bad = m(okPi); const o2 = CP.paymentIntentProofObservationV3(bad, { accountVerified: true });
+    const e2 = { ...ev, status: o2.status, observed: o2, observedAt: 10 };
+    const mine = E.piCapturedV3Refusal(e2, { intent: pending, attemptId: ATTEMPT, chargeId: CH, capturedMinor: AMT, currency: "USD", phase: "unrefunded" }, RP.piIdentityOk);
+    const theirs = TP.piCapturedUnrefundedProofV3(e2, pending, ATTEMPT, CH, { now: 20, notBefore: 1 });
+    if (mine === null) assert.equal(theirs, null, `${label}: accepted=${theirs}`); else assert.equal(mine, theirs, `${label}: mine=${mine} accepted=${theirs}`);
+    if (mine === null) assert.notEqual(TP.rawPiPreSendRefusal(bad, { paymentIntentId: PI, chargeId: CH, amountMinor: AMT, currency: "USD" }), null, `${label}: raw safeguard`);
+  }
+});
+
+test("F1 (ROOT 5881490593) complete v3 PI proof at the FINAL readback: each single contradictory field (foreign charge PI, paid false, not fully refunded, refunded flag, dispute, amounts, identity) → POSTCHECK_MISMATCH, never TEST_CLEANUP_COMPLETED; persisted facts reported", async () => {
+  const mut = (f) => (pi) => { const x = JSON.parse(JSON.stringify(pi)); f(x); return x; };
+  const cases = [
+    ["charge.payment_intent foreign", mut((x) => { x.latest_charge.payment_intent = "pi_OTHER000000"; }), "PI_READBACK_CHARGE_NOT_BOUND"],
+    ["charge paid false", mut((x) => { x.latest_charge.paid = false; }), "PI_READBACK_CHARGE_NOT_PAID"],
+    ["both (ROOT mutant)", mut((x) => { x.latest_charge.payment_intent = "pi_OTHER000000"; x.latest_charge.paid = false; }), "PI_READBACK_CHARGE_NOT_BOUND"],
+    ["not fully refunded", mut((x) => { x.latest_charge.amount_refunded = AMT - 1; }), "PI_READBACK_CHARGE_NOT_FULLY_REFUNDED"],
+    ["refunded flag false", mut((x) => { x.latest_charge.refunded = false; }), "PI_READBACK_RAW_CHARGE_REFUNDED_FLAG"],
+    ["disputed", mut((x) => { x.latest_charge.disputed = true; }), "PI_READBACK_RAW_CHARGE_DISPUTED"],
+    ["dispute present", mut((x) => { x.latest_charge.dispute = { id: "dp_x" }; }), "PI_READBACK_RAW_CHARGE_DISPUTE_PRESENT"],
+    ["charge id foreign", mut((x) => { x.latest_charge.id = "ch_OTHER0000000000"; }), "PI_READBACK_CHARGE_ID_MISMATCH"],
+    ["amount_received", mut((x) => { x.amount_received = 0; }), "PI_READBACK_AMOUNT_RECEIVED_NOT_CAPTURED"],
+    ["metadata attempt", mut((x) => { x.metadata.mv_payment_attempt_id = "other"; }), "PI_READBACK_PAYMENT_INTENT_IDENTITY"],
+    ["charge captured false", mut((x) => { x.latest_charge.captured = false; }), "PI_READBACK_CHARGE_NOT_CAPTURED"],
+    ["charge amount", mut((x) => { x.latest_charge.amount = AMT + 1; }), "PI_READBACK_CHARGE_AMOUNT"],
+    ["charge not expanded", mut((x) => { x.latest_charge = CH; }), "PI_READBACK_CHARGE_NOT_EXPANDED"]];
+  for (const [label, finalPiMutate, code] of cases) {
+    const w = world(); const r = await core(w, { finalPiMutate });
+    assert.deepEqual([r.outcome, r.code, r.cancelInvocations, r.refundInvocations, r.finalState, r.postcheck], ["POSTCHECK_MISMATCH", code, 1, 1, "cancelled", null], `${label}: ${JSON.stringify(r)}`);
+    assert.equal(r.proofs.includes("READBACK"), false, label);
+  }
+  { const w = world(); const r = await core(w, { finalPiMutate: (pi) => pi }); assert.equal(r.outcome, "TEST_CLEANUP_COMPLETED", "control"); }
+});
+
+test("F2 (ROOT 5881490593) fully bound ACTIVE reservation proof BEFORE the request (accepted activeReservationProof over runner-read observations): total / channel / foreign non-null ref / status not new / listing / stay / currency each refuse with ZERO request; missing ref → ONE bounded lookup proving exactly this reservation (duplicate / none / other id / stay mismatch refuse); echoed + no-echo controls pass", async () => {
+  const mut = (f) => (obj) => { const x = JSON.parse(JSON.stringify(obj)); f(x); return x; };
+  const cases = [
+    ["totalPrice 999", mut((x) => { x.totalPrice = 999; }), "RESERVATION_BY_ID_RESERVATION_IDENTITY"],
+    ["channelId 123", mut((x) => { x.channelId = 123; }), "RESERVATION_CHANNEL_NOT_DIRECT"],
+    ["ref MV-OTHER000", mut((x) => { x.customFieldValues = [{ customFieldId: C.refFieldId, value: "MV-OTHER000" }]; }), "RESERVATION_BOOKING_REF_MISMATCH"],
+    ["status modified", mut((x) => { x.status = "modified"; }), "RESERVATION_BY_ID_RESERVATION_STATUS_NOT_NEW"],
+    ["status inquiry", mut((x) => { x.status = "inquiry"; }), "RESERVATION_BY_ID_RESERVATION_STATUS_NOT_NEW"],
+    ["status cancelled", mut((x) => { x.status = "cancelled"; }), "RESERVATION_BY_ID_RESERVATION_NOT_ACTIVE"],
+    ["status unknown string", mut((x) => { x.status = "mystery"; }), "RESERVATION_MALFORMED"],
+    ["listing other", mut((x) => { x.listingMapId = 603566; }), "RESERVATION_BY_ID_RESERVATION_IDENTITY"],
+    ["arrival other", mut((x) => { x.arrivalDate = "2026-11-24"; }), "RESERVATION_BY_ID_RESERVATION_IDENTITY"],
+    ["departure other", mut((x) => { x.departureDate = "2026-11-27"; }), "RESERVATION_BY_ID_RESERVATION_IDENTITY"],
+    ["currency MXN", mut((x) => { x.currency = "MXN"; }), "RESERVATION_BY_ID_RESERVATION_IDENTITY"],
+    ["id other", mut((x) => { x.id = 71999902; }), "RESERVATION_BY_ID_RESERVATION_ID_MISMATCH"],
+    ["id protected", mut((x) => { x.id = Number(C.protectedReservationIds[0]); }), "RESERVATION_BY_ID_RESERVATION_ID_MISMATCH"]];
+  for (const [label, preResMutate, code] of cases) {
+    const w = world(); const r = await core(w, { preResMutate });
+    assert.equal(r.outcome, "PROVIDER_PROOF_FAILED", `${label}: ${JSON.stringify(r)}`); assert.equal(r.code, code, label);
+    assert.deepEqual([w.requestCalls, w.workerCalls, posts(w).length, r.requestInvocations, w.status, w.lookupPages ?? 0], [0, 0, 0, 0, "payment_captured", 0], label);
+  }
+  // missing ref: the lookup decides — exactly one identical match passes; duplicates / none / another id / stay disagreement refuse with ZERO request
+  const other = (w) => ({ ...resObj({ ...w, echoRef: true }), id: 71999902 });
+  for (const [label, lookupResult, code] of [["duplicate ref", (w) => [resObj({ ...w, echoRef: true }), other(w)], "LOOKUP_DUPLICATE_REF"], ["none", () => [], "LOOKUP_NOT_FOUND"],
+    ["other id only", (w) => [other(w)], "RESERVATION_BY_REF_RESERVATION_ID_MISMATCH"], ["departure disagrees", (w) => [{ ...resObj({ ...w, echoRef: true }), departureDate: "2026-11-27" }], "LOOKUP_MATCH_DISAGREES"]]) {
+    const w = world({ echoRef: false }); const r = await core(w, { lookupResult });
+    assert.equal(r.outcome, "PROVIDER_PROOF_FAILED", `${label}: ${JSON.stringify(r)}`); assert.equal(r.code, code, label);
+    assert.deepEqual([w.requestCalls, w.workerCalls, posts(w).length, r.requestInvocations], [0, 0, 0, 0], label);
+    assert.ok((w.lookupPages ?? 0) >= 1 && r.lookupPages <= 3, `${label}: bounded lookup pages ${w.lookupPages}`);
+  }
+  for (const echoRef of [true, false]) { const w = world({ echoRef }); const r = await core(w); assert.equal(r.outcome, "TEST_CLEANUP_COMPLETED", `control echoRef=${echoRef}`); assert.equal((w.lookupPages ?? 0) > 0, !echoRef); }
+  // a lookup page that is not THIS arrival never leaves the process (fence) — the accepted lookupByRef always asks for the pinned arrival, so this is the fence test
+  { const w = world({ echoRef: false }); const r = await core(w, { toolingOver: { lookupByRef: (spec, cfg, fetchPage) => HR.lookupByRef({ ...spec, arrivalDate: "2026-11-24", departureDate: "2026-11-25" }, cfg, fetchPage) } });
+    assert.equal(r.outcome, "PROVIDER_PROOF_FAILED"); assert.equal(w.lookupPages ?? 0, 0, "no foreign-arrival page reached the exchange"); assert.ok(r.refusedAtTransport >= 1); }
+});
+
+test("F3 (ROOT 5881490593) the lock-session error aborts the worker's OWN signal synchronously: an error observed while the worker is between awaits leaves signal.aborted TRUE before its next admission; transports refuse; latched deadline / outer abort also abort the composed signal", async () => {
+  { const w = world(); let seenAbortedAtEmit = null;   // the fake worker: emit the lock error right after the cancel PUT reply lands (inside the step), then inspect the signal
+    const r = await core(w, { worker: async (pool, { executors, signal }) => {
+      await executors.retrieveAccount({ signal: AbortSignal.timeout(1000) });
+      w.lockClient.errorFn(new Error("SYNTHETIC_PRIVATE_ERROR_CANARY"));
+      seenAbortedAtEmit = signal.aborted;                                                                  // synchronous: no await between the emit and this read
+      let refused = false; try { await executors.retrievePaymentIntent(PI, { expand: ["latest_charge"] }, { signal: AbortSignal.timeout(1000) }); } catch { refused = true; }
+      return { status: "worked", intentId: IID, actions: [refused ? "PI_READ_REFUSED_AFTER_LOCK_ERROR" : "PI_READ_WENT_THROUGH"], delayMs: 0, late: Promise.resolve([]), refused };
+    } });
+    assert.deepEqual([seenAbortedAtEmit, r.outcome, r.code, r.cancelInvocations, r.refundInvocations, r.lock, w.lockReleased], [true, "LOCK_LOST", "STOP_LOCK_SESSION_ERROR", 0, 0, "session_error_connection_destroyed", "destroyed"], JSON.stringify(r));
+    assert.ok(r.actions.includes("PI_READ_REFUSED_AFTER_LOCK_ERROR")); assert.equal(JSON.stringify(r).includes("CANARY"), false); }
+  { const w = world(); const ac = new AbortController(); let seen = null;                                   // outer abort → composed signal aborted (semantics kept)
+    const r = await core(w, { signal: ac.signal, worker: async (pool, { signal }) => { ac.abort(); seen = signal.aborted; return { status: "worked", intentId: IID, actions: [], delayMs: 0, late: Promise.resolve([]) }; } });
+    assert.deepEqual([seen, r.outcome], [true, "ABORTED"]); }
+  { const w = world(); let m = 0; let seen = null;                                                         // deadline latched by a stop check → composed signal aborted
+    const r = await core(w, { monotonic: () => (m > 0 ? 10 ** 9 : 0), worker: async (pool, { signal }) => { m = 1; const before = signal.aborted; await Promise.resolve(); return { status: "worked", intentId: IID, actions: [`BEFORE:${before}`], delayMs: 0, late: Promise.resolve([]), seen: (seen = signal) }; } });
+    assert.equal(r.outcome, "DEADLINE"); assert.equal(seen.aborted, true, "the latched deadline aborted the worker's signal"); }
 });
 
 test("A5 v1 uncertainty: lost cancel reply → WRITE_OUTCOME_UNKNOWN / LOST_CANCEL_REPLY, exactly ONE PUT, ZERO refund, NO further step, facts reported; lost refund reply → LOST_REFUND_REPLY with exactly ONE POST; a SECOND SESSION on the same intent refuses read-only with ZERO sends; a second write in the same step never leaves the process", async () => {
@@ -701,7 +848,7 @@ if (process.env.E7_HTC_DB_TESTS === "1") {
 
   test("I2 PG integration: pre-request proof failure (charge partly refunded at the provider) → PROVIDER_PROOF_FAILED, DB unchanged, ZERO request; lost cancel reply → WRITE_OUTCOME_UNKNOWN with ONE PUT and ZERO refund, the accepted worker settles outcome_unknown, a SECOND SESSION refuses read-only; lost refund reply → WRITE_OUTCOME_UNKNOWN with ONE POST, no resend; 401 → no write", async () => {
     { const a = await capturedIntent(); const clk = newClock(); const before = await snap(a.id); const w = pgWorld(a, clk); w.refunded = 1; const r = await pgRun(a, clk, w);
-      assert.deepEqual([r.outcome, r.code, r.requestInvocations, w.calls.filter((x) => x.startsWith("H")).length, w.cancelRequests], ["PROVIDER_PROOF_FAILED", "RAW_CHARGE_AMOUNT_REFUNDED", 0, 0, 0]); assert.deepEqual(await snap(a.id), before); }
+      assert.deepEqual([r.outcome, r.code, r.requestInvocations, w.calls.filter((x) => x.startsWith("H")).length, w.cancelRequests], ["PROVIDER_PROOF_FAILED", "CHARGE_ALREADY_REFUNDED", 0, 0, 0]); assert.deepEqual(await snap(a.id), before); }
     { const a = await capturedIntent(); const clk = newClock(); const w = pgWorld(a, clk, { cancelLost: true }); const r = await pgRun(a, clk, w);
       assert.deepEqual([r.outcome, r.code, r.cancelInvocations, r.cancelOutcome, r.refundInvocations, w.cancelRequests, w.refundRequests], ["WRITE_OUTCOME_UNKNOWN", "LOST_CANCEL_REPLY", 1, "UNKNOWN", 0, 1, 0], JSON.stringify(r));
       const s = await snap(a.id); assert.equal(s.st.state, "test_cleanup_pending", JSON.stringify(s.st));
@@ -719,6 +866,35 @@ if (process.env.E7_HTC_DB_TESTS === "1") {
       assert.deepEqual([r2.outcome, w2.calls.length, w2.refundRequests], ["START_STATE_NOT_ELIGIBLE", 0, 0]); }
     { const a = await capturedIntent(); const clk = newClock(); const w = pgWorld(a, clk, { hostawayStatus: 401 }); const r = await pgRun(a, clk, w);
       assert.deepEqual([r.outcome, r.code, r.requestInvocations, w.cancelRequests, (await snap(a.id)).locks], ["PROVIDER_PROOF_FAILED", "RESERVATION_READ_401", 0, 0, 0], JSON.stringify(r)); }
+  });
+
+  test("I4 PG integration (ROOT 5881490593 F3): a lock-session error on the REAL dedicated lock client while the REAL worker runs — (a) at afterComplete(refund row): the worker's signal is already aborted, its terminal event is DEFERRED (row succeeded, intent pending, claim HELD), runner LOCK_LOST / STOP_LOCK_SESSION_ERROR, no resend; (b) in-flight after the refund send: the worker settles the row unknown, zero resend; (c) control: an error AFTER the committed terminal step reports the committed effects truthfully (no fake rollback)", async () => {
+    const withLock = () => { const h = { lc: null }; h.factory = async () => { h.lc = await db.app.connect(); return h.lc; }; return h; };
+    { const a = await capturedIntent(); const clk = newClock(); const w = pgWorld(a, clk); const L = withLock(); let signalAborted = null; let emitted = 0;
+      const tooling = { ...realTooling, runTestCleanupStep: (pool, opts) => W.runTestCleanupStep(pool, { ...opts, hooks: { afterComplete: async (op) => { if (op.op_type === RFD) { emitted += 1; L.lc.emit("error", new Error("ROOT_SYNTHETIC_LOCK_ERROR")); signalAborted = opts.signal.aborted; } } } }) };
+      const r = await pgRun(a, clk, w, { lockClientFactory: L.factory, tooling });
+      const s = await snap(a.id);
+      assert.deepEqual([emitted, signalAborted, r.outcome, r.code, r.lockSession, r.lock, r.cancelInvocations, r.refundInvocations, r.refundOutcome, w.refundRequests], [1, true, "LOCK_LOST", "STOP_LOCK_SESSION_ERROR", "error_observed", "session_error_connection_destroyed", 1, 1, "REPLIED", 1], JSON.stringify(r));
+      assert.ok(r.actions.includes("REFUND_ROW_SUCCEEDED_EVENT_DEFERRED"), JSON.stringify(r.actions));
+      assert.deepEqual([s.st.state, s.st.c, s.st.a, s.claim[0].released, s.locks], ["test_cleanup_pending", true, false, false, 0], JSON.stringify(s.st));
+      assert.deepEqual(s.ops.filter((x) => x.op_type === RFD).map((x) => [x.state, x.attempts, x.result_ref]), [["succeeded", 1, w.refundId]], "the durable succeeded refund row is preserved, never rewritten");
+      assert.deepEqual([r.finalState, r.refundOps, r.claimHeld, r.factsObserved], ["test_cleanup_pending", ["succeeded"], true, true]);
+      assert.equal(JSON.stringify(r).includes("ROOT_SYNTHETIC"), false, "no raw error text");
+      const a2 = { ...a, intent: await R.loadIntent(db.app, a.id) }; const w2 = pgWorld(a2, clk); const r2 = await pgRun(a2, clk, w2);   // a later session: read-only refusal, zero sends
+      assert.deepEqual([r2.outcome, w2.calls.length, w2.refundRequests, w2.cancelRequests], ["START_STATE_NOT_ELIGIBLE", 0, 0, 0]); }
+    { const a = await capturedIntent(); const clk = newClock(); const w = pgWorld(a, clk); const L = withLock(); let signalAborted = null;
+      const tooling = { ...realTooling, runTestCleanupStep: (pool, opts) => W.runTestCleanupStep(pool, { ...opts, hooks: { afterSend: async () => { if (w.refundRequests === 1 && signalAborted === null) { L.lc.emit("error", new Error("ROOT_SYNTHETIC_LOCK_ERROR")); signalAborted = opts.signal.aborted; } } } }) };
+      const r = await pgRun(a, clk, w, { lockClientFactory: L.factory, tooling });
+      const s = await snap(a.id);
+      assert.deepEqual([signalAborted, r.outcome, r.refundInvocations, w.refundRequests, s.st.state, s.claim[0].released, s.locks], [true, "LOCK_LOST", 1, 1, "test_cleanup_pending", false, 0], JSON.stringify(r));
+      assert.deepEqual(s.ops.filter((x) => x.op_type === RFD).map((x) => [x.state, x.attempts]), [["outcome_unknown", 1]], "in-flight stop: the accepted worker settles the row unknown; never a second POST");
+      assert.ok(r.actions.some((x) => /^STOP:SIGNAL/.test(x)), JSON.stringify(r.actions)); }
+    { const a = await capturedIntent(); const clk = newClock(); const w = pgWorld(a, clk); const L = withLock(); let steps = 0;
+      const tooling = { ...realTooling, runTestCleanupStep: async (pool, opts) => { const out = await W.runTestCleanupStep(pool, opts); steps += 1; if (steps === 2) L.lc.emit("error", new Error("ROOT_SYNTHETIC_LOCK_ERROR")); return out; } };
+      const r = await pgRun(a, clk, w, { lockClientFactory: L.factory, tooling });
+      const s = await snap(a.id);
+      assert.deepEqual([r.outcome, r.code, r.finalState, r.claimHeld, r.refundOps, s.st.state, s.claim[0].released, s.locks], ["LOCK_LOST", "STOP_LOCK_SESSION_ERROR", "cancelled", false, ["succeeded"], "cancelled", true, 0], JSON.stringify(r));
+      assert.equal(r.postcheck, null, "never success after a latched session error; the committed effects are reported, not rolled back"); }
   });
 
   test("I3 PG integration: real lock conflict (another session holds LOCK_KEY) → LOCK_NOT_ACQUIRED, zero provider calls, zero DB writes; historic / stale version / wrong amount / PI / reservation / charge / session pins refuse read-only; deadline at the final read → never success, facts observed; the schema prerequisite is READ (never applied)", async () => {

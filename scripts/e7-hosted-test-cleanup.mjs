@@ -34,6 +34,11 @@
 //     repeated blindly), a possibly-sent write without an admissible reply (WRITE_OUTCOME_UNKNOWN: the session stops, the persisted facts are
 //     reported; a future resume needs its OWN pinned admission / review — no second mode here), escalation, budget, cancellation.
 //   * Never: capture, void, create, offline-charge recording, notification, queue draining, historical intents, protected reservation ids.
+//   * rev2 (ROOT review 5881490593): F1 complete state-independent v3 PI proofs at BOTH runner boundaries (runner-local LABELLED adapter mirroring the
+//     accepted capturedChargeRefusal + accepted piIdentityOk + raw safeguards, unrefunded before / fully refunded after); F2 the accepted
+//     activeReservationProof over runner-read (non-persisted, labelled) observations incl. total / channel / ref, missing ref → ONE bounded
+//     accepted lookupByRef proving exactly this reservation; F3 a runner-owned AbortController in EVERY composed worker / transport signal,
+//     aborted synchronously by the lock-session error listener and by every latched stop.
 import process from "node:process";
 import { readFile, realpath } from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -329,27 +334,87 @@ export function checkEnd(f, plan, c = CONSTANTS, tooling = null) {
  *  lockClientFactory() → a dedicated checked-out client (query / release / on) for the session lock (pool.connect by default).
  */
 export const TOOLING_KEYS = freeze(["runTestCleanupStep", "requestTestCleanup", "loadIntent", "createTestCleanupExecutors", "createStripeSend", "createHostawaySend", "validateAdapterConfig",
-  "unwrapEnvelope", "normalizeReservation", "paymentIntentProofObservationV3", "piIdentityOk", "rawPiPreSendRefusal", "refundObservation", "arrivalStrictlyFuture", "refundKey", "publicStatus"]);
+  "unwrapEnvelope", "normalizeReservation", "lookupByRef", "activeReservationProof", "paymentIntentProofObservationV3", "piIdentityOk", "rawPiPreSendRefusal", "refundObservation",
+  "arrivalStrictlyFuture", "refundKey", "publicStatus"]);
+const RES_READ_OP = "hostaway.retrieve_reservation"; const LOOKUP_OP = "hostaway.lookup_reservation";   // = the accepted OPS.RES_READ / OPS.LOOKUP read op types (asserted by the tests)
+
+// =================================================================================================================================
+// F1 — runner-local, STATE-INDEPENDENT PaymentIntent proof adapter. LABELLED MIRROR of the accepted test-cleanup-proof.js capturedChargeRefusal
+// (which is module-private and whose callers require the intent to ALREADY be test_cleanup_pending, so they cannot judge the runner's
+// payment_captured / cancelled boundaries). Identity comes from the ACCEPTED piIdentityOk (account verified, PI object / id, request selector,
+// livemode false, metadata intent + attempt, manual capture, authorized amount / currency). Every field below is a copied provider field.
+/** piCapturedV3Refusal(ev, { intent, attemptId, chargeId, capturedMinor, currency, phase: "unrefunded" | "fully_refunded" }, piIdentityOk) → null | code */
+export function piCapturedV3Refusal(ev, { intent, attemptId, chargeId, capturedMinor, currency, phase }, piIdentityOk) {
+  const o = ev && ev.observed;
+  if (!o || typeof o !== "object" || o.proofVersion !== "pi-proof-v3") return "V3_OBSERVATION_REQUIRED";
+  if (piIdentityOk(ev, intent, attemptId) !== true) return "PAYMENT_INTENT_IDENTITY";
+  if (o.status !== "succeeded") return "PI_NOT_SUCCEEDED";
+  if (o.amountMinor !== capturedMinor) return "PI_AMOUNT";
+  if (o.amountReceivedMinor !== capturedMinor) return "AMOUNT_RECEIVED_NOT_CAPTURED";
+  if (o.amountCapturableMinor !== 0) return "AMOUNT_CAPTURABLE_NOT_ZERO";
+  if (o.currency !== currency) return "PI_CURRENCY";
+  const c = o.latestCharge;
+  if (!c || typeof c !== "object" || c.object !== "charge" || typeof c.id !== "string" || !CHARGE_RE.test(c.id)) return "CHARGE_NOT_EXPANDED";
+  if (c.id !== chargeId) return "CHARGE_ID_MISMATCH";
+  if (c.paymentIntent !== intent.payment.paymentIntentId) return "CHARGE_NOT_BOUND";
+  if (c.livemode !== false) return "CHARGE_NOT_TEST_MODE";
+  if (c.status !== "succeeded") return "CHARGE_STATUS";
+  if (c.paid !== true) return "CHARGE_NOT_PAID";
+  if (c.captured !== true) return "CHARGE_NOT_CAPTURED";
+  if (c.amountMinor !== capturedMinor) return "CHARGE_AMOUNT";
+  if (c.amountCapturedMinor !== capturedMinor) return "CHARGE_AMOUNT_CAPTURED";
+  if (c.currency !== currency) return "CHARGE_CURRENCY";
+  if (phase === "unrefunded") { if (c.amountRefundedMinor !== 0) return "CHARGE_ALREADY_REFUNDED"; }
+  else if (phase === "fully_refunded") { if (c.amountRefundedMinor !== capturedMinor) return "CHARGE_NOT_FULLY_REFUNDED"; }
+  else return "PHASE_INVALID";
+  return null;
+}
+/** rawPiFullyRefundedRefusal(pi, bound) → null | code — LABELLED MIRROR of the accepted rawPiPreSendRefusal with the refund expectations inverted (post-refund readback) */
+export function rawPiFullyRefundedRefusal(pi, { paymentIntentId, chargeId, amountMinor, currency } = {}) {
+  const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+  if (!isObj(pi) || pi.object !== "payment_intent" || pi.id !== paymentIntentId) return "RAW_PI_IDENTITY";
+  if (pi.livemode !== false) return "RAW_PI_NOT_TEST_MODE";
+  if (pi.status !== "succeeded" || pi.amount_received !== amountMinor || pi.amount !== amountMinor) return "RAW_PI_NOT_CAPTURED_FULL";
+  if (String(pi.currency || "").toUpperCase() !== currency) return "RAW_PI_CURRENCY";
+  const c = pi.latest_charge;
+  if (!isObj(c) || c.object !== "charge" || c.id !== chargeId) return "RAW_CHARGE_IDENTITY";
+  if (c.livemode !== false) return "RAW_CHARGE_NOT_TEST_MODE";
+  if (c.captured !== true || c.paid !== true || c.status !== "succeeded") return "RAW_CHARGE_NOT_CAPTURED";
+  if (c.amount !== amountMinor || c.amount_captured !== amountMinor) return "RAW_CHARGE_AMOUNT";
+  if (c.amount_refunded !== amountMinor) return "RAW_CHARGE_NOT_FULLY_REFUNDED";
+  if (c.refunded !== true) return "RAW_CHARGE_REFUNDED_FLAG";
+  if (c.disputed !== false) return "RAW_CHARGE_DISPUTED";
+  if (c.dispute !== undefined && c.dispute !== null) return "RAW_CHARGE_DISPUTE_PRESENT";
+  return null;
+}
+// F2 — runner-read reservation observation (LABELLED COPY of the accepted reservation-worker observedReservation, NOT persisted as evidence)
+const observedReservation = (r) => ({ reservationId: String(r.reservationId), listingId: r.listingId, from: r.from, to: r.to, totalMinor: r.totalMinor, currency: r.currency, status: r.status,
+  ...(r.bookingRef ? { bookingRef: r.bookingRef } : {}) });
+const runnerResEvidence = (id, readOpType, requestRef, r, observedAt, extra = {}) => freeze({ id, kind: "hostaway_reservation", readOpType, requestRef, externalRef: String(r.reservationId),
+  status: r.status === "cancelled" ? "cancelled" : "found_active", observed: { ...extra, ...observedReservation(r) }, observedAt });
 export async function runTestCleanupCore(input) {
   const c = CONSTANTS; const B = c.budgets;
   const r = { schema: RESULT_SCHEMA, outcome: null, code: null, startState: null, finalState: null, finalVersion: null, publicStatus: null, reservationId: null, capturedMinor: null, chargeId: null, refundId: null,
     requestInvocations: 0, requestOutcome: "NONE", steps: 0, actions: [], exchanges: 0, hostawayReads: 0, lookupPages: 0, accountReads: 0, piReads: 0, refundReads: 0, refundLists: 0,
     dbQueries: 0, dbBudgetRefused: 0, cancelInvocations: 0, cancelOutcome: "NONE", refundInvocations: 0, refundOutcome: "NONE", refusedAtTransport: 0, refusedByStop: 0,
     lock: "not_acquired", lockSession: null, lockBackendPid: null, proofs: [], postcheck: null, cancelOps: null, refundOps: null, refundRecord: null, recordingRetired: null, claimHeld: null,
-    legs: null, factsObserved: false, stopReason: null, stripeVersion: c.stripeVersion,
+    legs: null, factsObserved: false, stopReason: null, workerSignalAborted: null, stripeVersion: c.stripeVersion,
     writes: { request: 0, cancel: 0, refund: 0, capture: 0, create: 0, record: 0, notify: 0, void: 0 } };
   const DONE = Symbol("done");
   const done = (outcome, code = null) => { r.outcome = outcome; r.code = code; return DONE; };
   const snapshot = () => freeze(JSON.parse(JSON.stringify(r)));
   let stopReason = null; let runSignalRef = null; let monoRef = null; let endsAtRef = Infinity;
   let lockClient = null; let lockAcquired = false; let lockErrored = false; let lockPid = null; let finalFactsRef = null;
+  // F3: the runner-OWNED stop signal — part of EVERY composed worker / transport signal; aborted synchronously by the lock-session error listener
+  // and by every latched stop, so an already-running accepted worker observes it at its own admission / success-event checks
+  const stopAc = new AbortController();
   // LABELLED COPY (Slice 2 / Slice 1) — the GLOBAL stop latch (run abort, fixed wall deadline, observed lock-session error)
   const stopped = () => {
     if (stopReason === null) {
       if (runSignalRef && runSignalRef.aborted) stopReason = "ABORTED";
       else if (lockErrored) stopReason = "LOCK_SESSION_ERROR";
       else if (monoRef && monoRef() >= endsAtRef) stopReason = "DEADLINE";
-      if (stopReason !== null) r.stopReason = stopReason;
+      if (stopReason !== null) { r.stopReason = stopReason; stopAc.abort(); }
     }
     return stopReason;
   };
@@ -418,7 +483,7 @@ export async function runTestCleanupCore(input) {
 
     // ---- (3) LABELLED COPY (Slice 1 §3, F4): the P3 session lock on a DEDICATED client; pid-stable proof --------------------------------------
     try { lockClient = await lockClientFactory(); } catch { return done("DB_ERROR", "LOCK_CONNECT_FAILED"); }
-    const onLockErr = () => { lockErrored = true; r.lockSession = "error_observed"; };
+    const onLockErr = () => { lockErrored = true; r.lockSession = "error_observed"; stopAc.abort(); stopped(); };   // F3: synchronous abort of every composed signal
     if (typeof lockClient.on === "function") lockClient.on("error", onLockErr);
     const OWN_LOCK_SQL = `${tooling.LOCK_PRECHECK_SQL} AND l.pid = pg_catalog.pg_backend_pid()`;
     const lockQuery = async (sql, params) => { guard(); count(); return lockClient.query(sql, params); };
@@ -504,7 +569,7 @@ export async function runTestCleanupCore(input) {
     const th = tooling.createHostawaySend({ exchange: hostawayGate, credential: credentials.hostaway });
     if (!ts || ts.ok !== true || !th || th.ok !== true) return done("CORE_INVALID", "TRANSPORT_INVALID");
     const composed = (sig) => {
-      const parts = [];
+      const parts = [stopAc.signal];                                                                  // F3: the runner-owned stop first
       if (sig instanceof AbortSignal) parts.push(sig);
       if (runSignal instanceof AbortSignal) parts.push(runSignal);
       parts.push(AbortSignal.timeout(Math.max(1, Math.floor(endsAt - mono()))));
@@ -521,19 +586,34 @@ export async function runTestCleanupCore(input) {
       const pi = await ts.transport.send({ op: "paymentIntents.retrieve", id: PI, params: { expand: ["latest_charge"] } }, { signal: composed(null) });
       const observed = tooling.paymentIntentProofObservationV3(pi, { accountVerified: true });
       const ev = { id: "runner-readback", kind: "payment_intent", readOpType: "stripe.retrieve_payment_intent", requestRef: PI, externalRef: PI, status: observed.status, observed, observedAt: clock() };
-      if (tooling.piIdentityOk(ev, intent0, st.attemptId) !== true) return done("PROVIDER_PROOF_FAILED", "PAYMENT_INTENT_IDENTITY");
+      // F1: COMPLETE state-independent v3 proof (accepted identity + mirrored charge checks, UNREFUNDED) + the accepted raw safeguards (refund list / dispute)
+      const bound = { intent: intent0, attemptId: st.attemptId, chargeId: plan.chargeId, capturedMinor: plan.capturedMinor, currency: c.currency };
+      const v3 = piCapturedV3Refusal(ev, { ...bound, phase: "unrefunded" }, tooling.piIdentityOk);
+      if (v3) return done("PROVIDER_PROOF_FAILED", v3);
       const raw = tooling.rawPiPreSendRefusal(pi, { paymentIntentId: PI, chargeId: plan.chargeId, amountMinor: plan.capturedMinor, currency: c.currency });
       if (raw) return done("PROVIDER_PROOF_FAILED", CODE_RE.test(String(raw)) ? String(raw) : "PI_PROOF");
       guard();
+      // F2: the ACCEPTED activeReservationProof over runner-read observations (never persisted): status "new", id / listing / stay / total / currency, the
+      // booking ref echoed equal, or (ref absent) ONE bounded accepted lookupByRef proving exactly this reservation; a contradicting non-null ref refuses.
       const rr = await th.transport.send({ method: "GET", path: `/v1/reservations/${RID}`, query: {} }, { signal: composed(null) });
       if (!rr || rr.httpStatus !== 200) return done("PROVIDER_PROOF_FAILED", `RESERVATION_READ_${Number.isSafeInteger(rr && rr.httpStatus) ? rr.httpStatus : "FAILED"}`);
       const env = tooling.unwrapEnvelope(rr.json);
       if (!env || env.ok !== true) return done("PROVIDER_PROOF_FAILED", "RESERVATION_ENVELOPE");
       const nr = tooling.normalizeReservation(env.result, adapterConfig);
       if (!nr || nr.ok !== true) return done("PROVIDER_PROOF_FAILED", "RESERVATION_MALFORMED");
-      const res = nr.reservation;
-      if (String(res.reservationId) !== RID || res.listingId !== c.listingId || res.from !== plan.from || res.to !== plan.to || String(res.currency || "").toUpperCase() !== c.currency) return done("PROVIDER_PROOF_FAILED", "RESERVATION_IDENTITY");
-      if (typeof res.status !== "string" || /cancel|declin|expire|denied|inquiry/i.test(res.status)) return done("PROVIDER_PROOF_FAILED", "RESERVATION_NOT_ACTIVE");
+      if (nr.reservation.channelId !== 2000) return done("PROVIDER_PROOF_FAILED", "RESERVATION_CHANNEL_NOT_DIRECT");
+      const byId = runnerResEvidence("runner-res-by-id", RES_READ_OP, RID, nr.reservation, clock());
+      let byRef = null;
+      if (byId.observed.bookingRef === undefined) {                                                   // ref not echoed: ONE bounded by-ref lookup for THIS arrival (fenced pages)
+        guard();
+        let lk; try { lk = await tooling.lookupByRef({ ref: intent0.ref, listingId: c.listingId, arrivalDate: plan.from, departureDate: plan.to }, adapterConfig,
+          (req) => th.transport.send({ method: req.method, path: `/v1${req.path}`, query: req.query }, { signal: composed(null) })); } catch { lk = null; }   // = the executor's path mapping; pages fenced to THIS arrival
+        if (!lk || lk.outcome !== "found" || !lk.reservation) return done("PROVIDER_PROOF_FAILED", lk && lk.outcome === "conflict" ? `LOOKUP_${String(lk.code)}` : lk && lk.outcome === "not_found" ? "LOOKUP_NOT_FOUND" : "LOOKUP_FAILED");
+        if (lk.reservation.channelId !== 2000) return done("PROVIDER_PROOF_FAILED", "RESERVATION_CHANNEL_NOT_DIRECT");
+        byRef = runnerResEvidence("runner-res-by-ref", LOOKUP_OP, intent0.ref, lk.reservation, clock(), { bookingRef: intent0.ref, matchCount: 1 });
+      }
+      const ap = tooling.activeReservationProof({ intent: intent0, byId, byRef, now: clock(), notBefore: isoMs(plan.notBefore) });
+      if (!ap || ap.ok !== true) return done("PROVIDER_PROOF_FAILED", ap && CODE_RE.test(String(ap.code)) ? `RESERVATION_${String(ap.code)}` : "RESERVATION_PROOF");
       const arr = tooling.arrivalStrictlyFuture(plan.from, c.listingTimeZone, clock());
       if (!arr || arr.ok !== true) return done("PROVIDER_PROOF_FAILED", "ARRIVAL_NOT_IN_FUTURE");
       r.proofs.push("PROVIDER_BEFORE_REQUEST");
@@ -644,7 +724,7 @@ export async function runTestCleanupCore(input) {
       if (step === B.steps) { finalFacts = f; return done("STEP_BUDGET_EXHAUSTED", "STEPS"); }
       const delay = w.status === "worked" && Number.isSafeInteger(w.delayMs) ? Math.min(Math.max(w.delayMs, 0), B.waitCapMs) : Math.min(5000, B.waitCapMs);
       const left = endsAt - mono();
-      if (left <= delay) { r.stopReason = "DEADLINE"; stopReason = "DEADLINE"; return stopOutcome(); }
+      if (left <= delay) { r.stopReason = "DEADLINE"; stopReason = "DEADLINE"; stopAc.abort(); return stopOutcome(); }
       await sleep(delay);
     }
 
@@ -663,10 +743,13 @@ export async function runTestCleanupCore(input) {
           || ro.metadataRefundOp !== fence.refundOpId || ro.metadataRefundKey !== plan.refundIdempotencyKey) return done("POSTCHECK_MISMATCH", "REFUND_READBACK");
       guard();
       const pi = await ts.transport.send({ op: "paymentIntents.retrieve", id: PI, params: { expand: ["latest_charge"] } }, { signal: composed(null) });
-      const ch = pi && pi.latest_charge;
-      if (!pi || pi.object !== "payment_intent" || pi.id !== PI || pi.livemode !== false || pi.status !== "succeeded" || pi.amount !== plan.capturedMinor || pi.amount_received !== plan.capturedMinor
-          || !ch || typeof ch !== "object" || ch.id !== plan.chargeId || ch.captured !== true || ch.amount_captured !== plan.capturedMinor || ch.amount_refunded !== plan.capturedMinor || ch.refunded !== true
-          || ch.livemode !== false || (ch.disputed !== undefined && ch.disputed !== false)) return done("POSTCHECK_MISMATCH", "PI_NOT_FULLY_REFUNDED");
+      // F1: the SAME complete v3 proof at the final boundary (accepted identity + mirrored charge checks, FULLY REFUNDED) + mirrored raw safeguards
+      const observed = tooling.paymentIntentProofObservationV3(pi, { accountVerified: true });
+      const ev = { id: "runner-final-readback", kind: "payment_intent", readOpType: "stripe.retrieve_payment_intent", requestRef: PI, externalRef: PI, status: observed.status, observed, observedAt: clock() };
+      const v3 = piCapturedV3Refusal(ev, { intent: finalFacts.intent, attemptId: finalFacts.attempts[0].id, chargeId: plan.chargeId, capturedMinor: plan.capturedMinor, currency: c.currency, phase: "fully_refunded" }, tooling.piIdentityOk);
+      if (v3) return done("POSTCHECK_MISMATCH", `PI_READBACK_${v3}`);
+      const raw = rawPiFullyRefundedRefusal(pi, { paymentIntentId: PI, chargeId: plan.chargeId, amountMinor: plan.capturedMinor, currency: c.currency });
+      if (raw) return done("POSTCHECK_MISMATCH", `PI_READBACK_${raw}`);
       guard();
       const rr = await th.transport.send({ method: "GET", path: `/v1/reservations/${RID}`, query: {} }, { signal: composed(null) });
       const env = rr && rr.httpStatus === 200 ? tooling.unwrapEnvelope(rr.json) : null;
@@ -832,8 +915,9 @@ async function defaultImportTooling(dir) {
   return { X, createBookingPool: P.createBookingPool,
     tooling: { runTestCleanupStep: W.runTestCleanupStep, requestTestCleanup: TC.requestTestCleanup, loadIntent: R.loadIntent, createTestCleanupExecutors: EX.createTestCleanupExecutors,
       createStripeSend: TT.createE7StripeTestCleanupSend, createHostawaySend: T.createE7HostawaySend, validateAdapterConfig: HR.validateAdapterConfig, unwrapEnvelope: HR.unwrapEnvelope,
-      normalizeReservation: HR.normalizeReservation, paymentIntentProofObservationV3: CP.paymentIntentProofObservationV3, piIdentityOk: RP.piIdentityOk, rawPiPreSendRefusal: TP.rawPiPreSendRefusal,
-      refundObservation: TP.refundObservation, arrivalStrictlyFuture: CO.arrivalStrictlyFuture, refundKey: IS.refundKey, publicStatus: IS.publicStatus, LOCK_KEY: LK.LOCK_KEY, LOCK_PRECHECK_SQL: LK.LOCK_PRECHECK_SQL } };
+      normalizeReservation: HR.normalizeReservation, lookupByRef: HR.lookupByRef, activeReservationProof: CO.activeReservationProof, paymentIntentProofObservationV3: CP.paymentIntentProofObservationV3,
+      piIdentityOk: RP.piIdentityOk, rawPiPreSendRefusal: TP.rawPiPreSendRefusal, refundObservation: TP.refundObservation, arrivalStrictlyFuture: CO.arrivalStrictlyFuture, refundKey: IS.refundKey,
+      publicStatus: IS.publicStatus, LOCK_KEY: LK.LOCK_KEY, LOCK_PRECHECK_SQL: LK.LOCK_PRECHECK_SQL } };
 }
 export function summaryMarkdown(r) {
   const core = r.core ? ` core=${r.core.outcome}${r.core.code ? `/${r.core.code}` : ""} request=${r.core.requestInvocations}/${r.core.requestOutcome} steps=${r.core.steps} cancel=${r.core.cancelInvocations}/${r.core.cancelOutcome} refund=${r.core.refundInvocations}/${r.core.refundOutcome} lock=${r.core.lock} publicStatus=${r.core.publicStatus}` : "";
