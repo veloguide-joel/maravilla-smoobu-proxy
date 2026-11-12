@@ -1,0 +1,204 @@
+{
+  "schema": "e7-0019-0020-pins-v1",
+  "inventorySql": "2554b4d4488a4c38ad849d49415817b57439a642123206a90c17aa7320f0fed0",
+  "files": {
+    "up19": "734bbb221a2f6700a14b38d49960e62ecc16fe231d3a2712df41a520a13e886a",
+    "down19": "af9dc54e6463233cd85fe78bb7457492dec7cb8d82500a9853f042517c4320e0",
+    "up20": "23af20d7103d9019deefe5ac5c0d9947c6faa818309d7635256ffd3d26a9d004",
+    "down20": "3122a797ae12d5b45122a073e67512140af4d364205b37a14a708e2ae3ef561e",
+    "name19": "test_cleanup_refund_settlement",
+    "name20": "test_refund_evidence_settlement"
+  },
+  "pre": {
+    "acls": {
+      "booking.intents_safety_guard()": [
+        "mv_booking_admin=X/postgres",
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.is_intent_state(s text)": [
+        "mv_booking_admin=X/postgres",
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.void_cancel_claim_fence()": [
+        "postgres=X/postgres"
+      ],
+      "booking.authorization_blockers(p_intent uuid)": [
+        "mv_booking_admin=X/postgres",
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.claim_release_blockers(p_intent uuid)": [
+        "mv_booking_admin=X/postgres",
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.settle_operation_from_evidence(p_op uuid, p_evidence uuid)": [
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.validate_evidence(p_kind text, p_status text, p_observed jsonb)": [
+        "mv_booking_admin=X/postgres",
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.record_provider_evidence(p_read_op uuid, p_kind text, p_external_ref text, p_status text, p_observed jsonb, p_provider_request_id text)": [
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ]
+    },
+    "columns": "f36d30b457d8e669f8d9059425ec83cb73fa0a954dd968a28fa5835a2258c386",
+    "indexes": "ab6e586bbd80d8d193bd6dbe8fd9925ce053b8f22ddff82f9695535d0aa61dc9",
+    "objects": {
+      "refund_claim_fence": false,
+      "idx_one_refund_ever": false,
+      "test_refund_ledgered": false,
+      "trg_refund_claim_fence": false,
+      "test_refund_settled_for": false,
+      "test_cleanup_cancel_bound": false,
+      "recording_retirement_fence": false,
+      "test_refund_pi_observation_ok": false,
+      "trg_test_cleanup_cancel_bound": false,
+      "trg_recording_retirement_fence": false,
+      "settle_test_refund_from_evidence": false
+    },
+    "triggers": "6a4c0ef578357fae3ab945e0f18339eb8924369418b4556948777198b828e526",
+    "functions": "47e3409b3ca867cd8e36728b2e3d293ad0d963bf6c600b7e56345d4c3fe19b5e",
+    "migrations": {
+      "max": 18,
+      "min": 1,
+      "v19": null,
+      "v20": null,
+      "count": 18,
+      "aggregate": "a46acad20b6f259b07ee7749e5f2954ee4e7f9aa13caf8fc866a281d79ab351e",
+      "all_env_test": true,
+      "aggregate_1_18": "a46acad20b6f259b07ee7749e5f2954ee4e7f9aa13caf8fc866a281d79ab351e"
+    },
+    "table_acls": "ac592f6a13039a3a3aec6495664c4819b51054c3dc139b7378276dfa58b30609",
+    "constraints": "fe6d751a95e084050b90ba66e3be09d524098083f3de157bb65973d825ed5b06",
+    "schema_owner": "postgres",
+    "trigger_count": 70,
+    "function_count": 123,
+    "is_privileged_src": "a14a1dc5befcd96d03ca1c7e28020c5b07b6d1b212510cc1ad715368bc43fb9d",
+    "is_privileged_config": [
+      "search_path=pg_catalog, pg_temp"
+    ],
+    "test_cleanup_pending_state": false
+  },
+  "post": {
+    "acls": {
+      "booking.refund_claim_fence()": [
+        "postgres=X/postgres"
+      ],
+      "booking.intents_safety_guard()": [
+        "mv_booking_admin=X/postgres",
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.is_intent_state(s text)": [
+        "mv_booking_admin=X/postgres",
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.void_cancel_claim_fence()": [
+        "postgres=X/postgres"
+      ],
+      "booking.test_cleanup_cancel_bound()": [
+        "postgres=X/postgres"
+      ],
+      "booking.recording_retirement_fence()": [
+        "postgres=X/postgres"
+      ],
+      "booking.authorization_blockers(p_intent uuid)": [
+        "mv_booking_admin=X/postgres",
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.claim_release_blockers(p_intent uuid)": [
+        "mv_booking_admin=X/postgres",
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.test_refund_ledgered(p_intent uuid, p_pi text)": [
+        "mv_booking_admin=X/postgres",
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.test_refund_settled_for(p_intent uuid, p_pi text)": [
+        "mv_booking_admin=X/postgres",
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.settle_operation_from_evidence(p_op uuid, p_evidence uuid)": [
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.settle_test_refund_from_evidence(p_op uuid, p_evidence uuid)": [
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.validate_evidence(p_kind text, p_status text, p_observed jsonb)": [
+        "mv_booking_admin=X/postgres",
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.test_refund_pi_observation_ok(o jsonb, p_intent uuid, p_pi text, p_charge text, p_amount bigint, p_currency text)": [
+        "postgres=X/postgres"
+      ],
+      "booking.record_provider_evidence(p_read_op uuid, p_kind text, p_external_ref text, p_status text, p_observed jsonb, p_provider_request_id text)": [
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ]
+    },
+    "columns": "f36d30b457d8e669f8d9059425ec83cb73fa0a954dd968a28fa5835a2258c386",
+    "indexes": "7cd619d3d5cafe45b94e3db5e7a6fce8df99061b606c4023fb2e108437137fee",
+    "objects": {
+      "refund_claim_fence": true,
+      "idx_one_refund_ever": true,
+      "test_refund_ledgered": true,
+      "trg_refund_claim_fence": true,
+      "test_refund_settled_for": true,
+      "test_cleanup_cancel_bound": true,
+      "recording_retirement_fence": true,
+      "test_refund_pi_observation_ok": true,
+      "trg_test_cleanup_cancel_bound": true,
+      "trg_recording_retirement_fence": true,
+      "settle_test_refund_from_evidence": true
+    },
+    "triggers": "eeb4095b2ebc40d7235f8ea5e968b689b77ddb8fb81d513fa3a8cd7666def3f8",
+    "functions": "5ad41abbb9cac6245b25b0f0f979171cbc44c4824866cba398c23d1b0a96a086",
+    "migrations": {
+      "max": 20,
+      "min": 1,
+      "v19": {
+        "name": "test_cleanup_refund_settlement",
+        "version": 19,
+        "environment": "test",
+        "up_checksum": "734bbb221a2f6700a14b38d49960e62ecc16fe231d3a2712df41a520a13e886a",
+        "down_checksum": "af9dc54e6463233cd85fe78bb7457492dec7cb8d82500a9853f042517c4320e0"
+      },
+      "v20": {
+        "name": "test_refund_evidence_settlement",
+        "version": 20,
+        "environment": "test",
+        "up_checksum": "23af20d7103d9019deefe5ac5c0d9947c6faa818309d7635256ffd3d26a9d004",
+        "down_checksum": "3122a797ae12d5b45122a073e67512140af4d364205b37a14a708e2ae3ef561e"
+      },
+      "count": 20,
+      "aggregate": "a1c2821dea03ff5d00777359c35dbc1cc9d420fe29b62220b368d4f47ec0f183",
+      "all_env_test": true,
+      "aggregate_1_18": "a46acad20b6f259b07ee7749e5f2954ee4e7f9aa13caf8fc866a281d79ab351e"
+    },
+    "table_acls": "ac592f6a13039a3a3aec6495664c4819b51054c3dc139b7378276dfa58b30609",
+    "constraints": "9499e2f98ea64180b7d93fc821234dc1e03fe7e2faea606971a3acbc770aaed2",
+    "schema_owner": "postgres",
+    "trigger_count": 73,
+    "function_count": 130,
+    "is_privileged_src": "a14a1dc5befcd96d03ca1c7e28020c5b07b6d1b212510cc1ad715368bc43fb9d",
+    "is_privileged_config": [
+      "search_path=pg_catalog, pg_temp"
+    ],
+    "test_cleanup_pending_state": true
+  }
+}
