@@ -14,6 +14,7 @@ import assert from "node:assert/strict";
 import { startMigratedDatabase } from "./harness.mjs";
 import * as F from "./fixtures.mjs";
 import { runRecordingStep } from "../../lib/booking-db/recording-worker.js";
+import { isActionToken } from "../../scripts/e7-connected/run-journal-memory.mjs";   // frozen journal grammar (read-only parity check)
 
 let db;
 before(async () => { db = await startMigratedDatabase(); });
@@ -188,7 +189,8 @@ test("S-6 a stop AFTER the durable completion → the succeeded row is RETAINED,
   const b = await booking(); const w = world(b);
   const ac = new AbortController();
   const r = await step(b, w, { signal: ac.signal, hooks: { afterComplete: async () => ac.abort() } });
-  assert.ok(r.actions.includes("COMPLETED") && r.actions.includes("RECORDING_ROW_SUCCEEDED_EVENT_DEFERRED"), JSON.stringify(r.actions));
+  assert.ok(r.actions.includes("COMPLETED") && r.actions.includes("COMPLETED:EVENT_DEFERRED") && !r.actions.includes("RECORDING_ROW_SUCCEEDED_EVENT_DEFERRED"), JSON.stringify(r.actions));
+  assert.ok(r.actions.every(isActionToken), `every stop-path action is a frozen-grammar token: ${JSON.stringify(r.actions)}`);   // ROOT 5883244600 option (a)
   assert.ok(!r.actions.some((a) => a.startsWith("RECORDED")));
   const op = await recording(b.id);
   assert.deepEqual([op.state, op.settled_evidence_id !== null, op.result_ref !== null, (await intentRow(b.id)).state, await notifies(b.id)], ["succeeded", true, true, "payment_captured", 0]);
