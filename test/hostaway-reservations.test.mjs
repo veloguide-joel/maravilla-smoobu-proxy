@@ -565,8 +565,18 @@ test("containment: the adapter is pure and unreachable — no imports, network, 
   // E7.4b-0 (root-authorized): the PURE offline-charge proof imports only its pure parsers / amount helpers (no route reaches it; packaging-closure)
   assert.deepEqual(importers.sort(), ["lib/booking-db/capture-worker.js", "lib/booking-db/compensation-worker.js", "lib/booking-db/reservation-worker.js", "lib/checkout/offline-charge-proof.js", "scripts/e4-connected/connected-execute.mjs", "scripts/e4-connected/connected-path.mjs", "scripts/e4-connected/connected-precheck.mjs",
     "scripts/e4-connected/connected-recover.mjs", "scripts/e4-write-runner/happy-path.mjs", "scripts/e4-write-runner/happy-preflight.mjs",
-    "scripts/e4-write-runner/runner.mjs"], "nothing deployable references the adapter");
-  assert.doesNotMatch(readFileSync(join(ROOT, "scripts/e4-write-runner/happy-preflight.mjs"), "utf8"), /^import[^\n]*hostaway-reservations/m);
+    "scripts/e4-write-runner/runner.mjs",
+    // E7 R1 (reviewed, PR #41 / #53): the three R1 closure files name the adapter's PATH only, in their source-closure lists, to hash it
+    // into the reviewed foundation / executor digests. They do not import it (asserted below); all three are offline scripts/ (not deployable).
+    "scripts/e7-connected/run-binding-r1.mjs", "scripts/e7-connected/run-plan-cli-main.mjs", "scripts/e7-connected/run-plan-v1.mjs"].sort(),
+    "nothing deployable references the adapter");
+  for (const pathOnly of ["scripts/e4-write-runner/happy-preflight.mjs", "scripts/e7-connected/run-binding-r1.mjs", "scripts/e7-connected/run-plan-cli-main.mjs",
+    "scripts/e7-connected/run-plan-v1.mjs"]) {
+    const s = readFileSync(join(ROOT, pathOnly), "utf8");
+    assert.doesNotMatch(s, /^\s*import\b[^;]*hostaway-reservations/m, `${pathOnly}: no static import of the adapter`);
+    assert.doesNotMatch(s, /\bimport\s*\([^)]*hostaway-reservations|\brequire\s*\([^)]*hostaway-reservations/, `${pathOnly}: no dynamic import / require of the adapter`);
+    assert.match(s, /"lib\/hostaway-reservations\.js"/, `${pathOnly}: names the adapter path as a closure string`);
+  }
   // nothing under api/ references the worker or the adapter
   const apiRefs = [];
   const walkApi = (dir) => { for (const e of readdirSync(join(ROOT, dir), { withFileTypes: true })) { const p = `${dir}/${e.name}`;

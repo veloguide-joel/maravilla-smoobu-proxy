@@ -18,6 +18,10 @@ import * as NEWB from "../scripts/e7-connected/run-test-abort.mjs";
 
 const ROOT = normalize(join(dirname(fileURLToPath(import.meta.url)), ".."));
 const BASE = "913f96258eb9ea6797ee0a60e5f2474408b2be6f";
+// The REVIEWED M2-G2b state (PR #40 merge). The "only these runtime files changed vs BASE" assertions below are a point-in-time review of
+// G2b; later reviewed work (0018, credential files, launcher, PR #53 / #56 ...) legitimately changes other files, so those git-diff
+// assertions compare BASE..G2B (immutable), while every current-source check in the test still runs against the working tree.
+const G2B = "ab9d463a771044fa6c257f931ee8978cd3e28113";
 let netAttempts = 0;
 const realFetch = globalThis.fetch;
 globalThis.fetch = async () => { netAttempts += 1; throw new Error("network refused (offline G2a parity suite)"); };
@@ -266,16 +270,16 @@ test("G2a-S2 extraction boundary: the core flow is NOT exported, takes no hooks;
   const v2src = readFileSync(join(ROOT, "scripts/e7-connected/run-manifest-v2.mjs"), "utf8");
   assert.equal(v2src, execFileSync("git", ["-C", ROOT, "show", `${BASE}:scripts/e7-connected/run-manifest-v2.mjs`], { encoding: "utf8" }), "v2 validator byte-exact");
   // the four changed modules are the ONLY changed runtime files vs the base (plus the G1 preflight's two mechanical origin pins)
-  const changed = execFileSync("git", ["-C", ROOT, "diff", "--name-only", BASE, "--", "scripts", "lib", "db", ".github"], { encoding: "utf8" }).trim().split("\n").filter(Boolean).sort();
+  const changed = execFileSync("git", ["-C", ROOT, "diff", "--name-only", BASE, G2B, "--", "scripts", "lib", "db", ".github"], { encoding: "utf8" }).trim().split("\n").filter(Boolean).sort();
   // M2-G2b (contract §9): + run-plan-v1.mjs, whose ONLY change is the two foundation-closure paths the R1 consumer now imports
   assert.deepEqual(changed, ["scripts/e7-connected/run-core-abort-v2.mjs", "scripts/e7-connected/run-journal-file-v2.mjs", "scripts/e7-connected/run-journal-memory-v2.mjs",
     "scripts/e7-connected/run-plan-v1.mjs", "scripts/e7-connected/run-preflight-r1.mjs", "scripts/e7-connected/run-test-abort.mjs"]);
-  const planDiff = execFileSync("git", ["-C", ROOT, "diff", "-U0", BASE, "--", "scripts/e7-connected/run-plan-v1.mjs"], { encoding: "utf8" }).split("\n").filter((l) => /^[+-][^+-]/.test(l));
+  const planDiff = execFileSync("git", ["-C", ROOT, "diff", "-U0", BASE, G2B, "--", "scripts/e7-connected/run-plan-v1.mjs"], { encoding: "utf8" }).split("\n").filter((l) => /^[+-][^+-]/.test(l));
   const added = (sign) => planDiff.filter((l) => l[0] === sign).join("\n").match(/"[^"]+"/g);
   assert.deepEqual([...new Set(added("+"))].filter((x) => !(added("-") || []).includes(x)).sort(), ['"scripts/e7-connected/run-binding-r1.mjs"', '"scripts/e7-connected/run-preflight-r1.mjs"'],
     "run-plan-v1: only the two closure paths added");
   assert.deepEqual((added("-") || []).filter((x) => !added("+").includes(x)), [], "run-plan-v1: nothing removed");
-  const pf = execFileSync("git", ["-C", ROOT, "diff", "-U0", BASE, "--", "scripts/e7-connected/run-preflight-r1.mjs"], { encoding: "utf8" });
+  const pf = execFileSync("git", ["-C", ROOT, "diff", "-U0", BASE, G2B, "--", "scripts/e7-connected/run-preflight-r1.mjs"], { encoding: "utf8" });
   const changedLines = pf.split("\n").filter((l) => /^[+-][^+-]/.test(l));
   assert.equal(changedLines.length, 4, "exactly the two origin-pin lines changed in the G1 preflight");
   assert.ok(changedLines.every((l) => /"scripts\/e7-connected\/run-(core-abort-v2|test-abort)\.mjs": "[0-9a-f]{64}"/.test(l)));
