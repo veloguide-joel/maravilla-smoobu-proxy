@@ -157,6 +157,53 @@ END $$;
 
 -- ---------------------------------------------------------------------------------------------
 -- 3. the TEST-scoped full-refund settlement predicates (read-only)
+-- F2 helper: strict typed check of ONE v3 PaymentIntent observation for "captured and fully refunded" (reads payment_attempts for the bound attempt)
+CREATE FUNCTION booking.test_refund_pi_observation_ok(o jsonb, p_intent uuid, p_pi text, p_charge text, p_amount bigint, p_currency text) RETURNS boolean
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE c jsonb; att text;
+BEGIN
+  IF o IS NULL OR jsonb_typeof(o) <> 'object' THEN RETURN false; END IF;
+  c := o -> 'latestCharge';
+  IF c IS NULL OR jsonb_typeof(c) <> 'object' THEN RETURN false; END IF;
+  -- PaymentIntent: proof version, object, id, status, TEST, verified account, bound metadata, manual capture, money, currency
+  IF jsonb_typeof(o -> 'proofVersion') IS DISTINCT FROM 'string' OR o ->> 'proofVersion' <> 'pi-proof-v3'
+     OR jsonb_typeof(o -> 'object') IS DISTINCT FROM 'string' OR o ->> 'object' <> 'payment_intent'
+     OR jsonb_typeof(o -> 'paymentIntentId') IS DISTINCT FROM 'string' OR o ->> 'paymentIntentId' <> p_pi
+     OR jsonb_typeof(o -> 'status') IS DISTINCT FROM 'string' OR o ->> 'status' <> 'succeeded'
+     OR jsonb_typeof(o -> 'livemode') IS DISTINCT FROM 'boolean' OR (o -> 'livemode') <> 'false'::jsonb
+     OR jsonb_typeof(o -> 'accountVerified') IS DISTINCT FROM 'boolean' OR (o -> 'accountVerified') <> 'true'::jsonb
+     OR jsonb_typeof(o -> 'metadataIntentId') IS DISTINCT FROM 'string' OR o ->> 'metadataIntentId' <> p_intent::text
+     OR jsonb_typeof(o -> 'metadataAttemptId') IS DISTINCT FROM 'string'
+     OR jsonb_typeof(o -> 'captureMethod') IS DISTINCT FROM 'string' OR o ->> 'captureMethod' <> 'manual'
+     OR jsonb_typeof(o -> 'amountMinor') IS DISTINCT FROM 'number' OR (o ->> 'amountMinor')::numeric <> p_amount
+     OR jsonb_typeof(o -> 'amountReceivedMinor') IS DISTINCT FROM 'number' OR (o ->> 'amountReceivedMinor')::numeric <> p_amount
+     OR jsonb_typeof(o -> 'amountCapturableMinor') IS DISTINCT FROM 'number' OR (o ->> 'amountCapturableMinor')::numeric <> 0
+     OR jsonb_typeof(o -> 'currency') IS DISTINCT FROM 'string' OR upper(o ->> 'currency') <> upper(p_currency) THEN
+    RETURN false;
+  END IF;
+  -- the bound metadata attempt id must be THE completed TEST payment attempt of this intent for this PI
+  att := o ->> 'metadataAttemptId';
+  IF NOT EXISTS (SELECT 1 FROM booking.payment_attempts WHERE intent_id = p_intent AND id::text = att AND payment_intent_id = p_pi AND status = 'completed' AND livemode = false) THEN
+    RETURN false;
+  END IF;
+  -- expanded Charge: object, id, paymentIntent, status, paid, captured, TEST, money (captured in full, refunded in full), currency
+  IF jsonb_typeof(c -> 'object') IS DISTINCT FROM 'string' OR c ->> 'object' <> 'charge'
+     OR jsonb_typeof(c -> 'id') IS DISTINCT FROM 'string' OR c ->> 'id' <> p_charge
+     OR jsonb_typeof(c -> 'paymentIntent') IS DISTINCT FROM 'string' OR c ->> 'paymentIntent' <> p_pi
+     OR jsonb_typeof(c -> 'status') IS DISTINCT FROM 'string' OR c ->> 'status' <> 'succeeded'
+     OR jsonb_typeof(c -> 'paid') IS DISTINCT FROM 'boolean' OR (c -> 'paid') <> 'true'::jsonb
+     OR jsonb_typeof(c -> 'captured') IS DISTINCT FROM 'boolean' OR (c -> 'captured') <> 'true'::jsonb
+     OR jsonb_typeof(c -> 'livemode') IS DISTINCT FROM 'boolean' OR (c -> 'livemode') <> 'false'::jsonb
+     OR jsonb_typeof(c -> 'amountMinor') IS DISTINCT FROM 'number' OR (c ->> 'amountMinor')::numeric <> p_amount
+     OR jsonb_typeof(c -> 'amountCapturedMinor') IS DISTINCT FROM 'number' OR (c ->> 'amountCapturedMinor')::numeric <> p_amount
+     OR jsonb_typeof(c -> 'amountRefundedMinor') IS DISTINCT FROM 'number' OR (c ->> 'amountRefundedMinor')::numeric <> p_amount
+     OR jsonb_typeof(c -> 'currency') IS DISTINCT FROM 'string' OR upper(c ->> 'currency') <> upper(p_currency)
+     OR (c ? 'refunded' AND (jsonb_typeof(c -> 'refunded') IS DISTINCT FROM 'boolean' OR (c -> 'refunded') <> 'true'::jsonb)) THEN
+    RETURN false;
+  END IF;
+  RETURN true;
+END $$;
+
 CREATE FUNCTION booking.test_refund_settled_for(p_intent uuid, p_pi text) RETURNS boolean
 LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
 DECLARE i record; cap record; rf record; ev record; pe record;
@@ -184,33 +231,34 @@ BEGIN
     AND (payload ->> 'amountMinor')::bigint = i.captured_minor AND upper(payload ->> 'currency') = upper(i.currency) AND (payload ->> 'attempt') = '1'
     AND payload ->> 'providerIdempotencyKey' = 'ref:' || p_intent::text || ':1' AND result_ref ~ '^re_[A-Za-z0-9_]{1,200}$';
   IF NOT FOUND THEN RETURN false; END IF;
-  -- bound Refund READ (API, after the dispatch): exactly this refund id, status succeeded, same PI / charge / exact amount / currency
-  SELECT 1 INTO ev FROM booking.provider_evidence e
-   WHERE e.intent_id = p_intent AND e.kind = 'stripe_refund' AND e.source = 'stripe_api' AND e.external_ref = rf.result_ref AND e.status = 'succeeded'
-     AND e.observed_at >= rf.dispatched_at AND e.observed ->> 'refundId' = rf.result_ref AND e.observed ->> 'paymentIntentId' = p_pi
-     AND e.observed ->> 'chargeId' = cap.result_ref AND (e.observed ->> 'amountMinor')::bigint = i.captured_minor AND upper(e.observed ->> 'currency') = upper(i.currency)
-   ORDER BY e.observed_at DESC, e.created_at DESC LIMIT 1;
-  IF NOT FOUND THEN RETURN false; END IF;
-  -- any later Refund read of that id that is NOT succeeded contradicts (a refund can fail after pending)
-  IF EXISTS (SELECT 1 FROM booking.provider_evidence e WHERE e.intent_id = p_intent AND e.kind = 'stripe_refund' AND e.external_ref = rf.result_ref AND e.status <> 'succeeded'
-             AND e.observed_at >= (SELECT max(observed_at) FROM booking.provider_evidence WHERE intent_id = p_intent AND kind = 'stripe_refund' AND external_ref = rf.result_ref AND status = 'succeeded')) THEN
+  -- F1 (ROOT 5879309344): the LATEST bound-refund observation of THIS refund id decides — selected FIRST, then validated in full.
+  -- Ties on observed_at are refused (two observations at the same instant can never pick a convenient row).
+  IF (SELECT count(*) FROM booking.provider_evidence e WHERE e.intent_id = p_intent AND e.kind = 'stripe_refund' AND e.external_ref = rf.result_ref
+        AND e.observed_at = (SELECT max(observed_at) FROM booking.provider_evidence WHERE intent_id = p_intent AND kind = 'stripe_refund' AND external_ref = rf.result_ref)) <> 1 THEN
     RETURN false;
   END IF;
-  -- the LATEST PaymentIntent read (API, after the dispatch): succeeded, livemode false, that charge, amount_received = captured, fully refunded
-  SELECT status, observed, observed_at INTO pe FROM booking.provider_evidence
-   WHERE intent_id = p_intent AND kind = 'payment_intent' AND source = 'stripe_api' AND external_ref = p_pi ORDER BY observed_at DESC, created_at DESC LIMIT 1;
-  IF NOT FOUND OR pe.status <> 'succeeded' OR pe.observed_at < rf.dispatched_at THEN RETURN false; END IF;
-  -- the accepted v3 observation shape (lib/checkout/recovery-plan.js paymentIntentProofObservation + capture-proof v3): the charge's
-  -- amountRefundedMinor (Charge.amount_refunded) must equal the captured amount; a `refunded` flag, when present, must be true
-  IF (pe.observed ->> 'livemode') IS DISTINCT FROM 'false' OR pe.observed -> 'latestCharge' ->> 'id' IS DISTINCT FROM cap.result_ref
-     OR (pe.observed ->> 'amountReceivedMinor')::bigint IS DISTINCT FROM i.captured_minor
-     OR (pe.observed -> 'latestCharge' ->> 'captured') IS DISTINCT FROM 'true'
-     OR (pe.observed -> 'latestCharge' ->> 'amountCapturedMinor')::bigint IS DISTINCT FROM i.captured_minor
-     OR (pe.observed -> 'latestCharge' ->> 'amountRefundedMinor')::bigint IS DISTINCT FROM i.captured_minor
-     OR ((pe.observed -> 'latestCharge') ? 'refunded' AND (pe.observed -> 'latestCharge' ->> 'refunded') IS DISTINCT FROM 'true')
-     OR (pe.observed -> 'latestCharge' ->> 'livemode') IS DISTINCT FROM 'false' THEN
+  SELECT e.source, e.status, e.observed, e.observed_at INTO ev FROM booking.provider_evidence e
+   WHERE e.intent_id = p_intent AND e.kind = 'stripe_refund' AND e.external_ref = rf.result_ref ORDER BY e.observed_at DESC, e.created_at DESC LIMIT 1;
+  IF NOT FOUND OR ev.source <> 'stripe_api' OR ev.status <> 'succeeded' OR ev.observed_at < rf.dispatched_at THEN RETURN false; END IF;
+  -- complete identity / money shape, strictly typed (JSON string / number), exact values
+  IF jsonb_typeof(ev.observed -> 'refundId') IS DISTINCT FROM 'string' OR ev.observed ->> 'refundId' <> rf.result_ref
+     OR jsonb_typeof(ev.observed -> 'paymentIntentId') IS DISTINCT FROM 'string' OR ev.observed ->> 'paymentIntentId' <> p_pi
+     OR jsonb_typeof(ev.observed -> 'chargeId') IS DISTINCT FROM 'string' OR ev.observed ->> 'chargeId' <> cap.result_ref
+     OR jsonb_typeof(ev.observed -> 'amountMinor') IS DISTINCT FROM 'number' OR (ev.observed ->> 'amountMinor')::numeric <> i.captured_minor
+     OR jsonb_typeof(ev.observed -> 'currency') IS DISTINCT FROM 'string' OR upper(ev.observed ->> 'currency') <> upper(i.currency)
+     OR jsonb_typeof(ev.observed -> 'status') IS DISTINCT FROM 'string' OR ev.observed ->> 'status' <> 'succeeded' THEN
     RETURN false;
   END IF;
+  -- F2 (ROOT 5879309344): the LATEST PaymentIntent read (API, after the dispatch) must be a COHERENT, fully typed v3 captured-and-fully-refunded
+  -- observation (lib/checkout/recovery-plan.js paymentIntentProofObservation + capture-proof v3): a subset or any contradictory field refuses.
+  IF (SELECT count(*) FROM booking.provider_evidence e WHERE e.intent_id = p_intent AND e.kind = 'payment_intent' AND e.external_ref = p_pi
+        AND e.observed_at = (SELECT max(observed_at) FROM booking.provider_evidence WHERE intent_id = p_intent AND kind = 'payment_intent' AND external_ref = p_pi)) <> 1 THEN
+    RETURN false;
+  END IF;
+  SELECT source, status, observed, observed_at INTO pe FROM booking.provider_evidence
+   WHERE intent_id = p_intent AND kind = 'payment_intent' AND external_ref = p_pi ORDER BY observed_at DESC, created_at DESC LIMIT 1;
+  IF NOT FOUND OR pe.source <> 'stripe_api' OR pe.status <> 'succeeded' OR pe.observed_at < rf.dispatched_at THEN RETURN false; END IF;
+  IF NOT booking.test_refund_pi_observation_ok(pe.observed, p_intent, p_pi, cap.result_ref, i.captured_minor, i.currency) THEN RETURN false; END IF;
   RETURN true;
 END $$;
 
@@ -233,7 +281,7 @@ BEGIN
   END IF;
   RETURN true;
 END $$;
-REVOKE ALL ON FUNCTION booking.test_refund_settled_for(uuid, text), booking.test_refund_ledgered(uuid, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION booking.test_refund_settled_for(uuid, text), booking.test_refund_ledgered(uuid, text), booking.test_refund_pi_observation_ok(jsonb, uuid, text, text, bigint, text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION booking.test_refund_settled_for(uuid, text), booking.test_refund_ledgered(uuid, text) TO mv_booking_app, mv_booking_admin;
 
 -- ---------------------------------------------------------------------------------------------
@@ -398,6 +446,7 @@ BEGIN
   ELSE
     -- 0019: the reservation leg of a TEST cleanup is open exactly like capture_failed's
     IF s NOT IN ('capture_failed', 'test_cleanup_pending') OR res_cancelled IS NOT FALSE
+       OR (s = 'test_cleanup_pending' AND (NEW.payload ->> 'attempt') IS DISTINCT FROM '1')
        OR rid IS NULL OR (NEW.payload ->> 'reservationId') IS DISTINCT FROM rid THEN
       RAISE EXCEPTION 'CANCEL_CLAIM_FENCED: the reservation leg of this intent is not open for a cancel'
         USING ERRCODE = 'check_violation';
@@ -405,6 +454,22 @@ BEGIN
   END IF;
   RETURN NEW;
 END $$;
+-- 7d. F3 (ROOT 5879309344): the ONE-cancel bound of a TEST cleanup at the DB layer — no second cancel row can be created, and only attempt 1
+--     can be claimed, while the intent is test_cleanup_pending (capture_failed keeps its bounded retries unchanged)
+CREATE FUNCTION booking.test_cleanup_cancel_bound() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE s text;
+BEGIN
+  SELECT state INTO s FROM booking.intents WHERE id = NEW.intent_id FOR SHARE;
+  IF s = 'test_cleanup_pending' AND ((NEW.payload ->> 'attempt') IS DISTINCT FROM '1'
+     OR EXISTS (SELECT 1 FROM booking.external_operations WHERE intent_id = NEW.intent_id AND op_type = 'hostaway.cancel_reservation' AND id <> NEW.id)) THEN
+    RAISE EXCEPTION 'CANCEL_BOUND_FENCED: a TEST cleanup sends at most ONE cancel' USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NEW;
+END $$;
+REVOKE ALL ON FUNCTION booking.test_cleanup_cancel_bound() FROM PUBLIC;
+CREATE TRIGGER external_operations_test_cleanup_cancel_bound BEFORE INSERT ON booking.external_operations
+  FOR EACH ROW WHEN (NEW.op_type = 'hostaway.cancel_reservation') EXECUTE FUNCTION booking.test_cleanup_cancel_bound();
 -- 7a. refund claim fence (0007 pattern): claimable only while the intent is test_cleanup_pending with the authorization leg OPEN, on TEST
 CREATE FUNCTION booking.refund_claim_fence() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, booking AS $$

@@ -1,5 +1,7 @@
 -- 0019_test_cleanup_refund_settlement (down) — restores the 0018 schema exactly: functions = their last accepted bodies (0003 / 0005 / 0010 / 0011 / 0017),
 -- constraints / index / vocabulary = their prior definitions. Fails (by design) if any row already uses the 0019 vocabulary.
+DROP TRIGGER external_operations_test_cleanup_cancel_bound ON booking.external_operations;
+DROP FUNCTION booking.test_cleanup_cancel_bound();
 DROP TRIGGER zy_recording_retirement_fence ON booking.external_operations;
 DROP FUNCTION booking.recording_retirement_fence();
 DROP TRIGGER external_operations_refund_claim_fence ON booking.external_operations;
@@ -162,6 +164,7 @@ END $$;
 
 DROP FUNCTION booking.test_refund_ledgered(uuid, text);
 DROP FUNCTION booking.test_refund_settled_for(uuid, text);
+DROP FUNCTION booking.test_refund_pi_observation_ok(jsonb, uuid, text, text, bigint, text);
 
 CREATE OR REPLACE FUNCTION booking.record_provider_evidence(p_read_op uuid, p_kind text, p_external_ref text, p_status text,
   p_observed jsonb, p_provider_request_id text) RETURNS uuid

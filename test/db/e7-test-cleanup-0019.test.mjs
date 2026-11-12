@@ -11,7 +11,7 @@ import pg from "pg";
 import { startMigratedDatabase, startPostgres } from "./harness.mjs";
 import * as F from "./fixtures.mjs";
 import { applyEvent, loadIntent, claimReleaseBlockers, createIntentRecord, collectGuestDetails, beginPayStep, recordCheckoutSession, recordHostawayCreateResult } from "../../lib/booking-db/repo.js";
-import { claimNextOperation, completeOperation, requestRead, recordProviderEvidence } from "../../lib/booking-db/operations.js";
+import { claimNextOperation, completeOperation, requestRead, recordProviderEvidence, settleOperationFromEvidence } from "../../lib/booking-db/operations.js";
 import { requestTestCleanup, bindCleanupExpectation, testCleanupGate, TEST_CLEANUP_EXPECTATION_KEYS } from "../../lib/booking-db/test-cleanup.js";
 import { migrateUp, migrateDown } from "../../db/lib/migrate.js";
 import { transition, EVENTS, STATES, TERMINAL_STATES, refundKey, testCleanupEventId, publicStatus, allowedEvents } from "../../lib/checkout/intent-state.js";
@@ -264,10 +264,11 @@ test("Q6 fences: the refund row is claimable ONLY in test_cleanup_pending with t
       await assert.rejects(o.query("UPDATE booking.external_operations SET state = 'superseded' WHERE intent_id = $1 AND op_type = $2", [c.id, RECORD]), /RECORDING_RETIREMENT_FENCED/);
     } finally { await o.query("ROLLBACK").catch(() => {}); o.release(); } }
   F.ok(await request(c));
-  // refund row: settle the authorization leg first (full proof), then the row can no longer be claimed — but it is already succeeded; instead, show the fence on a pending row of a settled leg (owner synthetic, rolled back)
+  // the guard itself refuses flagging the authorization leg without proof (owner, rolled back)
   { const o = await db.owner.connect(); try { await o.query("BEGIN");
-      await o.query("UPDATE booking.intents SET settlement_authorization_settled = true WHERE id = $1", [c.id]).catch(() => {});   // the guard refuses this (no proof): expected
+      await assert.rejects(o.query("UPDATE booking.intents SET settlement_authorization_settled = true, version = version + 1, updated_at = now() WHERE id = $1", [c.id]), /AUTHORIZATION_NOT_VERIFIED_SETTLED/);
     } finally { await o.query("ROLLBACK").catch(() => {}); o.release(); } }
+  // the refund claim fence on a pending row of a settled leg (owner synthetic: the flag forced with triggers off, rolled back)
   { const o = await db.owner.connect(); try { await o.query("BEGIN"); await o.query("ALTER TABLE booking.intents DISABLE TRIGGER USER");
       await o.query("UPDATE booking.intents SET settlement_authorization_settled = true WHERE id = $1", [c.id]);
       await assert.rejects(o.query("UPDATE booking.external_operations SET state = 'in_flight', lease_worker_id = 'x', lease_until = now() + interval '1 min', dispatched_at = now(), attempts = 1 WHERE intent_id = $1 AND op_type = $2", [c.id, REFUND]), /REFUND_CLAIM_FENCED/);
@@ -335,6 +336,132 @@ test("Q8 migration: 0019 down restores the 0018 schema exactly (constraints, ind
     assert.deepEqual(await objects(c), at19Objs, "up re-applies identically");
     const added = at19Objs.filter((o) => !base18Objs.includes(o)).map((o) => o.split("|").slice(0, 2).join("|"));
     for (const n of ["fn|booking.test_refund_settled_for(uuid,text)", "fn|booking.test_refund_ledgered(uuid,text)", "fn|booking.refund_claim_fence()", "fn|booking.recording_retirement_fence()",
+      "fn|booking.test_refund_pi_observation_ok(jsonb,uuid,text,text,bigint,text)", "fn|booking.test_cleanup_cancel_bound()",
       "idx|booking.external_operations_one_refund_ever", "trg|booking.external_operations", "fn|booking.authorization_blockers(uuid)", "fn|booking.intents_safety_guard()"]) assert.ok(added.includes(n), n);
   } finally { await c.end(); rt.stop(); }
+});
+
+// =============================================================================================
+// ROOT review 5879309344 (PR67 @ 1ee73829) — exact reproductions through the accepted APIs (RED on 1ee73829; GREEN here)
+const settled = (c) => db.app.query("SELECT booking.test_refund_settled_for($1, $2) AS ok", [c.id, c.piId]).then((r) => r.rows[0].ok);
+const tryRefundOk = (c, re, t = 45) => applyEvent(db.app, c.id, { type: "REFUND_SUCCEEDED", id: `refund-try:${c.id}:${t}:${Math.random()}`, refundId: re, chargeId: c.chargeId, amountMinor: AMT, currency: "usd" }, { now: F.at(t), actor: "worker" });
+
+test("RF1 (F1) the LATEST bound-refund observation decides: valid full read then a NEWER succeeded read with another amount / PI / charge / currency → NOT settled (predicate false, REFUND_SUCCEEDED refused, claim held); equal-timestamp observations are a refused tie; a newer VALID read restores; the terminal is refused while the latest contradicts", async () => {
+  { const c = await capturedUSD(); F.ok(await request(c)); const re = "re_test_rf1a";
+    await refundSend(c, re, 30); F.ok(await refundRead(c, re, 31)); await piRead(c, 31);
+    assert.equal(await settled(c), true, "baseline: one valid read settles");
+    F.ok(await refundRead(c, re, 32, { amount: AMT - 1 }));                                   // newer, status still succeeded, partial amount
+    assert.equal(await settled(c), false, "RED on 1ee73829: the newer contradictory succeeded read was ignored");
+    const r = await tryRefundOk(c, re); assert.deepEqual([r.ok, r.error], [false, "AUTHORIZATION_NOT_VERIFIED_SETTLED"]);
+    assert.deepEqual([(await loadIntent(db.app, c.id)).settlement.authorizationSettled, await held(c.id)], [false, true]);
+    F.ok(await refundRead(c, re, 33));                                                       // a newer VALID read restores
+    assert.equal(await settled(c), true);
+    for (const [t, o] of [[34, { pi: "pi_test_other000" }], [35, { charge: "ch_test_other0000000" }], [36, { currency: "MXN" }]]) {
+      F.ok(await refundRead(c, re, t, o)); assert.equal(await settled(c), false, JSON.stringify(o)); F.ok(await refundRead(c, re, t, {}).catch(() => ({ ok: true })));
+    }
+    F.ok(await refundRead(c, re, 40)); assert.equal(await settled(c), true); }
+  { const c = await capturedUSD(); F.ok(await request(c)); const re = "re_test_rf1b";       // tie: two observations at the same instant (one valid, one partial)
+    await refundSend(c, re, 30); await piRead(c, 31); F.ok(await refundRead(c, re, 32)); F.ok(await refundRead(c, re, 32, { amount: AMT - 1 }));
+    assert.equal(await settled(c), false, "a tie never picks the convenient row");
+    const r = await tryRefundOk(c, re); assert.equal(r.ok, false); assert.equal(await held(c.id), true); }
+  { const c = await capturedUSD(); F.ok(await request(c)); const re = "re_test_rf1c";       // full event / terminal / claim path: settle, then a newer contradictory read, then the cancel leg
+    await refundSend(c, re, 30); F.ok(await refundRead(c, re, 31)); await piRead(c, 31);
+    F.ok(await tryRefundOk(c, re, 32)); assert.equal((await loadIntent(db.app, c.id)).settlement.authorizationSettled, true);
+    F.ok(await refundRead(c, re, 33, { amount: AMT - 1 }));
+    const cr = await cancelLeg(c, 34); assert.deepEqual([cr.ok, cr.error], [false, "CANCELLATION_NOT_VERIFIED"], JSON.stringify(cr));
+    assert.deepEqual([(await loadIntent(db.app, c.id)).status, await held(c.id)], ["test_cleanup_pending", true]);
+    F.ok(await refundRead(c, re, 35));                                                       // only after the latest read is valid again (the cancel row + cancelled read already exist)
+    F.ok(await applyEvent(db.app, c.id, { type: "RESERVATION_CANCELLED", id: `cancel-ok2:${c.id}` }, { now: F.at(36) }));
+    assert.deepEqual([(await loadIntent(db.app, c.id)).status, await held(c.id)], ["cancelled", false]); }
+});
+
+test("RF2 (F2) the PI observation must be a COHERENT typed v3 captured-and-fully-refunded proof: each ROOT field altered alone → NOT settled (charge.paymentIntent other PI; EUR currencies; missing proofVersion; accountVerified false; charge.paid false), plus object / status / metadata / captureMethod / amounts / types / tie", async () => {
+  const c = await capturedUSD(); F.ok(await request(c)); const re = "re_test_rf2";
+  await refundSend(c, re, 30); F.ok(await refundRead(c, re, 31));
+  let t = 32;
+  const check = async (label, top, expect) => {
+    t += 1; await piRead(c, t, { top }); assert.equal(await settled(c), expect, label);
+  };
+  await check("valid v3", {}, true);
+  const base = piObserved(c); const ch = base.latestCharge;
+  const cases = [
+    ["charge.paymentIntent = another PI", { latestCharge: { ...ch, paymentIntent: "pi_test_other000" } }],
+    ["EUR on a USD intent (PI + charge)", { currency: "EUR", latestCharge: { ...ch, currency: "EUR" } }],
+    ["missing proofVersion", { proofVersion: undefined }],
+    ["accountVerified false", { accountVerified: false }],
+    ["charge.paid false", { latestCharge: { ...ch, paid: false } }],
+    ["object not payment_intent", { object: "charge" }],
+    ["PI id other", { paymentIntentId: "pi_test_other000" }],
+    ["metadata intent other", { metadataIntentId: "00000000-0000-4000-8000-000000000000" }],
+    ["metadata attempt other", { metadataAttemptId: "00000000-0000-4000-8000-000000000000" }],
+    ["captureMethod automatic", { captureMethod: "automatic" }],
+    ["amountReceived short", { amountReceivedMinor: AMT - 1 }],
+    ["amountCapturable non-zero", { amountCapturableMinor: 1 }],
+    ["livemode as string", { livemode: "false" }],
+    ["accountVerified as string", { accountVerified: "true" }],
+    ["charge.captured false", { latestCharge: { ...ch, captured: false } }],
+    ["charge.amountRefunded partial", { latestCharge: { ...ch, amountRefundedMinor: AMT - 100 } }],
+    ["charge.amountCaptured as string", { latestCharge: { ...ch, amountCapturedMinor: String(AMT) } }],
+    ["charge.livemode true", { latestCharge: { ...ch, livemode: true } }],
+    ["charge.refunded false", { latestCharge: { ...ch, refunded: false } }],
+    ["charge id other", { latestCharge: { ...ch, id: "ch_test_other0000000" } }],
+    ["latestCharge missing", { latestCharge: null }]
+  ];
+  for (const [label, top] of cases) {
+    const o = { ...top }; if ("proofVersion" in o && o.proofVersion === undefined) delete o.proofVersion;
+    t += 1;
+    const observed = { ...piObserved(c), ...o }; if (top.proofVersion === undefined && "proofVersion" in top) delete observed.proofVersion;
+    const id = await F.completedRead(db.app, c.id, "stripe.retrieve_payment_intent", c.piId, F.at(t));
+    F.ok(await recordProviderEvidence(db.app, { readOpId: id, kind: "payment_intent", externalRef: c.piId, status: "succeeded", observed }), label);
+    assert.equal(await settled(c), false, `RED on 1ee73829 for the five ROOT fields: ${label}`);
+    const r = await tryRefundOk(c, re, 100 + t); assert.equal(r.ok, false, label);
+  }
+  assert.equal(await held(c.id), true);
+  // a newer valid observation settles again; two PI observations at the same instant are a refused tie
+  await check("valid again", {}, true);
+  t += 1; await piRead(c, t); await piRead(c, t, { refunded: AMT - 1 }); assert.equal(await settled(c), false, "PI tie refused");
+});
+
+test("RF3 (F3) ONE cancel only: cancel attempt 1 → outcome_unknown → found_active read at dispatch + 2 min → settle failed_definite → RECONCILED_RESERVATION_STILL_ACTIVE escalates to an owner case with NO second cancel (default and permissive maxCancelAttempts; same step and a second session); the DB refuses a second cancel row / an attempt-2 claim while test_cleanup_pending; capture_failed keeps its bounded retry", async () => {
+  const stillActive = async (c, cfg) => applyEvent(db.app, c.id, { type: "RECONCILED_RESERVATION_STILL_ACTIVE" }, { now: F.at(40), config: cfg });
+  const chain = async (c) => {
+    const op = await claimNextOperation(db.app, { workerId: "w-cleanup", now: F.at(30), intentId: c.id, opTypes: [CANCEL] }); assert.ok(op, "cancel attempt 1 claimable");
+    F.ok(await completeOperation(db.app, op.id, { workerId: "w-cleanup", now: F.at(30), outcome: { status: "outcome_unknown", errorCode: "TIMEOUT" } }));
+    F.ok(await applyEvent(db.app, c.id, { type: "RESERVATION_CANCEL_OUTCOME_UNKNOWN", id: `cancel-unk:${c.id}`, code: "TIMEOUT" }, { now: F.at(31) }));
+    const ev = await F.reservationStatus(db.app, c.id, String(c.reservationId), "found_active", { listingId: LIST, from: c.stay.from, to: c.stay.to, totalMinor: AMT, currency: "USD" }, 33);
+    assert.deepEqual(F.ok(await settleOperationFromEvidence(db.app, op.id, ev)).state, "failed_definite");
+    return op;
+  };
+  for (const cfg of [{}, { maxCancelAttempts: 10 }]) {
+    const c = await capturedUSD(); F.ok(await request(c)); await chain(c);
+    const r = await stillActive(c, cfg);
+    F.ok(r); const i = await loadIntent(db.app, c.id);
+    assert.deepEqual([i.status, i.reasonCode, i.counters.cancelAttempts], ["reconciliation_required", "RESERVATION_STILL_ACTIVE_AFTER_CANCEL", 1], `RED on 1ee73829 (${JSON.stringify(cfg)}): a second cancel was queued`);
+    assert.deepEqual((await rows(c.id, CANCEL)).map((o) => [o.state, o.payload.attempt]), [["failed_definite", 1]], "exactly ONE cancel row, ever");
+    assert.equal((await db.app.query("SELECT count(*)::int AS n FROM booking.reconciliation_cases WHERE intent_id = $1 AND status = 'open'", [c.id])).rows[0].n, 1);
+    assert.equal(await held(c.id), true);
+    // second session: nothing claimable, the event is not routed from reconciliation_required
+    assert.equal(await claimNextOperation(db.app, { workerId: "x", now: F.at(500), intentId: c.id, opTypes: [CANCEL, REFUND] }), null);
+    assert.equal((await stillActive(c, cfg)).ok, false);
+  }
+  { // DB layer: a second cancel row cannot be created while test_cleanup_pending; an attempt-2 row (owner synthetic, triggers off on insert) cannot be claimed
+    const c = await capturedUSD(); F.ok(await request(c));
+    await assert.rejects(db.app.query(`INSERT INTO booking.external_operations (id, intent_id, op_type, idempotency_key, retry_class, state, payload, source_version, max_attempts, next_attempt_at, created_at, updated_at)
+      VALUES (gen_random_uuid(), $1, $2, $3, 'reconcile_first', 'pending', $4, 1, 1, now(), now(), now())`, [c.id, CANCEL, `hcancel:${c.id}:${c.reservationId}:2`, { reservationId: String(c.reservationId), cancelledBy: "host", attempt: 2 }]), /CANCEL_BOUND_FENCED/);
+    const o = await db.owner.connect();
+    try { await o.query("BEGIN"); await o.query("ALTER TABLE booking.external_operations DISABLE TRIGGER USER");
+      await o.query("UPDATE booking.external_operations SET payload = payload || '{\"attempt\": 2}' WHERE intent_id = $1 AND op_type = $2", [c.id, CANCEL]);
+      await o.query("ALTER TABLE booking.external_operations ENABLE TRIGGER USER");
+      await assert.rejects(o.query("UPDATE booking.external_operations SET state = 'in_flight', lease_worker_id = 'x', lease_until = now() + interval '1 min', dispatched_at = now(), attempts = 1 WHERE intent_id = $1 AND op_type = $2", [c.id, CANCEL]), /CANCEL_CLAIM_FENCED/);
+    } finally { await o.query("ROLLBACK").catch(() => {}); o.release(); } }
+  { // capture_failed (void path) keeps its bounded retry: still-active → attempt 2 queued
+    const p = await F.reserved(db.app, { listingId: LIST, currency: "USD", from: "2029-10-01", to: "2029-10-03" });
+    F.ok(await applyEvent(db.app, p.id, { type: "CAPTURE_FAILED", definite: true, code: "CARD_DECLINED" }, { now: F.at(8) }));
+    const op = await claimNextOperation(db.app, { workerId: "w1", now: F.at(9), intentId: p.id, opTypes: [CANCEL] }); assert.ok(op);
+    F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(9), outcome: { status: "outcome_unknown", errorCode: "TIMEOUT" } }));
+    F.ok(await applyEvent(db.app, p.id, { type: "RESERVATION_CANCEL_OUTCOME_UNKNOWN", code: "TIMEOUT" }, { now: F.at(10) }));
+    const ev = await F.reservationStatus(db.app, p.id, String(p.reservationId), "found_active", { listingId: LIST, from: "2029-10-01", to: "2029-10-03", totalMinor: AMT, currency: "USD" }, 12);
+    assert.deepEqual(F.ok(await settleOperationFromEvidence(db.app, op.id, ev)).state, "failed_definite");
+    F.ok(await applyEvent(db.app, p.id, { type: "RECONCILED_RESERVATION_STILL_ACTIVE" }, { now: F.at(13) }));
+    assert.deepEqual([(await loadIntent(db.app, p.id)).status, (await loadIntent(db.app, p.id)).counters.cancelAttempts, (await rows(p.id, CANCEL)).length], ["capture_failed", 2, 2], "unchanged"); }
 });
