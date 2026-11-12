@@ -2,6 +2,7 @@
 // Deterministic: no network, no credentials, no Hostaway, no database. Fixtures are SYNTHETIC
 // (test/fixtures/hostaway/README.md); they are not provider evidence.
 import { test } from "node:test";
+import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
@@ -541,32 +542,31 @@ test("mapping: every response/lookup assumption not stated in the docs is labell
   assert.equal(DIRECT_CHANNEL_ID, 2000);
 });
 
+// These four sources were individually reviewed: adapter references are closure-path data, not adapter loaders.
+// Exact source pins deliberately require another review for ANY future edit. This is not a JavaScript parser or a transitive-import proof.
+const CLOSURE_PATH_ONLY_PINS = Object.freeze({
+  "scripts/e4-write-runner/happy-preflight.mjs": "30b9ec467c2d5b6d025f0636519f1291ae6f68dbefc050c41551a8366bf3ce99",
+  "scripts/e7-connected/run-binding-r1.mjs": "d724625c1109c6e82486dee471bc93928e7095e9aea15517257078894696c62c",
+  "scripts/e7-connected/run-plan-cli-main.mjs": "9f5931b88d4b1f57c1f46e0f890beab79213800177967759e0928f83458c6724",
+  "scripts/e7-connected/run-plan-v1.mjs": "585a90120bbea9692e8bf0d1b4b9d31309b189ecb53b99601ab42b9632b85edf"
+});
 function assertClosurePathOnly(source, label) {
-  // Preserve quoted strings while removing comments, including comments between import/export tokens.
-  const code = source.replace(/("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)|\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g,
-    (match, quoted) => quoted ?? " ");
-  assert.doesNotMatch(code, /^\s*import\b[^;]*hostaway-reservations/m, `${label}: no static import of the adapter`);
-  assert.doesNotMatch(code, /^\s*export\b[^;]*\bfrom\s*["'][^"']*hostaway-reservations/m, `${label}: no re-export of the adapter`);
-  assert.doesNotMatch(code, /\b(?:createRequire|require)\b/, `${label}: no require or require factory`);
-  for (const call of code.matchAll(/\bimport\s*\(/g)) {
-    const literal = /^\s*(["'])(node:[^"']+|\.\/[^"'/]+)\1\s*\)/.exec(code.slice(call.index + call[0].length));
-    assert.ok(literal && !literal[2].includes("hostaway-reservations"), `${label}: dynamic imports must be literal node modules or siblings, never the adapter`);
-  }
-  assert.match(code, /"lib\/hostaway-reservations\.js"/, `${label}: names the adapter path as a closure string`);
+  assert.ok(Object.hasOwn(CLOSURE_PATH_ONLY_PINS, label), `${label}: must be individually reviewed`);
+  assert.equal(createHash("sha256").update(source).digest("hex"), CLOSURE_PATH_ONLY_PINS[label], `${label}: closure-only source changed; explicit review required`);
 }
 
-test("closure-only containment rejects commented exports, require factories and computed imports", () => {
-  const path = 'const paths = ["lib/hostaway-reservations.js"];\n';
-  assert.doesNotThrow(() => assertClosurePathOnly(path + 'const load = () => import(/* permitted comment */ "node:fs/promises");', "fixture"));
+test("closure-only source pins reject loader mutations regardless of statement position or JavaScript syntax", () => {
+  const label = "scripts/e7-connected/run-plan-v1.mjs";
+  const source = readFileSync(join(ROOT, label), "utf8");
+  assert.doesNotThrow(() => assertClosurePathOnly(source, label));
   for (const bad of [
     'export { normalizeReservation } from /* c */ "../../lib/hostaway-reservations.js";',
-    'export * from "../../lib/hostaway-reservations.js";',
+    'const x = 1; export * from "../../lib/hostaway-reservations.js";',
+    'const x = 1; import * as H from "../../lib/hostaway-reservations.js";',
+    String.raw`const re = /a\/\//; export * from "../../lib/hostaway-reservations.js";`,
     'import { createRequire as CR } from "node:module"; CR(import.meta.url)("../../lib/hostaway-reservations.js");',
-    'module.require("../../lib/hostaway-reservations.js");',
-    'for (const f of paths) await import(new URL("../../" + f, import.meta.url));',
-    'await import("../../lib/" + "hostaway-reservations.js");',
-    'await import("./hostaway-reservations.js");'
-  ]) assert.throws(() => assertClosurePathOnly(path + bad, "fixture"), /no re-export|no require|dynamic imports/);
+    'for (const f of ["lib/hostaway-reservations.js"]) await import(new URL("../../" + f, import.meta.url));'
+  ]) assert.throws(() => assertClosurePathOnly(source + "\n" + bad, label), /source changed/);
 });
 
 test("containment: the adapter is pure and unreachable — no imports, network, env, timers or callers", () => {
@@ -595,7 +595,7 @@ test("containment: the adapter is pure and unreachable — no imports, network, 
     "scripts/e4-connected/connected-recover.mjs", "scripts/e4-write-runner/happy-path.mjs", "scripts/e4-write-runner/happy-preflight.mjs",
     "scripts/e4-write-runner/runner.mjs",
     // E7 R1 (reviewed, PR #41 / #53): the three R1 closure files name the adapter's PATH only, in their source-closure lists, to hash it
-    // into the reviewed foundation / executor digests. They do not import it (asserted below); all three are offline scripts/ (not deployable).
+    // into the reviewed foundation / executor digests. They do not import it (reviewed source pins below); all three are offline scripts/ (not deployable).
     "scripts/e7-connected/run-binding-r1.mjs", "scripts/e7-connected/run-plan-cli-main.mjs", "scripts/e7-connected/run-plan-v1.mjs"].sort(),
     "nothing deployable references the adapter");
   for (const pathOnly of ["scripts/e4-write-runner/happy-preflight.mjs", "scripts/e7-connected/run-binding-r1.mjs", "scripts/e7-connected/run-plan-cli-main.mjs",
