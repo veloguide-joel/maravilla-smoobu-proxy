@@ -19,7 +19,7 @@
 <main id="mv-test-app" data-listing-id="606998" data-currency="USD">
   <h1>maraVilla direct booking — TEST checkout</h1>
   <p id="mv-listing" class="muted"></p>
-  <h2 id="mv-title">Loading…</h2>
+  <h2 id="mv-title" tabindex="-1">Loading…</h2>
   <p id="mv-text"></p>
   <p id="mv-notice" class="notice" hidden></p>
   <ul id="mv-price" class="price"></ul>
@@ -44,10 +44,6 @@
     <button type="button" id="mv-pay-btn">Continue to Stripe TEST Checkout</button>
   </div>
 
-  <div id="mv-release" hidden>
-    <button type="button" id="mv-release-btn">Request release of the TEST hold</button>
-  </div>
-
   <div id="mv-ack-create" hidden>
     <button type="button" id="mv-ack-create-btn">I understand a TEST intent may already exist — start a new one</button>
   </div>
@@ -58,6 +54,21 @@
     <button type="button" id="mv-refresh" hidden>Refresh status</button>
     <button type="button" id="mv-restart" class="secondary" hidden>Forget this TEST booking in this tab</button>
   </p>
+
+  <section id="mv-release" class="release-zone" aria-label="End this TEST early" hidden>
+    <div id="mv-release-trigger">
+      <p class="muted">Only if you want to end this test early:</p>
+      <button type="button" id="mv-release-btn" class="secondary">Request release of the TEST hold…</button>
+    </div>
+    <div id="mv-release-confirm" class="confirm" role="group" aria-labelledby="mv-release-confirm-title" aria-describedby="mv-release-confirm-text" hidden>
+      <h3 id="mv-release-confirm-title">Request release of the TEST hold?</h3>
+      <p id="mv-release-confirm-text">This asks the server to queue the release of the TEST card authorization and end this test. It is queued, not instant, and this page cannot undo it. The server decides whether a release is still allowed.</p>
+      <p class="actions">
+        <button type="button" id="mv-release-keep">Keep waiting</button>
+        <button type="button" id="mv-release-yes" class="secondary">Yes, request release</button>
+      </p>
+    </div>
+  </section>
 </main>
 </body>
 </html>
