@@ -103,12 +103,18 @@ test("D2 schema / role / URL structure / cross-file TEXT checks → code-only re
 });
 
 test("D3 file safety = the accepted reader's (parity on the SAME real files): mode / owner / links / symlink / dir / size / missing / in-repo / git-tree / parent symlink / replace + growth races", async () => {
-  const provider = (f) => readProbeCredentialFile({ path: f, repoRoot: ROOT, needs: { hostaway: true, stripe: false }, fs: FS });
+  const provider = (f, fs = FS) => readProbeCredentialFile({ path: f, repoRoot: ROOT, needs: { hostaway: true, stripe: false }, fs });
   const valid = login("mv_booking_app");
   const scen = [];
   { const d = dirOf(); scen.push(["mode 0644", put(d, "a.json", valid, 0o644), "CRED_MODE"]); }
   { const d = dirOf(); scen.push(["mode 0400", put(d, "a.json", valid, 0o400), "CRED_MODE"]); }
-  { const d = dirOf(); const f = put(d, "a.json", valid); chownSync(f, 4321, 4321); scen.push(["owner", f, "CRED_OWNER"]); }
+  // owner mismatch, ALWAYS covered deterministically: a real own-uid file read through an adapter whose uid differs (both readers apply the
+  // same `s.uid !== fs.uid` policy). The real chown variant is added only where the platform permits chown (root / capability); a
+  // refusal of chown (EPERM / EINVAL, e.g. a user-namespace mapping) is reported, never treated as a pass for that variant.
+  { const d = dirOf(); scen.push(["owner (adapter uid ≠ file uid)", put(d, "a.json", valid), "CRED_OWNER", { ...FS, uid: FS.uid + 1 }]); }
+  { const d = dirOf(); const f = put(d, "a.json", valid);
+    try { chownSync(f, 4321, 4321); scen.push(["owner (real chown)", f, "CRED_OWNER"]); }
+    catch (e) { if (!["EPERM", "EINVAL"].includes(e.code)) throw e; console.log(`# D3 real-chown owner variant unavailable here (${e.code}); adapter-uid variant covers CRED_OWNER`); } }
   { const d = dirOf(); const f = put(d, "a.json", valid); linkSync(f, join(d, "b.json")); scen.push(["hard link", f, "CRED_LINKS"]); }
   { const d = dirOf(); const f = put(d, "a.json", valid); symlinkSync(f, join(d, "s.json")); scen.push(["symlink", join(d, "s.json"), "CRED_NOT_REGULAR"]); }
   { const d = dirOf(); mkdirSync(join(d, "dir.json")); scen.push(["directory", join(d, "dir.json"), "CRED_NOT_REGULAR"]); }
@@ -118,10 +124,10 @@ test("D3 file safety = the accepted reader's (parity on the SAME real files): mo
   { scen.push(["in repo", join(ROOT, "test", "e7-g3a-in-repo-never-created.json"), "CRED_IN_REPO"]); }
   { const d = dirOf(); mkdirSync(join(d, ".git")); mkdirSync(join(d, "sub")); chmodSync(join(d, "sub"), 0o700); scen.push(["git tree", put(join(d, "sub"), "a.json", valid), "CRED_IN_GIT_TREE"]); }
   { const d = dirOf(); mkdirSync(join(d, "real")); const f = put(join(d, "real"), "a.json", valid); symlinkSync(join(d, "real"), join(d, "alias")); scen.push(["parent symlink", join(d, "alias", "a.json"), "CRED_PATH_NOT_CANONICAL"]); void f; }
-  for (const [label, f, code] of scen) {
+  for (const [label, f, code, fs = FS] of scen) {
     const d2 = dirOf(); const rep = put(d2, "report.json", login("mv_booking_report"));
-    const r = await DB.readDbLoginFiles({ appPath: f, reportPath: rep, repoRoot: ROOT, fs: FS });
-    const a = await provider(f);
+    const r = await DB.readDbLoginFiles({ appPath: f, reportPath: rep, repoRoot: ROOT, fs });
+    const a = await provider(f, fs);
     assert.deepEqual([r.ok, r.code, r.slot], [false, code, "app"], `${label}: ${JSON.stringify(r)}`);
     assert.equal(r.code, a.code, `${label}: same refusal as the accepted reader`); assert.equal(r.closeState, a.closeState, `${label}: same close state`);
   }
