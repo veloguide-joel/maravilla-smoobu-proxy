@@ -40,7 +40,7 @@ export function describe(status, { releaseRequested = false } = {}) {
     // "processing" is a COARSE public status (payment_authorized, reservation_pending, capture_unknown, ... all map to it): no positive
     // authorization / uncaptured claim can be made from it
     case "processing": return { kind: "authorized", title: "Processing — not a booking",
-      text: "Next: keep this tab open and follow the test operator’s instructions. Do not make another TEST payment. A TEST card authorization may be held; this status alone cannot show whether it has been captured or released. This page does not create a reservation or confirm a booking. Request release only when you want to end this test; the server checks whether release is allowed." };
+      text: "Keep this tab open and follow the test operator’s instructions. Do not make another TEST payment. A TEST card authorization may be held; this status cannot show whether it has been captured or released. This page does not create a reservation or confirm a booking." };
     case "release_requested": return { kind: "releaseQueued", title: "Release requested — not released yet",
       text: "Your release request is queued, not finished. Next: wait for the test operator to run cleanup. Refresh status checks the result; it does not release the hold. The TEST hold stays until cleanup verifies the release." };
     case "unavailable_not_charged": return releaseRequested
@@ -73,6 +73,35 @@ export function detailsProblem(f) {
 }
 const DETAILS_PROBLEM_TEXT = { FIRST_NAME_INVALID: "Enter a first name.", LAST_NAME_INVALID: "Enter a last name.", EMAIL_INVALID: "Enter a valid email address.",
   PHONE_INVALID: "Enter a valid phone number or leave it empty.", TERMS_NOT_ACCEPTED: "Accept the TEST terms first.", DETAILS_INVALID: "Complete the guest details." };
+/** W2: "start new" wording ONLY when the rendered screen is exactly one where the server itself reports this TEST intent closed (terminal)
+ *  or the release verified (released). Every other screen (lost, unreadable, review, unexpected, payWait, processing, releaseQueued, ...)
+ *  keeps the explicit Forget / loss-of-access warning, even if an earlier status was terminal. Same local reset either way. */
+export const resetFor = (screen) => (screen === "terminal" || screen === "released" ? "startNew" : "forget");
+/** A1: what (if anything) the polite live region says for this render. One announcement per change of the displayed screen / title /
+ *  notice code / notice sentence; busy and loading renders say nothing and do NOT consume the key (a change seen while busy is announced
+ *  once settled); the create screen (explicit reset / no intent) clears the region and the key. Text = title (+ notice sentence) only:
+ *  no support codes, price, guest data or bearer. */
+export function announcementFor(v, prevKey) {
+  if (v.screen === "create") return { key: null, text: "" };
+  if (v.busy || v.screen === "loading") return null;
+  const key = JSON.stringify([v.screen, v.title, v.notice ? v.notice.code : null, v.notice ? v.notice.text : null]);
+  if (key === prevKey) return null;
+  return { key, text: v.notice ? `${v.title}. ${v.notice.text}` : v.title };
+}
+/** W3: plain-language reasons for stopped automatic checks (the code is shown separately as a support code). Unknown codes get a
+ *  neutral reason; a manual-Refresh hint is added ONLY when Refresh is actually offered (never on "lost"). */
+export const STOP_TEXT = Object.freeze({ BUDGET: "Automatic checks paused to limit requests.",
+  RATE_LIMITED: "Automatic checks stopped because the server asked this page to slow down.",
+  STORAGE: "Automatic checks are off because this tab cannot save its progress.",
+  UNREADABLE: "Automatic checks stopped because the last reply could not be read.",
+  ERROR: "Automatic checks stopped after a failed status check." });
+const STOP_HINT = Object.freeze({ BUDGET: " Use Refresh status to check again.", RATE_LIMITED: " Wait, then use Refresh status." });
+export function stopLine(code, refreshOffered) {
+  const reason = Object.prototype.hasOwnProperty.call(STOP_TEXT, code) ? STOP_TEXT[code] : "Automatic checks stopped.";
+  return refreshOffered ? reason + (Object.prototype.hasOwnProperty.call(STOP_HINT, code) ? STOP_HINT[code] : " Use Refresh status.") : reason;
+}
+/** W3: support codes are diagnostics only: re-sanitized at render (fallback UNEXPECTED_REPLY), shown as text, never in instructions / announcements */
+export const supportCode = (c) => (typeof c === "string" && CODE_RE.test(c) ? c : "UNEXPECTED_REPLY");
 const POLL_KINDS = new Set(["pay", "releaseQueued"]);    // states worth re-reading automatically (after Stripe return / after a release request)
 
 /** sessionStorage wrapper. Every access is guarded; `ok` is false when the browser refuses storage. Stores no guest data. */
@@ -190,7 +219,10 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
       canRefresh: !!(st && st.token) && !busy && !lost,
       latch: latch(), retry: lost || waitingPay ? null : retry, canPay: payEligible(),   // payWait: only Refresh (the details form is not shown there)
       termsVersion: config.termsVersion || null, listingId: config.listingId, currency: config.currency,
-      canRequestRelease: releaseEligible(), confirmingRelease: armed !== null, ...extra, focus: focus || null });
+      canRequestRelease: releaseEligible(), confirmingRelease: armed !== null,
+      // W2: "start new" wording ONLY where the server itself reports this TEST intent closed (terminal) or the release verified (released);
+      // every unknown / review / waiting / lost state keeps the explicit Forget warning
+      ...extra, reset: resetFor(extra.screen || screen), focus: focus || null });
   }
   /** notices: `forStatus` ties an action / hint notice to the status it was issued for; a newer authoritative status clears it */
   const setNotice = (n, forStatus) => { notice = n ? { ...n, forStatus } : null; };
@@ -407,12 +439,15 @@ export function startApp(doc, win) {
   const root = $("mv-test-app");
   const config = { listingId: Number(root.dataset.listingId), currency: root.dataset.currency, termsVersion: (doc.querySelector('meta[name="mv-test-terms-version"]') || {}).content || "" };
   const show = (id, on) => { $(id).hidden = !on; };
+  let announced = null; let resetKind = "forget";
   const ui = {
     render(v) {
       $("mv-title").textContent = v.title; $("mv-text").textContent = v.text;
       $("mv-listing").textContent = `Listing ${v.listingId} (${v.currency})`;
       const n = $("mv-notice");
-      n.textContent = v.notice ? `${v.notice.text} [${v.notice.code}]` : ""; n.dataset.level = v.notice ? v.notice.level : ""; n.hidden = !v.notice;
+      n.textContent = v.notice ? v.notice.text : ""; n.dataset.level = v.notice ? v.notice.level : ""; n.hidden = !v.notice;
+      const codes = [...new Set([v.notice && v.notice.code, v.pollStopped].filter((c) => c != null).map(supportCode))];
+      $("mv-diag").textContent = codes.length ? `Support code: ${codes.join(", ")}` : ""; $("mv-diag").hidden = !codes.length;   // W3: diagnostic, not an instruction
       const p = $("mv-price"); p.replaceChildren();
       if (v.price) {
         for (const l of v.price.lines) { const li = doc.createElement("li"); li.textContent = `${l.label}: ${formatMoney(l.amountMinor, v.price.currency)}`; p.append(li); }
@@ -442,7 +477,17 @@ export function startApp(doc, win) {
       if (v.focus || (doc.activeElement && doc.activeElement !== doc.body && !visible(doc.activeElement))) {
         if (!visible(doc.activeElement) || doc.activeElement === doc.body) (visible($("mv-refresh")) && !$("mv-refresh").disabled ? $("mv-refresh") : $("mv-title")).focus();
       }
-      $("mv-polling").textContent = v.polling ? "Checking the server automatically…" : v.pollStopped ? `Automatic checks stopped (${v.pollStopped}). Use Refresh status.` : "";
+      const refreshOffered = v.canRefresh || v.busy;               // the same rule as the Refresh button's visibility below
+      $("mv-polling").textContent = v.polling ? "Checking the server automatically…"
+        : v.pollStopped && !(v.notice && v.notice.level !== "info") ? stopLine(v.pollStopped, refreshOffered) : "";   // a warn / error notice already says it
+      // W2: reset wording by server-reported state (same startOver; nothing is sent)
+      $("mv-restart").textContent = v.reset === "startNew" ? "Start a new TEST booking…" : "Forget this TEST booking in this tab…";
+      $("mv-forget-warn").textContent = v.reset === "startNew" ? "This only clears this tab. Nothing is sent to the server, and its record of this TEST intent stays as it is."
+        : "Forget only clears this tab. It does not cancel the TEST booking or release any TEST hold, and this tab will then no longer be able to check it or request a release.";
+      resetKind = v.reset;
+      // A1: one polite announcement per CHANGE of screen / title / notice code; never on repeated polls or busy renders; no codes, no price
+      const a = announcementFor(v, announced);                    // A1 (no focus change)
+      if (a) { announced = a.key; if (a.key !== null || $("mv-announce").textContent !== "") $("mv-announce").textContent = a.text; }
     }
   };
   const nav = { assign: (u) => win.location.assign(u), search: () => win.location.search, stripQuery: () => win.history.replaceState(null, "", win.location.pathname) };
@@ -464,7 +509,8 @@ export function startApp(doc, win) {
     c.retryUncertain({ firstName: String(f.get("firstName")), lastName: String(f.get("lastName")), email: String(f.get("email")), phone: String(f.get("phone") || ""), accepted: $("mv-terms").checked }); });
   $("mv-ack-create-btn").addEventListener("click", () => { if (win.confirm("A previous TEST intent may exist. Start a new TEST booking anyway?")) c.acknowledgeUncertainCreate(); });
   $("mv-refresh").addEventListener("click", () => c.refresh());
-  $("mv-restart").addEventListener("click", () => { if (win.confirm("Forget this TEST booking in this tab? This does not cancel the booking or release any TEST hold, and this tab will no longer be able to check it or request a release.")) c.startOver(); });
+  $("mv-restart").addEventListener("click", () => { if (win.confirm(resetKind === "startNew" ? "Start a new TEST booking in this tab? This only clears this tab; nothing is sent to the server and its record of this TEST intent stays as it is."
+    : "Forget this TEST booking in this tab? This does not cancel the booking or release any TEST hold, and this tab will no longer be able to check it or request a release.")) c.startOver(); });
   c.init();
   return c;
 }

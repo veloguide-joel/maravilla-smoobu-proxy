@@ -22,12 +22,14 @@
   <h2 id="mv-title" tabindex="-1">Loading…</h2>
   <p id="mv-text"></p>
   <p id="mv-notice" class="notice" hidden></p>
+  <p id="mv-diag" class="diag" hidden></p>
+  <p id="mv-announce" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
   <ul id="mv-price" class="price"></ul>
 
   <form id="mv-create" hidden>
     <label>Arrival <input type="date" name="from" required></label>
     <label>Departure <input type="date" name="to" required></label>
-    <label>Guests <input type="number" name="guests" min="1" max="20" value="2" required></label>
+    <label>Guests <input type="number" name="guests" min="1" max="20" value="1" required></label>
     <button type="submit" id="mv-create-submit">Get TEST price</button>
   </form>
 
@@ -56,7 +58,7 @@
 
   <section id="mv-release" class="release-zone" aria-label="End this TEST early" hidden>
     <div id="mv-release-trigger">
-      <p class="muted">Only if you want to end this test early:</p>
+      <p class="muted">Only if you want to end this test early. The server decides whether a release is still allowed.</p>
       <button type="button" id="mv-release-btn" class="secondary">Request release of the TEST hold…</button>
     </div>
     <div id="mv-release-confirm" class="confirm" role="group" aria-labelledby="mv-release-confirm-title" aria-describedby="mv-release-confirm-text" hidden>
