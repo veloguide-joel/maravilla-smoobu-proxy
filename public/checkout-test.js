@@ -123,10 +123,22 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
   let busy = false; let pollTimer = null; let stopped = null; let last = null; let notice = null; let price = null; let returned = false;
   let retry = null;                     // the latched action a FRESH status shows may be explicitly resent ("details" | "release")
   let unreadable = false;               // the LAST status reply carried no recognised status: nothing is claimed about the current state
+  // Release confirmation (two-step, never persisted): `armed` binds the confirmation to the bearer it was opened for. Arming sends nothing;
+  // ANY operation start (once), status / error change, latch, unreadable state, busy, token change or reset disarms it.
+  let armed = null;
   const storageOk = () => (st ? store.save(st) : true);
   const latch = () => (st && st.uncertain) || null;
 
+  /** the ONE release-eligibility predicate (arm, confirm and the view): bound token, current processing status shown as "authorized", no
+   *  latch, no unreadable state, not busy. The server stays authoritative; this only decides whether the page may offer the request. */
+  function releaseEligible() {
+    if (!st || !st.token || latch() || unreadable || busy) return false;
+    const effective = last === "awaiting_details" && st.detailsSaved ? "awaiting_payment" : last;
+    return effective === "processing" && describe(effective, { releaseRequested: st.releaseRequested }).kind === "authorized";
+  }
   function view(extra = {}) {
+    let focus = extra.focus;
+    if (armed && (!releaseEligible() || !st || armed.token !== st.token)) { armed = null; if (!focus) focus = "fallback"; }   // auto-dismiss
     // the accepted API reports details_collected as "awaiting_details": a VERIFIED details reply in this tab (session flag) moves the page on
     const effective = last === "awaiting_details" && st && st.detailsSaved ? "awaiting_payment" : last;
     const d = effective && !unreadable ? describe(effective, { releaseRequested: st && st.releaseRequested }) : null;
@@ -136,12 +148,14 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
       : screen === "unreadable" ? "The server's last reply did not contain a recognised status, so this page claims nothing about the current state. Nothing is sent automatically; use Refresh status." : d ? d.text : "";
     ui.render({ screen, title, text, price, notice, busy, polling: pollTimer !== null, pollStopped: stopped, canRefresh: !!(st && st.token) && !busy,
       latch: latch(), retry, canPay: !busy && !unreadable && !!st && !!st.token && (latch() === null || (latch() === "details" && retry === "details")),
-      termsVersion: config.termsVersion || null, listingId: config.listingId, currency: config.currency, ...extra });
+      termsVersion: config.termsVersion || null, listingId: config.listingId, currency: config.currency,
+      canRequestRelease: releaseEligible(), confirmingRelease: armed !== null, ...extra, focus: focus || null });
   }
   /** notices: `forStatus` ties an action / hint notice to the status it was issued for; a newer authoritative status clears it */
   const setNotice = (n, forStatus) => { notice = n ? { ...n, forStatus } : null; };
   async function once(fn) {                     // concurrency cap 1; buttons are disabled while busy
     if (busy) return null;
+    armed = null;                               // any operation (refresh, poll, write) disarms a pending release confirmation first
     busy = true; view();
     try { return await fn(); } finally { busy = false; }
   }
@@ -277,7 +291,7 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
       view();
     },
     /** explicit reset after an unknown create: the guest acknowledges a possible prior TEST intent */
-    acknowledgeUncertainCreate() { if (latch() !== "create") return; store.clear(); st = null; last = null; price = null; setNotice(null); view(); },
+    acknowledgeUncertainCreate() { if (latch() !== "create") return; armed = null; store.clear(); st = null; last = null; price = null; setNotice(null); view(); },
     async details(form) {
       if (!st || !st.token || latch() || unreadable) return;
       if (!config.termsVersion) { setNotice({ level: "error", code: "TERMS_NOT_CONFIGURED", text: "This TEST page has no terms version configured; details cannot be sent." }); view(); return; }
@@ -305,10 +319,24 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
       absorb(r); view({ screen: "redirecting" });
       nav.assign(url);
     },
-    async release() {
-      if (!st || !st.token || latch() || unreadable) return;
+    /** step 1 of 2: open the reversible release confirmation. Sends NOTHING. */
+    armRelease() {
+      if (!releaseEligible()) return;
+      armed = { token: st.token }; view({ focus: "releaseConfirm" });
+    },
+    /** cancel the confirmation (button / Escape). Sends NOTHING; focus returns to the release trigger. */
+    cancelRelease() {
+      if (!armed) return;
+      armed = null; view({ focus: "releaseTrigger" });
+    },
+    /** step 2 of 2: the armed state is consumed synchronously BEFORE any send, so a double confirm sends once */
+    async confirmRelease() {
+      const a = armed; armed = null;
+      if (!a || !st || a.token !== st.token || !releaseEligible()) { view(); return; }
       await sendRelease();
     },
+    /** compatibility alias: arm-only (never a one-click send) */
+    release() { this.armRelease(); },
     /** explicit resend of a latched details / release AFTER a fresh status showed the server still allows that step */
     async retryUncertain(form) {
       if (!st || !st.token || unreadable || !retry || retry !== latch()) return;
@@ -318,7 +346,7 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
       } else if (retry === "release") await sendRelease();
     },
     async refresh() { stopPolling(null); await readStatus({ auto: false }); },
-    startOver() { stopPolling(null); store.clear(); st = null; last = null; price = null; retry = null; unreadable = false; setNotice(null); view(); }
+    startOver() { armed = null; stopPolling(null); store.clear(); st = null; last = null; price = null; retry = null; unreadable = false; setNotice(null); view(); }
   };
 }
 
@@ -345,7 +373,8 @@ export function startApp(doc, win) {
         const t = doc.createElement("li"); t.className = "total"; t.textContent = `Total (server price, TEST): ${formatMoney(v.price.totalMinor, v.price.currency)}`; p.append(t);
       }
       show("mv-create", v.screen === "create"); show("mv-details", v.screen === "details"); show("mv-pay", v.screen === "pay" || (v.retry === "details" && v.canPay));
-      show("mv-release", v.screen === "authorized"); show("mv-restart", !["create", "loading", "redirecting", "createUncertain"].includes(v.screen));
+      show("mv-release", v.screen === "authorized"); show("mv-release-trigger", !v.confirmingRelease); show("mv-release-confirm", v.confirmingRelease === true);
+      show("mv-restart", !["create", "loading", "redirecting", "createUncertain"].includes(v.screen));
       show("mv-ack-create", v.screen === "createUncertain");
       const rb = $("mv-retry-btn"); rb.hidden = !v.retry;
       rb.textContent = v.retry === "release" ? "Send the release request again (the server treats a repeat as the same request)"
@@ -356,9 +385,17 @@ export function startApp(doc, win) {
       const latched = { "mv-details-submit": "details", "mv-pay-btn": "pay", "mv-release-btn": "release", "mv-create-submit": "create" };
       for (const b of doc.querySelectorAll("button")) {
         b.disabled = v.busy || (b.id === "mv-details-submit" && !v.termsVersion) || (latched[b.id] !== undefined && v.latch === latched[b.id])
-          || (b.id === "mv-pay-btn" && !v.canPay);
+          || (b.id === "mv-pay-btn" && !v.canPay)
+          || ((b.id === "mv-release-btn" || b.id === "mv-release-yes") && !v.canRequestRelease) || (b.id === "mv-release-keep" && v.busy);
       }
       $("mv-refresh").hidden = !v.canRefresh && !v.busy;
+      // focus moves ONLY on an explicit release-confirmation transition, or when focus would otherwise sit in hidden content
+      const visible = (el) => el && !el.closest("[hidden]");
+      if (v.focus === "releaseConfirm") $("mv-release-keep").focus();
+      else if (v.focus === "releaseTrigger" && visible($("mv-release-btn"))) $("mv-release-btn").focus();
+      if (v.focus || (doc.activeElement && doc.activeElement !== doc.body && !visible(doc.activeElement))) {
+        if (!visible(doc.activeElement) || doc.activeElement === doc.body) (visible($("mv-refresh")) && !$("mv-refresh").disabled ? $("mv-refresh") : $("mv-title")).focus();
+      }
       $("mv-polling").textContent = v.polling ? "Checking the server automatically…" : v.pollStopped ? `Automatic checks stopped (${v.pollStopped}). Use Refresh status.` : "";
     }
   };
@@ -371,7 +408,10 @@ export function startApp(doc, win) {
   $("mv-details").addEventListener("submit", (e) => { e.preventDefault(); const f = form("mv-details");
     c.details({ firstName: String(f.get("firstName")), lastName: String(f.get("lastName")), email: String(f.get("email")), phone: String(f.get("phone") || ""), accepted: $("mv-terms").checked }); });
   $("mv-pay-btn").addEventListener("click", () => c.pay());
-  $("mv-release-btn").addEventListener("click", () => c.release());
+  $("mv-release-btn").addEventListener("click", () => c.armRelease());
+  $("mv-release-keep").addEventListener("click", () => c.cancelRelease());
+  $("mv-release-yes").addEventListener("click", () => c.confirmRelease());
+  $("mv-release-confirm").addEventListener("keydown", (e) => { if (e.key === "Escape") { e.preventDefault(); c.cancelRelease(); } });
   $("mv-retry-btn").addEventListener("click", () => { const f = form("mv-details");
     c.retryUncertain({ firstName: String(f.get("firstName")), lastName: String(f.get("lastName")), email: String(f.get("email")), phone: String(f.get("phone") || ""), accepted: $("mv-terms").checked }); });
   $("mv-ack-create-btn").addEventListener("click", () => { if (win.confirm("A previous TEST intent may exist. Start a new TEST booking anyway?")) c.acknowledgeUncertainCreate(); });

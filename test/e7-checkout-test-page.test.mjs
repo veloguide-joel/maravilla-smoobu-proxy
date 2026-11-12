@@ -34,6 +34,14 @@ function rig({ storage = memStorage(), search = "", api = fakeApi(), timers = fa
   return { c, views, nav, api, timers, storage, last: () => views[views.length - 1], get state() { return c.state; } };
 }
 const reply = (http, body) => ({ kind: "reply", http, body });
+/** the TWO-STEP release (arm, then confirm): every existing release assertion runs through the confirmation, never a one-click send */
+// Release is offered only while the page SHOWS a current "processing" status (ROOT condition 2). Where an older test sent the release from a
+// tab that had not read any status yet, `f` makes it first read ONE extra scripted "processing" status (unshifted, so the test's own queue
+// is untouched); every assertion after that is the original one.
+const rel = async (c, f) => {
+  if (f && c.state.last !== "processing" && c.state.st && c.state.st.token) { f.q.status.unshift(reply(200, { status: "processing" })); await c.refresh(); }
+  c.armRelease(); return c.confirmRelease();
+};
 
 test("redirect validation: only https://checkout.stripe.com (no port / credentials); everything else refused", () => {
   assert.equal(validateCheckoutUrl("https://checkout.stripe.com/c/pay/cs_test_1"), "https://checkout.stripe.com/c/pay/cs_test_1");
@@ -108,7 +116,7 @@ test("happy flow with Stripe return + reload: create -> details (configured term
   await timers.tick(); assert.equal(b.last().screen, "authorized");
   assert.equal(b.state.polling, false, "no polling while simply authorized");
   assert.equal(api.count("create") + api.count("pay"), 2, "a reload never creates or pays again");
-  await b.c.release();
+  await rel(b.c);
   assert.equal(b.last().screen, "releaseQueued"); assert.match(b.last().title, /not released yet/);
   await timers.tick(); assert.equal(b.last().screen, "releaseQueued");
   await timers.tick(); assert.equal(b.last().screen, "released");
@@ -142,7 +150,7 @@ test("automatic status reads: <= 24 per 10 minutes per tab+token ACROSS reloads;
   assert.deepEqual([r3.state.stopped, r3.state.polling, a3.count("status"), t3.q.length], ["RATE_LIMITED", false, 2, 0]);
   // concurrency cap 1: a click while a request is in flight is ignored
   let release; const slow = fakeApi(); slow.api.status = async () => new Promise((res) => { release = res; });
-  const r4 = rig({ storage: s3, api: slow }); const p = r4.c.refresh(); await r4.c.release(); await r4.c.refresh();
+  const r4 = rig({ storage: s3, api: slow }); const p = r4.c.refresh(); await rel(r4.c); await r4.c.refresh();
   assert.equal(slow.count("release"), 0); release(reply(200, { status: "processing" })); await p;
   // storage that cannot persist the budget -> no automatic reads at all
   const brokenApi = fakeApi(); const r5 = rig({ storage: brokenStorage(), api: brokenApi }); await r5.c.init();
@@ -157,9 +165,9 @@ test("uncertain writes are never resent; create while a token exists is refused;
   for (const [k, code] of [["release", "RELEASE_UNCERTAIN"], ["pay", "PAY_UNCERTAIN"], ["details", "DETAILS_UNCERTAIN"]]) {
     const s = memStorage(); createStore(s).save({ token: TOKEN, releaseRequested: false, polls: [] });
     const f = fakeApi({ [k]: [{ kind: "unknown" }] }); const r = rig({ storage: s, api: f, search: "" });
-    if (k === "details") await r.c.details({ firstName: "A", lastName: "B", email: "a@example.test", accepted: true }); else await r.c[k]();
+    if (k === "details") await r.c.details({ firstName: "A", lastName: "B", email: "a@example.test", accepted: true }); else if (k === "release") await rel(r.c, f); else await r.c[k]();
     const timers = r.timers; while (await timers.tick());
-    assert.deepEqual([r.state.notice.code, f.count(k), f.count("status")], [code, 1, 0], k);
+    assert.deepEqual([r.state.notice.code, f.count(k), f.count("status")], [code, 1, k === "release" ? 1 : 0], k);   // release: only its one pre-read
   }
   // a second create while this tab already holds a token: nothing sent
   const s2 = memStorage(); createStore(s2).save({ token: TOKEN, releaseRequested: false, polls: [] });
@@ -181,9 +189,9 @@ test("uncertain writes are never resent; create while a token exists is refused;
 
 test("server failures are honest: release flag off, 503, 401 lost token, under_review, unknown status text; server codes are sanitized", async () => {
   const mk = (script) => { const s = memStorage(); createStore(s).save({ token: TOKEN, releaseRequested: false, polls: [] }); const f = fakeApi(script); return { s, f, r: rig({ storage: s, api: f }) }; };
-  let x = mk({ release: [reply(400, { code: "UNKNOWN_STEP" })] }); await x.r.c.release(); assert.equal(x.r.state.notice.code, "RELEASE_NOT_ENABLED");
-  x = mk({ release: [reply(503, { code: "UNAVAILABLE" })] }); await x.r.c.release(); assert.equal(x.r.state.notice.code, "RELEASE_UNCERTAIN", "5xx after a write is uncertain, not a refusal"); assert.equal(x.f.count("release"), 1);
-  x = mk({ release: [reply(409, { code: "<script>alert(1)</script>" })] }); await x.r.c.release(); assert.equal(x.r.state.notice.code, "UNEXPECTED_REPLY");
+  let x = mk({ release: [reply(400, { code: "UNKNOWN_STEP" })] }); await rel(x.r.c, x.f); assert.equal(x.r.state.notice.code, "RELEASE_NOT_ENABLED");
+  x = mk({ release: [reply(503, { code: "UNAVAILABLE" })] }); await rel(x.r.c, x.f); assert.equal(x.r.state.notice.code, "RELEASE_UNCERTAIN", "5xx after a write is uncertain, not a refusal"); assert.equal(x.f.count("release"), 1);
+  x = mk({ release: [reply(409, { code: "<script>alert(1)</script>" })] }); await rel(x.r.c, x.f); assert.equal(x.r.state.notice.code, "UNEXPECTED_REPLY");
   x = mk({ status: [reply(401, { code: "UNAUTHORIZED" })] }); await x.r.c.init(); assert.deepEqual([x.r.last().screen, x.r.state.notice.code], ["lost", "UNAUTHORIZED"]);
   x = mk({ status: [reply(200, { status: "under_review" })] }); await x.r.c.init(); assert.equal(x.r.last().screen, "review"); assert.equal(x.r.state.polling, false);
   x = mk({ status: [reply(200, { status: "confirmed" })] }); await x.r.c.init(); assert.equal(x.r.last().screen, "unexpected");
@@ -268,10 +276,10 @@ test("R-UI1 details / release: uncertain -> latched; status proving resolution c
   const s2 = seeded();
   const g = fakeApi({ release: [reply(500, { code: "UNAVAILABLE" })], status: [reply(200, { status: "processing" }), reply(200, { status: "release_requested" })] });
   const b = rig({ storage: s2, api: g });
-  await b.c.release(); await b.c.release(); assert.equal(g.count("release"), 1); assert.equal(b.state.notice.code, "RELEASE_UNCERTAIN");
+  await rel(b.c, g); await rel(b.c, g); assert.equal(g.count("release"), 1); assert.equal(b.state.notice.code, "RELEASE_UNCERTAIN");
   const b2 = rig({ storage: s2, api: g }); await b2.c.init();              // reload: latch kept, status processing -> explicit resend allowed
   assert.deepEqual([b2.last().latch, b2.last().retry], ["release", "release"]);
-  await b2.c.release(); assert.equal(g.count("release"), 1);
+  await rel(b2.c, g); assert.equal(g.count("release"), 1);
   await b2.c.retryUncertain(); assert.equal(g.count("release"), 2);
   assert.equal(b2.last().latch, null); assert.equal(b2.last().screen, "releaseQueued");
   // storage refused: the latch still holds in memory
@@ -306,13 +314,13 @@ test("R-UI2: a newer authoritative status clears stale action notices (queued / 
   const f = fakeApi({ status: [reply(200, { status: "processing" }), reply(200, { status: "release_requested" }), reply(200, { status: "unavailable_not_charged" })] });
   const t = fakeTimers(); const a = rig({ storage: s, api: f, timers: t, search: "?checkout=complete" });
   await a.c.init(); assert.equal(a.state.notice.code, "RETURNED_COMPLETE");
-  await a.c.release(); assert.equal(a.state.notice.code, "RELEASE_REQUESTED");
+  await rel(a.c); assert.equal(a.state.notice.code, "RELEASE_REQUESTED");
   await t.tick(); assert.equal(a.last().screen, "releaseQueued"); assert.equal(a.state.notice && a.state.notice.code, "RELEASE_REQUESTED");
   await t.tick(); assert.equal(a.last().screen, "released");
   assert.equal(a.state.notice, null, "no stale 'queued, not done' notice next to 'Release verified'");
   const s2 = seeded({ releaseRequested: true });
   const g = fakeApi({ release: [{ kind: "unknown" }], status: [reply(200, { status: "under_review" })] });
-  const b = rig({ storage: s2, api: g }); await b.c.release(); assert.equal(b.state.notice.code, "RELEASE_UNCERTAIN");
+  const b = rig({ storage: s2, api: g }); await rel(b.c, g); assert.equal(b.state.notice.code, "RELEASE_UNCERTAIN");
   await b.c.refresh(); assert.equal(b.last().screen, "review"); assert.equal(b.state.notice, null); assert.equal(b.last().latch, null);
 });
 
@@ -331,7 +339,7 @@ test("R-UI1a: a 200 status reply without a RECOGNISED status never resolves any 
       assert.equal(r.last().latch, action, `${action} ${JSON.stringify(bad.body)}`);
       assert.deepEqual([r.last().screen, r.state.stopped, r.state.polling, r.state.last], ["unreadable", "UNREADABLE", false, null], `${action} ${JSON.stringify(bad.body)}`);
       const before = f.calls.length;
-      await r.c.pay(); await r.c.release(); await r.c.details({ firstName: "A", lastName: "B", email: "a@example.test", accepted: true }); await r.c.retryUncertain({ accepted: true });
+      await r.c.pay(); await rel(r.c); await r.c.details({ firstName: "A", lastName: "B", email: "a@example.test", accepted: true }); await r.c.retryUncertain({ accepted: true });
       assert.equal(f.calls.length, before, `${action}: nothing sent after an unreadable status`);
       assert.equal(createStore(s).load().uncertain, action);
     }
@@ -368,11 +376,11 @@ test("R-UI1a: malformed 2xx mutation replies latch (never a definite refusal, ne
   }
   for (const body of [{}, { status: "release_requested" }, { release: "REQUESTED" }, { release: "REQUESTED", status: "weird" }]) {
     const f = fakeApi({ release: [reply(202, body)] }); const r = rig({ storage: seeded(), api: f });
-    await r.c.release(); await r.c.release(); assert.deepEqual([r.last().latch, f.count("release")], ["release", 1], JSON.stringify(body));
+    await rel(r.c, f); await rel(r.c, f); assert.deepEqual([r.last().latch, f.count("release")], ["release", 1], JSON.stringify(body));
   }
   // other 2xx codes on a write are not success either
   const f2 = fakeApi({ release: [reply(200, { status: "release_requested", release: "REQUESTED" })] }); const r2 = rig({ storage: seeded(), api: f2 });
-  await r2.c.release(); assert.equal(r2.last().latch, "release");
+  await rel(r2.c, f2); assert.equal(r2.last().latch, "release");
 });
 
 test("accepted details success shape (status stays awaiting_details) advances to payment; an uncertain details step can be proven by a definite pay refusal", async () => {

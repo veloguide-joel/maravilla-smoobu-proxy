@@ -15,3 +15,5 @@ input { font: inherit; padding: 8px; border: 1px solid var(--line); border-radiu
 button { font: inherit; padding: 10px 14px; border-radius: 6px; border: 1px solid var(--fg); background: var(--fg); color: var(--bg); cursor: pointer; }
 button.secondary { background: transparent; color: var(--fg); } button:disabled { opacity: .5; cursor: not-allowed; }
 .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.release-zone { margin-top: 20px; padding-top: 12px; border-top: 1px solid var(--line); }
+.confirm { border: 1px solid var(--warn); border-radius: 8px; padding: 12px; margin-top: 8px; } .confirm h3 { margin: 0 0 6px; font-size: 1rem; }
