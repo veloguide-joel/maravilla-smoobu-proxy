@@ -45,25 +45,40 @@ export function createReconcileExecutorsR1({ binding, send, maxGets, remainingMs
   const signalOf = (opts) => { if (!keysEq(opts, ["signal"]) && !(isObj(opts) && Object.keys(opts).length === 0)) refuse("OPTIONS"); return opts.signal; };
   async function get(path, query, opts) {
     const outer = signalOf(opts);
+    // an outer TIMEOUT signal (AbortSignal.timeout) is a timeout; any other outer abort is a caller abort
+    const outerCode = () => (outer && outer.aborted ? (outer.reason && outer.reason.name === "TimeoutError" ? "CALL_TIMEOUT" : "CALL_ABORTED") : null);
     if (st.stop) refuse("SESSION_STOPPED");
     const left = Math.floor(remainingMs());
     if (!(left > 0)) { setStop("SESSION_DEADLINE"); throw new ReconcileRefusal("SESSION_DEADLINE"); }
     if (st.gets >= maxGets) { setStop("GET_BUDGET_EXHAUSTED"); throw new ReconcileRefusal("GET_BUDGET_EXHAUSTED"); }
+    if (outerCode()) { const c = outerCode(); setStop(c); throw new ReconcileRefusal(c); }   // pre-aborted: ZERO transport calls
     st.gets += 1;
     const bound = Math.min(callTimeoutMs, left);
     const ac = new AbortController();
     const signal = outer ? AbortSignal.any([outer, ac.signal]) : ac.signal;
-    let timer = null; let hard = null;
+    let timer = null; let hard = null; let onAbort = null;
     let reply;
+    const dropped = (c) => { st.log.push(freeze({ path, httpStatus: null })); setStop(c); return new ReconcileRefusal(c); };
     try {
       const call = Promise.resolve().then(() => send(freeze({ method: "GET", path: `/v1${path}`, query: freeze({ ...query }) }), freeze({ signal })));
       call.catch(() => {});                                                    // a dropped late rejection is never unhandled
       timer = setTimeout(() => ac.abort(), bound);
-      const expire = new Promise((_, rej) => { hard = setTimeout(() => rej(Object.assign(new Error("CALL_TIMEOUT"), { code: "CALL_TIMEOUT" })), bound + 50); });
+      // the combined signal (per-call bound OR outer abort) rejects the wait IMMEDIATELY — no grace window in which a reply is accepted;
+      // the bound+50 timer is only a backstop for an environment whose abort event never fires
+      const expire = new Promise((_, rej) => {
+        const fail = () => rej(Object.assign(new Error("CALL_TIMEOUT"), { code: "CALL_TIMEOUT" }));
+        onAbort = fail; signal.addEventListener("abort", onAbort, { once: true }); hard = setTimeout(fail, bound + 50);
+      });
       reply = await Promise.race([call, expire]);                              // READ-ONLY call; a late result is dropped, never passed on
     } catch (e) {
-      st.log.push(freeze({ path, httpStatus: null })); setStop(e && e.code === "CALL_TIMEOUT" ? "CALL_TIMEOUT" : "UNREADABLE"); throw e;
-    } finally { clearTimeout(timer); clearTimeout(hard); }
+      const c = ac.signal.aborted ? "CALL_TIMEOUT" : outerCode() ?? (e && e.code === "CALL_TIMEOUT" ? "CALL_TIMEOUT" : "UNREADABLE");
+      throw dropped(c);
+    } finally { clearTimeout(timer); clearTimeout(hard); if (onAbort) signal.removeEventListener("abort", onAbort); }
+    // re-check AFTER the await and BEFORE anything reaches the (mutating) worker: an aborted signal or an expired session drops the reply
+    if (ac.signal.aborted) throw dropped("CALL_TIMEOUT");
+    if (outerCode()) throw dropped(outerCode());
+    if (!(remainingMs() > 0)) throw dropped("SESSION_DEADLINE");
+    if (st.stop) throw dropped(st.stop.code);
     if (!keysEq(reply, ["httpStatus", "json"]) || !Number.isSafeInteger(reply.httpStatus)) { st.log.push(freeze({ path, httpStatus: null })); setStop("UNREADABLE"); return reply; }
     const s = reply.httpStatus;
     st.log.push(freeze({ path, httpStatus: s }));

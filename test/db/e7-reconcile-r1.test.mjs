@@ -570,7 +570,7 @@ async function planFor(S, over = {}) {
 async function rb(S, o = {}) {
   const plan = o.plan ?? await planFor(S, o.over);
   const jdir = o.journalDir ?? ownerDir("rb-j-");
-  const r = await runReconcileR1({ plan, pools: { app: db.app, report: reportPool }, hostawaySend: o.send ?? S.t.hostaway.send, clock: o.clock ?? (() => S.clock()),
+  const r = await runReconcileR1({ plan, pools: { app: db.app, report: o.report ?? reportPool }, hostawaySend: o.send ?? S.t.hostaway.send, clock: o.clock ?? (() => S.clock()),
     monotonic: o.monotonic, sleep: o.sleep, journalOpen: o.journalOpen, journalDir: jdir, uid: process.getuid(),
     native: o.native ?? { packageInput: S.pk.input, journalDir: S.jd, headDir: S.hd, trustedHead: S.native.trustedHead }, hooks: o.hooks ?? {} });
   return { r, plan, jdir };
@@ -578,8 +578,9 @@ async function rb(S, o = {}) {
 const assertNoWrite = async (S, before, label) => assert.equal(await dbSnap(S.bk.id), before, `${label}: zero DB writes`);
 const advisoryLocks = async () => Number((await one("SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory'")).n);
 /** teardown contract for every non-success: no session lock leaked, cleanup never handed off, journal ends with a terminal record when it can */
-const assertTeardown = async (r, label) => { assert.equal(await advisoryLocks(), 0, `${label}: no advisory lock left`); assert.equal(r.cleanup, "NOT_HANDED_OFF", label);
-  assert.notEqual(r.outcome, "RECONCILED_CONFIRMED", label); assert.ok(["released", "not_acquired", "unlock_failed_connection_destroyed"].includes(r.lock), `${label}: ${r.lock}`); };
+const settledLocks = async () => { for (let k = 0; k < 40; k++) { const n = await advisoryLocks(); if (n === 0) return 0; await new Promise((res) => setTimeout(res, 50)); } return advisoryLocks(); };
+const assertTeardown = async (r, label) => { assert.equal(await settledLocks(), 0, `${label}: no advisory lock left`); assert.equal(r.cleanup, "NOT_HANDED_OFF", label);
+  assert.notEqual(r.outcome, "RECONCILED_CONFIRMED", label); assert.ok(["released", "not_acquired", "unlock_failed_connection_destroyed", "session_error_connection_destroyed"].includes(r.lock), `${label}: ${r.lock}`); };
 
 // ---------------------------------------------------------------------------------------------------------------------------------
 test("RB1 happy: stopped N2 shape → R-B (precheck · ≤5 accepted steps (measured 3) · FINAL paired readback after the DB change) → RECONCILED_CONFIRMED with GET-only provider calls; then the SEPARATE accepted cleanup settles both legs once", async () => {
@@ -604,7 +605,8 @@ test("RB1 happy: stopped N2 shape → R-B (precheck · ≤5 accepted steps (meas
   assert.equal((await one("SELECT state FROM booking.hostaway_reservation_attempts WHERE intent_id = $1", [S.bk.id])).state, "succeeded");
   assert.equal(await claimsHeld(S.bk.id), 1, "R-B never releases the claim");
   const j = await readReconcileJournalR1(`${jdir}/${journalName(plan.runId)}`);
-  assert.equal(j.ok, true); assert.deepEqual([j.records[0].type, j.records.at(-1).type], ["RUN_STARTED", "ENDED"]);
+  assert.equal(j.ok, true); assert.deepEqual([j.records[0].type, j.records.at(-2).type, j.records.at(-1).type], ["RUN_STARTED", "ENDED", "TEARDOWN"]);
+  assert.deepEqual([j.records.at(-2).data.provisional, j.records.at(-1).data.outcome, j.records.at(-1).data.lock], [true, "RECONCILED_CONFIRMED", "released"]);
   assert.deepEqual(r.journalHead, j.head);
   assert.deepEqual(await appPids(), [], "no connection left open");
   // ---- the SEPARATE accepted cleanup (operator abort + compensation worker), its own expectation from fresh persisted facts ----
@@ -926,7 +928,7 @@ test("RB14 exact lock: ROOT's case (own LOCK_KEY unlocked then an UNRELATED lock
     assert.deepEqual([r.outcome, r.code], ["STOPPED", "INTERNAL_EXCEPTION"]); await assertTeardown(r, "hook"); }
   { const S = await stoppedRun(); const { r } = await rb(S, { hooks: { afterPrecheck: async (h) => { const pid = (await h.lockQuery("SELECT pg_backend_pid() AS p")).rows[0].p;
       await db.owner.query("SELECT pg_terminate_backend($1)", [pid]); } } });
-    assert.equal(r.outcome, "STOPPED"); assert.ok(["LOCK_LOST", "INTERNAL_EXCEPTION"].includes(r.code), r.code); await assertTeardown(r, "killed session"); }
+    assert.equal(r.outcome, "STOPPED"); assert.ok(["LOCK_LOST", "LOCK_SESSION_ERROR", "INTERNAL_EXCEPTION"].includes(r.code), r.code); await assertTeardown(r, "killed session"); }
   { const S = await stoppedRun(); const before = await dbSnap(S.bk.id);
     const r = await runReconcileR1({ plan: await planFor(S), pools: { app: db.app, report: { connect: async () => { throw new Error("no connection"); } } }, hostawaySend: S.t.hostaway.send,
       clock: () => S.clock(), journalDir: ownerDir("rb-j-"), uid: process.getuid(), native: { packageInput: S.pk.input, journalDir: S.jd, headDir: S.hd, trustedHead: S.native.trustedHead } });
@@ -961,4 +963,112 @@ test("RB15 deadline: late FINAL completion / a never-settling, abort-ignoring re
   { const S = await stoppedRun(); let m = 0;
     const { r } = await rb(S, { monotonic: () => m, hooks: { afterFinalDb: () => { m = RB.sessionBudgetMs + 1; } } });
     assert.deepEqual([r.outcome, r.code, r.dbState], ["STOPPED", "SESSION_DEADLINE_AFTER_FINAL_DB", "reservation_confirmed"], JSON.stringify(r)); await assertTeardown(r, "final db"); }
+});
+
+// =================================================================================================================================
+// ROOT rev2 review (c80ca424) R1 — the deadline is re-checked AFTER terminal persistence and through every teardown step; teardown grace never succeeds
+/** wraps the REAL journal: `onType(type)` runs after the real append of that type returns (or instead, when it returns a promise to await first) */
+const tapJournal = (tap) => async (o) => {
+  const jo = await openReconcileJournalR1(o); if (!jo.ok) return jo; const j = jo.journal;
+  return { ok: true, journal: { file: j.file, head: j.head, close: async () => { await tap.beforeClose?.(); return j.close(); },
+    async append(type, at, data) { if (tap.before) { const x = await tap.before(type); if (x === "HANG") return new Promise(() => {}); }
+      const r = await j.append(type, at, data); await tap.after?.(type); return r; } } };
+};
+const journalText = async (jdir, plan) => (await import("node:fs/promises")).readFile(`${jdir}/${journalName(plan.runId)}`, "utf8");
+test("RB16 terminal / teardown deadline: expiry when ENDED returns (ROOT's repro) / during a delayed terminal fsync / at the TEARDOWN record / at close / a HUNG terminal append → STOPPED, history kept (ENDED is provisional, TEARDOWN records the real outcome), lock released, bounded", async () => {
+  // (a) ROOT's exact repro: all monotonic values 0 until the REAL ENDED append returns, then 300000
+  { const S = await stoppedRun(); let m = 0;
+    const { r, plan, jdir } = await rb(S, { monotonic: () => m, journalOpen: tapJournal({ after: (t) => { if (t === "ENDED") m = 300_000; } }) });
+    assert.deepEqual([r.outcome, r.code, r.audit, r.cleanup], ["STOPPED", "SESSION_DEADLINE_AT_TERMINAL", "complete", "NOT_HANDED_OFF"], JSON.stringify(r));
+    const j = await readReconcileJournalR1(`${jdir}/${journalName(plan.runId)}`); assert.equal(j.ok, true);
+    assert.deepEqual(j.records.slice(-2).map((x) => [x.type, x.data.provisional ?? null, x.data.outcome ?? null, x.data.code ?? null]),
+      [["ENDED", true, null, null], ["TEARDOWN", null, "STOPPED", "SESSION_DEADLINE_AT_TERMINAL"]], "history kept; the provisional ENDED is followed by the honest outcome");
+    await assertTeardown(r, "at terminal"); }
+  // (b) the terminal fsync is DELAYED (1.5 s real) and the deadline passes during it
+  { const S = await stoppedRun(); let m = 0; const fsp = await import("node:fs/promises"); let armed = false;
+    const journalOpen = (o) => tapJournal({ before: (t) => { if (t === "ENDED") armed = true; } })({ ...o, openHandle: async (...a) => { const fh = await fsp.open(...a);
+      return { write: (...w) => fh.write(...w), stat: () => fh.stat(), close: () => fh.close(), sync: async () => { if (armed) { armed = false; await new Promise((res) => setTimeout(res, 1500)); m = 300_000; } return fh.sync(); } }; } });
+    const { r } = await rb(S, { monotonic: () => m, journalOpen });
+    assert.deepEqual([r.outcome, r.code], ["STOPPED", "SESSION_DEADLINE_AT_TERMINAL"], JSON.stringify(r)); await assertTeardown(r, "delayed fsync"); }
+  // (c) expiry at the TEARDOWN record and (d) at close — after close there is nowhere to journal: an HONEST unjournalled downgrade
+  { const S = await stoppedRun(); let m = 0;
+    const { r } = await rb(S, { monotonic: () => m, journalOpen: tapJournal({ after: (t) => { if (t === "TEARDOWN") m = 300_000; } }) });
+    assert.deepEqual([r.outcome, r.code], ["STOPPED", "SESSION_DEADLINE_AT_TEARDOWN_RECORD"], JSON.stringify(r)); await assertTeardown(r, "teardown record"); }
+  { const S = await stoppedRun(); let m = 0;
+    const { r } = await rb(S, { monotonic: () => m, journalOpen: tapJournal({ beforeClose: () => { m = 300_000; } }) });
+    assert.deepEqual([r.outcome, r.code, r.audit], ["STOPPED", "SESSION_DEADLINE_AFTER_CLOSE", "incomplete:AFTER_CLOSE:DOWNGRADE_NOT_JOURNALED"], JSON.stringify(r)); await assertTeardown(r, "close"); }
+  // (e) expiry during the UNLOCK query (the report session wrapped) → STOPPED at release
+  { const S = await stoppedRun(); let m = 0;
+    const report = { connect: async () => { const c = await reportPool.connect(); const q = c.query.bind(c);
+      c.query = async (...a) => { const res = await q(...a); if (typeof a[0] === "string" && a[0].includes("pg_advisory_unlock")) m = 300_000; return res; }; return c; } };
+    const { r } = await rb(S, { monotonic: () => m, report });
+    assert.deepEqual([r.outcome, r.code, r.lock], ["STOPPED", "SESSION_DEADLINE_AT_RELEASE", "released"], JSON.stringify(r)); await assertTeardown(r, "release"); }
+  // (f) a HUNG terminal append (never settles) → bounded by teardownGraceMs; STOPPED TERMINAL_JOURNAL_FAILED; journal dead, no interleaved TEARDOWN
+  { const S = await stoppedRun(); const t0 = Date.now();
+    const { r, plan, jdir } = await rb(S, { journalOpen: tapJournal({ before: (t) => (t === "ENDED" ? "HANG" : null) }) });
+    assert.deepEqual([r.outcome, r.code, r.audit], ["STOPPED", "TERMINAL_JOURNAL_FAILED", "incomplete:ENDED:JOURNAL_APPEND_TIMEOUT"], JSON.stringify(r));
+    assert.ok(Date.now() - t0 < 120_000); const txt = await journalText(jdir, plan); assert.ok(!txt.includes('"TEARDOWN"'), "no record after a timed-out append");
+    await assertTeardown(r, "hung terminal"); }
+});
+
+// R2 — an `error` emitted on the lock session LATCHES failure; no private text is ever returned or journalled
+const ERR_CANARY = "SYNTHETIC_PRIVATE_ERROR_CANARY";
+const capturingReport = () => { const box = { c: null }; return { box, report: { connect: async () => { box.c = await reportPool.connect(); return box.c; } } }; };
+test("RB17 lock-session client error (backend NOT killed): emitted after the precheck / during a worker step (delayed race) / after the final DB work / at the terminal append → STOPPED LOCK_SESSION_ERROR, never success; session destroyed, no lock left; the error text never appears in the result or the journal", async () => {
+  const cases = [
+    ["afterPrecheck", (box) => ({ hooks: { afterPrecheck: () => { box.c.emit("error", new Error(ERR_CANARY)); } } }), 0],
+    ["in-step race", (box) => ({ hooks: { beforeStep: (i) => { if (i === 2) setTimeout(() => box.c.emit("error", new Error(ERR_CANARY)), 0); } } }), null],
+    ["afterFinalDb", (box) => ({ hooks: { afterFinalDb: () => { box.c.emit("error", new Error(ERR_CANARY)); } } }), null],
+    ["terminal", (box) => ({ journalOpen: tapJournal({ after: (t) => { if (t === "ENDED") box.c.emit("error", new Error(ERR_CANARY)); } }) }), null]];
+  for (const [label, mk, steps] of cases) {
+    const S = await stoppedRun(); const { box, report } = capturingReport(); const before = await dbSnap(S.bk.id);
+    const { r, plan, jdir } = await rb(S, { report, ...mk(box) });
+    assert.deepEqual([r.outcome, r.code, r.lock, r.lockSession], ["STOPPED", "LOCK_SESSION_ERROR", "session_error_connection_destroyed", "error_observed"], `${label}: ${JSON.stringify(r)}`);
+    if (steps === 0) { assert.equal(r.steps.length, 0, label); await assertNoWrite(S, before, label); }
+    assert.ok(!JSON.stringify(r).includes(ERR_CANARY), `${label}: canary not in the result`);
+    assert.ok(!(await journalText(jdir, plan)).includes(ERR_CANARY), `${label}: canary not in the journal`);
+    await assertTeardown(r, label);
+  }
+});
+
+// R3 — executor: no reply accepted after abort / bound / deadline — not even inside the backstop grace
+test("RB18 executor deadline / abort (pure): ROOT's repro (callTimeout 15, reply 10 ms AFTER the abort) rejected; pre-aborted outer signal → zero transport calls; outer abort then reply → rejected; session expires while a resolving read completes → rejected; late rejections handled", async () => {
+  const binding = { listingId: ABORT_LISTING, arrivalDate: "2027-03-07", reservationId: "5100123" };
+  const req = { method: "GET", path: "/reservations/5100123", query: {} };
+  const unhandled = []; const onU = (e) => unhandled.push(e); process.on("unhandledRejection", onU);
+  try {
+    { const send = (rq, { signal }) => new Promise((res) => signal.addEventListener("abort", () => setTimeout(() => res({ httpStatus: 200, json: {} }), 10), { once: true }));
+      const m = createReconcileExecutorsR1({ binding, send, maxGets: 5, remainingMs: () => 10_000, callTimeoutMs: 15 });
+      await assert.rejects(m.executors.retrieveReservation(req, {}), (e) => e.code === "CALL_TIMEOUT");
+      await new Promise((res) => setTimeout(res, 40)); assert.equal(m.observe.stop.code, "CALL_TIMEOUT", "ROOT repro: the in-grace reply is dropped"); }
+    { let calls = 0; const m = createReconcileExecutorsR1({ binding, send: async () => { calls += 1; return { httpStatus: 200, json: {} }; }, maxGets: 5, remainingMs: () => 10_000 });
+      const ac = new AbortController(); ac.abort();
+      await assert.rejects(m.executors.retrieveReservation(req, { signal: ac.signal }), (e) => e.code === "CALL_ABORTED");
+      assert.deepEqual([calls, m.observe.gets, m.observe.stop.code], [0, 0, "CALL_ABORTED"], "pre-aborted: zero transport calls"); }
+    { const ac = new AbortController();
+      const send = () => new Promise((res) => { setTimeout(() => ac.abort(), 5); setTimeout(() => res({ httpStatus: 200, json: {} }), 8); });
+      const m = createReconcileExecutorsR1({ binding, send, maxGets: 5, remainingMs: () => 10_000 });
+      await assert.rejects(m.executors.retrieveReservation(req, { signal: ac.signal }), (e) => e.code === "CALL_ABORTED"); assert.equal(m.observe.stop.code, "CALL_ABORTED"); }
+    { let left = 10_000; const send = async () => { left = 0; return { httpStatus: 200, json: {} }; };   // the read completes exactly as the session expires
+      const m = createReconcileExecutorsR1({ binding, send, maxGets: 5, remainingMs: () => left });
+      await assert.rejects(m.executors.retrieveReservation(req, {}), (e) => e.code === "SESSION_DEADLINE"); assert.equal(m.observe.stop.code, "SESSION_DEADLINE"); }
+    { const send = (rq, { signal }) => new Promise((_, rej) => signal.addEventListener("abort", () => setTimeout(() => rej(new Error("late")), 5), { once: true }));
+      const m = createReconcileExecutorsR1({ binding, send, maxGets: 5, remainingMs: () => 10_000, callTimeoutMs: 15 });
+      await assert.rejects(m.executors.retrieveReservation(req, {}), (e) => e.code === "CALL_TIMEOUT"); await new Promise((res) => setTimeout(res, 50)); }
+    assert.equal(unhandled.length, 0, "no unhandled late rejection");
+  } finally { process.off("unhandledRejection", onU); }
+});
+
+// R3 on PG — the session expires WHILE a worker step's read resolves: that reply never reaches the worker → no new evidence row from it
+test("RB18b session expiry while a worker step's provider read resolves → the reply is dropped (no accepted evidence / DB result from it); STOPPED, never success", async () => {
+  const S = await stoppedRun(); let m = 0; let inStep = false; let evidAtCall = null;
+  const evidCount = async () => Number((await one("SELECT count(*)::int AS n FROM booking.provider_evidence e JOIN booking.external_operations o ON o.id = e.read_operation_id WHERE o.intent_id = $1", [S.bk.id])).n);
+  const send = async (req, o) => { const rep = await S.t.hostaway.send(req, o); if (inStep && evidAtCall === null && /\/reservations\/\d+$/.test(req.path)) { evidAtCall = await evidCount(); m = RB.sessionBudgetMs + 1; } return rep; };
+  const { r } = await rb(S, { send, monotonic: () => m, hooks: { beforeStep: (i) => { inStep = i === 2; } } });
+  assert.equal(r.outcome, "STOPPED", JSON.stringify(r)); assert.ok(evidAtCall !== null, "the in-step read happened");
+  const found = Number((await one(`SELECT count(*)::int AS n FROM booking.provider_evidence e JOIN booking.external_operations o ON o.id = e.read_operation_id
+    WHERE o.intent_id = $1 AND e.status = 'found_active' AND o.op_type = 'hostaway.retrieve_reservation'`, [S.bk.id])).n);
+  assert.equal(await state(S.bk.id), "reservation_pending", "the dropped reply did not confirm the reservation");
+  assert.equal(await evidCount(), evidAtCall, "no evidence row was recorded from the reply that resolved as the session expired"); void found;
+  await assertTeardown(r, "rb18b");
 });

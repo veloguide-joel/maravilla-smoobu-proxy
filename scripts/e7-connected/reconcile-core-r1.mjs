@@ -35,7 +35,7 @@ const freeze = Object.freeze;
 /** Normal path (measured in the tests; see RB1): the accepted recovery requests the by-id read and reschedules (worker waitMs 30 s), the read
  *  executes, then the accepted recovery applies RESERVATION_SUCCEEDED. Bounded maximum: 5 steps, each wait ≤ 60 s business, session ≤ 240 s. GETs: precheck ≤ 1 + 1 lookup page (normal 2 pages incl. the terminal empty page) + 1 by-id; same for the final;
  *  worker ≤ 2 per step. Hard caps below; a session deadline on the monotonic clock covers every awaited call. */
-export const LIMITS = freeze({ maxSteps: 5, maxGets: 20, lookupMaxPages: 2, callTimeoutMs: 10_000, maxWaitMs: 60_000, sessionBudgetMs: 240_000, minAuthMarginMs: 6 * 3600_000 });
+export const LIMITS = freeze({ maxSteps: 5, maxGets: 20, lookupMaxPages: 2, callTimeoutMs: 10_000, maxWaitMs: 60_000, sessionBudgetMs: 240_000, minAuthMarginMs: 6 * 3600_000, teardownGraceMs: 5_000 });
 export const OUTCOMES = freeze(["RECONCILED_CONFIRMED", "STOPPED", "REFUSED"]);
 const LISTING = freeze({ id: 606998, currency: "USD" });            // the ONLY listing / currency this runner accepts (TEST listing)
 const PLAN_KEYS = freeze(["attemptId", "createOpId", "currency", "expectedVersion", "from", "guests", "intentId", "listingId", "nativeExecClock",
@@ -77,6 +77,13 @@ export function validatePlanR1(p) {
  * starts after it, and it is re-checked after every awaited proof / step / DB read and immediately before success. An in-flight accepted worker
  * step is awaited (bounded by the executors' per-call bound + the worker's own step budget) — that is TEARDOWN GRACE, never success.
  */
+/** await `p` for at most `ms` (REAL timer). Resolves { done:true, value } | { done:false } (timeout) | { done:true, threw:true }. A late
+ *  settlement is swallowed and NEVER used. */
+function bounded(p, ms) {
+  let t = null;
+  const guarded = Promise.resolve().then(() => p).then((value) => ({ done: true, value }), () => ({ done: true, threw: true }));
+  return Promise.race([guarded, new Promise((res) => { t = setTimeout(() => res({ done: false }), ms); })]).finally(() => clearTimeout(t));
+}
 export async function runReconcileR1(opts = {}) {
   const { plan, pools, hostawaySend, clock, journalDir, uid, native, hooks = {} } = opts;
   const mono = typeof opts.monotonic === "function" ? opts.monotonic : () => performance.now();
@@ -89,12 +96,25 @@ export async function runReconcileR1(opts = {}) {
     getLog: [], violations: [], precheck: null, final: null, dbState: null, dbEvidence: null, exclusionAfter: "not_attempted", lock: "not_acquired",
     liveEffects: null, queuedEffects: null, cleanup: "NOT_HANDED_OFF", audit: "complete", journalHead: null, elapsedMs: null };
   let J = null; let lockClient = null; let lockAcquired = false; let ex = null; let onLockErr = null;
+  // R2: an `error` observed on the lock session LATCHES — fixed code only, never the error text (it may carry private data)
+  let lockSessionErrored = false;
+  // every append is bounded by the teardown grace; a timed-out append KILLS the journal for this run (no later append may interleave with it)
+  let journalDead = null;
   const audit = async (type, data) => {
     if (!J) return false;
-    let r; try { r = await J.append(type, clock(), data); } catch { r = { ok: false, code: "JOURNAL_APPEND_THREW" }; }
+    let r;
+    if (journalDead) r = { ok: false, code: journalDead };
+    else {
+      const b = await bounded(J.append(type, clock(), data), LIMITS.teardownGraceMs);
+      if (!b.done) { journalDead = "JOURNAL_APPEND_TIMEOUT"; r = { ok: false, code: journalDead }; }
+      else if (b.threw) r = { ok: false, code: "JOURNAL_APPEND_THREW" };
+      else r = b.value;
+    }
     if (!r || r.ok !== true) { if (R.audit === "complete") R.audit = `incomplete:${type}:${(r && r.code) || "UNKNOWN"}`; return false; }
     return true;
   };
+  /** the lock session is usable AND holds exactly our lock (latched session error vetoes) */
+  const lockOk = async () => !lockSessionErrored && (await ownLockProven(lockClient)) && !lockSessionErrored;
   const obs = () => { if (ex) { R.gets = ex.observe.gets; R.getLog = ex.observe.log; R.violations = ex.observe.violations; } };
   let outcome = "STOPPED"; let code = "INTERNAL_EXCEPTION";
   const set = (o, c) => { outcome = o; code = c; return null; };
@@ -122,13 +142,13 @@ export async function runReconcileR1(opts = {}) {
       if (!(await audit("NATIVE_VALIDATED", { relation: rc.relation, suppliedHead: rc.suppliedHead, chain: rc.chain.status, facts: rc.chain.facts }))) return set("REFUSED", "AUDIT_NATIVE_VALIDATED_FAILED");
       // ---- 3. native-run lock (session-level, report pool) ----------------------------------------------------------------------------
       try { lockClient = await pools.report.connect(); } catch { return set("REFUSED", "DB_CONNECT_FAILED"); }
-      onLockErr = (e) => { R.lockSessionError = String(e && e.message || e); };   // a server-killed backend emits `error` on a checked-out client — never uncaught
+      onLockErr = () => { lockSessionErrored = true; R.lockSession = "error_observed"; };   // fixed code only; never e.message / String(e)
       if (typeof lockClient.on === "function") lockClient.on("error", onLockErr);
       const lr = await lockClient.query("SELECT pg_try_advisory_lock(pg_catalog.hashtext($1), 0) AS ok", [LOCK_KEY]);
       if (lr.rows[0]?.ok !== true) return set("REFUSED", "RUN_LOCK_HELD");
       lockAcquired = true; R.lock = "held";
       const hk = freeze({ lockQuery: (sql, p) => lockClient.query(sql, p) });     // TEST hooks only (fault injection on THIS session)
-      if (!(await ownLockProven(lockClient))) return set("REFUSED", "LOCK_NOT_PROVEN");
+      if (!(await lockOk())) return set("REFUSED", lockSessionErrored ? "LOCK_SESSION_ERROR" : "LOCK_NOT_PROVEN");
       if (hooks.afterLock) await hooks.afterLock(hk);
       // ---- 4. read-only DB preflight + exclusion baseline -------------------------------------------------------------------------------
       const F0 = await factsOf(lockClient, plan.intentId); const ex0 = await exclusionOf(lockClient, plan.intentId);
@@ -156,7 +176,7 @@ export async function runReconcileR1(opts = {}) {
       for (let i = 1; i <= LIMITS.maxSteps && state !== "reservation_confirmed"; i++) {
         while (waitUntil !== null && clock() < waitUntil) { if (expired()) return set("STOPPED", "SESSION_DEADLINE"); await sleep(200); }
         if (expired()) return set("STOPPED", "SESSION_DEADLINE");
-        if (!(await ownLockProven(lockClient))) return set("STOPPED", "LOCK_LOST");
+        if (!(await lockOk())) return set("STOPPED", lockSessionErrored ? "LOCK_SESSION_ERROR" : "LOCK_LOST");
         if (hooks.beforeStep) await hooks.beforeStep(i, hk);
         let r;
         try {
@@ -169,6 +189,7 @@ export async function runReconcileR1(opts = {}) {
         R.steps.push({ step: i, status: r.status, actions: r.actions, sends: r.sends, state: s2 });
         R.dbState = s2;
         if (!(await audit("STEP", { step: i, status: r.status, actions: r.actions, sends: r.sends, state: s2, gets: ex.observe.gets }))) return set("STOPPED", "AUDIT_STEP_FAILED");
+        if (lockSessionErrored) return set("STOPPED", "LOCK_SESSION_ERROR");
         if (r.sends !== 0) return set("STOPPED", "WORKER_SENT_WRITE");               // unreachable by construction; recorded if ever
         if (ex.observe.stop) return set("STOPPED", ex.observe.stop.code);
         if (r.status === "refused") return set("STOPPED", `WORKER_REFUSED_${r.code}`);
@@ -183,6 +204,7 @@ export async function runReconcileR1(opts = {}) {
       if (hooks.afterReconciled) await hooks.afterReconciled(hk);
       // ---- 7. FINAL paired readback (after the DB reconciliation) + DB re-read ------------------------------------------------------------
       if (expired()) return set("STOPPED", "SESSION_DEADLINE");
+      if (lockSessionErrored) return set("STOPPED", "LOCK_SESSION_ERROR");
       const fin = await pairedRead(ex, cfg, plan, clock); obs();
       R.final = fin;
       if (!(await audit("FINAL_READ", fin))) return set("STOPPED", "AUDIT_FINAL_FAILED");
@@ -203,7 +225,7 @@ export async function runReconcileR1(opts = {}) {
       const fc = finalCheck(F1, plan);
       if (fc) return set("STOPPED", fc);
       if (R.exclusionAfter !== "equal") return set("STOPPED", "EXCLUSION_CHANGED");
-      if (!(await ownLockProven(lockClient))) return set("STOPPED", "LOCK_LOST");
+      if (!(await lockOk())) return set("STOPPED", lockSessionErrored ? "LOCK_SESSION_ERROR" : "LOCK_LOST");
       if (expired()) return set("STOPPED", "SESSION_DEADLINE_BEFORE_SUCCESS");
       R.cleanup = "REQUIRES_OWN_PLAN_AND_FRESH_PROOFS";                               // never "safe to clean"
       return set("RECONCILED_CONFIRMED", null);
@@ -213,26 +235,45 @@ export async function runReconcileR1(opts = {}) {
     try { if (lockClient) R.dbState = await stateOf(lockClient, R.intentId); } catch { /* reported as is */ }
   } finally {
     obs();
-    // (a) terminal record — a failed terminal append can never leave a success
+    // TEARDOWN GRACE: every await below is bounded (LIMITS.teardownGraceMs); the hard session deadline is re-checked after EACH teardown step and a
+    // provisional success is DOWNGRADED (journalled when the journal can still take a record; otherwise reported as an unjournalled downgrade).
+    const downgrade = (c) => { if (outcome === "RECONCILED_CONFIRMED") { outcome = "STOPPED"; code = c; } };
+    // (a) terminal record. For a success it is PROVISIONAL (teardown not yet done) — never a completion claim on its own.
     if (J) {
-      const ok = await audit(outcome === "RECONCILED_CONFIRMED" ? "ENDED" : outcome, { code });
-      if (!ok && outcome === "RECONCILED_CONFIRMED") { outcome = "STOPPED"; code = "TERMINAL_JOURNAL_FAILED"; }
-      if (R.audit !== "complete" && outcome === "RECONCILED_CONFIRMED") { outcome = "STOPPED"; code = "AUDIT_INCOMPLETE"; }
+      const ok = await audit(outcome === "RECONCILED_CONFIRMED" ? "ENDED" : outcome, outcome === "RECONCILED_CONFIRMED" ? { code, provisional: true } : { code });
+      if (!ok) downgrade("TERMINAL_JOURNAL_FAILED");
+      if (R.audit !== "complete") downgrade("AUDIT_INCOMPLETE");
     }
-    if (outcome !== "RECONCILED_CONFIRMED") R.cleanup = "NOT_HANDED_OFF";
-    // (b) lock release — checked; on failure / exception the connection is destroyed (server drops session locks) and that is reported
+    if (expired()) downgrade("SESSION_DEADLINE_AT_TERMINAL");
+    if (lockSessionErrored) downgrade("LOCK_SESSION_ERROR");
+    // (b) lock release — checked and bounded; a session error / failed / timed-out unlock DESTROYS the connection (server drops session locks)
     if (lockClient) {
-      if (lockAcquired) {
-        let released = false;
-        try { released = (await lockClient.query("SELECT pg_advisory_unlock(pg_catalog.hashtext($1), 0) AS ok", [LOCK_KEY])).rows[0]?.ok === true; } catch { released = false; }
+      if (lockAcquired && !lockSessionErrored) {
+        const u = await bounded(lockClient.query("SELECT pg_advisory_unlock(pg_catalog.hashtext($1), 0) AS ok", [LOCK_KEY]), LIMITS.teardownGraceMs);
+        const released = u.done && !u.threw && u.value && u.value.rows && u.value.rows[0]?.ok === true && !lockSessionErrored;
         if (released) { R.lock = "released"; try { lockClient.release(); } catch { /* */ } }
         else { R.lock = "unlock_failed_connection_destroyed"; try { lockClient.release(true); } catch { /* */ } }
-      } else { try { lockClient.release(); } catch { /* */ } }
-      if (onLockErr && typeof lockClient.removeListener === "function") lockClient.removeListener("error", onLockErr);
+      } else if (lockAcquired) { R.lock = "session_error_connection_destroyed"; try { lockClient.release(true); } catch { /* */ } }
+      else { try { lockClient.release(lockSessionErrored ? true : undefined); } catch { /* */ } }
+      // a POOLED client goes back without our listener (the pool owns idle errors); a DESTROYED one keeps it so a late error is never uncaught
+      if (R.lock === "released" && onLockErr && typeof lockClient.removeListener === "function") lockClient.removeListener("error", onLockErr);
       lockClient = null;
     }
-    // (c) journal close
-    if (J) { R.journalHead = J.head(); try { await J.close(); } catch { /* */ } }
+    if (lockSessionErrored) downgrade("LOCK_SESSION_ERROR");
+    if (expired()) downgrade("SESSION_DEADLINE_AT_RELEASE");
+    if (outcome !== "RECONCILED_CONFIRMED") R.cleanup = "NOT_HANDED_OFF";
+    // (c) TEARDOWN record (final outcome + lock disposition) then close — both bounded
+    if (J) {
+      if (!(await audit("TEARDOWN", { outcome, code, lock: R.lock }))) downgrade("TEARDOWN_JOURNAL_FAILED");
+      if (expired()) downgrade("SESSION_DEADLINE_AT_TEARDOWN_RECORD");
+      R.journalHead = J.head();
+      const c = await bounded(J.close(), LIMITS.teardownGraceMs);
+      if (!c.done || c.threw) downgrade("JOURNAL_CLOSE_FAILED");
+    }
+    if (expired() && outcome === "RECONCILED_CONFIRMED") {                       // nothing left to journal into: an HONEST unjournalled downgrade
+      downgrade("SESSION_DEADLINE_AFTER_CLOSE"); R.audit = "incomplete:AFTER_CLOSE:DOWNGRADE_NOT_JOURNALED";
+    }
+    if (outcome !== "RECONCILED_CONFIRMED") R.cleanup = "NOT_HANDED_OFF";
     R.elapsedMs = Math.round(mono() - t0);
   }
   R.outcome = outcome; R.code = code;
