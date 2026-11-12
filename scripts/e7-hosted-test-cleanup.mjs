@@ -66,10 +66,11 @@ export const CONSTANTS = Object.freeze({
   // worker: the happy cleanup is TWO steps (cancel leg: RES read → account → PI → ONE PUT → confirming RES read; refund leg: account → PI → ONE POST →
   // Refund GET → confirming PI read) with a 30 s wait between them; waits are honoured (capped). dbQueries = EVERY statement on the counted pool
   // (runner reads + the ONE request + worker + lock session). Measured on disposable PG16 with the REAL request + worker (test I1):
-  // 286 (ref echoed) / 318 (ref not echoed: + by-ref lookup pages) statements, 16 / 20 exchanges (Hostaway reads 4, lookup pages 0 / 4, account 3,
-  // PI 5, refund reads 2, lists 0), 2 steps; ceilings ≈ 3x the larger measured value (the worker's own per-kind read admission stays authoritative). Fail-closed past them.
-  budgets: Object.freeze({ steps: 16, cancel: 1, refund: 1, hostawayReads: 12, lookupPages: 12, accountReads: 9, piReads: 15, refundReads: 8, refundLists: 4,
-    exchanges: 60, dbQueries: 960, runMs: 15 * 60 * 1000, waitCapMs: 35 * 1000 }),
+  // 286 (ref echoed) / 318 (ref not echoed: + by-ref lookup pages) statements, 16 / 22 exchanges (Hostaway reads 4, lookup pages 0 / 6 incl. the runner's
+  // own F2 pre-request lookup, account 3, PI 5, refund reads 2, lists 0), 2 steps; ceilings ≈ 3x the larger measured value (the worker's own per-kind
+  // read admission stays authoritative). Fail-closed past them.
+  budgets: Object.freeze({ steps: 16, cancel: 1, refund: 1, hostawayReads: 12, lookupPages: 18, accountReads: 9, piReads: 15, refundReads: 8, refundLists: 4,
+    exchanges: 66, dbQueries: 960, runMs: 15 * 60 * 1000, waitCapMs: 35 * 1000 }),
   dbEnvironment: RES.dbEnvironment, dbProjectRef: RES.dbProjectRef, nodeVersion: RES.nodeVersion,
   synthetic: Object.freeze({ approvalRef: "SYNTHETIC-test-cleanup-preflight-not-for-execute", intentId: "00000000-0000-4000-8000-000000000000", expectedVersion: 8,
     notBefore: "2026-11-12T00:00:00.000Z", paymentIntentId: "pi_SYNTHETIC00000000000000", reservationId: "1", chargeId: "ch_SYNTHETIC00000000000000", capturedMinor: 1,
