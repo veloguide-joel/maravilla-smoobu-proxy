@@ -1,7 +1,8 @@
 -- e7-0019-0020-readback-v1.sql — PURE READ-ONLY. Run it BEFORE and AFTER the 0019+0020 apply wrapper and compare the JSON with the pins
--- (claude/e7-0019-0020-pins-v1.json: `pre` must equal the BEFORE identity keys, `post` the AFTER). It writes nothing, takes no lock (the advisory
+-- (claude/e7-0019-0020-pins-v1.json: `pre` must equal the BEFORE identity keys, `post` the AFTER; table_acls is canonical over the PG16 / PG17 owner
+-- MAINTAIN default, rls / policies cover the accepted RLS boundary). It writes nothing, takes no lock (the advisory
 -- probe only READS pg_locks), returns no guest field or credential. SCHEMA-OWNER ONLY in practice (booking_migrations has no app/admin/report USAGE).
--- `identity` = claude/e7-0019-0020-inventory.sql verbatim (sha256 2554b4d4488a4c38ad849d49415817b57439a642123206a90c17aa7320f0fed0); `exclusion` shows why an apply would refuse now
+-- `identity` = claude/e7-0019-0020-inventory.sql verbatim (sha256 891f3e2521dba0910739a93966c5392ecbee512d4a1e0138d2f6467103aab29d); `exclusion` shows why an apply would refuse now
 -- (active hosted-run lock, work / intent / operation leases, in-flight writes, 0019 vocabulary already present); `booking_tables_fingerprint`
 -- must be IDENTICAL before and after (zero booking-row writes).
 -- Expected BEFORE: identity.functions = 47e3409b3ca867cd8e36728b2e3d293ad0d963bf6c600b7e56345d4c3fe19b5e, migrations.max = 18, aggregate = a46acad20b6f259b07ee7749e5f2954ee4e7f9aa13caf8fc866a281d79ab351e, every identity.objects = false.
@@ -25,8 +26,19 @@ SELECT jsonb_build_object(
                      FROM pg_catalog.pg_indexes WHERE schemaname = 'booking'),
                  'columns', (SELECT encode(sha256(convert_to(coalesce(string_agg(table_name || '|' || column_name || '|' || data_type || '|' || coalesce(column_default, '') || '|' || is_nullable, E'\n' ORDER BY table_name, ordinal_position), ''), 'UTF8')), 'hex')
                      FROM information_schema.columns WHERE table_schema = 'booking'),
-                 'table_acls', (SELECT encode(sha256(convert_to(coalesce(string_agg(c.relname || '|' || coalesce(c.relacl::text, ''), E'\n' ORDER BY c.relname), ''), 'UTF8')), 'hex')
+                 -- table ACLs, CANONICAL and portable across the reviewed PG16 / PG17 owner-default difference (PG17 adds MAINTAIN `m` to the OWNER's default aclitem only):
+                 -- the owner's own aclitem is reduced to the marker `owner`; EVERY non-owner aclitem is kept verbatim (grantee=privileges/grantor), so any widened or
+                 -- extra non-owner grant (incl. a MAINTAIN grant to a non-owner) still changes the fingerprint; a NULL relacl (no explicit grants) is kept as `-`.
+                 'table_acls', (SELECT encode(sha256(convert_to(coalesce(string_agg(c.relname || '|' || coalesce((SELECT string_agg(CASE WHEN split_part(a.item, '=', 1) = pg_catalog.pg_get_userbyid(c.relowner) THEN 'owner' ELSE a.item END, ','
+                       ORDER BY CASE WHEN split_part(a.item, '=', 1) = pg_catalog.pg_get_userbyid(c.relowner) THEN 'owner' ELSE a.item END) FROM (SELECT unnest(c.relacl)::text AS item) a), '-'), E'\n' ORDER BY c.relname), ''), 'UTF8')), 'hex')
                      FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace s ON s.oid = c.relnamespace WHERE s.nspname = 'booking' AND c.relkind IN ('r', 'p', 'v')),
+                 -- the accepted RLS boundary: per-table relrowsecurity / relforcerowsecurity and EVERY policy (name, permissive, roles, command, USING, WITH CHECK)
+                 'rls', (SELECT encode(sha256(convert_to(coalesce(string_agg(c.relname || '|' || c.relrowsecurity::text || '|' || c.relforcerowsecurity::text, E'\n' ORDER BY c.relname), ''), 'UTF8')), 'hex')
+                     FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace s ON s.oid = c.relnamespace WHERE s.nspname = 'booking' AND c.relkind IN ('r', 'p')),
+                 'rls_enabled_count', (SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace s ON s.oid = c.relnamespace WHERE s.nspname = 'booking' AND c.relkind IN ('r', 'p') AND c.relrowsecurity),
+                 'policies', (SELECT encode(sha256(convert_to(coalesce(string_agg(tablename || '|' || policyname || '|' || permissive || '|' || coalesce(array_to_string(roles, ','), '') || '|' || cmd || '|' || coalesce(qual, '') || '|' || coalesce(with_check, ''), E'\n' ORDER BY tablename, policyname), ''), 'UTF8')), 'hex')
+                     FROM pg_catalog.pg_policies WHERE schemaname = 'booking'),
+                 'policy_count', (SELECT count(*) FROM pg_catalog.pg_policies WHERE schemaname = 'booking'),
                  'schema_owner', (SELECT pg_catalog.pg_get_userbyid(nspowner) FROM pg_catalog.pg_namespace WHERE nspname = 'booking'),
                  'is_privileged_src', (SELECT encode(sha256(convert_to(prosrc, 'UTF8')), 'hex') FROM pg_catalog.pg_proc WHERE oid = 'booking.is_privileged()'::regprocedure),
                  'is_privileged_config', (SELECT to_jsonb(proconfig) FROM pg_catalog.pg_proc WHERE oid = 'booking.is_privileged()'::regprocedure),

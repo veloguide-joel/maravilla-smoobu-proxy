@@ -25,7 +25,7 @@ const rd = (p) => readFileSync(join(ROOT, p), "utf8");
 const sha = (s) => createHash("sha256").update(s, "utf8").digest("hex");
 const WRAPPER = rd("claude/e7-0019-0020-sqleditor-apply-v1.sql"); const READBACK = rd("claude/e7-0019-0020-readback-v1.sql");
 const INVENTORY = rd("claude/e7-0019-0020-inventory.sql"); const PINS = JSON.parse(rd("claude/e7-0019-0020-pins-v1.json"));
-const IDENTITY_KEYS = ["functions", "function_count", "triggers", "trigger_count", "constraints", "indexes", "columns", "table_acls", "schema_owner", "is_privileged_src", "is_privileged_config", "test_cleanup_pending_state", "objects", "acls"];
+const IDENTITY_KEYS = ["functions", "function_count", "triggers", "trigger_count", "constraints", "indexes", "columns", "table_acls", "rls", "rls_enabled_count", "policies", "policy_count", "schema_owner", "is_privileged_src", "is_privileged_config", "test_cleanup_pending_state", "objects", "acls"];
 const identity = (inv) => Object.fromEntries(IDENTITY_KEYS.map((k) => [k, inv[k]]));
 const M = loadMigrations(); const m19 = M.find((m) => m.version === 19); const m20 = M.find((m) => m.version === 20);
 
@@ -41,7 +41,7 @@ async function clusterAt18() {
 }
 const inventory = async (c) => (await c.query(INVENTORY)).rows[0].e7_inventory;
 const readback = async (c) => (await c.query(READBACK)).rows[0].e7_1920_readback;
-const runWrapper = async (c) => { const res = await c.query(WRAPPER); return res[res.length - 3].rows[0].e7_1920_status; };   // SET; SET; DO; SELECT; RESET; RESET → the SELECT is third from last
+const runWrapper = async (c, text = WRAPPER) => { const res = await c.query(text); return res[res.length - 1].rows[0].e7_1920_status; };   // SET LOCAL; SET LOCAL; DO; SELECT → the SELECT is last
 const expectRaise = async (c, re) => { let msg = null; try { await runWrapper(c); } catch (e) { msg = e.message; } assert.ok(msg && re.test(msg), `expected ${re}, got ${msg}`); };
 const unchanged = async (c, pre) => { const inv = await inventory(c); assert.deepEqual(identity(inv), identity(pre), "schema identity unchanged after the refusal"); assert.equal(inv.migrations.max, 18); assert.deepEqual(inv.objects, PINS.pre.objects); };
 async function seedFixture(db) {
@@ -62,6 +62,8 @@ test("C0 deterministic assembly: the committed pins equal a fresh derivation on 
   assert.equal(emb19, m19.up, "0019 up embedded verbatim"); assert.equal(emb20, m20.up, "0020 up embedded verbatim");
   assert.equal(sha(INVENTORY), PINS.inventorySql);
   assert.ok(WRAPPER.includes(`hashtext('${LOCK_KEY}')`), "active-run exclusion uses the hosted runners' P3 lock key");
+  assert.ok(PRE.rls_enabled_count >= 20 && PRE.policy_count >= 50, `the accepted RLS boundary is part of the identity (${PRE.rls_enabled_count} RLS tables, ${PRE.policy_count} policies)`);
+  assert.ok(!/RESET |SET statement_timeout|SET lock_timeout/.test(WRAPPER.replace(/SET LOCAL/g, "")), "only SET LOCAL (caller session settings preserved)");
   assert.ok(!/DOWN|migrateDown|DROP TRIGGER|DROP FUNCTION booking\.(test_|settle_test)/.test(WRAPPER.replace(/\$e7_00(19|20)_up\$[\s\S]*?\$e7_00(19|20)_up\$/g, "")), "the wrapper itself runs no down and drops nothing outside the embedded ups");
   const out = execFileSync("python3", [join(ROOT, "claude/gen-0019-0020-wrapper.py"), ROOT], { encoding: "utf8" });  // asserts byte-identical (no --write)
   assert.ok(out.includes(`sqleditor-apply-v1.sql sha256: ${sha(WRAPPER)}`) && out.includes(`readback-v1.sql sha256: ${sha(READBACK)}`), out);
@@ -91,9 +93,44 @@ test("C1 refusals leave the schema unchanged: wrong environment marker; history 
   await A.c.query("GRANT EXECUTE ON FUNCTION booking.authorization_blockers(uuid) TO mv_booking_report");
   await expectRaise(A.c, /E7_1920_SCHEMA_IDENTITY_DRIFT:.*(functions|acls)/);
   await A.c.query("REVOKE EXECUTE ON FUNCTION booking.authorization_blockers(uuid) FROM mv_booking_report"); await unchanged(A.c, PRE);
+  // a widened NON-owner TABLE grant is identity drift (the canonical table ACL keeps every non-owner aclitem verbatim)
+  await A.c.query("GRANT INSERT ON booking.intents TO mv_booking_report");
+  await expectRaise(A.c, /E7_1920_SCHEMA_IDENTITY_DRIFT:.*table_acls/);
+  await A.c.query("REVOKE INSERT ON booking.intents FROM mv_booking_report"); await unchanged(A.c, PRE);
+  // the owner's OWN aclitem is the only thing the canonical ACL ignores: PG17's default adds MAINTAIN (m) there — emulated here on PG16 by revoking an owner privilege, which must NOT be drift
+  await A.c.query("REVOKE TRIGGER ON booking.api_rate_limits FROM postgres");
+  assert.equal((await inventory(A.c)).table_acls, PRE.table_acls, "owner-item-only change: canonical table ACL unchanged (portable over the PG16 / PG17 owner default)");
+  await A.c.query("GRANT TRIGGER ON booking.api_rate_limits TO postgres"); await unchanged(A.c, PRE);
 });
 
-test("C2 active-run / lease exclusion: a hosted runner's P3 session lock held elsewhere; a work lease; an intent lease; a leased operation; an in-flight write; a 0019 vocabulary row — each refuses with the schema unchanged", async () => {
+test("C1b (ROOT F2) the accepted RLS boundary is identity: DISABLE ROW LEVEL SECURITY on a table, FORCE RLS, an altered policy (USING false) and a dropped policy EACH refuse E7_1920_SCHEMA_IDENTITY_DRIFT before any migration / history write, schema unchanged", async () => {
+  { const B = await clusterAt18(); try { const pre = await inventory(B.c);
+      await B.c.query("ALTER TABLE booking.intents DISABLE ROW LEVEL SECURITY");
+      assert.notEqual((await inventory(B.c)).rls, pre.rls, "the inventory sees the disabled RLS");
+      await expectRaise(B.c, /E7_1920_SCHEMA_IDENTITY_DRIFT:.*rls/);
+      assert.equal((await B.c.query("SELECT count(*)::int AS n FROM booking_migrations.applied WHERE version >= 19")).rows[0].n, 0); assert.equal((await inventory(B.c)).migrations.max, 18);
+      await B.c.query("ALTER TABLE booking.intents ENABLE ROW LEVEL SECURITY"); await unchanged(B.c, pre);
+      await B.c.query("ALTER TABLE booking.intents FORCE ROW LEVEL SECURITY");
+      await expectRaise(B.c, /E7_1920_SCHEMA_IDENTITY_DRIFT:.*rls/);
+      await B.c.query("ALTER TABLE booking.intents NO FORCE ROW LEVEL SECURITY"); await unchanged(B.c, pre);
+    } finally { await B.end(); } }
+  { const B = await clusterAt18(); try { const pre = await inventory(B.c);
+      const pol = (await B.c.query("SELECT policyname, cmd, roles FROM pg_policies WHERE schemaname = 'booking' AND tablename = 'intents' ORDER BY policyname LIMIT 1")).rows[0];
+      await B.c.query(`ALTER POLICY ${pol.policyname} ON booking.intents USING (false)`);
+      assert.notEqual((await inventory(B.c)).policies, pre.policies, "the inventory sees the altered policy");
+      await expectRaise(B.c, /E7_1920_SCHEMA_IDENTITY_DRIFT:.*policies/);
+      assert.equal((await inventory(B.c)).migrations.max, 18);
+    } finally { await B.end(); } }
+  { const B = await clusterAt18(); try {
+      const pol = (await B.c.query("SELECT policyname FROM pg_policies WHERE schemaname = 'booking' AND tablename = 'external_operations' ORDER BY policyname LIMIT 1")).rows[0];
+      await B.c.query(`DROP POLICY ${pol.policyname} ON booking.external_operations`);
+      await expectRaise(B.c, /E7_1920_SCHEMA_IDENTITY_DRIFT:.*(policies|policy_count)/);
+      assert.equal((await inventory(B.c)).migrations.max, 18);
+      assert.equal((await B.c.query("SELECT to_regprocedure('booking.settle_test_refund_from_evidence(uuid,uuid)') IS NULL AS gone")).rows[0].gone, true, "no migration ran");
+    } finally { await B.end(); } }
+});
+
+test("C2 active-run / lease exclusion: a hosted runner's P3 session lock held elsewhere; then the ACCEPTED fixtures (dispatched: a reservation_pending intent holding its intent lease; claimOp: its create operation claimed in_flight) — the wrapper refuses while any lease / in-flight write exists; a clean cluster applies. Gate order is work → intent → operation, so with the real fixture the INTENT-lease code fires and the in_flight state is asserted through the readback indicator; the work-lease and operation-lease gate codes are exercised with owner-set leases; the 0019-vocabulary gate is NOT reachable at exactly 0018 (the 0018 CHECK constraints reject every 0019 value) and is reported through the readback indicator only", async () => {
   const holder = new pg.Client({ connectionString: A.db.adminUrl }); await holder.connect();
   try { await holder.query("SELECT pg_advisory_lock(pg_catalog.hashtext($1), 0)", [LOCK_KEY]);          // = the hosted runners' session lock
     await expectRaise(A.c, /E7_1920_ACTIVE_RUN_LOCK_HELD/); await unchanged(A.c, PRE);
@@ -104,18 +141,32 @@ test("C2 active-run / lease exclusion: a hosted runner's P3 session lock held el
     await seedFixture(B.db);
     const pre = await inventory(B.c);
     const intentId = (await B.c.query("SELECT id FROM booking.intents ORDER BY created_at LIMIT 1")).rows[0].id;
+    // work lease (owner-set, the accepted worker's claimWork shape)
     await B.c.query("UPDATE booking.intent_work SET work_worker_id = 'w-hold', work_lease_until = now() + interval '1 minute' WHERE intent_id = $1", [intentId]);
     await expectRaise(B.c, /E7_1920_ACTIVE_WORK_LEASE/); await unchanged(B.c, pre);
     await B.c.query("UPDATE booking.intent_work SET work_worker_id = NULL, work_lease_until = NULL WHERE intent_id = $1", [intentId]);
+    // operation lease (owner-set)
     const op = (await B.c.query("SELECT id FROM booking.external_operations WHERE state = 'pending' ORDER BY created_at LIMIT 1")).rows[0].id;
     await B.c.query("UPDATE booking.external_operations SET lease_worker_id = 'w-hold', lease_until = now() + interval '1 minute' WHERE id = $1", [op]);
     await expectRaise(B.c, /E7_1920_OPERATION_LEASED_OR_IN_FLIGHT/); await unchanged(B.c, pre);
     await B.c.query("UPDATE booking.external_operations SET lease_worker_id = NULL, lease_until = NULL WHERE id = $1", [op]);
-    // an intent lease / an in-flight row / a vocabulary row: the guards refuse direct edits of these columns, so they are asserted at the readback level
+    // the ACCEPTED dispatched fixture: RESERVATION_STARTED + RESERVATION_DISPATCHED → intent lease held, create op claimed in_flight (real worker state, not an owner edit)
+    const appPool = new pg.Pool({ connectionString: B.db.appUrl(), max: 2 }); let d;
+    try { d = await F.dispatched(appPool, { listingId: 606998, from: "2028-06-01", to: "2028-06-04", currency: "USD" }); const claimed = await F.claimOp(appPool, d.id, "hostaway.create_reservation", F.at(6)); assert.ok(claimed, "the accepted claimOp claimed the create operation"); }
+    finally { await appPool.end(); }
+    const facts = (await B.c.query(`SELECT (SELECT lease_worker_id IS NOT NULL FROM booking.intents WHERE id = $1) AS intent_lease,
+        (SELECT state FROM booking.external_operations WHERE id = $2) AS op_state, (SELECT work_worker_id IS NOT NULL FROM booking.intent_work WHERE intent_id = $1) AS work_lease`, [d.id, d.createOpId])).rows[0];
+    console.log("C2 dispatched fixture facts:", JSON.stringify(facts));
+    assert.deepEqual([facts.intent_lease, facts.op_state], [true, "in_flight"], "the accepted fixtures hold the intent lease and an in-flight create");
     const rb = await readback(B.c);
-    assert.deepEqual(rb.exclusion, { hosted_run_lock_held: false, work_leases: 0, intent_leases: 0, operation_leases_or_in_flight: 0, vocabulary_rows: 0 });
-    const r = await runWrapper(B.c); assert.deepEqual([r.migrations_max, r.v19, r.v20], [20, true, true], "clean after the leases are released");
+    assert.ok(rb.exclusion.intent_leases >= 1 && rb.exclusion.operation_leases_or_in_flight >= 1, JSON.stringify(rb.exclusion)); assert.equal(rb.exclusion.vocabulary_rows, 0);
+    await expectRaise(B.c, facts.work_lease ? /E7_1920_ACTIVE_WORK_LEASE/ : /E7_1920_ACTIVE_INTENT_LEASE/); await unchanged(B.c, pre);
+    assert.equal((await inventory(B.c)).migrations.max, 18);
+    // the dispatched intent is left as real accepted state; the clean apply is asserted on a cluster without it
   } finally { await B.end(); }
+  { const Cc = await clusterAt18(); try { await seedFixture(Cc.db); const rb = await readback(Cc.c);
+      assert.deepEqual(rb.exclusion, { hosted_run_lock_held: false, work_leases: 0, intent_leases: 0, operation_leases_or_in_flight: 0, vocabulary_rows: 0 });
+      const r = await runWrapper(Cc.c); assert.deepEqual([r.migrations_max, r.v19, r.v20], [20, true, true], "clean apply when nothing is leased / in flight"); } finally { await Cc.end(); } }
 });
 
 test("C3 held migrator xact lock → lock_timeout (55P03), schema unchanged; interruption AFTER both ups (forced tracking-row failure) rolls EVERYTHING back — no 0019 / 0020 function, trigger, index or row survives", async () => {
@@ -169,7 +220,7 @@ test("C4 healthy apply (fresh cluster, nonempty booking fixture): status 20 / bo
   } finally { await B.end(); }
 });
 
-test("C5 forward-only limits documented and real: after the wrapper, migrateDown 20 → 19 works on an UNUSED schema (disposable only), while a 0020-settled refund row makes 0020's down refuse by design; the wrapper never runs a down", async () => {
+test("C5 forward-only limits: after the wrapper, migrateDown 20 → 19 works on an UNUSED schema (disposable only) and re-applies; the wrapper embeds / runs no down. The USED-schema refusals (0020 down after a refund settled through it; 0019 down once its vocabulary is in use) are NOT exercised here — they are the merged down scripts' own guards (source asserted below); no claim beyond that", async () => {
   const B = await clusterAt18();
   try {
     await runWrapper(B.c);
@@ -188,11 +239,11 @@ test("C6 the time bound is REAL at the transport (ROOT local finding): RED contr
   await A.c.query("DO $$ BEGIN PERFORM pg_catalog.set_config($q$statement_timeout$q$, $q$20ms$q$, true); PERFORM pg_catalog.pg_sleep(0.1); END $$;");
   assert.ok(Date.now() - t0 >= 90, "the probe ran to completion: an in-DO statement_timeout is NOT a bound");
   // GREEN envelope: the same shape as the wrapper's head (SET as a separate statement BEFORE the DO, one multi-statement string)
-  let code = null; try { await A.c.query("SET statement_timeout = '100ms';\nDO $$ BEGIN PERFORM pg_catalog.pg_sleep(1); END $$;\nRESET statement_timeout;"); } catch (e) { code = e.code; }
-  assert.equal(code, "57014", "query_canceled by the envelope's statement_timeout");
-  assert.equal((await A.c.query("SHOW statement_timeout")).rows[0].statement_timeout, "0", "no session residue after the failed batch (implicit transaction rolled back)");
+  let code = null; try { await A.c.query("SET LOCAL statement_timeout = '100ms';\nDO $$ BEGIN PERFORM pg_catalog.pg_sleep(1); END $$;\nSELECT 1;"); } catch (e) { code = e.code; }
+  assert.equal(code, "57014", "query_canceled by the envelope's SET LOCAL statement_timeout (effective in the implicit transaction block of the batch)");
+  assert.equal((await A.c.query("SHOW statement_timeout")).rows[0].statement_timeout, "0", "no session residue after the failed batch");
   // GREEN actual wrapper: only the bound shortened (180s -> 20ms); the DO's own work (two migrations + two full inventories) cannot finish in 20 ms
-  const SHORT = WRAPPER.replace("SET statement_timeout = '180s';", "SET statement_timeout = '20ms';");
+  const SHORT = WRAPPER.replace("SET LOCAL statement_timeout = '180s';", "SET LOCAL statement_timeout = '20ms';");
   assert.notEqual(SHORT, WRAPPER); assert.equal(SHORT.split("20ms").length, 2);
   const preRows = (await A.c.query(READBACK)).rows[0].e7_1920_readback;
   code = null; try { await A.c.query(SHORT); } catch (e) { code = e.code; }
@@ -203,6 +254,14 @@ test("C6 the time bound is REAL at the transport (ROOT local finding): RED contr
   assert.equal((await A.c.query("SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory'")).rows[0].n, 0, "no advisory lock left behind");
   assert.deepEqual([(await A.c.query("SHOW statement_timeout")).rows[0].statement_timeout, (await A.c.query("SHOW lock_timeout")).rows[0].lock_timeout], ["0", "0"], "no session residue");
   assert.equal((await A.c.query("SELECT 1 AS ok")).rows[0].ok, 1, "the session is usable (no aborted-transaction state)");
-  // and the healthy wrapper on the same session still works afterwards
-  const B = await clusterAt18(); try { const st = await runWrapper(B.c); assert.equal(st.migrations_max, 20); } finally { await B.end(); }
+  // NON-DEFAULT session control (ROOT nonblocking point): a caller's pre-existing timeouts survive BOTH a failed and a healthy batch (SET LOCAL, no RESET)
+  await A.c.query("SET statement_timeout = '30s'"); await A.c.query("SET lock_timeout = '7s'");
+  code = null; try { await A.c.query(SHORT); } catch (e) { code = e.code; } assert.equal(code, "57014");
+  assert.deepEqual([(await A.c.query("SHOW statement_timeout")).rows[0].statement_timeout, (await A.c.query("SHOW lock_timeout")).rows[0].lock_timeout], ["30s", "7s"], "caller settings preserved after the failed batch");
+  const B = await clusterAt18();
+  try { await B.c.query("SET statement_timeout = '30s'"); await B.c.query("SET lock_timeout = '7s'");
+    const st = await runWrapper(B.c); assert.equal(st.migrations_max, 20);
+    assert.deepEqual([(await B.c.query("SHOW statement_timeout")).rows[0].statement_timeout, (await B.c.query("SHOW lock_timeout")).rows[0].lock_timeout], ["30s", "7s"], "caller settings preserved after the healthy batch");
+  } finally { await B.end(); }
+  await A.c.query("RESET statement_timeout"); await A.c.query("RESET lock_timeout");
 });

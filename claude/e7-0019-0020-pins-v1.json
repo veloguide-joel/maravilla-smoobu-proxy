@@ -1,6 +1,6 @@
 {
   "schema": "e7-0019-0020-pins-v1",
-  "inventorySql": "2554b4d4488a4c38ad849d49415817b57439a642123206a90c17aa7320f0fed0",
+  "inventorySql": "891f3e2521dba0910739a93966c5392ecbee512d4a1e0138d2f6467103aab29d",
   "files": {
     "up19": "734bbb221a2f6700a14b38d49960e62ecc16fe231d3a2712df41a520a13e886a",
     "down19": "af9dc54e6463233cd85fe78bb7457492dec7cb8d82500a9853f042517c4320e0",
@@ -10,6 +10,7 @@
     "name20": "test_refund_evidence_settlement"
   },
   "pre": {
+    "rls": "dcfc0098e03cb1da9ea3200fad12cbd23d777d6ad136c425bfcad0cd336d9932",
     "acls": {
       "booking.intents_safety_guard()": [
         "mv_booking_admin=X/postgres",
@@ -63,6 +64,7 @@
       "trg_recording_retirement_fence": false,
       "settle_test_refund_from_evidence": false
     },
+    "policies": "e19d4646894fc9b8d21688d8dd0433bcbdbfbcc9b06c69b781cc0e11f96e7148",
     "triggers": "6a4c0ef578357fae3ab945e0f18339eb8924369418b4556948777198b828e526",
     "functions": "47e3409b3ca867cd8e36728b2e3d293ad0d963bf6c600b7e56345d4c3fe19b5e",
     "migrations": {
@@ -75,18 +77,21 @@
       "all_env_test": true,
       "aggregate_1_18": "a46acad20b6f259b07ee7749e5f2954ee4e7f9aa13caf8fc866a281d79ab351e"
     },
-    "table_acls": "ac592f6a13039a3a3aec6495664c4819b51054c3dc139b7378276dfa58b30609",
+    "table_acls": "585c0e7f028e5dbbed41d34b7f224b880de0a01c652af6bba391a52f127e2955",
     "constraints": "fe6d751a95e084050b90ba66e3be09d524098083f3de157bb65973d825ed5b06",
+    "policy_count": 72,
     "schema_owner": "postgres",
     "trigger_count": 70,
     "function_count": 123,
     "is_privileged_src": "a14a1dc5befcd96d03ca1c7e28020c5b07b6d1b212510cc1ad715368bc43fb9d",
+    "rls_enabled_count": 28,
     "is_privileged_config": [
       "search_path=pg_catalog, pg_temp"
     ],
     "test_cleanup_pending_state": false
   },
   "post": {
+    "rls": "dcfc0098e03cb1da9ea3200fad12cbd23d777d6ad136c425bfcad0cd336d9932",
     "acls": {
       "booking.refund_claim_fence()": [
         "postgres=X/postgres"
@@ -166,6 +171,7 @@
       "trg_recording_retirement_fence": true,
       "settle_test_refund_from_evidence": true
     },
+    "policies": "e19d4646894fc9b8d21688d8dd0433bcbdbfbcc9b06c69b781cc0e11f96e7148",
     "triggers": "eeb4095b2ebc40d7235f8ea5e968b689b77ddb8fb81d513fa3a8cd7666def3f8",
     "functions": "5ad41abbb9cac6245b25b0f0f979171cbc44c4824866cba398c23d1b0a96a086",
     "migrations": {
@@ -190,12 +196,14 @@
       "all_env_test": true,
       "aggregate_1_18": "a46acad20b6f259b07ee7749e5f2954ee4e7f9aa13caf8fc866a281d79ab351e"
     },
-    "table_acls": "ac592f6a13039a3a3aec6495664c4819b51054c3dc139b7378276dfa58b30609",
+    "table_acls": "585c0e7f028e5dbbed41d34b7f224b880de0a01c652af6bba391a52f127e2955",
     "constraints": "9499e2f98ea64180b7d93fc821234dc1e03fe7e2faea606971a3acbc770aaed2",
+    "policy_count": 72,
     "schema_owner": "postgres",
     "trigger_count": 73,
     "function_count": 130,
     "is_privileged_src": "a14a1dc5befcd96d03ca1c7e28020c5b07b6d1b212510cc1ad715368bc43fb9d",
+    "rls_enabled_count": 28,
     "is_privileged_config": [
       "search_path=pg_catalog, pg_temp"
     ],
