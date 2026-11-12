@@ -526,6 +526,13 @@ export async function runReservationCore(input) {
       const raw = { query: (sql, params) => input.pool.query(sql, params) };
       const b = await bounded(readFacts(async (sql, params) => (await input.pool.query(sql, params)).rows, input.plan, input.tooling, raw));
       if (b.done && !b.threw) observe(b.value);
+      // F5: success is PROVISIONAL until this residual read is validated — a contradiction (ineligible state, non-pristine capture, released
+      //     claim, open case, id conflict) or an unavailable read downgrades to a fixed non-success code; the OBSERVED facts stay, the earlier
+      //     postcheck (which would claim the opposite) is dropped. Read-only: nothing is repaired.
+      if (r.outcome === "RESERVATION_CONFIRMED_INTERMEDIATE") {
+        const re = b.done && !b.threw ? checkEnd(b.value, input.plan, c) : "RESIDUAL_READ_UNAVAILABLE";
+        if (re) { r.outcome = "NOT_CONFIRMED"; r.code = re === "RESIDUAL_READ_UNAVAILABLE" ? re : `RESIDUAL_${re}`; r.postcheck = null; }
+      }
     }
     // (b) teardown: checked, bounded unlock on the dedicated session; a failed / errored / timed-out unlock destroys the connection (the server
     //     drops session locks) AND vetoes a clean success (F3b) — the observed facts above stay in the result

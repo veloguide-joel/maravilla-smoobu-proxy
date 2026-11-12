@@ -396,6 +396,27 @@ test("R4 (F4) lock topology: sessionLockUrl derives ONLY the same scoped pooler 
   assert.equal(typeof coreArgs.lockClientFactory, "function");
 });
 
+test("R5 (F5) success is PROVISIONAL until the teardown residual read agrees: a contradiction observed ONLY by the residual read (after a clean postcheck) → NOT_CONFIRMED / RESIDUAL_<code>, observed facts kept, no stale postcheck; an unavailable residual read → RESIDUAL_READ_UNAVAILABLE", async () => {
+  const run = async (mutate) => {
+    const w = world(); const pool = fakePool(w); const q = pool.query.bind(pool); let n = 0;
+    pool.query = async (sql, params) => { if (/e7hrs:instance/.test(sql) && w.status === "reservation_confirmed" && ++n === 2) mutate(w); if (w.residualThrow) throw new Error("SYNTHETIC_RESIDUAL_READ_FAILURE"); return q(sql, params); };
+    const tooling = { runOrchestratorStep: fakeWorker(w), loadIntent: async () => intentOf(w), createPhaseExecutors: EA.createPhaseExecutors, createStripeSend: T.createE7StripeTestSend, createHostawaySend: T.createE7HostawaySend,
+      validateAdapterConfig: HR.validateAdapterConfig, paymentIntentProofObservationV3: CP.paymentIntentProofObservationV3, stillAuthorizedV3Refusal: CP.stillAuthorizedV3Refusal, LOCK_KEY: LK.LOCK_KEY, LOCK_PRECHECK_SQL: LK.LOCK_PRECHECK_SQL };
+    const r = await E.runReservationCore({ plan: plan(), pool, lockClientFactory: () => pool.lock(), tooling, exchanges: exchanges(w), credentials: { stripe: () => "sk_test_Fake1", hostaway: () => "x" }, sleep: async () => {},
+      clock: () => Date.UTC(2026, 10, 12, 16, 0, 0) + (w.tick = (w.tick ?? 0) + 1000) });
+    assert.equal(n, 2, "the residual read happened"); return [r, w];
+  };
+  { const [r] = await run((w) => { const cap = w.ops.find((o) => o.op_type === "stripe.capture_payment_intent"); Object.assign(cap, { state: "dispatched", attempts: 1, dispatched: true }); });
+    assert.deepEqual([r.outcome, r.code, r.postcheck, r.captureQueuedPristine, r.finalState, r.reservationId, r.lock], ["NOT_CONFIRMED", "RESIDUAL_CAPTURE_NOT_PRISTINE", null, false, "reservation_confirmed", RID, "released"], JSON.stringify(r)); }
+  { const [r] = await run((w) => { w.claimReleased = true; });
+    assert.deepEqual([r.outcome, r.code, r.postcheck, r.finalState], ["NOT_CONFIRMED", "RESIDUAL_CLAIM_NOT_HELD", null, "reservation_confirmed"], JSON.stringify(r)); }
+  { const [r] = await run((w) => { w.status = "capture_failed"; });
+    assert.deepEqual([r.outcome, r.code, r.postcheck, r.finalState, r.factsObserved], ["NOT_CONFIRMED", "RESIDUAL_STATE_NOT_CONFIRMED", null, "capture_failed", true], JSON.stringify(r)); }
+  { const [r] = await run((w) => { w.residualThrow = true; });                                                                  // unavailable residual read
+    assert.deepEqual([r.outcome, r.code, r.postcheck], ["NOT_CONFIRMED", "RESIDUAL_READ_UNAVAILABLE", null], JSON.stringify(r)); }
+  { const w = world(); const r = await core(w); assert.deepEqual([r.outcome, r.postcheck?.claimHeld], ["RESERVATION_CONFIRMED_INTERMEDIATE", true]); } // agreement → success stands
+});
+
 // ---------------------------------------------------------------------------------------------------------------------------------
 // OPT-IN INTEGRATION (E7_HRS_DB_TESTS=1; tooling with its pinned pg; PG_BIN): the REAL merged runOrchestratorStep (E7.2 + PR56 lease fix), repo,
 // operations, transports and executor adapters on a disposable PostgreSQL (tooling test/db/harness.mjs). FAKE exchanges ONLY; fixtures through
