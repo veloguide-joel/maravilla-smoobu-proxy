@@ -541,6 +541,34 @@ test("mapping: every response/lookup assumption not stated in the docs is labell
   assert.equal(DIRECT_CHANNEL_ID, 2000);
 });
 
+function assertClosurePathOnly(source, label) {
+  // Preserve quoted strings while removing comments, including comments between import/export tokens.
+  const code = source.replace(/("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)|\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g,
+    (match, quoted) => quoted ?? " ");
+  assert.doesNotMatch(code, /^\s*import\b[^;]*hostaway-reservations/m, `${label}: no static import of the adapter`);
+  assert.doesNotMatch(code, /^\s*export\b[^;]*\bfrom\s*["'][^"']*hostaway-reservations/m, `${label}: no re-export of the adapter`);
+  assert.doesNotMatch(code, /\b(?:createRequire|require)\b/, `${label}: no require or require factory`);
+  for (const call of code.matchAll(/\bimport\s*\(/g)) {
+    const literal = /^\s*(["'])(node:[^"']+|\.\/[^"'/]+)\1\s*\)/.exec(code.slice(call.index + call[0].length));
+    assert.ok(literal && !literal[2].includes("hostaway-reservations"), `${label}: dynamic imports must be literal node modules or siblings, never the adapter`);
+  }
+  assert.match(code, /"lib\/hostaway-reservations\.js"/, `${label}: names the adapter path as a closure string`);
+}
+
+test("closure-only containment rejects commented exports, require factories and computed imports", () => {
+  const path = 'const paths = ["lib/hostaway-reservations.js"];\n';
+  assert.doesNotThrow(() => assertClosurePathOnly(path + 'const load = () => import(/* permitted comment */ "node:fs/promises");', "fixture"));
+  for (const bad of [
+    'export { normalizeReservation } from /* c */ "../../lib/hostaway-reservations.js";',
+    'export * from "../../lib/hostaway-reservations.js";',
+    'import { createRequire as CR } from "node:module"; CR(import.meta.url)("../../lib/hostaway-reservations.js");',
+    'module.require("../../lib/hostaway-reservations.js");',
+    'for (const f of paths) await import(new URL("../../" + f, import.meta.url));',
+    'await import("../../lib/" + "hostaway-reservations.js");',
+    'await import("./hostaway-reservations.js");'
+  ]) assert.throws(() => assertClosurePathOnly(path + bad, "fixture"), /no re-export|no require|dynamic imports/);
+});
+
 test("containment: the adapter is pure and unreachable — no imports, network, env, timers or callers", () => {
   const src = readFileSync(join(ROOT, "lib/hostaway-reservations.js"), "utf8");
   const code = src.replace(/\/\/.*$/gm, "").replace(/"(?:[^"\\]|\\.)*"/g, '""');
@@ -573,10 +601,7 @@ test("containment: the adapter is pure and unreachable — no imports, network, 
   for (const pathOnly of ["scripts/e4-write-runner/happy-preflight.mjs", "scripts/e7-connected/run-binding-r1.mjs", "scripts/e7-connected/run-plan-cli-main.mjs",
     "scripts/e7-connected/run-plan-v1.mjs"]) {
     const s = readFileSync(join(ROOT, pathOnly), "utf8");
-    assert.doesNotMatch(s, /^\s*import\b[^;]*hostaway-reservations/m, `${pathOnly}: no static import of the adapter`);
-    assert.doesNotMatch(s, /^\s*export\b[^;]*\bfrom\s*["'][^"']*hostaway-reservations/m, `${pathOnly}: no re-export of the adapter`);
-    assert.doesNotMatch(s, /\bimport\s*\([^)]*hostaway-reservations|\brequire\s*\([^)]*hostaway-reservations/, `${pathOnly}: no dynamic import / require of the adapter`);
-    assert.match(s, /"lib\/hostaway-reservations\.js"/, `${pathOnly}: names the adapter path as a closure string`);
+    assertClosurePathOnly(s, pathOnly);
   }
   // nothing under api/ references the worker or the adapter
   const apiRefs = [];
