@@ -229,3 +229,49 @@ test("S-8 the deadline passes DURING the final (confirming) evidence read → th
   for (let k = 0; k < 2; k++) await nextSession(b, w);
   assert.deepEqual([w.calls.createOfflineCharge, w.charges.length, await notifies(b.id)], [1, 1, 0]);
 });
+
+// ---------------------------------------------------------------------------------------------
+// ROOT 5883086133 F1 — exact reproductions: a stop newly observed AFTER the admitted reply and BEFORE the completion must not be crossed
+// by fresh proof / completion. The sent write stays an uncertain lineage (outcome_unknown + case), one provider write ever, no completion, no
+// success event, no notification; already-committed read rows / evidence are kept as truth; a later session never resends.
+
+const uncertainLineage = async (b, w, r, label) => {
+  assert.ok(!r.actions.includes("COMPLETED") && !r.actions.some((a) => a.startsWith("RECORDED")), `${label}: ${JSON.stringify(r.actions)}`);
+  assert.ok(r.actions.some((a) => /^UNKNOWN:CONFIRM_STOPPED_(SIGNAL|DEADLINE)$/.test(a)), `${label}: ${JSON.stringify(r.actions)}`);
+  const op = await recording(b.id);
+  assert.deepEqual([r.writes, w.calls.createOfflineCharge, w.charges.length, op.state, op.settled_evidence_id, await unknownCase(b.id), (await intentRow(b.id)).state, await notifies(b.id)],
+    [1, 1, 1, "outcome_unknown", null, 1, "payment_captured", 0], label);
+  for (let k = 0; k < 2; k++) { const n = await nextSession(b, w); assert.ok(n.actions.includes("STOP:RECORDING_OUTCOME_UNKNOWN"), `${label}: ${JSON.stringify(n.actions)}`); }
+  assert.deepEqual([w.calls.createOfflineCharge, w.charges.length, await notifies(b.id), (await recording(b.id)).state], [1, 1, 0, "outcome_unknown"], `${label}: later sessions`);
+};
+
+test("S-9 ROOT repro A: a stop in afterConfirmEvidence (SIGNAL and DEADLINE) → no completion after the stop; uncertain lineage; one write ever; no notify", async () => {
+  { const b = await booking(); const w = world(b); const ac = new AbortController();
+    const r = await step(b, w, { signal: ac.signal, hooks: { afterConfirmEvidence: async () => ac.abort() } });
+    assert.deepEqual(r.stop, { code: "SIGNAL", where: "before_complete" }, JSON.stringify(r.actions));
+    await uncertainLineage(b, w, r, "A/signal"); }
+  { const b = await booking(); const w = world(b); const c = fakeClock(Date.now(), { live: true });
+    const r = await step(b, w, { clock: c.read, deadlineAt: Date.now() + 20 * 1000, hooks: { afterConfirmEvidence: async () => c.arm(30000, Date.now()) } });
+    assert.deepEqual(r.stop, { code: "DEADLINE", where: "before_complete" }, JSON.stringify(r.actions));
+    await uncertainLineage(b, w, r, "A/deadline"); }
+});
+
+test("S-10 ROOT repro B: a stop during the post-reply loadFacts proof (real pool wrapper; no hook) (SIGNAL and DEADLINE) → no fresh proof / completion after the stop; uncertain lineage", async () => {
+  /** real db.app pool whose query() fires `onIntentsSelect` once, after the first SELECT touching booking.intents once armed, BEFORE returning the awaited result */
+  const wrapped = (onIntentsSelect) => { const st = { armed: false, fired: false }; const pool = {
+    query: async (...a) => { const r = await db.app.query(...a); const sql = typeof a[0] === "string" ? a[0] : a[0]?.text ?? "";
+      if (st.armed && !st.fired && /SELECT[\s\S]*booking\.intents\b/.test(sql)) { st.fired = true; await onIntentsSelect(); } return r; },
+    connect: (...a) => db.app.connect(...a) }; return { pool, st }; };
+  { const b = await booking(); const ac = new AbortController();
+    const { pool, st } = wrapped(async () => ac.abort());
+    const w = world(b, { list: (req, ww) => { if (ww.calls.listOfflineCharges === 2) st.armed = true; return ww.listReply(); } });   // armed by the confirming read
+    const r = await step(b, w, { pool, signal: ac.signal });
+    assert.ok(st.fired && r.stop?.code === "SIGNAL" && r.stop.where === "after_confirm_facts", JSON.stringify([st, r.stop, r.actions]));
+    await uncertainLineage(b, w, r, "B/signal"); }
+  { const b = await booking(); const c = fakeClock(Date.now(), { live: true });
+    const { pool, st } = wrapped(async () => c.arm(30000, Date.now()));
+    const w = world(b, { list: (req, ww) => { if (ww.calls.listOfflineCharges === 2) st.armed = true; return ww.listReply(); } });
+    const r = await step(b, w, { pool, clock: c.read, deadlineAt: Date.now() + 20 * 1000 });
+    assert.ok(st.fired && r.stop?.code === "DEADLINE" && r.stop.where === "after_confirm_facts", JSON.stringify([st, r.stop, r.actions]));
+    await uncertainLineage(b, w, r, "B/deadline"); }
+});
