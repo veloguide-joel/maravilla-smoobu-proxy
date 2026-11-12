@@ -15,12 +15,13 @@
 //     ROOT-pinned trusted head (from captured native stdout), and the frozen core re-reads the same chain with the accepted reader requiring
 //     AT_ESCROW_HEAD + MATCH_TIP — the tip hash covers every record (incl. `at`), so both reads are tied to identical bytes. The native
 //     package / journal / head are only READ (bounded O_NOFOLLOW); they never authorize create / abort / cleanup.
-//   * Not used: runR1Launch / runPreflightR1 (they bind at NOW and call Stripe). Reconciliation makes ZERO Stripe calls and needs no Stripe
-//     credential; the package's Stripe account is historical bound identity only. Hostaway identity / auth is proven only by the allowed exact
-//     reservation GETs. The PI authorization margin is from DB facts (Stripe unobserved), as the core labels it.
+//   * Not used: runR1Launch / runPreflightR1 (they bind at NOW and call Stripe). Reconciliation makes ZERO Stripe calls and builds no Stripe
+//     transport. ROOT F1: the owner's dual-key provider file IS read with the accepted reader (needs both, exact key set); the Stripe test key
+//     stays a private capability that is never used, passed or output. The package's Stripe account is historical bound identity only.
+//     Hostaway identity / auth is proven only by the allowed exact reservation GETs. The PI authorization margin is from DB facts (Stripe unobserved), as the core labels it.
 //   * Nothing secret is placed in any result; owner values are passed only as capabilities. No retry / fallback / adopt / resume / repair.
 import { createHash } from "node:crypto";
-import { lstat as fspLstat, mkdir as fspMkdir } from "node:fs/promises";
+import { lstat as fspLstat, mkdir as fspMkdir, realpath as fspRealpath } from "node:fs/promises";
 import path from "node:path";
 import { runReconcileR1, validatePlanR1 } from "./reconcile-core-r1.mjs";
 import { RUN_ID_RE } from "./reconcile-journal-r1.mjs";
@@ -61,6 +62,8 @@ export function runDirsOk(nativeRunDir, reconcileRunDir, repoRoot) {
 async function ownDir(p, uid) {
   try { const st = await fspLstat(p); return st.isDirectory() && !st.isSymbolicLink() && st.uid === uid && (st.mode & 0o077) === 0; } catch { return false; }
 }
+/** canonical: the resolved real path equals the literal path (no symlink anywhere in its ancestry) */
+async function canonical(p) { try { return (await fspRealpath(p)) === p; } catch { return false; } }
 async function absent(p) { try { await fspLstat(p); return false; } catch (e) { return !!e && e.code === "ENOENT"; } }
 
 /** PURE: the ROOT-pinned recovery plan (canonical JSON bytes, no trailing newline) → { ok, plan } | { ok:false, code } */
@@ -121,8 +124,8 @@ const refused = (stage, code, extra = {}) => freeze({ stage, code, result: sanit
  * runReconcileLaunch({ flags, nat, proc, hooks, repoRoot, envSnapshot, interrupted }) → Promise<{ stage, code, result }>; never rejects.
  *   hooks (IN-PROCESS ONLY, never selectable from argv / env): { exchanges?: { hostaway }, loopbackEndpointsForTests?, core?: { monotonic, sleep },
  *   beforeStage?(stage) } — default: the real https exchange and ONLY the two exact DEV endpoints.
- *   interrupted(): true once the first SIGINT / SIGTERM arrived — checked at every stage boundary BEFORE the core; the frozen core itself is
- *   bounded by its hard session deadline + teardown grace (it takes no signal).
+ *   interrupted(): true once the first SIGINT / SIGTERM arrived — checked at every stage boundary BEFORE the core; `signal` (aborted by the
+ *   same first signal) is passed INTO the core (PR63 S1): no new GET / step / success after it → STOPPED / INTERRUPTED.
  */
 export async function runReconcileLaunch(input) {
   const { flags, nat, proc, hooks, repoRoot } = input;
@@ -139,7 +142,14 @@ export async function runReconcileLaunch(input) {
   const priv = path.dirname(path.dirname(flags.nativeRunDir));
   const nativeId = path.basename(flags.nativeRunDir);
   const dirs = { package: `${flags.nativeRunDir}/package`, journal: `${flags.nativeRunDir}/journal`, head: `${flags.nativeRunDir}/head` };
-  for (const d of [priv, path.dirname(flags.nativeRunDir), flags.nativeRunDir, dirs.package, dirs.journal, dirs.head]) if (!(await ownDir(d, uid))) return refused("namespace", "RUN_DIR_UNSAFE");
+  // PR63 N1: EVERY namespace dir must be canonical (realpath === path: no symlinked ancestor anywhere) AND an own-uid private real dir;
+  // the repo exclusion is re-checked on the RESOLVED repo root. No chmod / repair / adopt.
+  for (const d of [priv, path.dirname(flags.nativeRunDir), flags.nativeRunDir, dirs.package, dirs.journal, dirs.head]) {
+    if (!(await canonical(d))) return refused("namespace", "RUN_DIR_NOT_CANONICAL");
+    if (!(await ownDir(d, uid))) return refused("namespace", "RUN_DIR_UNSAFE");
+  }
+  let realRepo; try { realRepo = await fspRealpath(repoRoot); } catch { return refused("namespace", "REPO_ROOT_UNRESOLVED"); }
+  if (runDirsOk(flags.nativeRunDir, flags.reconcileRunDir, realRepo)) return refused("namespace", "RUN_DIR_INSIDE_REPO");
   if (!(await absent(flags.reconcileRunDir))) return refused("namespace", "RECONCILE_RUN_DIR_EXISTS");
   // ---- (3) ROOT-pinned recovery plan -----------------------------------------------------------------------------------------------------
   if (await stage("plan")) return refused("plan", "INTERRUPTED");
@@ -166,6 +176,15 @@ export async function runReconcileLaunch(input) {
   if (bindingKindV2(B) !== "r1") return refused("package", "BINDING_UNVERIFIED");
   if (B.identity.runId !== nativeId || B.identity.intentId !== flags.intent || B.manifest.intentId !== flags.intent) return refused("package", "PACKAGE_IDENTITY_MISMATCH");
   if (B.r1.paymentIntentId !== plan.paymentIntentId) return refused("package", "PACKAGE_PI_MISMATCH");
+  // PR63 P1: EVERY shared original scope field of the ROOT-pinned recovery plan must equal the VERIFIED native package (deliberate map).
+  // version / createOpId / attemptId / reservationId are NOT package fields: separately pinned and checked by the core's preflight under its lock.
+  // Account / DB identity stays the package's historical bound scope (never replaced by DB facts); the amount covers the bound quote total.
+  const M = B.manifest;
+  const scope = [["ref", plan.ref, M.expectedRef], ["listingId", plan.listingId, M.listing.id], ["currency", plan.currency, M.listing.currency],
+    ["refFieldId", plan.refFieldId, M.listing.refFieldId], ["from", plan.from, M.stay.arrival], ["to", plan.to, M.stay.departure],
+    ["guests", plan.guests, M.stay.guests], ["totalMinor", plan.totalMinor, M.amountMinor], ["rateBps", plan.rateBps, M.pricing.rateBps],
+    ["intentId", plan.intentId, M.intentId], ["facts.listingId", plan.listingId, B.facts.listingId], ["facts.amountMinor", plan.totalMinor, B.facts.amountMinor]];
+  for (const [k, a, b] of scope) if (a !== b) return refused("package", "PACKAGE_SCOPE_MISMATCH", { field: k });
   // ---- (5) historical provenance of the native journal (read once, bounded, read-only) -----------------------------------------------
   if (await stage("provenance")) return refused("provenance", "INTERRUPTED");
   const [seqS, hash] = flags.expectTrustedHead.split(":");
@@ -176,7 +195,7 @@ export async function runReconcileLaunch(input) {
   const pv = checkNativeProvenance({ bytes: jbytes, binding: B, trustedHead, nativeExecClock: plan.nativeExecClock, now: proc.now() });
   if (!pv.ok) return refused("provenance", pv.code);
   const provenance = { records: pv.records, firstAt: pv.firstAt, lastAt: pv.lastAt, trustedHead: { seq: trustedHead.seq, hash: trustedHead.hash }, historicalClock: plan.nativeExecClock };
-  // ---- (6) owner file ingress: Hostaway credential ONLY (no Stripe), DB logins, endpoint policy, CA ------------------------------------
+  // ---- (6) owner file ingress: dual-key provider file (Hostaway token used; Stripe key read, never used), DB logins, endpoint policy, CA ------------------------------------
   if (await stage("owner-files")) return refused("owner-files", "INTERRUPTED", { provenance });
   // The accepted reader requires the file's EXACT key set; the owner's existing provider file holds BOTH keys (native run), so it is read with
   // both needs. The Stripe test key stays a non-enumerable capability that is NEVER passed to any transport / result (no Stripe transport
@@ -224,7 +243,8 @@ export async function runReconcileLaunch(input) {
   try {
     r = await runReconcileR1({ plan, pools: { app: pools.app, report: pools.report }, hostawaySend: th.transport.send, clock: () => proc.now(),
       monotonic: hooks && hooks.core && hooks.core.monotonic ? hooks.core.monotonic : () => proc.monotonic(), ...(hooks && hooks.core && hooks.core.sleep ? { sleep: hooks.core.sleep } : {}),
-      journalDir: jdir, uid, native: { packageInput: r1, journalDir: dirs.journal, headDir: dirs.head, trustedHead } });
+      journalDir: jdir, uid, native: { packageInput: r1, journalDir: dirs.journal, headDir: dirs.head, trustedHead },
+      ...(input.signal instanceof AbortSignal ? { signal: input.signal } : {}) });
   } catch { r = null; }
   const pe = await endPools();
   const code = r === null ? "CORE_FAILED" : r.outcome;

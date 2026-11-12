@@ -8,8 +8,9 @@
 //     the fixed-specifier imports of the accepted native adapters / env evaluation → accepted env evaluation → the launch wiring.
 //   * The native R1 lists (NATIVE_EXEC_SOURCES / RUN_PLAN_CLOSURE / R1_EXECUTOR_CLOSURE), the stager and every reviewed pin are UNCHANGED; this
 //     closure is its OWN list and digest.
-//   * Signals: the first SIGINT / SIGTERM is recorded and stops the launch at the next stage boundary BEFORE the core; once the frozen core
-//     runs it is bounded by its own hard deadline + teardown grace (it takes no signal). A second signal → terminal exit 130 (tail uncertain).
+//   * Signals: the first SIGINT / SIGTERM aborts the session AbortSignal: before the core → refused at the next stage boundary; inside the core
+//     (PR63 S1) → no new GET / step / success, late replies dropped, in-flight accepted work awaited (bounded), STOPPED / INTERRUPTED. A second
+//     signal → terminal exit 130 (tail uncertain).
 //   * Output: ONE stdout line = whitelisted result + exitCode. No path, content, error text, credential or env value is echoed.
 import process from "node:process";
 import { constants as FS_CONSTANTS } from "node:fs";
@@ -182,12 +183,12 @@ async function run(proc, hooks) {
     try { L = await hooks.importLaunch(); } catch { return say("BOOT_IMPORT_FAILED"); }
     if (typeof L.runReconcileLaunch !== "function") return say("BOOT_IMPORT_FAILED");
     // ---- signals --------------------------------------------------------------------------------------------------------------------
-    let signals = 0;
-    const onSig = () => { signals += 1; if (signals >= 2) exitOnce(EXIT_CODES.SIGNAL_TERMINAL); };
+    let signals = 0; const ac = new AbortController();
+    const onSig = () => { signals += 1; if (signals === 1) { try { ac.abort(); } catch { /* contained */ } return; } exitOnce(EXIT_CODES.SIGNAL_TERMINAL); };
     try { proc.onSignal("SIGINT", onSig); proc.onSignal("SIGTERM", onSig); } catch { return say("FAILED"); }
     const nat = N.createNativeAdapters({ platform, uid, constants: fsc, gate: () => { if (signals >= 2) throw new Error("e7-terminal"); } });
     let out;
-    try { out = await L.runReconcileLaunch({ flags, nat, proc, hooks: hooks.launch || null, repoRoot: hooks.repoRoot, envSnapshot, interrupted: () => signals > 0 }); }
+    try { out = await L.runReconcileLaunch({ flags, nat, proc, hooks: hooks.launch || null, repoRoot: hooks.repoRoot, envSnapshot, interrupted: () => signals > 0, signal: ac.signal }); }
     catch { return say("FAILED", { reconcileDigest: digest }); }
     const o = out.stage !== "run" ? "REFUSED" : out.code === "RECONCILED_CONFIRMED" ? "RECONCILED" : out.code === "REFUSED" ? "REFUSED" : out.code === "STOPPED" ? "STOPPED" : "FAILED";
     return emit({ outcome: o, stage: out.stage, code: out.code, reconcileDigest: digest, interrupted: signals > 0, result: out.result }, EXIT_CODES[o]);

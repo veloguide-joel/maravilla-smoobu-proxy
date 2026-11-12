@@ -627,7 +627,7 @@ async function reconcile(S, o = {}) {
     setTimer: (fn, ms) => setTimeout(fn, ms), clearTimer: (id) => clearTimeout(id),
     stdout: { once: () => {}, write: (s, cb) => { X.out.push(s); cb(); return true; } }, exit: (c) => { if (X.code === null) X.code = c; }, setExitCode: () => {},
     now: o.now ?? (() => S.clock()) };
-  const hooks = { ...RC.defaultHooks(), launch: { exchanges: { hostaway: S.t.x.hostaway }, loopbackEndpointsForTests: o.loopback ?? true,
+  const hooks = { ...RC.defaultHooks(), launch: { exchanges: { hostaway: o.wrapExchange ? o.wrapExchange(X, S.t.x.hostaway) : S.t.x.hostaway }, loopbackEndpointsForTests: o.loopback ?? true,
     ...(o.beforeStage ? { beforeStage: (st) => o.beforeStage(st, X) } : {}), ...(o.core ? { core: o.core } : {}) } };
   await RC.main(X.proc, hooks);
   X.line = X.out.length === 1 ? JSON.parse(X.out[0]) : null;
@@ -676,7 +676,8 @@ test("RC2 refusals BEFORE any secret / DB / new dir: plan hash / runId / intent 
   { const c = copyNs(S); chmodSync(join(c.ndir, "journal"), 0o750);
     const X = await reconcile(S, { provider: noSecret, priv: c.priv, ndir: c.ndir }); assert.deepEqual([X.line.stage, X.line.code], ["namespace", "RUN_DIR_UNSAFE"]); }
   { const c = copyNs(S); const real = join(c.priv, "elsewhere"); renameSync(join(c.ndir, "journal"), real); symlinkSync(real, join(c.ndir, "journal"));
-    const X = await reconcile(S, { provider: noSecret, priv: c.priv, ndir: c.ndir }); assert.deepEqual([X.line.stage, X.line.code], ["namespace", "RUN_DIR_UNSAFE"]); }
+    const X = await reconcile(S, { provider: noSecret, priv: c.priv, ndir: c.ndir }); assert.equal(X.line.stage, "namespace");
+    assert.ok(["RUN_DIR_UNSAFE", "RUN_DIR_NOT_CANONICAL"].includes(X.line.code), X.line.code); }            // PR63 N1: the canonical check now fires first
   assert.equal(await dbSnap(S.bk.id), snap, "zero DB writes"); assert.equal(nativeFiles(S), nf, "native files untouched");
 });
 
@@ -731,4 +732,94 @@ test("RC5 signals + bounded teardown: first SIGINT before the core → REFUSED I
     assert.deepEqual([X.line.outcome, X.code, X.line.result.run.outcome, X.line.result.run.steps], ["STOPPED", 6, "STOPPED", 0], JSON.stringify(X.line));
     assert.deepEqual(X.line.result.teardown.pools, { app: "ended", report: "ended" }); }
   assert.equal(await dbSnap(S.bk.id), snap); assert.equal(await advisory(), 0);
+});
+
+// =================================================================================================================================
+// ROOT PR63 review (3f019898): P1 package scope, N1 canonical namespace, S1 signal inside the core
+test("RC6 P1 package scope: a ONE-field change of any shared original scope field (ref / listing / currency / refFieldId / stay / guests / amount / rate) is REFUSED before secrets / DB / new dir", async () => {
+  const S = await nsStoppedRun(); const snap = await dbSnap(S.bk.id); const nf = nativeFiles(S);
+  const noSecret = join(S.priv, "no-such-provider.json");
+  const i = await loadIntent(db.app, S.bk.id);
+  const muts = { ref: `${i.ref.slice(0, -1)}${i.ref.endsWith("A") ? "B" : "A"}`, listingId: 606999, currency: "MXN", refFieldId: REF_FIELD + 1, from: addDays(i.from, 1),
+    to: addDays(i.to, 1), guests: i.guests + 1, totalMinor: i.price.finalTotalMinor + 1, rateBps: S.bk.price.rateBps + 1 };
+  for (const [k, v] of Object.entries(muts)) {
+    const X = await reconcile(S, { provider: noSecret, over: { [k]: v } });
+    assert.equal(X.line.outcome, "REFUSED", k); assert.ok(["plan", "package"].includes(X.line.stage), `${k}: ${X.line.stage}/${X.line.code}`);
+    if (X.line.stage === "package") assert.deepEqual([X.line.code, X.line.result.field], ["PACKAGE_SCOPE_MISMATCH", k], k);
+    assert.equal(existsSync(X.rdir), false, k);
+  }
+  { const X = await reconcile(S, { provider: noSecret, over: { totalMinor: S.bk.price.finalTotalMinor + 1 } });          // ROOT's exact repro
+    assert.deepEqual([X.line.stage, X.line.code, X.line.result.field], ["package", "PACKAGE_SCOPE_MISMATCH", "totalMinor"]); }
+  assert.equal(await dbSnap(S.bk.id), snap); assert.equal(nativeFiles(S), nf);
+});
+
+test("RC7 N1 canonical namespace: a symlinked ANCESTOR of the namespace (ROOT's repro) / a symlinked .maravilla-private / a symlinked native run dir → REFUSED at namespace before secrets / DB / new dir; real tree unchanged", async () => {
+  const S = await nsStoppedRun(); const snap = await dbSnap(S.bk.id); const nf = nativeFiles(S);
+  const noSecret = join(S.priv, "no-such-provider.json");
+  const cases = [];
+  { const link = join(ownerDir("rc-link-"), "link"); symlinkSync(dirname(S.priv), link); cases.push(["ancestor", join(link, ".maravilla-private")]); }
+  { const holder = ownerDir("rc-link2-"); const lp = join(holder, ".maravilla-private"); symlinkSync(S.priv, lp); cases.push(["private", lp]); }
+  for (const [label, priv] of cases) {
+    const runsBefore = readdirSync(join(S.priv, "runs")).sort().join();
+    const X = await reconcile(S, { provider: noSecret, priv, ndir: join(priv, "runs", S.nid) });
+    assert.deepEqual([X.line.outcome, X.line.stage, X.line.code], ["REFUSED", "namespace", "RUN_DIR_NOT_CANONICAL"], `${label}: ${JSON.stringify(X.line)}`);
+    assert.equal(readdirSync(join(S.priv, "runs")).sort().join(), runsBefore, `${label}: no new dir in the real tree`);
+  }
+  { const c = copyNs(S); const real = join(c.priv, "real-run"); renameSync(c.ndir, real); symlinkSync(real, c.ndir);
+    const X = await reconcile(S, { provider: noSecret, priv: c.priv, ndir: c.ndir }); assert.deepEqual([X.line.stage, X.line.code], ["namespace", "RUN_DIR_NOT_CANONICAL"]); }
+  assert.equal(await dbSnap(S.bk.id), snap); assert.equal(nativeFiles(S), nf);
+});
+
+/** count Hostaway exchanges; fire the FIRST signal on exchange k (then return the normal reply) */
+const sigAt = (k, box) => (X, base) => async (req) => { box.n += 1; if (box.n === k) X.sig.SIGINT(); return base(req); };
+const evid = async (id) => all(`SELECT e.status, o.op_type FROM booking.provider_evidence e JOIN booking.external_operations o ON o.id = e.read_operation_id WHERE o.intent_id = $1 ORDER BY e.id`, [id]);
+test("RC8 S1 signal INSIDE the core: at the first GET / at the first worker read / at the final read → STOPPED INTERRUPTED (exit 6), no GET after it, the late reply dropped (no evidence from it), already-applied state reported, journal agrees, teardown settled; second signal → 130", async () => {
+  // (a) ROOT's repro: first exchange
+  { const S = await nsStoppedRun(); const snap = await dbSnap(S.bk.id); const box = { n: 0 };
+    const X = await reconcile(S, { wrapExchange: sigAt(1, box) });
+    assert.deepEqual([X.line.outcome, X.code, X.line.result.run.outcome, X.line.result.run.code, box.n, X.line.interrupted], ["STOPPED", 6, "STOPPED", "INTERRUPTED", 1, true], JSON.stringify(X.line));
+    assert.equal(await dbSnap(S.bk.id), snap, "zero DB writes");
+    const j = await readReconcileJournalR1(join(X.rdir, "journal", journalName(X.plan.runId)));
+    assert.deepEqual([j.records.at(-1).type, j.records.at(-1).data.outcome, j.records.at(-1).data.code, X.line.result.run.audit], ["TEARDOWN", "STOPPED", "INTERRUPTED", "complete"]);
+    assert.deepEqual(X.line.result.teardown.pools, { app: "ended", report: "ended" }); assert.equal(await advisory(), 0); }
+  // (b) first WORKER read (precheck = lookup + by-id = 2 exchanges)
+  { const S = await nsStoppedRun(); const e0 = await evid(S.bk.id); const box = { n: 0 };
+    const X = await reconcile(S, { wrapExchange: sigAt(3, box) });
+    assert.deepEqual([X.line.outcome, X.line.result.run.code, box.n], ["STOPPED", "INTERRUPTED", 3], JSON.stringify(X.line));
+    assert.ok(X.line.result.run.steps <= 1, "no step after the signal");
+    assert.equal(await state(S.bk.id), "reservation_pending", "the dropped reply never confirmed the reservation");
+    const e1 = await evid(S.bk.id);
+    assert.equal(e1.filter((x) => x.status === "found_active").length, e0.filter((x) => x.status === "found_active").length, "no found evidence from the dropped reply");
+    assert.equal(await advisory(), 0); }
+  // (c) the FINAL read (normal run: 2 precheck + 3 worker + 2 final) → the reservation was ALREADY confirmed: reported, never rolled back, never success
+  { const S = await nsStoppedRun(); const box = { n: 0 };
+    const X = await reconcile(S, { wrapExchange: sigAt(6, box) });
+    assert.deepEqual([X.line.outcome, X.line.result.run.code, X.line.result.run.dbState, X.line.result.run.cleanup, box.n], ["STOPPED", "INTERRUPTED", "reservation_confirmed", "NOT_HANDED_OFF", 6], JSON.stringify(X.line));
+    assert.equal(await state(S.bk.id), "reservation_confirmed"); assert.equal(await advisory(), 0); }
+  // (d) second signal inside the core → terminal 130 (tail uncertain)
+  { const S = await nsStoppedRun(); const box = { n: 0 };
+    const X = await reconcile(S, { wrapExchange: (X0, base) => async (req) => { box.n += 1; if (box.n === 1) { X0.sig.SIGINT(); X0.sig.SIGTERM(); } return base(req); } });
+    assert.equal(X.code, 130); }
+});
+
+test("RC9 S1 at the core boundary (direct runReconcileR1 with a signal): aborted after the final DB work / when the terminal record returns → STOPPED INTERRUPTED with result / journal agreement; a pre-aborted signal → REFUSED INTERRUPTED before any GET / lock", async () => {
+  const run = async (S, o) => { const plan = await planFor(S, { runId: `rc-core-${String(++rcN).padStart(4, "0")}` }); const jdir = ownerDir("rc-cj-");
+    const r = await runReconcileR1({ plan, pools: { app: db.app, report: reportPool }, hostawaySend: S.t.hostaway.send, clock: () => S.clock(), journalDir: jdir, uid: process.getuid(),
+      native: { packageInput: S.pk.input, journalDir: S.jd, headDir: S.hd, trustedHead: S.native.trustedHead }, signal: o.signal, hooks: o.hooks ?? {}, ...(o.journalOpen ? { journalOpen: o.journalOpen } : {}) });
+    const j = await readReconcileJournalR1(join(jdir, journalName(plan.runId)));
+    const last = j.ok ? [...j.records].reverse().find((x) => x.type === "TEARDOWN" || x.type === "DOWNGRADED") : null;
+    if (!j.ok) assert.equal(r.journalHead, null, "no journal was opened (refused before it)");
+    else assert.ok(r.audit !== "complete" || (last && last.data.outcome === r.outcome && last.data.code === r.code), `agreement ${r.audit} ${JSON.stringify(last && last.data)}`);
+    return r; };
+  { const S = await nsStoppedRun(); const ac = new AbortController(); ac.abort(); const g0 = S.t.x.log.length;
+    const r = await run(S, { signal: ac.signal }); assert.deepEqual([r.outcome, r.code, r.lock, S.t.x.log.length - g0], ["REFUSED", "INTERRUPTED", "not_acquired", 0]); }
+  { const S = await nsStoppedRun(); const ac = new AbortController();
+    const r = await run(S, { signal: ac.signal, hooks: { afterFinalDb: () => ac.abort() } });
+    assert.deepEqual([r.outcome, r.code, r.dbState, r.cleanup, r.lock], ["STOPPED", "INTERRUPTED", "reservation_confirmed", "NOT_HANDED_OFF", "released"]); }
+  { const S = await nsStoppedRun(); const ac = new AbortController();
+    const journalOpen = async (o) => { const jo = await openReconcileJournalR1(o); if (!jo.ok) return jo; const j = jo.journal;
+      return { ok: true, journal: { file: j.file, head: j.head, close: j.close, async append(t, at, d) { const x = await j.append(t, at, d); if (t === "ENDED") ac.abort(); return x; } } }; };
+    const r = await run(S, { signal: ac.signal, journalOpen });
+    assert.deepEqual([r.outcome, r.code, r.audit], ["STOPPED", "INTERRUPTED", "complete"]); }
+  { const ac = new AbortController(); const r = await runReconcileR1({ plan: { x: 1 }, signal: ac.signal }); assert.equal(r.outcome, "REFUSED"); }
 });

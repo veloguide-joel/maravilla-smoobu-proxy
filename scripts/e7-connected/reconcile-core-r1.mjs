@@ -86,6 +86,10 @@ function bounded(p, ms) {
 }
 export async function runReconcileR1(opts = {}) {
   const { plan, pools, hostawaySend, clock, journalDir, uid, native, hooks = {} } = opts;
+  // PR63 (ROOT S1, narrow exception): OPTIONAL session AbortSignal. Omitted → behaviour unchanged. Once aborted: no new GET / step / proof,
+  // late replies dropped by the executors, in-flight accepted work awaited (bounded), never success; fixed code INTERRUPTED (no reason text).
+  const sessionSignal = opts.signal === undefined || opts.signal === null ? null : opts.signal;
+  const interrupted = () => !!(sessionSignal && sessionSignal.aborted === true);
   const mono = typeof opts.monotonic === "function" ? opts.monotonic : () => performance.now();
   const sleep = typeof opts.sleep === "function" ? opts.sleep : (ms) => new Promise((res) => setTimeout(res, ms));
   const journalOpen = typeof opts.journalOpen === "function" ? opts.journalOpen : openReconcileJournalR1;   // TEST-ONLY injection point
@@ -124,6 +128,8 @@ export async function runReconcileR1(opts = {}) {
       const pe = isObj(plan) ? validatePlanR1(plan) : "PLAN_SHAPE";
       if (pe) return set("REFUSED", pe);
       if (!isObj(pools) || !pools.app || !pools.report || typeof hostawaySend !== "function" || typeof clock !== "function") return set("REFUSED", "OPTIONS_INVALID");
+      if (sessionSignal !== null && !(sessionSignal instanceof AbortSignal)) return set("REFUSED", "OPTIONS_INVALID");
+      if (interrupted()) return set("REFUSED", "INTERRUPTED");
       const jo = await journalOpen({ dir: journalDir, runId: plan.runId, uid });
       if (!jo || !jo.ok) { R.audit = `incomplete:OPEN:${(jo && jo.code) || "UNKNOWN"}`; return set("REFUSED", (jo && jo.code) || "JOURNAL_OPEN_FAILED"); }
       J = jo.journal;
@@ -140,6 +146,7 @@ export async function runReconcileR1(opts = {}) {
       catch { rc = null; }
       if (!nativeStoppedInReservationPhase(rc)) return set("REFUSED", "NATIVE_RUN_NOT_PROVEN_STOPPED");
       if (!(await audit("NATIVE_VALIDATED", { relation: rc.relation, suppliedHead: rc.suppliedHead, chain: rc.chain.status, facts: rc.chain.facts }))) return set("REFUSED", "AUDIT_NATIVE_VALIDATED_FAILED");
+      if (interrupted()) return set("REFUSED", "INTERRUPTED");
       // ---- 3. native-run lock (session-level, report pool) ----------------------------------------------------------------------------
       try { lockClient = await pools.report.connect(); } catch { return set("REFUSED", "DB_CONNECT_FAILED"); }
       onLockErr = () => { lockSessionErrored = true; R.lockSession = "error_observed"; };   // fixed code only; never e.message / String(e)
@@ -156,17 +163,18 @@ export async function runReconcileR1(opts = {}) {
       const pf = preflight(F0, plan, now0);
       if (pf) { R.dbState = F0.intent ? F0.intent.status : null; return set("REFUSED", pf); }
       if (!(await audit("PREFLIGHT_OK", { version: F0.intent.version, createOpId: plan.createOpId, attempt: F0.att[0].state }))) return set("STOPPED", "AUDIT_PREFLIGHT_FAILED");
-      if (expired()) return set("STOPPED", "SESSION_DEADLINE");
+      if (interrupted()) return set("STOPPED", "INTERRUPTED"); if (expired()) return set("STOPPED", "SESSION_DEADLINE");
       // ---- 5. PRECHECK (fresh, not persisted) ---------------------------------------------------------------------------------------
       ex = createReconcileExecutorsR1({ binding: { listingId: plan.listingId, arrivalDate: plan.from, reservationId: plan.reservationId }, send: hostawaySend,
-        maxGets: LIMITS.maxGets, remainingMs: remaining, callTimeoutMs: LIMITS.callTimeoutMs });
+        maxGets: LIMITS.maxGets, remainingMs: remaining, callTimeoutMs: LIMITS.callTimeoutMs,
+        ...(sessionSignal ? { sessionSignal } : {}) });
       if (!ex.ok) return set("REFUSED", ex.code);
       const cfg = { allowedListingIds: [plan.listingId], refFieldId: plan.refFieldId, channelId: DIRECT_CHANNEL_ID, currency: plan.currency };
       const pre = await pairedRead(ex, cfg, plan, clock); obs();
       R.precheck = pre;
       if (!(await audit("PRECHECK", pre))) return set("STOPPED", "AUDIT_PRECHECK_FAILED");
       if (!pre.ok) return set("STOPPED", ex.observe.stop ? ex.observe.stop.code : pre.code);
-      if (expired()) return set("STOPPED", "SESSION_DEADLINE");
+      if (interrupted()) return set("STOPPED", "INTERRUPTED"); if (expired()) return set("STOPPED", "SESSION_DEADLINE");
       const sessionFloor = Math.max(pre.lookupObservedAt, pre.byIdObservedAt);
       if (hooks.afterPrecheck) await hooks.afterPrecheck(hk);
       // ---- 6. accepted worker steps (scoped, strict executors) -------------------------------------------------------------------------
@@ -174,8 +182,8 @@ export async function runReconcileR1(opts = {}) {
       const workerId = `e7rb:${plan.runId}`.slice(0, 80);
       let state = F0.intent.status; let waitUntil = null;
       for (let i = 1; i <= LIMITS.maxSteps && state !== "reservation_confirmed"; i++) {
-        while (waitUntil !== null && clock() < waitUntil) { if (expired()) return set("STOPPED", "SESSION_DEADLINE"); await sleep(200); }
-        if (expired()) return set("STOPPED", "SESSION_DEADLINE");
+        while (waitUntil !== null && clock() < waitUntil) { if (interrupted()) return set("STOPPED", "INTERRUPTED"); if (expired()) return set("STOPPED", "SESSION_DEADLINE"); await sleep(200); }
+        if (interrupted()) return set("STOPPED", "INTERRUPTED"); if (expired()) return set("STOPPED", "SESSION_DEADLINE");
         if (!(await lockOk())) return set("STOPPED", lockSessionErrored ? "LOCK_SESSION_ERROR" : "LOCK_LOST");
         if (hooks.beforeStep) await hooks.beforeStep(i, hk);
         let r;
@@ -195,7 +203,7 @@ export async function runReconcileR1(opts = {}) {
         if (r.status === "refused") return set("STOPPED", `WORKER_REFUSED_${r.code}`);
         state = s2;
         if (state !== "reservation_confirmed" && state !== "reservation_pending") return set("STOPPED", "STATE_CHANGED");
-        if (expired()) return set("STOPPED", "SESSION_DEADLINE");
+        if (interrupted()) return set("STOPPED", "INTERRUPTED"); if (expired()) return set("STOPPED", "SESSION_DEADLINE");
         const wait = r.status === "idle" ? WORKER_LIMITS.waitMs : Number.isSafeInteger(r.delayMs) && r.delayMs > 0 ? r.delayMs : 0;
         if (wait > LIMITS.maxWaitMs) return set("STOPPED", "WAIT_TOO_LONG");
         waitUntil = wait > 0 ? clock() + wait : null;
@@ -203,12 +211,12 @@ export async function runReconcileR1(opts = {}) {
       if (state !== "reservation_confirmed") return set("STOPPED", "STEP_BUDGET_EXHAUSTED");
       if (hooks.afterReconciled) await hooks.afterReconciled(hk);
       // ---- 7. FINAL paired readback (after the DB reconciliation) + DB re-read ------------------------------------------------------------
-      if (expired()) return set("STOPPED", "SESSION_DEADLINE");
+      if (interrupted()) return set("STOPPED", "INTERRUPTED"); if (expired()) return set("STOPPED", "SESSION_DEADLINE");
       if (lockSessionErrored) return set("STOPPED", "LOCK_SESSION_ERROR");
       const fin = await pairedRead(ex, cfg, plan, clock); obs();
       R.final = fin;
       if (!(await audit("FINAL_READ", fin))) return set("STOPPED", "AUDIT_FINAL_FAILED");
-      if (expired()) return set("STOPPED", "SESSION_DEADLINE_AFTER_FINAL_READ");
+      if (interrupted()) return set("STOPPED", "INTERRUPTED"); if (expired()) return set("STOPPED", "SESSION_DEADLINE_AFTER_FINAL_READ");
       const F1 = await factsOf(lockClient, plan.intentId); const ex1 = await exclusionOf(lockClient, plan.intentId);
       if (hooks.afterFinalDb) await hooks.afterFinalDb(hk);
       R.dbState = F1.intent ? F1.intent.status : null;
@@ -219,14 +227,14 @@ export async function runReconcileR1(opts = {}) {
         claim: F1.claims === 1 ? "held" : `unexpected_${F1.claims}` });
       R.queuedEffects = F1.ops.filter((o) => o.op_type !== "hostaway.create_reservation" && WRITE_OP_TYPES.includes(o.op_type))
         .map((o) => ({ opType: o.op_type, state: o.state, attempts: o.attempts, dispatched: !!o.dispatched_at }));
-      if (expired()) return set("STOPPED", "SESSION_DEADLINE_AFTER_FINAL_DB");
+      if (interrupted()) return set("STOPPED", "INTERRUPTED"); if (expired()) return set("STOPPED", "SESSION_DEADLINE_AFTER_FINAL_DB");
       if (!fin.ok) return set("STOPPED", `FINAL_${ex.observe.stop ? ex.observe.stop.code : fin.code}`);
       if (!(fin.lookupObservedAt > sessionFloor && fin.byIdObservedAt > sessionFloor)) return set("STOPPED", "FINAL_NOT_AFTER_SESSION_FLOOR");
       const fc = finalCheck(F1, plan);
       if (fc) return set("STOPPED", fc);
       if (R.exclusionAfter !== "equal") return set("STOPPED", "EXCLUSION_CHANGED");
       if (!(await lockOk())) return set("STOPPED", lockSessionErrored ? "LOCK_SESSION_ERROR" : "LOCK_LOST");
-      if (expired()) return set("STOPPED", "SESSION_DEADLINE_BEFORE_SUCCESS");
+      if (interrupted()) return set("STOPPED", "INTERRUPTED"); if (expired()) return set("STOPPED", "SESSION_DEADLINE_BEFORE_SUCCESS");
       R.cleanup = "REQUIRES_OWN_PLAN_AND_FRESH_PROOFS";                               // never "safe to clean"
       return set("RECONCILED_CONFIRMED", null);
     })();
@@ -244,7 +252,7 @@ export async function runReconcileR1(opts = {}) {
       if (!ok) downgrade("TERMINAL_JOURNAL_FAILED");
       if (R.audit !== "complete") downgrade("AUDIT_INCOMPLETE");
     }
-    if (expired()) downgrade("SESSION_DEADLINE_AT_TERMINAL");
+    if (interrupted()) downgrade("INTERRUPTED"); if (expired()) downgrade("SESSION_DEADLINE_AT_TERMINAL");
     if (lockSessionErrored) downgrade("LOCK_SESSION_ERROR");
     // (b) lock release — checked and bounded; a session error / failed / timed-out unlock DESTROYS the connection (server drops session locks)
     if (lockClient) {
@@ -260,7 +268,7 @@ export async function runReconcileR1(opts = {}) {
       lockClient = null;
     }
     if (lockSessionErrored) downgrade("LOCK_SESSION_ERROR");
-    if (expired()) downgrade("SESSION_DEADLINE_AT_RELEASE");
+    if (interrupted()) downgrade("INTERRUPTED"); if (expired()) downgrade("SESSION_DEADLINE_AT_RELEASE");
     if (outcome !== "RECONCILED_CONFIRMED") R.cleanup = "NOT_HANDED_OFF";
     // (c) TEARDOWN record (final outcome + lock disposition) then close — both bounded
     // The journal's LAST durable outcome must equal the returned outcome, or the audit is explicitly incomplete (DOWNGRADE_NOT_JOURNALED).
@@ -268,7 +276,7 @@ export async function runReconcileR1(opts = {}) {
     if (J) {
       if (await audit("TEARDOWN", { outcome, code, lock: R.lock })) journaled = { outcome, code };
       else downgrade("TEARDOWN_JOURNAL_FAILED");
-      if (expired()) downgrade("SESSION_DEADLINE_AT_TEARDOWN_RECORD");
+      if (interrupted()) downgrade("INTERRUPTED"); if (expired()) downgrade("SESSION_DEADLINE_AT_TEARDOWN_RECORD");
       // ONE bounded corrective record while still writable (no retry loop; history is never edited or erased)
       if (journaled && (journaled.outcome !== outcome || journaled.code !== code)) {
         if (await audit("DOWNGRADED", { outcome, code, supersedes: journaled.outcome })) journaled = { outcome, code };
@@ -277,7 +285,7 @@ export async function runReconcileR1(opts = {}) {
       const c = await bounded(J.close(), LIMITS.teardownGraceMs);
       if (!c.done || c.threw) downgrade("JOURNAL_CLOSE_FAILED");             // after close is attempted nothing more is journalled
     }
-    if (expired()) downgrade("SESSION_DEADLINE_AFTER_CLOSE");
+    if (interrupted()) downgrade("INTERRUPTED"); if (expired()) downgrade("SESSION_DEADLINE_AFTER_CLOSE");
     if (J && R.audit === "complete" && !(journaled && journaled.outcome === outcome && journaled.code === code)) {
       R.audit = `incomplete:${journaled ? "FINAL" : "TEARDOWN"}:DOWNGRADE_NOT_JOURNALED`;
     }
