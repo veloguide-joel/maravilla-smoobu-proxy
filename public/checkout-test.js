@@ -162,10 +162,11 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
    *  Stripe's result after a "complete" return, never when lost / unreadable / busy / any other latch. */
   function payEligible() {
     if (!st || !st.token || busy || unreadable || lost) return false;
+    if (returnedComplete) return false;              // the completed-return guard DOMINATES every pay path, incl. the details-latch recovery
     const effective = last === "awaiting_details" && st.detailsSaved ? "awaiting_payment" : last;
     if (latch() === "details") return retry === "details";
     if (latch() !== null) return false;
-    return effective === "awaiting_payment" && !returnedComplete;
+    return effective === "awaiting_payment";
   }
   function view(extra = {}) {
     let focus = extra.focus;
@@ -173,7 +174,7 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
     // the accepted API reports details_collected as "awaiting_details": a VERIFIED details reply in this tab (session flag) moves the page on
     const effective = last === "awaiting_details" && st && st.detailsSaved ? "awaiting_payment" : last;
     const d = effective && !unreadable ? describe(effective, { releaseRequested: st && st.releaseRequested }) : null;
-    const waitingPay = !!d && d.kind === "pay" && returnedComplete && latch() === null;
+    const waitingPay = !!d && d.kind === "pay" && returnedComplete;   // any latch included: never a "Ready for payment" screen after a complete return
     const screen = latch() === "create" && !(st && st.token) ? "createUncertain" : lost ? "lost" : unreadable ? "unreadable"
       : st ? (waitingPay ? "payWait" : d ? d.kind : statusFailed && !busy ? "notChecked" : "loading") : "create";
     const title = screen === "createUncertain" ? "TEST intent outcome unknown" : screen === "lost" ? "This tab can no longer check this TEST booking"
@@ -187,7 +188,7 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
       : d ? d.text : "";
     ui.render({ screen, title, text, price, notice, busy, polling: pollTimer !== null, pollStopped: lost ? null : stopped,   // lost: no "use Refresh" hint (Refresh is not offered)
       canRefresh: !!(st && st.token) && !busy && !lost,
-      latch: latch(), retry: lost ? null : retry, canPay: payEligible(),
+      latch: latch(), retry: lost || waitingPay ? null : retry, canPay: payEligible(),   // payWait: only Refresh (the details form is not shown there)
       termsVersion: config.termsVersion || null, listingId: config.listingId, currency: config.currency,
       canRequestRelease: releaseEligible(), confirmingRelease: armed !== null, ...extra, focus: focus || null });
   }

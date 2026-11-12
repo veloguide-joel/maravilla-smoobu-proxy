@@ -250,3 +250,41 @@ test("F3-3 DOM: the explicit details resend checks form validity first; blank in
     assert.match(p.$("mv-notice").textContent, /Enter a first name/);
   } finally { p.restore(); }
 });
+
+// ROOT HOLD on 62c1e225: the details-latch recovery must not bypass the completed-return guard
+test("F1-5 complete return + details latch: canPay false, direct pay() sends 0, no re-enable after refreshes; token / latch / manual reads kept", async () => {
+  for (const detailsSaved of [false, true]) {                      // effective awaiting_details (details screen) / awaiting_payment (payWait)
+    const s = seeded({ detailsSaved, uncertain: "details" });
+    const f = fakeApi({}, { status: reply(200, { status: "awaiting_details" }) });
+    const r = rig({ storage: s, api: f, search: "?checkout=complete" }); await r.c.init();
+    const want = detailsSaved ? ["payWait", null] : ["details", "details"];
+    const chk = (label) => { const v = r.last(); assert.deepEqual([v.screen, v.retry, v.canPay, v.latch, v.canRefresh], [...want, false, "details", true], `${detailsSaved} ${label}`); };
+    chk("after init");
+    await r.c.pay(); await r.c.pay(); assert.equal(f.count("pay"), 0, `${detailsSaved}: direct pay bypass`);
+    for (let i = 0; i < 3; i++) { await r.c.refresh(); chk(`refresh ${i}`); }
+    while (await r.timers.tick()); chk("timers / budget");
+    await r.c.pay(); assert.equal(f.count("pay"), 0);
+    assert.deepEqual([createStore(s).load().token, createStore(s).load().uncertain], [TOKEN, "details"], "token and latch kept");
+    assert.equal(f.count("status"), 4, "init + 3 manual reads; a latched tab never polls");
+    assert.doesNotMatch(`${r.last().title} ${r.last().text}`, NO_CLAIM);
+  }
+  // preserved: details recovery without a complete return (none / cancelled hint) still offers Pay
+  for (const search of ["", "?checkout=cancelled"]) {
+    const f = fakeApi({}, { status: reply(200, { status: "awaiting_details" }) });
+    const r = rig({ storage: seeded({ detailsSaved: false, uncertain: "details" }), api: f, search }); await r.c.init();
+    assert.deepEqual([r.last().canPay, r.last().retry], [true, "details"], JSON.stringify(search)); await r.c.pay(); assert.equal(f.count("pay"), 1);
+  }
+});
+
+test("F1-6 DOM: complete return + details latch — Pay is unavailable in both variants; payWait shows only Refresh", async () => {
+  for (const detailsSaved of [false, true]) {
+    const p = await page({ seed: { detailsSaved, uncertain: "details" }, status: [{ s: 200, b: { status: "awaiting_details" } }], search: "?checkout=complete" }); p.restore();
+    assert.ok(!visible(p.$("mv-pay")) || p.$("mv-pay-btn").disabled, `${detailsSaved}: Pay unavailable`);
+    assert.equal(visible(p.$("mv-pay")), false, `${detailsSaved}: Pay hidden`);
+    p.$("mv-pay-btn").dispatch("click"); await settle();          // even a forced click event on the (hidden) button sends nothing
+    assert.equal(p.calls.filter((k) => k === "pay").length, 0);
+    assert.equal(visible(p.$("mv-refresh")), true);
+    if (detailsSaved) assert.deepEqual([p.$("mv-title").textContent, visible(p.$("mv-retry-btn"))], ["Waiting for the TEST payment result", false]);
+    else assert.deepEqual([visible(p.$("mv-details")), visible(p.$("mv-retry-btn"))], [true, true], "details recovery (resend) kept, without Pay");
+  }
+});
