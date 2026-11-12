@@ -599,7 +599,10 @@ test("containment: the adapter is pure and unreachable — no imports, network, 
     "scripts/e7-connected/run-binding-r1.mjs", "scripts/e7-connected/run-plan-cli-main.mjs", "scripts/e7-connected/run-plan-v1.mjs",
     // E7 N2 reconcile-only core (R-B Step A, ROOT-approved 2026-11-11, DRAFT): imports lookupByRef / normalizeReservation / unwrapEnvelope for its
     // GET-only by-ref + by-id READS; offline scripts/ (not deployable), outside every reviewed closure; no write builder is used.
-    "scripts/e7-connected/reconcile-core-r1.mjs"].sort(),
+    "scripts/e7-connected/reconcile-core-r1.mjs",
+    // E7 N2 reconcile LOCAL CLI (R-B Step B, ROOT-authorized 2026-11-12, DRAFT): names the adapter's PATH only, in its reconcile execution
+    // closure list, to hash it into the reconcile closure digest. It does not import it; offline scripts/ (not deployable).
+    "scripts/e7-connected/reconcile-cli-main.mjs"].sort(),
     "nothing deployable references the adapter");
   for (const pathOnly of ["scripts/e4-write-runner/happy-preflight.mjs", "scripts/e7-connected/run-binding-r1.mjs", "scripts/e7-connected/run-plan-cli-main.mjs",
     "scripts/e7-connected/run-plan-v1.mjs"]) {
