@@ -823,3 +823,26 @@ test("RC9 S1 at the core boundary (direct runReconcileR1 with a signal): aborted
     assert.deepEqual([r.outcome, r.code, r.audit], ["STOPPED", "INTERRUPTED", "complete"]); }
   { const ac = new AbortController(); const r = await runReconcileR1({ plan: { x: 1 }, signal: ac.signal }); assert.equal(r.outcome, "REFUSED"); }
 });
+
+// ROOT PR63 rev2 review (3b2c08ec) S2 — worker ADMISSION: an interruption during the awaited lock proof / beforeStep admits NO worker step
+test("RC10 S2 admission: abort inside beforeStep (ROOT's repro) / WHILE the real own-lock proof query completes → STOPPED INTERRUPTED, ZERO admitted steps, tracked facts unchanged, journal agreement, lock released", async () => {
+  const run = async (S, o) => { const plan = await planFor(S, { runId: `rc-s2-${String(++rcN).padStart(4, "0")}` }); const jdir = ownerDir("rc-s2j-");
+    const r = await runReconcileR1({ plan, pools: { app: db.app, report: o.report ?? reportPool }, hostawaySend: S.t.hostaway.send, clock: () => S.clock(), journalDir: jdir,
+      uid: process.getuid(), native: { packageInput: S.pk.input, journalDir: S.jd, headDir: S.hd, trustedHead: S.native.trustedHead }, signal: o.signal, hooks: o.hooks ?? {} });
+    const j = await readReconcileJournalR1(join(jdir, journalName(plan.runId))); assert.equal(j.ok, true);
+    const last = [...j.records].reverse().find((x) => x.type === "TEARDOWN" || x.type === "DOWNGRADED");
+    assert.deepEqual([r.audit, last.data.outcome, last.data.code], ["complete", r.outcome, r.code], "journal agrees");
+    assert.equal(j.records.filter((x) => x.type === "STEP").length, 0, "no STEP journalled");
+    return r; };
+  { const S = await nsStoppedRun(); const ac = new AbortController(); let snap = null;
+    const r = await run(S, { signal: ac.signal, hooks: { beforeStep: async () => { snap = await dbSnap(S.bk.id); ac.abort(); } } });
+    assert.deepEqual([r.outcome, r.code, r.steps.length, r.lock], ["STOPPED", "INTERRUPTED", 0, "released"], JSON.stringify(r));
+    assert.equal(await dbSnap(S.bk.id), snap, "tracked facts unchanged after the interruption"); assert.equal(await advisory(), 0); }
+  { const S = await nsStoppedRun(); const ac = new AbortController(); let armed = false; let snap = null; let fired = 0;
+    const report = { connect: async () => { const c = await reportPool.connect(); const q = c.query.bind(c);
+      c.query = async (sql, p) => { const res = await q(sql, p); if (armed && sql === OWN_LOCK_SQL && fired === 0) { fired += 1; snap = await dbSnap(S.bk.id); ac.abort(); } return res; }; return c; } };
+    const r = await run(S, { signal: ac.signal, report, hooks: { afterPrecheck: () => { armed = true; } } });
+    assert.equal(fired, 1, "aborted while the real own-lock proof completed");
+    assert.deepEqual([r.outcome, r.code, r.steps.length, r.lock], ["STOPPED", "INTERRUPTED", 0, "released"], JSON.stringify(r));
+    assert.equal(await dbSnap(S.bk.id), snap, "tracked facts unchanged"); assert.equal(await advisory(), 0); }
+});

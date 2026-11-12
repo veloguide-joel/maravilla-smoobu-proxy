@@ -186,6 +186,10 @@ export async function runReconcileR1(opts = {}) {
         if (interrupted()) return set("STOPPED", "INTERRUPTED"); if (expired()) return set("STOPPED", "SESSION_DEADLINE");
         if (!(await lockOk())) return set("STOPPED", lockSessionErrored ? "LOCK_SESSION_ERROR" : "LOCK_LOST");
         if (hooks.beforeStep) await hooks.beforeStep(i, hk);
+        // PR63 S2: worker ADMISSION re-check after the awaited lock proof / hook — nothing may be admitted after an interruption / expiry / session error
+        if (interrupted()) return set("STOPPED", "INTERRUPTED");
+        if (expired()) return set("STOPPED", "SESSION_DEADLINE");
+        if (lockSessionErrored) return set("STOPPED", "LOCK_SESSION_ERROR");
         let r;
         try {
           r = await runOrchestratorStep(pools.app, { workerId, env, adapterConfig: cfg, listings: new Map([[plan.listingId, { currency: plan.currency }]]),
