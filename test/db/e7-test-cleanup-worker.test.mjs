@@ -43,7 +43,7 @@ const setWorkLease = (intentId, untilMs, worker) => (worker === null
 // ---------- fake Stripe + Hostaway world (TEST objects; aggregates kept like the provider does) ----------
 function world() {
   const w = { calls: [], pis: new Map(), res: new Map(), refunds: new Map(), posts: [], cancels: [], signals: [], refundMode: "ok", cancelMode: "ok", piMode: "ok", listMode: "ok",
-    accountMode: "ok", retrieveMode: "ok", refundReadMode: "ok", onPiRead: null, onRefundPost: null, onCancel: null, extraRefunds: [], refundSeq: 0, now: () => Date.now() };
+    accountMode: "ok", retrieveMode: "ok", refundReadMode: "ok", onPiRead: null, onAccount: null, onRefundPost: null, onCancel: null, extraRefunds: [], refundSeq: 0, now: () => Date.now() };
   const hang = (signal) => { w.signals.push(signal); return new Promise(() => {}); };
   w.piObj = (p) => ({ object: "payment_intent", id: p.id, livemode: p.livemode ?? false, status: "succeeded", capture_method: "manual", amount: p.amount, amount_received: p.amount, amount_capturable: 0,
     currency: "usd", metadata: { mv_intent_id: p.intentId, mv_payment_attempt_id: p.attemptId },
@@ -62,7 +62,7 @@ function world() {
     if (!r.noRef) o.customFieldValues = [{ customFieldId: REF_FIELD, value: r.ref }]; return o; };
   const doCancel = (r) => { r.status = "cancelled"; };
   w.executors = {
-    retrieveAccount: async (o = {}) => { w.calls.push("ACCOUNT"); if (w.accountMode === "hang") return hang(o.signal); return { object: "account", id: w.accountMode === "other" ? "acct_1SomeoneElse" : ACCT }; },
+    retrieveAccount: async (o = {}) => { w.calls.push("ACCOUNT"); if (w.accountMode === "hang") return hang(o.signal); if (w.onAccount) await w.onAccount(); return { object: "account", id: w.accountMode === "other" ? "acct_1SomeoneElse" : ACCT }; },
     retrievePaymentIntent: async (id, params, o = {}) => {
       assert.deepEqual(params, { expand: ["latest_charge"] }); w.calls.push(`PI ${id}`);
       if (w.onPiRead) await w.onPiRead(id);
@@ -424,7 +424,7 @@ test("strict pre-send proof negatives: an existing refund / partial refund / dis
   { const w = world(); const c = await cleanupPending(w); const h = harness(w, c.id);
     w.pis.get(c.piId).refunded = AMT;
     const s = await h.step(); await settleLate(s);
-    assert.ok(s.actions.includes("ESCALATE:CANCEL_PROOF_PI_PROOF_CHARGE_ALREADY_REFUNDED"), JSON.stringify(s.actions));
+    assert.ok(s.actions.includes("ESCALATE:CANCEL_PRECONDITION_RAW_CHARGE_AMOUNT_REFUNDED"), JSON.stringify(s.actions));   // the raw aggregate gate runs first (F3)
     assert.deepEqual([w.cancels.length, w.posts.length], [0, 0]); }
 });
 
@@ -561,4 +561,152 @@ test("0020 migration: down restores the 0019 schema exactly; up re-applies ident
     const added = at20.filter((o) => !base19.includes(o)).map((o) => o.split("|").slice(0, 2).join("|"));
     assert.deepEqual(added.sort(), ["fn|booking.settle_operation_from_evidence(uuid,uuid)", "fn|booking.settle_test_refund_from_evidence(uuid,uuid)"]);
   } finally { await c.end(); fresh.stop(); }
+});
+
+// =============================================================================================
+// ROOT review 5880626183 (HOLD at be8f68d9) — exact reproductions: RED on be8f68d9, GREEN here
+test("F1(a) RED→GREEN: outer signal aborted right after retrieveAccount resolves → the PI transport is NEVER invoked (stop noted at the account boundary); pre-aborted signal → idle with zero calls", async () => {
+  { const w = world(); const c = await cleanupPending(w); const h = harness(w, c.id);
+    const ac = new AbortController(); w.onAccount = async () => { ac.abort(); };
+    const s = await h.step({ signal: ac.signal }); await settleLate(s);
+    assert.deepEqual([w.calls, s.stop && s.stop.code, w.cancels.length, w.posts.length], [["ACCOUNT"], "SIGNAL", 0, 0], JSON.stringify(s.actions));
+    assert.ok(s.actions.includes("STOP:SIGNAL:account_read"), JSON.stringify(s.actions));
+    const reads = (await opsOf(c.id, OPS.PI_READ)); assert.deepEqual(reads.map((r) => [r.state, r.attempts, r.error_code]), [["pending", 1, "STOP_SIGNAL"]], "the read row is bookkeeping only (read class: retry later, attempt counted)");
+    assert.deepEqual([await state(c.id), await held(c.id)], ["test_cleanup_pending", true]); }
+  { const w = world(); const c = await cleanupPending(w); const h = harness(w, c.id);
+    const ac = new AbortController(); ac.abort();
+    const s = await h.step({ signal: ac.signal }); await settleLate(s);
+    assert.deepEqual([s.status, s.stop.code, w.calls.length], ["idle", "SIGNAL", 0]); }
+});
+
+test("F1(b) RED→GREEN: after the refund POST the clock crosses the deadline / the signal aborts → NO refund GET, NO success, NO claim release; row unknown, stop reported; the next session settles it read-only", async () => {
+  for (const variant of ["deadline", "signal"]) {
+    const w = world(); const c = await cleanupPending(w); const h = harness(w, c.id);
+    await settleLate(await h.step()); assert.deepEqual(await legs(c.id), [true, false], variant);
+    h.clk.t += MIN;
+    const start = h.clk.t; const ac = new AbortController();
+    // (the pre-send gate needs whole-call room before the deadline: with the SHORT write timeout the POST is admitted, then the clock crosses the deadline)
+    const extra = variant === "deadline" ? { timeouts: SHORT, deadlineAt: start + 500, hooks: { afterSend: async () => { h.clk.t += 1000; } } } : { signal: ac.signal, hooks: { afterSend: async () => { h.clk.t += 1000; ac.abort(); } } };
+    const s = await h.step(extra); await settleLate(s);
+    assert.equal(w.posts.length, 1, variant);
+    assert.deepEqual([w.count("REFUND_GET"), s.stop && s.stop.code, await state(c.id), await held(c.id)], [0, variant === "deadline" ? "DEADLINE" : "SIGNAL", "test_cleanup_pending", true], `${variant}: ${JSON.stringify(s.actions)}`);
+    assert.ok(s.actions.some((a) => a.startsWith("REFUND_OUTCOME_UNKNOWN:STOP_")), `${variant}: ${JSON.stringify(s.actions)}`);
+    const row = (await opsOf(c.id, OPS.REFUND))[0]; assert.deepEqual([row.state, row.attempts], ["outcome_unknown", 1], variant);
+    assert.deepEqual(await legs(c.id), [true, false], variant);
+    assert.deepEqual(s.facts.refund[0].state, "outcome_unknown");
+    // a fresh session (no stop) settles it from the exact GET after discovery; still ONE POST ever
+    const h2 = harness(w, c.id, { start: h.clk.t + 3 * MIN });
+    await h2.until((st) => st === "cancelled", { max: 8 });
+    assert.deepEqual([w.posts.length, w.count("REFUND_LIST"), await held(c.id)], [1, 1, false], variant);
+  }
+  // with the default write timeout the pre-send gate needs whole-call room before the deadline: the POST is never admitted (zero sends, row unknown, stop reported)
+  { const w = world(); const c = await cleanupPending(w); const h = harness(w, c.id);
+    await settleLate(await h.step()); h.clk.t += MIN;
+    const s = await h.step({ deadlineAt: h.clk.t + 500 }); await settleLate(s);
+    assert.ok(s.actions.includes("SEND_ABORTED:STOP_DEADLINE"), JSON.stringify(s.actions));
+    assert.deepEqual([w.posts.length, s.stop.code, (await opsOf(c.id, OPS.REFUND))[0].state], [0, "DEADLINE", "outcome_unknown"]); }
+});
+
+test("F1 boundaries: a reply that resolves at / after the deadline is inadmissible (read row unknown, no claim); a provider rejection after a stop is reported as the stop, not as a provider failure; stop between claim and send → unknown without a PUT", async () => {
+  { const w = world(); const c = await cleanupPending(w); const h = harness(w, c.id);
+    w.onPiRead = async () => { h.clk.t += 30 * 1000; };
+    const s = await h.step({ deadlineAt: F.at(30) + 20 * 1000 }); await settleLate(s);
+    assert.deepEqual([s.stop.code, w.cancels.length, w.posts.length], ["DEADLINE", 0, 0], JSON.stringify(s.actions));
+    assert.ok(s.actions.includes("STOP:DEADLINE:pi_read"), JSON.stringify(s.actions));
+    assert.deepEqual((await opsOf(c.id, OPS.PI_READ)).map((r) => [r.state, r.attempts, r.error_code]), [["pending", 1, "STOP_DEADLINE"]], "the inadmissible reply is bookkeeping only"); }
+  { const w = world(); const c = await cleanupPending(w); const h = harness(w, c.id);
+    const ac = new AbortController(); w.piMode = "500"; w.onPiRead = async () => { ac.abort(); };
+    const s = await h.step({ signal: ac.signal }); await settleLate(s);
+    assert.deepEqual([s.stop.code, w.cancels.length], ["SIGNAL", 0]);
+    assert.ok(s.actions.includes("STOP:SIGNAL:pi_read") && !s.actions.includes("WAIT:PI_READ_FAILED"), JSON.stringify(s.actions)); }
+  { const w = world(); const c = await cleanupPending(w); const h = harness(w, c.id);
+    const ac = new AbortController();
+    const s = await h.step({ signal: ac.signal, hooks: { afterClaim: async () => { ac.abort(); } } }); await settleLate(s);
+    assert.deepEqual([w.cancels.length, (await opsOf(c.id, OPS.CANCEL))[0].state, s.stop.code], [0, "outcome_unknown", "SIGNAL"], JSON.stringify(s.actions)); }
+  // the cancel send itself: signal aborted while the PUT is in flight → the (applied) cancel is uncertain; no confirming read, no success; the next session proves it read-only
+  { const w = world(); const c = await cleanupPending(w); const h = harness(w, c.id);
+    const ac = new AbortController(); w.onCancel = async () => { ac.abort(); };
+    const s = await h.step({ signal: ac.signal }); await settleLate(s);
+    assert.deepEqual([w.cancels.length, (await opsOf(c.id, OPS.CANCEL))[0].state, s.stop.code, w.count("RES ")], [1, "outcome_unknown", "SIGNAL", 1], JSON.stringify(s.actions));
+    assert.ok(s.actions.includes("RESERVATION_CANCEL_OUTCOME_UNKNOWN:STOP_SIGNAL_AFTER_SEND"), JSON.stringify(s.actions));
+    const h2 = harness(w, c.id, { start: h.clk.t + 3 * MIN });
+    await h2.until((st) => st === "cancelled", { max: 10 });
+    assert.deepEqual([w.cancels.length, w.posts.length], [1, 1]); }
+});
+
+test("F2 RED→GREEN: ONE persisted read-budget admission for new AND reused pending / retried reads across sessions — unknown refund + PI 500s over 14 steps: SUM(attempts) ≤ 8, then a bounded owner case; no claim at the ceiling", async () => {
+  const w = world(); const c = await cleanupPending(w); const h = harness(w, c.id);
+  await settleLate(await h.step()); assert.deepEqual(await legs(c.id), [true, false]);
+  h.clk.t += MIN; w.refundMode = "hangApplied";
+  await settleLate(await h.step({ timeouts: SHORT }));
+  assert.equal((await opsOf(c.id, OPS.REFUND))[0].state, "outcome_unknown");
+  w.refundMode = "ok"; w.piMode = "500";
+  const h2 = harness(w, c.id, { start: h.clk.t + 3 * MIN });
+  for (let k = 0; k < 14; k++) { const s = await h2.step({ timeouts: SHORT }); await settleLate(s); h2.clk.t += MIN; }
+  const used = Number((await db.app.query("SELECT coalesce(sum(attempts), 0) AS n FROM booking.external_operations WHERE intent_id = $1 AND op_type = $2 AND retry_class = 'read'", [c.id, OPS.PI_READ])).rows[0].n);
+  assert.ok(used <= TEST_CLEANUP_WORKER_LIMITS.maxReads[OPS.PI_READ], `persisted PI-read attempts ${used} ≤ ${TEST_CLEANUP_WORKER_LIMITS.maxReads[OPS.PI_READ]}`);
+  assert.equal(await state(c.id), "reconciliation_required");
+  assert.deepEqual((await cases(c.id)).map((x) => x.kind), ["CLEANUP_READS_EXHAUSTED"]);
+  assert.deepEqual([w.posts.length, w.count("REFUND_LIST")], [1, 0], "never resent; no discovery without a PI read");
+  // the ceiling holds for the OTHER read kinds too (the Hostaway by-id read of an unknown cancel through the reused E3 row)
+  const w2 = world(); const c2 = await cleanupPending(w2); const g = harness(w2, c2.id);
+  w2.cancelMode = "hangCancelled";
+  await settleLate(await g.step({ timeouts: SHORT }));
+  assert.equal((await opsOf(c2.id, OPS.CANCEL))[0].state, "outcome_unknown");
+  w2.cancelMode = "ok"; w2.retrieveMode = "hang";
+  const g2 = harness(w2, c2.id, { start: g.clk.t + 3 * MIN });
+  for (let k = 0; k < 20; k++) { const s = await g2.step({ timeouts: SHORT }); await settleLate(s); g2.clk.t += MIN; if (isEnd(await state(c2.id))) break; }
+  const usedRes = Number((await db.app.query("SELECT coalesce(sum(attempts), 0) AS n FROM booking.external_operations WHERE intent_id = $1 AND op_type = $2 AND retry_class = 'read'", [c2.id, OPS.RES_READ])).rows[0].n);
+  assert.ok(usedRes <= TEST_CLEANUP_WORKER_LIMITS.maxReads[OPS.RES_READ], `Hostaway reads ${usedRes}`);
+  assert.deepEqual([await state(c2.id), w2.cancels.length, w2.posts.length], ["reconciliation_required", 1, 0]);
+});
+
+test("F3 RED→GREEN: a disputed PI, an existing refund in the charge's refunds list, a partial refund or a missing required flag on the INITIAL step → owner case with ZERO cancel PUT and ZERO refund POST; the cancel row stays pending (never admitted)", async () => {
+  for (const [label, mutate, code] of [
+    ["disputed", (p) => { p.disputed = true; }, "CANCEL_PRECONDITION_RAW_CHARGE_DISPUTED"],
+    ["refunds list non-empty", (p) => { p.chargeExtra = { refunds: { object: "list", has_more: false, data: [{ id: "re_external999" }] } }; }, "CANCEL_PRECONDITION_RAW_CHARGE_REFUNDS_PRESENT"],
+    ["partial refund", (p) => { p.refunded = 100; }, "CANCEL_PRECONDITION_RAW_CHARGE_AMOUNT_REFUNDED"],
+    ["refunded flag missing", (p) => { p.chargeExtra = { refunded: undefined }; }, "CANCEL_PRECONDITION_RAW_CHARGE_REFUNDED"],
+    ["disputed flag missing", (p) => { p.chargeExtra = { disputed: undefined }; }, "CANCEL_PRECONDITION_RAW_CHARGE_DISPUTED"],
+    ["dispute object present", (p) => { p.chargeExtra = { dispute: "dp_test_1" }; }, "CANCEL_PRECONDITION_RAW_CHARGE_DISPUTE_PRESENT"]]) {
+    const w = world(); const c = await cleanupPending(w); const h = harness(w, c.id);
+    mutate(w.pis.get(c.piId));
+    const s = await h.step(); await settleLate(s);
+    assert.ok(s.actions.includes(`ESCALATE:${code}`), `${label}: ${JSON.stringify(s.actions)}`);
+    assert.deepEqual([w.cancels.length, w.posts.length, await state(c.id), (await opsOf(c.id, OPS.CANCEL))[0].state, (await opsOf(c.id, OPS.CANCEL))[0].attempts], [0, 0, "reconciliation_required", "pending", 0], label);
+    assert.equal(await held(c.id), true, label);
+  }
+});
+
+test("residuals: equal-timestamp PI observations fail CLOSED (recorded, not used; reads later); INITIAL cancellation needs a strictly future arrival in the listing zone, but a past arrival never blocks read-only settlement of the worker's own cancel or the refund leg", async () => {
+  // tie: two reconcile steps at the SAME business clock → the second PI observation ties the first → fails CLOSED (recorded, not used; no GET, no settlement); a later clock resolves
+  { const w = world(); const c = await cleanupPending(w); const h = harness(w, c.id);
+    await settleLate(await h.step()); assert.deepEqual(await legs(c.id), [true, false]);
+    h.clk.t += MIN; w.refundMode = "hangApplied";
+    await settleLate(await h.step({ timeouts: SHORT }));                                // PI read (pre-send), POST hangs after applying → unknown
+    assert.equal((await opsOf(c.id, OPS.REFUND))[0].state, "outcome_unknown");
+    w.refundMode = "ok"; w.refundReadMode = "500";
+    const h2 = harness(w, c.id, { start: h.clk.t + 3 * MIN });
+    const a = await h2.step(); await settleLate(a);                                     // PI read at t2, discovery, exact GET fails → waiting
+    assert.ok(a.actions.includes("DISCOVERED:succeeded") && a.actions.includes("READ!REFUND_READ_FAILED"), JSON.stringify(a.actions));
+    const b = await h2.step(); await settleLate(b);                                     // SAME clock: the new PI observation ties → no list, no GET, no settlement
+    assert.ok(b.actions.includes("READ!PI_OBSERVATION_TIE"), JSON.stringify(b.actions));
+    assert.deepEqual([w.count("REFUND_LIST"), w.count("REFUND_GET"), await state(c.id)], [1, 1, "test_cleanup_pending"]);
+    assert.equal((await db.app.query("SELECT count(*)::int AS n FROM booking.provider_evidence WHERE intent_id = $1 AND kind = 'payment_intent' AND observed_at = $2", [c.id, new Date(h2.clk.t)])).rows[0].n, 2, "both observations are recorded; neither is used");
+    w.refundReadMode = "ok"; h2.clk.t += MIN;
+    await h2.until((st) => st === "cancelled", { max: 6 });
+    assert.equal(w.posts.length, 1); }
+  // arrival in the past at the INITIAL step: refused before any read of the reservation, zero PUT / POST
+  { const w = world(); const c = await cleanupPending(w); const h = harness(w, c.id, { start: Date.UTC(2028, 0, 15, 18, 0, 0) });
+    const s = await h.step(); await settleLate(s);
+    assert.ok(s.actions.includes("ESCALATE:CANCEL_ARRIVAL_NOT_IN_FUTURE"), JSON.stringify(s.actions));
+    assert.deepEqual([w.cancels.length, w.posts.length, w.count("RES "), await state(c.id)], [0, 0, 0, "reconciliation_required"]); }
+  // the arrival passes AFTER this worker's own uncertain cancel: read-only settlement and the refund leg still complete (no arrival gate there)
+  { const w = world(); const c = await cleanupPending(w); const h = harness(w, c.id);
+    w.cancelMode = "hangCancelled";
+    await settleLate(await h.step({ timeouts: SHORT }));
+    assert.equal((await opsOf(c.id, OPS.CANCEL))[0].state, "outcome_unknown");
+    const h2 = harness(w, c.id, { start: Date.UTC(2028, 0, 15, 18, 0, 0) });            // the stay is long past
+    await h2.until((st) => st === "cancelled", { max: 10 });
+    assert.deepEqual([w.cancels.length, w.posts.length, await held(c.id)], [1, 1, false]); }
 });

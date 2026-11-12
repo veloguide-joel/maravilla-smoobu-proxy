@@ -115,10 +115,12 @@ test("refundDiscovery (§5): has_more refused outright; exactly ONE refund that 
 
 test("cleanupCancelEligibility / buildCleanupCancelRequest: open reservation leg, attempt-1 pending row, fresh active identity, fresh captured-unrefunded PI; exact PUT; snapshot + brand + freshness carried", () => {
   const i = intent({ settlement: { reservationCancelled: false, authorizationSettled: false } });
-  const base = { intent: i, paymentAttemptId: PA, cancelOp: cancelRow(), captureRows: [capRow()], byId: resEv(), piEvidence: piEv(), now: NOW, notBefore: T0 };
+  const TZ = "America/Mazatlan";
+  const base = { intent: i, paymentAttemptId: PA, cancelOp: cancelRow(), captureRows: [capRow()], byId: resEv(), piEvidence: piEv(), rawPi: rawPi(), timeZone: TZ, now: NOW, notBefore: T0 };
   const e = P.cleanupCancelEligibility(base);
   assert.equal(e.ok, true, e.code); assert.equal(e.purpose, P.CANCEL_PURPOSE); assert.ok(Object.isFrozen(e));
-  const b = P.buildCleanupCancelRequest({ intent: i, cancelOp: cancelRow(), captureRows: [capRow()], eligibility: e, paymentAttemptId: PA, now: NOW, notBefore: T0 });
+  assert.deepEqual([e.snapshot.timeZone, e.snapshot.localDate], [TZ, "2027-01-15"]);
+  const b = P.buildCleanupCancelRequest({ intent: i, cancelOp: cancelRow(), captureRows: [capRow()], eligibility: e, paymentAttemptId: PA, timeZone: TZ, now: NOW, notBefore: T0 });
   assert.deepEqual(b, { ok: true, request: { method: "PUT", path: `/v1/reservations/${RID}/statuses/cancelled`, query: {}, body: { cancelledBy: "host" } } });
   assert.equal(P.validateCancelRequest(b.request, { intent: i, cancelOp: cancelRow() }).ok, true);
   for (const [label, over, code] of [["leg settled", { intent: intent() }, "RESERVATION_LEG_NOT_OPEN"], ["attempt 2 row", { cancelOp: cancelRow({ payload: { reservationId: RID, cancelledBy: "host", attempt: 2 } }) }, "CANCEL_NOT_INITIAL_ATTEMPT"],
@@ -126,15 +128,27 @@ test("cleanupCancelEligibility / buildCleanupCancelRequest: open reservation leg
     ["refunded PI", { piEvidence: piEv({}, { amountRefundedMinor: AMT }) }, "PI_PROOF_CHARGE_ALREADY_REFUNDED"], ["uncaptured PI", { piEvidence: piEv({ status: "requires_capture", amountReceivedMinor: 0 }) }, "PI_PROOF_PI_NOT_SUCCEEDED"],
     ["reservation cancelled", { byId: { ...resEv({ status: "cancelled" }), status: "cancelled" } }, "BY_ID_RESERVATION_NOT_ACTIVE"], ["identity", { byId: resEv({ totalMinor: 1 }) }, "BY_ID_RESERVATION_IDENTITY"],
     ["protected", { intent: intent({ settlement: i.settlement, reservation: { reservationId: PROTECTED_HOSTAWAY_RESERVATION_IDS[1] } }), cancelOp: cancelRow({ payload: { reservationId: PROTECTED_HOSTAWAY_RESERVATION_IDS[1], cancelledBy: "host", attempt: 1 } }) }, "PROTECTED_RESERVATION_ID"],
-    ["no attempt", { paymentAttemptId: "" }, "PAYMENT_ATTEMPT_REQUIRED"], ["two captures", { captureRows: [capRow(), capRow({ id: "cap-2" })] }, "CAPTURE_CAPTURE_HISTORY_NOT_SINGLE"]]) {
+    ["no attempt", { paymentAttemptId: "" }, "PAYMENT_ATTEMPT_REQUIRED"], ["two captures", { captureRows: [capRow(), capRow({ id: "cap-2" })] }, "CAPTURE_CAPTURE_HISTORY_NOT_SINGLE"],
+    // F3 (ROOT 5880626183): the raw refund / dispute safeguards gate the CANCEL too
+    ["raw disputed", { rawPi: rawPi({}, { disputed: true }) }, "CANCEL_PRECONDITION_RAW_CHARGE_DISPUTED"], ["raw refunds list", { rawPi: rawPi({}, { refunds: { object: "list", has_more: false, data: [{ id: "re_external999" }] } }) }, "CANCEL_PRECONDITION_RAW_CHARGE_REFUNDS_PRESENT"],
+    ["raw partial refund", { rawPi: rawPi({}, { amount_refunded: 1 }) }, "CANCEL_PRECONDITION_RAW_CHARGE_AMOUNT_REFUNDED"], ["raw refunded flag missing", { rawPi: rawPi({}, { refunded: undefined }) }, "CANCEL_PRECONDITION_RAW_CHARGE_REFUNDED"],
+    ["raw disputed flag missing", { rawPi: rawPi({}, { disputed: undefined }) }, "CANCEL_PRECONDITION_RAW_CHARGE_DISPUTED"], ["raw missing", { rawPi: null }, "CANCEL_PRECONDITION_RAW_PI_IDENTITY"],
+    // residual (ROOT 5880626183): the INITIAL cancellation needs a strictly future arrival in the listing zone
+    ["arrival today", { intent: { ...i, from: "2027-01-15", to: "2027-01-17" }, byId: resEv({ from: "2027-01-15", to: "2027-01-17" }) }, "ARRIVAL_NOT_IN_FUTURE"],
+    ["arrival past", { intent: { ...i, from: "2026-12-01", to: "2026-12-03" }, byId: resEv({ from: "2026-12-01", to: "2026-12-03" }) }, "ARRIVAL_NOT_IN_FUTURE"],
+    ["zone invalid", { timeZone: "+07:00" }, "TIME_ZONE_OR_CLOCK_INVALID"], ["zone missing", { timeZone: undefined }, "TIME_ZONE_OR_CLOCK_INVALID"]]) {
     assert.equal(P.cleanupCancelEligibility({ ...base, ...over }).code, code, label);
   }
+  // the local date is part of the snapshot: a day boundary between eligibility and build refuses (re-check at the fresh clock)
+  assert.equal(P.buildCleanupCancelRequest({ intent: i, cancelOp: cancelRow(), captureRows: [capRow()], eligibility: e, paymentAttemptId: PA, timeZone: TZ, now: NOW + 86400_000 * 200, notBefore: T0 }).code, "CARRIED_EVIDENCE_STALE");
+  assert.equal(P.buildCleanupCancelRequest({ intent: i, cancelOp: cancelRow(), captureRows: [capRow()], eligibility: e, paymentAttemptId: PA, timeZone: "America/New_York", now: NOW, notBefore: T0 }).code, "ELIGIBILITY_SNAPSHOT_CHANGED");
   // the builder: brand required; stale version / snapshot / carried freshness refuse
-  assert.equal(P.buildCleanupCancelRequest({ intent: i, cancelOp: cancelRow(), captureRows: [capRow()], eligibility: { ...e }, paymentAttemptId: PA, now: NOW, notBefore: T0 }).code, "ELIGIBILITY_REQUIRED");
-  assert.equal(P.buildCleanupCancelRequest({ intent: { ...i, version: 8 }, cancelOp: cancelRow(), captureRows: [capRow()], eligibility: e, paymentAttemptId: PA, now: NOW, notBefore: T0 }).code, "ELIGIBILITY_STALE");
-  assert.equal(P.buildCleanupCancelRequest({ intent: i, cancelOp: cancelRow(), captureRows: [capRow()], eligibility: e, paymentAttemptId: PA, now: NOW + P.PROOF_MAX_AGE_MS + 1, notBefore: T0 }).code, "CARRIED_EVIDENCE_STALE");
-  assert.equal(P.buildCleanupCancelRequest({ intent: i, cancelOp: cancelRow(), captureRows: [capRow()], eligibility: e, paymentAttemptId: "pa-2", now: NOW, notBefore: T0 }).code, "ELIGIBILITY_SNAPSHOT_CHANGED");
-  assert.equal(P.buildCleanupCancelRequest({ intent: i, cancelOp: cancelRow(), captureRows: [capRow()], eligibility: e, paymentAttemptId: PA, now: NOW, notBefore: T0 + 1 }).code, "STATE_ENTRY_CHANGED");
+  assert.equal(P.buildCleanupCancelRequest({ intent: i, cancelOp: cancelRow(), captureRows: [capRow()], eligibility: { ...e }, paymentAttemptId: PA, timeZone: TZ, now: NOW, notBefore: T0 }).code, "ELIGIBILITY_REQUIRED");
+  assert.equal(P.buildCleanupCancelRequest({ intent: { ...i, version: 8 }, cancelOp: cancelRow(), captureRows: [capRow()], eligibility: e, paymentAttemptId: PA, timeZone: TZ, now: NOW, notBefore: T0 }).code, "ELIGIBILITY_STALE");
+  assert.equal(P.buildCleanupCancelRequest({ intent: i, cancelOp: cancelRow(), captureRows: [capRow()], eligibility: e, paymentAttemptId: PA, timeZone: TZ, now: NOW + P.PROOF_MAX_AGE_MS + 1, notBefore: T0 }).code, "CARRIED_EVIDENCE_STALE");
+  assert.equal(P.buildCleanupCancelRequest({ intent: i, cancelOp: cancelRow(), captureRows: [capRow()], eligibility: e, paymentAttemptId: "pa-2", timeZone: TZ, now: NOW, notBefore: T0 }).code, "ELIGIBILITY_SNAPSHOT_CHANGED");
+  assert.equal(P.buildCleanupCancelRequest({ intent: i, cancelOp: cancelRow(), captureRows: [capRow()], eligibility: e, paymentAttemptId: PA, timeZone: TZ, now: NOW, notBefore: T0 + 1 }).code, "STATE_ENTRY_CHANGED");
+  assert.equal(P.buildCleanupCancelRequest({ intent: i, cancelOp: cancelRow(), captureRows: [capRow()], eligibility: e, paymentAttemptId: PA, now: NOW, notBefore: T0 }).code, "UNEXPECTED_INPUT");
   // a by-id read without the echoed ref needs the by-ref lookup with matchCount 1
   const noRef = resEv({ bookingRef: undefined }); delete noRef.observed.bookingRef;
   assert.equal(P.cleanupCancelEligibility({ ...base, byId: noRef }).code, "BY_REF_RESERVATION_EVIDENCE_SHAPE");
