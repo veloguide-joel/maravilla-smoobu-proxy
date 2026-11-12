@@ -330,9 +330,9 @@ test("Q8 migration: 0019 down restores the 0018 schema exactly (constraints, ind
     await migrateUp(c, { env: "test" });
     const at19 = await fnAttrs(c); const at19Objs = await objects(c);
     assert.deepEqual(at19.map((f) => ({ ...f })), base18.map((f) => ({ ...f })), "owner, ACL, SECURITY DEFINER, volatility, search_path, signature unchanged for every replaced function");
-    assert.deepEqual(await migrateDown(c, { env: "test", to: 18 }), [19]);
+    assert.deepEqual(await migrateDown(c, { env: "test", to: 18 }), [20, 19]);                      // 0020 (cleanup worker slice) sits on top
     assert.deepEqual(await objects(c), base18Objs, "down = 0018 schema exactly");
-    assert.deepEqual(await migrateUp(c, { env: "test" }), [19]);
+    assert.deepEqual(await migrateUp(c, { env: "test" }), [19, 20]);
     assert.deepEqual(await objects(c), at19Objs, "up re-applies identically");
     const added = at19Objs.filter((o) => !base18Objs.includes(o)).map((o) => o.split("|").slice(0, 2).join("|"));
     for (const n of ["fn|booking.test_refund_settled_for(uuid,text)", "fn|booking.test_refund_ledgered(uuid,text)", "fn|booking.refund_claim_fence()", "fn|booking.recording_retirement_fence()",

@@ -337,13 +337,23 @@ test("redaction: planted SYNTHETIC markers in actions are counted, never copied;
 test("grammar pinned against the accepted worker sources; vocabulary parity with intent-state / migrations / planner / manifest", () => {
   const dir = new URL("../lib/booking-db/", import.meta.url);
   const literals = new Set();
-  for (const f of readdirSync(dir).filter((x) => /-worker\.js$|^recovery\.js$/.test(x))) {
+  // E7 TEST cleanup worker (cleanup-worker.js): NOT one of the accepted hosted-runner workers this frozen v1/v2/R1 grammar journals. Its refund-only
+  // tokens are REFUSED by this grammar on purpose (singleton exclusion, ROOT 5879497019); a journal grammar for it is the hosted cleanup slice's
+  // own review. Explicit exclusion of exactly that file; its tokens are asserted REFUSED below.
+  const ACCEPTED_WORKER = (x) => (/-worker\.js$|^recovery\.js$/.test(x)) && x !== "cleanup-worker.js";
+  assert.ok(readdirSync(dir).includes("cleanup-worker.js"), "the excluded file exists (an exclusion of a missing file would be a stale pin)");
+  for (const f of readdirSync(dir).filter(ACCEPTED_WORKER)) {
     const src = readFileSync(new URL(f, dir), "utf8");
     // whole-token literals only: template substitutions (${…}) are removed first, so fragments like "ID" inside `READ:${…}` are not tokens
     for (const m of src.matchAll(/actions\.push\(([^;]*)\)/g)) for (const s of m[1].replace(/\$\{[^}]*\}/g, "").matchAll(/"([A-Z][A-Za-z0-9_:.>-]*)"/g)) literals.add(s[1]);
   }
   assert.ok(literals.size >= 30, String(literals.size));
   for (const t of literals) assert.equal(J.isActionToken(t), true, `worker literal accepted: ${t}`);
+  const cleanupSrc = readFileSync(new URL("cleanup-worker.js", dir), "utf8");
+  const cleanupLiterals = new Set();
+  for (const m of cleanupSrc.matchAll(/actions\.push\(([^;]*)\)/g)) for (const s of m[1].replace(/\$\{[^}]*\}/g, "").matchAll(/"([A-Z][A-Za-z0-9_:.>-]*)"/g)) cleanupLiterals.add(s[1]);
+  for (const t of ["REFUND_CLAIMED", "CANCEL_CLAIMED"]) assert.ok(cleanupLiterals.has(t), t);
+  for (const t of ["REFUND_CLAIMED", "REFUND_SUCCEEDED->cancelled", "REFUND_OUTCOME_UNKNOWN:REFUND_TIMEOUT", "DISCOVERED:succeeded"]) assert.equal(J.isActionToken(t), false, `cleanup-worker token refused by the frozen grammar: ${t}`);
   // representative TEMPLATED forms, built exactly as the workers build them
   for (const t of ["RESERVATION_STARTED->reservation_pending", "RESERVATION_STARTED!E3_REJECTED", "CAPTURE_SUCCEEDED->payment_captured", "RECORDED:DUPLICATE",
     "ASSESSED:eligible", "ASSESSED:blocked:HOLD_ACTIVE", "WAIT:CAPTURE_IN_FLIGHT", "STOP:RECORDING_ESCALATED", "LEASE_LOST:WORK_LEASE_LOST", "READ:hostaway.lookup_reservation:found",

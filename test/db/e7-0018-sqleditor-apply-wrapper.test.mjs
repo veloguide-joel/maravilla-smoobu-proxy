@@ -129,7 +129,7 @@ test("C5 healthy apply (fresh cluster) + migrator compatibility + replay refused
     // migrator compatibility: it sees 1..18 applied, no checksum drift, and a further up is a no-op
     const st = await migrationStatus(B.c, { env: "test" });
     assert.deepEqual(st.applied, [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18]);
-    assert.deepEqual(st.pending, [19]);                                                   // 0019 (local candidate) is the only later migration
+    assert.deepEqual(st.pending, [19, 20]);                                               // 0019 / 0020 (local candidates) are the only later migrations
     assert.deepEqual(await migrateUp(B.c, { env: "test", to: 18 }), [], "migrator no-op (through 18) after the wrapper applied 18");
     // replay refused
     await expectRaise(B.c, /E7_0018_ALREADY_APPLIED_OR_LATER/);
