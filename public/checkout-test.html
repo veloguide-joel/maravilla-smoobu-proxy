@@ -52,7 +52,6 @@
   <p id="mv-polling" class="muted"></p>
   <p class="actions">
     <button type="button" id="mv-refresh" hidden>Refresh status</button>
-    <button type="button" id="mv-restart" class="secondary" hidden>Forget this TEST booking in this tab</button>
   </p>
 
   <section id="mv-release" class="release-zone" aria-label="End this TEST early" hidden>
@@ -68,6 +67,11 @@
         <button type="button" id="mv-release-yes" class="secondary">Yes, request release</button>
       </p>
     </div>
+  </section>
+
+  <section id="mv-forget" class="forget-zone" aria-label="Reset this tab" hidden>
+    <p id="mv-forget-warn" class="muted">Forget only clears this tab. It does not cancel the TEST booking or release any TEST hold, and this tab will then no longer be able to check it or request a release.</p>
+    <button type="button" id="mv-restart" class="secondary" aria-describedby="mv-forget-warn">Forget this TEST booking in this tab…</button>
   </section>
 </main>
 </body>
