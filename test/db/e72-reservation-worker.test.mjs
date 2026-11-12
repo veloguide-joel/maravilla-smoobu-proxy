@@ -954,7 +954,7 @@ test("LF4 a SUCCEEDED create with missing / malformed / protected / inconsistent
     await recordHostawayCreateResult(db.app, a.id, { httpStatus: 201, reservation: replyId && /^\d+$/.test(replyId) ? { reservationId: replyId, listingId: L(n - 1), from: STAY.from, to: STAY.to, totalMinor: 1 } : null }, { now: F.at(10) });
     const out = { status: "succeeded" }; if (resultRef !== null) out.resultRef = resultRef;
     const c = await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(10), outcome: out });
-    if (!c.ok) { console.log(`# LF4 ${label}: the accepted API refused the fixture (${c.error}); not applicable`); continue; }
+    assert.equal(c.ok, true, `${label}: the fixture must settle through the accepted API (${c.error ?? "ok"})`);
     const r = await recoverInterruptedReservations(db.app, { now: F.at(13), intentId: a.id });
     assert.deepEqual(r.map((x) => [x.ok, x.status]), [[true, "reservation_unknown"]], label);
   }
