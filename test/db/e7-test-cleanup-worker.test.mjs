@@ -710,3 +710,94 @@ test("residuals: equal-timestamp PI observations fail CLOSED (recorded, not used
     await h2.until((st) => st === "cancelled", { max: 10 });
     assert.deepEqual([w.cancels.length, w.posts.length, await held(c.id)], [1, 1, false]); }
 });
+
+// =============================================================================================
+// ROOT re-review 5880873025 (HOLD at 1bd2fcf7) — R1 / R2 exact reproductions: RED on 1bd2fcf7, GREEN here
+const piEvidenceCount = async (id) => (await db.app.query("SELECT count(*)::int AS n FROM booking.provider_evidence WHERE intent_id = $1 AND kind = 'payment_intent'", [id])).rows[0].n;
+const evidenceCount = async (id, kind) => (await db.app.query("SELECT count(*)::int AS n FROM booking.provider_evidence WHERE intent_id = $1 AND kind = $2", [id, kind])).rows[0].n;
+
+test("R1(A) RED→GREEN: signal / deadline stop right AFTER the refund row completed (afterComplete) → NO REFUND_SUCCEEDED, NO claim release, stop reported; the durable succeeded row is preserved and the next session finishes WITHOUT a second POST", async () => {
+  for (const mode of ["signal", "deadline"]) {
+    const w = world(); const c = await cleanupPending(w); const h = harness(w, c.id);
+    await settleLate(await h.step()); h.clk.t += MIN;
+    const ac = new AbortController(); const deadline = h.clk.t + 30000;
+    const s = await h.step({ signal: ac.signal, deadlineAt: mode === "deadline" ? deadline : null,
+      hooks: { afterSend: async () => { h.clk.t += 1000; }, afterComplete: async (op) => { if (op.op_type === OPS.REFUND) { if (mode === "signal") ac.abort(); else h.clk.t = deadline; } } } });
+    await settleLate(s);
+    const row = (await opsOf(c.id, OPS.REFUND))[0];
+    assert.deepEqual([await state(c.id), await held(c.id), s.stop && s.stop.code, row.state, !!row.result_ref, w.posts.length], ["test_cleanup_pending", true, mode === "signal" ? "SIGNAL" : "DEADLINE", "succeeded", true, 1], `${mode}: ${JSON.stringify(s.actions)}`);
+    assert.ok(s.actions.includes("REFUND_ROW_SUCCEEDED_EVENT_DEFERRED") && !s.actions.some((a) => a.startsWith("REFUND_SUCCEEDED->")), `${mode}: ${JSON.stringify(s.actions)}`);
+    assert.deepEqual(await legs(c.id), [true, false], mode);
+    assert.deepEqual([s.facts.refund[0].state, s.facts.claimHeld], ["succeeded", true], `${mode}: honest facts — the committed row, the held claim`);
+    // next session (no stop): the succeeded row's own refund id is read again (exact GET + PI read) → REFUND_SUCCEEDED → cancelled; ONE POST ever
+    const h2 = harness(w, c.id, { start: h.clk.t + 3 * MIN });
+    await h2.until((st) => st === "cancelled", { max: 6 });
+    assert.deepEqual([w.posts.length, w.count("REFUND_LIST"), await held(c.id)], [1, 0, false], `${mode}: proven from the known id, no discovery, no resend`);
+  }
+  // the cancel completion has the same boundary
+  { const w = world(); const c = await cleanupPending(w); const h = harness(w, c.id);
+    const ac = new AbortController();
+    const s = await h.step({ signal: ac.signal, hooks: { afterComplete: async (op) => { if (op.op_type === OPS.CANCEL) ac.abort(); } } }); await settleLate(s);
+    const row = (await opsOf(c.id, OPS.CANCEL))[0];
+    assert.deepEqual([await legs(c.id), s.stop.code, row.state, w.cancels.length], [[false, false], "SIGNAL", "succeeded", 1], JSON.stringify(s.actions));
+    assert.ok(s.actions.includes("CANCEL_ROW_SUCCEEDED_EVENT_DEFERRED"), JSON.stringify(s.actions));
+    const h2 = harness(w, c.id, { start: h.clk.t + 3 * MIN });
+    await h2.until((st) => st === "cancelled", { max: 8 });
+    assert.deepEqual([w.cancels.length, w.posts.length, await held(c.id)], [1, 1, false]); }
+});
+
+test("R1(B) RED→GREEN: the stop arrives DURING the success transaction's own proof query (real client, abort before the evidence count returns) → the event is vetoed and rolled back: intent / claim untouched, stop reported; next session finishes without resend", async () => {
+  for (const [label, needle, opType] of [["refund", "e.source = 'stripe_api'", OPS.REFUND], ["cancel", "e.kind = 'hostaway_reservation'", OPS.CANCEL]]) {
+    const w = world(); const c = await cleanupPending(w); const h = harness(w, c.id);
+    if (label === "refund") { await settleLate(await h.step()); h.clk.t += MIN; }
+    const ac = new AbortController();
+    const origConnect = db.app.connect.bind(db.app);
+    const wrap = (client) => {
+      const q = client.query.bind(client);
+      client.query = async (...qa) => { const r = await q(...qa); if (typeof qa[0] === "string" && qa[0].includes(needle) && qa[0].includes("count(*)")) ac.abort(); return r; };
+      return client;
+    };
+    // pg Pool.connect: promise form (the repo's transactions) and callback form (pool.query internally) both wrapped
+    db.app.connect = (cb) => (typeof cb === "function" ? origConnect((err, client, release) => cb(err, client ? wrap(client) : client, release)) : origConnect().then(wrap));
+    let s;
+    try { s = await h.step({ signal: ac.signal }); await settleLate(s); } finally { db.app.connect = origConnect; }
+    const row = (await opsOf(c.id, opType))[0];
+    assert.equal(ac.signal.aborted, true, `${label}: the abort fired inside the transaction`);
+    assert.deepEqual([await state(c.id), await held(c.id), s.stop && s.stop.code, row.state], ["test_cleanup_pending", true, "SIGNAL", "succeeded"], `${label}: ${JSON.stringify(s.actions)}`);
+    assert.ok(s.actions.some((a) => a.endsWith("!STOPPED")), `${label}: the event was vetoed inside its transaction: ${JSON.stringify(s.actions)}`);
+    assert.deepEqual(await legs(c.id), label === "refund" ? [true, false] : [false, false], label);
+    const h2 = harness(w, c.id, { start: h.clk.t + 3 * MIN });
+    await h2.until((st) => st === "cancelled", { max: 8 });
+    assert.deepEqual([w.cancels.length, w.posts.length, await held(c.id)], [1, 1, false], label);
+  }
+});
+
+test("R2 RED→GREEN: a stop inside read post-processing (after*Read hooks) never persists authoritative evidence — PI, Hostaway and refund reads take the STOP_* bookkeeping path; a late tie / unusable reply keeps the fixed stop code", async () => {
+  // PI read on the initial step (exact ROOT repro): evidence count 0 → 0, read row attempts 1 with STOP_SIGNAL, no claim
+  { const w = world(); const c = await cleanupPending(w); const h = harness(w, c.id); const ac = new AbortController();
+    const before = await piEvidenceCount(c.id);
+    const s = await h.step({ signal: ac.signal, hooks: { afterPiRead: async () => ac.abort() } }); await settleLate(s);
+    assert.deepEqual([before, await piEvidenceCount(c.id), s.stop.code, w.cancels.length], [0, 0, "SIGNAL", 0], JSON.stringify(s.actions));
+    assert.deepEqual((await opsOf(c.id, OPS.PI_READ)).map((r) => [r.state, r.attempts, r.error_code]), [["pending", 1, "STOP_SIGNAL"]]);
+    assert.ok(s.actions.includes("STOP:SIGNAL:pi_read"), JSON.stringify(s.actions)); }
+  // Hostaway by-id read
+  { const w = world(); const c = await cleanupPending(w); const h = harness(w, c.id); const ac = new AbortController();
+    const s = await h.step({ signal: ac.signal, hooks: { afterResRead: async () => ac.abort() } }); await settleLate(s);
+    assert.deepEqual([await evidenceCount(c.id, "hostaway_reservation"), s.stop.code, w.cancels.length], [0, "SIGNAL", 0], JSON.stringify(s.actions));
+    assert.deepEqual((await opsOf(c.id, OPS.RES_READ)).map((r) => [r.state, r.attempts, r.error_code]), [["pending", 1, "STOP_SIGNAL"]]); }
+  // refund GET after the POST: no stripe_refund evidence, row unknown (uncertainty bookkeeping), no success; the next session proves it read-only
+  { const w = world(); const c = await cleanupPending(w); const h = harness(w, c.id); const ac = new AbortController();
+    await settleLate(await h.step()); h.clk.t += MIN;
+    const s = await h.step({ signal: ac.signal, hooks: { afterRefundRead: async () => ac.abort() } }); await settleLate(s);
+    assert.deepEqual([await evidenceCount(c.id, "stripe_refund"), s.stop.code, (await opsOf(c.id, OPS.REFUND))[0].state, await state(c.id), await held(c.id)], [0, "SIGNAL", "outcome_unknown", "test_cleanup_pending", true], JSON.stringify(s.actions));
+    assert.ok(s.actions.includes("REFUND_OUTCOME_UNKNOWN:STOP_SIGNAL_AFTER_SEND"), JSON.stringify(s.actions));
+    const h2 = harness(w, c.id, { start: h.clk.t + 3 * MIN });
+    await h2.until((st) => st === "cancelled", { max: 8 });
+    assert.deepEqual([w.posts.length, await held(c.id)], [1, false]); }
+  // the stop code stays fixed even when the reply is also unusable (live-mode PI) — the stop is reported, no evidence, no claim
+  { const w = world(); const c = await cleanupPending(w); const h = harness(w, c.id); const ac = new AbortController();
+    w.pis.get(c.piId).livemode = true;
+    const s = await h.step({ signal: ac.signal, hooks: { afterPiRead: async () => ac.abort() } }); await settleLate(s);
+    assert.deepEqual([await piEvidenceCount(c.id), s.stop.code], [0, "SIGNAL"]);
+    assert.ok(s.actions.includes("STOP:SIGNAL:pi_read") && !s.actions.includes("WAIT:PI_READ_UNUSABLE"), JSON.stringify(s.actions)); }
+});
