@@ -10,6 +10,7 @@ import { STATES } from "../../lib/checkout/intent-state.js";
 import { completeOperation, completeRecordingWithEvidence } from "../../db/lib/operations.js";
 import { applyResolution } from "../../db/lib/repo.js";
 import { adminResolveIntent } from "../../db/lib/admin.js";
+import { requestTestCleanup } from "../../lib/booking-db/test-cleanup.js";
 
 let db, report;
 before(async () => { db = await startMigratedDatabase(); report = new pg.Pool({ connectionString: db.reportUrl(), max: 2 }); });
@@ -88,6 +89,17 @@ test("every E3 state is reachable through persisted transitions, with exact roun
   reached.add(rr.intent.status);
   assert.equal(await F.count(db.app, "SELECT count(*) AS n FROM booking.reconciliation_cases WHERE intent_id = $1 AND status = 'resolved'", [a.id]), 1);
 
+  // 0019: test_cleanup_pending — a CAPTURED TEST payment (606998 / USD, capture result = a charge id) requested for cleanup through the accepted path
+  { const r = await F.reserved(db.app, { listingId: 606998, currency: "USD", from: "2028-01-10", to: "2028-01-12" });
+    const chargeId = `ch_test_${r.id.replace(/-/g, "").slice(0, 16)}`;
+    const cop = await F.claimOp(db.app, r.id, "stripe.capture_payment_intent", F.at(8));
+    F.ok(await completeOperation(db.app, cop.id, { workerId: "w1", now: F.at(8), outcome: { status: "succeeded", resultRef: chargeId } }));
+    F.ok(await applyEvent(db.app, r.id, { type: "CAPTURE_SUCCEEDED", id: `evt_cap_${r.piId}`, amountMinor: 576000, currency: "usd" }, { now: F.at(8), actor: "webhook" }));
+    const i = await loadIntent(db.app, r.id);
+    const c = F.ok(await requestTestCleanup(db.app, r.id, { now: F.at(20), env: { VERCEL_ENV: "development", MV_E7_TEST_CLEANUP: "enabled" },
+      operator: { approvalRef: "reach", attemptId: r.attemptId, authorizedMinor: 576000, capturedMinor: 576000, chargeId, currency: "USD", expectedVersion: i.version, finalTotalMinor: 576000,
+        from: i.from, guests: i.guests, intentId: r.id, listingId: 606998, paymentIntentId: r.piId, planHash: "0".repeat(64), reservationId: String(r.reservationId), sessionId: r.sessionId, to: i.to } }));
+    reached.add(c.intent.status); assert.equal(rowToIntent(await loadIntentRow(db.app, r.id)).status, "test_cleanup_pending"); }
   for (const s of Object.values(STATES)) assert.ok(reached.has(s), `state ${s} persisted`);
 });
 

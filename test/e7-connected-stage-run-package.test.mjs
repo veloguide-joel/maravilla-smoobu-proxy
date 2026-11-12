@@ -17,8 +17,8 @@ import { PRESENT_KEYS } from "../scripts/e7-connected/probe-env-preflight.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CLI = path.join(ROOT, "scripts/e7-connected/stage-run-package.mjs");
-// PR #56 updates repo.js in the reviewed lease-maintenance baseline, also part of the executor closure.
-const EXEC = "93c899039272e90987163cf33b817e27fc79acd177d936178bfa21a539eb45ca";
+// PR #67 (0019 test-cleanup foundation) updates intent-state.js / repo.js / operations.js, also part of the executor closure.
+const EXEC = "5b91c32aa42bfac298f063b84eb1d072047e1bbf644f107c2862700fa05a0b10";
 const NATIVE22 = process.version === "v22.22.0";
 const sha = (b) => createHash("sha256").update(b).digest("hex");
 const iso = (t) => new Date(t).toISOString();

@@ -12,8 +12,9 @@
 //   * Writes exactly two files: O_CREAT|O_EXCL|O_NOFOLLOW requested 0600; the NEW fd must then fstat as a regular own-uid nlink-1 file with
 //     mode EXACTLY 0600 (rev2, ROOT F2: an inherited restrictive umask is refused, never chmod-repaired) BEFORE any byte is written. No
 //     overwrite / chmod / repair / adopt / cleanup / retry: after the first create, every failure is *_LEFT_IN_PLACE.
-//   * Baseline note: FIXED.repoCommit is the reviewed lease-maintenance EXECUTION baseline (ac20347d) the plan declares; it is NOT a claim about the
-//     current Git HEAD of the checkout this helper is published in. The foundation sourceDigest is what binds the actual bytes.
+//   * Baseline note: FIXED.repoCommit is the reviewed EXECUTION baseline the plan declares (66032e14: PR #67 0019 test-cleanup foundation on the
+//     lease-maintenance baseline; ROOT logic PASS 5879497019); it is NOT a claim about the current Git HEAD of the checkout this helper is
+//     published in. The foundation sourceDigest is what binds the actual bytes.
 //   * NOT part of any reviewed closure (native / foundation / executor lists unchanged); no execute mode.
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -32,8 +33,9 @@ export const REQUIRED_NODE = "v22.22.0";
 export const MAX_FACTS_B64 = 4096;
 export const MAX_FACTS_JSON = 3072;
 export const FIXED = Object.freeze({
-  // PR #56 changes lease-expiry maintenance. Future packages bind those reviewed bytes; existing packages are never rewritten.
-  repoCommit: "ac20347d0e788808ecdfc06e937d0731c9905ce2", sourceDigest: "a1f8e633b1ab6e1ae627ccd8fff01b880ddfd9278c4bea3484dc59615654418e",
+  // PR #67 (0019 test-cleanup foundation) extends intent-state / repo / operations in the reviewed foundation. Future packages bind those
+  // reviewed bytes; existing (spent) packages are never rewritten.
+  repoCommit: "66032e14393cb0def589415d9c942449aaca1d99", sourceDigest: "744d76f64951413547e87da748762a0651d447660e1d125853ee80ba98f62f26",
   stripeAccountId: "acct_1TyHE42B9LTneQgw", hostawayAccountRef: "201434", clientSnapshotId: "provider-file-h1-20261111",
   listing: Object.freeze({ id: 606998, currency: "USD", refFieldId: 105433, timeZone: "America/Mexico_City", connection: "disconnected" }),
   deadlines: Object.freeze({ quoteMaxAgeMinutes: 30, authorizationMaxAgeHours: 1 }), stayRules: Object.freeze({ minLeadDays: 7, maxNights: 1 }) });
