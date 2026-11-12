@@ -38,6 +38,8 @@ import { bindRunPackageR1Journal } from "../../scripts/e7-connected/run-journal-
 import * as CLI from "../../scripts/e7-connected/run-plan-cli-main.mjs";
 import * as L from "../../scripts/e7-connected/run-r1-launcher.mjs";                  // ADDED (de6285b5 P3): exported pre-check SQL for the mapping proofs
 import { LOCK_KEY } from "../../scripts/e7-connected/run-core.mjs";
+import { DEFAULT_CONFIG } from "../../lib/checkout/intent-state.js";                 // ADDED (T1): lease constant from source
+import { FRESH_AFTER_DISPATCH_MS } from "../../lib/checkout/recovery-plan.js";        // ADDED (T1): fresh-read window from source
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const ABORT_LISTING = 606998;
@@ -726,3 +728,81 @@ test("E8 P3 in the native launch: a second REAL session holding the exact run ke
   assert.deepEqual([S2.code, line2.outcome, line2.result.run.outcome], [0, "EXECUTE_ENDED", "ENDED_RELEASED"], "no holder → the accepted P0 / core path");
 });
 
+
+// =================================================================================================================================
+// T1 (ROOT-approved, 2026-11-11): the NORMAL live Hostaway shape — the create reply does NOT echo the booking ref — through ONE native R1
+// run, end to end. Nothing is forced: the business clock runs at the harness time scale, so the E3 lease (RESERVATION_STARTED + leaseMs)
+// expires BEFORE the fresh-read window opens (RESERVATION_DISPATCHED + FRESH_AFTER_DISPATCH_MS), exactly as in r02. The ONLY test input is
+// the labelled world mode `create: "noEcho"` (the mock applies the create and omits the custom-field value from the reply). The accepted
+// worker / repo / operator abort / cleanup run unmodified; no transition, evidence or success is inserted; no outside cleanup runner.
+// Calendar answers are SYNTHETIC TEST EVIDENCE over the launcher's real stdin protocol — not owner attestations, never real Airbnb sync.
+const LEASE_MS = DEFAULT_CONFIG.leaseMs;
+const chain = async (id) => all("SELECT version_after, event_type, to_state, reason_code, actor, at FROM booking.intent_transitions WHERE intent_id = $1 ORDER BY version_after", [id]);
+
+test("N1 no-echo create (lease expires before freshness) → RESERVATION_SUCCEEDED, never an interrupted-worker relabel → the run's OWN abort / host-cancel / void → REOPENED → ENDED_RELEASED, both synthetic modes", async () => {
+  for (const connection of ["disconnected", "airbnb"]) {
+    const w = world(); w.mode.create = "noEcho";
+    const S = await launch({ w, connection });
+    const line = await S.run();
+    noLeak(S, connection);
+    assert.equal(S.code, 0, `${connection}: ${S.out.join("")}`);
+    const r = line.result.run;
+    assert.deepEqual([line.outcome, r.ok, r.outcome, r.stopCode, r.journalTerminal, r.journalTail, r.bridgeCalls, r.connection, r.ownerCleanupRequired],
+      ["EXECUTE_ENDED", true, "ENDED_RELEASED", null, "acknowledged", "KNOWN", 1, connection, null], JSON.stringify(r));
+    // the transition chain: no RECOVER_INTERRUPTED / RECONCILED_RESERVATION_FOUND on the normal path
+    const c = await chain(S.bk.id);
+    const after = c.filter((t) => t.version_after > c.find((t2) => t2.event_type === "RESERVATION_DISPATCHED").version_after).map((t) => t.event_type);
+    assert.deepEqual(after.slice(0, 2), ["RESERVATION_SUCCEEDED", "TEST_ABORT_REQUESTED"], `${connection}: ${after.join(" → ")}`);
+    assert.deepEqual([...after.slice(2)].sort(), ["RESERVATION_CANCELLED", "VOID_SUCCEEDED"], `${connection}: both legs settled by the run's own cleanup`);
+    assert.equal(c.filter((t) => ["RECOVER_INTERRUPTED", "RECONCILED_RESERVATION_FOUND"].includes(t.event_type)).length, 0, `${connection}: no false interrupted handoff`);
+    assert.equal(c.filter((t) => t.event_type === "TEST_ABORT_REQUESTED").length, 1);
+    // the boundary really was crossed (not forced): confirmation came after the E3 lease expired and at / after the fresh-read window
+    const at = (e) => Date.parse(c.find((t) => t.event_type === e).at);
+    assert.ok(at("RESERVATION_SUCCEEDED") > at("RESERVATION_STARTED") + LEASE_MS, `${connection}: confirmed after the lease expired`);
+    assert.ok(at("RESERVATION_SUCCEEDED") >= at("RESERVATION_DISPATCHED") + FRESH_AFTER_DISPATCH_MS, `${connection}: confirmed by fresh reads`);
+    // attempt + bound ids: own host-cancel of THE bound id and own void of THE bound PI, exactly once each
+    const att = await one("SELECT state, hostaway_reservation_id FROM booking.hostaway_reservation_attempts WHERE intent_id = $1", [S.bk.id]);
+    const intentRow = await one("SELECT hostaway_reservation_id FROM booking.intents WHERE id = $1", [S.bk.id]);
+    assert.equal(att.state, "succeeded", `${connection}: attempt succeeded (not reconciled_found)`);
+    assert.equal(String(intentRow.hostaway_reservation_id), att.hostaway_reservation_id, "the bound id is the created one");
+    const cancels = w.calls.filter((k) => k === "cancelReservation").length;
+    assert.equal(cancels, 1); assert.equal(w.res.get(Number(att.hostaway_reservation_id)).status, "cancelled", "the bound reservation is the cancelled one");
+    assert.deepEqual([...w.res.values()].map((x) => x.status), ["cancelled"], "exactly one reservation ever created, and it is cancelled");
+    assert.deepEqual([w.writes.cancelPaymentIntent, w.pis.get(S.bk.piId).status], [1, "canceled"], "void of the bound PI, once");
+    assert.deepEqual(r.writes, { cancel: 1, capture: 0, create: 1, record: 0, void: 1 });
+    assert.deepEqual(writesAt(S), [1, 1, 1, 0, 0], "create 1 / host-cancel 1 / void 1 / capture 0 / record 0");
+    assert.equal(S.t.x.log.filter((e) => /refund/i.test(e.path)).length, 0, "refund 0"); assert.deepEqual(S.t.x.violations, []);
+    assert.deepEqual(r.release, { state: "cancelled", reason: "TEST_ABORT_REQUESTED", legs: "true/true", claimsHeld: 0 });
+    assert.deepEqual([await state(S.bk.id), await claimsHeld(S.bk.id)], ["cancelled", 0]);
+    await assertNotifyUnsent(S.bk.id, connection);                                     // pristine queued notifications are permitted; none sent
+    assert.deepEqual([r.r1.exclusionAfter, r.r1.fullyClean], ["equal", true]);
+    // synthetic calendar evidence: exactly the mode's three checkpoints, bound to this run / package / intent
+    assert.deepEqual(S.prompts.map((p) => p.checkpoint), [...S.K]);
+    assert.ok(S.prompts.every((p) => p.intentId === S.bk.id && p.manifestHash === S.pk.built.packageHash && p.connection === connection));
+    // the creation-only R1 journal is terminal and trusted
+    const b = bindRunPackageR1Journal(S.pk.input, S.clock()).binding;
+    const rc = await readJournalForRecoveryR1({ journalDir: S.jd, headDir: S.hd, binding: b, trustedHead: r.trustedHead });
+    assert.deepEqual([rc.relation, rc.suppliedHead, rc.chain.status], ["AT_ESCROW_HEAD", "MATCH_TIP", "ENDED"]); assert.ok(Object.values(rc.permission).every((x) => x === false));
+    assert.deepEqual(await appPids(), [], "no launcher connection left open");
+  }
+});
+
+// T5 (source-derived risk made concrete): the worker's slow ref-not-echoed escalation (per-op reads + MAX_RECOVERY_READS steps) never plays
+// out INSIDE a run — the run core stops at the FIRST failing read (run-core-abort-v2 `READ:*:error` → READ_FAILED), within the reservation
+// phase limits (12 steps / 15 min). Bounded refusal: exactly ONE create, no second create, no cleanup sends, claim kept, honest STOP with
+// ownerCleanupRequired = reservedNotConfirmed (a live reservation + held authorization outlive the run and need separately reviewed cleanup).
+test("N2 no-echo create whose confirming by-id reads fail (503) → STOPPED READ_FAILED inside the reservation phase: ONE create, never a second, no cancel / void, claim held, reservedNotConfirmed", async () => {
+  const w = world(); w.mode.create = "noEcho";
+  const S = await launch({ w, afterBooking: (w0) => { w0.exec.R.retrieveReservation = async () => ({ httpStatus: 503, json: { status: "fail" } }); } });   // LABELLED TEST FAULT
+  const line = await S.run(); noLeak(S, "N2");
+  const r = line.result.run;
+  assert.deepEqual([line.outcome, r.ok, r.outcome, r.stopCode, r.ownerCleanupRequired, r.journalTerminal, r.release], ["EXECUTE_STOPPED", false, "STOPPED", "READ_FAILED", "reservedNotConfirmed", "acknowledged", null], JSON.stringify(r));
+  assert.deepEqual(r.writes, { cancel: 0, capture: 0, create: 1, record: 0, void: 0 });
+  assert.deepEqual(writesAt(S), [1, 0, 0, 0, 0]); assert.equal(w.writes.createReservation, 1, "never a second create");
+  assert.deepEqual([await state(S.bk.id), await claimsHeld(S.bk.id)], ["reservation_pending", 1]);
+  assert.equal((await one("SELECT state FROM booking.hostaway_reservation_attempts WHERE intent_id = $1", [S.bk.id])).state, "dispatched");
+  const c = await chain(S.bk.id);
+  assert.deepEqual(c.filter((t) => t.version_after >= 5).map((t) => t.event_type), ["RESERVATION_STARTED", "RESERVATION_DISPATCHED"], "nothing relabelled, nothing confirmed");
+  assert.equal(S.prompts.filter((p) => p.checkpoint !== S.K[0]).length, 0, "no BLOCKED / REOPENED evidence requested for an unconfirmed reservation");
+  await assertNotifyUnsent(S.bk.id, "N2"); assert.deepEqual(await appPids(), []);
+});
