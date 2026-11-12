@@ -106,7 +106,8 @@ const cfgFor = (ids, currency = "MXN") => validateAdapterConfig({ allowedListing
 const POLICY = readDirectPolicyFromEnv(ENV).policy;
 
 /** A payment_authorized intent priced EXACTLY like the server would (fresh priceStay), with guest details. */
-async function authorizedIntent(w, listingId, stay = STAY) {
+async function authorizedIntent(w, listingId, stay = STAY) { return authorizedIntentOn(db, w, listingId, stay); }
+async function authorizedIntentOn(db, w, listingId, stay = STAY) {
   const priced = await priceStay({ request: { listingId, ...stay }, listingConfig: { currency: "MXN" }, client: w.pricing, policy: POLICY,
     today: todayInTimeZone(undefined, new Date(F.at(0))), now: F.at(0) });
   assert.ok(priced.ok, priced.error);
@@ -853,4 +854,187 @@ test("root (5): an exhausted re-issue never escalates an intent that left the re
   assert.ok(s.actions.includes("RECOVERY:ESCALATE!OUT_OF_SCOPE"), JSON.stringify(s.actions));
   const i = await loadIntent(db.app, a.id);
   assert.deepEqual([i.status, i.reasonCode], ["reservation_failed", "PRICE_CHANGED"], "not escalated by the stale exhaustion");
+});
+
+// =================================================================================================================================
+// E7 lease vs freshness (2026-11-11): the lease-expiry maintenance must not relabel a HANDED-OFF create (dispatched, succeeded,
+// usable consistent result_ref: the ref-not-echoed reply) as an interrupted worker; everything else keeps the original recovery.
+import { recoverInterruptedReservations, PROTECTED_IDS_FOR_MAINTENANCE, recordHostawayCreateResult } from "../../lib/booking-db/repo.js";
+import { FRESH_AFTER_DISPATCH_MS } from "../../lib/checkout/recovery-plan.js";
+const transitionsOf = async (id) => (await db.app.query("SELECT version_after, event_type, to_state, reason_code FROM booking.intent_transitions WHERE intent_id = $1 ORDER BY version_after", [id])).rows;
+const evTypes = async (id) => (await transitionsOf(id)).map((x) => x.event_type);
+const attemptOf = async (id) => (await db.app.query("SELECT state, hostaway_reservation_id FROM booking.hostaway_reservation_attempts WHERE intent_id = $1", [id])).rows;
+const intentRow = async (id) => (await db.app.query("SELECT state, lease_until, dispatch_at FROM booking.intents WHERE id = $1", [id])).rows[0];
+/** worker-driven: STARTED, then ONE create send in `mode`; returns { a, h, dispatchAt, leaseUntil } */
+async function handedOff(w, listing, mode = "refNotEchoed") {
+  const a = await authorizedIntent(w, listing);
+  const h = harness(w, [listing]);
+  await h.step({ intentId: a.id });
+  h.clk.t += 3700;                                                   // STARTED → dispatch gap (r02: 3.7 s); the lease runs from STARTED
+  w.createMode = mode;
+  const s = await h.step({ intentId: a.id });
+  const r = await intentRow(a.id);
+  return { a, h, s, dispatchAt: r.dispatch_at.getTime(), leaseUntil: r.lease_until.getTime() };
+}
+/** accepted E3 events only: STARTED (lease) + DISPATCHED at t, no worker afterwards (a crashed worker) */
+async function dispatchedByHand(w, listing, t = F.at(10)) {
+  const a = await authorizedIntent(w, listing);
+  F.ok(await applyEvent(db.app, a.id, { type: "RESERVATION_STARTED", workerId: "w1", recheck: { bookable: true, priceSame: true } }, { now: t, actor: "worker", workerId: "w1" }));
+  F.ok(await applyEvent(db.app, a.id, { type: "RESERVATION_DISPATCHED", workerId: "w1" }, { now: t, actor: "worker", workerId: "w1" }));
+  return a;
+}
+
+test("LF1 (RED on bf44/8f65) ref-not-echoed create survives the EXPIRED E3 lease and confirms via fresh by-ref + by-id reads as RESERVATION_SUCCEEDED — never RECOVER_INTERRUPTED", async () => {
+  const w = world();
+  const { a, h, s, dispatchAt, leaseUntil } = await handedOff(w, L(200));
+  assert.equal(s.actions.at(-1), "CREATE_REF_NOT_ECHOED:READS_REQUIRED");
+  assert.ok(leaseUntil < dispatchAt + FRESH_AFTER_DISPATCH_MS, "precondition: the E3 lease expires before the read window opens");
+  // the maintenance itself, called directly after the lease expired: this intent is not a candidate
+  const direct = await recoverInterruptedReservations(db.app, { now: leaseUntil + 1, intentId: a.id });
+  assert.deepEqual(direct, [], "a handed-off succeeded create is not an interrupted worker");
+  await h.until(a.id, (st) => st === "reservation_confirmed", { max: 30, advanceMs: 45 * 1000 });
+  const ev = await evTypes(a.id);
+  assert.equal(ev.includes("RECOVER_INTERRUPTED"), false, JSON.stringify(ev));
+  assert.deepEqual(ev.slice(-3), ["RESERVATION_STARTED", "RESERVATION_DISPATCHED", "RESERVATION_SUCCEEDED"]);
+  assert.deepEqual((await attemptOf(a.id)).map((x) => x.state), ["succeeded"]);
+  assert.equal(w.count("CREATE"), 1, "no second create");
+  // the proof reads (found_active; the pre-create absence lookup is excluded) were observed at/after dispatch + FRESH (strict rule unchanged)
+  const reads = (await db.app.query(`SELECT e.observed_at FROM booking.provider_evidence e WHERE e.intent_id = $1 AND e.kind = 'hostaway_reservation' AND e.status = 'found_active'`, [a.id])).rows;
+  assert.ok(reads.length >= 2 && reads.every((x) => x.observed_at.getTime() >= dispatchAt + FRESH_AFTER_DISPATCH_MS), "fresh reads only");
+});
+
+test("LF2 freshness boundary: 1 ms before dispatch + FRESH (lease long expired) nothing is read or confirmed; maintenance does not relabel; at the boundary the reads start", async () => {
+  const w = world();
+  const { a, h, dispatchAt } = await handedOff(w, L(201));
+  const lookups = w.count("LOOKUP"); const retrieves = w.count("RETRIEVE");
+  h.clk.t = dispatchAt + FRESH_AFTER_DISPATCH_MS - 1;
+  const early = await h.step({ intentId: a.id });
+  assert.equal(w.count("LOOKUP") + w.count("RETRIEVE"), lookups + retrieves, "no read before the boundary");
+  assert.equal((await intentRow(a.id)).state, "reservation_pending");
+  assert.equal((await evTypes(a.id)).includes("RECOVER_INTERRUPTED"), false);
+  assert.ok(early.status === "idle" || early.actions.some((x) => x.startsWith("WAIT:")), JSON.stringify(early));
+  h.clk.t = dispatchAt + FRESH_AFTER_DISPATCH_MS;
+  await h.step({ intentId: a.id });
+  assert.ok(w.count("LOOKUP") + w.count("RETRIEVE") > lookups + retrieves, "reads start at the boundary");
+});
+
+test("LF3 genuine interruptions keep the ORIGINAL recovery: crash before dispatch → payment_authorized; in_flight / outcome_unknown create → reservation_unknown (WORKER_INTERRUPTED)", async () => {
+  const w = world();
+  // (a) STARTED only (nothing sent)
+  const a = await authorizedIntent(w, L(202));
+  F.ok(await applyEvent(db.app, a.id, { type: "RESERVATION_STARTED", workerId: "w1", recheck: { bookable: true, priceSame: true } }, { now: F.at(10), actor: "worker", workerId: "w1" }));
+  let r = await recoverInterruptedReservations(db.app, { now: F.at(13), intentId: a.id });
+  assert.deepEqual(r.map((x) => [x.ok, x.status]), [[true, "payment_authorized"]]);
+  // (b) dispatched, create claimed in_flight (send may have started), worker gone
+  const b = await dispatchedByHand(w, L(203));
+  assert.ok(await F.claimOp(db.app, b.id, "hostaway.create_reservation", F.at(10)));
+  r = await recoverInterruptedReservations(db.app, { now: F.at(13), intentId: b.id });
+  assert.deepEqual(r.map((x) => [x.ok, x.status]), [[true, "reservation_unknown"]]);
+  assert.equal((await transitionsOf(b.id)).at(-1).reason_code, "WORKER_INTERRUPTED");
+  // (c) dispatched, create settled outcome_unknown, worker died before applying RESERVATION_OUTCOME_UNKNOWN
+  const c = await dispatchedByHand(w, L(204));
+  const op = await F.claimOp(db.app, c.id, "hostaway.create_reservation", F.at(10));
+  F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(10), outcome: { status: "outcome_unknown", errorCode: "CREATE_TIMEOUT" } }));
+  r = await recoverInterruptedReservations(db.app, { now: F.at(13), intentId: c.id });
+  assert.deepEqual(r.map((x) => [x.ok, x.status]), [[true, "reservation_unknown"]]);
+});
+
+test("LF4 a SUCCEEDED create with missing / malformed / protected / inconsistent metadata is NOT skipped (never stuck): original recovery applies", async () => {
+  const w = world();
+  const cases = [
+    ["result_ref NULL, reply unparsed", null, null],
+    ["result_ref malformed", "71A0001", "71A0001"],
+    ["result_ref ≠ recorded reply id", "79000002", "79000001"],
+    ["reply id not recorded (attempt id NULL)", "79000003", null]
+  ];
+  let n = 205;
+  for (const [label, resultRef, replyId] of cases) {
+    const a = await dispatchedByHand(w, L(n++));
+    const op = await F.claimOp(db.app, a.id, "hostaway.create_reservation", F.at(10));
+    await recordHostawayCreateResult(db.app, a.id, { httpStatus: 201, reservation: replyId && /^\d+$/.test(replyId) ? { reservationId: replyId, listingId: L(n - 1), from: STAY.from, to: STAY.to, totalMinor: 1 } : null }, { now: F.at(10) });
+    const out = { status: "succeeded" }; if (resultRef !== null) out.resultRef = resultRef;
+    const c = await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(10), outcome: out });
+    assert.equal(c.ok, true, `${label}: the fixture must settle through the accepted API (${c.error ?? "ok"})`);
+    const r = await recoverInterruptedReservations(db.app, { now: F.at(13), intentId: a.id });
+    assert.deepEqual(r.map((x) => [x.ok, x.status]), [[true, "reservation_unknown"]], label);
+  }
+  // protected result_ref, fully "consistent" (attempt + op agree): still NOT skipped. Own disposable DB: an earlier test in this file
+  // already recorded protected ids under the UNIQUE attempt column.
+  const db2 = await startMigratedDatabase();
+  try {
+    const a = await authorizedIntentOn(db2, w, L(210));
+    F.ok(await applyEvent(db2.app, a.id, { type: "RESERVATION_STARTED", workerId: "w1", recheck: { bookable: true, priceSame: true } }, { now: F.at(10), actor: "worker", workerId: "w1" }));
+    F.ok(await applyEvent(db2.app, a.id, { type: "RESERVATION_DISPATCHED", workerId: "w1" }, { now: F.at(10), actor: "worker", workerId: "w1" }));
+    const op = await F.claimOp(db2.app, a.id, "hostaway.create_reservation", F.at(10));
+    await recordHostawayCreateResult(db2.app, a.id, { httpStatus: 201, reservation: { reservationId: "70636076", listingId: L(210), from: STAY.from, to: STAY.to, totalMinor: 1 } }, { now: F.at(10) });
+    F.ok(await completeOperation(db2.app, op.id, { workerId: "w1", now: F.at(10), outcome: { status: "succeeded", resultRef: "70636076" } }));
+    const r = await recoverInterruptedReservations(db2.app, { now: F.at(13), intentId: a.id });
+    assert.deepEqual(r.map((x) => [x.ok, x.status]), [[true, "reservation_unknown"]], "protected result_ref is never skipped");
+  } finally { await db2.close(); }
+});
+
+test("LF5 with the skip active, a failed proof / failing reads still reach bounded recovery or escalation (no stuck pending, no second create)", async () => {
+  // (a) the provider loses the reservation: fresh reads cannot prove it → RESERVATION_OUTCOME_UNKNOWN → bounded unknown handling
+  let w = world();
+  let x = await handedOff(w, L(215));
+  w.reservations.length = 0;
+  await x.h.until(x.a.id, (st) => st !== "reservation_pending" && st !== "reservation_unknown", { max: 40, advanceMs: 60 * 1000 });
+  let ev = await evTypes(x.a.id);
+  assert.ok(ev.includes("RESERVATION_OUTCOME_UNKNOWN"), JSON.stringify(ev));
+  assert.equal(ev.includes("RECOVER_INTERRUPTED"), false);
+  assert.notEqual((await intentRow(x.a.id)).state, "reservation_confirmed");
+  assert.equal(w.count("CREATE"), 1);
+  // (b) reads keep failing at the provider (lookup HTTP 500): never confirmed from failures, never a second create, leaves pending
+  w = world();
+  x = await handedOff(w, L(216));
+  w.lookupMode = "error";
+  let steps = 0;
+  for (; steps < 120 && (await intentRow(x.a.id)).state === "reservation_pending"; steps++) { await x.h.step({ intentId: x.a.id }); x.h.clk.t += 60 * 1000; }
+  const st = (await intentRow(x.a.id)).state;
+  assert.notEqual(st, "reservation_pending", "bounded: per-op read attempts + MAX_RECOVERY_READS end in escalation, never stuck");
+  assert.notEqual(st, "reservation_confirmed"); assert.equal(w.count("CREATE"), 1);
+  assert.equal((await evTypes(x.a.id)).includes("RECOVER_INTERRUPTED"), false);
+  console.log(`# LF5b steps=${steps}`);
+  console.log(`# LF5b lookup-error end state after bounded steps: ${st}; events ${JSON.stringify(await evTypes(x.a.id))}`);
+});
+
+test("LF6 scope + LIMIT isolation: a skipped handed-off intent never consumes the LIMIT; scope filters still apply before LIMIT; concurrent maintenance recovers a genuine interruption exactly once", async () => {
+  const w = world();
+  const A = await handedOff(w, L(217));                               // skip-eligible (succeeded create, consistent ref)
+  const B = await dispatchedByHand(w, L(218));                        // genuinely interrupted (in_flight create)
+  assert.ok(await F.claimOp(db.app, B.id, "hostaway.create_reservation", F.at(10)));
+  const now = Math.max(A.leaseUntil, F.at(13)) + 1;
+  assert.deepEqual(await recoverInterruptedReservations(db.app, { now, listingIds: [L(217)] }), [], "listing scope: only A, skipped");
+  assert.deepEqual(await recoverInterruptedReservations(db.app, { now, intentId: A.a.id }), [], "intent scope: A skipped");
+  const [r1, r2] = await Promise.all([recoverInterruptedReservations(db.app, { now, limit: 1, listingIds: [L(217), L(218)] }),
+    recoverInterruptedReservations(db.app, { now, limit: 1, listingIds: [L(217), L(218)] })]);
+  const all = [...r1, ...r2];
+  assert.ok(all.length >= 1 && all.every((x) => x.intentId === B.id), "LIMIT 1 is never consumed by the skipped intent");
+  assert.equal((await intentRow(B.id)).state, "reservation_unknown");
+  assert.equal((await evTypes(B.id)).filter((t) => t === "RECOVER_INTERRUPTED").length, 1);
+  assert.equal((await intentRow(A.a.id)).state, "reservation_pending");
+});
+
+test("LF7 parity: the maintenance protected-id list equals reservation-worker PROTECTED_HOSTAWAY_RESERVATION_IDS", () => {
+  assert.deepEqual([...PROTECTED_IDS_FOR_MAINTENANCE], [...PROTECTED_HOSTAWAY_RESERVATION_IDS]);
+});
+
+test("LF8 crash AFTER a consistent succeeded create (echo case) but BEFORE RESERVATION_SUCCEEDED: skipped by maintenance, then the recovery pass + fresh reads confirm it (never stuck, never a second create, never payment_authorized)", async () => {
+  const w = world();
+  const a = await dispatchedByHand(w, L(219));
+  const op = await F.claimOp(db.app, a.id, "hostaway.create_reservation", F.at(10));
+  const rid = w.nextId++;
+  const intent = await loadIntent(db.app, a.id);
+  w.reservations.push({ id: rid, listingMapId: L(219), arrivalDate: STAY.from, departureDate: STAY.to, totalPrice: intent.price.finalTotalMinor / 100, currency: "MXN", status: "new", ref: a.ref });
+  await recordHostawayCreateResult(db.app, a.id, { httpStatus: 201, reservation: { reservationId: String(rid), listingId: L(219), from: STAY.from, to: STAY.to, totalMinor: intent.price.finalTotalMinor, currency: "MXN" } }, { now: F.at(10) });
+  F.ok(await completeOperation(db.app, op.id, { workerId: "w1", now: F.at(10), outcome: { status: "succeeded", resultRef: String(rid) } }));
+  // ...the worker dies here. The lease expires; maintenance does not relabel it.
+  assert.deepEqual(await recoverInterruptedReservations(db.app, { now: F.at(13), intentId: a.id }), []);
+  const h = harness(w, [L(219)], { start: F.at(13) });
+  await h.until(a.id, (st) => st === "reservation_confirmed", { max: 30, advanceMs: 45 * 1000 });
+  const ev = await evTypes(a.id);
+  assert.equal(ev.includes("RECOVER_INTERRUPTED"), false, JSON.stringify(ev));
+  assert.equal(ev.at(-1), "RESERVATION_SUCCEEDED");
+  assert.equal(String((await loadIntent(db.app, a.id)).reservation.reservationId), String(rid));
+  assert.equal(w.count("CREATE"), 0, "the worker never sends a create for an already dispatched intent");
 });
