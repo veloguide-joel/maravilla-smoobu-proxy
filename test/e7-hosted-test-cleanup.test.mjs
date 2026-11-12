@@ -27,10 +27,19 @@ const tool = (p) => import(pathToFileURL(join(TOOLING, p)).href);
 const E = await import("../scripts/e7-hosted-test-cleanup.mjs");
 const RESRUN = await import("../scripts/e7-hosted-reservation.mjs");
 const CAPRUN = await import("../scripts/e7-hosted-capture.mjs");
-const [TT, T, EX, HR, C1, CP, RP, TP, CO, IS, LK, TC] = await Promise.all([tool("scripts/e7-connected/test-cleanup-transports.mjs"), tool("scripts/e7-connected/http-transports.mjs"),
+const [TT, T, EX, HR, C1, CP, RP, TP, CO, IS, LK] = await Promise.all([tool("scripts/e7-connected/test-cleanup-transports.mjs"), tool("scripts/e7-connected/http-transports.mjs"),
   tool("scripts/e7-connected/test-cleanup-executors.mjs"), tool("lib/hostaway-reservations.js"), tool("scripts/e7-connected/probe-env-preflight.mjs"), tool("lib/checkout/capture-proof.js"),
   tool("lib/checkout/recovery-plan.js"), tool("lib/checkout/test-cleanup-proof.js"), tool("lib/checkout/compensation-proof.js"), tool("lib/checkout/intent-state.js"),
-  tool("scripts/e7-connected/run-lock-precheck.mjs"), tool("lib/booking-db/test-cleanup.js")]);
+  tool("scripts/e7-connected/run-lock-precheck.mjs")]);
+// The accepted request module (lib/booking-db/test-cleanup.js) transitively imports `pg` (repo.js → pool.js), which the hosted PREFLIGHT job never
+// installs (no dependency install before secrets, by design). It is loaded when the tooling's dependency is present (local / real-PG runs) and the
+// expectation binding is then cross-checked against the ACCEPTED function; in the dependency-free preflight the exact 17-key list below (a copy of
+// TEST_CLEANUP_EXPECTATION_KEYS, asserted equal whenever the module loads) is the check. Hosted run 43302881832 (HTC_TESTS_FAILED, tests 1 / pass 0) was this load failure.
+const EXPECTATION_KEYS = Object.freeze(["approvalRef", "attemptId", "authorizedMinor", "capturedMinor", "chargeId", "currency", "expectedVersion", "finalTotalMinor", "from", "guests", "intentId",
+  "listingId", "paymentIntentId", "planHash", "reservationId", "sessionId", "to"]);
+const TC = await tool("lib/booking-db/test-cleanup.js").catch((e) => (e && e.code === "ERR_MODULE_NOT_FOUND" ? null : Promise.reject(e)));
+if (TC) assert.deepEqual([...TC.TEST_CLEANUP_EXPECTATION_KEYS], [...EXPECTATION_KEYS], "the local key copy equals the accepted TEST_CLEANUP_EXPECTATION_KEYS");
+const bindsAccepted = (ex) => (TC ? TC.bindCleanupExpectation(ex) !== null : Object.keys(ex).length === 17);
 after(() => { assert.deepEqual(GUARD, { request: 0, Agent: 0, fetch: 0 }, "no real network primitive was touched"); });
 
 const C = E.CONSTANTS;
@@ -159,7 +168,7 @@ function fakeRequest(w, o = {}) {
   return async (pool, intentId, { now, env, operator }) => {
     w.requestCalls += 1;
     assert.equal(intentId, IID); assert.ok(Number.isFinite(now)); assert.deepEqual(env, { VERCEL_ENV: "development", MV_E7_TEST_CLEANUP: "enabled" });
-    assert.deepEqual(Object.keys(operator).sort(), [...TC.TEST_CLEANUP_EXPECTATION_KEYS]); assert.ok(TC.bindCleanupExpectation(operator) !== null, "the accepted binding accepts the derived expectation");
+    assert.deepEqual(Object.keys(operator).sort(), [...EXPECTATION_KEYS]); assert.ok(bindsAccepted(operator), "the accepted binding accepts the derived expectation");
     assert.deepEqual([operator.intentId, operator.paymentIntentId, operator.chargeId, operator.capturedMinor, operator.reservationId, operator.sessionId, operator.attemptId, operator.expectedVersion], [IID, PI, CH, AMT, RID, CS, ATTEMPT, VER]);
     if (o.requestThrow) { if (o.requestAppliedAnyway) apply(); throw new Error("connection terminated unexpectedly"); }
     if (o.requestRefuse) return { ok: false, error: o.requestRefuse };
@@ -627,7 +636,7 @@ test("C1 code ceiling: Slice 3 cleanup execution CLOSED (executeEnabled false) A
   assert.deepEqual(plan.writes, { requestMax: 1, cancelMax: 1, refundMax: 1, capture: 0, hostawayCreate: 0, record: 0, notify: 0, void: 0, account: 0, keys: 0 });
   assert.equal(plan.refundIdempotencyKey, IS.refundKey(IID, 1)); assert.deepEqual([plan.paymentIntentId, plan.reservationId, plan.chargeId, plan.capturedMinor, plan.from, plan.to, plan.guests, plan.attemptId, plan.sessionId], [PI, RID, CH, AMT, FROM, TO, 1, ATTEMPT, CS]);
   const ex = E.operatorExpectation(plan, planHash);
-  assert.deepEqual(Object.keys(ex).sort(), [...TC.TEST_CLEANUP_EXPECTATION_KEYS]); assert.deepEqual(TC.bindCleanupExpectation(ex), ex); assert.equal(ex.planHash, planHash);
+  assert.deepEqual(Object.keys(ex).sort(), [...EXPECTATION_KEYS]); if (TC) assert.deepEqual(TC.bindCleanupExpectation(ex), ex); assert.equal(ex.planHash, planHash);
   assert.deepEqual([ex.authorizedMinor, ex.finalTotalMinor, ex.capturedMinor, ex.listingId, ex.currency], [AMT, AMT, AMT, 606998, "USD"]);
   for (const bad of [{ reservationId: "" }, { reservationId: C.protectedReservationIds[0] }, { paymentIntentId: "ch_x" }, { paymentIntentId: "pi_short" }, { chargeId: "pi_FAKEhostedTc0001" }, { capturedMinor: 0 }, { capturedMinor: 1.5 },
     { notBefore: "2026-11-12" }, { notBefore: "2026-11-12T00:00:00+02:00" }, { expectedVersion: 0 }, { intentId: "not-a-uuid" }, { from: "2026-11-26" }, { to: "2026-02-30" }, { guests: 0 }, { guests: 51 },
