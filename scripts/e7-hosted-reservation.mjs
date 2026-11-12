@@ -235,15 +235,19 @@ export async function runReservationCore(input) {
   const c = CONSTANTS; const B = c.budgets;
   const r = { schema: RESULT_SCHEMA, outcome: null, code: null, admission: null, startState: null, finalState: null, finalVersion: null, reservationId: null, steps: 0, actions: [],
     exchanges: 0, pricingCalls: 0, hostawayReads: 0, lookupPages: 0, accountReads: 0, piReads: 0, dbQueries: 0, dbBudgetRefused: 0, createInvocations: 0, createOutcome: "NONE",
-    refusedAtTransport: 0, refusedByStop: 0, lock: "not_acquired", lockSession: null, proofs: [], postcheck: null, captureQueuedPristine: null, stopReason: null,
+    refusedAtTransport: 0, refusedByStop: 0, lock: "not_acquired", lockSession: null, lockBackendPid: null, proofs: [], postcheck: null, captureQueuedPristine: null, createOps: null,
+    factsObserved: false, stopReason: null,
     stripeVersion: c.stripeVersion, writes: { create: 0, capture: 0, refund: 0, record: 0, notify: 0, cancel: 0, void: 0 } };
   const DONE = Symbol("done");
   const done = (outcome, code = null) => { r.outcome = outcome; r.code = code; return DONE; };
   const snapshot = () => freeze(JSON.parse(JSON.stringify(r)));
   let stopReason = null; let runSignalRef = null; let monoRef = null; let endsAtRef = Infinity;
+  let lockClient = null; let lockAcquired = false; let lockErrored = false; let lockPid = null;
+  /** the GLOBAL stop latch: run abort, the fixed wall deadline, or an observed lock-session error (F2) — checked by every gate / transport */
   const stopped = () => {
     if (stopReason === null) {
       if (runSignalRef && runSignalRef.aborted) stopReason = "ABORTED";
+      else if (lockErrored) stopReason = "LOCK_SESSION_ERROR";
       else if (monoRef && monoRef() >= endsAtRef) stopReason = "DEADLINE";
       if (stopReason !== null) r.stopReason = stopReason;
     }
@@ -252,8 +256,16 @@ export async function runReservationCore(input) {
   class Stopped extends Error { constructor() { super("stopped"); } }
   const guard = () => { if (stopped()) throw new Stopped(); };
   const uncertain = () => (r.createOutcome === "UNKNOWN" ? "CREATE_OUTCOME_UNKNOWN" : null);
-  const stopOutcome = () => done(uncertain() ?? stopReason, `STOP_${stopReason}`);
-  let lockClient = null; let lockAcquired = false; let lockErrored = false;
+  const stopOutcome = () => done(uncertain() ?? (stopReason === "LOCK_SESSION_ERROR" ? "LOCK_LOST" : stopReason), `STOP_${stopReason}`);
+  /** best available OBSERVED facts (F3): recorded on every exit that has them; `factsObserved` distinguishes unobserved from absent */
+  const observe = (f) => {
+    if (!f || !f.intent) return;
+    r.factsObserved = true; r.finalState = f.intent.status; r.finalVersion = f.intent.version;
+    r.reservationId = f.intent.reservation && f.intent.reservation.reservationId !== null && f.intent.reservation.reservationId !== undefined ? String(f.intent.reservation.reservationId) : null;
+    const caps = f.ops.filter((o) => o.op_type === "stripe.capture_payment_intent");
+    r.captureQueuedPristine = caps.length === 0 ? null : caps.length === 1 && pristine(caps[0]);
+    r.createOps = f.ops.filter((o) => o.op_type === "hostaway.create_reservation").map((o) => o.state);
+  };
   const body = async () => {
     const { plan, pool, tooling, exchanges, credentials } = input ?? {};
     if (!plan || plan.schema !== PLAN_SCHEMA || plan.accountId !== c.accountId || plan.listingId !== c.listingId || plan.stripeVersion !== c.stripeVersion
@@ -300,12 +312,21 @@ export async function runReservationCore(input) {
     if (typeof lockClient.on === "function") lockClient.on("error", onLockErr);
     const OWN_LOCK_SQL = `${tooling.LOCK_PRECHECK_SQL} AND l.pid = pg_catalog.pg_backend_pid()`;
     const lockQuery = async (sql, params) => { guard(); count(); return lockClient.query(sql, params); };
-    const ownLock = async () => { if (lockErrored) return false; const x = await lockQuery(OWN_LOCK_SQL, [tooling.LOCK_KEY]); return !lockErrored && x.rows.length === 1 && x.rows[0].n === 1; };
+    // F4: the lock session must be ONE Postgres backend for the whole run. The acquire statement returns the backend pid; every later proof
+    // re-reads it in the SAME statement as the lock predicate — a different pid (a transaction-pooler backend hop) is a lost / unproven lock.
+    const PROOF_SQL = `SELECT (${OWN_LOCK_SQL}) AS n, pg_catalog.pg_backend_pid() AS pid`;
+    const ownLock = async () => {
+      if (lockErrored) return false;
+      const x = await lockQuery(PROOF_SQL, [tooling.LOCK_KEY]);
+      if (lockErrored || x.rows.length !== 1 || x.rows[0].n !== 1) return false;
+      if (lockPid !== null && String(x.rows[0].pid) !== lockPid) { r.lockSession = "backend_hop"; return false; }
+      return true;
+    };
     try {
-      const got = await lockQuery("SELECT pg_try_advisory_lock(pg_catalog.hashtext($1), 0) AS ok", [tooling.LOCK_KEY]);
+      const got = await lockQuery("SELECT pg_try_advisory_lock(pg_catalog.hashtext($1), 0) AS ok, pg_catalog.pg_backend_pid() AS pid", [tooling.LOCK_KEY]);
       if (!(got.rows.length === 1 && got.rows[0].ok === true)) return done("LOCK_NOT_ACQUIRED", "RUN_LOCK_PRESENT");
-      lockAcquired = true;
-      if (!(await ownLock())) return done("LOCK_NOT_ACQUIRED", "LOCK_NOT_PROVEN");
+      lockAcquired = true; lockPid = String(got.rows[0].pid); r.lockBackendPid = /^[0-9]{1,10}$/.test(lockPid) ? Number(lockPid) : null;
+      if (!(await ownLock())) return done("LOCK_NOT_ACQUIRED", r.lockSession === "backend_hop" ? "BACKEND_HOP" : "LOCK_NOT_PROVEN");
       r.lock = "held";
     } catch (e) { return e instanceof Stopped ? stopOutcome() : done("DB_ERROR", "LOCK_QUERY_FAILED"); }
 
@@ -445,14 +466,16 @@ export async function runReservationCore(input) {
     let finalFacts = null;
     for (let step = 1; step <= B.steps; step++) {
       if (stopped()) return stopOutcome();
-      try { if (!(await ownLock())) { r.lock = "lost"; return done("LOCK_LOST", lockErrored ? "LOCK_SESSION_ERROR" : "LOCK_NOT_HELD"); } }
+      try { if (!(await ownLock())) { r.lock = "lost"; return done("LOCK_LOST", lockErrored ? "LOCK_SESSION_ERROR" : r.lockSession === "backend_hop" ? "BACKEND_HOP" : "LOCK_NOT_HELD"); } }
       catch (e) { return e instanceof Stopped ? stopOutcome() : done("DB_ERROR", "LOCK_PROOF_FAILED"); }
+      if (stopped()) return stopOutcome();                                                            // F1: admission re-check AFTER the awaited proof
       const cand = candidateOf(f, plan, c);
       if (!cand.ok) return done("SCOPE_REFUSED", cand.code);
       boundId = cand.id;
       const executors = buildExecutors(cand.id);
       if (!executors) return done("SCOPE_REFUSED", "EXECUTOR_BINDING_REFUSED");
       let w;
+      if (stopped()) return stopOutcome();                                                            // F1: immediately BEFORE the worker is admitted
       try {
         r.steps += 1;
         w = await tooling.runOrchestratorStep(countedPool, { workerId: `e7-hosted-res:${plan.approvalRef}`, env, adapterConfig, listings, executors, clock, intentId: plan.intentId });
@@ -467,6 +490,8 @@ export async function runReservationCore(input) {
       if (r.createOutcome === "UNKNOWN") { try { finalFacts = await read(); } catch { /* reported below */ } return done("CREATE_OUTCOME_UNKNOWN", "LOST_CREATE_REPLY"); }
       if (stopped()) return stopOutcome();
       try { f = await read(); } catch (e) { return e instanceof Stopped ? stopOutcome() : done("DB_ERROR", "STEP_READBACK_FAILED"); }
+      observe(f);
+      if (stopped()) return stopOutcome();                                                            // F3: the readback may have crossed the deadline
       const stNow = f.intent ? f.intent.status : null;
       if (stNow === "reservation_confirmed") { finalFacts = f; break; }
       if (stNow === "reservation_failed") { finalFacts = f; return done("RESERVATION_FAILED", "WORKER_FAILED_RESERVATION"); }       // cleanup is a SEPARATE reviewed step
@@ -479,14 +504,16 @@ export async function runReservationCore(input) {
     }
 
     // ---- (9) read-only postcheck: output and persisted facts must agree ------------------------------------------------------------------
+    observe(finalFacts);
     const pe = checkEnd(finalFacts, plan, c);
     if (pe) return done("POSTCHECK_MISMATCH", pe);
-    r.finalState = finalFacts.intent.status; r.finalVersion = finalFacts.intent.version; r.reservationId = String(finalFacts.intent.reservation.reservationId);
-    const caps = finalFacts.ops.filter((o) => o.op_type === "stripe.capture_payment_intent");
-    r.captureQueuedPristine = caps.length === 1;
     r.postcheck = { createOps: finalFacts.ops.filter((o) => o.op_type === "hostaway.create_reservation").length, claimHeld: true, openCases: 0, capturedMinor: 0 };
+    if (stopped()) return stopOutcome();                                                              // F3: never success past the deadline / after a session error
     return done("RESERVATION_CONFIRMED_INTERMEDIATE");
   };
+  const TEARDOWN_MS = 5000;
+  const bounded = (p) => new Promise((resolve) => { let t = null; const fin = (v) => { clearTimeout(t); resolve(v); };
+    t = setTimeout(() => fin({ done: false }), TEARDOWN_MS); Promise.resolve().then(() => p).then((value) => fin({ done: true, value }), () => fin({ done: true, threw: true })); });
   try {
     const out = await body();
     if (out !== DONE) done("DB_ERROR", "INTERNAL");
@@ -494,16 +521,25 @@ export async function runReservationCore(input) {
     if (e instanceof Refusal && e.code === "DB_BUDGET") done(uncertain() ?? "BUDGET_EXHAUSTED", "DB_QUERY_CEILING");
     else done(uncertain() ?? "DB_ERROR", "INTERNAL");
   } finally {
-    // teardown: checked unlock on the dedicated session; a failed / errored unlock destroys the connection (the server drops session locks)
+    // (a) F3 residual facts: after any admitted step / send, ONE bounded read-only readback reports the best available observed facts
+    if ((r.steps > 0 || r.createInvocations > 0) && input && input.pool && input.tooling) {
+      const raw = { query: (sql, params) => input.pool.query(sql, params) };
+      const b = await bounded(readFacts(async (sql, params) => (await input.pool.query(sql, params)).rows, input.plan, input.tooling, raw));
+      if (b.done && !b.threw) observe(b.value);
+    }
+    // (b) teardown: checked, bounded unlock on the dedicated session; a failed / errored / timed-out unlock destroys the connection (the server
+    //     drops session locks) AND vetoes a clean success (F3b) — the observed facts above stay in the result
     if (lockClient) {
       let released = false;
       if (lockAcquired && !lockErrored) {
-        try { const u = await lockClient.query("SELECT pg_advisory_unlock(pg_catalog.hashtext($1), 0) AS ok", [input?.tooling?.LOCK_KEY ?? ""]); released = u.rows.length === 1 && u.rows[0].ok === true && !lockErrored; }
-        catch { released = false; }
+        const u = await bounded(lockClient.query("SELECT pg_advisory_unlock(pg_catalog.hashtext($1), 0) AS ok, pg_catalog.pg_backend_pid() AS pid", [input?.tooling?.LOCK_KEY ?? ""]));
+        released = u.done && !u.threw && u.value && u.value.rows && u.value.rows.length === 1 && u.value.rows[0].ok === true && String(u.value.rows[0].pid) === lockPid && !lockErrored;
       }
       if (lockAcquired) r.lock = released ? "released" : (lockErrored ? "session_error_connection_destroyed" : "unlock_failed_connection_destroyed");
       try { lockClient.release(released ? undefined : true); } catch { /* contained */ }
+      if (lockAcquired && !released && r.outcome === "RESERVATION_CONFIRMED_INTERMEDIATE") { r.outcome = "NOT_CONFIRMED"; r.code = lockErrored ? "LOCK_SESSION_ERROR_AT_TEARDOWN" : "UNLOCK_NOT_PROVEN"; }
     }
+    if (r.outcome === "RESERVATION_CONFIRMED_INTERMEDIATE" && stopped()) { r.outcome = "NOT_CONFIRMED"; r.code = `STOP_${stopReason}_AT_TEARDOWN`; }
   }
   return snapshot();
 }
@@ -545,6 +581,15 @@ export function dbTargetOk(url, c = CONSTANTS) {
   return (u.protocol === "postgresql:" || u.protocol === "postgres:") && u.hostname === "aws-0-us-east-1.pooler.supabase.com" && u.port === "6543"
     && decodeURIComponent(u.username) === `mv_booking_app_dev.${c.dbProjectRef}` && u.pathname === "/postgres" && u.search === "" && u.hash === "";
 }
+/** F4: the dedicated SESSION-lock connection string = the SAME scoped Supabase pooler host / role / database as the worker pool, over the
+ *  pooler's SESSION port 5432 (official Supabase docs: 6543 = transaction mode, 5432 = session mode). The worker pool stays on 6543. A session
+ *  advisory lock needs ONE backend for the whole run, which transaction mode does not give. Pinned derivation; any other target refuses. */
+export const SESSION_LOCK_PORT = "5432";
+export function sessionLockUrl(url, c = CONSTANTS) {
+  if (!dbTargetOk(url, c)) return null;
+  const u = new URL(url); u.port = SESSION_LOCK_PORT;
+  return u.href;
+}
 export const OFFICIAL_CA_SHA256 = "700723581420dd1ac98fd7e9ac529f0ef210eadcaf87fc868a3ad7d114c2f3b7";
 const SECRET_KEYS = Object.freeze(["E7_STRIPE_TEST_KEY", "E7_HOSTAWAY_TOKEN", "E7_DEV_BOOKING_DATABASE_URL"]);
 
@@ -558,8 +603,8 @@ export async function runHosted({ mode = "preflight", env, proc, wrapperDir, dep
   const readPgVersion = deps.readPgVersion ?? (async (dir) => JSON.parse(await readFile(`${dir}/node_modules/pg/package.json`, "utf8")).version);
   const readCa = deps.readCa ?? ((p) => readFile(p));
   const r = { schema: "e7-hosted-reservation-hosted-v1", mode: null, code: null, workflowSha: null, toolingCommit: c.toolingCommit, toolingStatus: c.toolingStatus,
-    executeEnabled: c.executeEnabled, closureDigest: null, runnerDigest: null, planKind: null, planHash: null, envCode: null, tests: null, core: null };
-  let pool = null;
+    executeEnabled: c.executeEnabled, closureDigest: null, runnerDigest: null, planKind: null, planHash: null, envCode: null, tests: null, lockEndpoint: null, core: null };
+  let pool = null; let lockPool = null;
   try {
     if (!["preflight", "verify", "execute"].includes(mode)) refuse("HRS_USAGE");
     r.mode = mode;
@@ -623,10 +668,16 @@ export async function runHosted({ mode = "preflight", env, proc, wrapperDir, dep
     let mods; try { mods = await importTooling(tooling); } catch { wipe(); refuse("HRS_IMPORT_FAILED"); }
     const xs = mods.X.createE7RealExchange({ provider: "stripe" }); const xh = mods.X.createE7RealExchange({ provider: "hostaway" });
     if (!xs || xs.ok !== true || !xh || xh.ok !== true) { wipe(); refuse("HRS_IMPORT_FAILED"); }
-    try { pool = mods.createBookingPool({ connectionString: dbUrl, caPem, max: 3 }); } catch { wipe(); refuse("HRS_DB_TARGET_INVALID"); } finally { dbUrl = null; }
+    let lockUrl = sessionLockUrl(dbUrl, c);
+    if (lockUrl === null) { wipe(); refuse("HRS_DB_TARGET_INVALID"); }
+    try {
+      pool = mods.createBookingPool({ connectionString: dbUrl, caPem, max: 3 });                      // worker pool: transaction pooler (6543)
+      lockPool = mods.createBookingPool({ connectionString: lockUrl, caPem, max: 1 });                // dedicated SESSION lock connection (5432)
+    } catch { wipe(); refuse("HRS_DB_TARGET_INVALID"); } finally { dbUrl = null; lockUrl = null; }
+    r.lockEndpoint = `session:${SESSION_LOCK_PORT}`;
     const ac = new AbortController(); const onSig = () => ac.abort(); proc.once?.("SIGINT", onSig); proc.once?.("SIGTERM", onSig);
     try {
-      r.core = await runCore({ plan: built.plan, pool, tooling: mods.tooling, exchanges: { stripe: xs.exchange, hostaway: xh.exchange },
+      r.core = await runCore({ plan: built.plan, pool, lockClientFactory: () => lockPool.connect(), tooling: mods.tooling, exchanges: { stripe: xs.exchange, hostaway: xh.exchange },
         credentials: { stripe: () => skey, hostaway: () => htok }, runSignal: ac.signal });
     } finally { wipe(); proc.off?.("SIGINT", onSig); proc.off?.("SIGTERM", onSig); }
     r.code = "EXECUTE_DONE";
@@ -635,6 +686,7 @@ export async function runHosted({ mode = "preflight", env, proc, wrapperDir, dep
     r.code = e instanceof Refusal && HOSTED_CODES.includes(e.code) ? e.code : "HRS_INTERNAL";
     return { exitCode: 1, result: r };
   } finally {
+    if (lockPool) await lockPool.end().catch(() => {});
     if (pool) await pool.end().catch(() => {});
   }
 }
@@ -650,7 +702,7 @@ async function defaultImportTooling(dir) {
 }
 export function summaryMarkdown(r) {
   const core = r.core ? ` core=${r.core.outcome}${r.core.code ? `/${r.core.code}` : ""} steps=${r.core.steps} create=${r.core.createInvocations}/${r.core.createOutcome} lock=${r.core.lock} captureQueuedPristine=${r.core.captureQueuedPristine}` : "";
-  return `e7-hosted-reservation ${r.mode} ${r.code} executeEnabled=${r.executeEnabled} plan=${r.planKind ?? "-"}:${r.planHash ?? "-"} closure=${r.closureDigest ?? "-"} runner=${r.runnerDigest ?? "-"}${core}\n`;
+  return `e7-hosted-reservation ${r.mode} ${r.code} executeEnabled=${r.executeEnabled} lock=${r.lockEndpoint ?? "-"} plan=${r.planKind ?? "-"}:${r.planHash ?? "-"} closure=${r.closureDigest ?? "-"} runner=${r.runnerDigest ?? "-"}${core}\n`;
 }
 
 // ---- the ONLY top-level effect -----------------------------------------------------------------------------------------------------

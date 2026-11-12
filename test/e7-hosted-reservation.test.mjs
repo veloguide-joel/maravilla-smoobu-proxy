@@ -66,14 +66,23 @@ function fakePool(w, o = {}) {
       default: throw new Error(`unexpected SQL ${String(sql).slice(0, 40)}`);
     }
   }, async connect() { return { query: (sql, params) => p.query(sql, params), release() {}, on() {} }; } };
-  p.lock = () => ({ query: async (sql, params) => {
-    p.reads += 1;
-    if (/pg_try_advisory_lock/.test(sql)) return { rows: [{ ok: o.lockHeldElsewhere ? false : true }] };
-    if (/pg_advisory_unlock/.test(sql)) { w.unlocked = (w.unlocked ?? 0) + 1; return { rows: [{ ok: true }] }; }
-    if (/pg_backend_pid/.test(sql)) { assert.equal(sql, `${LK.LOCK_PRECHECK_SQL} AND l.pid = pg_catalog.pg_backend_pid()`); assert.deepEqual(params, [LK.LOCK_KEY]); return { rows: [{ n: typeof o.lockLostAt === "number" && w.workerCalls >= o.lockLostAt ? 0 : w.lockRows }] }; }
-    if (tag(sql) === "identity") return { rows: [{ db: o.lockDb ?? "fake", environment: "test" }] };
-    throw new Error(`unexpected lock SQL ${sql.slice(0, 40)}`);
-  }, release(destroy) { w.lockReleased = destroy === true ? "destroyed" : "pooled"; }, on() {} });
+  p.lock = () => { const cl = { pid: o.pid ?? 4242, proofs: 0, errorFn: null,
+    async query(sql, params) {
+      p.reads += 1;
+      if (/pg_try_advisory_lock/.test(sql)) return { rows: [{ ok: o.lockHeldElsewhere ? false : true, pid: cl.pid }] };
+      if (/pg_advisory_unlock/.test(sql)) { w.unlocked = (w.unlocked ?? 0) + 1; return { rows: [{ ok: o.unlockFalse ? false : true, pid: cl.pid }] }; }
+      if (/pg_backend_pid/.test(sql)) {
+        const own = `${LK.LOCK_PRECHECK_SQL} AND l.pid = pg_catalog.pg_backend_pid()`;
+        assert.ok(sql === `SELECT (${own}) AS n, pg_catalog.pg_backend_pid() AS pid` || sql === own, "own-lock proof statement (pid-stable form, or the pre-F4 form)"); assert.deepEqual(params, [LK.LOCK_KEY]);
+        cl.proofs += 1;
+        if (o.hopAtProof && cl.proofs >= o.hopAtProof) cl.pid += 1;                                 // F4 simulation: a transaction-pooler backend hop
+        if (o.onProofResolve) o.onProofResolve(cl.proofs);                                           // F1 reproduction hook (runs as the proof resolves)
+        return { rows: [{ n: typeof o.lockLostAt === "number" && w.workerCalls >= o.lockLostAt ? 0 : w.lockRows, pid: cl.pid }] };
+      }
+      if (tag(sql) === "identity") return { rows: [{ db: o.lockDb ?? "fake", environment: "test" }] };
+      throw new Error(`unexpected lock SQL ${sql.slice(0, 40)}`);
+    }, release(destroy) { w.lockReleased = destroy === true ? "destroyed" : "pooled"; }, on(ev, fn) { if (ev === "error") cl.errorFn = fn; } };
+    w.lockClient = cl; return cl; };
   return p;
 }
 const piObj = (w) => ({ object: "payment_intent", id: PI, livemode: false, status: w.piStatus, capture_method: "manual", amount: AMT, amount_received: 0,
@@ -133,11 +142,12 @@ function fakeWorker(w, o = {}) {
   };
 }
 function core(w, o = {}) {
-  const pool = fakePool(w, o);
+  const pool = fakePool(w, o); w.pool = pool;
   const tooling = { runOrchestratorStep: o.worker ?? fakeWorker(w, o), loadIntent: async () => intentOf(w), createPhaseExecutors: EA.createPhaseExecutors, createStripeSend: T.createE7StripeTestSend,
     createHostawaySend: T.createE7HostawaySend, validateAdapterConfig: HR.validateAdapterConfig, paymentIntentProofObservationV3: CP.paymentIntentProofObservationV3,
     stillAuthorizedV3Refusal: CP.stillAuthorizedV3Refusal, LOCK_KEY: LK.LOCK_KEY, LOCK_PRECHECK_SQL: LK.LOCK_PRECHECK_SQL };
-  return E.runReservationCore({ plan: o.plan ?? plan(), pool, lockClientFactory: () => pool.lock(), tooling, exchanges: exchanges(w, o),
+  const x = exchanges(w, o);
+  return E.runReservationCore({ plan: o.plan ?? plan(), pool, lockClientFactory: () => pool.lock(), tooling, exchanges: o.wrapExchanges ? o.wrapExchanges(x) : x,
     credentials: { stripe: () => "sk_test_Fake1", hostaway: () => "synthetic-hostaway-token" }, sleep: async () => {}, runSignal: o.signal, monotonic: o.monotonic,
     clock: () => Date.UTC(2026, 10, 12, 16, 0, 0) + (w.tick = (w.tick ?? 0) + 1000) });
 }
@@ -326,6 +336,64 @@ test("S1 static: the runner imports node built-ins only; no capture / refund / r
   for (const m of src.matchAll(/^import .* from "([^"]+)";$/gm)) assert.ok(m[1].startsWith("node:"), m[1]);
   for (const bad of ["capturePaymentIntent(", "cancelPaymentIntent(", "cancelReservation(", "createOfflineCharge(", "sendMessage(", "refunds"]) assert.equal(src.includes(bad), false, bad);
   assert.equal(process.listenerCount("SIGINT"), 0);
+});
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// ROOT review 5877116684 (PR64 @ 94f45ee3) — exact reproductions (RED on 94f45ee3; GREEN on the fixed head)
+test("R1 (F1) abort / deadline exactly as the FIRST per-step lock proof resolves → ZERO admitted steps / worker calls; no provider exchange after the stop", async () => {
+  { const w = world(); const ac = new AbortController();
+    const r = await core(w, { signal: ac.signal, onProofResolve: (n) => { if (n === 2) ac.abort(); } });        // proof #1 = after acquire; #2 = first per-step proof
+    assert.deepEqual([r.outcome, r.steps, w.workerCalls, r.createInvocations], ["ABORTED", 0, 0, 0], JSON.stringify(r));
+    assert.equal(w.calls.filter((x) => x.startsWith("H:")).length, 0, "no Hostaway exchange after the stop"); }
+  { const w = world(); let late = false;
+    const r = await core(w, { monotonic: () => (late ? 10 ** 9 : 0), onProofResolve: (n) => { if (n === 2) late = true; } });
+    assert.deepEqual([r.outcome, r.steps, w.workerCalls], ["DEADLINE", 0, 0], JSON.stringify(r)); }
+});
+
+test("R2 (F2) a lock-session error observed while the priceDetails exchange resolves (before the create) VETOES every later transport: ZERO creates, outcome LOCK_LOST / STOP_LOCK_SESSION_ERROR, lockSession error_observed, connection destroyed", async () => {
+  const w = world();
+  const r = await core(w, { wrapExchanges: (x) => ({ stripe: x.stripe, hostaway: async (req) => { const out = await x.hostaway(req); if (/priceDetails/.test(req.url)) w.lockClient.errorFn(new Error("SYNTHETIC_PRIVATE_ERROR_CANARY")); return out; } }) });
+  assert.deepEqual([r.outcome, r.code, r.createInvocations, r.lockSession, r.lock, w.lockReleased], ["LOCK_LOST", "STOP_LOCK_SESSION_ERROR", 0, "error_observed", "session_error_connection_destroyed", "destroyed"], JSON.stringify(r));
+  assert.deepEqual(writes(w), [], "no create after the observed session error"); assert.equal(JSON.stringify(r).includes("CANARY"), false, "no raw error text");
+});
+
+test("R3 (F3) never success past the deadline or without a proven unlock: (a) monotonic 900001 during the final claims read → DEADLINE with the OBSERVED facts (reservation_confirmed, id, pristine capture) reported; (b) pg_advisory_unlock false → NOT_CONFIRMED / UNLOCK_NOT_PROVEN, lock unlock_failed_connection_destroyed, facts kept", async () => {
+  { const w = world(); let reads = 0;
+    const pool = fakePool(w); const q = pool.query.bind(pool);
+    pool.query = async (sql, params) => { const res = await q(sql, params); if (/e7hrs:claims/.test(sql) && w.status === "reservation_confirmed") reads += 1; return res; };
+    let m = 0; const monotonic = () => (reads > 0 ? 900001 : (m += 1, 0));
+    const tooling = { runOrchestratorStep: fakeWorker(w), loadIntent: async () => intentOf(w), createPhaseExecutors: EA.createPhaseExecutors, createStripeSend: T.createE7StripeTestSend, createHostawaySend: T.createE7HostawaySend,
+      validateAdapterConfig: HR.validateAdapterConfig, paymentIntentProofObservationV3: CP.paymentIntentProofObservationV3, stillAuthorizedV3Refusal: CP.stillAuthorizedV3Refusal, LOCK_KEY: LK.LOCK_KEY, LOCK_PRECHECK_SQL: LK.LOCK_PRECHECK_SQL };
+    const r = await E.runReservationCore({ plan: plan(), pool, lockClientFactory: () => pool.lock(), tooling, exchanges: exchanges(w), credentials: { stripe: () => "sk_test_Fake1", hostaway: () => "x" }, sleep: async () => {}, monotonic,
+      clock: () => Date.UTC(2026, 10, 12, 16, 0, 0) + (w.tick = (w.tick ?? 0) + 1000) });
+    assert.deepEqual([r.outcome, r.factsObserved, r.finalState, r.reservationId, r.captureQueuedPristine, r.createInvocations], ["DEADLINE", true, "reservation_confirmed", RID, true, 1], JSON.stringify(r)); }
+  { const w = world(); const r = await core(w, { unlockFalse: true });
+    assert.deepEqual([r.outcome, r.code, r.lock, w.lockReleased, r.finalState, r.reservationId, r.captureQueuedPristine], ["NOT_CONFIRMED", "UNLOCK_NOT_PROVEN", "unlock_failed_connection_destroyed", "destroyed", "reservation_confirmed", RID, true], JSON.stringify(r)); }
+  { const w = world(); const r = await core(w, { lockLostAt: 1, stayPending: true });                     // a stop after effects still reports observed facts
+    assert.deepEqual([r.outcome, r.factsObserved, r.finalState, r.createOps], ["LOCK_LOST", true, "reservation_pending", ["succeeded"]], JSON.stringify(r)); }
+});
+
+test("R4 (F4) lock topology: sessionLockUrl derives ONLY the same scoped pooler target over session port 5432 (worker pool stays 6543); a backend hop between acquire and proof is refused (BACKEND_HOP) with ZERO worker steps; hosted execute wires TWO pools (6543 max 3 worker, 5432 max 1 lock)", async () => {
+  const good = `postgresql://mv_booking_app_dev.${C.dbProjectRef}:pw@aws-0-us-east-1.pooler.supabase.com:6543/postgres`;
+  assert.equal(E.sessionLockUrl(good), `postgresql://mv_booking_app_dev.${C.dbProjectRef}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`);
+  for (const bad of [good.replace("6543", "5432"), good.replace("postgres", "other"), good.replace("pooler.supabase.com", "example.com"), good.replace("mv_booking_app_dev", "postgres"), `${good}?sslmode=require`]) assert.equal(E.sessionLockUrl(bad), null, bad);
+  { const w = world(); const r = await core(w, { hopAtProof: 1 });
+    assert.deepEqual([r.outcome, r.code, w.workerCalls, r.lockSession], ["LOCK_NOT_ACQUIRED", "BACKEND_HOP", 0, "backend_hop"], JSON.stringify(r)); assert.equal(w.calls.filter((x) => x.startsWith("H:")).length, 0); }
+  { const w = world(); const r = await core(w, { hopAtProof: 2 });
+    assert.deepEqual([r.outcome, r.code, w.workerCalls], ["LOCK_LOST", "BACKEND_HOP", 0], JSON.stringify(r)); }
+  // hosted wiring (opened-constants seam; fake tooling import; no network): two pools, the lock pool on 5432 with max 1, both ended
+  const opened = { ...C, executeEnabled: true };
+  const pf = await E.runHosted({ mode: "preflight", env: realEnv(), proc: PROC, wrapperDir: ROOT, deps: { spawnChild: okChild } });
+  const pools = []; let coreArgs = null;
+  const fakeTooling = async () => ({ X: { createE7RealExchange: () => ({ ok: true, exchange: async () => ({}) }) },
+    createBookingPool: (o) => { const u = new URL(o.connectionString); pools.push({ port: u.port, max: o.max, ended: false }); const me = pools.at(-1); return { connect: async () => ({ query: async () => ({ rows: [] }), release() {}, on() {} }), query: async () => ({ rows: [] }), end: async () => { me.ended = true; } }; },
+    tooling: {} });
+  const x = await E.runHosted({ mode: "execute", env: { ...realEnv(), E7_EXPECTED_PLAN_HASH: pf.result.planHash, E7_EXPECTED_CLOSURE_DIGEST: pf.result.closureDigest, E7_EXPECTED_RUNNER_DIGEST: pf.result.runnerDigest, GITHUB_REF: "refs/heads/main",
+    E7_STRIPE_TEST_KEY: "sk_test_x", E7_HOSTAWAY_TOKEN: "t", E7_DEV_BOOKING_DATABASE_URL: good, E7_CA_FILE: "ca" }, proc: PROC, wrapperDir: ROOT,
+    deps: { constants: opened, readPgVersion: async () => C.pgVersion, readCa: async () => Buffer.from("CA"), caSha256: (await import("node:crypto")).createHash("sha256").update("CA").digest("hex"), importTooling: fakeTooling,
+      runCore: async (a) => { coreArgs = a; return { outcome: "SCOPE_REFUSED", code: "FAKE" }; } } });
+  assert.deepEqual([x.result.code, x.result.lockEndpoint, pools.map((p) => [p.port, p.max, p.ended])], ["EXECUTE_DONE", "session:5432", [["6543", 3, true], ["5432", 1, true]]], JSON.stringify(x.result));
+  assert.equal(typeof coreArgs.lockClientFactory, "function");
 });
 
 // ---------------------------------------------------------------------------------------------------------------------------------
