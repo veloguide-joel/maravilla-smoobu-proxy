@@ -42,6 +42,11 @@ const rel = async (c, f) => {
   if (f && c.state.last !== "processing" && c.state.st && c.state.st.token) { f.q.status.unshift(reply(200, { status: "processing" })); await c.refresh(); }
   c.armRelease(); return c.confirmRelease();
 };
+// F1: Pay is offered only on a status READ as awaiting_payment (or the details-latch recovery); tests that pay a seeded tab read it first
+const pay = async (c, f) => {
+  if (f && c.state.last !== "awaiting_payment" && c.state.st && c.state.st.token && !c.state.st.uncertain) { f.q.status.unshift(reply(200, { status: "awaiting_payment" })); await c.refresh(); }
+  return c.pay();
+};
 
 test("redirect validation: only https://checkout.stripe.com (no port / credentials); everything else refused", () => {
   assert.equal(validateCheckoutUrl("https://checkout.stripe.com/c/pay/cs_test_1"), "https://checkout.stripe.com/c/pay/cs_test_1");
@@ -110,9 +115,9 @@ test("happy flow with Stripe return + reload: create -> details (configured term
   await b.c.init();
   assert.equal(b.nav.stripped, 1, "the query hint is stripped from the URL");
   assert.equal(b.state.notice.code, "RETURNED_COMPLETE");
-  assert.equal(b.last().screen, "pay", "the hint never counts as authorization");
+  assert.deepEqual([b.last().screen, b.last().canPay], ["payWait", false], "the hint never counts as authorization; Pay is not offered again (F1)");
   assert.equal(b.state.polling, true);
-  await timers.tick(); assert.equal(b.last().screen, "pay");
+  await timers.tick(); assert.equal(b.last().screen, "payWait");
   await timers.tick(); assert.equal(b.last().screen, "authorized");
   assert.equal(b.state.polling, false, "no polling while simply authorized");
   assert.equal(api.count("create") + api.count("pay"), 2, "a reload never creates or pays again");
@@ -165,9 +170,9 @@ test("uncertain writes are never resent; create while a token exists is refused;
   for (const [k, code] of [["release", "RELEASE_UNCERTAIN"], ["pay", "PAY_UNCERTAIN"], ["details", "DETAILS_UNCERTAIN"]]) {
     const s = memStorage(); createStore(s).save({ token: TOKEN, releaseRequested: false, polls: [] });
     const f = fakeApi({ [k]: [{ kind: "unknown" }] }); const r = rig({ storage: s, api: f, search: "" });
-    if (k === "details") await r.c.details({ firstName: "A", lastName: "B", email: "a@example.test", accepted: true }); else if (k === "release") await rel(r.c, f); else await r.c[k]();
+    if (k === "details") await r.c.details({ firstName: "A", lastName: "B", email: "a@example.test", accepted: true }); else if (k === "release") await rel(r.c, f); else await pay(r.c, f);
     const timers = r.timers; while (await timers.tick());
-    assert.deepEqual([r.state.notice.code, f.count(k), f.count("status")], [code, 1, k === "release" ? 1 : 0], k);   // release: only its one pre-read
+    assert.deepEqual([r.state.notice.code, f.count(k), f.count("status")], [code, 1, k === "details" ? 0 : 1], k);   // release / pay: only their one pre-read
   }
   // a second create while this tab already holds a token: nothing sent
   const s2 = memStorage(); createStore(s2).save({ token: TOKEN, releaseRequested: false, polls: [] });
@@ -175,12 +180,12 @@ test("uncertain writes are never resent; create while a token exists is refused;
   // storage refused at create: reported; payment never requested
   const f3 = fakeApi(); const r3 = rig({ storage: brokenStorage(), api: f3 }); await r3.c.init();
   await r3.c.create({ from: "2027-01-10", to: "2027-01-13", guests: 2 }); assert.equal(r3.state.notice.code, "STORAGE_UNAVAILABLE");
-  await r3.c.pay(); assert.equal(f3.count("pay"), 0);
+  await pay(r3.c, f3); assert.deepEqual([f3.count("pay"), r3.state.notice.code], [0, "STORAGE_UNAVAILABLE"]);
   // malicious / foreign checkout URL from the server: never opened
   for (const bad of ["https://evil.example/pay", "javascript:alert(1)", "http://checkout.stripe.com/x", null]) {
     const s4 = memStorage(); createStore(s4).save({ token: TOKEN, releaseRequested: false, polls: [] });
     const f4 = fakeApi({ pay: [reply(200, { status: "awaiting_payment", checkoutUrl: bad })] }); const r4 = rig({ storage: s4, api: f4 });
-    await r4.c.pay(); assert.deepEqual([r4.nav.assigned, r4.state.notice.code], [[], "CHECKOUT_URL_REFUSED"], String(bad));
+    await pay(r4.c, f4); assert.deepEqual([r4.nav.assigned, r4.state.notice.code], [[], "CHECKOUT_URL_REFUSED"], String(bad));
   }
   // missing terms configuration: details never sent
   const f5 = fakeApi(); const r5 = rig({ api: f5, cfg: { ...CFG, termsVersion: "" } }); await r5.c.create({ from: "2027-01-10", to: "2027-01-13", guests: 2 });
@@ -230,7 +235,7 @@ test("R-UI1 pay: an uncertain pay (network / invalid reply / 5xx) latches; repea
     const s = seeded();
     const f = fakeApi({ pay: [unk], status: [reply(200, { status: "awaiting_payment" }), reply(200, { status: "awaiting_payment" }), reply(200, { status: "processing" })] });
     const a = rig({ storage: s, api: f });
-    await a.c.pay();
+    await pay(a.c, f);
     assert.equal(a.state.notice.code, "PAY_UNCERTAIN", JSON.stringify(unk));
     assert.equal(a.last().latch, "pay"); assert.equal(a.last().canPay, false, "the DOM keeps Pay disabled");
     await a.c.pay(); await a.c.pay();
@@ -242,7 +247,7 @@ test("R-UI1 pay: an uncertain pay (network / invalid reply / 5xx) latches; repea
   }
   // a definite refusal stays a refusal (no latch)
   const f = fakeApi({ pay: [reply(409, { code: "SESSION_NOT_REUSABLE" })] }); const r = rig({ storage: seeded(), api: f });
-  await r.c.pay(); assert.deepEqual([r.state.notice.code, r.last().latch], ["SESSION_NOT_REUSABLE", null]);
+  await pay(r.c, f); assert.deepEqual([r.state.notice.code, r.last().latch], ["SESSION_NOT_REUSABLE", null]);
 });
 
 test("R-UI1 create: unknown create (no bearer) needs an explicit acknowledgement reset, also after reload; ordinary Create stays blocked", async () => {
@@ -339,7 +344,7 @@ test("R-UI1a: a 200 status reply without a RECOGNISED status never resolves any 
       assert.equal(r.last().latch, action, `${action} ${JSON.stringify(bad.body)}`);
       assert.deepEqual([r.last().screen, r.state.stopped, r.state.polling, r.state.last], ["unreadable", "UNREADABLE", false, null], `${action} ${JSON.stringify(bad.body)}`);
       const before = f.calls.length;
-      await r.c.pay(); await rel(r.c); await r.c.details({ firstName: "A", lastName: "B", email: "a@example.test", accepted: true }); await r.c.retryUncertain({ accepted: true });
+      await r.c.pay(); await rel(r.c); await r.c.details({ firstName: "A", lastName: "B", email: "a@example.test", accepted: true }); await r.c.retryUncertain({ firstName: "A", lastName: "B", email: "a@example.test", accepted: true });   // a VALID form: only the unreadable gate blocks it
       assert.equal(f.calls.length, before, `${action}: nothing sent after an unreadable status`);
       assert.equal(createStore(s).load().uncertain, action);
     }
@@ -366,7 +371,7 @@ test("R-UI1a: malformed 2xx mutation replies latch (never a definite refusal, ne
   // pay 200 with a missing / invalid checkoutUrl -> latch pay, nothing opened, no resend
   for (const body of [{ status: "awaiting_payment" }, { status: "awaiting_payment", checkoutUrl: "https://evil.example/x" }, { checkoutUrl: 5 }]) {
     const f = fakeApi({ pay: [reply(200, body)] }); const r = rig({ storage: seeded(), api: f });
-    await r.c.pay(); await r.c.pay();
+    await pay(r.c, f); await r.c.pay();
     assert.deepEqual([r.last().latch, r.nav.assigned, f.count("pay")], ["pay", [], 1], JSON.stringify(body));
   }
   // details 200 without its expected status; release 202 without the REQUESTED marker / a recognised status

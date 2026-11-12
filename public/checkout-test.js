@@ -57,6 +57,22 @@ export function describe(status, { releaseRequested = false } = {}) {
     default: return { kind: "unexpected", title: "Unknown status", text: "The server returned a status this page does not know. Nothing more is sent automatically." };
   }
 }
+/** F3: client copy of the server's guest-details contract (lib/booking-db/repo.js validateGuest) + accepted terms. Checked BEFORE any
+ *  details write (ordinary and explicit resend): an invalid form sends NOTHING. Returns null or a code. Guest data is never stored. */
+const NAME_RE = /^[^\u0000-\u001f<>]{1,100}$/;
+const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+const PHONE_RE = /^[+0-9 ()-]{6,32}$/;
+export function detailsProblem(f) {
+  if (!f || typeof f !== "object") return "DETAILS_INVALID";
+  if (typeof f.firstName !== "string" || !NAME_RE.test(f.firstName.trim())) return "FIRST_NAME_INVALID";
+  if (typeof f.lastName !== "string" || !NAME_RE.test(f.lastName.trim())) return "LAST_NAME_INVALID";
+  if (typeof f.email !== "string" || f.email.length > 254 || !EMAIL_RE.test(f.email.trim())) return "EMAIL_INVALID";
+  if (f.phone && (typeof f.phone !== "string" || !PHONE_RE.test(f.phone.trim()))) return "PHONE_INVALID";
+  if (f.accepted !== true) return "TERMS_NOT_ACCEPTED";
+  return null;
+}
+const DETAILS_PROBLEM_TEXT = { FIRST_NAME_INVALID: "Enter a first name.", LAST_NAME_INVALID: "Enter a last name.", EMAIL_INVALID: "Enter a valid email address.",
+  PHONE_INVALID: "Enter a valid phone number or leave it empty.", TERMS_NOT_ACCEPTED: "Accept the TEST terms first.", DETAILS_INVALID: "Complete the guest details." };
 const POLL_KINDS = new Set(["pay", "releaseQueued"]);    // states worth re-reading automatically (after Stripe return / after a release request)
 
 /** sessionStorage wrapper. Every access is guarded; `ok` is false when the browser refuses storage. Stores no guest data. */
@@ -126,15 +142,31 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
   // Release confirmation (two-step, never persisted): `armed` binds the confirmation to the bearer it was opened for. Arming sends nothing;
   // ANY operation start (once), status / error change, latch, unreadable state, busy, token change or reset disarms it.
   let armed = null;
+  // F1: this page load returned from Stripe with the "complete" hint. While the server still says awaiting_payment, Pay is NOT offered again
+  // (no automatic re-enable when the read budget ends). In-memory only: a reload (query already stripped) forgets it — not durable prevention.
+  let returnedComplete = false;
+  // F2: status-read failure state, kept across renders until the next successful read ("failed") or an explicit reset ("lost" = HTTP 401)
+  let lost = false; let statusFailed = false;
   const storageOk = () => (st ? store.save(st) : true);
   const latch = () => (st && st.uncertain) || null;
 
   /** the ONE release-eligibility predicate (arm, confirm and the view): bound token, current processing status shown as "authorized", no
    *  latch, no unreadable state, not busy. The server stays authoritative; this only decides whether the page may offer the request. */
   function releaseEligible() {
-    if (!st || !st.token || latch() || unreadable || busy) return false;
+    if (!st || !st.token || latch() || unreadable || busy || lost) return false;
     const effective = last === "awaiting_details" && st.detailsSaved ? "awaiting_payment" : last;
     return effective === "processing" && describe(effective, { releaseRequested: st.releaseRequested }).kind === "authorized";
+  }
+  /** F1: the ONE pay-eligibility predicate (view canPay AND pay()). Initial unpaid checkout: status awaiting_payment (incl. a verified
+   *  details reply). Details-latch recovery: an uncertain details write whose fresh status still allows the step. Never while waiting for
+   *  Stripe's result after a "complete" return, never when lost / unreadable / busy / any other latch. */
+  function payEligible() {
+    if (!st || !st.token || busy || unreadable || lost) return false;
+    if (returnedComplete) return false;              // the completed-return guard DOMINATES every pay path, incl. the details-latch recovery
+    const effective = last === "awaiting_details" && st.detailsSaved ? "awaiting_payment" : last;
+    if (latch() === "details") return retry === "details";
+    if (latch() !== null) return false;
+    return effective === "awaiting_payment";
   }
   function view(extra = {}) {
     let focus = extra.focus;
@@ -142,12 +174,21 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
     // the accepted API reports details_collected as "awaiting_details": a VERIFIED details reply in this tab (session flag) moves the page on
     const effective = last === "awaiting_details" && st && st.detailsSaved ? "awaiting_payment" : last;
     const d = effective && !unreadable ? describe(effective, { releaseRequested: st && st.releaseRequested }) : null;
-    const screen = latch() === "create" && !(st && st.token) ? "createUncertain" : unreadable ? "unreadable" : st ? (d ? d.kind : "loading") : "create";
-    const title = screen === "createUncertain" ? "TEST intent outcome unknown" : screen === "unreadable" ? "Status not confirmed" : d ? d.title : st ? "Checking status…" : "Start a TEST booking";
+    const waitingPay = !!d && d.kind === "pay" && returnedComplete;   // any latch included: never a "Ready for payment" screen after a complete return
+    const screen = latch() === "create" && !(st && st.token) ? "createUncertain" : lost ? "lost" : unreadable ? "unreadable"
+      : st ? (waitingPay ? "payWait" : d ? d.kind : statusFailed && !busy ? "notChecked" : "loading") : "create";
+    const title = screen === "createUncertain" ? "TEST intent outcome unknown" : screen === "lost" ? "This tab can no longer check this TEST booking"
+      : screen === "unreadable" ? "Status not confirmed" : screen === "payWait" ? "Waiting for the TEST payment result" : screen === "notChecked" ? "Status not checked"
+      : d ? d.title : st ? "Checking status…" : "Start a TEST booking";
     const text = screen === "createUncertain" ? "A create request may or may not have reached the server. This tab has no way to look it up. Acknowledge before starting another TEST booking (a second TEST intent may then exist)."
-      : screen === "unreadable" ? "The server's last reply did not contain a recognised status, so this page claims nothing about the current state. Nothing is sent automatically; use Refresh status." : d ? d.text : "";
-    ui.render({ screen, title, text, price, notice, busy, polling: pollTimer !== null, pollStopped: stopped, canRefresh: !!(st && st.token) && !busy,
-      latch: latch(), retry, canPay: !busy && !unreadable && !!st && !!st.token && (latch() === null || (latch() === "details" && retry === "details")),
+      : screen === "lost" ? "The server no longer accepts this tab's access to the TEST booking, so this page cannot check it, pay or request a release. Nothing more is sent from this tab. This says nothing about whether a TEST hold exists; follow the test operator's instructions."
+      : screen === "unreadable" ? "The server's last reply did not contain a recognised status, so this page claims nothing about the current state. Nothing is sent automatically; use Refresh status."
+      : screen === "payWait" ? "You returned from Stripe. The server has not reported a result yet, so nothing is known about the payment from this page. Payment is not offered again here. Use Refresh status to check; if this does not change, follow the test operator's instructions."
+      : screen === "notChecked" ? "The status check did not succeed (for example too many requests or a server error). This page claims nothing about the current state. Wait, then use Refresh status."
+      : d ? d.text : "";
+    ui.render({ screen, title, text, price, notice, busy, polling: pollTimer !== null, pollStopped: lost ? null : stopped,   // lost: no "use Refresh" hint (Refresh is not offered)
+      canRefresh: !!(st && st.token) && !busy && !lost,
+      latch: latch(), retry: lost || waitingPay ? null : retry, canPay: payEligible(),   // payWait: only Refresh (the details form is not shown there)
       termsVersion: config.termsVersion || null, listingId: config.listingId, currency: config.currency,
       canRequestRelease: releaseEligible(), confirmingRelease: armed !== null, ...extra, focus: focus || null });
   }
@@ -203,7 +244,7 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
   }
   /** one status read; `auto` reads consume the persisted per-tab budget (and are skipped if storage cannot persist it) */
   async function readStatus({ auto = false } = {}) {
-    if (!st || !st.token) return;
+    if (!st || !st.token || lost) return;
     if (auto) {
       if (autoBudgetLeft() <= 0) { stopped = "BUDGET"; view(); return; }
       st.polls.push(now());
@@ -211,16 +252,17 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
     }
     const r = await once(() => api.status(st.token));
     if (r === null) return;
-    if (r.kind === "unknown") { stopPolling("UNREADABLE"); last = null; unreadable = true; retry = null; setNotice({ level: "warn", code: "STATUS_UNREADABLE", text: "The server's status could not be read. Use Refresh status." }); view(); return; }
-    if (r.http === 429) { stopPolling("RATE_LIMITED"); setNotice({ level: "warn", code: "RATE_LIMITED", text: "Too many requests. Automatic status checks stopped; wait, then use Refresh status." }); view(); return; }
-    if (r.http === 401) { stopPolling("UNAUTHORIZED"); setNotice({ level: "error", code: "UNAUTHORIZED", text: "This tab's TEST booking is no longer accepted by the server. Start over to try again." }); last = null; view({ screen: "lost" }); return; }
-    if (r.http !== 200) { stopPolling("ERROR"); setNotice({ level: "warn", code: safeCode(r.body.code), text: "The status check failed. Use Refresh status." }); view(); return; }
+    if (r.kind === "unknown") { statusFailed = false; stopPolling("UNREADABLE"); last = null; unreadable = true; retry = null; setNotice({ level: "warn", code: "STATUS_UNREADABLE", text: "The server's status could not be read. Use Refresh status." }); view(); return; }
+    if (r.http === 429) { stopPolling("RATE_LIMITED"); statusFailed = true; setNotice({ level: "warn", code: "RATE_LIMITED", text: "Too many requests. Automatic status checks stopped; wait, then use Refresh status." }); view(); return; }
+    if (r.http === 401) { stopPolling("UNAUTHORIZED"); lost = true; armed = null; retry = null;
+      setNotice({ level: "error", code: "UNAUTHORIZED", text: "This tab's TEST booking access is no longer accepted by the server." }); last = null; view(); return; }
+    if (r.http !== 200) { stopPolling("ERROR"); statusFailed = true; setNotice({ level: "warn", code: safeCode(r.body.code), text: "The status check failed. Use Refresh status." }); view(); return; }
     const s = absorb(r);
     if (s === null) {                             // HTTP 200 without a recognised status: no proof, no previous label reused
       stopPolling("UNREADABLE"); last = null; unreadable = true; retry = null;
       setNotice({ level: "warn", code: "STATUS_UNRECOGNISED", text: "The server's reply did not contain a recognised status. Use Refresh status." }); view(); return;
     }
-    unreadable = false; stopped = null;
+    unreadable = false; stopped = null; statusFailed = false;
     if (notice && !notice.latch) {               // stale action / hint notices never contradict a newer authoritative status
       if (notice.forStatus === undefined) notice = { ...notice, forStatus: s };
       else if (notice.forStatus !== s) notice = null;
@@ -263,7 +305,7 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
       const q = nav.search();
       const hint = q === "?checkout=complete" ? "complete" : q === "?checkout=cancelled" ? "cancelled" : null;
       if (q) nav.stripQuery();
-      returned = hint !== null;
+      returned = hint !== null; returnedComplete = hint === "complete";
       if (hint) setNotice({ level: "info", code: hint === "complete" ? "RETURNED_COMPLETE" : "RETURNED_CANCELLED",
         text: hint === "complete" ? "You returned from Stripe. This is only a hint: the page now asks the server what actually happened." : "You left Stripe Checkout without paying (hint only). Checking the server…" });
       if (latch() === "create" && !st.token) { setNotice({ level: "warn", code: "CREATE_UNCERTAIN", latch: true, text: "The previous create request's outcome is unknown." }); view(); return; }
@@ -291,15 +333,17 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
       view();
     },
     /** explicit reset after an unknown create: the guest acknowledges a possible prior TEST intent */
-    acknowledgeUncertainCreate() { if (latch() !== "create") return; armed = null; store.clear(); st = null; last = null; price = null; setNotice(null); view(); },
+    acknowledgeUncertainCreate() { if (latch() !== "create") return; armed = null; lost = false; statusFailed = false; store.clear(); st = null; last = null; price = null; setNotice(null); view(); },
     async details(form) {
       if (!st || !st.token || latch() || unreadable) return;
       if (!config.termsVersion) { setNotice({ level: "error", code: "TERMS_NOT_CONFIGURED", text: "This TEST page has no terms version configured; details cannot be sent." }); view(); return; }
-      if (form.accepted !== true) { setNotice({ level: "warn", code: "TERMS_NOT_ACCEPTED", text: "Accept the TEST terms first." }); view(); return; }
+      if (lost) return;
+      const bad = detailsProblem(form);
+      if (bad) { setNotice({ level: "warn", code: bad, text: DETAILS_PROBLEM_TEXT[bad] }); view(); return; }   // zero writes
       await sendDetails(detailsBody(form));
     },
     async pay() {
-      if (!st || !st.token || unreadable || (latch() && !(latch() === "details" && retry === "details"))) return;
+      if (!payEligible()) return;                    // F1: the same predicate as the view's canPay
       if (!storageOk()) { setNotice({ level: "error", code: "STORAGE_UNAVAILABLE", text: "This tab cannot remember the TEST booking; payment stays disabled." }); view(); return; }
       const r = await once(() => api.pay(st.token));
       if (r === null) return;
@@ -339,14 +383,16 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
     release() { this.armRelease(); },
     /** explicit resend of a latched details / release AFTER a fresh status showed the server still allows that step */
     async retryUncertain(form) {
-      if (!st || !st.token || unreadable || !retry || retry !== latch()) return;
+      if (!st || !st.token || unreadable || lost || !retry || retry !== latch()) return;
       if (retry === "details") {
-        if (!config.termsVersion || !form || form.accepted !== true) { setNotice({ level: "warn", code: "TERMS_NOT_ACCEPTED", text: "Accept the TEST terms first." }); view(); return; }
+        if (!config.termsVersion) { setNotice({ level: "error", code: "TERMS_NOT_CONFIGURED", text: "This TEST page has no terms version configured; details cannot be sent." }); view(); return; }
+        const bad = detailsProblem(form);            // F3: an invalid resend sends NOTHING; latch and token are kept so the guest can correct it
+        if (bad) { setNotice({ level: "warn", code: bad, latch: true, text: DETAILS_PROBLEM_TEXT[bad] }); view(); return; }
         await sendDetails(detailsBody(form));
       } else if (retry === "release") await sendRelease();
     },
     async refresh() { stopPolling(null); await readStatus({ auto: false }); },
-    startOver() { armed = null; stopPolling(null); store.clear(); st = null; last = null; price = null; retry = null; unreadable = false; setNotice(null); view(); }
+    startOver() { armed = null; lost = false; statusFailed = false; returnedComplete = false; stopPolling(null); store.clear(); st = null; last = null; price = null; retry = null; unreadable = false; setNotice(null); view(); }
   };
 }
 
@@ -374,7 +420,7 @@ export function startApp(doc, win) {
       }
       show("mv-create", v.screen === "create"); show("mv-details", v.screen === "details"); show("mv-pay", v.screen === "pay" || (v.retry === "details" && v.canPay));
       show("mv-release", v.screen === "authorized"); show("mv-release-trigger", !v.confirmingRelease); show("mv-release-confirm", v.confirmingRelease === true);
-      show("mv-restart", !["create", "loading", "redirecting", "createUncertain"].includes(v.screen));
+      show("mv-forget", !["create", "loading", "redirecting", "createUncertain"].includes(v.screen));
       show("mv-ack-create", v.screen === "createUncertain");
       const rb = $("mv-retry-btn"); rb.hidden = !v.retry;
       rb.textContent = v.retry === "release" ? "Send the release request again (the server treats a repeat as the same request)"
@@ -412,11 +458,13 @@ export function startApp(doc, win) {
   $("mv-release-keep").addEventListener("click", () => c.cancelRelease());
   $("mv-release-yes").addEventListener("click", () => c.confirmRelease());
   $("mv-release-confirm").addEventListener("keydown", (e) => { if (e.key === "Escape") { e.preventDefault(); c.cancelRelease(); } });
-  $("mv-retry-btn").addEventListener("click", () => { const f = form("mv-details");
+  $("mv-retry-btn").addEventListener("click", () => {
+    if (c.state.retry === "details" && typeof $("mv-details").reportValidity === "function" && !$("mv-details").reportValidity()) return;   // F3 (the controller re-checks)
+    const f = form("mv-details");
     c.retryUncertain({ firstName: String(f.get("firstName")), lastName: String(f.get("lastName")), email: String(f.get("email")), phone: String(f.get("phone") || ""), accepted: $("mv-terms").checked }); });
   $("mv-ack-create-btn").addEventListener("click", () => { if (win.confirm("A previous TEST intent may exist. Start a new TEST booking anyway?")) c.acknowledgeUncertainCreate(); });
   $("mv-refresh").addEventListener("click", () => c.refresh());
-  $("mv-restart").addEventListener("click", () => { if (win.confirm("Forget this TEST booking in this tab? Nothing is cancelled or released by this.")) c.startOver(); });
+  $("mv-restart").addEventListener("click", () => { if (win.confirm("Forget this TEST booking in this tab? This does not cancel the booking or release any TEST hold, and this tab will no longer be able to check it or request a release.")) c.startOver(); });
   c.init();
   return c;
 }
