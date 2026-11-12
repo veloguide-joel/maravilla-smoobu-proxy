@@ -574,6 +574,7 @@ test("containment: the adapter is pure and unreachable — no imports, network, 
     "scripts/e7-connected/run-plan-v1.mjs"]) {
     const s = readFileSync(join(ROOT, pathOnly), "utf8");
     assert.doesNotMatch(s, /^\s*import\b[^;]*hostaway-reservations/m, `${pathOnly}: no static import of the adapter`);
+    assert.doesNotMatch(s, /^\s*export\b[^;]*\bfrom\s*["'][^"']*hostaway-reservations/m, `${pathOnly}: no re-export of the adapter`);
     assert.doesNotMatch(s, /\bimport\s*\([^)]*hostaway-reservations|\brequire\s*\([^)]*hostaway-reservations/, `${pathOnly}: no dynamic import / require of the adapter`);
     assert.match(s, /"lib\/hostaway-reservations\.js"/, `${pathOnly}: names the adapter path as a closure string`);
   }
