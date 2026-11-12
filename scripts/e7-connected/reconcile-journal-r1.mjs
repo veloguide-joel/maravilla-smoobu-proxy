@@ -14,8 +14,10 @@ const freeze = Object.freeze;
 const sha = (s) => createHash("sha256").update(s, "utf8").digest("hex");
 const GENESIS = "0".repeat(64);
 
-/** openReconcileJournalR1({ dir, runId, uid }) → { ok:true, journal } | { ok:false, code } — never throws */
-export async function openReconcileJournalR1({ dir, runId, uid } = {}) {
+/** openReconcileJournalR1({ dir, runId, uid, openHandle? }) → { ok:true, journal } | { ok:false, code } — never throws.
+ *  openHandle (TEST-ONLY injection, default fs.promises.open) lets fault tests wrap write / sync; production never passes it. */
+export async function openReconcileJournalR1({ dir, runId, uid, openHandle } = {}) {
+  const open = typeof openHandle === "function" ? openHandle : (f, flags, mode) => fsp.open(f, flags, mode);
   const bad = (code) => freeze({ ok: false, code });
   if (typeof dir !== "string" || !path.isAbsolute(dir) || dir.includes("\0") || path.normalize(dir) !== dir) return bad("JOURNAL_DIR_INVALID");
   if (typeof runId !== "string" || !RUN_ID_RE.test(runId)) return bad("RUN_ID_INVALID");
@@ -25,7 +27,7 @@ export async function openReconcileJournalR1({ dir, runId, uid } = {}) {
   if ((st.mode & 0o777) !== 0o700 || (Number.isSafeInteger(uid) && st.uid !== uid)) return bad("JOURNAL_DIR_NOT_PRIVATE");
   const file = path.join(dir, journalName(runId));
   let fh;
-  try { fh = await fsp.open(file, C.O_WRONLY | C.O_CREAT | C.O_EXCL | C.O_NOFOLLOW | C.O_APPEND, 0o600); }
+  try { fh = await open(file, C.O_WRONLY | C.O_CREAT | C.O_EXCL | C.O_NOFOLLOW | C.O_APPEND, 0o600); }
   catch (e) { return bad(e && e.code === "EEXIST" ? "JOURNAL_EXISTS" : "JOURNAL_CREATE_FAILED"); }
   try {
     const fst = await fh.stat();
@@ -37,19 +39,33 @@ export async function openReconcileJournalR1({ dir, runId, uid } = {}) {
   let seq = 0; let prev = GENESIS; let closed = false; let failed = null;
   const journal = freeze({
     file,
-    /** append(type, at, data) → { ok, seq, hash } | { ok:false, code } — one fsynced line; after a failure every later append refuses */
+    /** append(type, at, data) → { ok, seq, hash } | { ok:false, code }. The FULL line is written (a zero-progress or over-progress write fails;
+     *  partial progress continues from the reported offset), then fsync; only then do seq / head advance. Any failure latches: every later
+     *  append refuses with the first code — no retry, no repair, no truncation (a partial line on disk is reported by the reader). */
     async append(type, at, data = {}) {
       if (closed) return freeze({ ok: false, code: "JOURNAL_CLOSED" });
       if (failed) return freeze({ ok: false, code: failed });
-      seq += 1;
-      const rec = { kind: RECONCILE_JOURNAL_KIND, seq, prev, type, at, data };
+      const nseq = seq + 1;
+      const rec = { kind: RECONCILE_JOURNAL_KIND, seq: nseq, prev, type, at, data };
       const line = JSON.stringify(rec);
       const hash = sha(`${prev}\n${line}`);
-      try { await fh.write(`${JSON.stringify({ ...rec, hash })}\n`); await fh.sync(); }
-      catch { failed = "JOURNAL_WRITE_FAILED"; return freeze({ ok: false, code: failed }); }
-      prev = hash;
+      let buf;
+      try { buf = Buffer.from(`${JSON.stringify({ ...rec, hash })}\n`, "utf8"); } catch { failed = "JOURNAL_ENCODE_FAILED"; return freeze({ ok: false, code: failed }); }
+      try {
+        let off = 0;
+        while (off < buf.length) {
+          const r = await fh.write(buf, off, buf.length - off);
+          const n = r && r.bytesWritten;
+          if (!Number.isSafeInteger(n) || n <= 0) { failed = "JOURNAL_WRITE_NO_PROGRESS"; return freeze({ ok: false, code: failed }); }
+          if (n > buf.length - off) { failed = "JOURNAL_WRITE_OVER_PROGRESS"; return freeze({ ok: false, code: failed }); }
+          off += n;
+        }
+      } catch { failed = "JOURNAL_WRITE_FAILED"; return freeze({ ok: false, code: failed }); }
+      try { await fh.sync(); } catch { failed = "JOURNAL_SYNC_FAILED"; return freeze({ ok: false, code: failed }); }
+      seq = nseq; prev = hash;                                                        // acknowledged ONLY after full write + fsync
       return freeze({ ok: true, seq, hash });
     },
+    get failed() { return failed; },
     head: () => freeze({ seq, hash: prev }),
     async close() { if (closed) return; closed = true; await fh.close().catch(() => {}); }
   });

@@ -6,8 +6,9 @@
 //   2. validates the STOPPED native run READ-ONLY from disk (accepted R1 binding at a clock inside the package's validity + readJournalForRecoveryR1
 //      with the run's trusted head): AT_ESCROW_HEAD / MATCH_TIP / terminal chain whose evidence facts show it ended INSIDE the reservation phase
 //      (no reservation end, no BLOCKED attestation, no abort, no open step), no permission — never a caller boolean;
-//   3. takes the native run advisory lock (LOCK_KEY) on a report session for the whole session (native-run and R-B-vs-R-B exclusion ONLY —
-//      hosted runner A does NOT take this lock; against it R-B relies on DB state / version / lease fences and its final check);
+//   3. takes the native run advisory lock (LOCK_KEY, two-int4 form) on a report session for the whole session and PROVES it is still exactly this
+//      session's lock (accepted P3 predicate + backend pid) before every worker step and before success (native-run and R-B-vs-R-B exclusion
+//      ONLY — hosted runner A takes no lock; against it R-B relies on DB state / version / lease fences and its final check);
 //   4. read-only DB preflight of the exact V1 shape (version, history, ops, attempt, claim, leases, protected ids, freshness / grace, auth margin)
 //      and an exclusion baseline over every other intent / operation;
 //   5. a PRECHECK: fresh by-ref lookup (exactly one match) + by-id GET of the bound id through STRICT GET-only executors (not persisted);
@@ -23,7 +24,7 @@ import { runOrchestratorStep, PROTECTED_HOSTAWAY_RESERVATION_IDS, LIMITS as WORK
 import { FRESH_AFTER_DISPATCH_MS, WRITE_OP_TYPES } from "../../lib/checkout/recovery-plan.js";
 import { RECOVERY_DEFAULT_GRACE_MS } from "../../lib/booking-db/recovery.js";
 import { lookupByRef, normalizeReservation, unwrapEnvelope, REF_RE, DIRECT_CHANNEL_ID } from "../../lib/hostaway-reservations.js";
-import { LOCK_KEY } from "./run-core.mjs";
+import { LOCK_KEY, LOCK_PRECHECK_SQL } from "./run-lock-precheck.mjs";
 import { bindRunPackageR1Journal } from "./run-journal-memory-v2.mjs";
 import { readJournalForRecoveryR1 } from "./run-journal-file-v2.mjs";
 import { createReconcileExecutorsR1 } from "./reconcile-executors-r1.mjs";
@@ -68,152 +69,200 @@ export function validatePlanR1(p) {
 }
 
 /**
- * runReconcileR1({ plan, pools: { app, report }, hostawaySend, clock, monotonic?, journalDir, uid?, native: { packageInput, journalDir, headDir,
- *   trustedHead }, hooks? }) → frozen result { outcome, code, ... } — never throws for caller input / provider / DB refusals.
+ * runReconcileR1({ plan, pools: { app, report }, hostawaySend, clock, monotonic?, sleep?, journalDir, uid?, native: { packageInput, journalDir,
+ *   headDir, trustedHead }, hooks?, journalOpen? }) → frozen result — never throws.
+ * Lifecycle: ONE try / finally. The finally (a) appends the terminal record (its failure turns any success into STOPPED / TERMINAL_JOURNAL_FAILED),
+ * (b) releases the native lock — unlock result checked; on failure / exception the session connection is DESTROYED (the server drops its session
+ * locks) and that is reported, never claimed as a clean release — (c) closes the journal. HARD session deadline: no new GET / step / proof
+ * starts after it, and it is re-checked after every awaited proof / step / DB read and immediately before success. An in-flight accepted worker
+ * step is awaited (bounded by the executors' per-call bound + the worker's own step budget) — that is TEARDOWN GRACE, never success.
  */
 export async function runReconcileR1(opts = {}) {
   const { plan, pools, hostawaySend, clock, journalDir, uid, native, hooks = {} } = opts;
   const mono = typeof opts.monotonic === "function" ? opts.monotonic : () => performance.now();
   const sleep = typeof opts.sleep === "function" ? opts.sleep : (ms) => new Promise((res) => setTimeout(res, ms));
+  const journalOpen = typeof opts.journalOpen === "function" ? opts.journalOpen : openReconcileJournalR1;   // TEST-ONLY injection point
   const t0 = mono();
+  const remaining = () => t0 + LIMITS.sessionBudgetMs - mono();
+  const expired = () => !(remaining() > 0);
   const R = { outcome: null, code: null, runId: isObj(plan) ? plan.runId : null, intentId: isObj(plan) ? plan.intentId : null, steps: [], gets: 0,
-    getLog: [], violations: [], precheck: null, final: null, dbState: null, dbEvidence: null, exclusionAfter: "not_attempted", lockHeld: false,
-    liveEffects: null, queuedEffects: null, cleanup: "NOT_HANDED_OFF", journalHead: null };
-  const done = async (outcome, code, J) => {
-    R.outcome = outcome; R.code = code;
-    if (J) { await J.append(outcome === "RECONCILED_CONFIRMED" ? "ENDED" : outcome, clock(), { code }); R.journalHead = J.head(); await J.close(); }
-    return freeze(structuredClone(R));
+    getLog: [], violations: [], precheck: null, final: null, dbState: null, dbEvidence: null, exclusionAfter: "not_attempted", lock: "not_acquired",
+    liveEffects: null, queuedEffects: null, cleanup: "NOT_HANDED_OFF", audit: "complete", journalHead: null, elapsedMs: null };
+  let J = null; let lockClient = null; let lockAcquired = false; let ex = null; let onLockErr = null;
+  const audit = async (type, data) => {
+    if (!J) return false;
+    let r; try { r = await J.append(type, clock(), data); } catch { r = { ok: false, code: "JOURNAL_APPEND_THREW" }; }
+    if (!r || r.ok !== true) { if (R.audit === "complete") R.audit = `incomplete:${type}:${(r && r.code) || "UNKNOWN"}`; return false; }
+    return true;
   };
-  // ---- 1. plan + own journal -------------------------------------------------------------------------------------------------------
-  const pe = isObj(plan) ? validatePlanR1(plan) : "PLAN_SHAPE";
-  if (pe) return done("REFUSED", pe, null);
-  if (!isObj(pools) || !pools.app || !pools.report || typeof hostawaySend !== "function" || typeof clock !== "function") return done("REFUSED", "OPTIONS_INVALID", null);
-  const jo = await openReconcileJournalR1({ dir: journalDir, runId: plan.runId, uid });
-  if (!jo.ok) return done("REFUSED", jo.code, null);
-  const J = jo.journal;
-  const jr = await J.append("RUN_STARTED", clock(), { version: RECONCILE_CORE_R1_VERSION, plan });
-  if (!jr.ok) return done("REFUSED", jr.code, J);
-  const overBudget = () => mono() - t0 > LIMITS.sessionBudgetMs;
-  // ---- 2. the stopped native run, read-only, from disk ------------------------------------------------------------------------------
-  if (!isObj(native)) return done("REFUSED", "NATIVE_EVIDENCE_MISSING", J);
-  const nb = bindRunPackageR1Journal(native.packageInput, plan.nativeExecClock);
-  if (!nb.ok) return done("REFUSED", "NATIVE_BINDING_INVALID", J);
-  const B = nb.binding;
-  if (B.identity.runId !== plan.nativeRunId || B.manifest.intentId !== plan.intentId || B.r1.packageHash !== plan.nativePackageHash
-      || B.r1.paymentIntentId !== plan.paymentIntentId) return done("REFUSED", "NATIVE_BINDING_MISMATCH", J);
-  let rc;
-  try { rc = await readJournalForRecoveryR1({ journalDir: native.journalDir, headDir: native.headDir, binding: B, trustedHead: native.trustedHead ?? null }); }
-  catch { rc = { ok: false }; }
-  if (!nativeStoppedInReservationPhase(rc)) return done("REFUSED", "NATIVE_RUN_NOT_PROVEN_STOPPED", J);
-  const fx = rc.chain.facts;
-  await J.append("NATIVE_VALIDATED", clock(), { relation: rc.relation, suppliedHead: rc.suppliedHead, chain: rc.chain.status, facts: fx });
-  // ---- 3. native-run lock (session-level, report pool) ------------------------------------------------------------------------------
-  let lockClient = null;
-  try { lockClient = await pools.report.connect(); } catch { return done("REFUSED", "DB_CONNECT_FAILED", J); }
-  const unlock = async () => {
-    if (!lockClient) return;
-    try { if (R.lockHeld) await lockClient.query("SELECT pg_advisory_unlock(hashtext($1), 0)", [LOCK_KEY]); } catch { /* reported by lockHeld */ }
-    lockClient.release(); lockClient = null; R.lockHeld = false;
-  };
-  const finish = async (outcome, code) => { await unlock(); return done(outcome, code, J); };
+  const obs = () => { if (ex) { R.gets = ex.observe.gets; R.getLog = ex.observe.log; R.violations = ex.observe.violations; } };
+  let outcome = "STOPPED"; let code = "INTERNAL_EXCEPTION";
+  const set = (o, c) => { outcome = o; code = c; return null; };
   try {
-    const lr = await lockClient.query("SELECT pg_try_advisory_lock(hashtext($1), 0) AS ok", [LOCK_KEY]);
-    if (lr.rows[0]?.ok !== true) return finish("REFUSED", "RUN_LOCK_HELD");
-    R.lockHeld = true;
-  } catch { return finish("REFUSED", "DB_FAILURE"); }
-  const lockStillHeld = async () => {
-    try { return Number((await lockClient.query("SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND granted AND pid = pg_backend_pid()")).rows[0].n) >= 1; }
-    catch { return false; }
-  };
-  if (hooks.afterLock) await hooks.afterLock();
-  // ---- 4. read-only DB preflight + exclusion baseline --------------------------------------------------------------------------------
-  const q = (sql, p = []) => lockClient.query(sql, p).then((r) => r.rows);
-  const facts = async () => {
-    const intent = await loadIntent(lockClient, plan.intentId);
-    const ops = await q(`SELECT id::text AS id, op_type, state, attempts, result_ref, dispatched_at, completed_at, lease_until, lease_worker_id
-      FROM booking.external_operations WHERE intent_id = $1 ORDER BY created_at, id`, [plan.intentId]);
-    const att = await q("SELECT id::text AS id, operation_id::text AS operation_id, state, hostaway_reservation_id FROM booking.hostaway_reservation_attempts WHERE intent_id = $1", [plan.intentId]);
-    const last = (await q("SELECT version_after, event_type, event_id FROM booking.intent_transitions WHERE intent_id = $1 ORDER BY version_after DESC LIMIT 1", [plan.intentId]))[0] ?? null;
-    const claims = Number((await q("SELECT count(*)::int AS n FROM booking.inventory_claims WHERE intent_id = $1 AND released_at IS NULL", [plan.intentId]))[0].n);
-    const work = (await q("SELECT work_worker_id, work_lease_until FROM booking.intent_work WHERE intent_id = $1", [plan.intentId]))[0] ?? null;
-    const evid = await q(`SELECT e.status, e.external_ref, e.observed_at, o.op_type FROM booking.provider_evidence e JOIN booking.external_operations o ON o.id = e.read_operation_id
-      WHERE o.intent_id = $1 AND e.kind = 'hostaway_reservation' ORDER BY e.observed_at`, [plan.intentId]);
-    return { intent, ops, att, last, claims, work, evid };
-  };
-  const exclusion = async () => (await q(`SELECT
-      (SELECT md5(coalesce(string_agg(id::text || ':' || state || ':' || version || ':' || updated_at::text, ',' ORDER BY id), '')) FROM booking.intents WHERE id <> $1) AS i,
-      (SELECT md5(coalesce(string_agg(id::text || ':' || state || ':' || attempts || ':' || coalesce(completed_at::text, '-'), ',' ORDER BY id), '')) FROM booking.external_operations WHERE intent_id <> $1) AS o`,
-    [plan.intentId]))[0];
-  let F0; let ex0;
-  try { F0 = await facts(); ex0 = await exclusion(); } catch { return finish("REFUSED", "DB_FAILURE"); }
-  const now0 = clock();
-  const pf = preflight(F0, plan, now0);
-  if (pf) { R.dbState = F0.intent ? F0.intent.status : null; return finish("REFUSED", pf); }
-  await J.append("PREFLIGHT_OK", now0, { version: F0.intent.version, createOpId: plan.createOpId, attempt: F0.att[0].state });
-  // ---- 5. PRECHECK (fresh, not persisted) ---------------------------------------------------------------------------------------------
-  const ex = createReconcileExecutorsR1({ binding: { listingId: plan.listingId, arrivalDate: plan.from, reservationId: plan.reservationId }, send: hostawaySend, maxGets: LIMITS.maxGets });
-  if (!ex.ok) return finish("REFUSED", ex.code);
-  const obs = () => { R.gets = ex.observe.gets; R.getLog = ex.observe.log; R.violations = ex.observe.violations; };
-  const cfg = { allowedListingIds: [plan.listingId], refFieldId: plan.refFieldId, channelId: DIRECT_CHANNEL_ID, currency: plan.currency };
-  const pre = await pairedRead(ex, cfg, plan, clock); obs();
-  R.precheck = pre;
-  await J.append("PRECHECK", clock(), pre);
-  if (!pre.ok) return finish("STOPPED", ex.observe.stop ? ex.observe.stop.code : pre.code);
-  const sessionFloor = Math.max(pre.lookupObservedAt, pre.byIdObservedAt);
-  if (hooks.afterPrecheck) await hooks.afterPrecheck();
-  // ---- 6. accepted worker steps (scoped, strict executors) ---------------------------------------------------------------------------
-  const env = { VERCEL_ENV: "development", MV_E7_RESERVATION_WORKER: "enabled", DIRECT_DISCOUNT_BPS: String(plan.rateBps) };
-  const workerId = `e7rb:${plan.runId}`.slice(0, 80);
-  let state = F0.intent.status;
-  let waitUntil = null;
-  for (let i = 1; i <= LIMITS.maxSteps && state !== "reservation_confirmed"; i++) {
-    // honour the ACCEPTED worker's own schedule (delayMs / next_action_at) on the business clock — never skip time, never busy-loop
-    while (waitUntil !== null && clock() < waitUntil) { if (overBudget()) return finish("STOPPED", "SESSION_BUDGET_EXHAUSTED"); await sleep(200); }
-    if (overBudget()) return finish("STOPPED", "SESSION_BUDGET_EXHAUSTED");
-    if (!(await lockStillHeld())) return finish("STOPPED", "LOCK_LOST");
-    let r;
-    try {
-      r = await runOrchestratorStep(pools.app, { workerId, env, adapterConfig: cfg, listings: new Map([[plan.listingId, { currency: plan.currency }]]),
-        executors: ex.executors, clock, intentId: plan.intentId });
-    } catch { obs(); R.dbState = await stateOf(lockClient, plan.intentId); return finish("STOPPED", "WORKER_FAILED"); }
+    await (async () => {
+      // ---- 1. plan + own journal ---------------------------------------------------------------------------------------------------
+      const pe = isObj(plan) ? validatePlanR1(plan) : "PLAN_SHAPE";
+      if (pe) return set("REFUSED", pe);
+      if (!isObj(pools) || !pools.app || !pools.report || typeof hostawaySend !== "function" || typeof clock !== "function") return set("REFUSED", "OPTIONS_INVALID");
+      const jo = await journalOpen({ dir: journalDir, runId: plan.runId, uid });
+      if (!jo || !jo.ok) { R.audit = `incomplete:OPEN:${(jo && jo.code) || "UNKNOWN"}`; return set("REFUSED", (jo && jo.code) || "JOURNAL_OPEN_FAILED"); }
+      J = jo.journal;
+      if (!(await audit("RUN_STARTED", { version: RECONCILE_CORE_R1_VERSION, plan }))) return set("REFUSED", "AUDIT_RUN_STARTED_FAILED");
+      // ---- 2. the stopped native run, read-only, from disk ---------------------------------------------------------------------------
+      if (!isObj(native)) return set("REFUSED", "NATIVE_EVIDENCE_MISSING");
+      const nb = bindRunPackageR1Journal(native.packageInput, plan.nativeExecClock);
+      if (!nb.ok) return set("REFUSED", "NATIVE_BINDING_INVALID");
+      const B = nb.binding;
+      if (B.identity.runId !== plan.nativeRunId || B.manifest.intentId !== plan.intentId || B.r1.packageHash !== plan.nativePackageHash
+          || B.r1.paymentIntentId !== plan.paymentIntentId) return set("REFUSED", "NATIVE_BINDING_MISMATCH");
+      let rc;
+      try { rc = await readJournalForRecoveryR1({ journalDir: native.journalDir, headDir: native.headDir, binding: B, trustedHead: native.trustedHead ?? null }); }
+      catch { rc = null; }
+      if (!nativeStoppedInReservationPhase(rc)) return set("REFUSED", "NATIVE_RUN_NOT_PROVEN_STOPPED");
+      if (!(await audit("NATIVE_VALIDATED", { relation: rc.relation, suppliedHead: rc.suppliedHead, chain: rc.chain.status, facts: rc.chain.facts }))) return set("REFUSED", "AUDIT_NATIVE_VALIDATED_FAILED");
+      // ---- 3. native-run lock (session-level, report pool) ----------------------------------------------------------------------------
+      try { lockClient = await pools.report.connect(); } catch { return set("REFUSED", "DB_CONNECT_FAILED"); }
+      onLockErr = (e) => { R.lockSessionError = String(e && e.message || e); };   // a server-killed backend emits `error` on a checked-out client — never uncaught
+      if (typeof lockClient.on === "function") lockClient.on("error", onLockErr);
+      const lr = await lockClient.query("SELECT pg_try_advisory_lock(pg_catalog.hashtext($1), 0) AS ok", [LOCK_KEY]);
+      if (lr.rows[0]?.ok !== true) return set("REFUSED", "RUN_LOCK_HELD");
+      lockAcquired = true; R.lock = "held";
+      const hk = freeze({ lockQuery: (sql, p) => lockClient.query(sql, p) });     // TEST hooks only (fault injection on THIS session)
+      if (!(await ownLockProven(lockClient))) return set("REFUSED", "LOCK_NOT_PROVEN");
+      if (hooks.afterLock) await hooks.afterLock(hk);
+      // ---- 4. read-only DB preflight + exclusion baseline -------------------------------------------------------------------------------
+      const F0 = await factsOf(lockClient, plan.intentId); const ex0 = await exclusionOf(lockClient, plan.intentId);
+      const now0 = clock();
+      const pf = preflight(F0, plan, now0);
+      if (pf) { R.dbState = F0.intent ? F0.intent.status : null; return set("REFUSED", pf); }
+      if (!(await audit("PREFLIGHT_OK", { version: F0.intent.version, createOpId: plan.createOpId, attempt: F0.att[0].state }))) return set("STOPPED", "AUDIT_PREFLIGHT_FAILED");
+      if (expired()) return set("STOPPED", "SESSION_DEADLINE");
+      // ---- 5. PRECHECK (fresh, not persisted) ---------------------------------------------------------------------------------------
+      ex = createReconcileExecutorsR1({ binding: { listingId: plan.listingId, arrivalDate: plan.from, reservationId: plan.reservationId }, send: hostawaySend,
+        maxGets: LIMITS.maxGets, remainingMs: remaining, callTimeoutMs: LIMITS.callTimeoutMs });
+      if (!ex.ok) return set("REFUSED", ex.code);
+      const cfg = { allowedListingIds: [plan.listingId], refFieldId: plan.refFieldId, channelId: DIRECT_CHANNEL_ID, currency: plan.currency };
+      const pre = await pairedRead(ex, cfg, plan, clock); obs();
+      R.precheck = pre;
+      if (!(await audit("PRECHECK", pre))) return set("STOPPED", "AUDIT_PRECHECK_FAILED");
+      if (!pre.ok) return set("STOPPED", ex.observe.stop ? ex.observe.stop.code : pre.code);
+      if (expired()) return set("STOPPED", "SESSION_DEADLINE");
+      const sessionFloor = Math.max(pre.lookupObservedAt, pre.byIdObservedAt);
+      if (hooks.afterPrecheck) await hooks.afterPrecheck(hk);
+      // ---- 6. accepted worker steps (scoped, strict executors) -------------------------------------------------------------------------
+      const env = { VERCEL_ENV: "development", MV_E7_RESERVATION_WORKER: "enabled", DIRECT_DISCOUNT_BPS: String(plan.rateBps) };
+      const workerId = `e7rb:${plan.runId}`.slice(0, 80);
+      let state = F0.intent.status; let waitUntil = null;
+      for (let i = 1; i <= LIMITS.maxSteps && state !== "reservation_confirmed"; i++) {
+        while (waitUntil !== null && clock() < waitUntil) { if (expired()) return set("STOPPED", "SESSION_DEADLINE"); await sleep(200); }
+        if (expired()) return set("STOPPED", "SESSION_DEADLINE");
+        if (!(await ownLockProven(lockClient))) return set("STOPPED", "LOCK_LOST");
+        if (hooks.beforeStep) await hooks.beforeStep(i, hk);
+        let r;
+        try {
+          r = await runOrchestratorStep(pools.app, { workerId, env, adapterConfig: cfg, listings: new Map([[plan.listingId, { currency: plan.currency }]]),
+            executors: ex.executors, clock, intentId: plan.intentId });
+          if (r && r.late) await r.late;                                       // late recordings settle (every executor call is bounded)
+        } catch { obs(); R.dbState = await stateOf(lockClient, plan.intentId); return set("STOPPED", "WORKER_FAILED"); }
+        obs();
+        const s2 = await stateOf(lockClient, plan.intentId);
+        R.steps.push({ step: i, status: r.status, actions: r.actions, sends: r.sends, state: s2 });
+        R.dbState = s2;
+        if (!(await audit("STEP", { step: i, status: r.status, actions: r.actions, sends: r.sends, state: s2, gets: ex.observe.gets }))) return set("STOPPED", "AUDIT_STEP_FAILED");
+        if (r.sends !== 0) return set("STOPPED", "WORKER_SENT_WRITE");               // unreachable by construction; recorded if ever
+        if (ex.observe.stop) return set("STOPPED", ex.observe.stop.code);
+        if (r.status === "refused") return set("STOPPED", `WORKER_REFUSED_${r.code}`);
+        state = s2;
+        if (state !== "reservation_confirmed" && state !== "reservation_pending") return set("STOPPED", "STATE_CHANGED");
+        if (expired()) return set("STOPPED", "SESSION_DEADLINE");
+        const wait = r.status === "idle" ? WORKER_LIMITS.waitMs : Number.isSafeInteger(r.delayMs) && r.delayMs > 0 ? r.delayMs : 0;
+        if (wait > LIMITS.maxWaitMs) return set("STOPPED", "WAIT_TOO_LONG");
+        waitUntil = wait > 0 ? clock() + wait : null;
+      }
+      if (state !== "reservation_confirmed") return set("STOPPED", "STEP_BUDGET_EXHAUSTED");
+      if (hooks.afterReconciled) await hooks.afterReconciled(hk);
+      // ---- 7. FINAL paired readback (after the DB reconciliation) + DB re-read ------------------------------------------------------------
+      if (expired()) return set("STOPPED", "SESSION_DEADLINE");
+      const fin = await pairedRead(ex, cfg, plan, clock); obs();
+      R.final = fin;
+      if (!(await audit("FINAL_READ", fin))) return set("STOPPED", "AUDIT_FINAL_FAILED");
+      if (expired()) return set("STOPPED", "SESSION_DEADLINE_AFTER_FINAL_READ");
+      const F1 = await factsOf(lockClient, plan.intentId); const ex1 = await exclusionOf(lockClient, plan.intentId);
+      if (hooks.afterFinalDb) await hooks.afterFinalDb(hk);
+      R.dbState = F1.intent ? F1.intent.status : null;
+      R.exclusionAfter = ex1.i === ex0.i && ex1.o === ex0.o ? "equal" : "changed";
+      R.dbEvidence = freeze({ byRefSessionFresh: F1.evid.some((e) => e.op_type === "hostaway.lookup_reservation" && e.status === "found_active" && ms(e.observed_at) >= sessionFloor),
+        byIdSessionFresh: F1.evid.some((e) => e.op_type === "hostaway.retrieve_reservation" && e.status === "found_active" && ms(e.observed_at) >= sessionFloor) });
+      R.liveEffects = freeze({ hostawayReservation: fin.ok ? "active_at_final_readback" : "unverified", stripeAuthorization: "held_per_db_not_observed",
+        claim: F1.claims === 1 ? "held" : `unexpected_${F1.claims}` });
+      R.queuedEffects = F1.ops.filter((o) => o.op_type !== "hostaway.create_reservation" && WRITE_OP_TYPES.includes(o.op_type))
+        .map((o) => ({ opType: o.op_type, state: o.state, attempts: o.attempts, dispatched: !!o.dispatched_at }));
+      if (expired()) return set("STOPPED", "SESSION_DEADLINE_AFTER_FINAL_DB");
+      if (!fin.ok) return set("STOPPED", `FINAL_${ex.observe.stop ? ex.observe.stop.code : fin.code}`);
+      if (!(fin.lookupObservedAt > sessionFloor && fin.byIdObservedAt > sessionFloor)) return set("STOPPED", "FINAL_NOT_AFTER_SESSION_FLOOR");
+      const fc = finalCheck(F1, plan);
+      if (fc) return set("STOPPED", fc);
+      if (R.exclusionAfter !== "equal") return set("STOPPED", "EXCLUSION_CHANGED");
+      if (!(await ownLockProven(lockClient))) return set("STOPPED", "LOCK_LOST");
+      if (expired()) return set("STOPPED", "SESSION_DEADLINE_BEFORE_SUCCESS");
+      R.cleanup = "REQUIRES_OWN_PLAN_AND_FRESH_PROOFS";                               // never "safe to clean"
+      return set("RECONCILED_CONFIRMED", null);
+    })();
+  } catch {
+    outcome = outcome === "RECONCILED_CONFIRMED" ? "STOPPED" : outcome; code = "INTERNAL_EXCEPTION";
+    try { if (lockClient) R.dbState = await stateOf(lockClient, R.intentId); } catch { /* reported as is */ }
+  } finally {
     obs();
-    const s2 = await stateOf(lockClient, plan.intentId);
-    R.steps.push({ step: i, status: r.status, actions: r.actions, sends: r.sends, state: s2 });
-    await J.append("STEP", clock(), { step: i, status: r.status, actions: r.actions, sends: r.sends, state: s2, gets: ex.observe.gets });
-    if (r.sends !== 0) { R.dbState = s2; return finish("STOPPED", "WORKER_SENT_WRITE"); }            // unreachable by construction; recorded if ever
-    if (ex.observe.stop) { R.dbState = s2; return finish("STOPPED", ex.observe.stop.code); }
-    if (r.status === "refused") { R.dbState = s2; return finish("STOPPED", `WORKER_REFUSED_${r.code}`); }
-    state = s2;
-    if (state !== "reservation_confirmed" && state !== "reservation_pending") { R.dbState = state; return finish("STOPPED", "STATE_CHANGED"); }
-    const wait = r.status === "idle" ? WORKER_LIMITS.waitMs : Number.isSafeInteger(r.delayMs) && r.delayMs > 0 ? r.delayMs : 0;
-    if (wait > LIMITS.maxWaitMs) { R.dbState = state; return finish("STOPPED", "WAIT_TOO_LONG"); }
-    waitUntil = wait > 0 ? clock() + wait : null;
+    // (a) terminal record — a failed terminal append can never leave a success
+    if (J) {
+      const ok = await audit(outcome === "RECONCILED_CONFIRMED" ? "ENDED" : outcome, { code });
+      if (!ok && outcome === "RECONCILED_CONFIRMED") { outcome = "STOPPED"; code = "TERMINAL_JOURNAL_FAILED"; }
+      if (R.audit !== "complete" && outcome === "RECONCILED_CONFIRMED") { outcome = "STOPPED"; code = "AUDIT_INCOMPLETE"; }
+    }
+    if (outcome !== "RECONCILED_CONFIRMED") R.cleanup = "NOT_HANDED_OFF";
+    // (b) lock release — checked; on failure / exception the connection is destroyed (server drops session locks) and that is reported
+    if (lockClient) {
+      if (lockAcquired) {
+        let released = false;
+        try { released = (await lockClient.query("SELECT pg_advisory_unlock(pg_catalog.hashtext($1), 0) AS ok", [LOCK_KEY])).rows[0]?.ok === true; } catch { released = false; }
+        if (released) { R.lock = "released"; try { lockClient.release(); } catch { /* */ } }
+        else { R.lock = "unlock_failed_connection_destroyed"; try { lockClient.release(true); } catch { /* */ } }
+      } else { try { lockClient.release(); } catch { /* */ } }
+      if (onLockErr && typeof lockClient.removeListener === "function") lockClient.removeListener("error", onLockErr);
+      lockClient = null;
+    }
+    // (c) journal close
+    if (J) { R.journalHead = J.head(); try { await J.close(); } catch { /* */ } }
+    R.elapsedMs = Math.round(mono() - t0);
   }
-  if (state !== "reservation_confirmed") { R.dbState = state; return finish("STOPPED", "STEP_BUDGET_EXHAUSTED"); }
-  if (hooks.afterReconciled) await hooks.afterReconciled();
-  // ---- 7. FINAL paired readback (after the DB reconciliation) + DB re-read --------------------------------------------------------------
-  if (overBudget()) { R.dbState = state; return finish("STOPPED", "SESSION_BUDGET_EXHAUSTED"); }
-  const fin = await pairedRead(ex, cfg, plan, clock); obs();
-  R.final = fin;
-  await J.append("FINAL_READ", clock(), fin);
-  let F1; let ex1;
-  try { F1 = await facts(); ex1 = await exclusion(); } catch { R.dbState = state; return finish("STOPPED", "FINAL_DB_READ_FAILED"); }
-  R.dbState = F1.intent ? F1.intent.status : null;
-  R.exclusionAfter = ex1.i === ex0.i && ex1.o === ex0.o ? "equal" : "changed";
-  R.dbEvidence = freeze({ byRefSessionFresh: F1.evid.some((e) => e.op_type === "hostaway.lookup_reservation" && e.status === "found_active" && ms(e.observed_at) >= sessionFloor),
-    byIdSessionFresh: F1.evid.some((e) => e.op_type === "hostaway.retrieve_reservation" && e.status === "found_active" && ms(e.observed_at) >= sessionFloor) });
-  R.liveEffects = freeze({ hostawayReservation: fin.ok ? "active_at_final_readback" : "unverified", stripeAuthorization: "held_per_db_not_observed",
-    claim: F1.claims === 1 ? "held" : `unexpected_${F1.claims}` });
-  R.queuedEffects = F1.ops.filter((o) => o.op_type !== "hostaway.create_reservation" && WRITE_OP_TYPES.includes(o.op_type))
-    .map((o) => ({ opType: o.op_type, state: o.state, attempts: o.attempts, dispatched: !!o.dispatched_at }));
-  if (!fin.ok) return finish("STOPPED", `FINAL_${ex.observe.stop ? ex.observe.stop.code : fin.code}`);
-  if (!(fin.lookupObservedAt > sessionFloor && fin.byIdObservedAt > sessionFloor)) return finish("STOPPED", "FINAL_NOT_AFTER_SESSION_FLOOR");
-  const fc = finalCheck(F1, plan);
-  if (fc) return finish("STOPPED", fc);
-  if (R.exclusionAfter !== "equal") return finish("STOPPED", "EXCLUSION_CHANGED");
-  if (!(await lockStillHeld())) return finish("STOPPED", "LOCK_LOST");
-  R.cleanup = "REQUIRES_OWN_PLAN_AND_FRESH_PROOFS";                                   // never "safe to clean"
-  return finish("RECONCILED_CONFIRMED", null);
+  R.outcome = outcome; R.code = code;
+  return freeze(structuredClone(R));
+}
+
+/** EXACT own-lock proof (accepted P3 predicate, run-lock-precheck.mjs LOCK_PRECHECK_SQL: current database, two-int4 form classid = hashtext(key)
+ *  as unsigned oid, objid 0, objsubid 2, granted) restricted to THIS session's backend pid: exactly one row. Any error → not proven. */
+export const OWN_LOCK_SQL = `${LOCK_PRECHECK_SQL} AND l.pid = pg_catalog.pg_backend_pid()`;
+async function ownLockProven(c) {
+  try { const r = await c.query(OWN_LOCK_SQL, [LOCK_KEY]); return r.rows.length === 1 && r.rows[0].n === 1; } catch { return false; }
+}
+async function factsOf(c, id) {
+  const q = (sql, p) => c.query(sql, p).then((r) => r.rows);
+  const intent = await loadIntent(c, id);
+  const ops = await q(`SELECT id::text AS id, op_type, state, attempts, result_ref, dispatched_at, completed_at, lease_until, lease_worker_id
+    FROM booking.external_operations WHERE intent_id = $1 ORDER BY created_at, id`, [id]);
+  const att = await q("SELECT id::text AS id, operation_id::text AS operation_id, state, hostaway_reservation_id FROM booking.hostaway_reservation_attempts WHERE intent_id = $1", [id]);
+  const last = (await q("SELECT version_after, event_type, event_id FROM booking.intent_transitions WHERE intent_id = $1 ORDER BY version_after DESC LIMIT 1", [id]))[0] ?? null;
+  const claims = Number((await q("SELECT count(*)::int AS n FROM booking.inventory_claims WHERE intent_id = $1 AND released_at IS NULL", [id]))[0].n);
+  const work = (await q("SELECT work_worker_id, work_lease_until FROM booking.intent_work WHERE intent_id = $1", [id]))[0] ?? null;
+  const evid = await q(`SELECT e.status, e.external_ref, e.observed_at, o.op_type FROM booking.provider_evidence e JOIN booking.external_operations o ON o.id = e.read_operation_id
+    WHERE o.intent_id = $1 AND e.kind = 'hostaway_reservation' ORDER BY e.observed_at`, [id]);
+  return { intent, ops, att, last, claims, work, evid };
+}
+async function exclusionOf(c, id) {
+  return (await c.query(`SELECT
+    (SELECT md5(coalesce(string_agg(id::text || ':' || state || ':' || version || ':' || updated_at::text, ',' ORDER BY id), '')) FROM booking.intents WHERE id <> $1) AS i,
+    (SELECT md5(coalesce(string_agg(id::text || ':' || state || ':' || attempts || ':' || coalesce(completed_at::text, '-'), ',' ORDER BY id), '')) FROM booking.external_operations WHERE intent_id <> $1) AS o`,
+  [id])).rows[0];
 }
 
 /** PURE: the accepted reader's result (readJournalForRecoveryR1) proves a terminated native run that ended INSIDE the reservation phase: chain ENDED

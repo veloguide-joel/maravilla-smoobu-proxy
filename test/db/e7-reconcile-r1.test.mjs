@@ -527,9 +527,9 @@ const assertAcquiredEnds = (line, slots) => {
 // R-B TESTS (new). The stopped native run is produced by the REAL native path (labelled fault: the confirming by-id read returns 503), exactly
 // the PR61 N2 shape. R-B then runs against the SAME disposable PG with the accepted worker and the fake provider (HTTP-level exchange through
 // the ACCEPTED Hostaway send). Calendar / attestation answers are synthetic test evidence. Nothing here is live.
-import { runReconcileR1, validatePlanR1, nativeStoppedInReservationPhase, LIMITS as RB } from "../../scripts/e7-connected/reconcile-core-r1.mjs";
+import { runReconcileR1, validatePlanR1, nativeStoppedInReservationPhase, OWN_LOCK_SQL, LIMITS as RB } from "../../scripts/e7-connected/reconcile-core-r1.mjs";
 import { createReconcileExecutorsR1 } from "../../scripts/e7-connected/reconcile-executors-r1.mjs";
-import { readReconcileJournalR1, journalName } from "../../scripts/e7-connected/reconcile-journal-r1.mjs";
+import { readReconcileJournalR1, journalName, openReconcileJournalR1 } from "../../scripts/e7-connected/reconcile-journal-r1.mjs";
 import { requestTestAbort } from "../../lib/booking-db/test-abort.js";
 import { buildAbortExpectation } from "../../scripts/e7-operator/test-abort.mjs";
 import { runCleanupStep } from "../../lib/booking-db/compensation-worker.js";
@@ -571,11 +571,15 @@ async function rb(S, o = {}) {
   const plan = o.plan ?? await planFor(S, o.over);
   const jdir = o.journalDir ?? ownerDir("rb-j-");
   const r = await runReconcileR1({ plan, pools: { app: db.app, report: reportPool }, hostawaySend: o.send ?? S.t.hostaway.send, clock: o.clock ?? (() => S.clock()),
-    monotonic: o.monotonic, journalDir: jdir, uid: process.getuid(),
+    monotonic: o.monotonic, sleep: o.sleep, journalOpen: o.journalOpen, journalDir: jdir, uid: process.getuid(),
     native: o.native ?? { packageInput: S.pk.input, journalDir: S.jd, headDir: S.hd, trustedHead: S.native.trustedHead }, hooks: o.hooks ?? {} });
   return { r, plan, jdir };
 }
 const assertNoWrite = async (S, before, label) => assert.equal(await dbSnap(S.bk.id), before, `${label}: zero DB writes`);
+const advisoryLocks = async () => Number((await one("SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory'")).n);
+/** teardown contract for every non-success: no session lock leaked, cleanup never handed off, journal ends with a terminal record when it can */
+const assertTeardown = async (r, label) => { assert.equal(await advisoryLocks(), 0, `${label}: no advisory lock left`); assert.equal(r.cleanup, "NOT_HANDED_OFF", label);
+  assert.notEqual(r.outcome, "RECONCILED_CONFIRMED", label); assert.ok(["released", "not_acquired", "unlock_failed_connection_destroyed"].includes(r.lock), `${label}: ${r.lock}`); };
 
 // ---------------------------------------------------------------------------------------------------------------------------------
 test("RB1 happy: stopped N2 shape → R-B (precheck · ≤5 accepted steps (measured 3) · FINAL paired readback after the DB change) → RECONCILED_CONFIRMED with GET-only provider calls; then the SEPARATE accepted cleanup settles both legs once", async () => {
@@ -662,7 +666,7 @@ test("RB4 cancelled / gone (404 / not found) / 503 at session start → STOPPED 
     assert.equal(r.dbState, "reservation_pending"); }
 });
 
-test("RB5 plan / identity refusals: other id, protected id, amount mismatch, wrong ref field → REFUSED in preflight with ZERO DB writes and ZERO provider calls; provider identity mismatch → STOPPED at the precheck", async () => {
+test("RB5 plan / identity refusals: other id, protected id, amount, listing, version, create op, PI → REFUSED in preflight with ZERO DB writes and ZERO provider calls; wrong ref field and provider identity mismatch → STOPPED at the precheck with zero DB writes", async () => {
   const S = await stoppedRun();
   const before = await dbSnap(S.bk.id); const g0 = S.t.x.log.length;
   for (const [over, code] of [[{ reservationId: "999999991" }, "CREATE_RESULT_REF_MISMATCH"], [{ reservationId: "71072615" }, "PLAN_RESERVATION_PROTECTED"],
@@ -672,6 +676,9 @@ test("RB5 plan / identity refusals: other id, protected id, amount mismatch, wro
     assert.deepEqual([r.outcome, r.code], ["REFUSED", code], JSON.stringify(over));
   }
   assert.equal(S.t.x.log.length, g0, "no provider call on any refusal"); await assertNoWrite(S, before, "RB5");
+  // wrong ref custom-field id in the plan → the lookup cannot see our ref on the reservation → STOPPED at the precheck, zero DB writes
+  { const { r } = await rb(S, { over: { refFieldId: REF_FIELD + 1 } });
+    assert.deepEqual([r.outcome, r.code, r.steps.length], ["STOPPED", "LOOKUP_NOT_FOUND", 0], JSON.stringify(r)); await assertNoWrite(S, before, "RB5 wrong ref field"); }
   // provider total differs from the intent → STOPPED at the precheck (never adopted)
   const rid = [...S.w.res.keys()][0]; S.w.res.get(rid).totalPrice += 1;
   const { r } = await rb(S);
@@ -693,8 +700,8 @@ test("RB6 other lineages are REFUSED with ZERO writes: ambiguous create (applied
   { const S = await launch(); const line = await S.run(); S.native = line.result.run;            // ENDED_RELEASED (echo path): not a stopped run
     assert.equal(S.native.outcome, "ENDED_RELEASED");
     const before = await dbSnap(S.bk.id);
-    const { r } = await rb(S, { plan: await planFor(S).catch(() => null) ?? undefined }).catch((e) => ({ r: { outcome: "REFUSED", code: String(e) } }));
-    assert.equal(r.outcome, "REFUSED"); await assertNoWrite(S, before, "ended"); }
+    const { r } = await rb(S);                                                   // no catch-all: a thrown error fails the test
+    assert.deepEqual([r.outcome, r.code, r.gets], ["REFUSED", "NATIVE_RUN_NOT_PROVEN_STOPPED", 0], JSON.stringify(r)); await assertNoWrite(S, before, "ended"); }
 });
 
 test("RB7 native journal is validated READ-ONLY from disk (never a caller boolean): wrong trusted head / wrong native run id / missing dirs → REFUSED, zero writes", async () => {
@@ -738,11 +745,23 @@ test("RB8 exclusion: native-run lock held → REFUSED; two concurrent R-B sessio
 
 test("RB9 cross-runner (hosted runner A's REAL operator path, requestTestAbort): NOT excluded by the native lock (runner A takes none). Before reconciliation its state fence refuses; after it, an abort racing the FINAL check is detected → STOPPED FINAL_STATE_CHANGED, never success", async () => {
   { const S = await stoppedRun();
-    let refused = null;
-    const { r } = await rb(S, { hooks: { afterPrecheck: async () => {
+    let refused = null; let snapBefore = null; let snapAfter = null;
+    const { r, plan } = await rb(S, { hooks: { afterPrecheck: async () => {
       const i = await loadIntent(db.app, S.bk.id);
-      refused = await requestTestAbort(db.app, i.id, { now: S.clock(), env: ENV_ABORT, operator: { intentId: i.id, expectedVersion: i.version } }); } } });
-    assert.equal(refused.ok, false, "operator refuses a reservation_pending intent"); assert.equal(r.outcome, "RECONCILED_CONFIRMED", JSON.stringify(r)); }
+      const co = (await all("SELECT result_ref, payload FROM booking.external_operations WHERE intent_id = $1 AND op_type = 'stripe.create_checkout_session' AND state = 'succeeded'", [S.bk.id]))[0];
+      const c = (await opsAll(S.bk.id)).find((o) => o.op_type === "hostaway.create_reservation");
+      // a FULLY VALID bound expectation (all 15 keys, validated by bindAbortExpectation) — so only the operator's STATE fence can refuse
+      const e = buildAbortExpectation({ intentId: i.id, expectedVersion: i.version, listingId: i.listingId, from: i.from, to: i.to, guests: i.guests, currency: "USD",
+        finalTotalMinor: i.price.finalTotalMinor, authorizedMinor: i.payment.amountMinor, paymentIntentId: i.payment.paymentIntentId, sessionId: co.result_ref,
+        attemptId: co.payload.paymentAttemptId, reservationId: c.result_ref, approvalRef: "rb-test-pending" });
+      snapBefore = await dbSnap(S.bk.id);
+      refused = await requestTestAbort(db.app, i.id, { now: S.clock(), env: ENV_ABORT, operator: e });
+      snapAfter = await dbSnap(S.bk.id); } } });
+    assert.equal(refused.ok, false); assert.notEqual(refused.error, "TEST_ABORT_EXPECTATION_INVALID", "the expectation itself was valid");
+    S.rb9Refusal = refused.error;
+    assert.ok(/STALE|STATE|RESERVATION|NOT_CONFIRMED|IDENTITY|ILLEGAL_TRANSITION/.test(refused.error), `a genuine state refusal: ${refused.error}`);
+    assert.equal(snapAfter, snapBefore, "the refused operator call changed nothing");
+    assert.equal(r.outcome, "RECONCILED_CONFIRMED", JSON.stringify(r)); assert.ok(plan); }
   { const S = await stoppedRun();
     let ab = null;
     const { r } = await rb(S, { hooks: { afterReconciled: async () => {
@@ -768,7 +787,7 @@ test("RB10 lost / failed postcheck and budgets: final by-id 503 → STOPPED, no 
   }
   { const S = await stoppedRun(); let m = 0;
     const { r } = await rb(S, { monotonic: () => (m += 100_000) });
-    assert.deepEqual([r.outcome, r.code], ["STOPPED", "SESSION_BUDGET_EXHAUSTED"], JSON.stringify(r)); }
+    assert.deepEqual([r.outcome, r.code], ["STOPPED", "SESSION_DEADLINE"], JSON.stringify(r)); await assertTeardown(r, "budget"); }
 });
 
 test("RB11 executor containment (unit): create / pricing / any other path, query, method or cursor shape refuses BEFORE the transport; GET cap; first non-200 sets stop", async () => {
@@ -776,7 +795,7 @@ test("RB11 executor containment (unit): create / pricing / any other path, query
   assert.deepEqual([EX.LOOKUP_PAGE_LIMIT, EX.DIRECT_CHANNEL_ID], [AD.LOOKUP_PAGE_LIMIT, AD.DIRECT_CHANNEL_ID], "restated constants equal the adapter's");
   const calls = [];
   const send = async (req) => { calls.push(req); return { httpStatus: 200, json: { status: "success", result: [] } }; };
-  const mk = (maxGets = 5) => createReconcileExecutorsR1({ binding: { listingId: ABORT_LISTING, arrivalDate: "2027-03-07", reservationId: "5100123" }, send, maxGets });
+  const mk = (maxGets = 5) => createReconcileExecutorsR1({ binding: { listingId: ABORT_LISTING, arrivalDate: "2027-03-07", reservationId: "5100123" }, send, maxGets, remainingMs: () => 60_000 });
   const q = { listingId: ABORT_LISTING, channelId: 2000, arrivalStartDate: "2027-03-07", arrivalEndDate: "2027-03-07", limit: 100, includeResources: 1 };
   { const x = mk().executors;
     await assert.rejects(x.createReservation({ method: "POST", path: "/reservations", query: {}, body: {} }), { code: "CREATE_NOT_ALLOWED" });
@@ -799,7 +818,7 @@ test("RB11 executor containment (unit): create / pricing / any other path, query
     assert.deepEqual(calls.at(-1), { method: "GET", path: "/v1/reservations", query: { ...q, afterId: 77 } }, "exact accepted wire form, cursor kept"); }
   { const m = mk(2); await m.executors.lookupPage({ method: "GET", path: "/reservations", query: q }, {}); await m.executors.retrieveReservation({ method: "GET", path: "/reservations/5100123", query: {} }, {});
     await assert.rejects(m.executors.lookupPage({ method: "GET", path: "/reservations", query: q }, {}), { code: "GET_BUDGET_EXHAUSTED" }); assert.equal(m.observe.gets, 2); }
-  { const m = createReconcileExecutorsR1({ binding: { listingId: ABORT_LISTING, arrivalDate: "2027-03-07", reservationId: "5100123" }, send: async () => ({ httpStatus: 429, json: {} }), maxGets: 5 });
+  { const m = createReconcileExecutorsR1({ binding: { listingId: ABORT_LISTING, arrivalDate: "2027-03-07", reservationId: "5100123" }, send: async () => ({ httpStatus: 429, json: {} }), maxGets: 5, remainingMs: () => 60_000 });
     await m.executors.lookupPage({ method: "GET", path: "/reservations", query: q }, {}); assert.deepEqual(m.observe.stop, { code: "RATE_LIMITED", httpStatus: 429 });
     await assert.rejects(m.executors.lookupPage({ method: "GET", path: "/reservations", query: q }, {}), { code: "SESSION_STOPPED" }); }
 });
@@ -817,4 +836,129 @@ test("RB12 native stop proof (pure, on the ACCEPTED reader's real output): the N
   for (const tweak of [(x) => { x.permission.resume = true; }, (x) => { x.chain.facts.openStep = true; }, (x) => { x.relation = "JOURNAL_AHEAD"; }]) {
     const x = structuredClone(rcS); tweak(x); assert.equal(nativeStoppedInReservationPhase(x), false);
   }
+});
+
+// =================================================================================================================================
+// ROOT HOLD (5016df0a) F1 — the audit journal is FAIL-CLOSED at EVERY boundary
+/** wraps the REAL journal: the append of `failType` (n-th occurrence) returns a failure; the real journal then latches (we close it) */
+const failingJournal = (failType, nth = 1) => async (o) => {
+  const jo = await openReconcileJournalR1(o); if (!jo.ok) return jo;
+  let seen = 0; let dead = false;
+  return { ok: true, journal: { file: jo.journal.file, head: jo.journal.head, close: jo.journal.close,
+    async append(type, at, data) { if (dead) return { ok: false, code: "INJECTED_LATCHED" };
+      if (type === failType && ++seen === nth) { dead = true; return { ok: false, code: "INJECTED_FAILURE" }; }
+      return jo.journal.append(type, at, data); } } };
+};
+test("RB13 journal fail-closed at each boundary: RUN_STARTED / NATIVE_VALIDATED / PREFLIGHT_OK / PRECHECK stop BEFORE any worker step with zero DB writes; STEP / FINAL_READ / terminal never yield success; audit reported incomplete; lock released", async () => {
+  for (const [type, outcome, code, steps0] of [["RUN_STARTED", "REFUSED", "AUDIT_RUN_STARTED_FAILED", true], ["NATIVE_VALIDATED", "REFUSED", "AUDIT_NATIVE_VALIDATED_FAILED", true],
+    ["PREFLIGHT_OK", "STOPPED", "AUDIT_PREFLIGHT_FAILED", true], ["PRECHECK", "STOPPED", "AUDIT_PRECHECK_FAILED", true]]) {
+    const S = await stoppedRun(); const before = await dbSnap(S.bk.id);
+    const { r } = await rb(S, { journalOpen: failingJournal(type) });
+    assert.deepEqual([r.outcome, r.code, r.steps.length], [outcome, code, 0], `${type}: ${JSON.stringify(r)}`);
+    assert.ok(r.audit.startsWith(`incomplete:${type}:`), r.audit); await assertNoWrite(S, before, type); await assertTeardown(r, type);
+  }
+  { const S = await stoppedRun(); const { r } = await rb(S, { journalOpen: failingJournal("STEP") });
+    assert.deepEqual([r.outcome, r.code, r.steps.length], ["STOPPED", "AUDIT_STEP_FAILED", 1], JSON.stringify(r)); assert.equal(r.dbState, await state(S.bk.id)); await assertTeardown(r, "STEP"); }
+  { const S = await stoppedRun(); const { r } = await rb(S, { journalOpen: failingJournal("FINAL_READ") });
+    assert.deepEqual([r.outcome, r.code, r.dbState], ["STOPPED", "AUDIT_FINAL_FAILED", "reservation_confirmed"], JSON.stringify(r)); await assertTeardown(r, "FINAL"); }
+  { const S = await stoppedRun(); const { r } = await rb(S, { journalOpen: failingJournal("ENDED") });
+    assert.deepEqual([r.outcome, r.code, r.dbState, r.cleanup], ["STOPPED", "TERMINAL_JOURNAL_FAILED", "reservation_confirmed", "NOT_HANDED_OFF"], JSON.stringify(r));
+    assert.ok(r.audit.startsWith("incomplete:ENDED:")); await assertTeardown(r, "terminal"); }
+});
+
+test("RB13b ROOT's exact fault: fsync throws on PREFLIGHT_OK (after RUN_STARTED / NATIVE_VALIDATED) → STOPPED before any worker step, zero DB writes; pure journal: zero-progress write / throwing fsync never acknowledged, partial writes complete correctly", async () => {
+  { const S = await stoppedRun(); const before = await dbSnap(S.bk.id);
+    let syncs = 0;
+    const journalOpen = (o) => openReconcileJournalR1({ ...o, openHandle: async (...a) => { const fh = await (await import("node:fs/promises")).open(...a);
+      return { write: (...w) => fh.write(...w), stat: () => fh.stat(), close: () => fh.close(), sync: async () => { syncs += 1; if (syncs === 3) throw new Error("EIO (injected)"); return fh.sync(); } }; } });
+    const { r } = await rb(S, { journalOpen });
+    assert.deepEqual([r.outcome, r.code, r.steps.length], ["STOPPED", "AUDIT_PREFLIGHT_FAILED", 0], JSON.stringify(r));
+    assert.ok(r.audit.startsWith("incomplete:PREFLIGHT_OK:JOURNAL_SYNC_FAILED"), r.audit); await assertNoWrite(S, before, "fsync"); await assertTeardown(r, "fsync"); }
+  const fsp = await import("node:fs/promises");
+  const mkJ = async (wrap) => { const d = ownerDir("rb-pj-"); return openReconcileJournalR1({ dir: d, runId: `pure-${Math.random().toString(36).slice(2, 10)}`, uid: process.getuid(),
+    openHandle: async (...a) => { const fh = await fsp.open(...a); return wrap(fh); } }); };
+  { const jo = await mkJ((fh) => ({ write: async () => ({ bytesWritten: 0 }), sync: () => fh.sync(), stat: () => fh.stat(), close: () => fh.close() }));
+    const a = await jo.journal.append("X", 1, {});
+    assert.deepEqual([a.ok, a.code, jo.journal.head().seq], [false, "JOURNAL_WRITE_NO_PROGRESS", 0], "zero progress is never acknowledged");
+    assert.equal((await jo.journal.append("Y", 2, {})).code, "JOURNAL_WRITE_NO_PROGRESS", "latched");
+    assert.equal((await fsp.stat(jo.journal.file)).size, 0); await jo.journal.close(); }
+  { const jo = await mkJ((fh) => ({ write: async () => { throw new Error("EIO"); }, sync: () => fh.sync(), stat: () => fh.stat(), close: () => fh.close() }));
+    assert.deepEqual([(await jo.journal.append("X", 1, {})).code, jo.journal.head().seq], ["JOURNAL_WRITE_FAILED", 0]); await jo.journal.close(); }
+  { const jo = await mkJ((fh) => ({ write: (b, off, len) => fh.write(b, off, Math.min(len, 7)), sync: () => fh.sync(), stat: () => fh.stat(), close: () => fh.close() }));
+    for (let i = 0; i < 3; i++) assert.equal((await jo.journal.append("P", i, { i, pad: "x".repeat(50) })).ok, true);
+    await jo.journal.close(); const rj = await readReconcileJournalR1(jo.journal.file);
+    assert.deepEqual([rj.ok, rj.records.length], [true, 3], "7-byte partial writes still produce the full chained lines"); }
+  { const jo = await mkJ((fh) => ({ write: (b, off, len) => fh.write(b, off, len), sync: async () => { throw new Error("EIO"); }, stat: () => fh.stat(), close: () => fh.close() }));
+    assert.deepEqual([(await jo.journal.append("X", 1, {})).code, jo.journal.head().seq], ["JOURNAL_SYNC_FAILED", 0]); await jo.journal.close(); }
+  { const jo = await mkJ((fh) => ({ write: async (b, off, len) => ({ bytesWritten: len + 5 }), sync: () => fh.sync(), stat: () => fh.stat(), close: () => fh.close() }));
+    assert.equal((await jo.journal.append("X", 1, {})).code, "JOURNAL_WRITE_OVER_PROGRESS"); await jo.journal.close(); }
+});
+
+// ROOT HOLD F2 — EXACT own-lock proof
+test("RB14 exact lock: ROOT's case (own LOCK_KEY unlocked then an UNRELATED lock taken on the SAME session) → STOPPED LOCK_LOST before any worker step; wrong form / key / other session never prove it; hook / connection / query exceptions leak no lock", async () => {
+  { const S = await stoppedRun(); const before = await dbSnap(S.bk.id);
+    const { r } = await rb(S, { hooks: { afterPrecheck: async (h) => {
+      await h.lockQuery("SELECT pg_advisory_unlock(pg_catalog.hashtext($1), 0)", [LOCK_KEY]); await h.lockQuery("SELECT pg_advisory_lock(123, 456)"); } } });
+    assert.deepEqual([r.outcome, r.code, r.steps.length, r.lock], ["STOPPED", "LOCK_LOST", 0, "unlock_failed_connection_destroyed"], JSON.stringify(r));
+    await assertNoWrite(S, before, "lock lost"); await assertTeardown(r, "lost+unrelated"); }
+  // the predicate itself: only THIS session's exact two-int4 (hashtext(key), 0) lock in THIS database counts
+  { const a = await reportPool.connect(); const b = await reportPool.connect();
+    const n = async (c) => (await c.query(OWN_LOCK_SQL, [LOCK_KEY])).rows[0].n;
+    await a.query("SELECT pg_advisory_lock(pg_catalog.hashtext($1)::bigint)", [LOCK_KEY]); assert.equal(await n(a), 0, "single-int8 form is not it");
+    await a.query("SELECT pg_advisory_unlock(pg_catalog.hashtext($1)::bigint)", [LOCK_KEY]);
+    await a.query("SELECT pg_advisory_lock(pg_catalog.hashtext('other-key'), 0)"); assert.equal(await n(a), 0, "another key is not it");
+    await a.query("SELECT pg_advisory_unlock(pg_catalog.hashtext('other-key'), 0)");
+    await a.query("SELECT pg_advisory_lock(pg_catalog.hashtext($1), 1)", [LOCK_KEY]); assert.equal(await n(a), 0, "objid ≠ 0 is not it");
+    await a.query("SELECT pg_advisory_unlock(pg_catalog.hashtext($1), 1)", [LOCK_KEY]);
+    await a.query("SELECT pg_advisory_lock(pg_catalog.hashtext($1), 0)", [LOCK_KEY]); assert.equal(await n(a), 1, "the exact lock on THIS session");
+    assert.equal(await n(b), 0, "another session holding it does not prove it for this one");
+    await a.query("SELECT pg_advisory_unlock(pg_catalog.hashtext($1), 0)", [LOCK_KEY]); a.release(); b.release(); }
+  // another DATABASE on the same cluster holding the exact key does not count
+  { await db.owner.query("DROP DATABASE IF EXISTS rb_otherdb"); await db.owner.query("CREATE DATABASE rb_otherdb");
+    const u = new URL(db.reportUrl()); const o = new URL(db.reportUrl()); o.pathname = "/rb_otherdb";
+    const ownerUrl = new URL(o.href); const other = new pg.Client({ connectionString: (() => { const x = new URL(db.reportUrl()); x.pathname = "/rb_otherdb"; return x.href; })() });
+    let otherOk = true; try { await other.connect(); await other.query("SELECT pg_advisory_lock(pg_catalog.hashtext($1), 0)", [LOCK_KEY]); } catch { otherOk = false; }
+    if (otherOk) { const a = await reportPool.connect(); assert.equal((await a.query(OWN_LOCK_SQL, [LOCK_KEY])).rows[0].n, 0, "another database's lock is not it"); a.release(); await other.end(); }
+    await db.owner.query("DROP DATABASE IF EXISTS rb_otherdb WITH (FORCE)"); void u; void ownerUrl;
+    assert.equal(otherOk, true, "the other-database case actually ran"); }
+  // exceptions: a throwing hook / a killed lock session / a failing connect — no leaked lock, never success
+  { const S = await stoppedRun(); const { r } = await rb(S, { hooks: { afterPrecheck: () => { throw new Error("hook boom"); } } });
+    assert.deepEqual([r.outcome, r.code], ["STOPPED", "INTERNAL_EXCEPTION"]); await assertTeardown(r, "hook"); }
+  { const S = await stoppedRun(); const { r } = await rb(S, { hooks: { afterPrecheck: async (h) => { const pid = (await h.lockQuery("SELECT pg_backend_pid() AS p")).rows[0].p;
+      await db.owner.query("SELECT pg_terminate_backend($1)", [pid]); } } });
+    assert.equal(r.outcome, "STOPPED"); assert.ok(["LOCK_LOST", "INTERNAL_EXCEPTION"].includes(r.code), r.code); await assertTeardown(r, "killed session"); }
+  { const S = await stoppedRun(); const before = await dbSnap(S.bk.id);
+    const r = await runReconcileR1({ plan: await planFor(S), pools: { app: db.app, report: { connect: async () => { throw new Error("no connection"); } } }, hostawaySend: S.t.hostaway.send,
+      clock: () => S.clock(), journalDir: ownerDir("rb-j-"), uid: process.getuid(), native: { packageInput: S.pk.input, journalDir: S.jd, headDir: S.hd, trustedHead: S.native.trustedHead } });
+    assert.deepEqual([r.outcome, r.code, r.lock], ["REFUSED", "DB_CONNECT_FAILED", "not_acquired"]); await assertNoWrite(S, before, "connect"); await assertTeardown(r, "connect"); }
+});
+
+// ROOT HOLD F3 — HARD session deadline; teardown grace is never success
+test("RB15 deadline: late FINAL completion / a never-settling, abort-ignoring reply / expiry during a wait, inside a worker step, during the final DB work → STOPPED, never success; no new call after expiry; teardown clean", async () => {
+  // (a) the final read resolves but advances the monotonic clock past the session budget → no success
+  { const S = await stoppedRun(); let m = 0; let jump = false;
+    const send = async (req, o) => { const rep = await S.t.hostaway.send(req, o); if (jump) m = RB.sessionBudgetMs + 60_000; return rep; };
+    const { r } = await rb(S, { send, monotonic: () => m, hooks: { afterReconciled: () => { jump = true; } } });
+    assert.deepEqual([r.outcome, r.code, r.dbState], ["STOPPED", "SESSION_DEADLINE_AFTER_FINAL_READ", "reservation_confirmed"], JSON.stringify(r));
+    assert.ok(r.final === null || r.final.ok === false || r.elapsedMs > RB.sessionBudgetMs); await assertTeardown(r, "late final"); }
+  // (b) a reply that never settles and ignores the abort → bounded by the per-call bound; dropped; STOPPED before any worker step
+  { const S = await stoppedRun(); const before = await dbSnap(S.bk.id); let n = 0;
+    const send = (req, o) => { n += 1; if (/\/reservations\/\d+$/.test(req.path)) return new Promise(() => {}); return S.t.hostaway.send(req, o); };
+    const t0 = Date.now(); const { r } = await rb(S, { send });
+    assert.deepEqual([r.outcome, r.code, r.steps.length], ["STOPPED", "CALL_TIMEOUT", 0], JSON.stringify(r));
+    assert.ok(Date.now() - t0 < RB.callTimeoutMs + 5_000, "bounded by the per-call bound"); await assertNoWrite(S, before, "never settles"); await assertTeardown(r, "never settles"); void n; }
+  // (c) expiry during the wait between worker steps → STOPPED, no further step
+  { const S = await stoppedRun(); let m = 0;
+    const { r } = await rb(S, { monotonic: () => m, sleep: async () => { m = RB.sessionBudgetMs + 1; } });
+    assert.deepEqual([r.outcome, r.code, r.steps.length], ["STOPPED", "SESSION_DEADLINE", 1], JSON.stringify(r)); await assertTeardown(r, "wait"); }
+  // (d) expiry inside a worker step (during its provider read) → that step is awaited (teardown grace), then STOPPED; no new call / step
+  { const S = await stoppedRun(); let m = 0; let inStep = false; const calls = [];
+    const send = async (req, o) => { calls.push({ path: req.path, inStep, m }); if (inStep && /\/reservations\/\d+$/.test(req.path)) m = RB.sessionBudgetMs + 1; return S.t.hostaway.send(req, o); };
+    const { r } = await rb(S, { send, monotonic: () => m, hooks: { beforeStep: (i) => { inStep = i === 2; } } });
+    assert.deepEqual([r.outcome, r.code], ["STOPPED", "SESSION_DEADLINE"], JSON.stringify(r));
+    assert.equal(calls.filter((c) => c.m > RB.sessionBudgetMs).length, 0, "no GET started after expiry"); await assertTeardown(r, "in step"); }
+  // (e) expiry during the final DB work → STOPPED
+  { const S = await stoppedRun(); let m = 0;
+    const { r } = await rb(S, { monotonic: () => m, hooks: { afterFinalDb: () => { m = RB.sessionBudgetMs + 1; } } });
+    assert.deepEqual([r.outcome, r.code, r.dbState], ["STOPPED", "SESSION_DEADLINE_AFTER_FINAL_DB", "reservation_confirmed"], JSON.stringify(r)); await assertTeardown(r, "final db"); }
 });
