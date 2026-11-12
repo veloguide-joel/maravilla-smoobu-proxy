@@ -263,15 +263,23 @@ export async function runReconcileR1(opts = {}) {
     if (expired()) downgrade("SESSION_DEADLINE_AT_RELEASE");
     if (outcome !== "RECONCILED_CONFIRMED") R.cleanup = "NOT_HANDED_OFF";
     // (c) TEARDOWN record (final outcome + lock disposition) then close — both bounded
+    // The journal's LAST durable outcome must equal the returned outcome, or the audit is explicitly incomplete (DOWNGRADE_NOT_JOURNALED).
+    let journaled = null;                                                      // { outcome, code } of the last durable TEARDOWN / DOWNGRADED record
     if (J) {
-      if (!(await audit("TEARDOWN", { outcome, code, lock: R.lock }))) downgrade("TEARDOWN_JOURNAL_FAILED");
+      if (await audit("TEARDOWN", { outcome, code, lock: R.lock })) journaled = { outcome, code };
+      else downgrade("TEARDOWN_JOURNAL_FAILED");
       if (expired()) downgrade("SESSION_DEADLINE_AT_TEARDOWN_RECORD");
+      // ONE bounded corrective record while still writable (no retry loop; history is never edited or erased)
+      if (journaled && (journaled.outcome !== outcome || journaled.code !== code)) {
+        if (await audit("DOWNGRADED", { outcome, code, supersedes: journaled.outcome })) journaled = { outcome, code };
+      }
       R.journalHead = J.head();
       const c = await bounded(J.close(), LIMITS.teardownGraceMs);
-      if (!c.done || c.threw) downgrade("JOURNAL_CLOSE_FAILED");
+      if (!c.done || c.threw) downgrade("JOURNAL_CLOSE_FAILED");             // after close is attempted nothing more is journalled
     }
-    if (expired() && outcome === "RECONCILED_CONFIRMED") {                       // nothing left to journal into: an HONEST unjournalled downgrade
-      downgrade("SESSION_DEADLINE_AFTER_CLOSE"); R.audit = "incomplete:AFTER_CLOSE:DOWNGRADE_NOT_JOURNALED";
+    if (expired()) downgrade("SESSION_DEADLINE_AFTER_CLOSE");
+    if (J && R.audit === "complete" && !(journaled && journaled.outcome === outcome && journaled.code === code)) {
+      R.audit = `incomplete:${journaled ? "FINAL" : "TEARDOWN"}:DOWNGRADE_NOT_JOURNALED`;
     }
     if (outcome !== "RECONCILED_CONFIRMED") R.cleanup = "NOT_HANDED_OFF";
     R.elapsedMs = Math.round(mono() - t0);

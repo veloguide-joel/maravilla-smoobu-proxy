@@ -974,6 +974,14 @@ const tapJournal = (tap) => async (o) => {
     async append(type, at, data) { if (tap.before) { const x = await tap.before(type); if (x === "HANG") return new Promise(() => {}); }
       const r = await j.append(type, at, data); await tap.after?.(type); return r; } } };
 };
+/** ROOT-U contract: the audit is complete ONLY if the journal's last durable outcome record equals the returned outcome + code */
+const assertAuditAgrees = async (r, jdir, plan, label) => {
+  const j = await readReconcileJournalR1(`${jdir}/${journalName(plan.runId)}`); assert.equal(j.ok, true, `${label}: journal chain intact`);
+  const last = [...j.records].reverse().find((x) => x.type === "TEARDOWN" || x.type === "DOWNGRADED");
+  assert.ok(r.audit !== "complete" || (last && last.data.outcome === r.outcome && last.data.code === r.code),
+    `${label}: audit ${r.audit} vs last durable outcome ${JSON.stringify(last && last.data)} / result ${r.outcome} ${r.code}`);
+  return j;
+};
 const journalText = async (jdir, plan) => (await import("node:fs/promises")).readFile(`${jdir}/${journalName(plan.runId)}`, "utf8");
 test("RB16 terminal / teardown deadline: expiry when ENDED returns (ROOT's repro) / during a delayed terminal fsync / at the TEARDOWN record / at close / a HUNG terminal append → STOPPED, history kept (ENDED is provisional, TEARDOWN records the real outcome), lock released, bounded", async () => {
   // (a) ROOT's exact repro: all monotonic values 0 until the REAL ENDED append returns, then 300000
@@ -983,6 +991,7 @@ test("RB16 terminal / teardown deadline: expiry when ENDED returns (ROOT's repro
     const j = await readReconcileJournalR1(`${jdir}/${journalName(plan.runId)}`); assert.equal(j.ok, true);
     assert.deepEqual(j.records.slice(-2).map((x) => [x.type, x.data.provisional ?? null, x.data.outcome ?? null, x.data.code ?? null]),
       [["ENDED", true, null, null], ["TEARDOWN", null, "STOPPED", "SESSION_DEADLINE_AT_TERMINAL"]], "history kept; the provisional ENDED is followed by the honest outcome");
+    await assertAuditAgrees(r, jdir, plan, "at terminal");
     await assertTeardown(r, "at terminal"); }
   // (b) the terminal fsync is DELAYED (1.5 s real) and the deadline passes during it
   { const S = await stoppedRun(); let m = 0; const fsp = await import("node:fs/promises"); let armed = false;
@@ -991,12 +1000,28 @@ test("RB16 terminal / teardown deadline: expiry when ENDED returns (ROOT's repro
     const { r } = await rb(S, { monotonic: () => m, journalOpen });
     assert.deepEqual([r.outcome, r.code], ["STOPPED", "SESSION_DEADLINE_AT_TERMINAL"], JSON.stringify(r)); await assertTeardown(r, "delayed fsync"); }
   // (c) expiry at the TEARDOWN record and (d) at close — after close there is nowhere to journal: an HONEST unjournalled downgrade
+  // (c) ROOT-U: expiry after a SUCCESSFUL TEARDOWN append → ONE corrective DOWNGRADED record; result and journal agree; history kept
   { const S = await stoppedRun(); let m = 0;
-    const { r } = await rb(S, { monotonic: () => m, journalOpen: tapJournal({ after: (t) => { if (t === "TEARDOWN") m = 300_000; } }) });
-    assert.deepEqual([r.outcome, r.code], ["STOPPED", "SESSION_DEADLINE_AT_TEARDOWN_RECORD"], JSON.stringify(r)); await assertTeardown(r, "teardown record"); }
+    const { r, plan, jdir } = await rb(S, { monotonic: () => m, journalOpen: tapJournal({ after: (t) => { if (t === "TEARDOWN") m = 300_000; } }) });
+    assert.deepEqual([r.outcome, r.code, r.audit], ["STOPPED", "SESSION_DEADLINE_AT_TEARDOWN_RECORD", "complete"], JSON.stringify(r));
+    const j = await assertAuditAgrees(r, jdir, plan, "teardown record");
+    assert.deepEqual(j.records.slice(-3).map((x) => [x.type, x.data.outcome ?? null]), [["ENDED", null], ["TEARDOWN", "RECONCILED_CONFIRMED"], ["DOWNGRADED", "STOPPED"]]);
+    assert.equal(j.records.at(-1).data.supersedes, "RECONCILED_CONFIRMED"); await assertTeardown(r, "teardown record"); }
+  // (c2) the corrective append itself fails → explicit incomplete; old TEARDOWN kept
   { const S = await stoppedRun(); let m = 0;
-    const { r } = await rb(S, { monotonic: () => m, journalOpen: tapJournal({ beforeClose: () => { m = 300_000; } }) });
-    assert.deepEqual([r.outcome, r.code, r.audit], ["STOPPED", "SESSION_DEADLINE_AFTER_CLOSE", "incomplete:AFTER_CLOSE:DOWNGRADE_NOT_JOURNALED"], JSON.stringify(r)); await assertTeardown(r, "close"); }
+    const { r, plan, jdir } = await rb(S, { monotonic: () => m, journalOpen: tapJournal({ after: (t) => { if (t === "TEARDOWN") m = 300_000; }, before: (t) => (t === "DOWNGRADED" ? "HANG" : null) }) });
+    assert.deepEqual([r.outcome, r.code, r.audit], ["STOPPED", "SESSION_DEADLINE_AT_TEARDOWN_RECORD", "incomplete:DOWNGRADED:JOURNAL_APPEND_TIMEOUT"], JSON.stringify(r));
+    await assertAuditAgrees(r, jdir, plan, "corrective hung"); await assertTeardown(r, "corrective hung"); }
+  // (d) expiry at close / close THROWS / close HANGS after a successful TEARDOWN → nothing more can be journalled: explicit DOWNGRADE_NOT_JOURNALED
+  for (const [label, tap, codeX] of [["close deadline", (S, set) => ({ beforeClose: () => set() }), "SESSION_DEADLINE_AFTER_CLOSE"],
+      ["close throws", () => ({ beforeClose: () => { throw new Error("EIO close"); } }), "JOURNAL_CLOSE_FAILED"],
+      ["close hangs", () => ({ beforeClose: () => new Promise(() => {}) }), "JOURNAL_CLOSE_FAILED"]]) {
+    const S = await stoppedRun(); let m = 0;
+    const { r, plan, jdir } = await rb(S, { monotonic: () => m, journalOpen: tapJournal(tap(S, () => { m = 300_000; })) });
+    assert.deepEqual([r.outcome, r.code, r.audit], ["STOPPED", codeX, "incomplete:FINAL:DOWNGRADE_NOT_JOURNALED"], `${label}: ${JSON.stringify(r)}`);
+    const j = await assertAuditAgrees(r, jdir, plan, label);
+    assert.deepEqual([j.records.at(-1).type, j.records.at(-1).data.outcome], ["TEARDOWN", "RECONCILED_CONFIRMED"], `${label}: old history kept, not edited`);
+    await assertTeardown(r, label); }
   // (e) expiry during the UNLOCK query (the report session wrapped) → STOPPED at release
   { const S = await stoppedRun(); let m = 0;
     const report = { connect: async () => { const c = await reportPool.connect(); const q = c.query.bind(c);
