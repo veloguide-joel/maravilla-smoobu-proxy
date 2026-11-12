@@ -8,7 +8,14 @@ import { readFileSync, readdirSync } from "node:fs";
 import * as J from "../scripts/e7-connected/run-journal-memory.mjs";
 import { validateGuardDeps, createGuard, isNativePromise, createLifecycle, createLedger, wrapExecutors } from "../scripts/e7-connected/run-guard.mjs";
 import { STATES } from "../lib/checkout/intent-state.js";
-import { CHECKPOINTS } from "../scripts/e7-connected/run-manifest.mjs";
+import { CHECKPOINTS, canonicalJson } from "../scripts/e7-connected/run-manifest.mjs";
+// E7-0019 integration (ROOT 5879497019): v2 / R1 readers + the accepted R1 binder, used ONLY by the refusal test at the end of this file
+import * as V2 from "../scripts/e7-connected/run-journal-memory-v2.mjs";
+import { validateRunManifestV2 } from "../scripts/e7-connected/run-manifest-v2.mjs";
+import { R1_EXECUTOR_CLOSURE } from "../scripts/e7-connected/run-binding-r1.mjs";
+import { buildRunPackageV1, sourceDigestV1, RUN_PLAN_CLOSURE, HISTORICAL_EXCLUSIONS, ALLOWED_OPS } from "../scripts/e7-connected/run-plan-v1.mjs";
+import { dirname, join, normalize } from "node:path";
+import { fileURLToPath } from "node:url";
 
 let netAttempts = 0;
 const realFetch = globalThis.fetch;
@@ -345,7 +352,14 @@ test("grammar pinned against the accepted worker sources; vocabulary parity with
     "MAINTENANCE:hostaway.create_reservation:outcome_unknown", "SEND_ABORTED:STEP_BUDGET"]) assert.equal(J.isActionToken(t), true, t);
   for (const t of ["", "RESERVATION_STARTEDX", "XRESERVATION_STARTED", "RESERVATION_STARTED->bogus", "READ:hostaway.unknown_op", "MAINTENANCE:guest.notify:done",
     "STOP:A:B:C:D", "RECOVERY:NOT_AN_EVENT", "WAIT:" + "A".repeat(49), "stop:x", "WAIT:A B", `RECOVERY:READ:${"x".repeat(150)}`]) assert.equal(J.isActionToken(t), false, `refused: ${t}`);
-  assert.deepEqual([...J.INTENT_STATES].sort(), Object.values(STATES).sort());
+  // E7-0019 (ROOT 5879497019): the frozen v1/v2/R1 journal vocabulary is BYTE-IDENTICAL; lib/checkout/intent-state.js grew exactly ONE state
+  // (STATES.TEST_CLEANUP_PENDING) that the journals do not know. EXPLICIT singleton exclusion, both directions — no wildcard, no pattern.
+  assert.equal(STATES.TEST_CLEANUP_PENDING, "test_cleanup_pending", "the constant exists with its pinned value");
+  const e3States = Object.values(STATES), jStates = [...J.INTENT_STATES];
+  assert.deepEqual(e3States.filter((s) => !jStates.includes(s)), [STATES.TEST_CLEANUP_PENDING], "intent-state minus journal = exactly the singleton");
+  assert.deepEqual(jStates.filter((s) => !e3States.includes(s)), [], "journal minus intent-state = empty");
+  assert.deepEqual(jStates.sort(), e3States.filter((s) => s !== STATES.TEST_CLEANUP_PENDING).sort());
+  assert.equal(jStates.length, 20); assert.equal(e3States.length, 21);
   const sql1 = readFileSync(new URL("../db/migrations/0001_booking_core.up.sql", import.meta.url), "utf8");
   for (const s of J.INTENT_STATES) assert.ok(sql1.includes(`'${s}'`), s);
   for (const s of J.OPERATION_STATES) assert.ok(/state IN \('pending', 'in_flight', 'succeeded', 'failed_definite',\s+'outcome_unknown', 'superseded', 'escalated'\)/.test(sql1) && sql1.includes(`'${s}'`));
@@ -473,4 +487,87 @@ test("R-D2 through the journal: a structurally incoherent terminal is refused at
   const bare = mk(); await bare.journal.append(chain([["RUN_STARTED"]])[0]);
   assert.equal(await codeOf(bare.journal.append(chain([["RUN_STARTED"], ENDED("ENDED_CONFIRMED", "confirmed")])[1])), "ORDER_INVALID", "root probe through append");
   assert.equal(bare.controls.size(), 1);
+});
+
+// =================================================================================================================================
+// E7-0019 integration (ROOT 5879497019): the v1 / v2 / R1 journal READERS and VALIDATORS still REFUSE the new intent state and every
+// refund-only action / op type / recovery event. OFFLINE; the R1 binding below is minted from a LABELLED COPY of the accepted G1/G2b
+// synthetic fixture (test/e7-connected-run-journal-r1-g2b.test.mjs:22–60) against the CURRENT repo sources (no network, no DB).
+test("E7-0019: v1 / v2 / R1 journals REFUSE test_cleanup_pending and refund-only vocabulary (frozen grammar, singleton exclusion)", () => {
+  const TCP = STATES.TEST_CLEANUP_PENDING;
+  // vocabulary: none of the refund-only tokens leaked into the frozen lists
+  assert.ok(!J.INTENT_STATES.includes(TCP));
+  for (const op of ["stripe.refund_payment_intent", "stripe.retrieve_refund"]) assert.ok(!J.OPERATION_TYPES.includes(op), op);
+  for (const ev of ["TEST_CLEANUP_REQUESTED", "REFUND_SUCCEEDED", "REFUND_OUTCOME_UNKNOWN", "REFUND_FAILED"]) { assert.ok(!J.RECOVERY_EVENTS.includes(ev), ev); assert.ok(!J.ACTION_NAMES.includes(ev), ev); }
+  assert.ok(!J.ACTION_NAMES.includes("REFUND_CLAIMED"));
+  // v1 action grammar: every refund-only / cleanup-state token is refused; the frozen neighbours stay accepted (control)
+  for (const t of [`TEST_CLEANUP_REQUESTED->${TCP}`, `REFUND_SUCCEEDED->${TCP}`, `RESERVATION_CANCELLED->${TCP}`, `CANCEL_CLAIMED->${TCP}`, "REFUND_CLAIMED", "REFUND_SUCCEEDED",
+    "RECOVERY:REFUND_SUCCEEDED", "RECOVERY:REFUND_OUTCOME_UNKNOWN", "RECOVERY:TEST_CLEANUP_REQUESTED", "RECOVERY:READ:stripe.retrieve_refund",
+    "MAINTENANCE:stripe.refund_payment_intent:outcome_unknown", "MAINTENANCE:stripe.retrieve_refund:succeeded", "READ:stripe.retrieve_refund:found",
+    "READ:stripe.retrieve_refund:not_found", "RECOVERY:ESCALATE:RESERVATION_STILL_ACTIVE_AFTER_CANCEL->" + TCP]) assert.equal(J.isActionToken(t), false, `refused: ${t}`);
+  for (const t of ["RESERVATION_CANCELLED->cancelled", "CANCEL_CLAIMED", "RECOVERY:RESERVATION_CANCELLED", "MAINTENANCE:stripe.void_payment_intent:outcome_unknown"]) assert.equal(J.isActionToken(t), true, t);
+  // v1 record validator: STEP_ENDED / PHASE_ENDED carrying the new state are RECORD_FIELD_INVALID (controls with a frozen state pass)
+  const v1 = chain(HAPPY.slice(0, 7));
+  const v1Step = v1[3], v1Phase = v1[6];
+  assert.equal(J.validateRecord(v1Step).ok, true); assert.equal(J.validateRecord(v1Phase).ok, true);
+  assert.deepEqual(J.validateRecord({ ...v1Step, state: TCP }), { ok: false, code: "RECORD_FIELD_INVALID" });
+  assert.deepEqual(J.validateRecord({ ...v1Step, phase: "cleanup", state: TCP, actions: ["CANCEL_CLAIMED"] }), { ok: false, code: "RECORD_FIELD_INVALID" });
+  assert.deepEqual(J.validateRecord({ ...v1Phase, phase: "cleanup", state: TCP }), { ok: false, code: "RECORD_FIELD_INVALID" });
+  assert.equal(J.validateRecord({ ...v1Phase, phase: "cleanup", state: "cancelled" }).ok, true, "control: frozen cleanup end state");
+  assert.deepEqual(J.validateRecord({ ...v1Step, phase: "cleanup", state: "cancelled", actions: [`TEST_CLEANUP_REQUESTED->${TCP}`] }), { ok: false, code: "ACTION_INVALID" });
+  assert.deepEqual(J.validateRecord({ ...v1Step, phase: "cleanup", state: "cancelled", actions: ["READ:stripe.retrieve_refund:found"] }), { ok: false, code: "ACTION_INVALID" });
+  // v2 reader (manifest-bound): same refusal, identity-correct control passes
+  const m2 = { version: "e7-run-manifest-v2", runId: "synthetic-run-v2-0019", intentId: "00000000-0000-4000-8000-0000000000c2", baselineCommit: "0".repeat(40),
+    synthetic: true, providerMode: { hostaway: "fake", stripe: "mock" }, listing: { id: 891001, currency: "USD", refFieldId: 777009, timeZone: "America/Mazatlan", connection: "disconnected" },
+    expectedRef: "MV-SYNTH19", stay: { arrival: "2026-12-04", departure: "2026-12-06", guests: 2 }, amountMinor: 50000, pricing: { rateBps: 1000 },
+    stripeAccountId: "acct_1SyntheticRunner", hostawayAccountLabel: { accountRef: "acct-test-1", clientSnapshotId: "client-RUN" },
+    phases: { capture: true, recording: true, testAbortAfterReservation: false }, paymentMethod: "credit_card",
+    cleanup: { reservedNotConfirmed: "synthetic/cleanup-reserved", captured: "synthetic/cleanup-captured", confirmed: "synthetic/cleanup-confirmed" },
+    automationsReviewed: "synthetic/automations", checkpoints: ["CALENDAR_BASELINE", "CALENDAR_BLOCKED", "CALENDAR_REOPENED"] };
+  const vm = validateRunManifestV2(m2); assert.equal(vm.ok, true, vm.code);
+  const id2 = { manifestVersion: "e7-run-manifest-v2", connection: "disconnected", runId: m2.runId, intentId: m2.intentId, baselineCommit: m2.baselineCommit, manifestHash: vm.hash };
+  const v2Step = { v: 2, seq: 4, prevHash: "1".repeat(64), ...id2, at: 1_700_000_000_003, event: "STEP_ENDED", ...bodies.STEP_ENDED("reservation", 1) };
+  const v2Phase = { v: 2, seq: 7, prevHash: "1".repeat(64), ...id2, at: 1_700_000_000_006, event: "PHASE_ENDED", ...bodies.PHASE_ENDED("reservation") };
+  assert.equal(V2.validateRecordV2(v2Step, m2).ok, true, "control"); assert.equal(V2.validateRecordV2(v2Phase, m2).ok, true, "control");
+  assert.deepEqual(V2.validateRecordV2({ ...v2Step, state: TCP }, m2), { ok: false, code: "RECORD_FIELD_INVALID" });
+  assert.deepEqual(V2.validateRecordV2({ ...v2Phase, phase: "cleanup", state: TCP }, m2), { ok: false, code: "RECORD_FIELD_INVALID" });
+  assert.deepEqual(V2.validateRecordV2({ ...v2Step, actions: [`REFUND_SUCCEEDED->${TCP}`] }, m2), { ok: false, code: "ACTION_INVALID" });
+  const b2 = V2.bindManifestV2(m2); assert.equal(b2.ok, true);
+  assert.deepEqual(V2.validateRecordBound({ ...v2Step, state: TCP }, b2.binding), { ok: false, code: "RECORD_FIELD_INVALID" });
+  assert.deepEqual(V2.journalFactsV2([{ ...v2Step, seq: 1, prevHash: J.GENESIS_HASH, state: TCP }], m2).ok, false, "v2 facts reader refuses");
+  // R1 reader (package-bound; LABELLED COPY of the accepted G1/G2b synthetic fixture): same refusal, control passes
+  const ROOT = normalize(join(dirname(fileURLToPath(import.meta.url)), ".."));
+  const enc = new TextEncoder(); const u8 = (p) => new Uint8Array(readFileSync(join(ROOT, p)));
+  const FOUND = RUN_PLAN_CLOSURE.map((path) => ({ path, bytes: u8(path) })); const EXEC = R1_EXECUTOR_CLOSURE.map((path) => ({ path, bytes: u8(path) }));
+  const NOW = Date.parse("2027-02-01T03:00:00.000Z"); const MIN = 60_000; const at = (ms) => new Date(NOW - ms).toISOString();
+  const ENV = () => ({ schema: "e7-probe-env-snapshot-v1", nodeVersion: "22.22.0", platform: "linux", execArgvCount: 0, uidAvailable: true,
+    present: Object.fromEntries(["NODE_OPTIONS", "NODE_TLS_REJECT_UNAUTHORIZED", "NODE_EXTRA_CA_CERTS", "NODE_USE_ENV_PROXY", "NODE_DEBUG", "NODE_DEBUG_NATIVE", "SSLKEYLOGFILE",
+      "OPENSSL_CONF", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy"].map((k) => [k, false])) });
+  const plan = { version: "e7-run-plan-v1", kind: "reservation-test-abort-v1", runId: "synthetic-r1-0019", createdAt: at(MIN),
+    baseline: { repoCommit: "58a88f691ac88dcb260cdf407a73785cd96949cd", sourceDigest: sourceDigestV1(FOUND) },
+    environment: { stripe: { mode: "test", accountId: "acct_SYNTHETIC0001" }, hostaway: { accountRef: "synthetic-hostaway", clientSnapshotId: "synthetic-client-1" },
+      db: { instanceEnvironment: "test", appRole: "mv_booking_app", reportRole: "mv_booking_report" } },
+    listing: { id: 606998, currency: "USD", refFieldId: 777009, connection: "disconnected", timeZone: "America/Mazatlan" },
+    phases: { capture: false, recording: false, testAbortAfterReservation: true }, allowedOps: [...ALLOWED_OPS],
+    checkpoints: ["CALENDAR_BASELINE", "CALENDAR_BLOCKED", "CALENDAR_REOPENED"],
+    deadlines: { quoteMaxAgeMinutes: 30, authorizationMaxAgeHours: 24 }, stayRules: { minLeadDays: 7, maxNights: 7 }, exclusions: JSON.parse(JSON.stringify(HISTORICAL_EXCLUSIONS)),
+    binding: { intentId: "00000000-0000-4000-8000-0000000000f1", expectedRef: "MV-SYN0019", paymentIntentId: "pi_SYNTHETIC0000f1",
+      stay: { arrival: "2027-03-10", departure: "2027-03-12", guests: 2 }, amountMinor: 23000, rateBps: 1000,
+      quote: { totalMinor: 23000, currency: "USD", quotedAt: at(10 * MIN) }, authorizedAt: at(5 * MIN) } };
+  const planBytes = enc.encode(`${canonicalJson(plan)}\n`);
+  const built = buildRunPackageV1({ planBytes, sourceEntries: FOUND, envSnapshot: ENV(), planClock: NOW }); assert.ok(built.ok, `fixture build ${built.code}`);
+  const execDigest = createHash("sha256").update(Buffer.concat([Buffer.from("e7-run-executor-source-r1\n"), ...EXEC.flatMap((e) => [Buffer.from(`${e.path}\0${e.bytes.length}\0`), Buffer.from(e.bytes), Buffer.from([0])])])).digest("hex");
+  const mr = V2.bindRunPackageR1Journal({ packageBytes: enc.encode(`${canonicalJson(built.package)}\n`), planBytes, foundationSources: FOUND, executorSources: EXEC, envSnapshot: ENV(),
+    expected: { packageHash: built.packageHash, executorDigest: execDigest } }, NOW);
+  assert.equal(mr.ok, true, JSON.stringify(mr)); const b1 = mr.binding; assert.equal(V2.bindingKindV2(b1), "r1");
+  const r1Step = { v: 2, seq: 4, prevHash: "1".repeat(64), ...b1.identity, at: NOW, event: "STEP_ENDED", ...bodies.STEP_ENDED("reservation", 1) };
+  const r1Phase = { v: 2, seq: 7, prevHash: "1".repeat(64), ...b1.identity, at: NOW, event: "PHASE_ENDED", ...bodies.PHASE_ENDED("reservation") };
+  assert.equal(V2.validateRecordBound(r1Step, b1).ok, true, "control"); assert.equal(V2.validateRecordBound(r1Phase, b1).ok, true, "control");
+  assert.deepEqual(V2.validateRecordBound({ ...r1Step, state: TCP }, b1), { ok: false, code: "RECORD_FIELD_INVALID" });
+  assert.deepEqual(V2.validateRecordBound({ ...r1Phase, phase: "cleanup", state: TCP }, b1), { ok: false, code: "RECORD_FIELD_INVALID" });
+  assert.deepEqual(V2.validateRecordBound({ ...r1Step, actions: ["MAINTENANCE:stripe.refund_payment_intent:outcome_unknown"] }, b1), { ok: false, code: "ACTION_INVALID" });
+  assert.equal(V2.journalFactsBound([{ ...r1Step, seq: 1, prevHash: J.GENESIS_HASH, state: TCP }], b1).ok, false, "R1 facts reader refuses");
+  // the v2 module takes its state vocabulary FROM v1 (one frozen list; no second copy to drift)
+  const v2src = readFileSync(new URL("../scripts/e7-connected/run-journal-memory-v2.mjs", import.meta.url), "utf8");
+  assert.ok(/import \{ INTENT_STATES,[^}]*\} from "\.\/run-journal-memory\.mjs"/.test(v2src)); assert.ok(!v2src.includes(TCP) && !v2src.includes("refund"));
 });

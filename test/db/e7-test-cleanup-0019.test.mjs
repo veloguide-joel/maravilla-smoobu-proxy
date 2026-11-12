@@ -357,7 +357,7 @@ test("RF1 (F1) the LATEST bound-refund observation decides: valid full read then
     F.ok(await refundRead(c, re, 33));                                                       // a newer VALID read restores
     assert.equal(await settled(c), true);
     for (const [t, o] of [[34, { pi: "pi_test_other000" }], [35, { charge: "ch_test_other0000000" }], [36, { currency: "MXN" }]]) {
-      F.ok(await refundRead(c, re, t, o)); assert.equal(await settled(c), false, JSON.stringify(o)); F.ok(await refundRead(c, re, t, {}).catch(() => ({ ok: true })));
+      F.ok(await refundRead(c, re, t, o)); assert.equal(await settled(c), false, JSON.stringify(o));
     }
     F.ok(await refundRead(c, re, 40)); assert.equal(await settled(c), true); }
   { const c = await capturedUSD(); F.ok(await request(c)); const re = "re_test_rf1b";       // tie: two observations at the same instant (one valid, one partial)
