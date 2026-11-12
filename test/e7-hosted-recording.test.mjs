@@ -195,7 +195,8 @@ function fakeWorker(w, o = {}) {
 }
 const toolingFor = (w, o = {}) => ({ runRecordingStep: o.worker ?? fakeWorker(w, o), loadIntent: async () => intentOf(w), createPhaseExecutors: EX.createPhaseExecutors, createHostawaySend: T.createE7HostawaySend,
   validateAdapterConfig: HR.validateAdapterConfig, unwrapEnvelope: HR.unwrapEnvelope, normalizeReservation: HR.normalizeReservation, activeReservationProof: CO.activeReservationProof,
-  assessChargeList: OP.assessChargeList, preflightListObservation: OP.preflightListObservation, publicStatus: IS.publicStatus, LOCK_KEY: LK.LOCK_KEY, LOCK_PRECHECK_SQL: LK.LOCK_PRECHECK_SQL });
+  assessChargeList: OP.assessChargeList, preflightListObservation: OP.preflightListObservation, classifyTitle: OP.classifyTitle, providerIdToCanonical: OP.providerIdToCanonical, amountToMinor: HR.amountToMinor,
+  publicStatus: IS.publicStatus, LOCK_KEY: LK.LOCK_KEY, LOCK_PRECHECK_SQL: LK.LOCK_PRECHECK_SQL });
 function core(w, o = {}) {
   const pool = o.pool ?? fakePool(w, o); w.pool = pool;
   const x = exchanges(w, o);
@@ -369,13 +370,67 @@ test("A10 postcheck + readback + residual agreement: a non-pristine notify row /
   { const w = world(); const r = await core(w, { noNotify: true }); assert.deepEqual([r.outcome, r.code], ["POSTCHECK_MISMATCH", "NOTIFY_NOT_SINGLE_PRISTINE"]); }
   { const w = world(); const r = await core(w, { releaseClaim: true }); assert.deepEqual([r.outcome, r.code], ["POSTCHECK_MISMATCH", "CLAIM_NOT_HELD"]); }
   { const w = world(); const r = await core(w, { noEvidenceLink: true }); assert.deepEqual([r.outcome, r.code], ["POSTCHECK_MISMATCH", "RECORDING_OP_NOT_SINGLE_SUCCEEDED"]); }
-  { const w = world(); const r = await core(w, { listMutate: (n, ww) => (n === 4 ? { json: { status: "success", result: [], count: 0 } } : null) }); assert.deepEqual([r.outcome, r.code], ["POSTCHECK_MISMATCH", "CHARGE_READBACK"]); }
-  { const w = world(); const r = await core(w, { listMutate: (n, ww) => (n === 4 ? { json: { status: "success", result: [...ww.charges, chargeRow({ id: 9000777 })], count: ww.charges.length + 1 } } : null) }); assert.deepEqual([r.outcome, r.code], ["POSTCHECK_MISMATCH", "CHARGE_READBACK"]); }
-  { const w = world(); const r = await core(w, { listMutate: (n, ww) => (n === 4 ? { json: { status: "success", result: ww.charges.map((x) => ({ ...x, paymentMethod: "cash" })), count: ww.charges.length } } : null) }); assert.deepEqual([r.outcome, r.code], ["POSTCHECK_MISMATCH", "CHARGE_FIELDS_READBACK"]); }
+  { const w = world(); const r = await core(w, { listMutate: (n, ww) => (n === 4 ? { json: { status: "success", result: [], count: 0 } } : null) }); assert.deepEqual([r.outcome, r.code], ["POSTCHECK_MISMATCH", "READBACK_RECORDED_CHARGE_NOT_LISTED"]); }
+  { const w = world(); const r = await core(w, { listMutate: (n, ww) => (n === 4 ? { json: { status: "success", result: [...ww.charges, chargeRow({ id: 9000777 })], count: ww.charges.length + 1 } } : null) }); assert.deepEqual([r.outcome, r.code], ["POSTCHECK_MISMATCH", "READBACK_DUPLICATE_MARKED_CHARGES"]); }
+  { const w = world(); const r = await core(w, { listMutate: (n, ww) => (n === 4 ? { json: { status: "success", result: ww.charges.map((x) => ({ ...x, paymentMethod: "cash" })), count: ww.charges.length } } : null) }); assert.deepEqual([r.outcome, r.code], ["POSTCHECK_MISMATCH", "READBACK_RECORDED_CHARGE_FIELDS"]); }
   { const w = world(); const pool = fakePool(w); const q = pool.query.bind(pool); let reads = 0;
     pool.query = async (sql) => { const out = await q(sql); if (/e7hrc:claims/.test(sql) && ++reads === 3) return { rows: [{ listing_id: 606998, released: true }] }; return out; };   // the 3rd claims read = the teardown residual read
     const r = await core(w, { pool }); assert.deepEqual([r.outcome, r.code, r.postcheck], ["NOT_CONFIRMED", "RESIDUAL_CLAIM_NOT_HELD", null]); }
   { const w = world(); const r = await core(w, { unlockFalse: true }); assert.deepEqual([r.outcome, r.code, r.lock, w.lockReleased], ["NOT_CONFIRMED", "UNLOCK_NOT_PROVEN", "unlock_failed_connection_destroyed", "destroyed"]); }
+});
+
+test("F1 (ROOT 5883758657) final readback uses the ACCEPTED normalized marker classifier + complete-list rules: at the FOURTH list call a valid recorded row PLUS a zero-width / case / NFKC / spaced lookalike, a duplicate id, a foreign-reservation row, a malformed row, a wrong canonical id, a count mismatch, a fail envelope → POSTCHECK_MISMATCH / READBACK_<code> with postcheck null; the unchanged valid page (plus an unrelated charge) stays RECORDING_CONFIRMED", async () => {
+  const at4 = (rows) => (n, ww) => (n === 4 ? { json: { status: "success", result: rows(ww), count: rows(ww).length } } : null);
+  const cases = [
+    [at4((ww) => [...ww.charges, chargeRow({ id: 9000777, title: `maraVilla payment mv\u200boch1-${IID}`, amount: 1 })]), "READBACK_LOOKALIKE_CHARGE_PRESENT", "zero-width (ROOT repro)"],
+    [at4((ww) => [...ww.charges, chargeRow({ id: 9000778, title: `MARAVILLA PAYMENT MVOCH1-${IID.toUpperCase()}`, amount: 1 })]), "READBACK_LOOKALIKE_CHARGE_PRESENT", "case"],
+    [at4((ww) => [...ww.charges, chargeRow({ id: 9000779, title: `maraVilla payment ｍｖｏｃｈ１-${IID}`, amount: 1 })]), "READBACK_LOOKALIKE_CHARGE_PRESENT", "NFKC fullwidth"],
+    [at4((ww) => [...ww.charges, chargeRow({ id: 9000780, title: `other mvoch1 - ${IID}`, amount: 1 })]), "READBACK_LOOKALIKE_CHARGE_PRESENT", "spaced marker"],
+    [at4((ww) => [...ww.charges, chargeRow({ id: 9000781, title: `ref ${IID.replace(/-/g, "")}`, amount: 1 })]), "READBACK_LOOKALIKE_CHARGE_PRESENT", "dashless intent id"],
+    [at4((ww) => [...ww.charges, { ...ww.charges[0] }]), "READBACK_LIST_DUPLICATE_ID", "duplicate id"],
+    [at4((ww) => [...ww.charges, chargeRow({ id: 9000782, reservationId: 71999902, title: "Accommodation payment", amount: 5 })]), "READBACK_LIST_FOREIGN_RESERVATION_ROW", "foreign reservation"],
+    [at4((ww) => [...ww.charges, chargeRow({ id: 9000783, listingMapId: 606999, title: "Accommodation payment", amount: 5 })]), "READBACK_LIST_FOREIGN_LISTING_ROW", "foreign listing"],
+    [at4((ww) => [...ww.charges, { id: 9000784, listingMapId: 606998, reservationId: 71999901, type: "charge", title: "x", currency: "USD", paymentMethod: "cash", amount: "5", status: "paid", paymentProvider: "offline" }]), "READBACK_LIST_ROW_AMOUNT_INVALID", "malformed amount"],
+    [at4((ww) => [...ww.charges, chargeRow({ id: 9000785, type: "fee", title: "x", amount: 5 })]), "READBACK_LIST_ROW_TYPE_UNKNOWN", "unknown type"],
+    [at4((ww) => ww.charges.map((x) => ({ ...x, id: 9000786 }))), "READBACK_RECORDED_ID_MISMATCH", "other canonical id"],
+    [(n, ww) => (n === 4 ? { json: { status: "success", result: ww.charges, count: ww.charges.length + 1 } } : null), "READBACK_LIST_COUNT_LENGTH_MISMATCH", "count mismatch"],
+    [(n) => (n === 4 ? { json: { status: "fail", message: "nope" } } : null), "READBACK_LIST_ENVELOPE", "fail envelope"],
+    [(n) => (n === 4 ? { status: 500, json: { status: "fail" } } : null), "READBACK_LIST_HTTP_STATUS", "500"],
+  ];
+  for (const [listMutate, code, label] of cases) {
+    const w = world(); const r = await core(w, { listMutate });
+    assert.deepEqual([r.outcome, r.code, r.postcheck, r.recordInvocations, posts(w).length], ["POSTCHECK_MISMATCH", code, null, 1, 1], `${label}: ${JSON.stringify([r.outcome, r.code])}`);
+  }
+  { const w = world(); const r = await core(w, { listMutate: at4((ww) => [...ww.charges, chargeRow({ id: 9000790, title: "Cleaning fee", amount: 25 })]) });
+    assert.equal(r.outcome, "RECORDING_CONFIRMED", `an unrelated, non-lookalike row does not refuse: ${JSON.stringify([r.outcome, r.code])}`); }
+  assert.equal(OP.classifyTitle(`maraVilla payment mv\u200boch1-${IID}`, IID), "suspicious", "the accepted classifier folds the zero-width character");
+  assert.equal(E.finalListReadbackRefusal({ httpStatus: 200, json: { status: "success", result: [chargeRow()], count: 1 } }, { tooling: toolingFor(world()), intentId: IID, reservationId: RID, listingId: 606998, recordedId: CHARGE_ID, title: TITLE, amountMinor: AMT, currency: "USD", paymentMethod: "credit_card" }), null);
+  const src = readFileSync(join(TOOLING, "lib/checkout/offline-charge-proof.js"), "utf8");
+  assert.match(src, /const ROW_STRING_FIELDS = \["type", "title", "currency", "status", "paymentProvider", "paymentMethod"\];/); assert.match(src, /const CHARGE_TYPES = Object\.freeze\(\["charge", "preAuth", "refund"\]\);/);
+});
+
+test("F2 (ROOT 5883758657) honest statement accounting: reported dbQueries == EVERY physical statement (pool + lock session + residual read + unlock) on the happy path; a worker that exhausts the body budget is refused at total − reserve, the teardown spends only the reserve, physical == reported, nothing past the TOTAL ceiling, and an unavailable residual read never supports success", async () => {
+  { const w = world(); const r = await core(w);
+    assert.equal(r.outcome, "RECORDING_CONFIRMED");
+    assert.equal(r.dbQueries, w.pool.reads, `reported ${r.dbQueries} vs physical ${w.pool.reads}`);
+    assert.ok(r.dbTeardownQueries >= 2 && r.dbTeardownQueries <= C.budgets.dbTeardownReserve, `teardown ${r.dbTeardownQueries} within the reserve`);
+    assert.equal(r.dbBudgetRefused, 0); }
+  { const w = world(); const B = C.budgets;
+    const worker = async (pool) => { w.workerCalls += 1; const actions = []; let refused = 0;
+      for (let i = 0; i < 2 * B.dbQueries; i++) { try { await pool.query("/*e7hrc:instance*/ SELECT environment FROM booking.instance"); } catch { refused += 1; break; } }   // a synthetic worker burning the pool
+      actions.push(`BURNED:${refused}`); return { status: "worked", intentId: IID, actions, calls: [], writes: 0, delayMs: 0, workReleased: true, stop: null, late: Promise.resolve({ kind: "none" }) }; };
+    const r = await core(w, { worker });
+    assert.ok(r.actions.includes("BURNED:1"), JSON.stringify(r.actions));
+    assert.deepEqual([r.outcome, r.code, r.dbBudgetRefused >= 1, r.recordInvocations], ["BUDGET_EXHAUSTED", "DB_QUERY_CEILING", true, 0]);
+    assert.equal(r.dbQueries, w.pool.reads, `reported ${r.dbQueries} vs physical ${w.pool.reads}`);
+    assert.ok(w.pool.reads <= B.dbQueries, `physical ${w.pool.reads} never exceeds the TOTAL ceiling ${B.dbQueries}`);
+    assert.ok(r.dbTeardownQueries <= B.dbTeardownReserve && r.dbTeardownQueries > 0, `teardown ${r.dbTeardownQueries} within the reserve (the residual read ran on the reserve)`);
+    assert.equal(r.lock, "released", "the unlock fits in the reserve"); }
+  { const w = world(); const pool = fakePool(w); const q = pool.query.bind(pool); let claims = 0;
+    pool.query = async (sql) => { if (/e7hrc:claims/.test(sql) && ++claims === 3) { pool.reads += 1; throw new Error("residual read failed"); } return q(sql); };   // the statement was issued and failed
+    const r = await core(w, { pool });
+    assert.deepEqual([r.outcome, r.code, r.postcheck], ["NOT_CONFIRMED", "RESIDUAL_READ_UNAVAILABLE", null], "an unavailable residual read never supports success");
+    assert.equal(r.dbQueries, pool.reads, "counted even when the residual read fails"); }
 });
 
 test("C1 code ceiling: Slice 4 recording execution CLOSED (executeEnabled false; D4 blocker) AND Slice 1 / 2 / 3 still CLOSED on THEIR tooling; this runner pins the MERGED e7-test 5a094b16; the plan pins pi / reservation / charge / captured amount / stay / attempt / session, the accepted recording key, credit_card / hostaway-e7-test, title / amount wire forms = the accepted module's; ZERO stripe / capture / void / cancel / refund / notify / create", () => {
@@ -573,8 +628,9 @@ if (process.env.E7_HRC_DB_TESTS === "1") {
     return E.runRecordingCore({ plan: b.plan, planHash: b.planHash, runId: RUN_ID, pool: extra.pool ?? db.app, tooling: realTooling, exchanges: { hostaway: w.hostaway },
       credentials: { hostaway: () => "synthetic-hostaway-token" }, clock: clk.read, sleep: async () => {}, ...extra });
   };
-  /** a REAL, strictly increasing clock (the accepted worker checks skew against the database clock); `jump(ms)` moves it forward once (deadline tests) */
-  const newClock = () => { const c = { t: Date.now(), skew: 0 }; c.read = () => { const n = Date.now() + c.skew; c.t = n > c.t ? n : c.t + 1; return c.t; }; c.jump = (ms) => { c.skew += ms; }; return c; };
+  /** the REAL clock (the accepted worker checks skew against the database clock and the DB refuses a completion stamped in its future, so no artificial
+   *  monotonic increments — the e74b suite uses Date.now too); `jump(ms)` moves it forward once (deadline tests) */
+  const newClock = () => { const c = { skew: 0 }; c.read = () => Date.now() + c.skew; c.jump = (ms) => { c.skew += ms; }; return c; };
   const snap = async (id) => ({ st: (await db.app.query("SELECT state, version, offline_charge_id FROM booking.intents WHERE id = $1", [id])).rows[0],
     ops: (await db.app.query("SELECT op_type, state, attempts, (dispatched_at IS NOT NULL) AS d, result_ref FROM booking.external_operations WHERE intent_id = $1 ORDER BY op_type, created_at", [id])).rows,
     claim: (await db.app.query("SELECT (released_at IS NOT NULL) AS released FROM booking.inventory_claims WHERE intent_id = $1", [id])).rows,
@@ -591,7 +647,8 @@ if (process.env.E7_HRC_DB_TESTS === "1") {
       const a = await capturedIntent(); const clk = newClock(); const w = pgWorld(a, clk, { echoRef });
       const r = await pgRun(a, clk, w);
       assert.equal(r.outcome, "RECORDING_CONFIRMED", JSON.stringify(r));
-      console.log(`# I1 ${echoRef ? "echoed" : "not-echoed"}: steps=${r.steps} dbQueries=${r.dbQueries} exchanges=${r.exchanges} hostawayReads=${r.hostawayReads} chargeLists=${r.chargeLists}`);
+      console.log(`# I1 ${echoRef ? "echoed" : "not-echoed"}: steps=${r.steps} dbQueries=${r.dbQueries} (teardown ${r.dbTeardownQueries}) exchanges=${r.exchanges} hostawayReads=${r.hostawayReads} chargeLists=${r.chargeLists}`);
+      assert.ok(r.dbTeardownQueries > 0 && r.dbTeardownQueries <= C.budgets.dbTeardownReserve, "the real teardown fits the reserve");
       assert.ok(r.dbQueries < C.budgets.dbQueries / 2 && r.exchanges < C.budgets.exchanges / 2 && r.hostawayReads < C.budgets.hostawayReads && r.chargeLists < C.budgets.chargeLists, "measured well inside the ceilings");
       const s = await snap(a.id);
       assert.deepEqual([s.st.state, s.st.version, String(s.st.offline_charge_id), w.postRequests, w.charges.length, s.claim, s.cases, s.locks], ["confirmed", a.intent.version + 1, String(7700001), 1, 1, [{ released: false }], 0, 0]);

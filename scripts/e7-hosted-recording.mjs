@@ -28,7 +28,8 @@
 //     reservation read (accepted activeReservationProof over runner-read observations; the booking ref MUST be echoed — the accepted worker requires it,
 //     so a non-echoed ref refuses here: REF_NOT_ECHOED) + ONE preflight charge LIST read assessed with the ACCEPTED
 //     assessChargeList / preflightListObservation (must be complete with ZERO marker / lookalike / same-amount rows) → bounded worker steps behind a
-//     target-only transport fence → read-only postcheck + fresh LIST readback (exactly ONE marked charge = the recorded id) → residual re-validation.
+//     target-only transport fence → read-only postcheck + fresh LIST readback (accepted normalized marker classifier + complete-list rules: exactly ONE
+//     exact-marked charge = the recorded id with the pinned fields, zero lookalikes / duplicates / foreign / malformed rows) → counted residual re-validation.
 //   * Fence (counted BEFORE the transport, every other exchange refused in-process): Hostaway GET /v1/reservations/<bound>, GET
 //     /v1/guestPayments/charges?limit=500&reservationIds=<bound>, and AT MOST ONE POST /v1/guestPayments/charges/<bound> whose JSON body is EXACTLY
 //     { title: "maraVilla payment mvoch1-<intent>", amount: <captured as decimal>, paymentMethod: "credit_card", status: "paid", scheduledDate: <UTC of the
@@ -64,10 +65,14 @@ export const CONSTANTS = Object.freeze({
   // TEST recording configuration (ROOT design review): explicit, no owner decision, no production accounting-policy claim; labels are labels only
   paymentMethod: "credit_card", accountRef: "hostaway-e7-test",
   // worker: the happy recording is ONE step (identity read, list read, assessment, claim, ONE POST, confirming list read, completion, event). dbQueries =
-  // EVERY statement on the counted pool (runner reads + worker + lock session). MEASURED on disposable PG16 with the REAL worker (test I1, ref echoed):
-  // 132 statements, 7 exchanges (Hostaway identity reads 2 = runner proof + worker; charge lists 4 = runner proof + worker preflight + worker confirming +
-  // runner readback; 1 POST), 1 step. Ceilings ≈ 3–4.5x the measured values (the worker's own per-kind read admission stays authoritative). Fail-closed past them.
-  budgets: Object.freeze({ steps: 6, record: 1, hostawayReads: 9, chargeLists: 12, exchanges: 24, dbQueries: 600, runMs: 10 * 60 * 1000, waitCapMs: 35 * 1000 }),
+  // EVERY statement on the counted pool (runner reads + worker + lock session + teardown residual read + unlock). MEASURED on disposable PG16 with the REAL
+  // worker (test I1, ref echoed): 147 statements TOTAL (body 132 + teardown 15 = residual read 14 + unlock 1), 7 exchanges (Hostaway identity reads 2 = runner
+  // proof + worker; charge lists 4 = runner proof + worker preflight + worker confirming + runner readback; 1 POST), 1 step. Ceilings ≈ 3–4.5x the measured
+  // values (the worker's own per-kind read admission stays authoritative). Fail-closed past them.
+  // dbQueries = the TOTAL statement ceiling of a session, EVERY statement included (runner reads + worker + lock session + the teardown residual read + the
+  // unlock). dbTeardownReserve statements of that total are reserved for the teardown (residual read ≈ 14 statements + 1 unlock, measured): the body may
+  // use at most dbQueries − dbTeardownReserve; the teardown may use what is left of the total and nothing more (an unavailable residual read = NOT_CONFIRMED).
+  budgets: Object.freeze({ steps: 6, record: 1, hostawayReads: 9, chargeLists: 12, exchanges: 24, dbQueries: 600, dbTeardownReserve: 40, runMs: 10 * 60 * 1000, waitCapMs: 35 * 1000 }),
   dbEnvironment: RES.dbEnvironment, dbProjectRef: RES.dbProjectRef, nodeVersion: RES.nodeVersion,
   synthetic: Object.freeze({ approvalRef: "SYNTHETIC-recording-preflight-not-for-execute", intentId: "00000000-0000-4000-8000-000000000000", expectedVersion: 8,
     notBefore: "2026-11-12T00:00:00.000Z", paymentIntentId: "pi_SYNTHETIC00000000000000", reservationId: "1", chargeId: "ch_SYNTHETIC00000000000000", capturedMinor: 1,
@@ -130,7 +135,8 @@ export function buildPlan(c, { approvalRef, intentId, expectedVersion, notBefore
   if (typeof attemptId !== "string" || !UUID_RE.test(attemptId) || typeof sessionId !== "string" || !SESSION_RE.test(sessionId)) refuse("HRC_INPUT_INVALID");
   if (typeof runnerDigest !== "string" || !HEX64.test(runnerDigest)) refuse("HRC_INPUT_INVALID");
   if (c.accountId !== "acct_1TyHE42B9LTneQgw" || c.listingId !== 606998 || c.currency !== "USD" || c.dbEnvironment !== "test" || c.paymentMethod !== "credit_card"
-      || c.accountRef !== "hostaway-e7-test" || c.budgets.record !== 1 || c.budgets.steps !== 6 || c.budgets.runMs !== 10 * 60 * 1000) refuse("HRC_INPUT_INVALID");   // code ceiling
+      || c.accountRef !== "hostaway-e7-test" || c.budgets.record !== 1 || c.budgets.steps !== 6 || c.budgets.runMs !== 10 * 60 * 1000
+      || !(c.budgets.dbTeardownReserve > 0 && c.budgets.dbTeardownReserve < c.budgets.dbQueries)) refuse("HRC_INPUT_INVALID");   // code ceiling
   const plan = { schema: PLAN_SCHEMA, toolingCommit: c.toolingCommit, toolingStatus: c.toolingStatus, closureDigest: c.closureDigest, runnerDigest,
     pgVersion: c.pgVersion, listingId: c.listingId, currency: c.currency, refFieldId: c.refFieldId, listingTimeZone: c.listingTimeZone, dbEnvironment: c.dbEnvironment, dbProjectRef: c.dbProjectRef,
     intentId, expectedVersion, notBefore, paymentIntentId, reservationId, chargeId, capturedMinor, from, to, guests, attemptId, sessionId,
@@ -299,11 +305,53 @@ export function checkEnd(f, plan, c = CONSTANTS, tooling = null) {
 /**
  * runRecordingCore({ plan, planHash, runId, pool, lockClientFactory, tooling, exchanges, credentials, clock, monotonic, sleep, runSignal }) → frozen result.
  *  tooling = { runRecordingStep, loadIntent, createPhaseExecutors, createHostawaySend, validateAdapterConfig, unwrapEnvelope, normalizeReservation,
- *              activeReservationProof, assessChargeList, preflightListObservation, publicStatus, LOCK_KEY, LOCK_PRECHECK_SQL }
+ *              activeReservationProof, assessChargeList, preflightListObservation, classifyTitle, providerIdToCanonical, amountToMinor, publicStatus, LOCK_KEY, LOCK_PRECHECK_SQL }
  *  lockClientFactory() → a dedicated checked-out client (query / release / on) for the session lock (pool.connect by default).
  */
 export const TOOLING_KEYS = freeze(["runRecordingStep", "loadIntent", "createPhaseExecutors", "createHostawaySend", "validateAdapterConfig", "unwrapEnvelope", "normalizeReservation",
-  "activeReservationProof", "assessChargeList", "preflightListObservation", "publicStatus"]);
+  "activeReservationProof", "assessChargeList", "preflightListObservation", "classifyTitle", "providerIdToCanonical", "amountToMinor", "publicStatus"]);
+const CHARGE_TYPES = freeze(["charge", "preAuth", "refund"]);                                        // = the accepted CHARGE_TYPES (offline-charge-proof.js; asserted by the tests)
+const ROW_STRING_FIELDS = freeze(["type", "title", "currency", "status", "paymentProvider", "paymentMethod"]);   // = the accepted ROW_STRING_FIELDS
+/**
+ * FINAL (post-confirmation) charge-list readback (ROOT 5883758657 F1). The accepted assessChargeList assesses PAID-state facts only and the intent is now
+ * confirmed, so — without fabricating intent state — the readback composes the ACCEPTED primitives: unwrapEnvelope, providerIdToCanonical, amountToMinor and
+ * the NORMALIZED marker classifier classifyTitle (NFKC / case / invisible-character folding), plus a LABELLED COPY of assessChargeList's completeness rules
+ * (count, row shape, foreign rows, duplicates, exact money). → null | code. Exactly ONE "exact" row, which is the recorded id with the pinned fields; ZERO
+ * suspicious rows; no duplicate / foreign / malformed row anywhere on the page.
+ */
+export function finalListReadbackRefusal(lr, { tooling, intentId, reservationId, listingId, recordedId, title, amountMinor, currency, paymentMethod }) {
+  if (!lr || lr.httpStatus !== 200) return "LIST_HTTP_STATUS";
+  const env = tooling.unwrapEnvelope(lr.json);
+  if (!env || env.ok !== true) return "LIST_ENVELOPE";
+  const rows = env.result;
+  if (!Array.isArray(rows)) return "LIST_RESULT_NOT_ARRAY";
+  const count = lr.json.count;
+  if (!Number.isSafeInteger(count) || count < 0 || count > LIST_LIMIT) return "LIST_COUNT_INVALID";
+  if (rows.length !== count) return "LIST_COUNT_LENGTH_MISMATCH";
+  const seen = new Set(); let exact = null; let exactCount = 0;
+  for (let i = 0; i < rows.length; i++) {
+    if (!Object.prototype.hasOwnProperty.call(rows, i) || rows[i] === null || typeof rows[i] !== "object" || Array.isArray(rows[i])) return "LIST_ROW_MALFORMED";
+    const row = rows[i];
+    const id = tooling.providerIdToCanonical(row.id);
+    if (id === null) return "LIST_ROW_ID_INVALID";
+    if (seen.has(id)) return "LIST_DUPLICATE_ID";
+    seen.add(id);
+    if (tooling.providerIdToCanonical(row.reservationId) !== reservationId) return "LIST_FOREIGN_RESERVATION_ROW";
+    if (row.listingMapId !== listingId) return "LIST_FOREIGN_LISTING_ROW";
+    for (const k of ROW_STRING_FIELDS) if (typeof row[k] !== "string") return `LIST_ROW_${k.toUpperCase()}_INVALID`;
+    if (!CHARGE_TYPES.includes(row.type)) return "LIST_ROW_TYPE_UNKNOWN";
+    if (typeof row.amount !== "number" || !Number.isFinite(row.amount)) return "LIST_ROW_AMOUNT_INVALID";
+    if (row.type === "refund" ? !(row.amount <= 0 && tooling.amountToMinor(-row.amount) !== null) : tooling.amountToMinor(row.amount) === null) return "LIST_ROW_AMOUNT_NOT_EXACT";
+    const t = tooling.classifyTitle(row.title, intentId);                                            // the ACCEPTED normalized classifier (zero-width / case / NFKC folds)
+    if (t === "suspicious") return "LOOKALIKE_CHARGE_PRESENT";
+    if (t === "exact") { exactCount += 1; exact = { ...row, canonicalId: id }; }
+  }
+  if (exactCount !== 1) return exactCount === 0 ? "RECORDED_CHARGE_NOT_LISTED" : "DUPLICATE_MARKED_CHARGES";
+  if (exact.canonicalId !== recordedId) return "RECORDED_ID_MISMATCH";
+  if (exact.type !== "charge" || exact.status !== "paid" || exact.paymentProvider !== "offline" || exact.paymentMethod !== paymentMethod || exact.currency !== currency
+      || exact.title !== title || tooling.amountToMinor(exact.amount) !== amountMinor) return "RECORDED_CHARGE_FIELDS";
+  return null;
+}
 const RES_READ_OP = ID_READ;
 // runner-read reservation observation (LABELLED COPY of the accepted reservation-worker observedReservation, NOT persisted as evidence) — Slice 3 F2
 const observedReservation = (r) => ({ reservationId: String(r.reservationId), listingId: r.listingId, from: r.from, to: r.to, totalMinor: r.totalMinor, currency: r.currency, status: r.status,
@@ -317,7 +365,7 @@ const factsOf = (i, recordedPaymentAt) => freeze({ capturedMinor: i.payment ? i.
 export async function runRecordingCore(input) {
   const c = CONSTANTS; const B = c.budgets;
   const r = { schema: RESULT_SCHEMA, outcome: null, code: null, startState: null, finalState: null, finalVersion: null, publicStatus: null, reservationId: null, capturedMinor: null, offlineChargeId: null,
-    clientSnapshotId: null, steps: 0, actions: [], exchanges: 0, hostawayReads: 0, chargeLists: 0, dbQueries: 0, dbBudgetRefused: 0, recordInvocations: 0, recordOutcome: "NONE",
+    clientSnapshotId: null, steps: 0, actions: [], exchanges: 0, hostawayReads: 0, chargeLists: 0, dbQueries: 0, dbTeardownQueries: 0, dbBudgetRefused: 0, recordInvocations: 0, recordOutcome: "NONE",
     refusedAtTransport: 0, refusedByStop: 0, lock: "not_acquired", lockSession: null, lockBackendPid: null, proofs: [], postcheck: null, recordingOps: null, notifyOps: null, holds: null,
     claimHeld: null, factsObserved: false, stopReason: null, workerStop: null, writes: { record: 0, capture: 0, create: 0, cancel: 0, refund: 0, notify: 0, void: 0, stripe: 0 } };
   const DONE = Symbol("done");
@@ -339,6 +387,8 @@ export async function runRecordingCore(input) {
   };
   class Stopped extends Error { constructor() { super("stopped"); } }
   const guard = () => { if (stopped()) throw new Stopped(); };
+  /** a failed runner DB read: a latched stop → the stop outcome; the counted ceiling → BUDGET_EXHAUSTED (honest, F2); anything else → DB_ERROR/<site> */
+  const dbFail = (e, site) => (e instanceof Stopped ? stopOutcome() : e instanceof Refusal && e.code === "DB_BUDGET" ? done(uncertain() ?? "BUDGET_EXHAUSTED", "DB_QUERY_CEILING") : done(uncertain() ?? "DB_ERROR", site));
   /** a possibly-sent write without an admissible reply dominates every later exit (never hidden behind a stop code) */
   const uncertain = () => (r.recordOutcome === "UNKNOWN" ? "WRITE_OUTCOME_UNKNOWN" : null);
   const stopOutcome = () => done(uncertain() ?? (stopReason === "LOCK_SESSION_ERROR" ? "LOCK_LOST" : stopReason), `STOP_${stopReason}`);
@@ -354,6 +404,17 @@ export async function runRecordingCore(input) {
     r.holds = f.openHolds;
     r.claimHeld = f.claims.length === 1 ? f.claims[0].released === false : null;
   };
+  // ---- (1) LABELLED COPY + F2 (ROOT 5883758657): ONE counted pool for EVERY statement of the session — runner reads, worker, lock session, the teardown
+  // residual read and the unlock. `limit` is the body ceiling (total − reserve) until the teardown, then the TOTAL; refused statements never execute.
+  const pool0 = input && input.pool && typeof input.pool.query === "function" ? input.pool : null;
+  let limit = B.dbQueries - B.dbTeardownReserve;
+  const count = () => { if (r.dbQueries >= limit) { r.dbBudgetRefused += 1; throw new Refusal("DB_BUDGET"); } r.dbQueries += 1; };
+  const countedPool = pool0 ? {
+    query: (...a) => { count(); return pool0.query(...a); },
+    connect: async () => { const cl = await pool0.connect(); const q = cl.query.bind(cl);
+      return { query: (...a) => { count(); return q(...a); }, release: (...a) => cl.release(...a), on: (...a) => (typeof cl.on === "function" ? cl.on(...a) : undefined),
+        removeListener: (...a) => (typeof cl.removeListener === "function" ? cl.removeListener(...a) : undefined) }; }
+  } : null;
   const body = async () => {
     const { plan, planHash, runId, pool, tooling, exchanges, credentials } = input ?? {};
     if (!plan || plan.schema !== PLAN_SCHEMA || plan.listingId !== c.listingId || plan.currency !== c.currency || plan.paymentMethod !== c.paymentMethod || plan.accountRef !== c.accountRef
@@ -379,20 +440,12 @@ export async function runRecordingCore(input) {
     if (runSignal && typeof runSignal.addEventListener === "function") { if (runSignal.aborted) stopped(); else runSignal.addEventListener("abort", () => { stopped(); }, { once: true }); }
     deadlineTimer = setTimeout(() => { stopped(); }, Math.max(1, Math.floor(endsAt - mono())));
 
-    // ---- (1) LABELLED COPY: counted pool — EVERY statement (runner reads + worker, connected clients included) is counted once here --------------------
-    const count = () => { if (r.dbQueries >= B.dbQueries) { r.dbBudgetRefused += 1; throw new Refusal("DB_BUDGET"); } r.dbQueries += 1; };
-    const countedPool = {
-      query: (...a) => { count(); return pool.query(...a); },
-      connect: async () => { const cl = await pool.connect(); const q = cl.query.bind(cl);
-        return { query: (...a) => { count(); return q(...a); }, release: (...a) => cl.release(...a), on: (...a) => (typeof cl.on === "function" ? cl.on(...a) : undefined),
-          removeListener: (...a) => (typeof cl.removeListener === "function" ? cl.removeListener(...a) : undefined) }; }
-    };
     const q = async (sql, params) => { guard(); const res = await countedPool.query(sql, params); return res.rows; };
     const read = () => readFacts(q, plan, tooling, { query: (sql, params) => { guard(); return countedPool.query(sql, params); } });
 
     // ---- (2) read-only start check: the pins are RE-READ and cross-checked; the schema prerequisite is READ, never applied -------------------------
     let f;
-    try { f = await read(); } catch (e) { return e instanceof Stopped ? stopOutcome() : done("DB_ERROR", "START_READ_FAILED"); }
+    try { f = await read(); } catch (e) { return dbFail(e, "START_READ_FAILED"); }
     r.startState = f.intent ? f.intent.status : null;
     const st = checkStart(f, plan, c);
     if (!st.ok) return done(st.code === "SCHEMA_PREREQUISITE_MISSING" ? "SCHEMA_PREREQUISITE_MISSING"
@@ -421,8 +474,8 @@ export async function runRecordingCore(input) {
       lockAcquired = true; lockPid = String(got.rows[0].pid); r.lockBackendPid = /^[0-9]{1,10}$/.test(lockPid) ? Number(lockPid) : null;
       if (!(await ownLock())) return done("LOCK_NOT_ACQUIRED", r.lockSession === "backend_hop" ? "BACKEND_HOP" : "LOCK_NOT_PROVEN");
       r.lock = "held";
-    } catch (e) { return e instanceof Stopped ? stopOutcome() : done("DB_ERROR", "LOCK_QUERY_FAILED"); }
-    const lockLost = (e) => (e instanceof Stopped ? stopOutcome() : done("DB_ERROR", "LOCK_PROOF_FAILED"));
+    } catch (e) { return dbFail(e, "LOCK_QUERY_FAILED"); }
+    const lockLost = (e) => (dbFail(e, "LOCK_PROOF_FAILED"));
     const proveLock = async (tag) => {
       try { if (!(await ownLock())) { r.lock = "lost"; return done(uncertain() ?? "LOCK_LOST", lockErrored ? "LOCK_SESSION_ERROR" : r.lockSession === "backend_hop" ? "BACKEND_HOP" : "LOCK_NOT_HELD"); } }
       catch (e) { return lockLost(e); }
@@ -437,7 +490,7 @@ export async function runRecordingCore(input) {
       if (a.rows.length !== 1 || b.length !== 1 || a.rows[0].db !== b[0].db || a.rows[0].environment !== c.dbEnvironment || b[0].environment !== c.dbEnvironment) return done("DB_IDENTITY_MISMATCH", "POOLS_MISMATCH");
       const role = await q(Q.role, []);
       if (role.length !== 1 || role[0].privileged !== false || role[0].is_app !== true) return done("SCOPE_REFUSED", "ROLE_NOT_APP");
-    } catch (e) { return e instanceof Stopped ? stopOutcome() : done("DB_ERROR", "IDENTITY_READ_FAILED"); }
+    } catch (e) { return dbFail(e, "IDENTITY_READ_FAILED"); }
 
     // ---- (5) the target-only transport fence (recording phase, Hostaway ONLY): exact URL / method / headers / body; counters BEFORE the exchange ---
     const urls = { reservation: `${HOSTAWAY}/v1/reservations/${RID}`, list: `${HOSTAWAY}/v1/guestPayments/charges?limit=${LIST_LIMIT}&reservationIds=${RID}`, post: `${HOSTAWAY}/v1/guestPayments/charges/${RID}` };
@@ -554,7 +607,7 @@ export async function runRecordingCore(input) {
       if (!w || w.status === "refused") return done(uncertain() ?? "WORKER_REFUSED", w && CODE_RE.test(String(w.code)) ? String(w.code) : "WORKER_REFUSED");
       if (uncertain()) { try { finalFacts = await read(); observe(finalFacts); } catch { /* reported below */ } return done("WRITE_OUTCOME_UNKNOWN", "LOST_RECORD_REPLY"); }
       if (stopped()) return stopOutcome();
-      try { f = await read(); } catch (e) { return e instanceof Stopped ? stopOutcome() : done("DB_ERROR", "STEP_READBACK_FAILED"); }
+      try { f = await read(); } catch (e) { return dbFail(e, "STEP_READBACK_FAILED"); }
       observe(f);
       if (stopped()) return stopOutcome();
       const stNow = f.intent ? f.intent.status : null;
@@ -582,16 +635,10 @@ export async function runRecordingCore(input) {
     try {
       guard();
       const lr = await th.transport.send({ method: "GET", path: "/v1/guestPayments/charges", query: { limit: LIST_LIMIT, reservationId: RID } }, { signal: composed(null) });
-      // runner-local RAW readback (the accepted module assesses PAID-state facts only; the intent is now confirmed): envelope + rows field-exact, exactly ONE
-      // row carrying this intent's marker and it is the recorded id with the pinned fields; no other marker / lookalike row for this reservation
-      if (!lr || lr.httpStatus !== 200 || !lr.json || typeof lr.json !== "object" || lr.json.status !== "success" || !Array.isArray(lr.json.result)
-          || lr.json.count !== lr.json.result.length) return done("POSTCHECK_MISMATCH", "LIST_READBACK");
-      const rows = lr.json.result;
-      const marked = rows.filter((x) => x && typeof x === "object" && typeof x.title === "string" && x.title.includes("mvoch1-"));
-      if (marked.length !== 1 || marked[0].title !== plan.title) return done("POSTCHECK_MISMATCH", "CHARGE_READBACK");
-      const row = marked[0];
-      if (String(row.id) !== recordedId || String(row.reservationId) !== RID || row.listingMapId !== c.listingId || row.type !== "charge" || row.status !== "paid" || row.paymentProvider !== "offline"
-          || row.paymentMethod !== c.paymentMethod || row.currency !== c.currency || row.amount !== plan.amount) return done("POSTCHECK_MISMATCH", "CHARGE_FIELDS_READBACK");
+      // F1: the accepted complete-list / normalized-marker rules over the fresh page; exactly the recorded id with the pinned fields, zero lookalikes
+      const fr = finalListReadbackRefusal(lr, { tooling, intentId: plan.intentId, reservationId: RID, listingId: c.listingId, recordedId, title: plan.title, amountMinor: plan.capturedMinor,
+        currency: c.currency, paymentMethod: c.paymentMethod });
+      if (fr) return done("POSTCHECK_MISMATCH", `READBACK_${fr}`);
       r.proofs.push("READBACK");
     } catch (e) { if (e instanceof Stopped || stopped()) return stopOutcome(); return done("POSTCHECK_MISMATCH", "READBACK_FAILED"); }
     r.postcheck = { recordingOps: 1, offlineChargeId: recordedId, capturedMinor: finalFacts.intent.payment.capturedMinor, notifyQueuedPristine: 1, holds: 0, claimHeld: true, openCases: 0, publicStatus: "confirmed" };
@@ -609,9 +656,12 @@ export async function runRecordingCore(input) {
     if (e instanceof Refusal && e.code === "DB_BUDGET") done(uncertain() ?? "BUDGET_EXHAUSTED", "DB_QUERY_CEILING");
     else done(uncertain() ?? "DB_ERROR", "INTERNAL");
   } finally {
-    if (r.steps > 0 && input && input.pool && input.tooling) {
-      const raw = { query: (sql, params) => input.pool.query(sql, params) };
-      const b = await bounded(readFacts(async (sql, params) => (await input.pool.query(sql, params)).rows, input.plan, input.tooling, raw));
+    // F2: the teardown spends ONLY the reserve (what is left of the TOTAL); every residual statement and the unlock are counted; past the ceiling nothing is issued
+    limit = B.dbQueries;
+    const teardownStart = r.dbQueries;
+    if (r.steps > 0 && countedPool && input.tooling) {
+      const raw = { query: (sql, params) => countedPool.query(sql, params) };
+      const b = await bounded(readFacts(async (sql, params) => (await countedPool.query(sql, params)).rows, input.plan, input.tooling, raw));
       if (b.done && !b.threw) observe(b.value);
       if (r.outcome === "RECORDING_CONFIRMED") {
         const re = b.done && !b.threw ? checkEnd(b.value, input.plan, CONSTANTS, input.tooling) : "RESIDUAL_READ_UNAVAILABLE";
@@ -621,7 +671,8 @@ export async function runRecordingCore(input) {
     if (lockClient) {
       let released = false;
       if (lockAcquired && !lockErrored) {
-        const u = await bounded(lockClient.query("SELECT pg_advisory_unlock(pg_catalog.hashtext($1), 0) AS ok, pg_catalog.pg_backend_pid() AS pid", [input?.tooling?.LOCK_KEY ?? ""]));
+        const unlock = () => { count(); return lockClient.query("SELECT pg_advisory_unlock(pg_catalog.hashtext($1), 0) AS ok, pg_catalog.pg_backend_pid() AS pid", [input?.tooling?.LOCK_KEY ?? ""]); };
+        const u = await bounded(Promise.resolve().then(unlock));
         released = u.done && !u.threw && u.value && u.value.rows && u.value.rows.length === 1 && u.value.rows[0].ok === true && String(u.value.rows[0].pid) === lockPid && !lockErrored;
       }
       if (lockAcquired) r.lock = released ? "released" : (lockErrored ? "session_error_connection_destroyed" : "unlock_failed_connection_destroyed");
@@ -629,6 +680,7 @@ export async function runRecordingCore(input) {
       if (lockAcquired && !released && r.outcome === "RECORDING_CONFIRMED") { r.outcome = "NOT_CONFIRMED"; r.code = lockErrored ? "LOCK_SESSION_ERROR_AT_TEARDOWN" : "UNLOCK_NOT_PROVEN"; }
     }
     if (r.outcome === "RECORDING_CONFIRMED" && stopped()) { r.outcome = "NOT_CONFIRMED"; r.code = `STOP_${stopReason}_AT_TEARDOWN`; }
+    r.dbTeardownQueries = r.dbQueries - teardownStart;
     if (deadlineTimer) clearTimeout(deadlineTimer);
   }
   return snapshot();
@@ -755,7 +807,8 @@ async function defaultImportTooling(dir) {
   return { X, createBookingPool: P.createBookingPool,
     tooling: { runRecordingStep: W.runRecordingStep, loadIntent: R.loadIntent, createPhaseExecutors: EX.createPhaseExecutors, createHostawaySend: T.createE7HostawaySend,
       validateAdapterConfig: HR.validateAdapterConfig, unwrapEnvelope: HR.unwrapEnvelope, normalizeReservation: HR.normalizeReservation,
-      activeReservationProof: CO.activeReservationProof, assessChargeList: OP.assessChargeList, preflightListObservation: OP.preflightListObservation, publicStatus: IS.publicStatus,
+      activeReservationProof: CO.activeReservationProof, assessChargeList: OP.assessChargeList, preflightListObservation: OP.preflightListObservation, classifyTitle: OP.classifyTitle,
+      providerIdToCanonical: OP.providerIdToCanonical, amountToMinor: HR.amountToMinor, publicStatus: IS.publicStatus,
       LOCK_KEY: LK.LOCK_KEY, LOCK_PRECHECK_SQL: LK.LOCK_PRECHECK_SQL } };
 }
 export function summaryMarkdown(r) {
