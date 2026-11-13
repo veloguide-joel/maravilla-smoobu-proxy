@@ -171,7 +171,8 @@ test("R2 GREEN: the REAL worker → adapter → transport chain emits exactly `a
   assert.ok(!/final_capture/.test(w.bodies[0].body), "C1: no final_capture on the wire");
   assert.equal(w.stripeLog.filter((x) => x.startsWith("POST")).length, 1, "ONE capture POST");
   assert.deepEqual((await opRow(a.id)).map((o) => [o.state, o.attempts, o.d, o.result_ref]), [["succeeded", 1, true, a.chargeId]]);
-  assert.equal(i.payment.capturedMinor ?? i.capturedMinor ?? a.total, a.total);
+  assert.equal(i.payment.capturedMinor, a.total, "codec-owned captured amount == the stored full amount (strict, no fallback)");
+  assert.equal((await db.app.query("SELECT captured_minor::text AS c FROM booking.intents WHERE id = $1", [a.id])).rows[0].c, String(a.total), "independent persistence proof: booking.intents.captured_minor");
 });
 
 test("R3 injected provider rejection (400 on a correct body): the worker persists outcome_unknown / capture_unknown, ONE send, and a further step never sends again", async () => {
