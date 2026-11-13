@@ -1,0 +1,24 @@
+# C16 — Hosted-recording START VETO on stored refund observations — scope note (DRAFT PR; closed wrapper only) — 2026-11-13
+Claude executor · OFFLINE. Base: closed main `8bc95e1f` (all five flags FALSE; #93 merged with ROOT's doc-only `1a1d07e0`). Authorized by ROOT C16 as **defense-in-depth in the CLOSED Slice 4 wrapper only** — not a resolution of recording readiness (D4 held), not a new proof, not a freshness or admission widening, not a provider read.
+
+## What changed (exactly)
+| File | Change |
+|---|---|
+| `scripts/e7-hosted-recording.mjs` | (1) the start-facts evidence query now also returns `source, observed, observed_at` (read-only SELECT on `booking.provider_evidence`, same intent scope); (2) new pure export `refundObservationRefusal(evidence, paymentIntentId)` + `REFUND_OBSERVATION_FIELDS`; (3) `checkStart` calls it **after every existing admission check** (state, version, pins, history, ops, pristine recording, holds, ledger, existing `EVIDENCE_CONFLICT` fences incl. `stripe_refund` kind and foreign-PI refs, claim held) and before the schema-prerequisite check. Refusal codes: **`PAYMENT_REFUND_OBSERVED`**, **`PAYMENT_REFUND_EVIDENCE_INVALID`** — both surface as outcome `SCOPE_REFUSED` with zero lock / provider / worker activity (same path as the other start refusals). |
+| `test/e7-hosted-recording.test.mjs` | V1 pure matrix; V2 fake-DB runner cases; V3 opt-in PG proof (real repo + accepted `admin_record_evidence`). |
+Untouched: worker, lib, `INTENT_KEYS`, closure (`ef9341dc…`), pin `5a094b16`, workflow, schema, secrets, flags (`executeEnabled=false` ×5), other runners.
+
+## Rule (as implemented)
+For every stored evidence row with `kind = payment_intent` and `external_ref === plan.paymentIntentId` (any `source`, any `observed_at`, any position — **not a latest-only gate**): if `observed.amountRefundedMinor` is a positive safe integer **or** `observed.refunded === true` → `PAYMENT_REFUND_OBSERVED`. If either field is **present but malformed** (`null`, string, negative, non-finite, non-integer amount; non-boolean `refunded`) → `PAYMENT_REFUND_EVIDENCE_INVALID` (never coerced). Rows with no `observed` object or without these fields are UNKNOWN and change nothing (prior behaviour preserved; explicit `0`/`false` likewise refuses nothing and proves nothing). A positive observation wins over a malformed one (either refuses). Foreign-PI rows are not read by this veto (they already refuse as `EVIDENCE_CONFLICT`); other kinds are ignored by it.
+
+## Tests / results
+- recording suite @ pin 5a094b16: **22/22** dependency-free (V1, V2 added), **28/28** with `E7_HRC_DB_TESTS=1` (V3 added) on disposable schema-21 PG 16.
+- V2 covers: partial / full amount, `refunded` flag alone, both sources, old positive + newer zero (still refused), malformed amount / flag (`…_INVALID`), existing `stripe_refund` and foreign-PI fences still fire first as `EVIDENCE_CONFLICT`; zero / unknown / null-observed rows keep the A1 happy path (one POST). Each refusal: `w.calls` 0, lock `not_acquired`, worker 0, `writes.record` 0, fake state/ops/claim/ledger unchanged.
+- V3 (PG): owner-attested **dashboard** `payment_intent` row with `amountRefundedMinor = total, refunded = true` → `SCOPE_REFUSED / PAYMENT_REFUND_OBSERVED`, `recordInvocations` 0, provider calls 0, lock `not_acquired`, intent whole-row md5 / version / ops / claims / ledger byte-identical, recording op still `pending`, notify rows 0; a zero-refund dashboard row leaves admission unchanged (the I1 path records normally). Fixture note: the second case uses a distinct provider charge id (7700901) because the cluster already holds I1's 7700001 for another intent and the repo refuses a duplicate offline-charge id (event deferred) — a fixture collision, not a wrapper behaviour.
+- Other suites unchanged: reservation 20/20, capture 15/15, test-cleanup 20/20, recorded-cleanup 16/16, R0 1/1 (`[false×5]`), C15 default 1/1.
+
+## Digests (closed flags)
+reservation `5665544de105e4564a57a4434fa32fd2355b9bbd0e756b250d1248e07feb6b19` · capture `5b547a42200b452055d8a718c84ab70f7f2b5a0cd8343f6174c4a75b0c420ed1` · test-cleanup `33f2ab18984dccd3915a18ff8a55dd4a6e5b6bf89e3d84ba1e578347e6cebd1e` · **recording `31c0ca93c0a5440b8cccf8cdeb475e4f6f08a73421bab76460b958d13f810075`** (was `45dcc1a3…`; wrapper + its test file are in its `runnerFiles`) · recorded-cleanup `3e0eba4204d7dc8c688d8ddeb2afc0d057fe31b99258848b2538934e4c685d16`. Closure digests / pins unchanged. ROOT re-derives after merge.
+
+## What this does NOT do
+No affirmative proof that a payment is un-refunded (absence of fields = UNKNOWN); no freshness judgement; no provider read; no change to the worker's strict 12-key `INTENT_KEYS` or to the DB `recording_claim_fence` — a direct worker/DB path remains unprotected by this veto (ROOT `1a1d07e0`); no money, reservation, claim or state action; flags stay closed.
