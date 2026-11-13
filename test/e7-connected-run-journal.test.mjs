@@ -340,8 +340,11 @@ test("grammar pinned against the accepted worker sources; vocabulary parity with
   // E7 TEST cleanup worker (cleanup-worker.js): NOT one of the accepted hosted-runner workers this frozen v1/v2/R1 grammar journals. Its refund-only
   // tokens are REFUSED by this grammar on purpose (singleton exclusion, ROOT 5879497019); a journal grammar for it is the hosted cleanup slice's
   // own review. Explicit exclusion of exactly that file; its tokens are asserted REFUSED below.
-  const ACCEPTED_WORKER = (x) => (/-worker\.js$|^recovery\.js$/.test(x)) && x !== "cleanup-worker.js";
-  assert.ok(readdirSync(dir).includes("cleanup-worker.js"), "the excluded file exists (an exclusion of a missing file would be a stale pin)");
+  // E7 recorded TEST cleanup MIRROR worker (mirror-worker.js, ROOT GO 5884739645): the same explicit exclusion — not journaled by this frozen grammar;
+  // its tokens are asserted REFUSED below. Exactly these two files are excluded; nothing else.
+  const EXCLUDED = ["cleanup-worker.js", "mirror-worker.js"];
+  const ACCEPTED_WORKER = (x) => (/-worker\.js$|^recovery\.js$/.test(x)) && !EXCLUDED.includes(x);
+  for (const x of EXCLUDED) assert.ok(readdirSync(dir).includes(x), `the excluded file exists (an exclusion of a missing file would be a stale pin): ${x}`);
   for (const f of readdirSync(dir).filter(ACCEPTED_WORKER)) {
     const src = readFileSync(new URL(f, dir), "utf8");
     // whole-token literals only: template substitutions (${…}) are removed first, so fragments like "ID" inside `READ:${…}` are not tokens
@@ -354,6 +357,11 @@ test("grammar pinned against the accepted worker sources; vocabulary parity with
   for (const m of cleanupSrc.matchAll(/actions\.push\(([^;]*)\)/g)) for (const s of m[1].replace(/\$\{[^}]*\}/g, "").matchAll(/"([A-Z][A-Za-z0-9_:.>-]*)"/g)) cleanupLiterals.add(s[1]);
   for (const t of ["REFUND_CLAIMED", "CANCEL_CLAIMED"]) assert.ok(cleanupLiterals.has(t), t);
   for (const t of ["REFUND_CLAIMED", "REFUND_SUCCEEDED->cancelled", "REFUND_OUTCOME_UNKNOWN:REFUND_TIMEOUT", "DISCOVERED:succeeded"]) assert.equal(J.isActionToken(t), false, `cleanup-worker token refused by the frozen grammar: ${t}`);
+  const mirrorSrc = readFileSync(new URL("mirror-worker.js", dir), "utf8");
+  const mirrorLiterals = new Set();
+  for (const m of mirrorSrc.matchAll(/actions\.push\(([^;]*)\)/g)) for (const s of m[1].replace(/\$\{[^}]*\}/g, "").matchAll(/"([A-Z][A-Za-z0-9_:.>-]*)"/g)) mirrorLiterals.add(s[1]);
+  for (const t of ["MIRROR_CLAIMED", "REPLY:CANDIDATE", "MIRROR_COMPLETED"]) assert.ok(mirrorLiterals.has(t), t);
+  for (const t of ["MIRROR_CLAIMED", "MIRROR_COMPLETED", "OFFLINE_CHARGE_REFUND_RECORDED->cancelled", "MIRROR_UNKNOWN:MIRROR_TIMEOUT"]) assert.equal(J.isActionToken(t), false, `mirror-worker token refused by the frozen grammar: ${t}`);
   // representative TEMPLATED forms, built exactly as the workers build them
   for (const t of ["RESERVATION_STARTED->reservation_pending", "RESERVATION_STARTED!E3_REJECTED", "CAPTURE_SUCCEEDED->payment_captured", "RECORDED:DUPLICATE",
     "ASSESSED:eligible", "ASSESSED:blocked:HOLD_ACTIVE", "WAIT:CAPTURE_IN_FLIGHT", "STOP:RECORDING_ESCALATED", "LEASE_LOST:WORK_LEASE_LOST", "READ:hostaway.lookup_reservation:found",
