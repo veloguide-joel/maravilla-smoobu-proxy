@@ -5,8 +5,7 @@
 // HONEST LABEL: MANUAL hosted TEST processing (workflow_dispatch + the existing reviewer gate), NOT automatic customer checkout.
 // `payment_captured` is an INTERMEDIATE state: nothing is recorded (Hostaway offline charge) or notified by this runner; the recording row the
 // accepted state machine queues is reported PRISTINE and never dispatched. publicStatus is NOT changed here (alignment issue retained for
-// customer acceptance). Code is NOT consent: executeEnabled is OPEN here (and in the reservation runner) for ONE reviewed C3 TEST capture validation
-// only; Slices 3-5 stay CLOSED; the prepared CLOSE PR reverses both flags to false immediately after.
+// customer acceptance). Code is NOT consent: executeEnabled is CLOSED here, and the reservation runner's execution stays CLOSED too.
 //   * Inert on import (`import.meta.main` guard): no env / fs / network / DB / timer until a mode runs.
 //   * Smallest delta over the reviewed Slice 1 runner: the hosted boot / pinning / session-lock (5432) / stop / teardown patterns are REUSED
 //     (pure helpers imported from ./e7-hosted-reservation.mjs; the lock / fence / step / teardown sections are LABELLED COPIES of its reviewed
@@ -33,7 +32,7 @@ import { CONSTANTS as RES, canonical, framedDigest, childEnv, spawnNode, dbTarge
 export const CONSTANTS = Object.freeze({
   toolingCommit: "59178b0468469b6570beab861bbc8e48b3a887d1",                                  // C2 (2026-11-13): Slice 2 repinned to the MERGED e7-test C1 fix (#84, omits final_capture); DISTINCT from Slice 1 (40779e34)
   toolingStatus: "MERGED",
-  executeEnabled: true,                                    // Slice 2: OPEN for ONE reviewed C3 TEST capture validation (ROOT review 5897252439; C4 enable PR); CLOSE PR reverses this to false
+  executeEnabled: false,                                   // Slice 2: capture execution default CLOSED (verify / execute refuse HCP_EXECUTE_CLOSED)
   // the Slice 1 closure PATH SET + the accepted capture worker, at THIS runner's own pin 59178b04 (test C2 recomputes the set from an INDEPENDENT import scan
   // of the pinned tree — the set is unchanged by C1; the BYTES of capture-proof.js / executor-adapters.mjs / http-transports.mjs changed, hence the new digest)
   closure: Object.freeze([...RES.closure, "lib/booking-db/capture-worker.js"].sort()),

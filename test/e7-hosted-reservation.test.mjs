@@ -255,8 +255,8 @@ test("A9 postcheck agreement: a worker that claims confirmation while the captur
   assert.deepEqual([r.outcome, r.code], ["POSTCHECK_MISMATCH", "CAPTURE_NOT_PRISTINE"]);
 });
 
-test("C1 code ceiling: Slice 1 execution OPEN (executeEnabled true) for the ONE reviewed C3 TEST capture validation (C4 enable PR), tooling 40779e34 MERGED; plan pins exact scope and ZERO capture / refund / record / notify / cancel / void", () => {
-  assert.equal(C.executeEnabled, true); assert.equal(C.toolingCommit, "40779e34e8c65ac5c4494bc5a18cd4223ef723fa"); assert.equal(C.toolingStatus, "MERGED");
+test("C1 code ceiling: Slice 1 execution CLOSED again (executeEnabled false after the ONE reviewed owner-present hosted TEST), tooling 40779e34 MERGED; plan pins exact scope and ZERO capture / refund / record / notify / cancel / void", () => {
+  assert.equal(C.executeEnabled, false); assert.equal(C.toolingCommit, "40779e34e8c65ac5c4494bc5a18cd4223ef723fa"); assert.equal(C.toolingStatus, "MERGED");
   const p = plan(); assert.deepEqual(p.writes, { hostawayCreateMax: 1, capture: 0, refund: 0, record: 0, notify: 0, cancel: 0, void: 0, account: 0, keys: 0 });
   assert.deepEqual(plan({ admission: "pending", reservationId: RID }).writes.hostawayCreateMax, 0);
   for (const bad of [{ admission: "authorized", reservationId: RID }, { admission: "pending", reservationId: "" }, { admission: "pending", reservationId: C.protectedReservationIds[0] },
@@ -285,7 +285,7 @@ const realEnv = (over = {}) => ({ E7_TOOLING_DIR: TOOLING, E7_APPROVAL_REF: "lab
 
 test("H1 hosted: preflight (no secrets) passes on the pinned closure; any secret outside execute is refused; partial / invalid inputs refused", async () => {
   let x = await E.runHosted({ mode: "preflight", env: { E7_TOOLING_DIR: TOOLING }, proc: PROC, wrapperDir: ROOT, deps: { spawnChild: okChild } });
-  assert.deepEqual([x.exitCode, x.result.code, x.result.planKind, x.result.closureDigest, x.result.executeEnabled], [0, "PREFLIGHT_OK_SYNTHETIC_ONLY", "SYNTHETIC", C.closureDigest, true], JSON.stringify(x.result));
+  assert.deepEqual([x.exitCode, x.result.code, x.result.planKind, x.result.closureDigest, x.result.executeEnabled], [0, "PREFLIGHT_OK_SYNTHETIC_ONLY", "SYNTHETIC", C.closureDigest, false], JSON.stringify(x.result));
   x = await E.runHosted({ mode: "preflight", env: realEnv(), proc: PROC, wrapperDir: ROOT, deps: { spawnChild: okChild } });
   assert.deepEqual([x.exitCode, x.result.code, x.result.planKind], [0, "PREFLIGHT_OK_REAL_PLAN", "REAL"]);
   assert.equal(x.result.planHash, E.buildPlan(C, { approvalRef: "label-1", intentId: IID, expectedVersion: VER, notBefore: NB, admission: "authorized", reservationId: "", runnerDigest: x.result.runnerDigest }).planHash);
@@ -299,7 +299,7 @@ test("H1 hosted: preflight (no secrets) passes on the pinned closure; any secret
   assert.equal(bad.result.code, "HRS_TESTS_FAILED");
 });
 
-test("H2 hosted: verify / execute refuse HRS_EXECUTE_CLOSED under a test-local executeEnabled=false config before any pin, ref or import check (the shipped constant is OPEN for the C3 validation; the test-local control keeps the refusal path exercised in either state); an opened constants seam still refuses off main / wrong digests / secrets missing", async () => {
+test("H2 hosted: verify / execute refuse HRS_EXECUTE_CLOSED under a test-local executeEnabled=false config before any pin, ref or import check (the shipped constant is CLOSED again; the test-local control is kept so the refusal path is exercised in either state); an opened constants seam still refuses off main / wrong digests / secrets missing", async () => {
   const CLOSED = { ...C, executeEnabled: false };   // test-local CLOSED control: the refusal path stays exercised while the shipped constant is OPEN
   const x = await E.runHosted({ mode: "verify", env: { ...realEnv(), E7_EXPECTED_PLAN_HASH: "0".repeat(64), E7_EXPECTED_CLOSURE_DIGEST: C.closureDigest, E7_EXPECTED_RUNNER_DIGEST: "0".repeat(64), GITHUB_REF: "refs/heads/main" }, proc: PROC, wrapperDir: ROOT, deps: { constants: CLOSED } });
   assert.deepEqual([x.exitCode, x.result.code, x.result.closureDigest], [1, "HRS_EXECUTE_CLOSED", null]);

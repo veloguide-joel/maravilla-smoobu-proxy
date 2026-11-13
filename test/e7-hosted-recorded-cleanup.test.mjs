@@ -602,8 +602,8 @@ test("A10 postcheck + readbacks + residual agreement: a mirror worker that claim
     assert.deepEqual([r.outcome, r.code, posts(w), w.mirrorCalls], ["LINEAGE_MISMATCH", "MIRROR_ROW_NOT_BOUND", [CANCEL_URL, REFUND_URL], 0], JSON.stringify(r)); }
 });
 
-test("C1 code ceiling: Slice 5 recorded cleanup execution CLOSED (executeEnabled false), Slices 3 / 4 CLOSED, Slices 1 / 2 OPEN on THEIR tooling pins for the ONE reviewed C3 TEST capture validation; this runner pins the MERGED e7-test e41b654a; the plan pins pi / reservation / Stripe charge / original offline charge / captured amount / stay / attempt / session and the accepted keys / titles / amount; ZERO capture / void / record / notify / create; the derived expectation is EXACTLY the accepted 18 keys", () => {
-  assert.equal(C.executeEnabled, false); assert.deepEqual([RESRUN, CAPRUN, TCRUN, RCRUN].map((R) => R.CONSTANTS.executeEnabled), [true, true, false, false]);
+test("C1 code ceiling: Slice 5 recorded cleanup execution CLOSED (executeEnabled false) AND the Slice 1–4 runners CLOSED again on THEIR tooling pins (after the ONE reviewed owner-present TEST); this runner pins the MERGED e7-test e41b654a; the plan pins pi / reservation / Stripe charge / original offline charge / captured amount / stay / attempt / session and the accepted keys / titles / amount; ZERO capture / void / record / notify / create; the derived expectation is EXACTLY the accepted 18 keys", () => {
+  assert.equal(C.executeEnabled, false); for (const R of [RESRUN, CAPRUN, TCRUN, RCRUN]) assert.equal(R.CONSTANTS.executeEnabled, false);
   assert.equal(C.toolingCommit, "e41b654a667cb0ba8775b5bd0040c28a3d14fda0"); assert.equal(C.toolingStatus, "MERGED");
   assert.equal(TCRUN.CONSTANTS.toolingCommit, "9d86bfa1e60779b3794de88bbae151670e8fe515", "the reviewed Slice 3 pin is untouched"); assert.equal(RCRUN.CONSTANTS.toolingCommit, "5a094b16c1f84690a738a98ab89140caa69c1e1f", "the reviewed Slice 4 pin is untouched");
   assert.equal(CAPRUN.CONSTANTS.toolingCommit, "59178b0468469b6570beab861bbc8e48b3a887d1", "C2: Slice 2 pins the merged C1 fix; this runner's own pin is untouched");
