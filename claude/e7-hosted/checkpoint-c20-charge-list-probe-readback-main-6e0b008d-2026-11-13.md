@@ -7,7 +7,7 @@ Doc-only checkpoint from merged main `6e0b008d950e3045a7c73447405da413a75c9a8a` 
 ## 1. Merged identity
 | | |
 |---|---|
-| probe script | `scripts/e7-hosted-charge-list-probe.mjs` `e7-hosted-charge-list-probe-v2` (#95 C17/C18, review 5899125821 → main `20136805`, exact reviewed `6d5d9124` / tree `6e2af5b1`) |
+| probe script | `scripts/e7-hosted-charge-list-probe.mjs` `e7-hosted-charge-list-probe-v2` (#95 C17/C18, GO review 5899273450 (superseding HOLD 5899125821) → main `20136805`, exact reviewed `6d5d9124` / tree `6e2af5b1`) |
 | workflow + test | `.github/workflows/e7-hosted-charge-list-probe.yml`, `test/e7-hosted-charge-list-probe-workflow.test.mjs` (#96 C19, review 5899378420 → **main `6e0b008d`**, exact reviewed `5fee7a2e` / tree `278d0789`; ROOT independent 18/18) |
 | probe source digest | `b98931bc4d30f0fa0a8f475c4acbbd2ed2392472cf3fc70bec0ec7cfb36a765b` (prefix `e7-hosted-charge-list-probe-v1\n`; script → test → workflow; `framedDigest` frame; independently reproduced by ROOT) |
 | tooling pin / manifest | `5a094b16c1f84690a738a98ab89140caa69c1e1f`; 8 files (capture-proof `9a3c7948…`, compensation-proof `03645839…`, intent-state `ef132f4e…`, offline-charge-proof `2469ee96…`, recovery-plan `4ffd8dd4…`, hostaway-reservations `d86827cc…`, http-transports `2c41847f…`, real-exchange `bc584758…`) verified before any import |
@@ -39,9 +39,9 @@ Exit 0 = `SHAPE_COMPATIBLE` / `SHAPE_COMPATIBLE_WITH_UNKNOWN_VALUES`; 1 = probe 
 | what was NOT done | exactly 2 GETs; no pagination, redirect, retry, write, DB, Stripe, record, notify, cancel, refund or void; no operational INSERT anywhere |
 
 ## 5. Consequences (from §3–§4 only)
-- The Hostaway charge-LIST **empty-envelope** read for R71700931 matched the accepted proofs (`assessChargeList` + `preflightListObservation`): 200 / `success` / `result: []`, `count 0`, `offset null` and `limit absent` = the defined defaults, no continuation marker, no `UNKNOWN` enum value. Identity re-proven live: status `new`, USD, fixed binding matched. Nothing has been recorded on R71700931 through any path (matching 0, rowCount 0).
+- The Hostaway charge-LIST **empty-envelope** read for R71700931 matched the accepted proofs (`assessChargeList` + `preflightListObservation`): 200 / `success` / `result: []`, `count 0`, `offset null` and `limit absent` = the defined defaults, no continuation marker, no `UNKNOWN` enum value. Identity re-proven live: status `new`, USD, fixed binding matched. At this observation, the bounded selector returned no charge rows (matching 0, rowCount 0); this does not establish historical absence of charges through every path.
 - **Still LIVE-UNVERIFIED:** non-empty row shapes (`type/status/paymentProvider/paymentMethod/currency` values Hostaway actually emits), the `POST /v1/guestPayments/charges/{id}` create path and its reply shape (`offline-charge-proof.js` create branch), and pagination behaviour on a non-empty list.
-- **No fresh DB / Stripe / old-intent / protected-reservation / provider-wide check was performed in C20.** Earlier observations (C3 closure, C12 provider end check, C15 dashboard evidence) stand only with their own timestamps; they are NOT restated here as current claims.
+- **No fresh DB / Stripe / old-intent / protected-reservation / provider-wide check was performed in C20.** Earlier live observations (C3 closure and C12 provider end check) stand only with their own timestamps; they are NOT restated here as current claims. C15 dashboard-evidence tests used a disposable database and provide no live provider observation.
 - Recording / notification / cleanup remain HELD; manual disposition of the captured TEST payment is pending and is a policy decision, not a technical one; manual-refund policy unchanged; both intents immutable; all five flags FALSE and digests unchanged. **This checkpoint authorises nothing and implies no follow-up action.**
 
 ## 6. Closure
