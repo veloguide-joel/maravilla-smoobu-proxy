@@ -186,10 +186,12 @@ test("one fresh intent through the page controller + REAL handler/core/repo/PG: 
   p = pageLoad({ srv, storage, clock, timers, search: "?checkout=complete" }); await p.c.init();
   assert.deepEqual([p.last().screen, p.last().title], ["authorized", "Processing — not a booking"]);
   assert.equal(p.c.state.notice.code, "RETURNED_COMPLETE");
-  // release request: queued, claim held, ZERO provider calls in the route
+  // release request — the page's TWO-STEP release (arm, then explicit confirm): queued, claim held, ZERO provider calls in the route
   const callsBefore = w.calls.length;
   clock.now = NOW0 + 6 * MIN;
-  await p.c.release();
+  p.c.armRelease();                                                        // step 1 of 2: arms only, sends NOTHING
+  assert.deepEqual([p.last().confirmingRelease, srv.log.filter((l) => l.startsWith("release:")).length], [true, 0], "armed, nothing sent yet");
+  await p.c.confirmRelease();                                              // step 2 of 2: the ONE send
   assert.equal(w.calls.length, callsBefore, "the release route makes no provider call");
   assert.deepEqual([p.last().screen, p.c.state.notice.code], ["releaseQueued", "RELEASE_REQUESTED"]);
   assert.deepEqual((await loadIntent(db.app, id)).status, "reservation_failed");
@@ -231,8 +233,11 @@ test("reply-boundary faults across the real stack: Pay applied but its reply los
   await p.c.create(stay()); clock.now += 1000; await p.c.details(GUEST);
   assert.equal(p.last().screen, "pay");
   const id = await intentOf(storage);
-  // the REAL pay step runs (Checkout prepared on the fake account) but the reply never reaches the page
-  p = pageLoad({ srv, storage, clock, timers, fault: (_path, body) => (body.step === "pay" ? "drop" : null) });
+  // the REAL pay step runs (Checkout prepared on the fake account) but the reply never reaches the page.
+  // INITIALIZED fault setup: the faulted tab is loaded (init() reads the real pre-Pay status) BEFORE Pay — the stricter
+  // payEligible() sends nothing from an uninitialised tab, so a bare pay() on a fresh page object would never exercise the lost reply.
+  p = pageLoad({ srv, storage, clock, timers, fault: (_path, body) => (body.step === "pay" ? "drop" : null) }); await p.c.init();
+  assert.deepEqual([p.c.state.last, p.last().canPay], ["awaiting_details", true], "initialised: the real pre-Pay status is read and Pay is eligible before the faulted send");
   clock.now += 1000; await p.c.pay();
   assert.deepEqual([p.last().latch, p.c.state.notice.code, p.nav.assigned.length], ["pay", "PAY_UNCERTAIN", 0]);
   assert.equal(w.writes.sessionCreate, 1); assert.equal((await loadIntent(db.app, id)).status, "payment_pending");
