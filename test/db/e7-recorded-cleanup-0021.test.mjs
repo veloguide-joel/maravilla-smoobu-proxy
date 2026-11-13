@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 import pg from "pg";
 import { startMigratedDatabase, startPostgres } from "./harness.mjs";
 import * as F from "./fixtures.mjs";
-import { applyEvent, loadIntent, claimReleaseBlockers } from "../../lib/booking-db/repo.js";
+import { applyEvent, loadIntent, claimReleaseBlockers, createIntentRecord, collectGuestDetails, beginPayStep, recordCheckoutSession, recordHostawayCreateResult } from "../../lib/booking-db/repo.js";
 import { claimNextOperation, completeOperation, requestRead, recordProviderEvidence, completeRecordingWithEvidence, completeOfflineRefundWithEvidence } from "../../lib/booking-db/operations.js";
 import { requestTestCleanup } from "../../lib/booking-db/test-cleanup.js";
 import { requestRecordedTestCleanup, bindRecordedCleanupExpectation, TEST_CLEANUP_RECORDED_EXPECTATION_KEYS } from "../../lib/booking-db/test-cleanup-recorded.js";
@@ -39,10 +39,32 @@ const refusal = (p, re) => assert.rejects(p, re);
 // ---- REAL fixtures ----
 /** a CAPTURED TEST payment on 606998 / USD (0019 pattern: the capture result is a Stripe CHARGE id) */
 let stayN = 0;
-async function capturedUSD(pool = db.app) {
+/** F.reserved with a caller-chosen guest (the 0016 v1 recipient scope is `.invalid`; the shared fixture guest is out of scope) — same accepted steps */
+async function reservedWithGuest(pool, stay, guest) {
+  const intent = await createIntentRecord(pool, { ref: F.nextRef(), accessTokenHash: F.tokenHash(), environment: "test", now: F.at(0), guests: 2, ...stay });
+  const id = intent.id;
+  F.ok(await applyEvent(pool, id, { type: "PRICE_CONFIRMED", price: F.priceFor(stay) }, { now: F.at(0), actor: "guest" }), "price");
+  F.ok(await collectGuestDetails(pool, id, guest, { now: F.at(1), termsVersion: "terms-2026-10" }), "details");
+  const b = F.ok(await beginPayStep(pool, id, { now: F.at(2) }), "pay");
+  const sessionId = `cs_test_${id.slice(0, 8)}`;
+  const cs = await claimNextOperation(pool, { workerId: "w-pay", now: F.at(2), intentId: id, opTypes: ["stripe.create_checkout_session"] });
+  F.ok(await completeOperation(pool, cs.id, { workerId: "w-pay", now: F.at(2), outcome: { status: "succeeded", resultRef: sessionId } }), "cs op");
+  F.ok(await recordCheckoutSession(pool, id, b.attempt.id, { sessionId, expiresAt: F.at(32), now: F.at(2) }), "session");
+  const piId = `pi_test_${id.slice(0, 8)}`;
+  F.ok(await applyEvent(pool, id, F.authEvent(sessionId, piId, 5, { currency: "usd" }), { now: F.at(5), actor: "webhook" }), "auth");
+  F.ok(await applyEvent(pool, id, { type: "RESERVATION_STARTED", workerId: "w1", recheck: { bookable: true, priceSame: true } }, { now: F.at(6), actor: "worker", workerId: "w1" }), "start");
+  F.ok(await applyEvent(pool, id, { type: "RESERVATION_DISPATCHED", workerId: "w1" }, { now: F.at(6), actor: "worker", workerId: "w1" }), "dispatch");
+  const rid = F.nextReservationId();
+  const cr = await F.claimOp(pool, id, "hostaway.create_reservation", F.at(6));
+  await recordHostawayCreateResult(pool, id, { httpStatus: 201, reservation: F.reservationFor(stay, rid) }, { now: F.at(7) });
+  F.ok(await completeOperation(pool, cr.id, { workerId: "w1", now: F.at(7), outcome: { status: "succeeded", resultRef: rid } }), "create op");
+  F.ok(await applyEvent(pool, id, { type: "RESERVATION_SUCCEEDED", reservation: F.reservationFor(stay, rid) }, { now: F.at(7), actor: "worker" }), "reserved");
+  return { id, attemptId: b.attempt.id, sessionId, piId, reservationId: rid };
+}
+async function capturedUSD(pool = db.app, { guest = null } = {}) {
   stayN += 1;
   const stay = { listingId: LIST, currency: "USD", from: F.addDays("2027-06-01", 3 * stayN), to: F.addDays("2027-06-01", 3 * stayN + 2) };
-  const r = await F.reserved(pool, stay);
+  const r = guest ? await reservedWithGuest(pool, stay, guest) : await F.reserved(pool, stay);
   const stripeChargeId = `ch_test_${r.id.replace(/-/g, "").slice(0, 16)}`;
   const op = await F.claimOp(pool, r.id, CAP, F.at(8));
   F.ok(await completeOperation(pool, op.id, { workerId: "w1", now: F.at(8), outcome: { status: "succeeded", resultRef: stripeChargeId } }), "capture op");
@@ -52,8 +74,8 @@ async function capturedUSD(pool = db.app) {
 const origObserved = (c, o = {}) => F.recordingObserved({ id: c.id, reservationId: c.reservationId, listingId: LIST }, c.offlineChargeId, { currency: "USD", ...o });
 /** a RECORDED (confirmed) TEST booking: the ONE recording claimed (healthy preflight), proven by a confirming LIST read, completed through the
  *  0010 function, then OFFLINE_CHARGE_RECORDED (queues the ONE pristine guest.notify row) — F.confirmed, on USD */
-async function recordedUSD(pool = db.app) {
-  const c = await capturedUSD(pool);
+async function recordedUSD(pool = db.app, opts = {}) {
+  const c = await capturedUSD(pool, opts);
   const offlineChargeId = String(F.nextReservationId() + 500000);
   const cc = { ...c, offlineChargeId };
   const { op, t } = await F.claimRecording(pool, c, Date.now(), "w1");
@@ -80,10 +102,19 @@ const request = (c, over = {}, env = ENV, pool = db.app) => expectationFor(c, ov
 // ---- REAL legs (0019 helpers) ----
 const piObserved = (c, o = {}) => ({ proofVersion: "pi-proof-v3", object: "payment_intent", paymentIntentId: c.piId, accountVerified: true, livemode: false, metadataIntentId: c.id,
   metadataAttemptId: c.attemptId, captureMethod: "manual", status: "succeeded", amountMinor: AMT, amountReceivedMinor: AMT, amountCapturableMinor: 0, currency: "USD",
-  latestCharge: { object: "charge", id: c.stripeChargeId, paymentIntent: c.piId, status: "succeeded", captured: true, amountMinor: AMT, amountCapturedMinor: AMT, amountRefundedMinor: AMT,
+  latestCharge: { object: "charge", id: c.stripeChargeId, paymentIntent: c.piId, status: "succeeded", captured: true, amountMinor: AMT, amountCapturedMinor: AMT, amountRefundedMinor: o.refundedMinor ?? AMT,
     currency: "USD", livemode: false, paid: true, captureBefore: null }, ...o });
-const refundObserved = (c, re) => ({ refundId: re, paymentIntentId: c.piId, chargeId: c.stripeChargeId, amountMinor: AMT, currency: "USD", status: "succeeded", created: Math.floor(F.at(22) / 1000) });
-async function piRead(c, t, pool = db.app) { const id = await F.completedRead(pool, c.id, "stripe.retrieve_payment_intent", c.piId, F.at(t)); return F.readEvidenceOf(pool, id, "payment_intent", c.piId, "succeeded", piObserved(c)); }
+const refundObserved = (c, re, status = "succeeded") => ({ refundId: re, paymentIntentId: c.piId, chargeId: c.stripeChargeId, amountMinor: AMT, currency: "USD", status, created: Math.floor(F.at(22) / 1000) });
+async function piRead(c, t, pool = db.app, o = {}) { const id = await F.completedRead(pool, c.id, "stripe.retrieve_payment_intent", c.piId, F.at(t)); return F.readEvidenceOf(pool, id, "payment_intent", c.piId, "succeeded", piObserved(c, o)); }
+/** a NEW bound Stripe refund read through the accepted APIs (requestRead → claim → complete → recordProviderEvidence), observed at `atMs` */
+async function refundRead(c, re, status, atMs = Date.now(), pool = db.app) {
+  const rid = await requestRead(pool, c.id, "stripe.retrieve_refund", re, { now: atMs });
+  assert.ok(await claimNextOperation(pool, { workerId: "w-read", now: atMs, opId: rid }), "refund read claimable");
+  F.ok(await completeOperation(pool, rid, { workerId: "w-read", now: atMs, outcome: { status: "succeeded" } }), "refund read");
+  return F.ok(await recordProviderEvidence(pool, { readOpId: rid, kind: "stripe_refund", externalRef: re, status, observed: refundObserved(c, re, status) }), "refund evidence").id;
+}
+const stripeSettled = async (c, pool = db.app) => (await pool.query("SELECT booking.test_refund_settled_for($1, $2) AS ok", [c.id, c.piId])).rows[0].ok;
+const legsUnsettled = async (c, pool = db.app) => (await pool.query("SELECT booking.recorded_cleanup_legs_unsettled($1) AS r", [c.id])).rows[0].r;
 async function refundLeg(c, t, pool = db.app) {
   const re = `re_test_${c.id.replace(/-/g, "").slice(0, 12)}`;
   const op = await claimNextOperation(pool, { workerId: "w-cleanup", now: F.at(t), intentId: c.id, opTypes: [REFUND] });
@@ -94,6 +125,7 @@ async function refundLeg(c, t, pool = db.app) {
   F.ok(await completeOperation(pool, rid, { workerId: "w-read", now: F.at(t + 1), outcome: { status: "succeeded" } }), "refund read");
   F.ok(await recordProviderEvidence(pool, { readOpId: rid, kind: "stripe_refund", externalRef: re, status: "succeeded", observed: refundObserved(c, re) }), "refund evidence");
   await piRead(c, t + 1, pool);
+  c.re = re;
   return { re, r: await applyEvent(pool, c.id, { type: "REFUND_SUCCEEDED", id: `refund-ok:${c.id}`, refundId: re, chargeId: c.stripeChargeId, amountMinor: AMT, currency: "usd" }, { now: F.at(t + 2), actor: "worker", workerId: "w-cleanup" }) };
 }
 /** the cancelled reservation read is observed at REAL time: the recording's preflight identity read (found_active) was observed at real time,
@@ -338,7 +370,7 @@ test("Q2 REAL refusals (ZERO writes): the pristine request on a recorded booking
   F.ok(await request(c), "request after undo");
 });
 
-test("Q3 REAL two-session race at the intent row: a notification claimant holding the intent lock first → the request waits, then refuses read-only (claim wins, intent stays confirmed); request first → the later REAL claim is NOT_PENDING", async () => {
+test("Q3 two-session race at the intent row with SYNTHETIC claimant surrogates (owner trigger-bypass; the REAL claim_guest_notification race is Q13): a notification claimant holding the intent lock first → the request waits, then refuses read-only (claim wins, intent stays confirmed); request first → the later REAL claim is NOT_PENDING", async () => {
   // (a) claimant first: session 1 takes the gn_lock_bundle first lock (intents FOR SHARE), the request blocks on FOR NO KEY UPDATE, session 1
   //     writes the SYNTHETIC claim surrogate and commits; the request then sees attempts 1 and refuses with nothing written
   const c = await recordedUSD();
@@ -627,4 +659,164 @@ test("Q10 migration: 0021 down restores the 0020 schema exactly (functions incl.
   try { await refusal(migrateDown(owner, { env: "test", to: 20 }), /cannot be rolled back/); }
   finally { await owner.end(); }
   assert.equal((await db.app.query("SELECT count(*)::int AS n FROM booking.notification_suppressions")).rows[0].n > 0, true);
+});
+
+// ============================================================================================= ROOT HOLD 5884519489 (F1 / F2 / F3)
+test("Q11 (F1) the terminal event is BOUND to the ONE proven mirror: OFFLINE_CHARGE_REFUND_RECORDED carrying another refund id → ok:false TEST_CLEANUP_MIRROR_EVENT_UNBOUND with ZERO writes (pending, flag false, claim held, no ledger, end predicate false); the correct id completes; the DB ledger fence / deferred terminal trigger refuse an unbound entry independently of the repo", async () => {
+  const c = await bothLegs(await recordedUSD());
+  await claimMirror(c);
+  assert.deepEqual((await completeMirror(c)).r, { ok: true, state: "succeeded" });
+  const proven = refundIdOf(c); const wrong = String(Number(proven) + 77);
+  const snap = async () => [await intentRow(c.id), await ledger(c.id), await held(c.id), (await rows(c.id, MIRROR)).map((o) => [o.state, o.result_ref])];
+  const before = await snap();
+  const bad = await terminal(c, wrong);
+  assert.equal(bad.ok, false, JSON.stringify(bad)); assert.equal(bad.error, "TEST_CLEANUP_MIRROR_EVENT_UNBOUND");
+  assert.deepEqual(await snap(), before, "ZERO writes: still test_cleanup_pending / flag false / claim held / ledger unchanged");
+  assert.equal(await endOk(c.id), false);
+  assert.equal((await terminal(c, c.offlineChargeId)).error, "MIRROR_REFUND_ID_INVALID", "the original's id is refused by the reducer");
+  assert.equal((await terminal(c, String(Number(proven) + 1000))).error, "TEST_CLEANUP_MIRROR_EVENT_UNBOUND");
+  assert.deepEqual(await snap(), before);
+  // the DB alone (owner, rolled back): an unbound ledger entry is refused at the INSERT; a terminal without the bound entry is refused at COMMIT
+  const o = await db.owner.connect();
+  try {
+    await o.query("BEGIN");
+    await refusal(o.query("INSERT INTO booking.payment_ledger (intent_id, entry, amount_minor, currency, provider, provider_ref, source, at) VALUES ($1, 'offline_charge_refund_recorded', $2, 'USD', 'hostaway', $3, 'x', now())", [c.id, AMT, wrong]), /MIRROR_LEDGER_UNBOUND/);
+    await o.query("ROLLBACK"); await o.query("BEGIN");
+    await refusal(o.query("INSERT INTO booking.payment_ledger (intent_id, entry, amount_minor, currency, provider, provider_ref, source, at) VALUES ($1, 'offline_charge_refund_recorded', $2, 'USD', 'hostaway', $3, 'x', now())", [c.id, AMT, proven]), /MIRROR_LEDGER_UNBOUND/, "flag still false: not the terminal transaction");
+    await o.query("ROLLBACK"); await o.query("BEGIN");
+    await o.query("UPDATE booking.intents SET state = 'cancelled', settlement_recording_mirrored = TRUE, version = version + 1, updated_at = now() WHERE id = $1", [c.id]);
+    await refusal(o.query("COMMIT"), /MIRROR_LEDGER_REQUIRED/);
+  } finally { await o.query("ROLLBACK").catch(() => {}); o.release(); }
+  assert.deepEqual(await snap(), before, "the DB refusals persisted nothing");
+  // control: the proven id
+  const good = await terminal(c, proven);
+  assert.equal(good.ok, true, JSON.stringify(good));
+  assert.deepEqual((await ledger(c.id)).filter((l) => l.entry === "offline_charge_refund_recorded"), [{ entry: "offline_charge_refund_recorded", amt: String(AMT), currency: "USD", provider: "hostaway", provider_ref: proven }]);
+  assert.equal(await endOk(c.id), true); assert.equal(await held(c.id), false);
+});
+
+test("Q12 (F2) the other two legs are re-verified from the LATEST persisted facts at mirror claim, dedicated completion and the terminal: a later failed Stripe refund observation / a later found_active reservation observation refuse (row + claim preserved, no attempt); restoration controls admit", async () => {
+  const c = await bothLegs(await recordedUSD());
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const activeObserved = { listingId: LIST, from: c.stay.from, to: c.stay.to, totalMinor: AMT };
+  const mirrorRow = async () => (await rows(c.id, MIRROR)).map((o) => [o.state, o.attempts, o.dispatched_at === null])[0];
+  // after create / before claim: a NEW bound refund read says failed → not settled → the claim is refused; the pristine row and the claim stay
+  assert.equal(await stripeSettled(c), true); assert.equal(await legsUnsettled(c), null);
+  await refundRead(c, c.re, "failed", Date.now() - 5);
+  assert.equal(await stripeSettled(c), false, "the latest bound observation decides"); assert.equal(await legsUnsettled(c), "STRIPE_REFUND_NOT_SETTLED");
+  await refusal(claimMirror(c), /MIRROR_CLAIM_FENCED: STRIPE_REFUND_NOT_SETTLED/);
+  assert.deepEqual(await mirrorRow(), ["pending", 0, true], "no attempt"); assert.ok(await held(c.id));
+  assert.deepEqual(await intentRow(c.id).then((x) => [x.state, x.rc, x.a, x.m]), ["test_cleanup_pending", true, true, false], "flags only move forward; the intent is untouched");
+  // restoration: a newer succeeded observation
+  await sleep(15); await refundRead(c, c.re, "succeeded", Date.now() - 5);
+  assert.equal(await legsUnsettled(c), null);
+  // the reservation leg: a later found_active observation → refused; a later cancelled observation restores
+  await sleep(15); await F.reservationStatus(db.app, c.id, String(c.reservationId), "found_active", activeObserved, nowMin());
+  assert.equal(await legsUnsettled(c), "RESERVATION_NOT_CANCELLED_LATEST");
+  await refusal(claimMirror(c), /MIRROR_CLAIM_FENCED: RESERVATION_NOT_CANCELLED_LATEST/);
+  assert.deepEqual(await mirrorRow(), ["pending", 0, true]);
+  await sleep(15); await F.reservationStatus(db.app, c.id, String(c.reservationId), "cancelled", {}, nowMin());
+  assert.equal(await legsUnsettled(c), null);
+  const op = await claimMirror(c);
+  assert.deepEqual(await mirrorRow(), ["in_flight", 1, false]);
+  // after claim / before completion: a contradiction refuses the dedicated completion; the in_flight row and the claim are preserved
+  await sleep(15); await refundRead(c, c.re, "failed", Date.now() - 5);
+  const r1 = await completeMirror(c);
+  assert.equal(r1.r.ok, false, JSON.stringify(r1.r)); assert.match(String(r1.r.error), /MIRROR_LEGS_UNSETTLED/);
+  assert.deepEqual(await mirrorRow(), ["in_flight", 1, false]); assert.ok(await held(c.id));
+  assert.equal((await rows(c.id, MIRROR))[0].settled_evidence_id, null);
+  await sleep(15); await refundRead(c, c.re, "succeeded", Date.now() - 5);
+  assert.deepEqual((await completeMirror(c)).r, { ok: true, state: "succeeded" }, "restoration: the same proof completes");
+  // the terminal: a contradiction after the mirror success refuses the terminal (state preserved); restoration admits
+  await sleep(15); await refundRead(c, c.re, "failed", Date.now() - 5);
+  const t1 = await terminal(c); assert.equal(t1.ok, false); assert.match(String(t1.error), /CANCELLATION_NOT_VERIFIED|AUTHORIZATION_NOT_VERIFIED/);
+  assert.deepEqual(await intentRow(c.id).then((x) => [x.state, x.m]), ["test_cleanup_pending", false]); assert.ok(await held(c.id));
+  await sleep(15); await refundRead(c, c.re, "succeeded", Date.now() - 5);
+  assert.equal((await terminal(c)).ok, true); assert.equal(await endOk(c.id), true);
+  // and a contradiction AFTER the terminal does not reopen anything; the end predicate reports it honestly
+  await sleep(15); await refundRead(c, c.re, "failed", Date.now() - 5);
+  assert.equal((await intentRow(c.id)).state, "cancelled"); assert.equal(await endOk(c.id), false);
+  assert.ok(op);
+});
+
+test("Q13 (F3) REAL app-role claim_guest_notification race (valid work lease / RR snapshot / hashes; NO trigger bypass): claimant-first (the claimant holds the intent SHARE lock while blocked at the reservation-attempts row; the request waits, then refuses read-only), request-first (snapshot taken, suppression commits, the claim with the still-valid snapshot is NOT_PENDING and claim_notification_work is idle), and concurrent controls (exactly one winner)", async (t) => {
+  // preconditions for a QUALIFYING notification (0016 guest_notification_refusal): v1 recipient scope `.invalid`, USD, a v3 PI observation after the
+  // capture dispatch showing the capture and NO refund, the proven recording, no refund record, no open case, no unsettled provider op
+  const n = () => ++stayN;
+  const mk = async () => {
+    const c = await recordedUSD(db.app, { guest: { firstName: "Synthia", lastName: "Fixture", email: `guest.q13.${n()}@mv-test.invalid` } });
+    await piRead(c, 9, db.app, { refundedMinor: 0 });
+    return c;
+  };
+  const observe = async (sql, params) => {                                                 // R-C1 observation contract (0016)
+    const x = await db.app.connect();
+    try { await x.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"); const r = (await x.query(sql, params)).rows[0].r; await x.query("COMMIT"); return r; }
+    catch (e) { await x.query("ROLLBACK").catch(() => {}); throw e; } finally { x.release(); }
+  };
+  const work = async (worker, c) => (await db.app.query("SELECT booking.claim_notification_work($1, $2, $3) AS r", [worker, [LIST], c.id])).rows[0].r;
+  const snapshot = (op) => observe("SELECT booking.guest_notification_snapshot($1) AS r", [op]);
+  const CONTENT = "1".repeat(64);
+  const claim = async (op, worker, s) => (await db.app.query("SELECT booking.claim_guest_notification($1, $2, 'gn-v1', $3, $4, $5) AS r", [op, worker, CONTENT, s.factsHash, s.recipientHash])).rows[0].r;
+  const refusalCode = async (op) => (await db.owner.query("SELECT booking.guest_notification_refusal($1) AS r", [op])).rows[0].r;
+  // control: the fixture really qualifies and a REAL claim really claims (no race)
+  const k = await mk();
+  assert.equal(await refusalCode(k.notifyOpId), null, "the notification qualifies at the fence predicate");
+  const wk = await work("gn-q13-ctl", k); assert.equal(wk.status, "acquired", JSON.stringify(wk));
+  const sk = await snapshot(k.notifyOpId); assert.equal(sk.class, "ELIGIBLE", JSON.stringify(sk));
+  const ck = await claim(k.notifyOpId, "gn-q13-ctl", sk); assert.equal(ck.status, "claimed", JSON.stringify(ck));
+  assert.deepEqual((await rows(k.id, NOTIFY)).map((o) => [o.state, o.attempts]), [["in_flight", 1]]);
+  const rk = await request(k); assert.equal(rk.ok, false, "after a REAL claim the recorded request refuses read-only"); assert.equal((await intentRow(k.id)).state, "confirmed");
+  // (a) claimant first, REAL claim: a lock holder (owner, no write) on hostaway_reservation_attempts makes the claimant wait INSIDE gn_lock_bundle
+  //     while it already holds intents FOR SHARE; the request then waits at intents FOR NO KEY UPDATE; release → claim commits first → request refuses
+  const a = await mk();
+  const wa = await work("gn-q13-a", a); assert.equal(wa.status, "acquired", JSON.stringify(wa));
+  const sa = await snapshot(a.notifyOpId); assert.equal(sa.class, "ELIGIBLE");
+  const hold = await db.owner.connect();
+  let claimP, reqP;
+  try {
+    await hold.query("BEGIN"); await hold.query("SELECT 1 FROM booking.hostaway_reservation_attempts WHERE intent_id = $1 FOR UPDATE", [a.id]);
+    claimP = claim(a.notifyOpId, "gn-q13-a", sa);
+    await new Promise((r) => setTimeout(r, 400));
+    reqP = request(a);
+    await new Promise((r) => setTimeout(r, 400));
+    const waiting = (await db.owner.query(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND state = 'active'
+      AND (query ~ 'claim_guest_notification' OR query ~ 'booking.intents')`)).rows[0].n;
+    assert.ok(waiting >= 2, `both sessions wait on locks (${waiting})`);
+    await hold.query("COMMIT");
+  } finally { await hold.query("ROLLBACK").catch(() => {}); hold.release(); }
+  const [ca, ra] = await Promise.all([claimP, reqP]);
+  assert.equal(ca.status, "claimed", JSON.stringify(ca));
+  assert.equal(ra.ok, false, JSON.stringify(ra)); assert.ok(["TEST_CLEANUP_WORK_LEASE_HELD", "NOTIFY_SUPPRESS_REFUSED"].includes(ra.error), ra.error);
+  t.diagnostic(`Q13(a) claimant-first: claim=${ca.status} request=${ra.error}`);
+  assert.deepEqual((await rows(a.id, NOTIFY)).map((o) => [o.state, o.attempts]), [["in_flight", 1]]);
+  assert.deepEqual(await intentRow(a.id).then((x) => [x.state, x.m]), ["confirmed", null]); assert.equal((await suppressions(a.id)).length, 0);
+  // (b) request first, REAL claim after: the claimant's snapshot is taken BEFORE the request commits (a genuine interleaving); the claim with
+  //     that still-valid snapshot is NOT_PENDING; claim_notification_work no longer offers the row
+  const b = await mk();
+  const sb = await snapshot(b.notifyOpId); assert.equal(sb.class, "ELIGIBLE");
+  F.ok(await request(b));
+  const wb = await work("gn-q13-b", b); assert.equal(wb.status, "idle", JSON.stringify(wb));
+  await db.app.query("UPDATE booking.intent_work SET work_worker_id = $2, work_lease_until = now() + interval '120 seconds' WHERE intent_id = $1", [b.id, "gn-q13-b"]);
+  const cb = await claim(b.notifyOpId, "gn-q13-b", sb);
+  assert.deepEqual(cb, { status: "not_claimable", code: "NOT_PENDING" });
+  assert.deepEqual((await rows(b.id, NOTIFY)).map((o) => [o.state, o.attempts]), [["superseded", 0]]); assert.equal((await suppressions(b.id)).length, 1);
+  await db.app.query("UPDATE booking.intent_work SET work_worker_id = NULL, work_lease_until = NULL WHERE intent_id = $1", [b.id]);
+  // (c) concurrent controls: a REAL claim (work → snapshot → claim) racing the request from a barrier, several rounds: exactly one winner each time
+  const outcomes = [];
+  for (let i = 0; i < 4; i++) {
+    const e = await mk();
+    const se = await snapshot(e.notifyOpId);
+    const go = F.barrier(2);
+    const claimant = (async () => { await go(); const w = await work(`gn-q13-c${i}`, e); if (w.status !== "acquired") return { status: "no_work", w }; return claim(e.notifyOpId, `gn-q13-c${i}`, se); })();
+    const requester = (async () => { await go(); return request(e); })();
+    const [ce, re] = await Promise.all([claimant, requester]);
+    const row = (await rows(e.id, NOTIFY))[0]; const ir = await intentRow(e.id);
+    const claimWon = ce.status === "claimed"; const requestWon = re.ok === true;
+    assert.notEqual(claimWon, requestWon, `exactly one winner: ${JSON.stringify({ ce, re })}`);
+    if (claimWon) { assert.deepEqual([row.state, row.attempts, ir.state], ["in_flight", 1, "confirmed"]); }
+    else { assert.deepEqual([row.state, row.attempts, ir.state, ce.status], ["superseded", 0, "test_cleanup_pending", ce.status === "no_work" ? "no_work" : "not_claimable"]); }
+    outcomes.push(claimWon ? "claim" : "request");
+  }
+  assert.equal(outcomes.length, 4);
+  t.diagnostic(`Q13(c) concurrent winners: ${outcomes.join(",")}`);
 });

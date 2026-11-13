@@ -12,8 +12,12 @@ DO $$ BEGIN
   END IF;
 END $$;
 
--- 8 / 7 / 6 / 4: functions, triggers, table (reverse order)
+-- 8 / 7b / 7 / 6 / 5b / 4: functions, triggers, table (reverse order)
 DROP FUNCTION booking.recorded_state_cleanup_ok(uuid);
+DROP TRIGGER intents_offline_refund_ledger_required ON booking.intents;
+DROP FUNCTION booking.offline_refund_ledger_required();
+DROP TRIGGER payment_ledger_offline_refund_fence ON booking.payment_ledger;
+DROP FUNCTION booking.offline_refund_ledger_fence();
 DROP FUNCTION booking.suppress_guest_notification(uuid, text);
 DROP TRIGGER notification_suppressions_bound ON booking.notification_suppressions;
 DROP FUNCTION booking.notification_suppressions_bound();
@@ -26,6 +30,7 @@ DROP TRIGGER external_operations_offline_refund_claim_fence ON booking.external_
 DROP FUNCTION booking.offline_refund_claim_fence();
 DROP TRIGGER external_operations_offline_refund_create_fence ON booking.external_operations;
 DROP FUNCTION booking.offline_refund_create_fence();
+DROP FUNCTION booking.recorded_cleanup_legs_unsettled(uuid, boolean);
 
 -- 7. notify_op_fence: the 0016 body exactly
 CREATE OR REPLACE FUNCTION booking.notify_op_fence() RETURNS trigger

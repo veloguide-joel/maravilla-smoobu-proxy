@@ -415,6 +415,9 @@ BEGIN
       IF NOT (NEW.settlement_recording_mirrored IS TRUE AND booking.offline_refund_settled_for(NEW.id)) THEN
         RAISE EXCEPTION 'CANCELLATION_NOT_VERIFIED: MIRROR_NOT_VERIFIED' USING ERRCODE = 'check_violation';
       END IF;
+      IF booking.recorded_cleanup_legs_unsettled(NEW.id) IS NOT NULL THEN
+        RAISE EXCEPTION 'CANCELLATION_NOT_VERIFIED: %', booking.recorded_cleanup_legs_unsettled(NEW.id) USING ERRCODE = 'check_violation';
+      END IF;
     ELSIF NEW.settlement_recording_mirrored IS NOT NULL THEN
       RAISE EXCEPTION 'MIRROR_FLAG_IMMUTABLE: a pristine cleanup carries no mirror leg' USING ERRCODE = 'check_violation';
     END IF;
@@ -464,6 +467,42 @@ BEGIN
 END $$;
 
 -- ---------------------------------------------------------------------------------------------
+-- 5b. (ROOT 5884519489 F2) the CURRENT bound settlement of the two other legs, re-derived from persisted facts at every mirror admission
+--     (creation, claim, dedicated completion) and at the terminal: both flags TRUE; the Stripe refund settled by the LATEST bound observation
+--     AND audited / ledgered (booking.test_refund_ledgered); the reservation's LATEST observation is 'cancelled' with a succeeded cancel row.
+--     A later missing / contradictory observation makes this NULL -> refusal (rows and claim preserved; no new attempt). NULL = settled; else the reason.
+--     p_require_ledger: TRUE at claim / completion / terminal / end predicate (the audited payment_refunds row + refund_succeeded ledger entry must be
+--     committed); FALSE at the mirror row's CREATION, which happens inside the SAME transaction as the REFUND_SUCCEEDED transition, before the accepted
+--     repo writes those side records (the 0019 guard verified the leg flag from the observation in that transaction; the ledger is checked at every later admission).
+CREATE FUNCTION booking.recorded_cleanup_legs_unsettled(p_intent uuid, p_require_ledger boolean DEFAULT true) RETURNS text
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE i booking.intents%ROWTYPE; latest_at timestamptz; n_latest integer; n_status integer; st text;
+BEGIN
+  SELECT * INTO i FROM booking.intents WHERE id = p_intent;
+  IF NOT FOUND THEN RETURN 'INTENT_NOT_FOUND'; END IF;
+  IF i.state IS DISTINCT FROM 'test_cleanup_pending' AND i.state IS DISTINCT FROM 'cancelled' THEN RETURN 'INTENT_STATE'; END IF;
+  IF i.settlement_reservation_cancelled IS NOT TRUE OR i.settlement_authorization_settled IS NOT TRUE THEN RETURN 'LEGS_OPEN'; END IF;
+  IF i.stripe_payment_intent_id IS NULL OR NOT booking.test_refund_settled_for(i.id, i.stripe_payment_intent_id) THEN RETURN 'STRIPE_REFUND_NOT_SETTLED'; END IF;
+  IF p_require_ledger AND NOT booking.test_refund_ledgered(i.id, i.stripe_payment_intent_id) THEN RETURN 'STRIPE_REFUND_NOT_LEDGERED'; END IF;
+  IF i.hostaway_reservation_id IS NULL
+     OR NOT EXISTS (SELECT 1 FROM booking.external_operations WHERE intent_id = i.id AND op_type = 'hostaway.cancel_reservation' AND state = 'succeeded') THEN
+    RETURN 'CANCEL_NOT_SUCCEEDED';
+  END IF;
+  SELECT max(observed_at) INTO latest_at FROM booking.provider_evidence
+   WHERE intent_id = i.id AND kind = 'hostaway_reservation' AND external_ref = i.hostaway_reservation_id;
+  IF latest_at IS NULL THEN RETURN 'RESERVATION_NOT_OBSERVED'; END IF;
+  SELECT count(*), count(DISTINCT status) INTO n_latest, n_status FROM booking.provider_evidence
+   WHERE intent_id = i.id AND kind = 'hostaway_reservation' AND external_ref = i.hostaway_reservation_id AND observed_at = latest_at;
+  IF n_status <> 1 THEN RETURN 'RESERVATION_OBSERVATION_TIE'; END IF;
+  SELECT status INTO st FROM booking.provider_evidence
+   WHERE intent_id = i.id AND kind = 'hostaway_reservation' AND external_ref = i.hostaway_reservation_id AND observed_at = latest_at LIMIT 1;
+  IF st IS DISTINCT FROM 'cancelled' THEN RETURN 'RESERVATION_NOT_CANCELLED_LATEST'; END IF;
+  RETURN NULL;
+END $$;
+REVOKE ALL ON FUNCTION booking.recorded_cleanup_legs_unsettled(uuid, boolean) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION booking.recorded_cleanup_legs_unsettled(uuid, boolean) TO mv_booking_app, mv_booking_admin;
+
+-- ---------------------------------------------------------------------------------------------
 -- 6. the mirror op: creation / claim / success fences
 CREATE FUNCTION booking.offline_refund_create_fence() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
@@ -473,7 +512,7 @@ BEGIN
   IF NOT FOUND OR i.state IS DISTINCT FROM 'test_cleanup_pending' OR i.settlement_reservation_cancelled IS NOT TRUE OR i.settlement_authorization_settled IS NOT TRUE
      OR i.settlement_recording_mirrored IS NOT FALSE OR i.offline_charge_id IS NULL OR i.hostaway_reservation_id IS NULL
      OR i.environment <> 'test' OR (SELECT environment FROM booking.instance) IS DISTINCT FROM 'test'
-     OR NOT booking.test_refund_settled_for(i.id, i.stripe_payment_intent_id)
+     OR booking.recorded_cleanup_legs_unsettled(i.id, false) IS NOT NULL
      OR NOT EXISTS (SELECT 1 FROM booking.external_operations x WHERE x.intent_id = i.id AND x.op_type = 'hostaway.record_offline_charge'
                      AND x.state = 'succeeded' AND x.settled_evidence_id IS NOT NULL AND x.result_ref = i.offline_charge_id)
      OR EXISTS (SELECT 1 FROM booking.external_operations x WHERE x.intent_id = i.id AND x.op_type = 'hostaway.refund_offline_charge' AND x.id <> NEW.id) THEN
@@ -502,6 +541,11 @@ BEGIN
      OR i.environment <> 'test' OR (SELECT environment FROM booking.instance) IS DISTINCT FROM 'test'
      OR OLD.attempts <> 0 OR OLD.dispatched_at IS NOT NULL OR NEW.attempts <> 1 OR NEW.idempotency_key IS DISTINCT FROM 'ochr:' || i.id::text || ':1' THEN
     RAISE EXCEPTION 'MIRROR_CLAIM_FENCED: the mirror row is claimable once, as attempt 1, while the mirror leg is open' USING ERRCODE = 'check_violation';
+  END IF;
+  -- (ROOT 5884519489 F2) the two other legs must STILL be settled by the latest persisted facts at the claim instant; a later contradiction refuses
+  -- the claim and leaves the pristine row + the held claim untouched (no attempt, no send)
+  IF booking.recorded_cleanup_legs_unsettled(i.id) IS NOT NULL THEN
+    RAISE EXCEPTION 'MIRROR_CLAIM_FENCED: %', booking.recorded_cleanup_legs_unsettled(i.id) USING ERRCODE = 'check_violation';
   END IF;
   RETURN NEW;
 END $$;
@@ -560,6 +604,9 @@ BEGIN
   IF o.idempotency_key IS DISTINCT FROM 'ochr:' || v_intent::text || ':1' OR o.attempts IS DISTINCT FROM 1 THEN
     RAISE EXCEPTION 'MIRROR_STATE: only the single attempt completes through this function' USING ERRCODE = 'check_violation';
   END IF;
+  -- (ROOT 5884519489 F2) independent re-check of the other two legs at the completion instant (latest persisted Stripe / reservation facts)
+  r := booking.recorded_cleanup_legs_unsettled(v_intent);
+  IF r IS NOT NULL THEN RAISE EXCEPTION 'MIRROR_LEGS_UNSETTLED: %', r USING ERRCODE = 'check_violation'; END IF;
   r := booking.offline_refund_proof_refusal(v_intent, o.payload, p_result_ref, o.dispatched_at, p_evidence, 'worker_fresh', v_t);
   IF r IS NOT NULL THEN RAISE EXCEPTION 'MIRROR_PROOF_REFUSED: %', r USING ERRCODE = 'check_violation'; END IF;
   UPDATE booking.external_operations
@@ -750,6 +797,43 @@ REVOKE ALL ON FUNCTION booking.suppress_guest_notification(uuid, text) FROM PUBL
 GRANT EXECUTE ON FUNCTION booking.suppress_guest_notification(uuid, text) TO mv_booking_app;
 
 -- ---------------------------------------------------------------------------------------------
+-- 7b. (ROOT 5884519489 F1) the mirror's money fact is bound to the ONE succeeded, linked mirror row: the ledger entry offline_charge_refund_recorded
+--     is accepted ONLY with provider hostaway, provider_ref = that row's result_ref, the exact captured amount / currency, once, while the intent's
+--     mirror leg is TRUE (the terminal transaction); and the terminal COMMIT requires exactly that row (deferred constraint).
+CREATE FUNCTION booking.offline_refund_ledger_fence() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+DECLARE i booking.intents%ROWTYPE; m booking.external_operations%ROWTYPE;
+BEGIN
+  SELECT * INTO i FROM booking.intents WHERE id = NEW.intent_id;
+  SELECT * INTO m FROM booking.external_operations WHERE intent_id = NEW.intent_id AND op_type = 'hostaway.refund_offline_charge';
+  IF NOT FOUND OR m.state IS DISTINCT FROM 'succeeded' OR m.settled_evidence_id IS NULL OR m.result_ref IS NULL
+     OR NEW.provider IS DISTINCT FROM 'hostaway' OR NEW.provider_ref IS DISTINCT FROM m.result_ref
+     OR NEW.amount_minor IS DISTINCT FROM i.captured_minor OR NEW.currency::text IS DISTINCT FROM i.currency::text
+     OR i.settlement_recording_mirrored IS NOT TRUE OR i.offline_charge_id IS NULL OR (m.payload ->> 'offlineChargeId') IS DISTINCT FROM i.offline_charge_id
+     OR EXISTS (SELECT 1 FROM booking.payment_ledger l WHERE l.intent_id = NEW.intent_id AND l.entry = 'offline_charge_refund_recorded') THEN
+    RAISE EXCEPTION 'MIRROR_LEDGER_UNBOUND: the mirror ledger entry carries the ONE succeeded linked mirror result_ref, exact amount / currency, once' USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NEW;
+END $$;
+REVOKE ALL ON FUNCTION booking.offline_refund_ledger_fence() FROM PUBLIC;
+CREATE TRIGGER payment_ledger_offline_refund_fence BEFORE INSERT ON booking.payment_ledger
+  FOR EACH ROW WHEN (NEW.entry = 'offline_charge_refund_recorded') EXECUTE FUNCTION booking.offline_refund_ledger_fence();
+CREATE FUNCTION booking.offline_refund_ledger_required() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM booking.payment_ledger l JOIN booking.external_operations m ON m.intent_id = l.intent_id AND m.op_type = 'hostaway.refund_offline_charge'
+                  WHERE l.intent_id = NEW.id AND l.entry = 'offline_charge_refund_recorded' AND l.provider = 'hostaway' AND l.provider_ref = m.result_ref
+                    AND m.state = 'succeeded' AND m.settled_evidence_id IS NOT NULL AND l.amount_minor = NEW.captured_minor AND l.currency::text = NEW.currency::text) THEN
+    RAISE EXCEPTION 'MIRROR_LEDGER_REQUIRED: the recorded cleanup terminal commits only with its bound mirror ledger entry' USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NULL;
+END $$;
+REVOKE ALL ON FUNCTION booking.offline_refund_ledger_required() FROM PUBLIC;
+CREATE CONSTRAINT TRIGGER intents_offline_refund_ledger_required AFTER UPDATE ON booking.intents
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (OLD.state = 'test_cleanup_pending' AND NEW.state = 'cancelled' AND NEW.settlement_recording_mirrored IS TRUE)
+  EXECUTE FUNCTION booking.offline_refund_ledger_required();
+
+-- ---------------------------------------------------------------------------------------------
 -- 8. read-only end-state predicate (Slice 5 postcheck): every persisted fact of a recorded-cleaned TEST booking
 CREATE FUNCTION booking.recorded_state_cleanup_ok(p_intent uuid) RETURNS boolean
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
@@ -766,7 +850,11 @@ BEGIN
      AND (SELECT count(*) FROM booking.external_operations WHERE intent_id = i.id AND op_type = 'guest.notify') = 1
      AND EXISTS (SELECT 1 FROM booking.external_operations o JOIN booking.notification_suppressions s ON s.operation_id = o.id
                   WHERE o.intent_id = i.id AND o.op_type = 'guest.notify' AND o.state = 'superseded' AND o.attempts = 0 AND o.dispatched_at IS NULL)
-     AND (SELECT count(*) FROM booking.payment_ledger WHERE intent_id = i.id AND entry = 'offline_charge_refund_recorded' AND provider = 'hostaway') = 1
+     AND booking.recorded_cleanup_legs_unsettled(i.id) IS NULL
+     AND (SELECT count(*) FROM booking.payment_ledger WHERE intent_id = i.id AND entry = 'offline_charge_refund_recorded') = 1
+     AND EXISTS (SELECT 1 FROM booking.payment_ledger l JOIN booking.external_operations m ON m.intent_id = l.intent_id AND m.op_type = 'hostaway.refund_offline_charge'
+                  WHERE l.intent_id = i.id AND l.entry = 'offline_charge_refund_recorded' AND l.provider = 'hostaway' AND l.provider_ref = m.result_ref
+                    AND m.state = 'succeeded' AND m.settled_evidence_id IS NOT NULL AND l.amount_minor = i.captured_minor AND l.currency::text = i.currency::text)
      AND NOT EXISTS (SELECT 1 FROM booking.reconciliation_cases WHERE intent_id = i.id AND status = 'open')
      AND NOT EXISTS (SELECT 1 FROM booking.inventory_claims WHERE intent_id = i.id AND released_at IS NULL);
 END $$;
