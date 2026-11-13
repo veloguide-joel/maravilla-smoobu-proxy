@@ -53,7 +53,7 @@ function world() {
       created: Math.floor(w.now() / 1000), metadata: { ...params.metadata }, reason: null, failure_reason: null, key };
     w.refunds.set(r.id, r); if (status === "succeeded") p.refunded += params.amount; return r;
   };
-  const full = (r) => ({ id: r.id, listingMapId: r.listingMapId, channelId: 2000, arrivalDate: r.arrivalDate, departureDate: r.departureDate, totalPrice: r.totalPrice, currency: r.currency, status: r.status,
+  const full = (r) => ({ id: r.id, listingMapId: r.listingMapId, channelId: r.channelId ?? 2000, arrivalDate: r.arrivalDate, departureDate: r.departureDate, totalPrice: r.totalPrice, currency: r.currency, status: r.status,
     customFieldValues: [{ customFieldId: REF_FIELD, value: r.ref }] });
   const rowsOf = (rid) => w.charges.get(Number(rid)) || [];
   w.addRefundRow = (rid, over = {}) => {
@@ -393,4 +393,84 @@ test("leases / concurrency / wire containment: a second worker on the pinned int
   assert.deepEqual([seen, w2.mirrorPosts.length, s2.mirrorSends, s2.sends], [1, 1, 1, 1]);
   assert.deepEqual(Object.keys(w2.mirrorExecutors()).sort(), [...MIRROR_EXECUTOR_KEYS].sort());
   assert.equal(typeof _internal.preSend, "function");
+});
+
+// =============================================================================================
+// rev2 (ROOT HOLD 5885005598): F1 full cancelled-reservation identity, F2 stop rechecks at every awaited read-completion / evidence boundary,
+// F3 worker counter before the bounded executor call
+
+const evidenceCount = async (id, kind) => (await db.app.query("SELECT count(*)::int AS n FROM booking.provider_evidence WHERE intent_id = $1 AND kind = $2", [id, kind])).rows[0].n;
+const lastEvidence = async (id, kind) => (await db.app.query("SELECT status, observed FROM booking.provider_evidence WHERE intent_id = $1 AND kind = $2 ORDER BY observed_at DESC LIMIT 1", [id, kind])).rows[0];
+const readRows = async (id, opType) => (await db.app.query("SELECT state, error_code FROM booking.external_operations WHERE intent_id = $1 AND op_type = $2 AND retry_class = 'read' ORDER BY created_at", [id, opType])).rows;
+
+test("F1 reservation identity: a CANCELLED reservation whose listing / stay / total / currency / channel / reference differs from the intent is persisted truthfully (status cancelled, the observed field as seen) and the mirror leg escalates with ZERO POST and a pristine mirror row; the healthy control completes with ONE POST", async () => {
+  const mutations = [
+    ["TOTAL", (r) => { r.totalPrice = 999; }, (o) => assert.equal(o.totalMinor, 99900)],
+    ["LISTING", (r) => { r.listingMapId = 603566; }, (o) => assert.equal(o.listingId, 603566)],
+    ["ARRIVAL", (r) => { r.arrivalDate = F.addDays(r.arrivalDate, -1); }, null],
+    ["DEPARTURE", (r) => { r.departureDate = F.addDays(r.departureDate, 1); }, null],
+    ["CURRENCY", (r) => { r.currency = "MXN"; }, (o) => assert.equal(o.currency, "MXN")],
+    ["CHANNEL", (r) => { r.channelId = 2018; }, (o) => assert.equal(o.channelId, 2018)],
+    ["REF", (r) => { r.ref = `${r.ref}x`; }, null]
+  ];
+  for (const [code, mutate, checkObserved] of mutations) {
+    const w = world(); const c = await mirrorReady(w); const m0 = w.mark();
+    const r = w.res.get(Number(c.reservationId)); assert.equal(r.status, "cancelled"); mutate(r);
+    const s = await step(w, c);
+    assert.ok(s.actions.includes(`ESCALATE:RESERVATION_IDENTITY_${code}_MISMATCH`), `${code}: ${JSON.stringify(s.actions)}`);
+    assert.deepEqual([w.mirrorPosts.length, w.since(m0, "MIRROR"), w.since(m0, "LIST")], [0, 0, 0], `${code}: zero POST, no LIST after a failed identity`);
+    const m = (await opsOf(c.id, OPS.MIRROR))[0]; assert.deepEqual([m.state, m.attempts, m.dispatched_at], ["pending", 0, null], `${code}: mirror row pristine`);
+    assert.equal(await state(c.id), "reconciliation_required");
+    const e = await lastEvidence(c.id, "hostaway_reservation"); assert.equal(e.status, "cancelled", `${code}: the observed status is persisted as seen, never a fabricated active status`);
+    if (checkObserved) checkObserved(e.observed);
+  }
+  // healthy control: the same world shape, untouched → ONE exact POST, cancelled
+  const w = world(); const c = await mirrorReady(w);
+  const s = await step(w, c); assert.equal(await state(c.id), "cancelled", JSON.stringify(s.actions)); assert.equal(w.mirrorPosts.length, 1);
+  const e = await lastEvidence(c.id, "hostaway_reservation"); assert.deepEqual([e.status, e.observed.channelId, e.observed.bookingRef, e.observed.totalMinor], ["cancelled", 2000, c.intent.ref, AMT]);
+});
+
+/** a REAL checked-out pg client, wrapped: once `armed`, the first COMMIT it runs (the read row's completion) fires `onCommit` — the exact query boundary
+ *  between the committed read-row truth and the evidence write */
+function commitTrap(onCommit) {
+  const t = { armed: false, fired: 0 };
+  t.pool = { query: (...a) => db.app.query(...a), connect: async () => { const cl = await db.app.connect(); return new Proxy(cl, { get(target, k) {
+    if (k === "query") return async (sql, p) => { const r = await target.query(sql, p); if (t.armed && sql === "COMMIT") { t.armed = false; t.fired += 1; await onCommit(); } return r; };
+    const v = target[k]; return typeof v === "function" ? v.bind(target) : v; } }); } };
+  return t;
+}
+
+test("F2 query-boundary stop (signal + deadline) after the READ ROW's own COMMIT and before the evidence write, for the PI / reservation / LIST reads: the committed read row stays succeeded (truth preserved), NO evidence row is added after the stop, the stop is reported, nothing further (no later read, no claim, no POST)", async () => {
+  const boundaries = [
+    ["payment_intent", OPS.PI_READ, "retrievePaymentIntent", "RES"],
+    ["hostaway_reservation", OPS.RES_READ, "retrieveReservation", "LIST"],
+    ["hostaway_offline_charges", OPS.LIST_READ, "listOfflineCharges", "MIRROR"]
+  ];
+  for (const [kind, opType, executor, nextCall] of boundaries) {
+    for (const mode of ["SIGNAL", "DEADLINE"]) {
+      const w = world(); const c = await mirrorReady(w); const ac = new AbortController(); const clk = { t: Date.now() }; const deadline = clk.t + 45 * 1000;
+      const n0 = await evidenceCount(c.id, kind); const rows0 = (await readRows(c.id, opType)).length; const m0 = w.mark();
+      const trap = commitTrap(async () => { if (mode === "SIGNAL") ac.abort(); else clk.t = deadline + 1; });
+      const ex = { ...w.mirrorExecutors(), [executor]: async (...a) => { const r = await w.executors[executor](...a); trap.armed = true; return r; } };
+      await due(c.id, clk.t);
+      const s = await runMirrorStep(trap.pool, mirrorOpts(w, c, { executors: ex, signal: ac.signal, clock: () => clk.t, deadlineAt: deadline }));
+      assert.equal(trap.fired, 1, `${kind}/${mode}: the trap fired on the read row's COMMIT ${JSON.stringify(s)}`);
+      assert.ok(s.stop && s.stop.code === mode, `${kind}/${mode}: ${JSON.stringify(s.stop)} ${JSON.stringify(s.actions)}`);
+      assert.equal(await evidenceCount(c.id, kind), n0, `${kind}/${mode}: no evidence written after the stop`);
+      const rows = await readRows(c.id, opType); assert.equal(rows.length, rows0 + 1); assert.equal(rows[rows.length - 1].state, "succeeded", `${kind}/${mode}: the committed read row is preserved as it was committed`);
+      assert.deepEqual([w.since(m0, nextCall), w.mirrorPosts.length], [0, 0], `${kind}/${mode}: nothing after the stop`);
+      const m = (await opsOf(c.id, OPS.MIRROR))[0]; assert.deepEqual([m.state, m.attempts], ["pending", 0]); assert.equal(await state(c.id), "test_cleanup_pending");
+    }
+  }
+});
+
+test("F3 worker counter: the mirror send counter and call log move BEFORE the bounded executor is invoked (the synchronous beforeSend snapshot sees sends = 1 while the executor has not run); a synchronously throwing executor still counts ONE send, the row is unknown (MIRROR_CALL_FAILED) and the next session reconciles READ-ONLY", async () => {
+  const w = world(); const c = await mirrorReady(w); let snapshot = null; let invokedBeforeSnapshot = null;
+  const ex = { ...w.mirrorExecutors(), refundOfflineCharge: (req) => { invokedBeforeSnapshot = snapshot === null; w.mirrorPosts.push({ path: req.path, sync: true }); throw new Error("sync transport failure"); } };
+  const s = await step(w, c, { executors: ex, hooks: { beforeSend: (snap) => { snapshot = snap; } } });
+  assert.deepEqual([snapshot && snapshot.sends, snapshot && snapshot.mirrorSends, invokedBeforeSnapshot, s.sends, s.mirrorSends], [1, 1, false, 1, 1], JSON.stringify(s.actions));
+  assert.ok(snapshot && Object.isFrozen(snapshot) && snapshot.calls.at(-1) === `mirror_post:${c.offlineChargeId}`);
+  assert.ok(s.actions.includes("MIRROR_UNKNOWN:MIRROR_CALL_FAILED"), JSON.stringify(s.actions));
+  assert.equal((await opsOf(c.id, OPS.MIRROR))[0].state, "outcome_unknown");
+  const s2 = await step(w, c); assert.ok(s2.actions.includes("ESCALATE:MIRROR_UNKNOWN_ABSENT"), JSON.stringify(s2.actions)); assert.equal(w.mirrorPosts.length, 1);
 });
