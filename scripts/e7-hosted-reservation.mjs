@@ -30,7 +30,7 @@ export const CONSTANTS = Object.freeze({
   // the MERGED e7-test integration head (PR58–63; tree 004316db) — immutable tooling for this runner
   toolingCommit: "40779e34e8c65ac5c4494bc5a18cd4223ef723fa",
   toolingStatus: "MERGED",
-  executeEnabled: false,                                   // Slice 1: execution default CLOSED (verify / execute refuse ATC_EXECUTE_CLOSED)
+  executeEnabled: true,                                    // Slice 1: execution OPENED for the ONE reviewed owner-present hosted TEST (ROOT prep GO 2026-11-13); revert to false after
   closure: Object.freeze(["package.json", "package-lock.json", "lib/bookability.js", "lib/booking-db/codec.js", "lib/booking-db/config.js",
     "lib/booking-db/operations.js", "lib/booking-db/pool.js", "lib/booking-db/recovery.js", "lib/booking-db/repo.js",
     "lib/booking-db/reservation-worker.js", "lib/checkout/capture-proof.js", "lib/checkout/compensation-proof.js", "lib/checkout/final-price.js",
