@@ -1,0 +1,143 @@
+# E7 C19: HOSTED READ-ONLY Hostaway charge-LIST shape probe for the ONE approved TEST reservation (71700931 / listing 606998 / USD 140.00 = 14000 minor),
+# running the merged, reviewed `scripts/e7-hosted-charge-list-probe.mjs` (#95, C17/C18) UNCHANGED: at most TWO GETs (identity, then charge list),
+# the ACCEPTED pinned real exchange at the immutable tooling commit 5a094b16, hard budgets {maxBytes 262144, callMs 15000, totalMs 30000, calls 2},
+# no retry, no redirect follow, no POST / PUT / DELETE, no DB, no Stripe, no recording, no notification. HONEST LABEL: MANUAL hosted READ-ONLY probe
+# (workflow_dispatch + the EXISTING `e7-readonly-probe` reviewer gate), NOT recording, NOT checkout, NOT a refund path (refunds stay manual; all five
+# runner flags stay CLOSED). LABELLED SPECIALISATION of the reviewed e7-hosted-recording.yml execute skeleton (same pinned actions, same checkouts,
+# same Node), minus every DB / CA / Stripe / dependency-install step. MANUAL dispatch only; default mode `preflight` = no environment, no secret,
+# no provider request: focused FAKE probe tests + `--dry` + the deterministic probe source digest. `probe` = ONE `--probe` call, main only, only after
+# a SUCCESSFUL preflight job of the SAME dispatch SHA, and only after HEAD / tooling pin / full dependency manifest / expected digest re-checks pass.
+# Inputs / labels / hashes are NOT consent. The ONLY secret (E7_HOSTAWAY_TOKEN, environment `e7-readonly-probe`) is injected into the ONE probe
+# command step and nowhere else; E7_TOOLING_DIR is a non-secret path. No new secret, environment, permission or security setting.
+# Probe source digest = SHA-256 over: prefix "e7-hosted-charge-list-probe-v1\n", then for each file IN THIS ORDER
+#   1. scripts/e7-hosted-charge-list-probe.mjs  2. test/e7-hosted-charge-list-probe.test.mjs  3. .github/workflows/e7-hosted-charge-list-probe.yml
+# the frame  <relative path> NUL <decimal byte length> NUL <file bytes> NUL  (the framedDigest convention of the reviewed runners).
+name: e7-hosted-charge-list-probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "preflight (default: no environment, no secrets, no provider requests) or probe (ONE read-only --probe call; main only; needs a successful preflight of this dispatch)"
+        type: choice
+        options: [preflight, probe]
+        default: preflight
+      approval_ref:
+        description: "Approval label (non-secret; a label, never consent). Required non-empty for probe."
+        type: string
+        required: false
+        default: ""
+      expected_probe_digest:
+        description: "probe only: exact 64-hex probe source digest printed by a preflight of this SAME commit (no default; any mismatch refuses before the call)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e7-hosted-charge-list-probe
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout wrapper (this repository, exact dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout merged E7 tooling (fixed commit 5a094b16)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: 5a094b16c1f84690a738a98ab89140caa69c1e1f
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Verify checkout bindings (wrapper HEAD == dispatch SHA; tooling HEAD == pin; no secrets)
+        env:
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_TOOLING_PIN: 5a094b16c1f84690a738a98ab89140caa69c1e1f
+          E7_MODE: ${{ inputs.mode }}
+        run: |
+          set -eu
+          head="$(git -C wrapper rev-parse HEAD)"
+          [ "$head" = "$E7_WORKFLOW_SHA" ] || { echo "REFUSED: wrapper HEAD != dispatch SHA"; exit 3; }
+          tool="$(git -C tooling rev-parse HEAD)"
+          [ "$tool" = "$E7_TOOLING_PIN" ] || { echo "REFUSED: tooling HEAD != pin"; exit 3; }
+          case "$E7_MODE" in preflight|probe) ;; *) echo "REFUSED: mode"; exit 3 ;; esac
+          echo "bindings ok: wrapper=$head tooling=$tool mode=$E7_MODE"
+      - name: Focused FAKE probe tests + --dry (no environment, no secrets, no provider requests, no dependency install)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+        run: |
+          set -eu
+          node --test wrapper/test/e7-hosted-charge-list-probe.test.mjs
+          node wrapper/scripts/e7-hosted-charge-list-probe.mjs --dry
+      - name: Probe source digest (deterministic framed SHA-256; documented order and prefix)
+        env:
+          E7_EXPECTED_PROBE_DIGEST: ${{ inputs.expected_probe_digest }}
+        run: |
+          set -eu
+          d="$({ printf 'e7-hosted-charge-list-probe-v1\n'; for f in scripts/e7-hosted-charge-list-probe.mjs test/e7-hosted-charge-list-probe.test.mjs .github/workflows/e7-hosted-charge-list-probe.yml; do printf '%s\0%s\0' "$f" "$(stat -c%s "wrapper/$f")"; cat "wrapper/$f"; printf '\0'; done; } | sha256sum | cut -d' ' -f1)"
+          echo "probeSourceDigest=$d"
+          if [ -n "$E7_EXPECTED_PROBE_DIGEST" ] && [ "$E7_EXPECTED_PROBE_DIGEST" != "$d" ]; then echo "REFUSED: expected_probe_digest mismatch"; exit 3; fi
+
+  probe:
+    needs: preflight
+    if: inputs.mode == 'probe' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: e7-readonly-probe
+    timeout-minutes: 5
+    steps:
+      - name: Checkout wrapper (this repository, exact dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout merged E7 tooling (fixed commit 5a094b16)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: 5a094b16c1f84690a738a98ab89140caa69c1e1f
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Re-check bindings BEFORE the probe (HEAD == dispatch SHA; tooling pin + full 8-file manifest; expected digest; label; no secrets)
+        env:
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_TOOLING_PIN: 5a094b16c1f84690a738a98ab89140caa69c1e1f
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_APPROVAL_REF: ${{ inputs.approval_ref }}
+          E7_EXPECTED_PROBE_DIGEST: ${{ inputs.expected_probe_digest }}
+        run: |
+          set -eu
+          head="$(git -C wrapper rev-parse HEAD)"
+          [ "$head" = "$E7_WORKFLOW_SHA" ] || { echo "REFUSED: wrapper HEAD != dispatch SHA"; exit 3; }
+          tool="$(git -C tooling rev-parse HEAD)"
+          [ "$tool" = "$E7_TOOLING_PIN" ] || { echo "REFUSED: tooling HEAD != pin"; exit 3; }
+          [ -n "$E7_APPROVAL_REF" ] || { echo "REFUSED: approval_ref empty"; exit 3; }
+          printf '%s' "$E7_EXPECTED_PROBE_DIGEST" | grep -Eq '^[0-9a-f]{64}$' || { echo "REFUSED: expected_probe_digest not 64-hex"; exit 3; }
+          d="$({ printf 'e7-hosted-charge-list-probe-v1\n'; for f in scripts/e7-hosted-charge-list-probe.mjs test/e7-hosted-charge-list-probe.test.mjs .github/workflows/e7-hosted-charge-list-probe.yml; do printf '%s\0%s\0' "$f" "$(stat -c%s "wrapper/$f")"; cat "wrapper/$f"; printf '\0'; done; } | sha256sum | cut -d' ' -f1)"
+          [ "$d" = "$E7_EXPECTED_PROBE_DIGEST" ] || { echo "REFUSED: expected_probe_digest mismatch (actual $d)"; exit 3; }
+          node --input-type=module -e 'const m = await import(process.cwd() + "/wrapper/scripts/e7-hosted-charge-list-probe.mjs"); const r = await m.loadTooling(process.env.E7_TOOLING_DIR); if (r.ok !== true) { console.log("REFUSED: tooling manifest " + m.safeCode(r.code) + " " + (r.file ?? "")); process.exit(3); } console.log("tooling manifest ok: " + Object.keys(m.MANIFEST).length + " files at " + m.TOOLING_COMMIT);'
+          echo "bindings ok: wrapper=$head tooling=$tool digest=$d"
+      - name: ONE read-only charge-LIST probe (the sole secret, this step only; two GETs max; no DB; no write path)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_HOSTAWAY_TOKEN: ${{ secrets.E7_HOSTAWAY_TOKEN }}
+        run: node wrapper/scripts/e7-hosted-charge-list-probe.mjs --probe
