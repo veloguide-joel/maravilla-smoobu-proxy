@@ -37,9 +37,9 @@ All digest / pin / closure assertions preserved verbatim (C1 pin assertions for 
 |---|---|---|---|
 | reservation (S1) | `5665544de105e4564a57a4434fa32fd2355b9bbd0e756b250d1248e07feb6b19` | **`a3e0994d0171ddf60d379704a7f1928f947ff8ae5deff631e4e92601f83f0bbe`** | `0ffc0b9c84fc83ca8de663ea0a88f90b1fa40bfba1a65498e311309b3ac4b631` |
 | capture (S2) | `5b547a42200b452055d8a718c84ab70f7f2b5a0cd8343f6174c4a75b0c420ed1` | **`0b83183bf87a718b30e7b53b8c90d6019d20f5200e0ea90ae98771966f4eae16`** | `adaed04409012a233abcfb0a7aa748c0f8bc9e21afbd4e13adb94c064a97fd8f` |
-| test-cleanup (S3, false) | `33f2ab18984dccd3915a18ff8a55dd4a6e5b6bf89e3d84ba1e578347e6cebd1e` | `970ee68056d8319a3f33a32d38a3806c3d217a5d81f7744f76f05e494979e213` | `85c72bf661a7ad52b690227642c85a6f73d32639352c91d9f06fe02ccf72bee4` |
+| test-cleanup (S3, false) | `33f2ab18984dccd3915a18ff8a55dd4a6e5b6bf89e3d84ba1e578347e6cebd1e` | `970ee68056d8319a3f33a32d38a3806c3d217a5d81f7744f76f05e494979e213` | `f84b4157d88c4d4a3756c61040daa30e19323d7ba17b75a7764b0b22b3740ee7` |
 | recording (S4, false) | `dafcc415dd2a5b2bfcfa163bcf2c116d99e82c83ee8611353bd1cd395252b683` | `e06df94f8bc2d683b2b8a236bfb466c70926eed5a607c2b89ede3d53c8206bbf` | `ef9341dc16d0fc112203ce7dd074bbdece846821c33cdd8b26186eaa415e2358` |
-| recorded-cleanup (S5, false) | `3e0eba4204d7dc8c688d8ddeb2afc0d057fe31b99258848b2538934e4c685d16` | `2f0cca2cf077ce9976f5426824b14a24ee877527bdabd06e051b07261738cb24` | `f84b4157d88c4d4a3756c61040daa30e19323d7ba17b75a7764b0b22b3740ee7` |
+| recorded-cleanup (S5, false) | `3e0eba4204d7dc8c688d8ddeb2afc0d057fe31b99258848b2538934e4c685d16` | `2f0cca2cf077ce9976f5426824b14a24ee877527bdabd06e051b07261738cb24` | `85c72bf661a7ad52b690227642c85a6f73d32639352c91d9f06fe02ccf72bee4` |
 All five runner digests change because Slices 2–5 include the shared reservation runner in their `runnerFiles` and each suite file is part of its runner's digest. The baseline column was re-derived from a detached checkout of `88dafa11` and equals the previously pinned values. ROOT re-pins `expected_runner_digest` for S1/S2 from the **merged** enable commit (this PR's head digest is valid only if merged without further change; a squash/rebase that alters any `runnerFiles` content changes it — re-derive after merge).
 
 ## 5. Prepared CLOSE patch (reverses ONLY the runtime + test change; keeps this doc) — NOT applied
