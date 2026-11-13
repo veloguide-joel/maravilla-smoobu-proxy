@@ -4,7 +4,7 @@
 # offline-charge recording row stays pristine; publicStatus unchanged). LABELLED SPECIALISATION of the reviewed e7-hosted-reservation.yml.
 # MANUAL dispatch only; default mode `preflight` = no secrets, no DB, no provider request, no dependency install (fake tests + digests + env).
 # EXECUTION IS CLOSED in this revision (runner CONSTANTS.executeEnabled = false): verify / execute refuse HCP_EXECUTE_CLOSED until a
-# separately reviewed change opens it. Tooling = the MERGED e7-test integration head 40779e34 (PR58–63). Inputs / labels / hashes are NOT
+# separately reviewed change opens it. Tooling = the MERGED e7-test C1 fix 59178b04 (PR #84: single FULL capture without final_capture; supersedes 40779e34 for THIS runner only; Slice 1 stays at 40779e34). Inputs / labels / hashes are NOT
 # consent. Secrets (environment `e7-readonly-probe`, required reviewers, execute step only): E7_STRIPE_TEST_KEY, E7_HOSTAWAY_TOKEN,
 # E7_DEV_BOOKING_DATABASE_URL. No webhook, no deploy, no migration, zero Hostaway writes (GET only), <= 1 Stripe capture for the ONE bound
 # PaymentIntent with the pinned amount + accepted idempotency key, no refund / void / record / notify / cancel / create, no account or key
@@ -88,11 +88,11 @@ jobs:
         with:
           path: wrapper
           persist-credentials: false
-      - name: Checkout merged E7 tooling (fixed commit 40779e34)
+      - name: Checkout merged E7 tooling (fixed commit 59178b04)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: 40779e34e8c65ac5c4494bc5a18cd4223ef723fa
+          ref: 59178b0468469b6570beab861bbc8e48b3a887d1
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0
@@ -124,11 +124,11 @@ jobs:
         with:
           path: wrapper
           persist-credentials: false
-      - name: Checkout merged E7 tooling (fixed commit 40779e34)
+      - name: Checkout merged E7 tooling (fixed commit 59178b04)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: 40779e34e8c65ac5c4494bc5a18cd4223ef723fa
+          ref: 59178b0468469b6570beab861bbc8e48b3a887d1
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0

@@ -2,7 +2,7 @@
 // immutable tooling pins, composed on ONE disposable database migrated to 0021 with FAKE provider exchanges. NOT a runtime change: no runner,
 // worker, wrapper, state, schema or closure file is touched; nothing here reads the runners' `executeEnabled` (R0 only records the shipped flags).
 //
-//   purpose      cross-version composition: Slice 1 / 2 (tooling 40779e34) → Slice 4 recording (5a094b16) → Slice 5 recorded cleanup (e41b654a),
+//   purpose      cross-version composition: Slice 1 (tooling 40779e34) → Slice 2 (59178b04, C1 fix: no final_capture) → Slice 4 recording (5a094b16) → Slice 5 recorded cleanup (e41b654a),
 //                and Slice 1 / 2 → Slice 4 refusal → Slice 3 pristine captured cleanup (9d86bfa1), all against schema 0021. The per-phase hosted
 //                tests each seed their START state with their own pin's fixtures; none of them proves that the version N runner accepts the
 //                version M runner's actual OUTPUT rows. This file carries the SAME intent / reservation / payment intent / charge / price through.
@@ -23,7 +23,7 @@
 //                closure bytes at its pin are verified BEFORE any tooling import / database start, independent of test filters; a mismatch throws
 //                and nothing below it runs (the child-process control N2 proves zero tooling resolution / zero DB activity on a tampered pin).
 //   isolation    no network (https / fetch refused at module load), no env secrets, no live DB: a throwaway cluster from the e41b654a harness.
-//   opt-in       E7_REHEARSAL_DB_TESTS=1 and E7_REHEARSAL_TOOLING_ROOT=<dir holding checkouts 40779e34/ 9d86bfa1/ 5a094b16/ e41b654a/ (each with
+//   opt-in       E7_REHEARSAL_DB_TESTS=1 and E7_REHEARSAL_TOOLING_ROOT=<dir holding checkouts 40779e34/ 59178b04/ 9d86bfa1/ 5a094b16/ e41b654a/ (each with
 //                node_modules)>. Without the flag the file only checks the declared pins and exits.
 //
 // scenario A (ref ECHOED): reservation → capture → recording → recorded cleanup. Ends cancelled, all three settlement legs, claim released; EXACTLY
@@ -55,7 +55,7 @@ const [RES, CAP, TCL, REC, RCL] = await Promise.all(["reservation", "capture", "
 /** the five frozen runners and the tooling commit each one pins (the composition under test) */
 const RUNNERS = Object.freeze([
   { name: "reservation", E: RES, pin: "40779e34e8c65ac5c4494bc5a18cd4223ef723fa" },
-  { name: "capture", E: CAP, pin: "40779e34e8c65ac5c4494bc5a18cd4223ef723fa" },
+  { name: "capture", E: CAP, pin: "59178b0468469b6570beab861bbc8e48b3a887d1" },        // C2: Slice 2 at the merged C1 fix (omits final_capture); Slice 1 stays at 40779e34
   { name: "test-cleanup", E: TCL, pin: "9d86bfa1e60779b3794de88bbae151670e8fe515" },
   { name: "recording", E: REC, pin: "5a094b16c1f84690a738a98ab89140caa69c1e1f" },
   { name: "recorded-cleanup", E: RCL, pin: "e41b654a667cb0ba8775b5bd0040c28a3d14fda0" },
@@ -70,7 +70,7 @@ test("R0 the five runners declare the expected immutable tooling pins; shipped e
     assert.equal(r.E.CONSTANTS.toolingCommit, r.pin, r.name);
     assert.ok(Array.isArray(r.E.CONSTANTS.closure) && /^[0-9a-f]{64}$/.test(r.E.CONSTANTS.closureDigest), `${r.name} closure`);
   }
-  assert.deepEqual(RUNNERS.map((r) => r.E.CONSTANTS.toolingCommit.slice(0, 8)), ["40779e34", "40779e34", "9d86bfa1", "5a094b16", "e41b654a"]);
+  assert.deepEqual(RUNNERS.map((r) => r.E.CONSTANTS.toolingCommit.slice(0, 8)), ["40779e34", "59178b04", "9d86bfa1", "5a094b16", "e41b654a"]);
 });
 
 /** the closure gate: every runner's closure BYTES at its pin checkout == its frozen digest (the runner's OWN exported prefix). Pure: reads
@@ -97,7 +97,7 @@ if (GATE) for (const g of GATE) console.log(`# gate ${g.name} @ ${g.pin}: ${g.fi
 if (DB_ON) {
   const pinDir = (pin) => join(PIN_ROOT, pin.slice(0, 8));
   const at = (pin, p) => import(pathToFileURL(join(pinDir(pin), p)).href);
-  const P1 = RUNNERS[0].pin, P3 = RUNNERS[2].pin, P4 = RUNNERS[3].pin, P5 = RUNNERS[4].pin;
+  const P1 = RUNNERS[0].pin, P2 = RUNNERS[1].pin, P3 = RUNNERS[2].pin, P4 = RUNNERS[3].pin, P5 = RUNNERS[4].pin;
 
   test("R1 tooling closure bytes (report): the awaited bootstrap gate verified all five runners' closures at their pins before any tooling import; re-checked here", async () => {
     assert.equal(GATE.length, 5);
@@ -113,14 +113,19 @@ if (DB_ON) {
   after(async () => { await db.close(); });
 
   // ---- per-pin REAL tooling (the SAME construction as each runner's own I-tests, from ITS checkout) ------------------------------------------------
-  const [T1, EA1, HR1, CP1, LK1, IS1, W1res, W1cap, R1] = await Promise.all([at(P1, "scripts/e7-connected/http-transports.mjs"), at(P1, "scripts/e7-connected/executor-adapters.mjs"),
+  const [T1, EA1, HR1, CP1, LK1, IS1, W1res, R1] = await Promise.all([at(P1, "scripts/e7-connected/http-transports.mjs"), at(P1, "scripts/e7-connected/executor-adapters.mjs"),
     at(P1, "lib/hostaway-reservations.js"), at(P1, "lib/checkout/capture-proof.js"), at(P1, "scripts/e7-connected/run-lock-precheck.mjs"), at(P1, "lib/checkout/intent-state.js"),
-    at(P1, "lib/booking-db/reservation-worker.js"), at(P1, "lib/booking-db/capture-worker.js"), at(P1, "lib/booking-db/repo.js")]);
+    at(P1, "lib/booking-db/reservation-worker.js"), at(P1, "lib/booking-db/repo.js")]);
   const toolingRes = { runOrchestratorStep: W1res.runOrchestratorStep, loadIntent: R1.loadIntent, createPhaseExecutors: EA1.createPhaseExecutors, createStripeSend: T1.createE7StripeTestSend,
     createHostawaySend: T1.createE7HostawaySend, validateAdapterConfig: HR1.validateAdapterConfig, paymentIntentProofObservationV3: CP1.paymentIntentProofObservationV3,
     stillAuthorizedV3Refusal: CP1.stillAuthorizedV3Refusal, LOCK_KEY: LK1.LOCK_KEY, LOCK_PRECHECK_SQL: LK1.LOCK_PRECHECK_SQL };
-  const toolingCap = { ...toolingRes, runOrchestratorStep: undefined, runCaptureStep: W1cap.runCaptureStep, captureKey: IS1.captureKey };
-  delete toolingCap.runOrchestratorStep;
+  // C2: Slice 2's tooling comes from ITS OWN pin (59178b04, the C1 fix) — a DIFFERENT checkout from Slice 1's 40779e34
+  const [T2, EA2, HR2, CP2, LK2, IS2, W2cap, R2] = await Promise.all([at(P2, "scripts/e7-connected/http-transports.mjs"), at(P2, "scripts/e7-connected/executor-adapters.mjs"),
+    at(P2, "lib/hostaway-reservations.js"), at(P2, "lib/checkout/capture-proof.js"), at(P2, "scripts/e7-connected/run-lock-precheck.mjs"), at(P2, "lib/checkout/intent-state.js"),
+    at(P2, "lib/booking-db/capture-worker.js"), at(P2, "lib/booking-db/repo.js")]);
+  const toolingCap = { runCaptureStep: W2cap.runCaptureStep, captureKey: IS2.captureKey, loadIntent: R2.loadIntent, createPhaseExecutors: EA2.createPhaseExecutors, createStripeSend: T2.createE7StripeTestSend,
+    createHostawaySend: T2.createE7HostawaySend, validateAdapterConfig: HR2.validateAdapterConfig, paymentIntentProofObservationV3: CP2.paymentIntentProofObservationV3,
+    stillAuthorizedV3Refusal: CP2.stillAuthorizedV3Refusal, LOCK_KEY: LK2.LOCK_KEY, LOCK_PRECHECK_SQL: LK2.LOCK_PRECHECK_SQL };
 
   const [TT3, T3, EX3, HR3, CP3, RP3, TP3, CO3, IS3, LK3, W3, TCR3, R3] = await Promise.all([at(P3, "scripts/e7-connected/test-cleanup-transports.mjs"), at(P3, "scripts/e7-connected/http-transports.mjs"),
     at(P3, "scripts/e7-connected/test-cleanup-executors.mjs"), at(P3, "lib/hostaway-reservations.js"), at(P3, "lib/checkout/capture-proof.js"), at(P3, "lib/checkout/recovery-plan.js"),
@@ -214,7 +219,7 @@ if (DB_ON) {
         w.writes.push(`S POST ${p}`);
         if (p === `/v1/payment_intents/${a.piId}/capture`) {
           w.bodies.capture = { key: req.headers["Idempotency-Key"], body: req.body };
-          assert.equal(req.body, `amount_to_capture=${a.total}&final_capture=true&expand%5B%5D=latest_charge`);
+          assert.equal(req.body, `amount_to_capture=${a.total}&expand%5B%5D=latest_charge`, "C1/C2 wire: no final_capture");
           w.captured = true; return reply(200, pi());
         }
         if (p === "/v1/refunds") {
@@ -319,7 +324,7 @@ if (DB_ON) {
   const phaseRes = async (a, w) => RES.runReservationCore({ plan: RES.buildPlan(C1, { approvalRef: "SYNTHETIC-rehearsal", intentId: a.id, expectedVersion: await ver(a.id), notBefore: nb(a), admission: "authorized", reservationId: "", runnerDigest: ZERO }).plan,
     pool: db.app, tooling: toolingRes, exchanges: { stripe: w.stripe, hostaway: w.hostaway }, credentials: creds, clock: () => Date.now(), sleep: harnessSleep("reservation@40779e34") });
   const phaseCap = async (a, w, rid) => CAP.runCaptureCore({ plan: CAP.buildPlan(C2, { approvalRef: "SYNTHETIC-rehearsal", intentId: a.id, expectedVersion: await ver(a.id), notBefore: nb(a), paymentIntentId: a.piId, reservationId: rid, amountMinor: a.total, runnerDigest: ZERO }).plan,
-    pool: db.app, tooling: toolingCap, exchanges: { stripe: w.stripe, hostaway: w.hostaway }, credentials: creds, clock: () => Date.now(), sleep: harnessSleep("capture@40779e34") });
+    pool: db.app, tooling: toolingCap, exchanges: { stripe: w.stripe, hostaway: w.hostaway }, credentials: creds, clock: () => Date.now(), sleep: harnessSleep("capture@59178b04") });
   const recPlan = async (a, rid, chargeId) => REC.buildPlan(C4, { approvalRef: "SYNTHETIC-rehearsal", intentId: a.id, expectedVersion: await ver(a.id), notBefore: nb(a), paymentIntentId: a.piId, reservationId: rid, chargeId, capturedMinor: a.total,
     from: a.stay.from, to: a.stay.to, guests: a.intent.guests, attemptId: a.attemptId, sessionId: a.sessionId, runnerDigest: ZERO });
   const phaseRec = async (a, w, rid, chargeId, k) => { const b = await recPlan(a, rid, chargeId);
@@ -331,7 +336,7 @@ if (DB_ON) {
       from: a.stay.from, to: a.stay.to, guests: a.intent.guests, attemptId: a.attemptId, sessionId: a.sessionId, runnerDigest: ZERO });
     return TCL.runTestCleanupCore({ plan: b.plan, planHash: b.planHash, pool: db.app, tooling: toolingTcl, exchanges: { stripe: w.stripe, hostaway: w.hostaway }, credentials: creds, clock: () => Date.now(), sleep: harnessSleep("test-cleanup@9d86bfa1") }); };
 
-  /** the shared Slice 1 → Slice 2 prefix of both scenarios: reservation (40779e34) then capture (40779e34) on the SAME intent / PI / price */
+  /** the shared Slice 1 → Slice 2 prefix of both scenarios: reservation (40779e34) then capture (59178b04, C1 fix) on the SAME intent / PI / price */
   const phaseResPending = async (a, w) => RES.runReservationCore({ plan: RES.buildPlan(C1, { approvalRef: "SYNTHETIC-rehearsal", intentId: a.id, expectedVersion: await ver(a.id), notBefore: nb(a), admission: "pending", reservationId: String(w.res), runnerDigest: ZERO }).plan,
     pool: db.app, tooling: toolingRes, exchanges: { stripe: w.stripe, hostaway: w.hostaway }, credentials: creds, clock: () => Date.now(), sleep: harnessSleep("reservation@40779e34(pending)") });
   /** test-harness scheduling: REAL wait until the worker's OWN next_action_at (its E7.1 freshness schedule) has passed; nothing is rewritten */
@@ -371,7 +376,7 @@ if (DB_ON) {
     assert.deepEqual([s.st.state, s.st.rid, s.claim[0].released, s.locks], ["reservation_confirmed", r1.reservationId, false, 0]);
     assert.deepEqual(opsOf(s, "stripe.capture_payment_intent"), [["pending", 0, false]], "capture queued pristine by the 40779e34 reservation worker");
     const r2 = await phaseCap(a, w, r1.reservationId);
-    budgetLine(`${tag}.2 capture@40779e34`, r2, C2);
+    budgetLine(`${tag}.2 capture@59178b04`, r2, C2);
     assert.equal(r2.outcome, "PAYMENT_CAPTURED_INTERMEDIATE", JSON.stringify(r2));
     assert.deepEqual([r2.captureInvocations, r2.chargeId, r2.capturedMinor, r2.reservationId, w.captured, w.bodies.capture.key], [1, a.chargeId, a.total, r1.reservationId, true, `cap:${a.id}:${a.piId}`]);
     assert.deepEqual(w.writes, ["H POST /v1/reservations", `S POST /v1/payment_intents/${a.piId}/capture`], "phase 1+2 writes");
@@ -383,7 +388,7 @@ if (DB_ON) {
     return { rid: r1.reservationId, chargeId: r2.chargeId, transitions: s.transitions, opsAfter2: s.ops.map((x) => `${x.op_type}:${x.state}`) };
   }
 
-  test("A echoed ref: reservation(40779e34) → capture(40779e34) → recording(5a094b16) → recorded cleanup(e41b654a) on schema 0021: cancelled, 3 legs, claim released; exactly 1 create / 1 capture / 1 record / 1 cancel / 1 Stripe refund / 1 mirror; history preserved; notify suppressed never dispatched", async () => {
+  test("A echoed ref: reservation(40779e34) → capture(59178b04, C1 fix) → recording(5a094b16) → recorded cleanup(e41b654a) on schema 0021: cancelled, 3 legs, claim released; exactly 1 create / 1 capture / 1 record / 1 cancel / 1 Stripe refund / 1 mirror; history preserved; notify suppressed never dispatched", async () => {
     const a = await authorizedIntent("A"); const w = world(a, { echoRef: true });
     const pre = await reserveAndCapture(a, w, "A");
     // ---- phase 3: Slice 4 recording at 5a094b16 on the 40779e34-produced payment_captured row
@@ -489,7 +494,7 @@ if (DB_ON) {
       // a minimal tampered tooling root: only the closure files (copied bytes) of every pin, one byte flipped in the capture worker at 40779e34
       for (const r of RUNNERS) { const dir = join(tmp, r.pin.slice(0, 8)); mkdirSync(dir, { recursive: true }); writeFileSync(join(dir, "package.json"), "{}\n");
         for (const rel of r.E.CONSTANTS.closure) { mkdirSync(dirname(join(dir, rel)), { recursive: true }); cpSync(join(pinDir(r.pin), rel), join(dir, rel)); } }
-      const victim = join(tmp, "40779e34", "lib/booking-db/capture-worker.js");
+      const victim = join(tmp, "59178b04", "lib/booking-db/capture-worker.js");
       writeFileSync(victim, readFileSync(victim, "utf8").replace("workerId", "workerID"));
       const hook = join(tmp, "hook.mjs");
       writeFileSync(hook, `import { register } from "node:module"; register(new URL("./hooks.mjs", import.meta.url));`);
@@ -498,8 +503,8 @@ if (DB_ON) {
       const r = spawnSync(process.execPath, ["--import", pathToFileURL(hook).href, "--test", fileURLToPath(import.meta.url)], { env, encoding: "utf8", timeout: 120000 });
       const all = r.stdout + "\n" + r.stderr;
       assert.notEqual(r.status, 0, "the file fails to load");
-      assert.match(all, /CLOSURE_MISMATCH:capture@40779e34/, all.slice(-2000));
-      assert.doesNotMatch(all, /CLOSURE_MISMATCH:reservation@/, "the reservation closure (same pin, untouched files) passed first: files are verified in runner order");
+      assert.match(all, /CLOSURE_MISMATCH:capture@59178b04/, all.slice(-2000));
+      assert.doesNotMatch(all, /CLOSURE_MISMATCH:reservation@/, "the reservation closure (its own pin 40779e34, untouched) passed first: files are verified in runner order");
       assert.doesNotMatch(r.stderr, /TOOLING_RESOLVED/, "ZERO tooling imports resolved under the tampered root");
       assert.doesNotMatch(all, /initdb|no-such-pg-bin|# DB:|Subtest: A |Subtest: B |scheduling/, "ZERO database / scenario activity");
       assert.doesNotMatch(r.stdout, /# gate /, "the gate reports digests only after ALL five verified; nothing was reported on mismatch");

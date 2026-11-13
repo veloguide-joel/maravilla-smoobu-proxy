@@ -30,12 +30,13 @@ import { createHash } from "node:crypto";
 import { CONSTANTS as RES, canonical, framedDigest, childEnv, spawnNode, dbTargetOk, sessionLockUrl, SESSION_LOCK_PORT, OFFICIAL_CA_SHA256 } from "./e7-hosted-reservation.mjs";
 
 export const CONSTANTS = Object.freeze({
-  toolingCommit: RES.toolingCommit,                        // 40779e34 — the SAME immutable MERGED tooling as Slice 1
-  toolingStatus: RES.toolingStatus,
+  toolingCommit: "59178b0468469b6570beab861bbc8e48b3a887d1",                                  // C2 (2026-11-13): Slice 2 repinned to the MERGED e7-test C1 fix (#84, omits final_capture); DISTINCT from Slice 1 (40779e34)
+  toolingStatus: "MERGED",
   executeEnabled: false,                                   // Slice 2: capture execution default CLOSED (verify / execute refuse HCP_EXECUTE_CLOSED)
-  // Slice 1 closure + the accepted capture worker (test C2 recomputes this from an INDEPENDENT import scan of the pinned tree)
+  // the Slice 1 closure PATH SET + the accepted capture worker, at THIS runner's own pin 59178b04 (test C2 recomputes the set from an INDEPENDENT import scan
+  // of the pinned tree — the set is unchanged by C1; the BYTES of capture-proof.js / executor-adapters.mjs / http-transports.mjs changed, hence the new digest)
   closure: Object.freeze([...RES.closure, "lib/booking-db/capture-worker.js"].sort()),
-  closureDigest: "7321924fa0e841e0adc0779d73f00fc876a9d0246259847673c92859997c7ba0",
+  closureDigest: "adaed04409012a233abcfb0a7aa748c0f8bc9e21afbd4e13adb94c064a97fd8f",
   pgVersion: RES.pgVersion,
   runnerFiles: Object.freeze(["scripts/e7-hosted-capture.mjs", "scripts/e7-hosted-reservation.mjs", ".github/workflows/e7-hosted-capture.yml", "test/e7-hosted-capture.test.mjs"]),
   accountId: RES.accountId, listingId: RES.listingId, currency: RES.currency, refFieldId: RES.refFieldId, listingTimeZone: RES.listingTimeZone,
@@ -312,7 +313,7 @@ export async function runCaptureCore(input) {
     // ---- (5) the target-only transport fence (capture phase) ----------------------------------------------------------------------------------
     const urls = { account: `${STRIPE}/v1/account`, pi: `${STRIPE}/v1/payment_intents/${PI}?expand%5B%5D=latest_charge`, capture: `${STRIPE}/v1/payment_intents/${PI}/capture`,
       reservation: `${HOSTAWAY}/v1/reservations/${RID}` };
-    const CAPTURE_BODY = `amount_to_capture=${plan.amountMinor}&final_capture=true&expand%5B%5D=latest_charge`;
+    const CAPTURE_BODY = `amount_to_capture=${plan.amountMinor}&expand%5B%5D=latest_charge`;        // C1/C2: single FULL capture, NO final_capture (Stripe 400 on non-multicapture PIs)
     const fence = { captureOpen: false, captureExchanged: false, secondSend: false };
     const hkeys = (h) => Object.keys(h).sort().join(",");
     const stripeGate = (req) => {
