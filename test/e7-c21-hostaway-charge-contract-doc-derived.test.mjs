@@ -1,7 +1,8 @@
 // test/e7-c21-hostaway-charge-contract-doc-derived.test.mjs — C21 OFFLINE compatibility audit of the accepted Hostaway guest-charge contract
 // (pin 5a094b16: lib/checkout/offline-charge-proof.js, lib/hostaway-reservations.js, scripts/e7-connected/http-transports.mjs) against the
 // OFFICIAL PUBLIC documentation https://api.hostaway.com/documentation (sections "Guest payment" → guest charge object, Get guest charges list,
-// Create offline charge, Update / Refund offline charge; standard response description; changelog 2026-10-02 / 2026-09-23) as READ on 2026-11-13.
+// Create offline charge, Update / Refund offline charge, the list QUERY-PARAMETER table; standard response description; changelog 2026-10-02 /
+// 2026-09-23) as READ on 2026-11-13 (C22 re-read of the query table).
 // EVERY fixture here is DOC-DERIVED (shape + example values from the public docs) with SANITIZED SYNTHETIC identities (reservation 88000001,
 // listing 990001, acct-test-1) — NONE is a live observation. The REAL accepted normalizers / proofs / transport grammar from E7_TOOLING_DIR run
 // unchanged; the merged probe (scripts/e7-hosted-charge-list-probe.mjs) runs over a FAKE exchange. Zero network (throwing guards), zero DB,
@@ -32,9 +33,15 @@ export const DOC = Object.freeze({
   readOn: "2026-11-13",
   chargeTypes: ["charge", "preAuth", "refund"],                                            // documented (changelog 2026-10-02 added refund)
   paymentProviders: ["stripe", "braintree", "authorizeNet", "offline"],                   // documented closed list on the charge object
-  statusExamples: ["awaiting", "paid", "failed", "pause", "cancelled", "awaitingHold"],   // documented as EXAMPLES ("etc.") — open set
-  refundStatusExample: "succeeded",                                                        // Refund offline charge: result status "succeeded"
-  paymentMethodExamples: ["credit_card_online", "credit_card", "bank_transfer"],           // charge object: EXAMPLES ("etc.") — open set
+  // §"Guest charge object" table: status / paymentMethod are given as EXAMPLES ending in "etc." (OPEN sets)
+  statusObjectExamples: ["awaiting", "paid", "failed", "pause", "cancelled", "awaitingHold"],
+  paymentMethodObjectExamples: ["credit_card_online", "credit_card", "bank_transfer"],
+  refundStatusExample: "succeeded",                                                        // §"Refund offline charge": result status "succeeded"
+  // §"Get guest charges list" QUERY-PARAMETER table (filter vocabularies; the fullest documented enumerations, bracket-form arrays)
+  statusListFilter: ["paid", "failed", "awaiting", "waitingForConfirmation", "pause", "cancelled", "awaitingHold", "holdSuccess", "holdFail", "holdCancelled", "captureSuccess", "captureFail", "holdReleased", "holdReleasedFail", "succeeded", "pending"],
+  paymentMethodListFilter: ["bank_check", "bank_transfer", "cash", "credit_card", "paypal", "vcc", "venmo", "credit_card_online", "payment_link", "ota", "other"],
+  paymentProviderListFilter: ["stripe", "braintree", "authorizeNet", "offline"],         // single-value query parameter, same closed list as the object
+  typesListFilter: ["charge", "preAuth", "refund"],
   createPaymentMethods: ["credit_card", "vcc", "cash", "paypal", "venmo", "bank_transfer", "bank_check", "ota", "other"], // Create offline charge: closed list
   createStatuses: ["awaiting", "paid"],                                                    // Create offline charge: closed list
   createMandatory: ["title", "amount", "paymentMethod", "status", "scheduledDate"],        // "All fields but description are mandatory"
@@ -45,13 +52,14 @@ export const DOC = Object.freeze({
   listPath: "/v1/guestPayments/charges",                                                   // GET
   listSelectors: ["reservationId", "reservationIds[]"],                                    // both documented; changelog: reservationIds max 200 ids
   listLimit: { default: 100, max: 500 },
-  listCountSemantics: "count ignores limit and offset (TOTAL matching, not page length)",  // documented
+  listCountSemantics: "count = total number of matching charges, ignoring limit and offset",  // documented (§Get guest charges list)
+  listOffset: "documented paging parameter; the accepted PROOF never reads it; the merged PROBE separately refuses a non-zero offset",
   listEnvelopeExampleKeys: ["status", "result", "count", "offset"],                        // example: offset null; NO limit / page / totalPages
   genericEnvelopeKeys: ["status", "result", "limit", "offset", "count", "page", "totalPages"], // page-wide "standard response" description
   amountType: "float", amountUnits: "UNKNOWN (not stated; examples 10 / 100 are whole numbers)",
   scheduledDateFormat: "YYYY-MM-DD HH:MM:SS (datetime; examples)", chargeDateFormat: "date (format not stated; example 'YYYY-MM-DD HH:MM:SS')",
   createReplyHttpStatus: "UNKNOWN (docs: 'Created charge object or error response'; no code stated)",
-  errorBodies: "UNKNOWN (not documented)",
+  errorEnvelopes: "standard fail envelope {status:'fail', message} and 400 validation failures ARE documented page-wide / per parameter; the charge-specific full error matrix is UNKNOWN",
 });
 // what the ACCEPTED pin assumes beyond the docs (provenance; asserted below so a change in either side is visible)
 export const ACCEPTED = Object.freeze({
@@ -90,8 +98,10 @@ const assess = (rows, jo = {}, o = {}) => P.assessChargeList({ read: read(rows, 
 test("D1 documented list ENVELOPE: the documented example keys (status/result/count/offset:null; no limit/page/totalPages) with an EMPTY result pass the accepted proof — the same shape the C20 live probe observed; the page-wide generic envelope keys (page/totalPages) are IGNORED by the proof but STOP the merged probe (fail-closed divergence, documented here)", () => {
   const r = assess([]); assert.equal(r.ok, true, JSON.stringify(r)); assert.deepEqual([r.count, r.rows.length, r.complete], [0, 0, true]);
   assert.deepEqual(Object.keys(docListEnvelope([])), DOC.listEnvelopeExampleKeys);
-  // proof: extra generic keys do not change acceptance (only status/result/count are read)
+  // proof: extra generic keys do not change acceptance (only status/result/count are read; offset is NEVER read by the proof)
   assert.equal(assess([], { limit: 500, page: 1, totalPages: 1 }).ok, true);
+  assert.equal(assess([], { offset: 500 }).ok, true, "the PROOF ignores offset entirely");
+  assert.equal(PR.paginationRefusal(docListEnvelope([], { offset: 500 }), 0), "OFFSET_NOT_ZERO", "the merged PROBE separately refuses a non-zero offset");
   // merged probe: documented GENERIC envelope keys are continuation markers → STOP before any second request (no next-page path exists)
   assert.deepEqual([PR.paginationRefusal({ status: "success", result: [], count: 0, offset: null }, 0), PR.paginationRefusal({ ...docListEnvelope([]), page: 1, totalPages: 1 }, 0), PR.paginationRefusal({ ...docListEnvelope([]), limit: 100 }, 0)],
     [null, "CONTINUATION_MARKER_PRESENT", "LIMIT_INCOMPATIBLE"]);
@@ -184,15 +194,26 @@ test("D6 list count semantics: docs say `count` ignores limit/offset (TOTAL matc
   assert.equal(ACCEPTED.countMustEqualPageLength, true);
 });
 
-test("D7 enum provenance for the merged probe's OUTPUT enums (hygiene only, never acceptance): every documented status / paymentMethod / provider value outside the probe's lists maps to UNKNOWN (downgrading the outcome, never refusing); the probe lists also carry values the docs do NOT name (ASSUMED — recorded here)", () => {
+test("D7 enum provenance for the merged probe's OUTPUT enums (hygiene only, never acceptance), derived against the UNION of the documented vocabularies with section provenance: charge-object EXAMPLES (open, 'etc.') ∪ list-filter QUERY TABLE (fullest enumeration) ∪ create / refund sections; documented-not-in-probe values map to UNKNOWN (outcome downgrade, never refusal); probe-only values are recorded; no claim that any documented value was live-observed", () => {
   const E = PR.ENUMS;
-  const notInProbe = { chargeStatus: [...DOC.statusExamples, DOC.refundStatusExample].filter((v) => !E.chargeStatus.includes(v)), paymentMethod: [...new Set([...DOC.paymentMethodExamples, ...DOC.createPaymentMethods])].filter((v) => !E.paymentMethod.includes(v)), paymentProvider: DOC.paymentProviders.filter((v) => !E.paymentProvider.includes(v)) };
-  assert.deepEqual(notInProbe, { chargeStatus: ["awaiting", "pause", "awaitingHold", "succeeded"], paymentMethod: ["credit_card_online", "bank_transfer", "vcc", "cash", "paypal", "venmo", "bank_check", "ota"], paymentProvider: ["braintree", "authorizeNet"] });
-  for (const [k, vals] of Object.entries(notInProbe)) for (const v of vals) assert.equal(PR.safeEnum(k, v), "UNKNOWN", `${k}:${v}`);
-  const assumedByProbe = { chargeStatus: E.chargeStatus.filter((v) => ![...DOC.statusExamples, DOC.refundStatusExample].includes(v)), paymentProvider: E.paymentProvider.filter((v) => !DOC.paymentProviders.includes(v)), chargeType: E.chargeType.filter((v) => !DOC.chargeTypes.includes(v)) };
-  assert.deepEqual(assumedByProbe, { chargeStatus: ["unpaid", "pending", "refunded"], paymentProvider: ["hostaway"], chargeType: [] }, "probe enum values the public docs do not name (output labels only; a reviewed constants change could drop them)");
-  assert.deepEqual([...E.chargeType], DOC.chargeTypes, "charge types: probe == proof CHARGE_TYPES == docs");
-  assert.ok(DOC.paymentProviders.includes("offline") && E.paymentProvider.includes("offline"));
+  const uniq = (a) => [...new Set(a)];
+  const docStatuses = uniq([...DOC.statusObjectExamples, DOC.refundStatusExample, ...DOC.statusListFilter]);
+  const docMethods = uniq([...DOC.paymentMethodObjectExamples, ...DOC.createPaymentMethods, ...DOC.paymentMethodListFilter]);
+  const docProviders = uniq([...DOC.paymentProviders, ...DOC.paymentProviderListFilter]);
+  // the query table is the superset of the object examples (every object example appears in the filter vocabulary)
+  assert.ok(DOC.statusObjectExamples.every((v) => DOC.statusListFilter.includes(v)) && DOC.statusListFilter.includes(DOC.refundStatusExample));
+  assert.ok(DOC.paymentMethodObjectExamples.every((v) => DOC.paymentMethodListFilter.includes(v)) && DOC.createPaymentMethods.every((v) => DOC.paymentMethodListFilter.includes(v)));
+  assert.ok(DOC.paymentMethodListFilter.includes("payment_link") && DOC.statusListFilter.includes("pending") && DOC.statusListFilter.includes("waitingForConfirmation"));
+  const documentedNotInProbe = { chargeStatus: docStatuses.filter((v) => !E.chargeStatus.includes(v)), paymentMethod: docMethods.filter((v) => !E.paymentMethod.includes(v)), paymentProvider: docProviders.filter((v) => !E.paymentProvider.includes(v)) };
+  assert.deepEqual(documentedNotInProbe, {
+    chargeStatus: ["awaiting", "pause", "awaitingHold", "succeeded", "waitingForConfirmation", "holdSuccess", "holdFail", "holdCancelled", "captureSuccess", "captureFail", "holdReleased", "holdReleasedFail"],
+    paymentMethod: ["credit_card_online", "bank_transfer", "vcc", "cash", "paypal", "venmo", "bank_check", "ota", "payment_link"],
+    paymentProvider: ["braintree", "authorizeNet"] });
+  for (const [k, vals] of Object.entries(documentedNotInProbe)) for (const v of vals) assert.equal(PR.safeEnum(k, v), "UNKNOWN", `${k}:${v}`);
+  const probeOnly = { chargeStatus: E.chargeStatus.filter((v) => !docStatuses.includes(v)), paymentMethod: E.paymentMethod.filter((v) => !docMethods.includes(v)), paymentProvider: E.paymentProvider.filter((v) => !docProviders.includes(v)), chargeType: E.chargeType.filter((v) => !DOC.typesListFilter.includes(v)) };
+  assert.deepEqual(probeOnly, { chargeStatus: ["unpaid", "refunded"], paymentMethod: [], paymentProvider: ["hostaway"], chargeType: [] }, "probe enum values no documented section names (output labels only; `pending` IS documented in the list-filter table)");
+  assert.deepEqual([...E.chargeType], DOC.chargeTypes, "charge types: probe == proof CHARGE_TYPES == object table == list-filter table");
+  assert.ok(docProviders.includes("offline") && E.paymentProvider.includes("offline"));
 });
 
 test("D8 constants cross-check between docs, proof and probe (a drift on any side fails here): types, approved methods ⊂ documented create methods, status `paid` ∈ documented create statuses, LIST_LIMIT == documented max, probe target config method approved", () => {
