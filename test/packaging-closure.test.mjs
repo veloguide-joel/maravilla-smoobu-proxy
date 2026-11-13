@@ -11,7 +11,7 @@ import { importClosure } from "./helpers/import-closure.mjs";
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const walk = (d) => (existsSync(join(ROOT, d)) ? readdirSync(join(ROOT, d)).flatMap((n) => (statSync(join(ROOT, d, n)).isDirectory() ? walk(`${d}/${n}`) : [`${d}/${n}`])) : []);
 const MOVED = ["codec", "config", "operations", "pool", "repo", "webhooks"];
-const BOOKING_DB_FILES = [...MOVED, "intent-access", "recovery", "reservation-worker", "capture-worker", "compensation-worker", "recording-worker", "recording-inbox", "notification-worker", "test-abort", "test-cleanup", "cleanup-worker"].sort(); // + E6 bearer-token lookup and shared rate limits; + E7.1 recovery; + E7.2/E7.3b/E7.4a/E7.4b/E7 guest-notification offline workers; + E7 TEST abort/cleanup transactions + the TEST cleanup worker (not route-reachable)
+const BOOKING_DB_FILES = [...MOVED, "intent-access", "recovery", "reservation-worker", "capture-worker", "compensation-worker", "recording-worker", "recording-inbox", "notification-worker", "test-abort", "test-cleanup", "cleanup-worker", "test-cleanup-recorded"].sort(); // + 0021 recorded TEST cleanup request (not route-reachable); + E6 bearer-token lookup and shared rate limits; + E7.1 recovery; + E7.2/E7.3b/E7.4a/E7.4b/E7 guest-notification offline workers; + E7 TEST abort/cleanup transactions + the TEST cleanup worker (not route-reachable)
 const WEBHOOK = "api/checkout/stripe-webhook.js";
 const INTENT_ROUTES = ["api/checkout/intents.js", "api/checkout/intent-step.js"];
 // E6 intent API closure (identical for both routes apart from the entry file); everything after the HTTP layer is lazy.
@@ -104,7 +104,7 @@ test("db/lib shims: identical export names and identical function/object identit
     assert.equal(code, `export * from "../../lib/booking-db/${m}.js";`, `${m} shim is a pure re-export`);
   }
   assert.deepEqual(walk("db/lib").sort(), ["admin", "codec", "config", "index", "migrate", "operations", "pool", "repo", "webhooks"].map((n) => `db/lib/${n}.js`));
-  assert.deepEqual(walk("lib/booking-db").sort(), BOOKING_DB_FILES.map((n) => `lib/booking-db/${n}.js`));
+  assert.deepEqual(walk("lib/booking-db").sort(), BOOKING_DB_FILES.map((n) => `lib/booking-db/${n}.js`).sort());   // 0021: sorted as paths ("-" < ".")
   // the public DB surface (db/lib/index.js: migrations + admin + runtime) still exports everything it did
   const idx = await import(pathToFileURL(join(ROOT, "db/lib/index.js")).href);
   for (const n of ["migrateUp", "migrateDown", "loadMigrations", "createBookingPool", "assertEnvironment", "applyEvent", "recordStripeEvent", "claimNextOperation", "DB_CONFIG"]) assert.equal(typeof idx[n] === "undefined", false, n);

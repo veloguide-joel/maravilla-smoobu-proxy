@@ -205,8 +205,10 @@ test("C4 healthy apply (fresh cluster, nonempty booking fixture): status 20 / bo
     assert.deepEqual(post.identity.acls["booking.test_refund_pi_observation_ok(o jsonb, p_intent uuid, p_pi text, p_charge text, p_amount bigint, p_currency text)"], ["postgres=X/postgres"], "owner only");
     for (const f of ["test_cleanup_cancel_bound", "refund_claim_fence", "recording_retirement_fence"]) assert.deepEqual(post.identity.acls[`booking.${f}()`], ["postgres=X/postgres"], f);
     const st = await migrationStatus(B.c, { env: "test" });
-    assert.deepEqual(st.applied, Array.from({ length: 20 }, (_, i) => i + 1)); assert.deepEqual(st.pending, []);
-    assert.deepEqual(await migrateUp(B.c, { env: "test" }), [], "migrator no-op after the wrapper");
+    // historical TARGET (ROOT 5884658427): the wrapper applies 1..20 exactly; the tree now also carries the 0021 LOCAL candidate, which the wrapper
+    // never embeds / applies — it shows as pending and is NOT applied here (the migrator is capped at to: 20 for the no-op check below)
+    assert.deepEqual(st.applied, Array.from({ length: 20 }, (_, i) => i + 1)); assert.deepEqual(st.pending, [21]);
+    assert.deepEqual(await migrateUp(B.c, { env: "test", to: 20 }), [], "migrator no-op after the wrapper (historical target 20; 0021 not applied)");
     await expectRaise(B.c, /E7_1920_ALREADY_APPLIED_OR_LATER/);
     assert.deepEqual(identity(await inventory(B.c)), identity(PINS.post), "replay changed nothing");
     assert.equal((await B.c.query("SELECT count(*)::int AS n FROM booking_migrations.applied WHERE version IN (19, 20)")).rows[0].n, 2);
@@ -225,7 +227,7 @@ test("C5 forward-only limits: after the wrapper, migrateDown 20 → 19 works on 
   try {
     await runWrapper(B.c);
     assert.deepEqual(await migrateDown(B.c, { env: "test", to: 19 }), [20], "disposable only: 0020 down on an unused schema is possible");
-    assert.deepEqual(await migrateUp(B.c, { env: "test" }), [20], "and re-applies");
+    assert.deepEqual(await migrateUp(B.c, { env: "test", to: 20 }), [20], "and re-applies (historical target 20; 0021 not applied)");
     // the refusal path of 0020's down (its own guard): a settled refund row cannot be rolled back — proven on the DOWN script's guard text + a direct probe
     assert.match(m20.down, /cannot be rolled back/);
     assert.match(m19.down, /Fails \(by design\) if any row already uses the 0019 vocabulary/);
