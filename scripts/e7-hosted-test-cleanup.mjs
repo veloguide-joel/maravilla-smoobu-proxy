@@ -48,7 +48,7 @@ import { CONSTANTS as RES, canonical, framedDigest, childEnv, spawnNode, dbTarge
 export const CONSTANTS = Object.freeze({
   toolingCommit: "9d86bfa1e60779b3794de88bbae151670e8fe515",    // e7-test: PR67 (0019 foundation) + PR68 (cleanup worker / 0020) MERGED; immutable
   toolingStatus: "MERGED",
-  executeEnabled: true,                                           // Slice 3: cleanup execution OPENED for the ONE reviewed owner-present hosted TEST (ROOT prep GO 2026-11-13); revert to false after
+  executeEnabled: false,                                          // Slice 3: cleanup execution default CLOSED (verify / execute refuse HTC_EXECUTE_CLOSED)
   // the INDEPENDENTLY scanned transitive relative imports of the runner's tooling roots at 9d86bfa1 (test C2 recomputes this from the pinned tree):
   // = Slice 1 closure − executor-adapters.mjs − offline-charge-proof.js + the cleanup worker / request / proof / isolated executors + transports
   closure: Object.freeze(["lib/bookability.js", "lib/booking-db/cleanup-worker.js", "lib/booking-db/codec.js", "lib/booking-db/config.js", "lib/booking-db/operations.js",
