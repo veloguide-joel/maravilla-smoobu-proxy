@@ -1,0 +1,242 @@
+# E7 Slice 5: HOSTED RECORDED-TEST CLEANUP for ONE admitted RECORDED TEST intent (confirmed: captured + ONE succeeded LINKED Hostaway offline-charge
+# recording + ONE pristine queued guest.notify -> ONE accepted requestRecordedTestCleanup (lib/booking-db/test-cleanup-recorded.js: three legs open, the
+# notification SUPPRESSED, the recording NOT retired) -> test_cleanup_pending -> the ACCEPTED cleanup worker (lib/booking-db/cleanup-worker.js: ONE
+# host-cancel PUT then ONE bound FULL Stripe refund POST, each proven by a confirming READ) -> both legs proven -> the ACCEPTED mirror worker
+# (lib/booking-db/mirror-worker.js: fresh proofs, ONE bound Hostaway offline-refund POST through the accepted BOUND mirror transport, confirming LIST,
+# 0021 completion) -> cancelled / not_completed_refunded). HONEST LABEL: MANUAL hosted RECORDED-TEST cleanup (workflow_dispatch + the existing reviewer
+# gate), NOT automatic customer checkout and NOT a customer refund path. LABELLED SPECIALISATION of the reviewed e7-hosted-test-cleanup.yml (Slice 3),
+# DISTINCT from it (Slice 3 admits a payment_captured intent with a PRISTINE recording; this runner admits a confirmed RECORDED intent). MANUAL dispatch
+# only; default mode `preflight` = no secrets, no DB, no provider request, no dependency install (fake tests + digests + env). EXECUTION IS CLOSED in this
+# revision (runner CONSTANTS.executeEnabled = false): verify / execute refuse HRT_EXECUTE_CLOSED until a separately reviewed change opens it. Tooling =
+# the MERGED e7-test head e41b654a (PR75 0021 foundation + PR76 rev2 mirror worker); the shared DEV database must ALREADY carry the reviewed 0019 +
+# 0020 + 0021 objects (the runner only READS their presence and refuses SCHEMA_PREREQUISITE_MISSING; it never migrates). Inputs / labels / hashes are
+# NOT consent. E7_RUN_ID (github.run_id-run_attempt) = the immutable clientSnapshotId label of the session (a label, never authentication). Secrets
+# (environment `e7-readonly-probe`, required reviewers, execute step only): E7_STRIPE_TEST_KEY, E7_HOSTAWAY_TOKEN, E7_DEV_BOOKING_DATABASE_URL. No
+# webhook, no deploy, no migration, <= 1 Hostaway cancellation PUT for the ONE bound reservation (host, accepted body), <= 1 Stripe refund POST for the
+# ONE bound PaymentIntent with the EXACT captured amount + accepted idempotency key, <= 1 Hostaway offline-refund POST for the ONE bound original charge
+# with the EXACT accepted body (title / amount / isIncludeInPriceBreakdown 0), in that order; no capture / void / record / notify / create, no account or
+# key change, never a historical intent, a protected reservation id or a notification send.
+name: e7-hosted-recorded-cleanup
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "preflight (default: no secrets, no DB, no provider requests) or execute (CLOSED in this revision; exact reviewed bindings only)"
+        type: choice
+        options: [preflight, execute]
+        default: preflight
+      approval_ref:
+        description: "Approval label (non-secret; a label, never consent). All fourteen plan inputs empty = labelled SYNTHETIC preflight only."
+        type: string
+        required: false
+        default: ""
+      intent_id:
+        description: "The ONE admitted TEST intent (UUID v4)."
+        type: string
+        required: false
+        default: ""
+      expected_version:
+        description: "The intent's exact current version (refused at any other version)."
+        type: string
+        required: false
+        default: ""
+      not_before:
+        description: "ISO-8601 UTC instant (e.g. 2026-11-12T15:00:00Z); an intent created before it is refused as HISTORIC (never queue draining)."
+        type: string
+        required: false
+        default: ""
+      payment_intent_id:
+        description: "The bound TEST PaymentIntent id (pi_…) of the admitted intent (re-read and cross-checked by the runner)."
+        type: string
+        required: false
+        default: ""
+      reservation_id:
+        description: "The bound Hostaway reservation id (decimal; protected ids refused), proven by the ONE succeeded create."
+        type: string
+        required: false
+        default: ""
+      charge_id:
+        description: "The bound TEST charge id (ch_…) recorded by the ONE succeeded capture row (re-read and cross-checked)."
+        type: string
+        required: false
+        default: ""
+      offline_charge_id:
+        description: "The bound ORIGINAL Hostaway offline-charge id (decimal) recorded by the ONE succeeded LINKED recording row (= intents.offline_charge_id; re-read and cross-checked; never a Stripe id, never the reservation id)."
+        type: string
+        required: false
+        default: ""
+      captured_minor:
+        description: "The EXACT captured amount in minor units (= stored price = authorized = captured; the FULL refund amount; any other amount refuses)."
+        type: string
+        required: false
+        default: ""
+      stay_from:
+        description: "The stay's arrival date (YYYY-MM-DD; must be strictly in the listing's future at run time)."
+        type: string
+        required: false
+        default: ""
+      stay_to:
+        description: "The stay's departure date (YYYY-MM-DD)."
+        type: string
+        required: false
+        default: ""
+      guests:
+        description: "The stay's guest count (1-50)."
+        type: string
+        required: false
+        default: ""
+      attempt_id:
+        description: "The ONE completed payment attempt id (UUID) bound to the PaymentIntent and the Checkout Session."
+        type: string
+        required: false
+        default: ""
+      session_id:
+        description: "The bound TEST Checkout Session id (cs_test_…)."
+        type: string
+        required: false
+        default: ""
+      expected_plan_hash:
+        description: "execute only: exact 64-hex planHash from a REAL-plan preflight (no default)"
+        type: string
+        required: false
+        default: ""
+      expected_closure_digest:
+        description: "execute only: exact closureDigest of the pinned tooling closure (no default)"
+        type: string
+        required: false
+        default: ""
+      expected_runner_digest:
+        description: "execute only: exact 64-hex runnerDigest of the REVIEWED runner / workflow / test bytes (no default)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e7-hosted-recorded-cleanup
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    if: inputs.mode == 'preflight'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout runner (this repository, dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout merged E7 tooling (fixed commit e41b654a)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: e41b654a667cb0ba8775b5bd0040c28a3d14fda0
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Preflight (no secrets, no DB, no provider requests)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_APPROVAL_REF: ${{ inputs.approval_ref }}
+          E7_INTENT_ID: ${{ inputs.intent_id }}
+          E7_EXPECTED_VERSION: ${{ inputs.expected_version }}
+          E7_NOT_BEFORE: ${{ inputs.not_before }}
+          E7_PAYMENT_INTENT_ID: ${{ inputs.payment_intent_id }}
+          E7_RESERVATION_ID: ${{ inputs.reservation_id }}
+          E7_CHARGE_ID: ${{ inputs.charge_id }}
+          E7_OFFLINE_CHARGE_ID: ${{ inputs.offline_charge_id }}
+          E7_CAPTURED_MINOR: ${{ inputs.captured_minor }}
+          E7_STAY_FROM: ${{ inputs.stay_from }}
+          E7_STAY_TO: ${{ inputs.stay_to }}
+          E7_GUESTS: ${{ inputs.guests }}
+          E7_ATTEMPT_ID: ${{ inputs.attempt_id }}
+          E7_SESSION_ID: ${{ inputs.session_id }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+        run: node wrapper/scripts/e7-hosted-recorded-cleanup.mjs preflight
+
+  execute:
+    if: inputs.mode == 'execute' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: e7-readonly-probe
+    timeout-minutes: 30
+    steps:
+      - name: Checkout runner (this repository, dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout merged E7 tooling (fixed commit e41b654a)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: e41b654a667cb0ba8775b5bd0040c28a3d14fda0
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Verify bindings before any install (no secrets, no DB, no provider requests; refuses HRT_EXECUTE_CLOSED in this revision)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_APPROVAL_REF: ${{ inputs.approval_ref }}
+          E7_INTENT_ID: ${{ inputs.intent_id }}
+          E7_EXPECTED_VERSION: ${{ inputs.expected_version }}
+          E7_NOT_BEFORE: ${{ inputs.not_before }}
+          E7_PAYMENT_INTENT_ID: ${{ inputs.payment_intent_id }}
+          E7_RESERVATION_ID: ${{ inputs.reservation_id }}
+          E7_CHARGE_ID: ${{ inputs.charge_id }}
+          E7_OFFLINE_CHARGE_ID: ${{ inputs.offline_charge_id }}
+          E7_CAPTURED_MINOR: ${{ inputs.captured_minor }}
+          E7_STAY_FROM: ${{ inputs.stay_from }}
+          E7_STAY_TO: ${{ inputs.stay_to }}
+          E7_GUESTS: ${{ inputs.guests }}
+          E7_ATTEMPT_ID: ${{ inputs.attempt_id }}
+          E7_SESSION_ID: ${{ inputs.session_id }}
+          E7_EXPECTED_PLAN_HASH: ${{ inputs.expected_plan_hash }}
+          E7_EXPECTED_CLOSURE_DIGEST: ${{ inputs.expected_closure_digest }}
+          E7_EXPECTED_RUNNER_DIGEST: ${{ inputs.expected_runner_digest }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: node wrapper/scripts/e7-hosted-recorded-cleanup.mjs verify
+      - name: Install the pinned dependency from the verified lockfile (no lifecycle scripts)
+        working-directory: tooling
+        run: npm ci --ignore-scripts --omit=dev --no-audit --no-fund
+      - name: Fetch the public Supabase CA (the runner checks its pinned SHA-256)
+        run: curl --fail --silent --show-error --proto '=https' --max-time 20 -o "$RUNNER_TEMP/prod-ca-2021.crt" https://supabase-downloads.s3-ap-southeast-1.amazonaws.com/prod/ssl/prod-ca-2021.crt
+      - name: Execute bounded RECORDED-TEST cleanup (cancel + full refund + offline-charge mirror) for the ONE admitted recorded intent (secrets scoped to this step only)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_APPROVAL_REF: ${{ inputs.approval_ref }}
+          E7_INTENT_ID: ${{ inputs.intent_id }}
+          E7_EXPECTED_VERSION: ${{ inputs.expected_version }}
+          E7_NOT_BEFORE: ${{ inputs.not_before }}
+          E7_PAYMENT_INTENT_ID: ${{ inputs.payment_intent_id }}
+          E7_RESERVATION_ID: ${{ inputs.reservation_id }}
+          E7_CHARGE_ID: ${{ inputs.charge_id }}
+          E7_OFFLINE_CHARGE_ID: ${{ inputs.offline_charge_id }}
+          E7_CAPTURED_MINOR: ${{ inputs.captured_minor }}
+          E7_STAY_FROM: ${{ inputs.stay_from }}
+          E7_STAY_TO: ${{ inputs.stay_to }}
+          E7_GUESTS: ${{ inputs.guests }}
+          E7_ATTEMPT_ID: ${{ inputs.attempt_id }}
+          E7_SESSION_ID: ${{ inputs.session_id }}
+          E7_EXPECTED_PLAN_HASH: ${{ inputs.expected_plan_hash }}
+          E7_EXPECTED_CLOSURE_DIGEST: ${{ inputs.expected_closure_digest }}
+          E7_EXPECTED_RUNNER_DIGEST: ${{ inputs.expected_runner_digest }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          E7_CA_FILE: ${{ runner.temp }}/prod-ca-2021.crt
+          E7_STRIPE_TEST_KEY: ${{ secrets.E7_STRIPE_TEST_KEY }}
+          E7_HOSTAWAY_TOKEN: ${{ secrets.E7_HOSTAWAY_TOKEN }}
+          E7_DEV_BOOKING_DATABASE_URL: ${{ secrets.E7_DEV_BOOKING_DATABASE_URL }}
+        run: node wrapper/scripts/e7-hosted-recorded-cleanup.mjs execute
