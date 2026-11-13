@@ -1,4 +1,6 @@
 # PROPOSAL v3 (source-only, for ROOT review; v2 + ROOT review 5894805059 acceptance fix) — ONE owner-present hosted TEST: Slice 1 reservation → Slice 2 capture → Slice 3 pristine cleanup
+> **POLICY CORRECTION (Joel, 2026-11-13 11:00):** the capture → cleanup → FULL-refund sequence described below is SUPERSEDED on the refund point. Cancelling a reservation does NOT imply refunding/cancelling a payment; refunds remain MANUAL and policy-assessed; no automated refunds; the TEST-cleanup runners are historical / HELD, not production policy. Retained for history. See `checkpoint-owner-present-hosted-test-closure-2026-11-13.md`.
+
 2026-11-13 · Claude executor · v3 fixes the live-test ACCEPTANCE (foreign-intent fingerprints instead of global 28-table equality; enumerated target deltas; Class P evidence requirement; pending-session wording). v2 incorporated ROOT HOLD corrections F1 (no hosted rerun after possibly-effected outcomes), F2 (no inferred capture_before / expiry promises) and the baseline correction (SIX existing intents). Shared DEV = schema 0001..0021 (reconciled). main today = `f97c6495`, all five flags FALSE; the flag-only DRAFT PR is prepared but NOT merged.
 
 ## 0. Scope and non-goals

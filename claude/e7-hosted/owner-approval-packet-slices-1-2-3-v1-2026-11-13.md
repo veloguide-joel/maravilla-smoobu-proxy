@@ -1,4 +1,6 @@
 # OWNER APPROVAL PACKET v1 — ONE owner-present hosted TEST (Slice 1 reservation → Slice 2 capture → Slice 3 pristine cleanup)
+> **POLICY CORRECTION (Joel, 2026-11-13 11:00):** the capture → cleanup → FULL-refund sequence described below is SUPERSEDED on the refund point. Cancelling a reservation does NOT imply refunding/cancelling a payment; refunds remain MANUAL and policy-assessed; no automated refunds; the TEST-cleanup runners are historical / HELD, not production policy. Retained for history. See `checkpoint-owner-present-hosted-test-closure-2026-11-13.md`.
+
 2026-11-13 · SOURCE-ONLY inventory by Claude (no live, provider, Vercel, GitHub-settings or quote request was made). **T0 is NOT set. No owner action is requested yet.** Items marked **UNVERIFIED** need ROOT's read-only Vercel / GitHub / DB check before any GO; nothing here infers deployment from source alone.
 
 ## A. Scope the owner is asked to approve (one sentence each)
