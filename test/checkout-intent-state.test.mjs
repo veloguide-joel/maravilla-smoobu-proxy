@@ -42,7 +42,9 @@ const effectTypes = (r) => r.effects.map((e) => e.type);
 // ---------- structure ----------
 test("every state has a route table; terminal states accept only late money events", () => {
   for (const s of Object.values(S)) assert.ok(Array.isArray(allowedEvents(s)), s);
-  for (const s of TERMINAL_STATES) assert.ok(allowedEvents(s).every((e) => e === "PAYMENT_AUTHORIZED" || e === "CAPTURE_SUCCEEDED"), s);
+  // 0021 (recorded TEST cleanup foundation): confirmed ALSO admits the operator-only, config-gated TEST_CLEANUP_REQUESTED_RECORDED (TEST instance, explicit
+  // caller config; refused by default). Every other terminal state accepts only late money events.
+  for (const s of TERMINAL_STATES) assert.ok(allowedEvents(s).every((e) => e === "PAYMENT_AUTHORIZED" || e === "CAPTURE_SUCCEEDED" || (s === "confirmed" && e === "TEST_CLEANUP_REQUESTED_RECORDED")), s);
   for (const s of Object.values(S)) for (const e of allowedEvents(s)) assert.ok(EVENTS.includes(e), `${s}:${e}`);
 });
 

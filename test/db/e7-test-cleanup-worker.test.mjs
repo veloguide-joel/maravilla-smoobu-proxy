@@ -549,14 +549,14 @@ test("0020 migration: down restores the 0019 schema exactly; up re-applies ident
   try {
     assert.equal((await migrateUp(c, { env: "test", to: 19 })).at(-1), 19);
     const base19 = await objects(c); const a19 = await attrs(c);
-    assert.deepEqual(await migrateUp(c, { env: "test" }), [20]);
+    assert.deepEqual(await migrateUp(c, { env: "test", to: 20 }), [20]);   // 0021 (recorded cleanup foundation) sits on top: 0020 is measured alone
     const at20 = await objects(c); const a20 = await attrs(c);
     assert.deepEqual(a20.find((x) => x.sig.startsWith("booking.settle_operation_from_evidence")), a19[0], "replaced function: attributes unchanged");
     const nf = a20.find((x) => x.sig.startsWith("booking.settle_test_refund_from_evidence"));
     assert.ok(nf && nf.secdef === true && /mv_booking_app=X/.test(nf.acl) && !/mv_booking_report|mv_booking_admin/.test(nf.acl), JSON.stringify(nf));
     assert.deepEqual(await migrateDown(c, { env: "test", to: 19 }), [20]);
     assert.deepEqual(await objects(c), base19, "down = 0019 schema exactly");
-    assert.deepEqual(await migrateUp(c, { env: "test" }), [20]);
+    assert.deepEqual(await migrateUp(c, { env: "test", to: 20 }), [20]);
     assert.deepEqual(await objects(c), at20, "up re-applies identically");
     const added = at20.filter((o) => !base19.includes(o)).map((o) => o.split("|").slice(0, 2).join("|"));
     assert.deepEqual(added.sort(), ["fn|booking.settle_operation_from_evidence(uuid,uuid)", "fn|booking.settle_test_refund_from_evidence(uuid,uuid)"]);

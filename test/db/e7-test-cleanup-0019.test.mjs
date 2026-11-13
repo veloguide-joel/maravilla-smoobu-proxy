@@ -115,7 +115,8 @@ test("S1 static: the state machine addition is explicit and gated — new state 
   for (const e of ["TEST_CLEANUP_REQUESTED", "REFUND_SUCCEEDED", "REFUND_OUTCOME_UNKNOWN", "REFUND_FAILED"]) assert.ok(EVENTS.includes(e), e);
   assert.deepEqual(TERMINAL_STATES, ["confirmed", "validation_failed", "expired", "payment_failed", "payment_expired", "authorization_released", "cancelled"]);
   assert.ok(allowedEvents("payment_captured").includes("TEST_CLEANUP_REQUESTED"));
-  assert.deepEqual(allowedEvents("test_cleanup_pending").sort(), ["ESCALATE", "PAYMENT_AUTHORIZED", "RECONCILED_RESERVATION_STILL_ACTIVE", "REFUND_FAILED", "REFUND_OUTCOME_UNKNOWN", "REFUND_SUCCEEDED",
+  // 0021 (recorded cleanup foundation): test_cleanup_pending ALSO admits OFFLINE_CHARGE_REFUND_RECORDED (the mirror terminal; refused unless the mirror leg is present and open)
+  assert.deepEqual(allowedEvents("test_cleanup_pending").sort(), ["ESCALATE", "OFFLINE_CHARGE_REFUND_RECORDED", "PAYMENT_AUTHORIZED", "RECONCILED_RESERVATION_STILL_ACTIVE", "REFUND_FAILED", "REFUND_OUTCOME_UNKNOWN", "REFUND_SUCCEEDED",
     "RESERVATION_CANCELLED", "RESERVATION_CANCEL_FAILED", "RESERVATION_CANCEL_OUTCOME_UNKNOWN"]);
   assert.equal(refundKey("11111111-2222-4333-8444-555555555555"), "ref:11111111-2222-4333-8444-555555555555:1");
   assert.equal(testCleanupGate({ VERCEL_ENV: "production", MV_E7_TEST_CLEANUP: "enabled" }).ok, false);
@@ -330,9 +331,9 @@ test("Q8 migration: 0019 down restores the 0018 schema exactly (constraints, ind
     await migrateUp(c, { env: "test" });
     const at19 = await fnAttrs(c); const at19Objs = await objects(c);
     assert.deepEqual(at19.map((f) => ({ ...f })), base18.map((f) => ({ ...f })), "owner, ACL, SECURITY DEFINER, volatility, search_path, signature unchanged for every replaced function");
-    assert.deepEqual(await migrateDown(c, { env: "test", to: 18 }), [20, 19]);                      // 0020 (cleanup worker slice) sits on top
+    assert.deepEqual(await migrateDown(c, { env: "test", to: 18 }), [21, 20, 19]);                  // 0020 (cleanup worker slice) and 0021 (recorded cleanup foundation) sit on top
     assert.deepEqual(await objects(c), base18Objs, "down = 0018 schema exactly");
-    assert.deepEqual(await migrateUp(c, { env: "test" }), [19, 20]);
+    assert.deepEqual(await migrateUp(c, { env: "test" }), [19, 20, 21]);
     assert.deepEqual(await objects(c), at19Objs, "up re-applies identically");
     const added = at19Objs.filter((o) => !base18Objs.includes(o)).map((o) => o.split("|").slice(0, 2).join("|"));
     for (const n of ["fn|booking.test_refund_settled_for(uuid,text)", "fn|booking.test_refund_ledgered(uuid,text)", "fn|booking.refund_claim_fence()", "fn|booking.recording_retirement_fence()",
