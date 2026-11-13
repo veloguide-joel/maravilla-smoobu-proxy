@@ -32,7 +32,7 @@ import { CONSTANTS as RES, canonical, framedDigest, childEnv, spawnNode, dbTarge
 export const CONSTANTS = Object.freeze({
   toolingCommit: RES.toolingCommit,                        // 40779e34 — the SAME immutable MERGED tooling as Slice 1
   toolingStatus: RES.toolingStatus,
-  executeEnabled: false,                                   // Slice 2: capture execution default CLOSED (verify / execute refuse HCP_EXECUTE_CLOSED)
+  executeEnabled: true,                                    // Slice 2: capture execution OPENED for the ONE reviewed owner-present hosted TEST (ROOT prep GO 2026-11-13); revert to false after
   // Slice 1 closure + the accepted capture worker (test C2 recomputes this from an INDEPENDENT import scan of the pinned tree)
   closure: Object.freeze([...RES.closure, "lib/booking-db/capture-worker.js"].sort()),
   closureDigest: "7321924fa0e841e0adc0779d73f00fc876a9d0246259847673c92859997c7ba0",

@@ -1,6 +1,6 @@
 // test/e7-hosted-integrated-rehearsal.test.mjs — TEST-ONLY OFFLINE integrated rehearsal of the FIVE frozen hosted runners on main at THEIR OWN
 // immutable tooling pins, composed on ONE disposable database migrated to 0021 with FAKE provider exchanges. NOT a runtime change: no runner,
-// worker, wrapper, state, schema or closure file is touched; the five runners' `executeEnabled` stay false and nothing here reads them.
+// worker, wrapper, state, schema or closure file is touched; nothing here reads the runners' `executeEnabled` (R0 only records the shipped flags).
 //
 //   purpose      cross-version composition: Slice 1 / 2 (tooling 40779e34) → Slice 4 recording (5a094b16) → Slice 5 recorded cleanup (e41b654a),
 //                and Slice 1 / 2 → Slice 4 refusal → Slice 3 pristine captured cleanup (9d86bfa1), all against schema 0021. The per-phase hosted
@@ -64,10 +64,10 @@ const enc = (o) => new TextEncoder().encode(JSON.stringify(o));
 const MINUTE = 60000; const DAY = 86400000;
 const REAL_WAIT_CAP_MS = 150000;                      // test-harness scheduling: REAL wait up to 150 s per sleep (covers the E7.1 two-minute read freshness window); longer → throw (see header)
 
-test("R0 the five runners declare the expected immutable tooling pins and executeEnabled=false (nothing here opens execution)", () => {
+test("R0 the five runners declare the expected immutable tooling pins; shipped executeEnabled = [true, true, true, false, false] (Slices 1–3 OPEN for the ONE reviewed owner-present TEST; 4 / 5 CLOSED). The rehearsal itself never reads the flag", () => {
+  assert.deepEqual(RUNNERS.map((r) => r.E.CONSTANTS.executeEnabled), [true, true, true, false, false]);
   for (const r of RUNNERS) {
     assert.equal(r.E.CONSTANTS.toolingCommit, r.pin, r.name);
-    assert.equal(r.E.CONSTANTS.executeEnabled, false, `${r.name} executeEnabled`);
     assert.ok(Array.isArray(r.E.CONSTANTS.closure) && /^[0-9a-f]{64}$/.test(r.E.CONSTANTS.closureDigest), `${r.name} closure`);
   }
   assert.deepEqual(RUNNERS.map((r) => r.E.CONSTANTS.toolingCommit.slice(0, 8)), ["40779e34", "40779e34", "9d86bfa1", "5a094b16", "e41b654a"]);
