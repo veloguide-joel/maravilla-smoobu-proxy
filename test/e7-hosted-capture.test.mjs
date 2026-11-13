@@ -101,7 +101,7 @@ function exchanges(w, o = {}) {
     w.calls.push(`S:${req.method} ${req.url.replace("https://api.stripe.com", "")}`);
     if (req.url.endsWith("/v1/account")) return reply(200, { object: "account", id: ACCT });
     if (req.method === "POST") {
-      assert.equal(req.url, CAPTURE_URL); assert.equal(req.headers["Idempotency-Key"], KEY); assert.equal(req.body, `amount_to_capture=${AMT}&final_capture=true&expand%5B%5D=latest_charge`);
+      assert.equal(req.url, CAPTURE_URL); assert.equal(req.headers["Idempotency-Key"], KEY); assert.equal(req.body, `amount_to_capture=${AMT}&expand%5B%5D=latest_charge`, "C1/C2 wire: no final_capture");
       w.captureRequests = (w.captureRequests ?? 0) + 1;
       if (o.captureLost) { w.captured = o.captureLandedAnyway ?? false; return Promise.reject(new Error("socket reset")); }
       w.captured = true; return reply(200, piObj(w));
@@ -133,7 +133,8 @@ function fakeWorker(w, o = {}) {
       await executors.retrieveAccount({ signal: sig });
       await executors.retrievePaymentIntent(PI, { expand: ["latest_charge"] }, { signal: sig });
       if (o.stayConfirmed) return { status: "worked", intentId: IID, actions: ["WAIT:RESERVATION_PROOF"], delayMs: 30000, late: Promise.resolve([]) };
-      const params = { amount_to_capture: o.wrongAmount ?? AMT, final_capture: true, expand: ["latest_charge"] };
+      const params = o.oldFinalCapture ? { amount_to_capture: AMT, final_capture: true, expand: ["latest_charge"] } : o.extraParam ? { amount_to_capture: AMT, expand: ["latest_charge"], metadata: {} }
+        : { amount_to_capture: o.wrongAmount ?? AMT, expand: ["latest_charge"] };
       // the accepted worker claims the row (dispatch persisted) BEFORE the send
       Object.assign(cap, { state: "in_flight", attempts: 1, dispatched: true });
       let reply = null;
@@ -262,8 +263,11 @@ test("A6 target-only fence: wrong amount / wrong key / foreign reservation read 
       let refused = 0;
       for (const bad of [() => executors.retrieveReservation({ method: "POST", path: `/v1/reservations/${RID}`, query: {} }, { signal: AbortSignal.timeout(1000) }),
         () => executors.retrieveReservation({ method: "GET", path: "/v1/reservations/71999902", query: {} }, { signal: AbortSignal.timeout(1000) }),
-        () => executors.capturePaymentIntent("pi_FAKEother0001", { amount_to_capture: AMT, final_capture: true, expand: ["latest_charge"] }, { idempotencyKey: KEY, signal: AbortSignal.timeout(1000) })]) { try { await bad(); } catch { refused += 1; } }
-      assert.equal(refused, 3, "every out-of-scope call refused at the executor / fence");
+        () => executors.capturePaymentIntent("pi_FAKEother0001", { amount_to_capture: AMT, expand: ["latest_charge"] }, { idempotencyKey: KEY, signal: AbortSignal.timeout(1000) }),
+        // C1/C2: the historical final_capture parameter and any extra parameter are refused at the executor BEFORE any exchange
+        () => executors.capturePaymentIntent(PI, { amount_to_capture: AMT, final_capture: true, expand: ["latest_charge"] }, { idempotencyKey: KEY, signal: AbortSignal.timeout(1000) }),
+        () => executors.capturePaymentIntent(PI, { amount_to_capture: AMT, expand: ["latest_charge"], metadata: {} }, { idempotencyKey: KEY, signal: AbortSignal.timeout(1000) })]) { try { await bad(); } catch { refused += 1; } }
+      assert.equal(refused, 5, "every out-of-scope / incompatible call refused at the executor / fence");
       return { status: "worked", intentId: IID, actions: ["WAIT"], delayMs: 0, late: Promise.resolve([]) }; } });
     assert.deepEqual([posts(w).length, r.captureInvocations], [0, 0]); }
   { // transport-level: a cancel / refund op through the runner's stripe send is refused before any exchange
@@ -315,9 +319,10 @@ test("A9 postcheck + residual agreement: a worker that claims payment_captured w
     assert.deepEqual([r.outcome, r.code, r.lock, w.lockReleased, r.finalState, r.chargeId, r.recordingQueuedPristine], ["NOT_CONFIRMED", "UNLOCK_NOT_PROVEN", "unlock_failed_connection_destroyed", "destroyed", "payment_captured", CH, true], JSON.stringify(r)); }
 });
 
-test("C1 code ceiling: Slice 2 capture execution CLOSED again (executeEnabled false) AND the Slice 1 reservation runner CLOSED again — after the ONE reviewed owner-present hosted TEST; same tooling 40779e34 MERGED; plan pins pi / reservation / amount / accepted key and ZERO refund / record / notify / cancel / void / create", () => {
+test("C1 code ceiling: Slice 2 capture execution CLOSED (executeEnabled false) AND the Slice 1 reservation runner CLOSED; Slice 2 pins the MERGED e7-test C1 fix 59178b04 (DISTINCT from Slice 1's immutable 40779e34); plan pins pi / reservation / amount / accepted key and ZERO refund / record / notify / cancel / void / create", () => {
   assert.equal(C.executeEnabled, false); assert.equal(RESRUN.CONSTANTS.executeEnabled, false);
-  assert.equal(C.toolingCommit, "40779e34e8c65ac5c4494bc5a18cd4223ef723fa"); assert.equal(C.toolingStatus, "MERGED"); assert.equal(C.toolingCommit, RESRUN.CONSTANTS.toolingCommit);
+  assert.equal(C.toolingCommit, "59178b0468469b6570beab861bbc8e48b3a887d1"); assert.equal(C.toolingStatus, "MERGED");
+  assert.equal(RESRUN.CONSTANTS.toolingCommit, "40779e34e8c65ac5c4494bc5a18cd4223ef723fa", "Slice 1 keeps its own immutable pin"); assert.notEqual(C.toolingCommit, RESRUN.CONSTANTS.toolingCommit, "C2: distinct pins");
   const p = plan(); assert.deepEqual(p.writes, { captureMax: 1, hostawayCreate: 0, refund: 0, record: 0, notify: 0, cancel: 0, void: 0, account: 0, keys: 0 });
   assert.equal(p.captureIdempotencyKey, IS.captureKey(IID, PI, 1)); assert.deepEqual([p.paymentIntentId, p.reservationId, p.amountMinor], [PI, RID, AMT]);
   for (const bad of [{ reservationId: "" }, { reservationId: C.protectedReservationIds[0] }, { paymentIntentId: "ch_x" }, { amountMinor: 0 }, { amountMinor: 1.5 }, { notBefore: "2026-11-12" },
@@ -483,7 +488,7 @@ if (process.env.E7_HCP_DB_TESTS === "1") {
       if (req.url.endsWith("/v1/account")) return reply(200, { object: "account", id: ACCT });
       if (req.method === "POST") {
         assert.equal(req.url, `https://api.stripe.com/v1/payment_intents/${a.piId}/capture`); assert.equal(req.headers["Idempotency-Key"], `cap:${a.id}:${a.piId}`);
-        assert.equal(req.body, `amount_to_capture=${a.total}&final_capture=true&expand%5B%5D=latest_charge`);
+        assert.equal(req.body, `amount_to_capture=${a.total}&expand%5B%5D=latest_charge`, "C1/C2 wire: no final_capture");
         w.captureRequests += 1;
         if (w.captureLost) return Promise.reject(new Error("socket reset"));
         w.captured = true; return reply(200, pi());

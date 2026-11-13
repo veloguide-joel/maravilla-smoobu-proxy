@@ -606,7 +606,7 @@ test("C1 code ceiling: Slice 5 recorded cleanup execution CLOSED (executeEnabled
   assert.equal(C.executeEnabled, false); for (const R of [RESRUN, CAPRUN, TCRUN, RCRUN]) assert.equal(R.CONSTANTS.executeEnabled, false);
   assert.equal(C.toolingCommit, "e41b654a667cb0ba8775b5bd0040c28a3d14fda0"); assert.equal(C.toolingStatus, "MERGED");
   assert.equal(TCRUN.CONSTANTS.toolingCommit, "9d86bfa1e60779b3794de88bbae151670e8fe515", "the reviewed Slice 3 pin is untouched"); assert.equal(RCRUN.CONSTANTS.toolingCommit, "5a094b16c1f84690a738a98ab89140caa69c1e1f", "the reviewed Slice 4 pin is untouched");
-  assert.equal(CAPRUN.CONSTANTS.toolingCommit, "40779e34e8c65ac5c4494bc5a18cd4223ef723fa", "the reviewed Slice 1 / 2 pins are untouched");
+  assert.equal(CAPRUN.CONSTANTS.toolingCommit, "59178b0468469b6570beab861bbc8e48b3a887d1", "C2: Slice 2 pins the merged C1 fix; this runner's own pin is untouched");
   const { plan, planHash } = built();
   assert.deepEqual(plan.writes, { requestMax: 1, cancelMax: 1, refundMax: 1, mirrorMax: 1, capture: 0, hostawayCreate: 0, record: 0, notify: 0, void: 0, account: 0, keys: 0 });
   assert.equal(plan.refundIdempotencyKey, IS.refundKey(IID, 1)); assert.equal(plan.mirrorTitle, MP.mirrorTitle(IID)); assert.equal(plan.recordingTitle, OP.offlineChargeTitle(IID)); assert.equal(plan.amount, OP.exactAmount(AMT));
