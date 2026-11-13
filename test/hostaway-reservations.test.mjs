@@ -593,7 +593,7 @@ test("containment: the adapter is pure and unreachable — no imports, network, 
   // E7.4b-0 (root-authorized): the PURE offline-charge proof imports only its pure parsers / amount helpers (no route reaches it; packaging-closure)
   // E7 TEST cleanup worker (ROOT GO, DRAFT): the offline cleanup worker LIBRARY imports the adapter for Hostaway READS + the accepted cancel request shape
   // (unreachable from api/: packaging-closure OFFLINE_ONLY)
-  assert.deepEqual(importers.sort(), ["lib/booking-db/capture-worker.js", "lib/booking-db/cleanup-worker.js", "lib/booking-db/compensation-worker.js", "lib/booking-db/reservation-worker.js", "lib/checkout/offline-charge-proof.js", "scripts/e4-connected/connected-execute.mjs", "scripts/e4-connected/connected-path.mjs", "scripts/e4-connected/connected-precheck.mjs",
+  assert.deepEqual(importers.sort(), ["lib/booking-db/capture-worker.js", "lib/booking-db/cleanup-worker.js", "lib/booking-db/compensation-worker.js", "lib/booking-db/mirror-worker.js", "lib/booking-db/reservation-worker.js", "lib/checkout/mirror-proof.js", "lib/checkout/offline-charge-proof.js", "scripts/e4-connected/connected-execute.mjs", "scripts/e4-connected/connected-path.mjs", "scripts/e4-connected/connected-precheck.mjs",
     "scripts/e4-connected/connected-recover.mjs", "scripts/e4-write-runner/happy-path.mjs", "scripts/e4-write-runner/happy-preflight.mjs",
     "scripts/e4-write-runner/runner.mjs",
     // E7 R1 (reviewed, PR #41 / #53): the three R1 closure files name the adapter's PATH only, in their source-closure lists, to hash it
