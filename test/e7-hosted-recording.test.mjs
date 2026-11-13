@@ -557,6 +557,45 @@ test("S1 static: the runner imports node built-ins and ONLY the reviewed Slice 1
   assert.ok(src.indexOf("process.env") > src.indexOf("import.meta.main === true"), "process.env only after the main guard");
 });
 
+test("O1 ordering (REAL accepted state machine from the pinned tooling, no fakes): the full accepted event sequence to payment_captured queues EXACTLY ONE effect — the pristine recording op bound to the reservation and the captured amount — and NO guest.notify; publicStatus is already 'confirmed' there; a bare / invalid OFFLINE_CHARGE_RECORDED is rejected with ZERO effects; OFFLINE_CHARGE_FAILED re-queues ONLY another recording op; the ONE guest.notify (booking_confirmed) is queued ONLY by a valid OFFLINE_CHARGE_RECORDED, at the step that reaches confirmed", () => {
+  const T0 = CREATED; const MIN = 60 * 1000; const DAY = 24 * 60 * MIN;
+  const PRICE = { listingId: 606998, from: FROM, to: TO, guests: 1, nights: 1, currency: "USD", standardTotalMinor: AMT, eligibleMinor: 0, discountMinor: 0, finalTotalMinor: AMT,
+    policyVersion: "direct-v1", rateBps: 0, lines: [], charge: { currency: "usd", amountMinor: AMT, quantity: 1 }, quoteHash: "a".repeat(64) };
+  const AUTH = { type: "PAYMENT_AUTHORIZED", id: "evt_auth_o1", paymentIntentId: PI, sessionId: CS, amountMinor: AMT, currency: "usd", livemode: false, authorizationCreatedAt: T0 + 4 * MIN, captureBefore: T0 + 4 * MIN + 7 * DAY };
+  const RESV = { reservationId: Number(RID), listingId: 606998, from: FROM, to: TO, totalMinor: AMT, currency: "USD" };
+  const steps = [[{ type: "PRICE_CONFIRMED", price: PRICE }, 0], [{ type: "DETAILS_COLLECTED" }, 1], [{ type: "CHECKOUT_PREPARED", sessionId: CS }, 2], [AUTH, 5],
+    [{ type: "RESERVATION_STARTED", workerId: "w1", recheck: { bookable: true, priceSame: true } }, 6], [{ type: "RESERVATION_DISPATCHED", workerId: "w1" }, 6], [{ type: "RESERVATION_SUCCEEDED", reservation: RESV }, 7]];
+  let cur = IS.createIntent({ id: IID, ref: REF, listingId: 606998, from: FROM, to: TO, guests: 1, now: T0 });
+  const seen = [];
+  for (const [ev, m] of steps) { const r = IS.transition(cur, ev, { now: T0 + m * MIN }); assert.equal(r.ok, true, `${ev.type} from ${cur.status}: ${r.error}`); seen.push(...r.effects.map((e) => e.type)); cur = r.intent; }
+  assert.equal(cur.status, IS.STATES.RESERVATION_CONFIRMED);
+  assert.ok(!seen.includes(NOTIFY) && !seen.includes(REC), "nothing before the capture queues a recording op or a guest notification: " + seen.join(","));
+  // CAPTURE_SUCCEEDED → payment_captured: exactly ONE effect, the recording op, bound to THIS reservation and the captured amount; no notify
+  const cap = IS.transition(cur, { type: "CAPTURE_SUCCEEDED", id: "evt_cap_o1", amountMinor: AMT, currency: "usd" }, { now: T0 + 8 * MIN });
+  assert.equal(cap.ok, true, cap.error);
+  assert.equal(cap.intent.status, IS.STATES.PAYMENT_CAPTURED);
+  assert.deepEqual(cap.effects, [{ type: REC, reservationId: RID, amountMinor: AMT }]);
+  assert.equal(IS.publicStatus(cap.intent), "confirmed", "guest-facing status is already 'confirmed' at payment_captured (reserved + paid), before any recording or email");
+  assert.equal(IS.isConfirmedPaid(cap.intent), true);
+  assert.equal(IS.idempotencyKeys(cap.intent).offlineCharge, `och:${IID}`, "the accepted recording key family (the repo appends ':<attempt>', the runner pins och:<intent>:1)");
+  assert.ok(!IS.allowedEvents(IS.STATES.PAYMENT_CAPTURED).some((e) => /NOTIF|CONFIRM/i.test(e) && e !== "CAPTURE_SUCCEEDED"), "no event out of payment_captured names a notification");
+  // a bare / invalid recording report is rejected with ZERO effects — nothing can reach the notify from payment_captured without a validated recording
+  for (const bad of [{ type: "OFFLINE_CHARGE_RECORDED" }, { type: "OFFLINE_CHARGE_RECORDED", chargeId: "" }, { type: "OFFLINE_CHARGE_RECORDED", chargeId: null }]) {
+    const r = IS.transition(cap.intent, bad, { now: T0 + 9 * MIN });
+    assert.deepEqual([r.ok, r.error, r.effects ?? []], [false, "INVALID_CHARGE", []], JSON.stringify(bad));
+  }
+  // a definite recording failure re-queues ONLY another recording op (attempt counter advances); still no notify, still payment_captured
+  const failed = IS.transition(cap.intent, { type: "OFFLINE_CHARGE_FAILED", id: "evt_ocf_o1" }, { now: T0 + 9 * MIN });
+  assert.equal(failed.ok, true, failed.error);
+  assert.deepEqual([failed.intent.status, failed.intent.counters.offlineChargeAttempts, failed.effects.map((e) => e.type)], [IS.STATES.PAYMENT_CAPTURED, 1, [REC]]);
+  // the ONE guest.notify is queued only by a VALID OFFLINE_CHARGE_RECORDED, in the same step that reaches confirmed
+  const rec = IS.transition(cap.intent, { type: "OFFLINE_CHARGE_RECORDED", id: "evt_ocr_o1", chargeId: Number(CHARGE_ID) }, { now: T0 + 9 * MIN });
+  assert.equal(rec.ok, true, rec.error);
+  assert.deepEqual([rec.intent.status, rec.intent.offlineChargeId, rec.effects], [IS.STATES.CONFIRMED, CHARGE_ID, [{ type: NOTIFY, template: "booking_confirmed" }]]);
+  assert.equal(IS.publicStatus(rec.intent), "confirmed");
+  assert.deepEqual(rec.intent.history.slice(-2).map((h) => h.to), [IS.STATES.PAYMENT_CAPTURED, IS.STATES.CONFIRMED]);
+});
+
 test("W1 workflow: manual dispatch only; preflight default without secrets; execute on main + environment gate; tooling checkout pinned to 5a094b16 (both jobs); Hostaway + DB secrets ONLY in the execute step (no Stripe secret anywhere); E7_RUN_ID = github.run_id-run_attempt in verify + execute; every input env passed to all three runner invocations", () => {
   const yml = readFileSync(join(ROOT, ".github/workflows/e7-hosted-recording.yml"), "utf8");
   assert.match(yml, /^on:\n  workflow_dispatch:/m); assert.doesNotMatch(yml, /\n  (push|pull_request|schedule):/);
@@ -700,6 +739,21 @@ if (process.env.E7_HRC_DB_TESTS === "1") {
       assert.deepEqual([s.st.state, s.st.offline_charge_id, s.ops.filter((x) => x.op_type === REC).map((x) => [x.state, x.result_ref]), s.notifies.length, s.locks], ["payment_captured", null, [["succeeded", "7700001"]], 0, 0]);
       const r2 = await pgRun(a, clk, pgWorld(a, clk));
       assert.deepEqual([r2.outcome, r2.code, r2.steps, w.postRequests], ["START_STATE_NOT_ELIGIBLE", "RECORDING_NOT_PRISTINE", 0, 1], "the deferred lineage needs its OWN reviewed admission; never a resend here"); }
+  });
+
+test("O2 PG ordering (REAL repo + 0010–0021 fences, accepted fixtures): after the REAL CAPTURE_SUCCEEDED the database holds EXACTLY ONE pristine recording row — key och:<intent>:1, pending / 0 attempts / undispatched, payload bound to the reservation + captured amount, accepted recordingOpRefusal null — and ZERO guest.notify rows; a bare OFFLINE_CHARGE_RECORDED through the repo (no validated recording) is refused and leaves ZERO notify rows and the row untouched", async () => {
+    const a = await capturedIntent();
+    const rows = (await db.app.query("SELECT id::text AS id, op_type, idempotency_key, state, attempts, dispatched_at, payload FROM booking.external_operations WHERE intent_id = $1 AND op_type IN ($2, $3) ORDER BY created_at", [a.id, REC, NOTIFY])).rows;
+    assert.deepEqual(rows.map((r) => [r.op_type, r.idempotency_key, r.state, r.attempts, r.dispatched_at, r.payload]), [[REC, `och:${a.id}:1`, "pending", 0, null, { reservationId: a.rid, amountMinor: a.total }]]);
+    const facts = { capturedMinor: a.total, currency: "USD", finalTotalMinor: a.total, from: a.stay.from, intentId: a.id, listingId: LIST, recordedPaymentAt: a.recordedAt, ref: a.ref, reservationId: a.rid, status: "payment_captured", to: a.stay.to, version: a.intent.version };
+    assert.equal(OP.intentRefusal(facts, { accountRef: C.accountRef, channelId: 2000, currency: "USD", listingId: LIST, paymentMethod: C.paymentMethod, refFieldId: C.refFieldId }), null);
+    assert.equal(OP.recordingOpRefusal({ attempts: 0, dispatchedAt: null, id: rows[0].id, idempotencyKey: rows[0].idempotency_key, opType: REC, payload: rows[0].payload, state: "pending" }, facts), null, "the accepted proof admits exactly this row as the pristine initial recording");
+    let bare;
+    try { bare = await R.applyEvent(db.app, a.id, { type: "OFFLINE_CHARGE_RECORDED", id: `evt_ocr_bare_${a.id}`, chargeId: 7700999 }, { now: Date.now(), actor: "test" }); } catch (e) { bare = { ok: false, thrown: e.code ?? e.message }; }
+    assert.equal(bare.ok, false, "a recording report without the DB's validated recording evidence does not pass the repo / fences: " + JSON.stringify(bare));
+    assert.equal(bare.error ?? bare.thrown, "OFFLINE_CHARGE_NOT_VERIFIED", "the repo fence: a recording success event needs the DB-verified recording (0010 evidence link), never a bare report");
+    const s = await snap(a.id);
+    assert.deepEqual([s.st.state, s.st.offline_charge_id, s.ops.filter((x) => x.op_type === REC).map((x) => [x.state, x.attempts, x.d]), s.notifies, s.ledger.includes("offline_charge_recorded")], ["payment_captured", null, [["pending", 0, false]], [], false]);
   });
 
   test("I4 PG integration: prior / historic refusals on real rows — a prior marked charge at the provider → PROVIDER_PROOF_FAILED before the worker; a recording hold → START refusal; held lock elsewhere → LOCK_NOT_ACQUIRED with zero exchanges", async () => {
