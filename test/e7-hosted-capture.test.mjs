@@ -319,8 +319,8 @@ test("A9 postcheck + residual agreement: a worker that claims payment_captured w
     assert.deepEqual([r.outcome, r.code, r.lock, w.lockReleased, r.finalState, r.chargeId, r.recordingQueuedPristine], ["NOT_CONFIRMED", "UNLOCK_NOT_PROVEN", "unlock_failed_connection_destroyed", "destroyed", "payment_captured", CH, true], JSON.stringify(r)); }
 });
 
-test("C1 code ceiling: Slice 2 capture execution CLOSED (executeEnabled false) AND the Slice 1 reservation runner CLOSED; Slice 2 pins the MERGED e7-test C1 fix 59178b04 (DISTINCT from Slice 1's immutable 40779e34); plan pins pi / reservation / amount / accepted key and ZERO refund / record / notify / cancel / void / create", () => {
-  assert.equal(C.executeEnabled, false); assert.equal(RESRUN.CONSTANTS.executeEnabled, false);
+test("C1 code ceiling: Slice 2 capture execution OPEN (executeEnabled true) AND the Slice 1 reservation runner OPEN — the ONE reviewed C3 TEST capture validation (C4 enable PR); Slice 2 pins the MERGED e7-test C1 fix 59178b04 (DISTINCT from Slice 1's immutable 40779e34); plan pins pi / reservation / amount / accepted key and ZERO refund / record / notify / cancel / void / create", () => {
+  assert.equal(C.executeEnabled, true); assert.equal(RESRUN.CONSTANTS.executeEnabled, true);
   assert.equal(C.toolingCommit, "59178b0468469b6570beab861bbc8e48b3a887d1"); assert.equal(C.toolingStatus, "MERGED");
   assert.equal(RESRUN.CONSTANTS.toolingCommit, "40779e34e8c65ac5c4494bc5a18cd4223ef723fa", "Slice 1 keeps its own immutable pin"); assert.notEqual(C.toolingCommit, RESRUN.CONSTANTS.toolingCommit, "C2: distinct pins");
   const p = plan(); assert.deepEqual(p.writes, { captureMax: 1, hostawayCreate: 0, refund: 0, record: 0, notify: 0, cancel: 0, void: 0, account: 0, keys: 0 });
@@ -352,7 +352,7 @@ const realEnv = (over = {}) => ({ E7_TOOLING_DIR: TOOLING, E7_APPROVAL_REF: "lab
 
 test("H1 hosted: preflight (no secrets) passes on the pinned closure; any secret outside execute is refused; partial / invalid inputs refused; the runner digest covers the imported Slice 1 runner", async () => {
   let x = await E.runHosted({ mode: "preflight", env: { E7_TOOLING_DIR: TOOLING }, proc: PROC, wrapperDir: ROOT, deps: { spawnChild: okChild } });
-  assert.deepEqual([x.exitCode, x.result.code, x.result.planKind, x.result.closureDigest, x.result.executeEnabled, x.result.schema], [0, "PREFLIGHT_OK_SYNTHETIC_ONLY", "SYNTHETIC", C.closureDigest, false, "e7-hosted-capture-hosted-v1"], JSON.stringify(x.result));
+  assert.deepEqual([x.exitCode, x.result.code, x.result.planKind, x.result.closureDigest, x.result.executeEnabled, x.result.schema], [0, "PREFLIGHT_OK_SYNTHETIC_ONLY", "SYNTHETIC", C.closureDigest, true, "e7-hosted-capture-hosted-v1"], JSON.stringify(x.result));
   assert.equal(x.result.runnerDigest, await RESRUN.framedDigest(ROOT, C.runnerFiles, E.RUNNER_DIGEST_PREFIX)); assert.ok(C.runnerFiles.includes("scripts/e7-hosted-reservation.mjs"));
   x = await E.runHosted({ mode: "preflight", env: realEnv(), proc: PROC, wrapperDir: ROOT, deps: { spawnChild: okChild } });
   assert.deepEqual([x.exitCode, x.result.code, x.result.planKind], [0, "PREFLIGHT_OK_REAL_PLAN", "REAL"]);
@@ -367,7 +367,7 @@ test("H1 hosted: preflight (no secrets) passes on the pinned closure; any secret
   assert.equal(bad.result.code, "HCP_TESTS_FAILED");
 });
 
-test("H2 hosted: verify / execute refuse HCP_EXECUTE_CLOSED under a test-local executeEnabled=false config before any pin, ref or import check (the shipped constant is CLOSED again; the test-local control is kept so the refusal path is exercised in either state); an opened constants seam still refuses off main / wrong digests / secrets missing / wrong DB target, and wires TWO pools (6543 max 3 worker, 5432 max 1 lock)", async () => {
+test("H2 hosted: verify / execute refuse HCP_EXECUTE_CLOSED under a test-local executeEnabled=false config before any pin, ref or import check (the shipped constant is OPEN for the C3 validation; the test-local control keeps the refusal path exercised in either state); an opened constants seam still refuses off main / wrong digests / secrets missing / wrong DB target, and wires TWO pools (6543 max 3 worker, 5432 max 1 lock)", async () => {
   const CLOSED = { ...C, executeEnabled: false };   // test-local CLOSED control: the refusal path stays exercised while the shipped constant is OPEN
   const x = await E.runHosted({ mode: "verify", env: { ...realEnv(), E7_EXPECTED_PLAN_HASH: "0".repeat(64), E7_EXPECTED_CLOSURE_DIGEST: C.closureDigest, E7_EXPECTED_RUNNER_DIGEST: "0".repeat(64), GITHUB_REF: "refs/heads/main" }, proc: PROC, wrapperDir: ROOT, deps: { constants: CLOSED } });
   assert.deepEqual([x.exitCode, x.result.code, x.result.closureDigest], [1, "HCP_EXECUTE_CLOSED", null]);
