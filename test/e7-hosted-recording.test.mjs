@@ -436,7 +436,10 @@ test("F2 (ROOT 5883758657) honest statement accounting: reported dbQueries == EV
 test("C1 code ceiling: Slice 4 recording execution CLOSED (executeEnabled false; D4 blocker) AND Slice 1 / 2 / 3 CLOSED again on THEIR tooling (after the ONE reviewed owner-present TEST); this runner pins the MERGED e7-test 5a094b16; the plan pins pi / reservation / charge / captured amount / stay / attempt / session, the accepted recording key, credit_card / hostaway-e7-test, title / amount wire forms = the accepted module's; ZERO stripe / capture / void / cancel / refund / notify / create", () => {
   assert.equal(C.executeEnabled, false); assert.equal(RESRUN.CONSTANTS.executeEnabled, false); assert.equal(CAPRUN.CONSTANTS.executeEnabled, false); assert.equal(TCRUN.CONSTANTS.executeEnabled, false);
   assert.equal(C.toolingCommit, "5a094b16c1f84690a738a98ab89140caa69c1e1f"); assert.equal(C.toolingStatus, "MERGED");
-  assert.equal(RESRUN.CONSTANTS.toolingCommit, "40779e34e8c65ac5c4494bc5a18cd4223ef723fa"); assert.equal(CAPRUN.CONSTANTS.toolingCommit, "59178b0468469b6570beab861bbc8e48b3a887d1");   // C2: Slice 2 repinned (C1 fix); Slice 1 unchanged assert.equal(TCRUN.CONSTANTS.toolingCommit, "9d86bfa1e60779b3794de88bbae151670e8fe515");
+  // C2: Slice 2 is repinned to the merged C1 fix (59178b04); Slice 1 (40779e34) and Slice 3 (9d86bfa1) keep their own immutable pins
+  assert.equal(RESRUN.CONSTANTS.toolingCommit, "40779e34e8c65ac5c4494bc5a18cd4223ef723fa");
+  assert.equal(CAPRUN.CONSTANTS.toolingCommit, "59178b0468469b6570beab861bbc8e48b3a887d1");
+  assert.equal(TCRUN.CONSTANTS.toolingCommit, "9d86bfa1e60779b3794de88bbae151670e8fe515");
   assert.deepEqual([C.paymentMethod, C.accountRef, C.budgets.record, C.budgets.steps], ["credit_card", "hostaway-e7-test", 1, 6]);
   const { plan, planHash } = built();
   assert.deepEqual([plan.paymentIntentId, plan.reservationId, plan.chargeId, plan.capturedMinor, plan.from, plan.to, plan.guests, plan.attemptId, plan.sessionId, plan.recordingIdempotencyKey, plan.paymentMethod, plan.accountRef],
