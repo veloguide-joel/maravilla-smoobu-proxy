@@ -248,6 +248,53 @@ test("A2 provider proofs gate the worker: cancelled / wrong-channel / foreign-re
   }
 });
 
+// ---------------------------------------------------------------------------------------------------------------------------------
+// C16 (ROOT #93 / 1a1d07e0): START VETO on STORED refund observations — CLOSED-wrapper defense in depth; no new proof, no provider read
+const PI_EV = (observed, over = {}) => ({ kind: "payment_intent", external_ref: PI, status: "succeeded", source: "stripe_dashboard", observed, observed_at: new Date(CREATED), ...over });
+test("V1 refundObservationRefusal (pure): ANY correctly bound payment_intent row for the plan PI with amountRefundedMinor > 0 (safe integer) OR refunded === true → PAYMENT_REFUND_OBSERVED, regardless of source / age / order / newer zero rows; a PRESENT but malformed field → PAYMENT_REFUND_EVIDENCE_INVALID (never coerced); missing fields / no observed / foreign PI / other kinds → null (UNKNOWN keeps prior behaviour); a positive observation wins over a malformed one", () => {
+  const f = (rows) => E.refundObservationRefusal(rows, PI);
+  assert.equal(f([]), null); assert.equal(f(undefined), null);
+  assert.equal(f([{ kind: "payment_intent", external_ref: PI, status: "succeeded" }]), null, "no observed object → unknown");
+  assert.equal(f([PI_EV({ amountReceivedMinor: AMT })]), null, "observed without refund fields → unknown");
+  assert.equal(f([PI_EV({ amountRefundedMinor: 0, refunded: false })]), null, "explicit zero / false → no refusal (and no affirmative proof)");
+  for (const o of [{ amountRefundedMinor: 1 }, { amountRefundedMinor: AMT }, { amountRefundedMinor: AMT - 1 }, { refunded: true }, { amountRefundedMinor: 0, refunded: true }, { amountRefundedMinor: 500, refunded: false }])
+    assert.equal(f([PI_EV(o)]), "PAYMENT_REFUND_OBSERVED", JSON.stringify(o));
+  assert.equal(f([PI_EV({ amountRefundedMinor: AMT }, { source: "stripe_api" })]), "PAYMENT_REFUND_OBSERVED", "API source");
+  assert.equal(f([PI_EV({ amountRefundedMinor: 0, refunded: false }, { observed_at: new Date(CREATED + 9e6) }), PI_EV({ amountRefundedMinor: AMT }, { observed_at: new Date(CREATED - 9e6) })]), "PAYMENT_REFUND_OBSERVED", "old positive + NEWER zero → still refused (not latest-only)");
+  assert.equal(f([PI_EV({ amountRefundedMinor: AMT }), PI_EV({ amountRefundedMinor: 0, refunded: false })]), "PAYMENT_REFUND_OBSERVED", "order-independent");
+  for (const o of [{ amountRefundedMinor: null }, { amountRefundedMinor: "14000" }, { amountRefundedMinor: -1 }, { amountRefundedMinor: 1.5 }, { amountRefundedMinor: Infinity }, { amountRefundedMinor: NaN }, { amountRefundedMinor: 2 ** 53 },
+    { refunded: null }, { refunded: "true" }, { refunded: 1 }, { refunded: "false" }, { amountRefundedMinor: 0, refunded: "no" }])
+    assert.equal(f([PI_EV(o)]), "PAYMENT_REFUND_EVIDENCE_INVALID", JSON.stringify(o));
+  assert.equal(f([PI_EV({ amountRefundedMinor: "x" }), PI_EV({ refunded: true })]), "PAYMENT_REFUND_OBSERVED", "positive wins over malformed (either refuses)");
+  assert.equal(f([PI_EV({ refunded: true }, { external_ref: "pi_OTHER000000001" })]), null, "foreign PI row is not this veto's business (EVIDENCE_CONFLICT elsewhere)");
+  assert.equal(f([{ kind: "hostaway_reservation", external_ref: RID, status: "new", observed: { refunded: true } }, { kind: "stripe_refund", external_ref: "re_x", status: "succeeded", observed: { amountRefundedMinor: AMT } }]), null, "other kinds are not read by this veto");
+});
+test("V2 runner start veto (FAKE DB, ZERO provider calls / lock / worker; state untouched): a stored refund observation for the plan PI → SCOPE_REFUSED / PAYMENT_REFUND_OBSERVED (partial / full / refunded flag / either source / old positive + newer zero); malformed → PAYMENT_REFUND_EVIDENCE_INVALID; a zero / unknown reading changes nothing (A1 happy path preserved); existing stripe_refund / foreign-PI fences retained ahead of it", async () => {
+  const cases = [
+    [[PI_EV({ amountRefundedMinor: 5000, refunded: false })], "SCOPE_REFUSED", "PAYMENT_REFUND_OBSERVED"],
+    [[PI_EV({ amountRefundedMinor: AMT, refunded: true })], "SCOPE_REFUSED", "PAYMENT_REFUND_OBSERVED"],
+    [[PI_EV({ refunded: true })], "SCOPE_REFUSED", "PAYMENT_REFUND_OBSERVED"],
+    [[PI_EV({ amountRefundedMinor: AMT }, { source: "stripe_api" })], "SCOPE_REFUSED", "PAYMENT_REFUND_OBSERVED"],
+    [[PI_EV({ amountRefundedMinor: 0, refunded: false }, { observed_at: new Date(CREATED + 9e6) }), PI_EV({ amountRefundedMinor: AMT }, { observed_at: new Date(CREATED - 9e6) })], "SCOPE_REFUSED", "PAYMENT_REFUND_OBSERVED"],
+    [[PI_EV({ amountRefundedMinor: "14000" })], "SCOPE_REFUSED", "PAYMENT_REFUND_EVIDENCE_INVALID"],
+    [[PI_EV({ refunded: "true" })], "SCOPE_REFUSED", "PAYMENT_REFUND_EVIDENCE_INVALID"],
+    [[PI_EV({ refunded: true }, { external_ref: "pi_OTHER000000001" })], "SCOPE_REFUSED", "EVIDENCE_CONFLICT"],
+    [[{ kind: "stripe_refund", external_ref: "re_x", status: "succeeded", observed: { amountRefundedMinor: AMT } }], "SCOPE_REFUSED", "EVIDENCE_CONFLICT"],
+  ];
+  for (const [rows, outcome, code] of cases) {
+    const w = world(); w.evidence.push(...rows); const before = JSON.stringify([w.status, w.version, w.ops, w.claimReleased, w.ledger]);
+    const r = await core(w);
+    assert.deepEqual([r.outcome, r.code, w.calls.length, r.lock, w.workerCalls, r.recordInvocations, r.writes.record], [outcome, code, 0, "not_acquired", 0, 0, 0], `${code}: ${JSON.stringify(r)}`);
+    assert.equal(JSON.stringify([w.status, w.version, w.ops, w.claimReleased, w.ledger]), before, "fake state / ops / claim / ledger untouched");
+  }
+  for (const rows of [[PI_EV({ amountRefundedMinor: 0, refunded: false })], [PI_EV({ amountReceivedMinor: AMT })], [PI_EV(null)]]) {
+    const w = world(); w.evidence.push(...rows);
+    const r = await core(w);
+    assert.equal(r.outcome, "RECORDING_CONFIRMED", "zero / unknown refund fields preserve the happy path: " + JSON.stringify([rows, r.outcome, r.code]));
+    assert.equal(posts(w).length, 1);
+  }
+});
+
 test("A3 start refusals (read-only, ZERO provider calls, ZERO lock, ZERO worker): state / version / pins / historic / protected / open case / forbidden op / recording not pristine or unbound / hold / already linked / notify present / lease / work lease / claim / non-TEST / ambiguous recorded time / schema prerequisite missing", async () => {
   const cases = [
     [(w) => { w.status = "confirmed"; }, {}, "START_STATE_NOT_ELIGIBLE", "STATE_NOT_PAYMENT_CAPTURED"],
@@ -756,6 +803,28 @@ test("O2 PG ordering (REAL repo + 0010–0021 fences, accepted fixtures): after 
     assert.deepEqual([s.st.state, s.st.offline_charge_id, s.ops.filter((x) => x.op_type === REC).map((x) => [x.state, x.attempts, x.d]), s.notifies, s.ledger.includes("offline_charge_recorded")], ["payment_captured", null, [["pending", 0, false]], [], false]);
   });
 
+  test("V3 PG (REAL repo + accepted admin path): an owner-attested DASHBOARD payment_intent observation with amountRefundedMinor > 0 for the plan PI → SCOPE_REFUSED / PAYMENT_REFUND_OBSERVED with ZERO provider calls, ZERO worker invocations, no lock, and intent / version / ops / claims / ledger byte-identical; a zero-refund dashboard row leaves admission unchanged (I1 path still reaches the worker)", async () => {
+    const A = await tool("db/lib/admin.js");
+    const snapAll = async (id) => (await db.owner.query(`SELECT md5(i::text) AS intent, i.version,
+        (SELECT md5(coalesce(string_agg(o::text, '|' ORDER BY o::text), '')) FROM booking.external_operations o WHERE o.intent_id = i.id) AS ops,
+        (SELECT md5(coalesce(string_agg(c::text, '|' ORDER BY c::text), '')) FROM booking.inventory_claims c WHERE c.intent_id = i.id) AS claims,
+        (SELECT md5(coalesce(string_agg(l::text, '|' ORDER BY l::text), '')) FROM booking.payment_ledger l WHERE l.intent_id = i.id) AS ledger
+      FROM booking.intents i WHERE i.id = $1`, [id])).rows[0];
+    { const a = await capturedIntent(); const clk = newClock(); const w = pgWorld(a, clk);
+      F.ok(await A.adminRecordEvidence(db.reconciler, { intentId: a.id, kind: "payment_intent", externalRef: a.piId, status: "succeeded",
+        observed: { amountMinor: a.total, currency: "USD", amountReceivedMinor: a.total, amountRefundedMinor: a.total, refunded: true }, observedAt: new Date(Date.now() - 30_000), attestedBy: "owner", reference: "SYNTHETIC dashboard refund observation (C16 fixture)" }));
+      const s0 = await snapAll(a.id);
+      const r = await pgRun(a, clk, w);
+      assert.deepEqual([r.outcome, r.code, r.recordInvocations, w.calls.length, w.postRequests, r.lock], ["SCOPE_REFUSED", "PAYMENT_REFUND_OBSERVED", 0, 0, 0, "not_acquired"], JSON.stringify(r));
+      assert.deepEqual(await snapAll(a.id), s0, "intent / version / ops / claims / ledger byte-identical after the veto");
+      const s = await snap(a.id); assert.deepEqual([s.st.state, s.ops.filter((x) => x.op_type === REC).map((x) => x.state), s.notifies.length, s.locks], ["payment_captured", ["pending"], 0, 0]); }
+    { const a = await capturedIntent(); const clk = newClock(); const w = pgWorld(a, clk); w.nextId = 7700901;   // distinct provider charge id (I1 already recorded 7700001 in this cluster)
+      F.ok(await A.adminRecordEvidence(db.reconciler, { intentId: a.id, kind: "payment_intent", externalRef: a.piId, status: "succeeded",
+        observed: { amountMinor: a.total, currency: "USD", amountReceivedMinor: a.total, amountRefundedMinor: 0, refunded: false }, observedAt: new Date(Date.now() - 30_000), attestedBy: "owner", reference: "SYNTHETIC zero-refund observation (C16 fixture)" }));
+      const r = await pgRun(a, clk, w);
+      assert.equal(r.outcome, "RECORDING_CONFIRMED", "zero-refund observation does not widen or narrow admission: " + JSON.stringify([r.outcome, r.code]));
+      assert.equal(w.postRequests, 1); }
+  });
   test("I4 PG integration: prior / historic refusals on real rows — a prior marked charge at the provider → PROVIDER_PROOF_FAILED before the worker; a recording hold → START refusal; held lock elsewhere → LOCK_NOT_ACQUIRED with zero exchanges", async () => {
     { const a = await capturedIntent(); const clk = newClock(); const w = pgWorld(a, clk);
       w.charges.push({ id: 7799999, listingMapId: LIST, reservationId: Number(a.rid), type: "charge", title: `maraVilla payment mvoch1-${a.id}`, currency: "USD", paymentMethod: "credit_card", amount: a.total / 100, status: "paid", paymentProvider: "offline" });

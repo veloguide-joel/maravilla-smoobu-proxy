@@ -164,7 +164,7 @@ const Q = freeze({
   claims: "/*e7hrc:claims*/ SELECT listing_id, (released_at IS NOT NULL) AS released FROM booking.inventory_claims WHERE intent_id = $1",
   work: "/*e7hrc:work*/ SELECT (work_worker_id IS NOT NULL OR work_lease_until IS NOT NULL) AS leased FROM booking.intent_work WHERE intent_id = $1",
   ledger: "/*e7hrc:ledger*/ SELECT entry, amount_minor::text AS amt, currency, provider_ref FROM booking.payment_ledger WHERE intent_id = $1 ORDER BY id",
-  evidence: "/*e7hrc:evidence*/ SELECT kind, external_ref, status FROM booking.provider_evidence WHERE intent_id = $1",
+  evidence: "/*e7hrc:evidence*/ SELECT kind, external_ref, status, source, observed, observed_at FROM booking.provider_evidence WHERE intent_id = $1",   // C16: observed JSON + provenance for the stored refund-observation veto (read-only)
   row: "/*e7hrc:row*/ SELECT environment, reason_code, offline_charge_id, captured_minor::text AS cap FROM booking.intents WHERE id = $1",
   // = the accepted worker's recordedPaymentAt query (W-3): the DB-stamped UNIQUE entry into payment_captured
   recorded: `/*e7hrc:recorded*/ SELECT recorded_at FROM booking.intent_transitions WHERE intent_id = $1 AND to_state = 'payment_captured' AND from_state IS DISTINCT FROM 'payment_captured'`,
@@ -251,6 +251,37 @@ function checkCommon(f, plan, c) {
   return null;
 }
 const schemaOk = (s) => !!s && SCHEMA_FLAGS.every((k) => s[k] === true);
+// ---------------------------------------------------------------------------------------------
+// C16 (ROOT #93 / 1a1d07e0): START VETO on STORED refund observations — defense-in-depth in this CLOSED wrapper only.
+// ANY stored booking.provider_evidence row of kind payment_intent whose external_ref is EXACTLY the plan PI (any source, any age, regardless
+// of newer zero-refund rows) whose observed JSON carries amountRefundedMinor as a POSITIVE safe integer OR refunded === true refuses
+// PAYMENT_REFUND_OBSERVED. A row where either field is PRESENT but malformed (null / string / negative / non-finite / non-integer amount;
+// non-boolean refunded) refuses PAYMENT_REFUND_EVIDENCE_INVALID — never coerced. Rows without these fields are UNKNOWN and change nothing:
+// this veto supplies NO affirmative proof, widens no admission, adds no provider read, and is NOT a latest-only gate. A positive observation
+// wins over a malformed one when both exist (either refuses).
+const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+const isPlainObj = (o) => o !== null && typeof o === "object" && !Array.isArray(o);
+export const REFUND_OBSERVATION_FIELDS = freeze(["amountRefundedMinor", "refunded"]);
+/** refundObservationRefusal(evidence, paymentIntentId) → null | "PAYMENT_REFUND_OBSERVED" | "PAYMENT_REFUND_EVIDENCE_INVALID" (pure; rows = the wrapper's evidence read) */
+export function refundObservationRefusal(evidence, paymentIntentId) {
+  let invalid = false;
+  for (const x of Array.isArray(evidence) ? evidence : []) {
+    if (!x || x.kind !== "payment_intent" || x.external_ref !== paymentIntentId) continue;      // only the plan PI; foreign PIs are EVIDENCE_CONFLICT elsewhere
+    const o = x.observed;
+    if (!isPlainObj(o)) continue;                                                               // no observed object → nothing known here
+    if (hasOwn(o, "amountRefundedMinor")) {
+      const a = o.amountRefundedMinor;
+      if (typeof a !== "number" || !Number.isSafeInteger(a) || a < 0) invalid = true;           // null / string / negative / non-finite / non-integer
+      else if (a > 0) return "PAYMENT_REFUND_OBSERVED";
+    }
+    if (hasOwn(o, "refunded")) {
+      const r = o.refunded;
+      if (typeof r !== "boolean") invalid = true;
+      else if (r === true) return "PAYMENT_REFUND_OBSERVED";
+    }
+  }
+  return invalid ? "PAYMENT_REFUND_EVIDENCE_INVALID" : null;
+}
 /** checkStart(f, plan, c) → { ok, intent, recordingOpId, scheduledDate } | { ok:false, code } — read-only admission (the accepted worker's own gates stay authoritative) */
 export function checkStart(f, plan, c = CONSTANTS) {
   const no = (code) => freeze({ ok: false, code });
@@ -273,6 +304,8 @@ export function checkStart(f, plan, c = CONSTANTS) {
   if (f.ledger.some((l) => l.entry === "offline_charge_recorded")) return no("LEDGER_MISMATCH");
   if (f.evidence.some((x) => x.kind === "hostaway_offline_charges" || (x.kind === "hostaway_reservation" && x.status === "cancelled"))) return no("EVIDENCE_CONFLICT");
   if (f.claims[0].released !== false) return no("CLAIM_NOT_HELD");
+  const refundVeto = refundObservationRefusal(f.evidence, plan.paymentIntentId);                     // C16: stored refund observation → refuse (any source / age)
+  if (refundVeto) return no(refundVeto);
   if (!schemaOk(f.schema)) return no("SCHEMA_PREREQUISITE_MISSING");
   return freeze({ ok: true, intent: i, recordingOpId: String(recs[0].id), scheduledDate: scheduledDateOf(f.recordedPaymentAt) });
 }
