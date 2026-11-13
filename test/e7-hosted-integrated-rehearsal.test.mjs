@@ -15,11 +15,13 @@
 //   clock        the REAL clock (Date.now) in every phase — the recording and recorded-cleanup workers compare against the database clock, and
 //                the seed is stamped at the real now so the Stripe `capture_before` window (now + 7 d) is honoured by the accepted proofs.
 //   scheduling   TEST-HARNESS SCHEDULING ONLY, labelled and measured: where a runner would `sleep(delayMs)` in real time between worker steps,
-//                this harness (a) waits the REAL delay when it is ≤ REAL_WAIT_CAP_MS (150 s; the accepted E7.1 "reads ≥ 2 min after the create"
-//                freshness window is therefore honoured in real time), otherwise (b) makes the pinned intent due now with ONE
-//                owner-role `UPDATE booking.intent_work SET next_action_at = now()` (the Slice 5 I-tests' `dueNow`). Every sleep is logged with
-//                the requested delay and which path was taken (see `# scheduling`), so the report states the test-only scheduling precisely.
-//                The workers' own leases, proof windows and deadlines are untouched.
+//                this harness waits the REAL delay (≤ REAL_WAIT_CAP_MS = 150 s; the accepted E7.1 "reads ≥ 2 min after the create" freshness
+//                window is therefore honoured in real time) and THROWS on any longer wait — there is no owner-side rescheduling fallback. Before
+//                scenario B's second session it waits in real time until the worker's OWN next_action_at. Every sleep is logged (`# scheduling`)
+//                and Z asserts every entry is a real wait. The workers' own leases, proof windows, schedules and deadlines are untouched.
+//   bootstrap    the closure gate (`closureGate`) is an UNCONDITIONAL awaited top-level step: when the DB section is enabled, every runner's
+//                closure bytes at its pin are verified BEFORE any tooling import / database start, independent of test filters; a mismatch throws
+//                and nothing below it runs (the child-process control N2 proves zero tooling resolution / zero DB activity on a tampered pin).
 //   isolation    no network (https / fetch refused at module load), no env secrets, no live DB: a throwaway cluster from the e41b654a harness.
 //   opt-in       E7_REHEARSAL_DB_TESTS=1 and E7_REHEARSAL_TOOLING_ROOT=<dir holding checkouts 40779e34/ 9d86bfa1/ 5a094b16/ e41b654a/ (each with
 //                node_modules)>. Without the flag the file only checks the declared pins and exits.
@@ -36,7 +38,9 @@ import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import https from "node:https";
 import { syncBuiltinESMExports } from "node:module";
-import { realpathSync, existsSync } from "node:fs";
+import { realpathSync, existsSync, mkdtempSync, cpSync, readFileSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -58,7 +62,7 @@ const RUNNERS = Object.freeze([
 ]);
 const enc = (o) => new TextEncoder().encode(JSON.stringify(o));
 const MINUTE = 60000; const DAY = 86400000;
-const REAL_WAIT_CAP_MS = 150000;                      // test-harness scheduling: REAL wait up to 150 s per sleep (covers the E7.1 two-minute read freshness window), else `dueNow` (see header)
+const REAL_WAIT_CAP_MS = 150000;                      // test-harness scheduling: REAL wait up to 150 s per sleep (covers the E7.1 two-minute read freshness window); longer → throw (see header)
 
 test("R0 the five runners declare the expected immutable tooling pins and executeEnabled=false (nothing here opens execution)", () => {
   for (const r of RUNNERS) {
@@ -69,20 +73,37 @@ test("R0 the five runners declare the expected immutable tooling pins and execut
   assert.deepEqual(RUNNERS.map((r) => r.E.CONSTANTS.toolingCommit.slice(0, 8)), ["40779e34", "40779e34", "9d86bfa1", "5a094b16", "e41b654a"]);
 });
 
-if (process.env.E7_REHEARSAL_DB_TESTS === "1") {
-  const PIN_ROOT = realpathSync(process.env.E7_REHEARSAL_TOOLING_ROOT);
+/** the closure gate: every runner's closure BYTES at its pin checkout == its frozen digest (the runner's OWN exported prefix). Pure: reads
+ *  files only, imports nothing from the pins, touches no database. Throws `CLOSURE_MISMATCH:<runner>@<pin>` (or `CHECKOUT_MISSING`). */
+export async function closureGate(pinRoot) {
+  const out = [];
+  for (const r of RUNNERS) {
+    const dir = join(pinRoot, r.pin.slice(0, 8));
+    if (!existsSync(join(dir, "package.json"))) throw new Error(`CHECKOUT_MISSING:${r.name}@${r.pin.slice(0, 8)}`);
+    const got = await RES.framedDigest(dir, r.E.CONSTANTS.closure, r.E.CLOSURE_DIGEST_PREFIX).catch((e) => { throw new Error(`CLOSURE_UNREADABLE:${r.name}@${r.pin.slice(0, 8)}:${e && e.code ? e.code : e}`); });
+    if (got !== r.E.CONSTANTS.closureDigest) throw new Error(`CLOSURE_MISMATCH:${r.name}@${r.pin.slice(0, 8)}`);
+    out.push({ name: r.name, pin: r.pin.slice(0, 8), files: r.E.CONSTANTS.closure.length, digest: got });
+  }
+  return out;
+}
+
+// ---- (0) UNCONDITIONAL awaited bootstrap: the closure gate runs here, at module top level, BEFORE any tooling import or database start. It does
+//      not depend on which tests are selected; a mismatch throws out of the module and nothing below executes.
+const DB_ON = process.env.E7_REHEARSAL_DB_TESTS === "1";
+const PIN_ROOT = DB_ON ? realpathSync(process.env.E7_REHEARSAL_TOOLING_ROOT) : null;
+const GATE = DB_ON ? await closureGate(PIN_ROOT) : null;
+if (GATE) for (const g of GATE) console.log(`# gate ${g.name} @ ${g.pin}: ${g.files} files, digest ${g.digest.slice(0, 16)}… == pin (verified before any tooling import)`);
+
+if (DB_ON) {
   const pinDir = (pin) => join(PIN_ROOT, pin.slice(0, 8));
   const at = (pin, p) => import(pathToFileURL(join(pinDir(pin), p)).href);
   const P1 = RUNNERS[0].pin, P3 = RUNNERS[2].pin, P4 = RUNNERS[3].pin, P5 = RUNNERS[4].pin;
 
-  // ---- (0) the tooling closure BYTES at each pin == the runner's frozen digest, BEFORE anything else is imported from them --------------------
-  test("R1 tooling closure bytes: framedDigest(<pin checkout>, CONSTANTS.closure) == CONSTANTS.closureDigest for all five runners (verified first)", async () => {
-    for (const r of RUNNERS) {
-      assert.ok(existsSync(join(pinDir(r.pin), "package.json")), `${r.name}: checkout ${pinDir(r.pin)}`);
-      const got = await RES.framedDigest(pinDir(r.pin), r.E.CONSTANTS.closure, r.E.CLOSURE_DIGEST_PREFIX);   // the runner's OWN exported prefix
-      assert.equal(got, r.E.CONSTANTS.closureDigest, `${r.name} @ ${r.pin.slice(0, 8)}: closure digest`);
-      console.log(`# R1 ${r.name} @ ${r.pin.slice(0, 8)}: ${r.E.CONSTANTS.closure.length} files, digest ${got.slice(0, 16)}… == pin`);
-    }
+  test("R1 tooling closure bytes (report): the awaited bootstrap gate verified all five runners' closures at their pins before any tooling import; re-checked here", async () => {
+    assert.equal(GATE.length, 5);
+    const again = await closureGate(PIN_ROOT);
+    assert.deepEqual(again, GATE);
+    for (const g of GATE) console.log(`# R1 ${g.name} @ ${g.pin}: ${g.files} files, digest ${g.digest.slice(0, 16)}… == pin`);
   });
 
   // ---- latest (e41b654a) harness + fixtures + repo: the ONE disposable database at 0021 and the ONE seed path ------------------------------------
@@ -244,12 +265,10 @@ if (process.env.E7_REHEARSAL_DB_TESTS === "1") {
 
   // ---- test-harness scheduling (labelled, measured) -------------------------------------------------------------------------------------------------
   const schedule = [];
-  const harnessSleep = (phase, intentId) => async (ms) => {
+  const harnessSleep = (phase) => async (ms) => {
     const n = Math.max(0, Number(ms) || 0);
-    if (n <= REAL_WAIT_CAP_MS) { schedule.push({ phase, ms: n, path: "real-wait" }); await new Promise((r) => setTimeout(r, n)); return; }
-    schedule.push({ phase, ms: n, path: "dueNow" });
-    await new Promise((r) => setTimeout(r, 5));
-    await db.owner.query("UPDATE booking.intent_work SET next_action_at = now() WHERE intent_id = $1", [intentId]);   // TEST-ONLY scheduling: the pinned intent is due now
+    if (n > REAL_WAIT_CAP_MS) { schedule.push({ phase, ms: n, path: "REFUSED" }); throw new Error(`REHEARSAL_WAIT_BEYOND_CAP:${phase}:${n}`); }   // never rescheduled by the harness
+    schedule.push({ phase, ms: n, path: "real-wait" }); await new Promise((r) => setTimeout(r, n));
   };
   const creds = { stripe: () => "sk_test_Fake1", hostaway: () => "synthetic-hostaway-token" };
   const ZERO = "0".repeat(64);
@@ -258,20 +277,21 @@ if (process.env.E7_REHEARSAL_DB_TESTS === "1") {
 
   // ---- DB observation: per-intent row counts + fingerprints across every booking.* table with an intent_id column (foreign-write / baseline guard) ----
   const TABLES = (await db.owner.query("SELECT table_name FROM information_schema.columns WHERE table_schema = 'booking' AND column_name = 'intent_id' ORDER BY table_name")).rows.map((r) => r.table_name);
-  const fingerprints = async () => {
+  assert.ok(!TABLES.includes("intents"), "intents has no intent_id column: it is fingerprinted separately below, keyed by id");
+  /** per-intent fingerprints: the FULL booking.intents row (keyed by id, every column incl. version / updated_at) + every child table with an
+   *  intent_id column (row count + md5 over the whole rows). `q` is any query runner (pool or a transaction client), so a guard can observe
+   *  inside a transaction it later rolls back. */
+  const fingerprints = async (q = db.owner, { childrenOnly = false } = {}) => {
     const out = {};
+    if (!childrenOnly) for (const r of (await q.query("SELECT id::text AS id, md5(x::text) AS fp FROM booking.intents x")).rows) (out[r.id] ??= {}).intents = `1:${r.fp}`;
     for (const t of TABLES) {
-      const rows = (await db.owner.query(`SELECT intent_id::text AS id, count(*)::int AS n, md5(string_agg(x::text, '|' ORDER BY x::text)) AS fp FROM booking.${t} x GROUP BY intent_id`)).rows;
+      const rows = (await q.query(`SELECT intent_id::text AS id, count(*)::int AS n, md5(string_agg(x::text, '|' ORDER BY x::text)) AS fp FROM booking.${t} x GROUP BY intent_id`)).rows;
       for (const r of rows) (out[r.id] ??= {})[t] = `${r.n}:${r.fp}`;
     }
     return out;
   };
-  const schemaVersion = async () => {
-    const t = (await db.owner.query("SELECT table_name FROM information_schema.tables WHERE table_schema IN ('booking','public') AND table_name ~ 'migration' LIMIT 1")).rows[0];
-    if (!t) return null;
-    const r = await db.owner.query(`SELECT max(regexp_replace(name, '_.*$', '')) AS v FROM booking.${t.table_name}`).catch(() => db.owner.query(`SELECT max(regexp_replace(name, '_.*$', '')) AS v FROM ${t.table_name}`)).catch(() => null);
-    return r ? r.rows[0].v : null;
-  };
+  /** the migration ledger the harness's own migrator writes (booking_migrations.applied): EXACT 0001..0021, in order */
+  const appliedMigrations = async () => (await db.owner.query("SELECT version FROM booking_migrations.applied ORDER BY version")).rows.map((r) => String(r.version).padStart(4, "0"));
   const snap = async (id) => ({
     st: (await db.app.query("SELECT state, version, reason_code, hostaway_reservation_id::text AS rid, offline_charge_id::text AS och, captured_minor::text AS cap, settlement_reservation_cancelled AS c, settlement_authorization_settled AS a, settlement_recording_mirrored AS m FROM booking.intents WHERE id = $1", [id])).rows[0],
     ops: (await db.app.query("SELECT op_type, state, attempts, (dispatched_at IS NOT NULL) AS d, result_ref FROM booking.external_operations WHERE intent_id = $1 ORDER BY created_at, op_type", [id])).rows,
@@ -291,28 +311,29 @@ if (process.env.E7_REHEARSAL_DB_TESTS === "1") {
   const BASE_ID = baseline.id;
   assert.equal((await R.loadIntent(db.app, BASE_ID)).status, "confirmed");
   const fp0 = await fingerprints();
-  const sv = await schemaVersion();
-  console.log(`# DB: disposable cluster from e41b654a harness, migration head ${sv ?? "(table not found by regex)"}; booking tables with intent_id: ${TABLES.length}; baseline booking ${BASE_ID} confirmed`);
+  const APPLIED = await appliedMigrations();
+  assert.deepEqual(APPLIED, Array.from({ length: 21 }, (_, i) => String(i + 1).padStart(4, "0")), "booking_migrations.applied is EXACTLY 0001..0021");
+  console.log(`# DB: disposable cluster from e41b654a harness; booking_migrations.applied = ${APPLIED[0]}..${APPLIED[APPLIED.length - 1]} (${APPLIED.length} rows, exact); child tables with intent_id: ${TABLES.length} (+ intents by id); baseline booking ${BASE_ID} confirmed`);
 
   // ---- phase drivers: each core as exported on main, each with ITS pin's tooling and the shared world ---------------------------------------------------
   const phaseRes = async (a, w) => RES.runReservationCore({ plan: RES.buildPlan(C1, { approvalRef: "SYNTHETIC-rehearsal", intentId: a.id, expectedVersion: await ver(a.id), notBefore: nb(a), admission: "authorized", reservationId: "", runnerDigest: ZERO }).plan,
-    pool: db.app, tooling: toolingRes, exchanges: { stripe: w.stripe, hostaway: w.hostaway }, credentials: creds, clock: () => Date.now(), sleep: harnessSleep("reservation@40779e34", a.id) });
+    pool: db.app, tooling: toolingRes, exchanges: { stripe: w.stripe, hostaway: w.hostaway }, credentials: creds, clock: () => Date.now(), sleep: harnessSleep("reservation@40779e34") });
   const phaseCap = async (a, w, rid) => CAP.runCaptureCore({ plan: CAP.buildPlan(C2, { approvalRef: "SYNTHETIC-rehearsal", intentId: a.id, expectedVersion: await ver(a.id), notBefore: nb(a), paymentIntentId: a.piId, reservationId: rid, amountMinor: a.total, runnerDigest: ZERO }).plan,
-    pool: db.app, tooling: toolingCap, exchanges: { stripe: w.stripe, hostaway: w.hostaway }, credentials: creds, clock: () => Date.now(), sleep: harnessSleep("capture@40779e34", a.id) });
+    pool: db.app, tooling: toolingCap, exchanges: { stripe: w.stripe, hostaway: w.hostaway }, credentials: creds, clock: () => Date.now(), sleep: harnessSleep("capture@40779e34") });
   const recPlan = async (a, rid, chargeId) => REC.buildPlan(C4, { approvalRef: "SYNTHETIC-rehearsal", intentId: a.id, expectedVersion: await ver(a.id), notBefore: nb(a), paymentIntentId: a.piId, reservationId: rid, chargeId, capturedMinor: a.total,
     from: a.stay.from, to: a.stay.to, guests: a.intent.guests, attemptId: a.attemptId, sessionId: a.sessionId, runnerDigest: ZERO });
   const phaseRec = async (a, w, rid, chargeId, k) => { const b = await recPlan(a, rid, chargeId);
-    return REC.runRecordingCore({ plan: b.plan, planHash: b.planHash, runId: `rehearsal-${k}-rec`, pool: db.app, tooling: toolingRec, exchanges: { hostaway: w.hostaway }, credentials: { hostaway: creds.hostaway }, clock: () => Date.now(), sleep: harnessSleep("recording@5a094b16", a.id) }); };
+    return REC.runRecordingCore({ plan: b.plan, planHash: b.planHash, runId: `rehearsal-${k}-rec`, pool: db.app, tooling: toolingRec, exchanges: { hostaway: w.hostaway }, credentials: { hostaway: creds.hostaway }, clock: () => Date.now(), sleep: harnessSleep("recording@5a094b16") }); };
   const phaseRcl = async (a, w, rid, chargeId, offlineChargeId, k) => { const b = RCL.buildPlan(C5, { approvalRef: "SYNTHETIC-rehearsal", intentId: a.id, expectedVersion: await ver(a.id), notBefore: nb(a), paymentIntentId: a.piId, reservationId: rid, chargeId, offlineChargeId, capturedMinor: a.total,
       from: a.stay.from, to: a.stay.to, guests: a.intent.guests, attemptId: a.attemptId, sessionId: a.sessionId, runnerDigest: ZERO });
-    return RCL.runRecordedCleanupCore({ plan: b.plan, planHash: b.planHash, runId: `rehearsal-${k}-rcl`, pool: db.app, tooling: toolingRcl, exchanges: { stripe: w.stripe, hostaway: w.hostaway }, credentials: creds, clock: () => Date.now(), sleep: harnessSleep("recorded-cleanup@e41b654a", a.id) }); };
+    return RCL.runRecordedCleanupCore({ plan: b.plan, planHash: b.planHash, runId: `rehearsal-${k}-rcl`, pool: db.app, tooling: toolingRcl, exchanges: { stripe: w.stripe, hostaway: w.hostaway }, credentials: creds, clock: () => Date.now(), sleep: harnessSleep("recorded-cleanup@e41b654a") }); };
   const phaseTcl = async (a, w, rid, chargeId) => { const b = TCL.buildPlan(C3, { approvalRef: "SYNTHETIC-rehearsal", intentId: a.id, expectedVersion: await ver(a.id), notBefore: nb(a), paymentIntentId: a.piId, reservationId: rid, chargeId, capturedMinor: a.total,
       from: a.stay.from, to: a.stay.to, guests: a.intent.guests, attemptId: a.attemptId, sessionId: a.sessionId, runnerDigest: ZERO });
-    return TCL.runTestCleanupCore({ plan: b.plan, planHash: b.planHash, pool: db.app, tooling: toolingTcl, exchanges: { stripe: w.stripe, hostaway: w.hostaway }, credentials: creds, clock: () => Date.now(), sleep: harnessSleep("test-cleanup@9d86bfa1", a.id) }); };
+    return TCL.runTestCleanupCore({ plan: b.plan, planHash: b.planHash, pool: db.app, tooling: toolingTcl, exchanges: { stripe: w.stripe, hostaway: w.hostaway }, credentials: creds, clock: () => Date.now(), sleep: harnessSleep("test-cleanup@9d86bfa1") }); };
 
   /** the shared Slice 1 → Slice 2 prefix of both scenarios: reservation (40779e34) then capture (40779e34) on the SAME intent / PI / price */
   const phaseResPending = async (a, w) => RES.runReservationCore({ plan: RES.buildPlan(C1, { approvalRef: "SYNTHETIC-rehearsal", intentId: a.id, expectedVersion: await ver(a.id), notBefore: nb(a), admission: "pending", reservationId: String(w.res), runnerDigest: ZERO }).plan,
-    pool: db.app, tooling: toolingRes, exchanges: { stripe: w.stripe, hostaway: w.hostaway }, credentials: creds, clock: () => Date.now(), sleep: harnessSleep("reservation@40779e34(pending)", a.id) });
+    pool: db.app, tooling: toolingRes, exchanges: { stripe: w.stripe, hostaway: w.hostaway }, credentials: creds, clock: () => Date.now(), sleep: harnessSleep("reservation@40779e34(pending)") });
   /** test-harness scheduling: REAL wait until the worker's OWN next_action_at (its E7.1 freshness schedule) has passed; nothing is rewritten */
   const waitUntilDue = async (phase, id) => {
     const row = (await db.owner.query("SELECT next_action_at FROM booking.intent_work WHERE intent_id = $1", [id])).rows[0];
@@ -433,16 +454,70 @@ if (process.env.E7_REHEARSAL_DB_TESTS === "1") {
     findings.push({ scenario: "B", intent: a.id, reservation: pre.rid, pi: a.piId, charge: pre.chargeId, refund: w.refundId, recordingRow: opsOf(s, "hostaway.record_offline_charge"), transitions: s.transitions, writeOrder: w.writes, ops: s.ops.map((x) => `${x.op_type}:${x.state}:${x.attempts}`), ledger: s.ledger });
   });
 
-  test("Z guards + report: baseline active booking byte-identical, NO foreign intent row changed, zero network, lock count 0; scheduling + budgets + findings printed", async () => {
+  /** the foreign-write guard shared by Z and the negative control: every non-rehearsal intent (the baseline included) must fingerprint identically, and no new one may appear */
+  const foreignDiff = (before, afterFp, ours) => {
+    const changed = Object.keys(before).filter((id) => !ours.has(id) && JSON.stringify(afterFp[id]) !== JSON.stringify(before[id]));
+    const added = Object.keys(afterFp).filter((id) => !ours.has(id) && !before[id]);
+    return { changed, added };
+  };
+
+  test("N1 negative guard (disposable, rolled back): the EXACT injected mutation — UPDATE booking.intents SET version = version + 1, updated_at = updated_at + 1 s on the baseline — is caught by the full-row intents fingerprint (RED under the former child-only fingerprint, GREEN now); a new foreign intent is caught too", async () => {
+    const c = await db.owner.connect();
+    try {
+      await c.query("BEGIN");
+      const before = await fingerprints(c); const beforeChildren = await fingerprints(c, { childrenOnly: true });
+      await c.query("UPDATE booking.intents SET version = version + 1, updated_at = updated_at + interval '1 second' WHERE id = $1", [BASE_ID]);
+      const after = await fingerprints(c); const afterChildren = await fingerprints(c, { childrenOnly: true });
+      assert.deepEqual(foreignDiff(beforeChildren, afterChildren, OURS), { changed: [], added: [] }, "RED (documented former gap): a child-only fingerprint does NOT see the intents-row mutation");
+      assert.deepEqual(foreignDiff(before, after, OURS), { changed: [BASE_ID], added: [] }, "GREEN: the full-row intents fingerprint catches exactly the mutated baseline");
+      assert.notEqual(after[BASE_ID].intents, before[BASE_ID].intents); assert.deepEqual({ ...after[BASE_ID], intents: before[BASE_ID].intents }, before[BASE_ID], "only the intents row differs");
+      // a NEW foreign intent (the latest fixtures' minimal row) is caught as `added`
+      // (the latest fixtures' minimal intent, written INSIDE this rolled-back transaction through a savepoint shim of the pool interface)
+      const shim = { connect: async () => ({ release() {}, query: (q, ...a) => c.query(q === "BEGIN" ? "SAVEPOINT n1" : q === "COMMIT" ? "RELEASE SAVEPOINT n1" : q === "ROLLBACK" ? "ROLLBACK TO SAVEPOINT n1" : q, ...a) }), query: (...a) => c.query(...a) };
+      const extra = await F.newIntent(shim);
+      const after2 = await fingerprints(c);
+      assert.deepEqual(foreignDiff(before, after2, OURS), { changed: [BASE_ID], added: [extra] });
+      await c.query("ROLLBACK");
+    } catch (e) { await c.query("ROLLBACK").catch(() => {}); throw e; } finally { c.release(); }
+    const now = await fingerprints();
+    assert.deepEqual(now[BASE_ID], fp0[BASE_ID], "rolled back: the baseline fingerprint is exactly the pre-rehearsal one again");
+  });
+
+  test("N2 negative control (child process): a tampered byte in ONE closure file at ONE pin → the awaited bootstrap gate throws CLOSURE_MISMATCH and the module never imports any pin tooling, never starts a database and runs no scenario (import-resolution hook + PG_BIN pointed at nothing)", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "e7-rehearsal-gate-"));
+    try {
+      // a minimal tampered tooling root: only the closure files (copied bytes) of every pin, one byte flipped in the capture worker at 40779e34
+      for (const r of RUNNERS) { const dir = join(tmp, r.pin.slice(0, 8)); mkdirSync(dir, { recursive: true }); writeFileSync(join(dir, "package.json"), "{}\n");
+        for (const rel of r.E.CONSTANTS.closure) { mkdirSync(dirname(join(dir, rel)), { recursive: true }); cpSync(join(pinDir(r.pin), rel), join(dir, rel)); } }
+      const victim = join(tmp, "40779e34", "lib/booking-db/capture-worker.js");
+      writeFileSync(victim, readFileSync(victim, "utf8").replace("workerId", "workerID"));
+      const hook = join(tmp, "hook.mjs");
+      writeFileSync(hook, `import { register } from "node:module"; register(new URL("./hooks.mjs", import.meta.url));`);
+      writeFileSync(join(tmp, "hooks.mjs"), `export async function resolve(spec, ctx, next) { const r = await next(spec, ctx); if (String(r.url).includes(${JSON.stringify(tmp)})) process.stderr.write("TOOLING_RESOLVED " + r.url + "\\n"); return r; }`);
+      const env = { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR ?? "/tmp", E7_REHEARSAL_DB_TESTS: "1", E7_REHEARSAL_TOOLING_ROOT: tmp, PG_BIN: join(tmp, "no-such-pg-bin") };
+      const r = spawnSync(process.execPath, ["--import", pathToFileURL(hook).href, "--test", fileURLToPath(import.meta.url)], { env, encoding: "utf8", timeout: 120000 });
+      const all = r.stdout + "\n" + r.stderr;
+      assert.notEqual(r.status, 0, "the file fails to load");
+      assert.match(all, /CLOSURE_MISMATCH:capture@40779e34/, all.slice(-2000));
+      assert.doesNotMatch(all, /CLOSURE_MISMATCH:reservation@/, "the reservation closure (same pin, untouched files) passed first: files are verified in runner order");
+      assert.doesNotMatch(r.stderr, /TOOLING_RESOLVED/, "ZERO tooling imports resolved under the tampered root");
+      assert.doesNotMatch(all, /initdb|no-such-pg-bin|# DB:|Subtest: A |Subtest: B |scheduling/, "ZERO database / scenario activity");
+      assert.doesNotMatch(r.stdout, /# gate /, "the gate reports digests only after ALL five verified; nothing was reported on mismatch");
+      console.log(`# N2 child: status=${r.status}, mismatch surfaced, tooling resolutions under tampered root: ${(r.stderr.match(/TOOLING_RESOLVED/g) || []).length}`);
+    } finally { rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  test("Z guards + report: baseline active booking byte-identical (full intents row + children), NO foreign intent row changed or added, exact 0001..0021 ledger unchanged, every scheduling entry a REAL wait, zero network, lock count 0; scheduling + budgets + findings printed", async () => {
     const fp1 = await fingerprints();
-    const ours = OURS;
-    assert.deepEqual(fp1[BASE_ID], fp0[BASE_ID], "the intermediate baseline active booking is untouched");
+    assert.deepEqual(fp1[BASE_ID], fp0[BASE_ID], "the intermediate baseline active booking is untouched (intents row + every child row)");
     assert.equal((await R.loadIntent(db.app, BASE_ID)).status, "confirmed");
-    for (const id of Object.keys(fp0)) if (!ours.has(id)) assert.deepEqual(fp1[id], fp0[id], `foreign intent ${id} unchanged`);
-    for (const id of Object.keys(fp1)) if (!ours.has(id)) assert.ok(fp0[id], `no NEW foreign intent ${id}`);
+    assert.deepEqual(foreignDiff(fp0, fp1, OURS), { changed: [], added: [] }, "no foreign intent row changed, no foreign intent added");
+    assert.ok(OURS.size === 2 && [...OURS].every((id) => fp1[id] && fp1[id].intents && fp1[id].intents !== (fp0[id] ?? {}).intents), "exactly the two rehearsal intents changed");
+    assert.deepEqual(await appliedMigrations(), APPLIED, "the migration ledger is exactly as at bootstrap (0001..0021)");
+    assert.ok(schedule.length > 0 && schedule.every((e) => e.path === "real-wait" || e.path === "real-wait-until-next_action_at"), "every scheduling entry was a REAL wait: " + JSON.stringify(schedule.filter((e) => !/^real-wait/.test(e.path))));
     assert.deepEqual(GUARD, { request: 0, Agent: 0, fetch: 0 }, "no external call anywhere");
     assert.equal(Number((await db.app.query("SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory'")).rows[0].n), 0);
-    console.log("# scheduling (test-harness only): " + JSON.stringify(schedule));
+    console.log("# scheduling (test-harness only, all real waits): " + JSON.stringify(schedule));
     for (const f of findings) console.log("# " + JSON.stringify(f));
   });
 }
