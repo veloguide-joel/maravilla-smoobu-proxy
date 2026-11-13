@@ -162,7 +162,7 @@ test("X4. Stripe TEST cleanup transport: exact wire for the five operations (ref
   assert.equal(decodeURIComponent(t.log[2].body), `payment_intent=${PI}&amount=${AMT}&metadata[mv_refund_op]=${OPID}&metadata[mv_refund_key]=${KEY}`, "the contract §7 body, decoded");
   const z = stripeT(() => ok(REFUND()));
   for (const [label, call] of [
-    ["capture", { op: "paymentIntents.capture", id: PI, params: { amount_to_capture: AMT, final_capture: true, expand: ["latest_charge"] }, idempotencyKey: KEY }],
+    ["capture", { op: "paymentIntents.capture", id: PI, params: { amount_to_capture: AMT, expand: ["latest_charge"] }, idempotencyKey: KEY }],
     ["void", { op: "paymentIntents.cancel", id: PI, params: {}, idempotencyKey: KEY }], ["charge refund", { op: "refunds.create", params: { charge: CH, amount: AMT, metadata: { mv_refund_op: OPID, mv_refund_key: KEY } }, idempotencyKey: KEY }],
     ["partial key family", { op: "refunds.create", params: { payment_intent: PI, amount: AMT, metadata: { mv_refund_op: OPID, mv_refund_key: `rf:${INTENT}:1` } }, idempotencyKey: `rf:${INTENT}:1` }],
     ["key ≠ metadata key", { op: "refunds.create", params: { payment_intent: PI, amount: AMT, metadata: { mv_refund_op: OPID, mv_refund_key: refundKey(INTENT, 1) } }, idempotencyKey: refundKey(OPID, 1) }],

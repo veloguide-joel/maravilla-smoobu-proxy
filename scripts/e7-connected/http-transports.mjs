@@ -369,10 +369,13 @@ export function createE7StripeTestSend(input) {
       method = "GET"; path = `/v1/payment_intents/${c.id}?expand%5B%5D=latest_charge`; kind = "pi";
     } else if (c.op === "paymentIntents.capture" && keysExactly(c, ["id", "idempotencyKey", "op", "params"]) && typeof c.id === "string" && PI_RE.test(c.id)
         && typeof c.idempotencyKey === "string" && KEY_RE.test(c.idempotencyKey) && c.params && typeof c.params === "object"
-        && keysExactly(c.params, ["amount_to_capture", "expand", "final_capture"]) && isPosInt(c.params.amount_to_capture) && c.params.final_capture === true
+        && keysExactly(c.params, ["amount_to_capture", "expand"]) && isPosInt(c.params.amount_to_capture)
         && expandOnly({ expand: c.params.expand })) {
+      // C1 (2026-11-13): single FULL capture — amount_to_capture + expand[]=latest_charge ONLY. `final_capture` is a multicapture-only
+      // parameter; Stripe rejects it on an ordinary PaymentIntent (400 invalid_request_error, observed req_29dKSmY0uOuX26). Any request
+      // carrying it falls through to REQUEST_NOT_ALLOWED (keysExactly), so the parameter can never reach the wire.
       method = "POST"; path = `/v1/payment_intents/${c.id}/capture`; idem = c.idempotencyKey; kind = "pi";
-      form = `amount_to_capture=${c.params.amount_to_capture}&final_capture=true&expand%5B%5D=latest_charge`;
+      form = `amount_to_capture=${c.params.amount_to_capture}&expand%5B%5D=latest_charge`;
     } else if (c.op === "paymentIntents.cancel" && keysExactly(c, ["id", "idempotencyKey", "op", "params"]) && typeof c.id === "string" && PI_RE.test(c.id)
         && typeof c.idempotencyKey === "string" && KEY_RE.test(c.idempotencyKey) && c.params && typeof c.params === "object" && !Array.isArray(c.params) && Object.keys(c.params).length === 0) {
       method = "POST"; path = `/v1/payment_intents/${c.id}/cancel`; idem = c.idempotencyKey; kind = "pi"; form = "";

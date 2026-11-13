@@ -46,7 +46,7 @@ const HREQ = (o = {}) => ({ method: "GET", url: `https://api.hostaway.com/v1/res
 const HPOST = (o = {}) => HREQ({ method: "POST", url: "https://api.hostaway.com/v1/reservations", headers: { Accept: "application/json", Authorization: `Bearer ${HTOKEN}`, "Cache-control": "no-cache",
   "Content-Type": "application/json" }, body: '{"a":"é"}', ...o });
 const SREQ = (o = {}) => ({ method: "POST", url: `https://api.stripe.com/v1/payment_intents/${PI}/capture`, headers: { Authorization: `Bearer ${SKEY}`, "Stripe-Version": VERSION,
-  "Content-Type": "application/x-www-form-urlencoded", "Idempotency-Key": `cap:${INTENT}:${PI}` }, body: "amount_to_capture=50000&final_capture=true&expand%5B%5D=latest_charge", signal: sig(), maxBytes: 1024, ...o });
+  "Content-Type": "application/x-www-form-urlencoded", "Idempotency-Key": `cap:${INTENT}:${PI}` }, body: "amount_to_capture=50000&expand%5B%5D=latest_charge", signal: sig(), maxBytes: 1024, ...o });
 
 // ---- FAKE primitive (TEST-ONLY) -----------------------------------------------------------------------------------------------------
 class FakeRes extends EventEmitter {
@@ -330,11 +330,11 @@ test("X10. accepted T transports over the real exchange (FAKE primitive): H1–H
   const acct = await s.send({ op: "accounts.retrieve" }, o());
   assert.equal("livemode" in acct, false, "the true Account shape (no livemode) is accepted end to end");
   await s.send({ op: "paymentIntents.retrieve", id: PI, params: { expand: ["latest_charge"] } }, o());
-  await s.send({ op: "paymentIntents.capture", id: PI, params: { amount_to_capture: 50000, final_capture: true, expand: ["latest_charge"] }, idempotencyKey: `cap:${INTENT}:${PI}` }, o());
+  await s.send({ op: "paymentIntents.capture", id: PI, params: { amount_to_capture: 50000, expand: ["latest_charge"] }, idempotencyKey: `cap:${INTENT}:${PI}` }, o());
   await s.send({ op: "paymentIntents.cancel", id: PI, params: {}, idempotencyKey: `void:${INTENT}:${PI}` }, o());
   assert.deepEqual(sfx.log.map((e) => `${e.method} ${e.path} [${e.headerNames}] ${e.body ?? "-"}`), [
     "GET /v1/account [Authorization,Stripe-Version] -", `GET /v1/payment_intents/${PI}?expand%5B%5D=latest_charge [Authorization,Stripe-Version] -`,
-    `POST /v1/payment_intents/${PI}/capture [Authorization,Content-Length,Content-Type,Idempotency-Key,Stripe-Version] amount_to_capture=50000&final_capture=true&expand%5B%5D=latest_charge`,
+    `POST /v1/payment_intents/${PI}/capture [Authorization,Content-Length,Content-Type,Idempotency-Key,Stripe-Version] amount_to_capture=50000&expand%5B%5D=latest_charge`,
     `POST /v1/payment_intents/${PI}/cancel [Authorization,Content-Length,Content-Type,Idempotency-Key,Stripe-Version] `]);
   assert.ok(sfx.reqs.every((r) => r.options.rejectUnauthorized === true && r.options.agent.opts.keepAlive === false));
   // held reply + genuine abort → the exchange rejects; T sees the aborted genuine signal → ABORTED_IN_FLIGHT; one request, no retry

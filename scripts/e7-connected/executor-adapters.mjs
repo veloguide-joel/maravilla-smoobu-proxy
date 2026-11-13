@@ -338,8 +338,9 @@ function stripeKeys(b, send, phase) {
       const o = callOptions(opts, ["idempotencyKey", "signal"]);
       if (argSnap(id) !== PI) refuse("PAYMENT_INTENT_SCOPE");
       const p = argSnap(params);
-      if (p === null || typeof p !== "object" || !keysEq(p, ["amount_to_capture", "expand", "final_capture"]) || p.amount_to_capture !== b.amountMinor
-          || p.final_capture !== true || !expandOnly({ expand: p.expand })) refuse("PARAMS");
+      // C1 (2026-11-13): exact param set is amount_to_capture + expand ONLY; `final_capture` (multicapture-only) is never forwarded
+      if (p === null || typeof p !== "object" || !keysEq(p, ["amount_to_capture", "expand"]) || p.amount_to_capture !== b.amountMinor
+          || !expandOnly({ expand: p.expand })) refuse("PARAMS");
       if (o.idempotencyKey !== b.captureIdempotencyKey) refuse("IDEMPOTENCY_KEY");              // never a new / implicit key
       return invokeStripe(send, Object.freeze({ op: "paymentIntents.capture", id: PI, params: p, idempotencyKey: b.captureIdempotencyKey }), o.signal);
     };
