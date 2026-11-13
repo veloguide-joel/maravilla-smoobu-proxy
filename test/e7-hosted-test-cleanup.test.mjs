@@ -628,8 +628,8 @@ test("A10 postcheck + readbacks + residual agreement: a worker that claims cance
     assert.deepEqual([r.outcome, r.code, r.steps, r.cancelInvocations, r.refundInvocations, r.finalState], ["CLEANUP_ESCALATED", "OWNER_CASE", 1, 1, 0, "reconciliation_required"], JSON.stringify(r)); }
 });
 
-test("C1 code ceiling: Slice 3 cleanup execution CLOSED again (executeEnabled false) AND the Slice 1 / Slice 2 runners CLOSED on THEIR own pins (40779e34 / 59178b04) — after the ONE reviewed owner-present hosted TEST; this runner pins the MERGED e7-test 9d86bfa1; the plan pins pi / reservation / charge / captured amount / stay / attempt / session and the accepted refund key; ZERO capture / void / record / notify / create; the derived expectation is EXACTLY the accepted 17 keys", () => {
-  assert.equal(C.executeEnabled, false); assert.equal(RESRUN.CONSTANTS.executeEnabled, false); assert.equal(CAPRUN.CONSTANTS.executeEnabled, false);
+test("C1 code ceiling: Slice 3 cleanup execution CLOSED (executeEnabled false; HELD by policy) while the Slice 1 / Slice 2 runners are OPEN on THEIR own pins (40779e34 / 59178b04) for the ONE reviewed C3 TEST capture validation; this runner pins the MERGED e7-test 9d86bfa1; the plan pins pi / reservation / charge / captured amount / stay / attempt / session and the accepted refund key; ZERO capture / void / record / notify / create; the derived expectation is EXACTLY the accepted 17 keys", () => {
+  assert.equal(C.executeEnabled, false); assert.equal(RESRUN.CONSTANTS.executeEnabled, true); assert.equal(CAPRUN.CONSTANTS.executeEnabled, true);
   assert.equal(C.toolingCommit, "9d86bfa1e60779b3794de88bbae151670e8fe515"); assert.equal(C.toolingStatus, "MERGED");
   assert.equal(CAPRUN.CONSTANTS.toolingCommit, "59178b0468469b6570beab861bbc8e48b3a887d1", "C2: Slice 2 pins the merged C1 fix; this runner's own pin is untouched");
   const { plan, planHash } = built();
