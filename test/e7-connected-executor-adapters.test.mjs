@@ -110,7 +110,7 @@ test("positive mapping, every key: exactly ONE invocation with the normalised '/
   const c = make("capture", sp);
   await c.retrieveAccount({ signal: sig() });
   await c.retrievePaymentIntent(PI, { expand: ["latest_charge"] }, { signal: sig() });
-  await c.capturePaymentIntent(PI, { amount_to_capture: 50000, final_capture: true, expand: ["latest_charge"] }, { idempotencyKey: `cap:${INTENT}:${PI}`, signal: sig() });
+  await c.capturePaymentIntent(PI, { amount_to_capture: 50000, expand: ["latest_charge"] }, { idempotencyKey: `cap:${INTENT}:${PI}`, signal: sig() });
   await c.retrieveReservation({ method: "GET", path: `/reservations/${RID}`, query: {} }, { signal: sig() });
   const k = make("cleanup", sp);
   await k.cancelPaymentIntent(PI, {}, { idempotencyKey: `void:${INTENT}:${PI}`, signal: sig() });
@@ -121,7 +121,7 @@ test("positive mapping, every key: exactly ONE invocation with the normalised '/
   const body = { title: offlineChargeTitle(INTENT), amount: exactAmount(50000), paymentMethod: "credit_card", status: "paid", scheduledDate: formatScheduledDate(Date.UTC(2026, 11, 4, 10)) };
   await w.createOfflineCharge({ method: "POST", path: `/v1/guestPayments/charges/${RID}`, query: {}, body }, { signal: sig() });
   assert.deepEqual(sp.s.map((x) => plainJSON(x.call)), [{ op: "accounts.retrieve" }, { op: "paymentIntents.retrieve", id: PI, params: { expand: ["latest_charge"] } },
-    { op: "paymentIntents.capture", id: PI, params: { amount_to_capture: 50000, final_capture: true, expand: ["latest_charge"] }, idempotencyKey: `cap:${INTENT}:${PI}` },
+    { op: "paymentIntents.capture", id: PI, params: { amount_to_capture: 50000, expand: ["latest_charge"] }, idempotencyKey: `cap:${INTENT}:${PI}` },
     { op: "paymentIntents.cancel", id: PI, params: {}, idempotencyKey: `void:${INTENT}:${PI}` }]);
   assert.deepEqual(sp.h.slice(6).map((x) => [x.req.method, x.req.path]), [["GET", `/v1/reservations/${RID}`], ["PUT", `/v1/reservations/${RID}/statuses/cancelled`],
     ["GET", `/v1/reservations/${RID}`], ["GET", "/v1/guestPayments/charges"], ["POST", `/v1/guestPayments/charges/${RID}`]]);
@@ -163,9 +163,10 @@ test("scope refusals: wrong listing / reservation / ref / dates / amount / accou
     ["create wrong method", () => r.createReservation(crWith((x) => { x.method = "PUT"; }), { signal: sig() }), "METHOD"],
     ["PI other", () => c.retrievePaymentIntent("pi_test_other", { expand: ["latest_charge"] }, { signal: sig() }), "PAYMENT_INTENT_SCOPE"],
     ["PI params extra", () => c.retrievePaymentIntent(PI, { expand: ["latest_charge"], x: 1 }, { signal: sig() }), "PARAMS"],
-    ["capture other amount", () => c.capturePaymentIntent(PI, { amount_to_capture: 49999, final_capture: true, expand: ["latest_charge"] }, { idempotencyKey: `cap:${INTENT}:${PI}`, signal: sig() }), "PARAMS"],
-    ["capture new key", () => c.capturePaymentIntent(PI, { amount_to_capture: 50000, final_capture: true, expand: ["latest_charge"] }, { idempotencyKey: `cap:${INTENT}:${PI}:a2`, signal: sig() }), "IDEMPOTENCY_KEY"],
-    ["capture no key", () => c.capturePaymentIntent(PI, { amount_to_capture: 50000, final_capture: true, expand: ["latest_charge"] }, { signal: sig() }), "IDEMPOTENCY_KEY"],
+    ["capture other amount", () => c.capturePaymentIntent(PI, { amount_to_capture: 49999, expand: ["latest_charge"] }, { idempotencyKey: `cap:${INTENT}:${PI}`, signal: sig() }), "PARAMS"],
+    ["capture final_capture (C1: multicapture-only param refused)", () => c.capturePaymentIntent(PI, { amount_to_capture: 50000, final_capture: true, expand: ["latest_charge"] }, { idempotencyKey: `cap:${INTENT}:${PI}`, signal: sig() }), "PARAMS"],
+    ["capture new key", () => c.capturePaymentIntent(PI, { amount_to_capture: 50000, expand: ["latest_charge"] }, { idempotencyKey: `cap:${INTENT}:${PI}:a2`, signal: sig() }), "IDEMPOTENCY_KEY"],
+    ["capture no key", () => c.capturePaymentIntent(PI, { amount_to_capture: 50000, expand: ["latest_charge"] }, { signal: sig() }), "IDEMPOTENCY_KEY"],
     ["void params", () => k.cancelPaymentIntent(PI, { cancellation_reason: "x" }, { idempotencyKey: `void:${INTENT}:${PI}`, signal: sig() }), "PARAMS"],
     ["cancel other id", () => k.cancelReservation({ method: "PUT", path: "/v1/reservations/6100002/statuses/cancelled", query: {}, body: { cancelledBy: "host" } }, { signal: sig() }), "PATH"],
     ["cancel other body", () => k.cancelReservation({ method: "PUT", path: `/v1/reservations/${RID}/statuses/cancelled`, query: {}, body: { cancelledBy: "guest" } }, { signal: sig() }), "BODY_SCOPE"],
@@ -246,7 +247,7 @@ test("descriptor / mutation probes (R-G1 lessons): factory options and every cal
     () => c.retrieveReservation(reqOk(), revoked({ signal: sig() })),
     () => c.retrievePaymentIntent(PI, { expand: expandIter() }, { signal: sig() }),
     () => c.retrievePaymentIntent(PI, Object.assign(Object.create({ expand: ["latest_charge"] })), { signal: sig() }),
-    () => c.capturePaymentIntent(PI, { amount_to_capture: 50000, final_capture: true, expand: [, "latest_charge"] }, { idempotencyKey: `cap:${INTENT}:${PI}`, signal: sig() }),   // eslint-disable-line no-sparse-arrays
+    () => c.capturePaymentIntent(PI, { amount_to_capture: 50000, expand: [, "latest_charge"] }, { idempotencyKey: `cap:${INTENT}:${PI}`, signal: sig() }),   // eslint-disable-line no-sparse-arrays
     () => c.retrieveReservation({ ...reqOk(), extra: 1 }, { signal: sig() }),
     () => c.retrieveReservation(reqOk(), { signal: sig(), extra: 1 })];
   for (const [i, fn] of argCases.entries()) await refusedZero(fn, sp, undefined, `arg case ${i}`);

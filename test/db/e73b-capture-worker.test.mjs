@@ -233,7 +233,7 @@ test("happy initial capture: fresh reads -> exact request -> claim -> capture ->
   assert.equal(r.status, "worked");
   assert.deepEqual(w.calls, [`RES /reservations/${a.reservationId}`, "ACCOUNT", `PI ${a.piId}`, `CAPTURE ${a.piId}`, `PI ${a.piId}`], "confirming PI read after the reply");
   const op = (await opsOf(a.id, OPS.CAPTURE))[0];
-  assert.deepEqual(w.captures, [{ id: a.piId, params: { amount_to_capture: 576000, final_capture: true, expand: ["latest_charge"] }, key: op.payload.providerIdempotencyKey }]);
+  assert.deepEqual(w.captures, [{ id: a.piId, params: { amount_to_capture: 576000, expand: ["latest_charge"] }, key: op.payload.providerIdempotencyKey }]);
   assert.equal(op.payload.providerIdempotencyKey, `cap:${a.id}:${a.piId}`);
   assert.deepEqual([op.state, op.result_ref, op.attempts], ["succeeded", `ch_test_${a.id.slice(0, 8)}`, 1]);
   assert.ok(op.dispatched_at, "dispatch persisted (by the claim) before the send");

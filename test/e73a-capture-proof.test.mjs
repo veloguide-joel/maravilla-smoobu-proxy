@@ -175,14 +175,15 @@ test("eligibility can NEVER serve as permission to retry an uncertain capture (e
   assert.equal(elig({ evidence: { ...evOf(v3()), id: "" } }).code, "EVIDENCE_ID_REQUIRED");
 });
 
-test("capture request: exact full amount, final_capture true, expand latest_charge, the row's own key; nothing else", () => {
+test("capture request: exact full amount, NO final_capture (multicapture-only; C1), expand latest_charge, the row's own key; nothing else", () => {
   const i = confirmed();
   const e = elig();
   const pending = OP();
   const r = buildCaptureRequest({ intent: i, captureOp: pending, eligibility: e, paymentAttemptId: ATT });
   assert.equal(r.ok, true, r.code);
-  assert.deepEqual(JSON.parse(JSON.stringify(r.request)), { paymentIntentId: PI, params: { amount_to_capture: 90000, final_capture: true, expand: ["latest_charge"] },
+  assert.deepEqual(JSON.parse(JSON.stringify(r.request)), { paymentIntentId: PI, params: { amount_to_capture: 90000, expand: ["latest_charge"] },
     options: { idempotencyKey: `cap:int-1:${PI}` } });
+  assert.ok(!("final_capture" in r.request.params), "C1: final_capture is never built (Stripe 400 on non-multicapture PaymentIntents)");
   assert.ok(Object.isFrozen(r.request) && Object.isFrozen(r.request.params) && Object.isFrozen(r.request.params.expand));
   assert.equal(validateCaptureRequest(r.request, { intent: i, captureOp: pending }).ok, true);
   // caller parameters are not accepted at all
@@ -219,11 +220,13 @@ test("validateCaptureRequest refuses partial / multicapture / extra parameters /
   const v = (req) => validateCaptureRequest(req, { intent: i, captureOp: op }).code;
   assert.equal(v({ ...plain, params: { ...plain.params, amount_to_capture: 89999 } }), "PARTIAL_OR_WRONG_AMOUNT");
   assert.equal(v({ ...plain, params: { ...plain.params, amount_to_capture: 90000.5 } }), "PARTIAL_OR_WRONG_AMOUNT");
+  // C1: ANY final_capture (true / false / string) is refused — the parameter is multicapture-only and Stripe rejects it on this PI
+  assert.equal(v({ ...plain, params: { ...plain.params, final_capture: true } }), "MULTICAPTURE_REFUSED");
   assert.equal(v({ ...plain, params: { ...plain.params, final_capture: false } }), "MULTICAPTURE_REFUSED");
   assert.equal(v({ ...plain, params: { ...plain.params, final_capture: "true" } }), "MULTICAPTURE_REFUSED");
   assert.equal(v({ ...plain, params: { ...plain.params, metadata: { x: 1 } } }), "PARAMS_SHAPE");
   assert.equal(v({ ...plain, params: { ...plain.params, application_fee_amount: 1 } }), "PARAMS_SHAPE");
-  assert.equal(v({ ...plain, params: { amount_to_capture: 90000, final_capture: true } }), "PARAMS_SHAPE");
+  assert.equal(v({ ...plain, params: { amount_to_capture: 90000 } }), "PARAMS_SHAPE");
   assert.equal(v({ ...plain, params: { ...plain.params, expand: [] } }), "EXPAND_REQUIRED");
   assert.equal(v({ ...plain, params: { ...plain.params, expand: ["latest_charge", "customer"] } }), "EXPAND_REQUIRED");
   assert.equal(v({ ...plain, options: { idempotencyKey: "cap:other" } }), "IDEMPOTENCY_KEY");

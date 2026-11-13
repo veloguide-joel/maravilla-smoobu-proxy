@@ -254,8 +254,8 @@ test("T8. Stripe S1–S4 exact mapping, TEST-only key, operation-specific reply 
   const calls = [
     [{ op: "accounts.retrieve" }, "GET", "https://api.stripe.com/v1/account", null, null],
     [{ op: "paymentIntents.retrieve", id: PI, params: { expand: ["latest_charge"] } }, "GET", `https://api.stripe.com/v1/payment_intents/${PI}?expand%5B%5D=latest_charge`, null, null],
-    [{ op: "paymentIntents.capture", id: PI, params: { amount_to_capture: 50000, final_capture: true, expand: ["latest_charge"] }, idempotencyKey: `cap:${INTENT}:${PI}` }, "POST",
-      `https://api.stripe.com/v1/payment_intents/${PI}/capture`, "amount_to_capture=50000&final_capture=true&expand%5B%5D=latest_charge", `cap:${INTENT}:${PI}`],
+    [{ op: "paymentIntents.capture", id: PI, params: { amount_to_capture: 50000, expand: ["latest_charge"] }, idempotencyKey: `cap:${INTENT}:${PI}` }, "POST",
+      `https://api.stripe.com/v1/payment_intents/${PI}/capture`, "amount_to_capture=50000&expand%5B%5D=latest_charge", `cap:${INTENT}:${PI}`],   // C1: no final_capture on the wire
     [{ op: "paymentIntents.cancel", id: PI, params: {}, idempotencyKey: `void:${INTENT}:${PI}` }, "POST", `https://api.stripe.com/v1/payment_intents/${PI}/cancel`, "", `void:${INTENT}:${PI}`]
   ];
   for (const [call, method, url, body, idem] of calls) {
@@ -282,9 +282,10 @@ test("T8. Stripe S1–S4 exact mapping, TEST-only key, operation-specific reply 
   const z = stripe(() => ok(PIOBJ()));
   for (const [label, call] of [["unknown op", { op: "refunds.create" }], ["account with id", { op: "accounts.retrieve", id: ACCT }],
     ["retrieve without expand", { op: "paymentIntents.retrieve", id: PI, params: {} }], ["path injection", { op: "paymentIntents.retrieve", id: `${PI}/../../v1/charges`, params: { expand: ["latest_charge"] } }],
-    ["capture no key", { op: "paymentIntents.capture", id: PI, params: { amount_to_capture: 1, final_capture: true, expand: ["latest_charge"] } }],
-    ["capture partial", { op: "paymentIntents.capture", id: PI, params: { amount_to_capture: 1, final_capture: false, expand: ["latest_charge"] }, idempotencyKey: "k" }],
-    ["capture extra param", { op: "paymentIntents.capture", id: PI, params: { amount_to_capture: 1, final_capture: true, expand: ["latest_charge"], metadata: {} }, idempotencyKey: "k" }],
+    ["capture no key", { op: "paymentIntents.capture", id: PI, params: { amount_to_capture: 1, expand: ["latest_charge"] } }],
+    ["capture final_capture true (C1: multicapture-only, never sent)", { op: "paymentIntents.capture", id: PI, params: { amount_to_capture: 1, final_capture: true, expand: ["latest_charge"] }, idempotencyKey: "k" }],
+    ["capture final_capture false (partial / multicapture)", { op: "paymentIntents.capture", id: PI, params: { amount_to_capture: 1, final_capture: false, expand: ["latest_charge"] }, idempotencyKey: "k" }],
+    ["capture extra param", { op: "paymentIntents.capture", id: PI, params: { amount_to_capture: 1, expand: ["latest_charge"], metadata: {} }, idempotencyKey: "k" }],
     ["cancel with reason", { op: "paymentIntents.cancel", id: PI, params: { cancellation_reason: "abandoned" }, idempotencyKey: "k" }],
     ["cancel bad key", { op: "paymentIntents.cancel", id: PI, params: {}, idempotencyKey: "k\n" }]]) assert.equal(await codeOf(z.send(call, { signal: sig() })), "REQUEST_NOT_ALLOWED", label);
   assert.deepEqual([z.log.length, z.creds()], [0, 0]);
@@ -318,7 +319,7 @@ test("T9. accepted createPhaseExecutors over these transports (all five gate key
   const C = ex("capture");
   await C.retrieveAccount(o());
   await C.retrievePaymentIntent(PI, { expand: ["latest_charge"] }, o());
-  await C.capturePaymentIntent(PI, { amount_to_capture: 50000, final_capture: true, expand: ["latest_charge"] }, { signal: sig(), idempotencyKey: `cap:${INTENT}:${PI}` });
+  await C.capturePaymentIntent(PI, { amount_to_capture: 50000, expand: ["latest_charge"] }, { signal: sig(), idempotencyKey: `cap:${INTENT}:${PI}` });
   const K = ex("cleanup");
   await K.cancelPaymentIntent(PI, {}, { signal: sig(), idempotencyKey: `void:${INTENT}:${PI}` });
   await K.cancelReservation({ method: "PUT", path: `/reservations/${RID}/statuses/cancelled`, query: {}, body: { cancelledBy: "host" } }, o());
