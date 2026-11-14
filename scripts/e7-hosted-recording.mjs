@@ -7,7 +7,7 @@
 // consent: executeEnabled is CLOSED here (verify / execute refuse HRC_EXECUTE_CLOSED). D4 BLOCKER (ROOT 5883328669): opening / live recording stays
 // FORBIDDEN until the recorded-state cleanup contract is reviewed + implemented and the migration issuance hold is resolved — a recorded TEST
 // intent (confirmed + queued guest.notify + succeeded recording) cannot enter the Slice 3 pristine cleanup admission. Slice 1 / 2 / 3 stay CLOSED
-// and pinned to THEIR tooling; this runner pins the LATER immutable MERGED e7-test tooling 5a094b16 (PR72: outer signal / deadline stop safety).
+// and pinned to THEIR tooling; this runner pins the LATER immutable MERGED e7-test tooling 4ed7a636 (C24 repin: PR72 outer signal / deadline stop safety + C1 capture no-final_capture + C21-F1 list null-provider admission; 0021 / mirror additions are present in the closure but unused by this runner).
 //   * Inert on import (`import.meta.main` guard): no env / fs / network / DB / timer until a mode runs.
 //   * LABELLED SPECIALISATION of the reviewed Slice 3 runner (scripts/e7-hosted-test-cleanup.mjs): hosted boot / pinning / session lock (5432) /
 //     counted pool / stop latch / fence / step / postcheck / teardown sections are LABELLED COPIES specialised to the recording phase (pure helpers
@@ -47,10 +47,10 @@ import { createHash } from "node:crypto";
 import { CONSTANTS as RES, canonical, framedDigest, childEnv, spawnNode, dbTargetOk, sessionLockUrl, SESSION_LOCK_PORT, OFFICIAL_CA_SHA256 } from "./e7-hosted-reservation.mjs";
 
 export const CONSTANTS = Object.freeze({
-  toolingCommit: "5a094b16c1f84690a738a98ab89140caa69c1e1f",    // e7-test: PR72 (recording worker outer signal / deadline stop safety) MERGED; immutable
+  toolingCommit: "4ed7a636fee57981262b9c02574190d225b8a1fc",    // e7-test: #99 merged (C21-F1) on top of #84 (C1 capture) / #81 / #78 / #76 / #75 / PR72; immutable (C24 repin from 5a094b16)
   toolingStatus: "MERGED",
   executeEnabled: false,                                          // Slice 4: recording execution CLOSED (verify / execute refuse HRC_EXECUTE_CLOSED); D4 blocker
-  // the INDEPENDENTLY scanned transitive relative imports of the runner's tooling roots at 5a094b16 (test C2 recomputes this from the pinned tree):
+  // the INDEPENDENTLY scanned transitive relative imports of the runner's tooling roots at 4ed7a636 (test C2 recomputes this from the pinned tree; SAME 30-path set as at 5a094b16, 8 members changed bytes):
   // = the Slice 1 closure + lib/booking-db/recording-worker.js (executor-adapters + offline-charge-proof are already in the Slice 1 closure)
   closure: Object.freeze(["lib/bookability.js", "lib/booking-db/codec.js", "lib/booking-db/config.js", "lib/booking-db/operations.js", "lib/booking-db/pool.js",
     "lib/booking-db/recording-worker.js", "lib/booking-db/recovery.js", "lib/booking-db/repo.js", "lib/booking-db/reservation-worker.js", "lib/checkout/capture-proof.js",
@@ -58,8 +58,8 @@ export const CONSTANTS = Object.freeze({
     "lib/checkout/server-pricer.js", "lib/direct-policy.js", "lib/direct-pricing.js", "lib/hostaway-calendar.js", "lib/hostaway-reservations.js", "lib/hostaway.js",
     "lib/public-api.js", "lib/quote-public.js", "package-lock.json", "package.json", "scripts/e7-connected/executor-adapters.mjs", "scripts/e7-connected/http-transports.mjs",
     "scripts/e7-connected/probe-env-preflight.mjs", "scripts/e7-connected/real-exchange.mjs", "scripts/e7-connected/run-lock-precheck.mjs"]),
-  closureDigest: "ef9341dc16d0fc112203ce7dd074bbdece846821c33cdd8b26186eaa415e2358",
-  pgVersion: "8.18.0",                                            // package-lock.json at 5a094b16 (checked against node_modules/pg before execute)
+  closureDigest: "b02f0a76ae2347badc55ef2daaf27640f7ef80c01d7e69d1e9bdc7d8d38c4109",
+  pgVersion: "8.18.0",                                            // package-lock.json at 4ed7a636 (unchanged from 5a094b16) (checked against node_modules/pg before execute)
   runnerFiles: Object.freeze(["scripts/e7-hosted-recording.mjs", "scripts/e7-hosted-reservation.mjs", ".github/workflows/e7-hosted-recording.yml", "test/e7-hosted-recording.test.mjs"]),
   accountId: RES.accountId, listingId: RES.listingId, currency: RES.currency, refFieldId: RES.refFieldId, listingTimeZone: RES.listingTimeZone, protectedReservationIds: RES.protectedReservationIds,
   // TEST recording configuration (ROOT design review): explicit, no owner decision, no production accounting-policy claim; labels are labels only
@@ -345,6 +345,7 @@ export const TOOLING_KEYS = freeze(["runRecordingStep", "loadIntent", "createPha
   "activeReservationProof", "assessChargeList", "preflightListObservation", "classifyTitle", "providerIdToCanonical", "amountToMinor", "publicStatus"]);
 const CHARGE_TYPES = freeze(["charge", "preAuth", "refund"]);                                        // = the accepted CHARGE_TYPES (offline-charge-proof.js; asserted by the tests)
 const ROW_STRING_FIELDS = freeze(["type", "title", "currency", "status", "paymentProvider", "paymentMethod"]);   // = the accepted ROW_STRING_FIELDS
+const ROW_NULLABLE_STRING_FIELDS = freeze(["paymentProvider"]);   // = the accepted ROW_NULLABLE_STRING_FIELDS (C21-F1 at 4ed7a636): an EXPLICIT own null is a lawful UNRELATED-row value; the recorded row itself must still be "offline"
 /**
  * FINAL (post-confirmation) charge-list readback (ROOT 5883758657 F1). The accepted assessChargeList assesses PAID-state facts only and the intent is now
  * confirmed, so — without fabricating intent state — the readback composes the ACCEPTED primitives: unwrapEnvelope, providerIdToCanonical, amountToMinor and
@@ -371,7 +372,11 @@ export function finalListReadbackRefusal(lr, { tooling, intentId, reservationId,
     seen.add(id);
     if (tooling.providerIdToCanonical(row.reservationId) !== reservationId) return "LIST_FOREIGN_RESERVATION_ROW";
     if (row.listingMapId !== listingId) return "LIST_FOREIGN_LISTING_ROW";
-    for (const k of ROW_STRING_FIELDS) if (typeof row[k] !== "string") return `LIST_ROW_${k.toUpperCase()}_INVALID`;
+    for (const k of ROW_STRING_FIELDS) {
+      if (typeof row[k] === "string") continue;
+      if (row[k] === null && Object.prototype.hasOwnProperty.call(row, k) && ROW_NULLABLE_STRING_FIELDS.includes(k)) continue;   // = accepted assessChargeList (C21-F1)
+      return `LIST_ROW_${k.toUpperCase()}_INVALID`;
+    }
     if (!CHARGE_TYPES.includes(row.type)) return "LIST_ROW_TYPE_UNKNOWN";
     if (typeof row.amount !== "number" || !Number.isFinite(row.amount)) return "LIST_ROW_AMOUNT_INVALID";
     if (row.type === "refund" ? !(row.amount <= 0 && tooling.amountToMinor(-row.amount) !== null) : tooling.amountToMinor(row.amount) === null) return "LIST_ROW_AMOUNT_NOT_EXACT";

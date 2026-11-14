@@ -249,6 +249,34 @@ test("A2 provider proofs gate the worker: cancelled / wrong-channel / foreign-re
 });
 
 // ---------------------------------------------------------------------------------------------------------------------------------
+// C24 (tooling 4ed7a636, C21-F1): the DOCUMENTED null-provider list row (public Hostaway docs 2026-11-13) — admitted as an UNRELATED row by the REAL
+// pinned assessChargeList / preflightListObservation that the runner's proof and the final readback copy use; never a free pass for the marker row.
+const nullProviderRow = (over = {}) => chargeRow({ id: 8700001, title: "Charge", paymentMethod: "credit_card_online", amount: 10, status: "awaiting", paymentProvider: null,
+  description: "Charge description", capturedAmount: null, scheduledDate: null, chargeDate: null, isManual: 0, transactions: [], ...over });
+test("N1 (C24 / C21-F1, FAKE DB + worker, REAL pinned proofs + transport): a documented UNRELATED null-provider row on the preflight page is admitted → the worker runs and records ONCE and the final readback (same row still present) CONFIRMS; the exact-marker row with a NULL provider → PROVIDER_PROOF_FAILED / PRIOR_MARKED_CHARGE_PRESENT (zero worker, zero writes); a same-amount paid null-provider row → SAME_AMOUNT_CHARGE_PRESENT; a lookalike null row → LOOKALIKE_CHARGE_PRESENT; a missing / undefined / non-string provider still refuses the page; the refund veto with the null row present stops BEFORE lock / provider", async () => {
+  { const w = world({ charges: [nullProviderRow()] }); const r = await core(w);
+    assert.deepEqual([r.outcome, r.code, w.workerCalls, r.recordInvocations, posts(w).length, w.charges.length], ["RECORDING_CONFIRMED", null, 1, 1, 1, 2], JSON.stringify([r.outcome, r.code]));
+    assert.equal(w.charges.filter((c) => c.paymentProvider === null).length, 1, "the unrelated row is untouched"); }
+  for (const [charges, code] of [
+    [[nullProviderRow({ id: 8700002, title: TITLE, amount: 140, status: "paid" })], "PRIOR_MARKED_CHARGE_PRESENT"],
+    [[nullProviderRow({ id: 8700003, title: "Accommodation payment", amount: 140, status: "paid" })], "SAME_AMOUNT_CHARGE_PRESENT"],
+    [[nullProviderRow({ id: 8700004, title: `maraVilla payment mvoch1-${IID} (dup)`, amount: 1 })], "LOOKALIKE_CHARGE_PRESENT"],
+  ]) { const w = world({ charges }); const r = await core(w);
+    assert.deepEqual([r.outcome, r.code, w.workerCalls, r.recordInvocations, posts(w).length], ["PROVIDER_PROOF_FAILED", code, 0, 0, 0], JSON.stringify([code, r.outcome, r.code])); }
+  for (const [mut, label] of [[(row) => { delete row.paymentProvider; return row; }, "missing"], [(row) => ({ ...row, paymentProvider: undefined }), "undefined"], [(row) => ({ ...row, paymentProvider: 0 }), "number"], [(row) => ({ ...row, paymentProvider: ["offline"] }), "array"]]) {
+    const w = world({ charges: [mut(nullProviderRow({ id: 8700005 }))] }); const r = await core(w);
+    assert.deepEqual([r.outcome, r.code, w.workerCalls, posts(w).length], ["PROVIDER_PROOF_FAILED", "LIST_ROW_PAYMENTPROVIDER_INVALID", 0, 0], label); }
+  // final readback (ROOT 5883758657 F1 path): an unrelated null-provider row appearing only at the FOURTH list call does not refuse; the RECORDED row with a null provider does
+  { const w = world(); const r = await core(w, { listMutate: (n, ww) => (n === 4 ? { json: { status: "success", result: [...ww.charges, nullProviderRow({ id: 8700006 })], count: ww.charges.length + 1 } } : null) });
+    assert.equal(r.outcome, "RECORDING_CONFIRMED", JSON.stringify([r.outcome, r.code])); }
+  { const w = world(); const r = await core(w, { listMutate: (n, ww) => (n === 4 ? { json: { status: "success", result: ww.charges.map((x) => ({ ...x, paymentProvider: null })), count: ww.charges.length } } : null) });
+    assert.deepEqual([r.outcome, r.code, r.recordInvocations], ["POSTCHECK_MISMATCH", "READBACK_RECORDED_CHARGE_FIELDS", 1], JSON.stringify([r.outcome, r.code])); }
+  // the C16 start veto is evaluated before any provider read: the null row is never even fetched
+  { const w = world({ charges: [nullProviderRow()] }); w.evidence.push(PI_EV({ amountRefundedMinor: AMT, refunded: true })); const r = await core(w);
+    assert.deepEqual([r.outcome, r.code, w.calls.length, r.lock, w.workerCalls, r.recordInvocations], ["SCOPE_REFUSED", "PAYMENT_REFUND_OBSERVED", 0, "not_acquired", 0, 0], JSON.stringify(r)); }
+});
+
+// ---------------------------------------------------------------------------------------------------------------------------------
 // C16 (ROOT #93 / 1a1d07e0): START VETO on STORED refund observations — CLOSED-wrapper defense in depth; no new proof, no provider read
 const PI_EV = (observed, over = {}) => ({ kind: "payment_intent", external_ref: PI, status: "succeeded", source: "stripe_dashboard", observed, observed_at: new Date(CREATED), ...over });
 test("V1 refundObservationRefusal (pure): ANY correctly bound payment_intent row for the plan PI with amountRefundedMinor > 0 (safe integer) OR refunded === true → PAYMENT_REFUND_OBSERVED, regardless of source / age / order / newer zero rows; a PRESENT but malformed field → PAYMENT_REFUND_EVIDENCE_INVALID (never coerced); missing fields / no observed / foreign PI / other kinds → null (UNKNOWN keeps prior behaviour); a positive observation wins over a malformed one", () => {
@@ -454,6 +482,7 @@ test("F1 (ROOT 5883758657) final readback uses the ACCEPTED normalized marker cl
   assert.equal(E.finalListReadbackRefusal({ httpStatus: 200, json: { status: "success", result: [chargeRow()], count: 1 } }, { tooling: toolingFor(world()), intentId: IID, reservationId: RID, listingId: 606998, recordedId: CHARGE_ID, title: TITLE, amountMinor: AMT, currency: "USD", paymentMethod: "credit_card" }), null);
   const src = readFileSync(join(TOOLING, "lib/checkout/offline-charge-proof.js"), "utf8");
   assert.match(src, /const ROW_STRING_FIELDS = \["type", "title", "currency", "status", "paymentProvider", "paymentMethod"\];/); assert.match(src, /const CHARGE_TYPES = Object\.freeze\(\["charge", "preAuth", "refund"\]\);/);
+  assert.match(src, /const ROW_NULLABLE_STRING_FIELDS = Object\.freeze\(\["paymentProvider"\]\);/, "C21-F1 nullable set present at the pin; the runner's labelled copy mirrors it");
 });
 
 test("F2 (ROOT 5883758657) honest statement accounting: reported dbQueries == EVERY physical statement (pool + lock session + residual read + unlock) on the happy path; a worker that exhausts the body budget is refused at total − reserve, the teardown spends only the reserve, physical == reported, nothing past the TOTAL ceiling, and an unavailable residual read never supports success", async () => {
@@ -482,7 +511,7 @@ test("F2 (ROOT 5883758657) honest statement accounting: reported dbQueries == EV
 
 test("C1 code ceiling: Slice 4 recording execution CLOSED (executeEnabled false; D4 blocker) AND Slice 1 / 2 / 3 CLOSED again on THEIR tooling (after the ONE reviewed owner-present TEST); this runner pins the MERGED e7-test 5a094b16; the plan pins pi / reservation / charge / captured amount / stay / attempt / session, the accepted recording key, credit_card / hostaway-e7-test, title / amount wire forms = the accepted module's; ZERO stripe / capture / void / cancel / refund / notify / create", () => {
   assert.equal(C.executeEnabled, false); assert.equal(RESRUN.CONSTANTS.executeEnabled, false); assert.equal(CAPRUN.CONSTANTS.executeEnabled, false); assert.equal(TCRUN.CONSTANTS.executeEnabled, false);
-  assert.equal(C.toolingCommit, "5a094b16c1f84690a738a98ab89140caa69c1e1f"); assert.equal(C.toolingStatus, "MERGED");
+  assert.equal(C.toolingCommit, "4ed7a636fee57981262b9c02574190d225b8a1fc"); assert.equal(C.toolingStatus, "MERGED");
   // C2: Slice 2 is repinned to the merged C1 fix (59178b04); Slice 1 (40779e34) and Slice 3 (9d86bfa1) keep their own immutable pins
   assert.equal(RESRUN.CONSTANTS.toolingCommit, "40779e34e8c65ac5c4494bc5a18cd4223ef723fa");
   assert.equal(CAPRUN.CONSTANTS.toolingCommit, "59178b0468469b6570beab861bbc8e48b3a887d1");
@@ -643,10 +672,10 @@ test("O1 ordering (REAL accepted state machine from the pinned tooling, no fakes
   assert.deepEqual(rec.intent.history.slice(-2).map((h) => h.to), [IS.STATES.PAYMENT_CAPTURED, IS.STATES.CONFIRMED]);
 });
 
-test("W1 workflow: manual dispatch only; preflight default without secrets; execute on main + environment gate; tooling checkout pinned to 5a094b16 (both jobs); Hostaway + DB secrets ONLY in the execute step (no Stripe secret anywhere); E7_RUN_ID = github.run_id-run_attempt in verify + execute; every input env passed to all three runner invocations", () => {
+test("W1 workflow: manual dispatch only; preflight default without secrets; execute on main + environment gate; tooling checkout pinned to 4ed7a636 (both jobs); Hostaway + DB secrets ONLY in the execute step (no Stripe secret anywhere); E7_RUN_ID = github.run_id-run_attempt in verify + execute; every input env passed to all three runner invocations", () => {
   const yml = readFileSync(join(ROOT, ".github/workflows/e7-hosted-recording.yml"), "utf8");
   assert.match(yml, /^on:\n  workflow_dispatch:/m); assert.doesNotMatch(yml, /\n  (push|pull_request|schedule):/);
-  assert.equal((yml.match(/ref: 5a094b16c1f84690a738a98ab89140caa69c1e1f/g) || []).length, 2);
+  assert.equal((yml.match(/ref: 4ed7a636fee57981262b9c02574190d225b8a1fc/g) || []).length, 2); assert.doesNotMatch(yml, /5a094b16/);
   assert.match(yml, /if: inputs\.mode == 'execute' && github\.ref == 'refs\/heads\/main'/); assert.match(yml, /environment: e7-readonly-probe/);
   assert.equal((yml.match(/secrets\./g) || []).length, 2, "two secrets, execute step only"); assert.doesNotMatch(yml, /STRIPE/);
   assert.equal((yml.match(/E7_RUN_ID: \$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/g) || []).length, 2);
@@ -842,5 +871,28 @@ test("O2 PG ordering (REAL repo + 0010–0021 fences, accepted fixtures): after 
       try { await holder.query("SELECT pg_advisory_lock(pg_catalog.hashtext($1), 0)", [LK.LOCK_KEY]);
         const r = await pgRun(a, clk, w); assert.deepEqual([r.outcome, r.code, w.calls.length, r.steps], ["LOCK_NOT_ACQUIRED", "RUN_LOCK_PRESENT", 0, 0]);
       } finally { await holder.query("SELECT pg_advisory_unlock(pg_catalog.hashtext($1), 0)", [LK.LOCK_KEY]); holder.release(); } }
+  });
+  test("I5 PG (C24 / C21-F1; REAL NEW recording worker + repo + accepted proofs at 4ed7a636; FAKE exchanges): a documented UNRELATED null-provider row already on the reservation → RECORDING_CONFIRMED with exactly ONE POST, the null row untouched, evidence provider 'offline'; the exact-marker row with a NULL provider → PROVIDER_PROOF_FAILED / PRIOR_MARKED_CHARGE_PRESENT (zero POST, intent payment_captured); a stored refund observation + the null row → SCOPE_REFUSED before lock / provider (zero calls, state byte-identical)", async () => {
+    const A = await tool("db/lib/admin.js");
+    const docRow = (a, over = {}) => ({ id: 7710001, listingMapId: LIST, reservationId: Number(a.rid), autopaymentId: 34231, type: "charge", title: "Charge", description: "Charge description", currency: "USD", paymentMethod: "credit_card_online",
+      amount: 10, capturedAmount: null, status: "awaiting", paymentProvider: null, paymentProviderMessage: null, paymentProviderInvoiceId: null, paymentProviderChargeId: null, scheduledDate: null, chargeDate: null, holdReleaseDate: null, isManual: 0, autoChargeId: null, triggerEvent: null, triggerTimeDelta: 0, flatFee: null, percentageFee: null, transactions: [], ...over });
+    { const a = await capturedIntent(); const clk = newClock(); const w = pgWorld(a, clk); w.nextId = 7710901; w.charges.push(docRow(a));
+      const r = await pgRun(a, clk, w);
+      assert.equal(r.outcome, "RECORDING_CONFIRMED", JSON.stringify([r.outcome, r.code]));
+      const s = await snap(a.id);
+      assert.deepEqual([s.st.state, String(s.st.offline_charge_id), w.postRequests, w.charges.length, w.charges[0].paymentProvider, s.cases, s.locks], ["confirmed", "7710901", 1, 2, null, 0, 0]);
+      assert.deepEqual(s.ops.filter((x) => x.op_type === REC).map((x) => [x.state, x.result_ref]), [["succeeded", "7710901"]]);
+      const ev = (await db.app.query("SELECT observed FROM booking.provider_evidence WHERE intent_id = $1 AND kind = 'hostaway_offline_charges' AND (observed ? 'matchingChargeIds') ORDER BY observed_at DESC LIMIT 1", [a.id])).rows;
+      assert.equal(ev.length, 1); assert.deepEqual([ev[0].observed.paymentProvider, ev[0].observed.matchingChargeCount, ev[0].observed.matchingChargeIds], ["offline", 1, ["7710901"]], "evidence names the recorded offline row only"); }
+    { const a = await capturedIntent(); const clk = newClock(); const w = pgWorld(a, clk); w.charges.push(docRow(a, { id: 7710002, title: `maraVilla payment mvoch1-${a.id}`, amount: a.total / 100, status: "paid" }));
+      const r = await pgRun(a, clk, w);
+      assert.deepEqual([r.outcome, r.code, r.steps, w.postRequests, (await snap(a.id)).st.state], ["PROVIDER_PROOF_FAILED", "PRIOR_MARKED_CHARGE_PRESENT", 0, 0, "payment_captured"], JSON.stringify([r.outcome, r.code])); }
+    { const a = await capturedIntent(); const clk = newClock(); const w = pgWorld(a, clk); w.charges.push(docRow(a, { id: 7710003 }));
+      F.ok(await A.adminRecordEvidence(db.reconciler, { intentId: a.id, kind: "payment_intent", externalRef: a.piId, status: "succeeded",
+        observed: { amountMinor: a.total, currency: "USD", amountReceivedMinor: a.total, amountRefundedMinor: a.total, refunded: true }, observedAt: new Date(Date.now() - 30_000), attestedBy: "owner", reference: "SYNTHETIC dashboard refund observation (C24 fixture)" }), "evidence");
+      const before = (await db.app.query("SELECT md5(i::text) AS h FROM booking.intents i WHERE id = $1", [a.id])).rows[0].h;
+      const r = await pgRun(a, clk, w);
+      assert.deepEqual([r.outcome, r.code, w.calls.length, w.postRequests, r.recordInvocations, r.lock], ["SCOPE_REFUSED", "PAYMENT_REFUND_OBSERVED", 0, 0, 0, "not_acquired"], JSON.stringify(r));
+      assert.equal((await db.app.query("SELECT md5(i::text) AS h FROM booking.intents i WHERE id = $1", [a.id])).rows[0].h, before); }
   });
 }
