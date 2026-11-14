@@ -218,7 +218,7 @@ test("B17 accessors are refused WITHOUT invocation at both levels (throwing and 
   assert.equal(n, 0);
 });
 
-test("B18 hostile Proxy traps (ownKeys / getOwnPropertyDescriptor / getPrototypeOf) at both levels → code-only, no throw, no sentinel; [[Get]] never consulted", () => {
+test("B18 hostile Proxy traps (ownKeys / getOwnPropertyDescriptor / getPrototypeOf) and same-length key substitutions at both levels → code-only, no throw, no sentinel; [[Get]] never consulted", () => {
   const boom = () => { throw new Error(SENTINEL); };
   const traps = [{ ownKeys: boom }, { getOwnPropertyDescriptor: boom }, { getPrototypeOf: boom },
     { getOwnPropertyDescriptor: (t, k) => (k === "locale" ? { value: "en", enumerable: true, configurable: true, writable: true } : Reflect.getOwnPropertyDescriptor(t, k)), ownKeys: (t) => [...Reflect.ownKeys(t), "ghost"] }];
@@ -228,6 +228,24 @@ test("B18 hostile Proxy traps (ownKeys / getOwnPropertyDescriptor / getPrototype
     const r2 = renderBookingConfirmation({ template: "booking_confirmed", locale: "en", facts: new Proxy({ ...FACTS }, trap) });
     assert.equal(r2.ok, false); assert.equal(r2.code, "FACTS_SHAPE"); noSentinel(r2);
   }
+  // same-length SUBSTITUTIONS (C38): ownKeys reports the right COUNT but swaps a required key for a string or a symbol — both levels
+  const subs = [["locale", "email"], ["locale", Symbol("extra")], ["template", "email"], ["facts", Symbol("facts")]];
+  for (const [drop, add] of subs) {
+    const tgt = input("en");
+    const p = new Proxy(tgt, { ownKeys: (t) => Reflect.ownKeys(t).filter((k) => k !== drop).concat([add]) });
+    codeOnly(renderBookingConfirmation(p), "INPUT_INVALID");
+  }
+  for (const [drop, add] of [["ref", "email"], ["ref", Symbol("ref")], ["totalMinor", "amount"], ["currency", Symbol("currency")]]) {
+    const fp = new Proxy({ ...FACTS }, { ownKeys: (t) => Reflect.ownKeys(t).filter((k) => k !== drop).concat([add]) });
+    codeOnly(renderBookingConfirmation({ template: "booking_confirmed", locale: "en", facts: fp }), "FACTS_SHAPE");
+  }
+  // ROOT C38 reproducers verbatim: required descriptors still available on the extensible target, only ownKeys lies
+  codeOnly(renderBookingConfirmation(new Proxy(input("en"), { ownKeys: () => ["template", "facts", "email"] })), "INPUT_INVALID");
+  codeOnly(renderBookingConfirmation(new Proxy(input("en"), { ownKeys: () => ["template", "facts", Symbol("extra")] })), "INPUT_INVALID");
+  codeOnly(renderBookingConfirmation({ template: "booking_confirmed", locale: "en", facts: new Proxy({ ...FACTS }, { ownKeys: () => ["checkIn", "checkOut", "currency", "guests", "nights", "email", "totalMinor"] }) }), "FACTS_SHAPE");
+  codeOnly(renderBookingConfirmation({ template: "booking_confirmed", locale: "en", facts: new Proxy({ ...FACTS }, { ownKeys: () => ["checkIn", "checkOut", "currency", "guests", "nights", Symbol("ref"), "totalMinor"] }) }), "FACTS_SHAPE");
+  // ownKeys reporting a duplicate approved key (right count, missing member) is also refused
+  codeOnly(renderBookingConfirmation(new Proxy(input("en"), { ownKeys: () => ["template", "facts", "facts"] })), "INPUT_INVALID");
   // [[Get]] is never consulted: a throwing `get` trap cannot fire because values come from own data descriptors (both levels)
   let gets = 0; const getBoom = { get: () => { gets += 1; throw new Error(SENTINEL); } };
   assert.deepEqual(renderBookingConfirmation(new Proxy(input("en"), getBoom)), render("en"));
