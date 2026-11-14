@@ -185,6 +185,32 @@ test("R11 sender stays in the existing .invalid scope and SENDER_NAME_RE; exact 
   for (const sender of [null, [], { fromAddress: SENDER.fromAddress }]) codeOnly(build(input("en", { sender })), "SENDER_INVALID");
 });
 
+test("R11b C54 exact approved real sender: accepted ONLY as the exact pair; binds into request + contentHash; recipient scope unchanged; every variant refused", async () => {
+  const { APPROVED_REAL_SENDER, isApprovedRealSender } = await import("../lib/notify/sender-identity.js");
+  assert.deepEqual({ ...APPROVED_REAL_SENDER }, { fromAddress: "bookings@mail.maravillanayarit.com", fromName: "maraVilla" });
+  assert.ok(Object.isFrozen(APPROVED_REAL_SENDER));
+  const REAL = { ...APPROVED_REAL_SENDER };
+  const r = build(input("en", { sender: { ...REAL } })); const syn = build(input("en"));
+  assert.equal(r.ok, true); assert.equal(syn.ok, true);
+  assert.equal(r.request.from, REAL.fromAddress); assert.equal(r.request.fromName, REAL.fromName);
+  assert.deepEqual(Object.keys(r.request).sort(), Object.keys(syn.request).sort(), "no extra request keys");
+  assert.notEqual(r.contentHash, syn.contentHash, "sender is bound into the contentHash");
+  assert.equal(r.request.to, syn.request.to, "recipient untouched (no rewrite)");
+  for (const fromAddress of ["Bookings@mail.maravillanayarit.com", "bookings@MAIL.maravillanayarit.com", "bookings@maravillanayarit.com", "bookings@x.mail.maravillanayarit.com",
+    "booking@mail.maravillanayarit.com", "info@mail.maravillanayarit.com", "bookings@mail.maravillanayarit.com.", " bookings@mail.maravillanayarit.com", "bookings@mail.maravillanayarit.com ",
+    "bookings@mail.maravillanayarit.co", "bookings@mail.maravillanayarit.com.invalid.example", "bookings+x@mail.maravillanayarit.com"]) {
+    codeOnly(build(input("en", { sender: { ...REAL, fromAddress } })), "SENDER_INVALID");
+  }
+  for (const fromName of ["maravilla", "MaraVilla", "maraVilla Test", "maraVilla ", " maraVilla", "maraVilla Nayarit"]) codeOnly(build(input("en", { sender: { ...REAL, fromName } })), "SENDER_INVALID");
+  codeOnly(build(input("en", { sender: { ...REAL, replyTo: "a@b.invalid" } })), "SENDER_INVALID");
+  const acc = { fromName: REAL.fromName }; let n = 0; Object.defineProperty(acc, "fromAddress", { enumerable: true, get() { n += 1; return REAL.fromAddress; } });
+  codeOnly(build(input("en", { sender: acc })), "SENDER_INVALID"); assert.equal(n, 0, "hidden accessor never invoked");
+  codeOnly(build(input("en", { sender: Object.create(REAL) })), "SENDER_INVALID");
+  for (const email of ["guest@example.com", "guest@gmail.com", "guest@mail.maravillanayarit.com"]) codeOnly(build(input("en", { sender: { ...REAL }, guest: { ...GUEST, email } })), "RECIPIENT_INVALID");
+  assert.equal(isApprovedRealSender(new String(REAL.fromAddress), REAL.fromName), false);
+  assert.equal(isApprovedRealSender(REAL.fromAddress, REAL.fromName), true);
+});
+
 test("R12 opId: lowercase canonical UUID only; checked before rendering; refusal order is INPUT → OP_ID → renderer → RECIPIENT → SENDER", () => {
   for (const opId of ["00000000-0000-4000-8000-00000000000G", "00000000-0000-4000-8000-0000000000A1", "00000000000040008000000000000001", "", null, 1, ` ${OP}`, `${OP}\n`]) {
     codeOnly(build(input("en", { opId })), "OP_ID_INVALID");

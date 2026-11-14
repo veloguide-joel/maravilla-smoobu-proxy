@@ -73,6 +73,32 @@ test("X2 construction binding: exact option keys; sender inside the EXISTING .in
   for (const bad of [null, [], "x", Object.create({ exchange: () => {} })]) assert.equal(E.createResendNotificationExecutor(bad).ok, false);
 });
 
+test("X2b C54 exact approved real sender: construction accepts ONLY the exact pair; wire `from` uses it; recipient scope unchanged (.example refused at prepare / send); variants refused", async () => {
+  const { APPROVED_REAL_SENDER } = await import("../lib/notify/sender-identity.js");
+  const REAL = { ...APPROVED_REAL_SENDER };
+  const good = { exchange: () => {}, credential: () => KEY };
+  for (const sender of [{ ...REAL, fromAddress: "Bookings@mail.maravillanayarit.com" }, { ...REAL, fromAddress: "bookings@maravillanayarit.com" }, { ...REAL, fromAddress: "bookings@x.mail.maravillanayarit.com" },
+    { ...REAL, fromAddress: "bookings@mail.maravillanayarit.com." }, { ...REAL, fromName: "maravilla" }, { ...REAL, fromName: "maraVilla Test" }, { ...REAL, replyTo: "a@b.invalid" }, Object.create(REAL)]) {
+    assert.deepEqual({ ...E.createResendNotificationExecutor({ ...good, sender }) }, { ok: false, code: "EXECUTOR_SENDER_INVALID" }, JSON.stringify(sender));
+  }
+  const s = mk(() => ok200(), { sender: { ...REAL } });
+  assert.deepEqual({ ...s.ex.sender }, REAL);
+  const b = built("en", { sender: { ...REAL } });
+  const out = await s.ex.send({ request: b.request, opId: OP, contentHash: b.contentHash });
+  assert.equal(out.kind, "accepted"); assert.equal(s.calls, 1);
+  assert.equal(JSON.parse(s.reqs[0].body.toString("utf8")).from, "maraVilla <bookings@mail.maravillanayarit.com>");
+  assert.deepEqual(JSON.parse(s.reqs[0].body.toString("utf8")).to, [GUEST.email]);
+  // a synthetic-sender request is NOT accepted by a real-sender executor (sender binding unchanged)
+  const s2 = mk(() => ok200(), { sender: { ...REAL } }); const syn = built("en");
+  const o2 = await s2.ex.send({ request: syn.request, opId: OP, contentHash: syn.contentHash });
+  assert.notEqual(o2.kind, "accepted"); assert.equal(s2.calls, 0, "sender mismatch refused pre-exchange");
+  // a real recipient never gets in: the builder refuses it, and a hand-forged request with an .example recipient is refused before the exchange
+  const s3 = mk(() => ok200(), { sender: { ...REAL } });
+  const forged = { ...b.request, to: "guest@example.com" };
+  const o3 = await s3.ex.send({ request: forged, opId: OP, contentHash: contentHashV2(forged) });
+  assert.notEqual(o3.kind, "accepted"); assert.equal(s3.calls, 0, "real recipient refused pre-exchange");
+});
+
 test("X3 EN / ES exact wire bytes: body is exactly {from:'<name> <addr>', to:[guest], subject, text} from the frozen gn-v2 request (no rewrite); headers / idempotency key exact; ONE exchange; accepted", async () => {
   for (const [locale, subj] of [["en", EN_SUBJECT], ["es", ES_SUBJECT]]) {
     const b = built(locale); const s = mk();
