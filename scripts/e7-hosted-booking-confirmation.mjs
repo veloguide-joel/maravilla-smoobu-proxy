@@ -24,6 +24,9 @@
 //     Residual (documented worker behaviour): on such a throw the work / op leases are left to expire — no claim / send happens.
 //   * Budgets: ONE worker invocation, ONE exchange call (a counting fence in front of the reviewed exchange; a second call is refused), no retry,
 //     statement / connect bounds. Any non-acceptance → the worker's durable UNKNOWN (no resend: the lifecycle fences + this admission refuse a rerun).
+//   * C51 verified completion: an accepted worker outcome is a success (exit 0) ONLY with ONE valid read-only readback of the bound op matching the durable
+//     accepted shape (succeeded / attempts 1 / resend ref / no error / exactly 1 typed receipt / gn-v2 render / plan locale / replay consistent);
+//     otherwise ACCEPTED_UNVERIFIED_STOP (acceptance retained, exit 1). Provider acceptance is still NOT delivery (deliveryProven false).
 //   * Never: a second send, a retry, a generic sweep, notification / inbox processing beyond the ONE bound op, refund / cancel / void / claim release,
 //     or a recipient / name / subject / text / header / key / raw exception in a result or log (codes / hashes / sanitized operation metadata only).
 import process from "node:process";
@@ -80,7 +83,7 @@ const WORKER_ID_RE = /^[A-Za-z0-9._:-]{1,64}$/;
 
 export const PLAN_SCHEMA = "e7-hosted-booking-confirmation-plan-v1";
 export const RESULT_SCHEMA = "e7-hosted-booking-confirmation-result-v1";
-export const CORE_CODES = freeze(["PROVIDER_ACCEPTED", "PROVIDER_ACCEPTED_REPLAY", "UNKNOWN_STOP", "NOT_SENT", "NBC_ADMISSION_REFUSED", "NBC_BOUND_OP_MISMATCH",
+export const CORE_CODES = freeze(["PROVIDER_ACCEPTED", "PROVIDER_ACCEPTED_REPLAY", "ACCEPTED_UNVERIFIED_STOP", "UNKNOWN_STOP", "NOT_SENT", "NBC_ADMISSION_REFUSED", "NBC_BOUND_OP_MISMATCH",
   "NBC_WORKER_REFUSED", "NBC_WORKER_ERROR", "NBC_EXECUTOR_INVALID", "NBC_DB_FAILED", "NBC_DB_TIMEOUT", "NBC_BUDGET"]);
 export const ADMISSION_CODES = freeze(["NOT_READ_ONLY", "ROLE_REFUSED", "CATALOG_NOT_23", "NOT_TEST", "INTENT_NOT_FOUND", "INTENT_EXCLUDED", "LISTING_MISMATCH",
   "VERSION_MISMATCH", "CURRENCY_NOT_USD", "STATE_NOT_CONFIRMED", "PROTECTED", "OP_COUNT", "OP_NOT_BOUND", "OP_NOT_PRISTINE", "OP_PAYLOAD_SHAPE", "TEMPLATE_NOT_V2",
@@ -204,12 +207,35 @@ export const ADMISSION_QUERIES = deepFreeze({
     (SELECT count(*)::int FROM booking.intent_work w WHERE w.intent_id = $2::uuid AND (w.work_worker_id IS NOT NULL OR w.work_lease_until IS NOT NULL)) AS work_leased`,
   rollback: "ROLLBACK"
 });
-export const POSTCHECK_QUERY = `SELECT o.state AS state, o.attempts AS attempts, (o.result_ref LIKE 'resend:%') AS resend_ref, o.error_code AS error_code,
+export const POSTCHECK_QUERY = `SELECT o.state AS state, o.attempts AS attempts, coalesce(o.result_ref LIKE 'resend:%', false) AS resend_ref, o.error_code AS error_code,
     (SELECT count(*)::int FROM booking.notification_provider_receipts p WHERE p.operation_id = o.id) AS receipts,
     (SELECT coalesce(bool_or(p.replayed), false) FROM booking.notification_provider_receipts p WHERE p.operation_id = o.id) AS replayed,
     (SELECT r.template_version FROM booking.notification_renders r WHERE r.operation_id = o.id) AS template_version,
     (SELECT r.locale FROM booking.notification_renders r WHERE r.operation_id = o.id) AS locale
     FROM booking.external_operations o WHERE o.id = $1::uuid`;
+
+// ---- C51: the final readback of the ONE bound op — strict RAW types before any allowlisted mapping (never coerced into plausible null / false) ----
+export const READBACK_CODES = freeze(["VERIFIED", "NOT_REQUIRED", "UNAVAILABLE", "MISSING", "MALFORMED", "CONTRADICTS"]);
+const READBACK_KEYS = freeze(["attempts", "error_code", "locale", "receipts", "replayed", "resend_ref", "state", "template_version"]);
+/** parseReadback(res) → { kind: "OK", value } | { kind: "MISSING" } | { kind: "MALFORMED" } — pure; res = the raw pg result of POSTCHECK_QUERY */
+export function parseReadback(res) {
+  if (!res || typeof res !== "object" || !Array.isArray(res.rows)) return { kind: "MALFORMED" };
+  if (res.rows.length === 0) return { kind: "MISSING" };
+  if (res.rows.length !== 1) return { kind: "MALFORMED" };
+  const r = res.rows[0];
+  if (!r || typeof r !== "object" || JSON.stringify(Object.keys(r).sort()) !== JSON.stringify(READBACK_KEYS)) return { kind: "MALFORMED" };
+  const nni = (v) => Number.isSafeInteger(v) && v >= 0;
+  if (typeof r.state !== "string" || !TOKEN_RE.test(r.state) || !nni(r.attempts) || typeof r.resend_ref !== "boolean"
+      || !(r.error_code === null || (typeof r.error_code === "string" && CODE_RE.test(r.error_code))) || !nni(r.receipts) || typeof r.replayed !== "boolean"
+      || !(r.template_version === null || r.template_version === "gn-v1" || r.template_version === "gn-v2") || !(r.locale === null || r.locale === "en" || r.locale === "es")) return { kind: "MALFORMED" };
+  return { kind: "OK", value: freeze({ state: r.state, attempts: r.attempts, resendRef: r.resend_ref, errorCode: r.error_code, receipts: r.receipts, replayed: r.replayed,
+    templateVersion: r.template_version, locale: r.locale }) };
+}
+/** verifiesAcceptance(v, plan, replay) — the ONE durable shape of a verified accepted completion of the bound op */
+export function verifiesAcceptance(v, plan, replay) {
+  return v.state === "succeeded" && v.attempts === 1 && v.resendRef === true && v.errorCode === null && v.receipts === 1 && v.templateVersion === "gn-v2"
+    && v.locale === plan.locale && v.replayed === replay;
+}
 
 /** admit({ client, plan, c }) → { ok: true } | { ok: false, code }; ONE read-only transaction, always ROLLBACK; throws Refusal(NBC_DB_*) on DB failure */
 export async function admit({ client, plan, c = CONSTANTS }) {
@@ -287,7 +313,7 @@ export function countedPool(pool, c, counter) {
  */
 export async function runBookingConfirmationCore({ pool, plan, c = CONSTANTS, tooling, exchange, credential, runId }) {
   const out = { schema: RESULT_SCHEMA, code: null, admission: null, workerOutcome: null, workerCode: null, sendsAttempted: 0, workerInvocations: 0, statements: 0,
-    providerAccepted: false, providerReplay: false, deliveryProven: false, postcheck: null };
+    providerAccepted: false, providerReplay: false, verifiedCompletion: false, readback: null, deliveryProven: false, postcheck: null };
   const counter = { statements: 0 };
   const cp = countedPool(pool, c, counter);
   try {
@@ -321,20 +347,26 @@ export async function runBookingConfirmationCore({ pool, plan, c = CONSTANTS, to
   } catch (e) {
     if (out.code === null || !CORE_CODES.includes(out.code)) out.code = e instanceof Refusal && CORE_CODES.includes(e.code) ? e.code : "NBC_WORKER_ERROR";
   }
-  // 4. read-only postcheck of the ONE bound op (sanitized metadata only; best effort)
+  // 4. ONE read-only readback of the ONE bound op (no retry, no repair, no provider read). For an ACCEPTED worker outcome it is REQUIRED: only a
+  //    valid readback matching the durable accepted shape is a verified completion; unavailable / missing / malformed / contradictory → the explicit
+  //    STOP ACCEPTED_UNVERIFIED_STOP with providerAccepted / providerReplay RETAINED (the acceptance already happened: never "nothing happened",
+  //    never a permission to resend — the lifecycle fences + admission still refuse a rerun). Other outcomes: informational only, never upgraded.
   if (out.admission === "ADMITTED") {
+    let parsed;
     try {
       const pc = await cp.connect();
       try {
         await pc.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
-        const r = (await pc.query(POSTCHECK_QUERY, [plan.opId])).rows[0];
+        parsed = parseReadback(await pc.query(POSTCHECK_QUERY, [plan.opId]));
         await pc.query("ROLLBACK");
-        out.postcheck = r ? { state: TOKEN_RE.test(String(r.state)) ? r.state : "redacted", attempts: Number.isSafeInteger(r.attempts) ? r.attempts : null, resendRef: r.resend_ref === true,
-          errorCode: r.error_code !== null && CODE_RE.test(String(r.error_code)) ? r.error_code : null, receipts: Number.isSafeInteger(r.receipts) ? r.receipts : null,
-          replayed: r.replayed === true, templateVersion: r.template_version === "gn-v2" || r.template_version === "gn-v1" ? r.template_version : null,
-          locale: r.locale === "en" || r.locale === "es" ? r.locale : null } : null;
       } finally { pc.release(true); }
-    } catch { out.postcheck = "UNAVAILABLE"; }
+    } catch { parsed = { kind: "UNAVAILABLE" }; }
+    out.postcheck = parsed.kind === "OK" ? parsed.value : null;
+    if (out.providerAccepted) {
+      out.readback = parsed.kind !== "OK" ? parsed.kind : (verifiesAcceptance(parsed.value, plan, out.providerReplay) ? "VERIFIED" : "CONTRADICTS");
+      out.verifiedCompletion = out.readback === "VERIFIED";
+      if (!out.verifiedCompletion) out.code = "ACCEPTED_UNVERIFIED_STOP";
+    } else out.readback = parsed.kind === "OK" ? "NOT_REQUIRED" : parsed.kind;
   }
   out.statements = counter.statements;
   return deepFreeze(out);
@@ -432,7 +464,7 @@ export async function runHosted({ mode = "preflight", env, proc, wrapperDir, dep
       r.core = await runCore({ pool, plan: built.plan, c, tooling: mods.tooling, exchange: xr.exchange, credential, runId });
     } finally { dbUrl = null; key = null; }
     r.code = "EXECUTE_DONE";
-    return { exitCode: r.core && (r.core.code === "PROVIDER_ACCEPTED" || r.core.code === "PROVIDER_ACCEPTED_REPLAY") ? 0 : 1, result: r };
+    return { exitCode: r.core && (r.core.code === "PROVIDER_ACCEPTED" || r.core.code === "PROVIDER_ACCEPTED_REPLAY") && r.core.verifiedCompletion === true ? 0 : 1, result: r };
   } catch (e) {
     r.code = e instanceof Refusal && HOSTED_CODES.includes(e.code) ? e.code : "NBC_INTERNAL";
     return { exitCode: 1, result: r };
@@ -449,7 +481,7 @@ async function defaultImportTooling(dir) {
       NOTIFICATION_V2_OPTION_KEY: W.NOTIFICATION_V2_OPTION_KEY, NOTIFICATION_PROVIDER_OPTION_KEY: W.NOTIFICATION_PROVIDER_OPTION_KEY }) };
 }
 export function summaryMarkdown(r) {
-  const k = r.core ? ` core=${r.core.code} admission=${r.core.admission ?? "-"} worker=${r.core.workerOutcome ?? "-"}/${r.core.workerCode ?? "-"} sends=${r.core.sendsAttempted} invocations=${r.core.workerInvocations} statements=${r.core.statements} providerAccepted=${r.core.providerAccepted} replay=${r.core.providerReplay} deliveryProven=false` : "";
+  const k = r.core ? ` core=${r.core.code} admission=${r.core.admission ?? "-"} worker=${r.core.workerOutcome ?? "-"}/${r.core.workerCode ?? "-"} sends=${r.core.sendsAttempted} invocations=${r.core.workerInvocations} statements=${r.core.statements} providerAccepted=${r.core.providerAccepted} replay=${r.core.providerReplay} verifiedCompletion=${r.core.verifiedCompletion === true} readback=${r.core.readback ?? "-"} deliveryProven=false` : "";
   return `e7-hosted-booking-confirmation ${r.mode} ${r.code} executeEnabled=${r.executeEnabled} plan=${r.planKind ?? "-"}:${r.planHash ?? "-"} runId=${r.runId ?? "-"} closure=${r.closureDigest ?? "-"} source=${r.sourceDigest ?? "-"} cleanup=${r.cleanup ?? "-"}${k}\n`;
 }
 
