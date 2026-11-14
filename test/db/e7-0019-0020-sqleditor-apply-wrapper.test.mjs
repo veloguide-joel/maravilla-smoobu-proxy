@@ -207,7 +207,7 @@ test("C4 healthy apply (fresh cluster, nonempty booking fixture): status 20 / bo
     const st = await migrationStatus(B.c, { env: "test" });
     // historical TARGET (ROOT 5884658427): the wrapper applies 1..20 exactly; the tree now also carries the 0021 LOCAL candidate, which the wrapper
     // never embeds / applies — it shows as pending and is NOT applied here (the migrator is capped at to: 20 for the no-op check below)
-    assert.deepEqual(st.applied, Array.from({ length: 20 }, (_, i) => i + 1)); assert.deepEqual(st.pending, [21]);
+    assert.deepEqual(st.applied, Array.from({ length: 20 }, (_, i) => i + 1)); assert.deepEqual(st.pending, Array.from({ length: loadMigrations().at(-1).version - 20 }, (_, i) => 21 + i));   // C41: 21 … TOP (derived)
     assert.deepEqual(await migrateUp(B.c, { env: "test", to: 20 }), [], "migrator no-op after the wrapper (historical target 20; 0021 not applied)");
     await expectRaise(B.c, /E7_1920_ALREADY_APPLIED_OR_LATER/);
     assert.deepEqual(identity(await inventory(B.c)), identity(PINS.post), "replay changed nothing");
