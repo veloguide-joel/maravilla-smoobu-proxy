@@ -1,6 +1,6 @@
 // test/e7-hosted-booking-confirmation.test.mjs — C50: the SHIPPED-CLOSED hosted gn-v2 booking-confirmation runner (scripts/e7-hosted-booking-confirmation.mjs).
 // Always-on: the CLOSED proof (zero imports / env value reads / DB / provider), labelled copies, closure, plan binding, hosted gates, and the admission /
-// core flow through FAKE clients / fake tooling. OPT-IN (E7_HBC_DB_TESTS=1; PG_BIN; E7_TOOLING_DIR = the pinned d322d219 checkout with its pinned pg):
+// core flow through FAKE clients / fake tooling. OPT-IN (E7_HBC_DB_TESTS=1; PG_BIN; E7_TOOLING_DIR = the pinned 46b3eaf8 checkout with its pinned pg (C55 repin from d322d219)):
 // the execute BODY through the test-local constants / deps seam on DISPOSABLE PostgreSQL at schema 23 with the REAL accepted worker, builder, branded
 // executor and SQL 23 receipts — the exchange is ALWAYS FAKE (no network). Lifecycle helpers are generated at runtime from the pinned tooling file
 // test/db/e7-gn-v2-resend-integration.test.mjs (sha-checked; verbatim; imports rewritten to the tooling checkout). The hosted preflight child never sets
@@ -80,8 +80,8 @@ test("H2 labelled copies: hosted-boot helpers == scripts/e7-hosted-reservation.m
   assert.deepEqual(C.catalogPin23, I.CONSTANTS.catalogPins["23"]); assert.equal(R.bounded.toString(), I.bounded.toString());
 });
 
-test("H3 independent closure at the immutable tooling d322d219 (five runtime roots → 8 modules + package files; bare imports node:* and pg only); digest; pg 8.18.0; the tooling exchange is byte-identical to main's reviewed scripts/e7-resend/resend-exchange.mjs", async () => {
-  assert.equal(execFileSync("git", ["-C", TOOLING, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), C.toolingCommit, "E7_TOOLING_DIR must be the pinned d322d219 checkout");
+test("H3 independent closure at the immutable tooling 46b3eaf8 (five runtime roots → 9 modules incl. C54 lib/notify/sender-identity.js + package files; bare imports node:* and pg only); digest; pg 8.18.0; the tooling exchange is byte-identical to main's reviewed scripts/e7-resend/resend-exchange.mjs", async () => {
+  assert.equal(execFileSync("git", ["-C", TOOLING, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), C.toolingCommit, "E7_TOOLING_DIR must be the pinned 46b3eaf8 checkout");
   const bare = new Set();
   const scan = (rel, seen = new Set()) => {
     if (seen.has(rel)) return seen; seen.add(rel);
@@ -99,17 +99,40 @@ test("H3 independent closure at the immutable tooling d322d219 (five runtime roo
   assert.equal(JSON.parse(readFileSync(join(TOOLING, "package-lock.json"), "utf8")).packages["node_modules/pg"].version, C.pgVersion);
   assert.equal(sha(readFileSync(join(TOOLING, "scripts/e7-resend/resend-exchange.mjs"))), sha(readFileSync(join(ROOT, "scripts/e7-resend/resend-exchange.mjs"))));
   assert.equal(sha(readFileSync(join(ROOT, "scripts/e7-resend/resend-exchange.mjs"))), "19dae6de5657e1d06a41a68c76bbb53abff07948a3536f8a80cff4204f9f0e99");
+  // C55: the plan's sender IS the pinned tooling's approved identity (taken from / asserted equal to it), and the superseded identity is not
+  const SI = await import(pathToFileURL(join(TOOLING, "lib/notify/sender-identity.js")).href);
+  assert.deepEqual({ ...C.sender }, { ...SI.APPROVED_REAL_SENDER });
+  assert.equal(SI.isApprovedRealSender(C.sender.fromAddress, C.sender.fromName), true);
+  assert.equal(SI.isApprovedRealSender("bookings@mail.maravillanayarit.com", "maraVilla"), false);
+  assert.equal(sha(readFileSync(join(TOOLING, "lib/notify/sender-identity.js"))), "1430b2a60940aa4f7f82f834a2ac99df82cb607b198aab801dca1f2b5a12008a", "the reviewed #120 sender-identity bytes");
+  assert.notEqual(C.closureDigest, "d11f8070cda02bd634156172d956a26fb75adc10379200f0be1229546badab9c", "the d322d219 closure is no longer accepted");
 });
 
-test("H4 plan: deterministic; binds intent / op / version / locale / the fixed synthetic sender / excluded ids / protected ids / one-send budget / tooling / closure / source / schema-23 pin", () => {
+test("H3b C55 old-pin / tampered tooling refused at the closure check BEFORE any tooling import: the d322d219 shape (no sender-identity.js) and a sender-identity.js rewritten to the superseded identity", async () => {
+  const mkTool = (mut) => { const d = mkdtempSync(join(tmpdir(), "e7-c55-tool-"));
+    for (const f of C.closure) { mkdirSync(join(d, dirname(f)), { recursive: true }); writeFileSync(join(d, f), readFileSync(join(TOOLING, f))); }
+    mut(d); return d; };
+  const never = () => { throw new Error("must not be called"); };
+  for (const [kind, mut, codes] of [["d322d219 shape (no sender-identity.js)", (d) => rmSync(join(d, "lib/notify/sender-identity.js")), ["NBC_SOURCE_UNREADABLE"]],
+    ["superseded identity", (d) => { const f = join(d, "lib/notify/sender-identity.js"); writeFileSync(f, readFileSync(f, "utf8").replace('fromAddress: "bookings@mail.micasadirect.com", fromName: "MiCasaDirect"', 'fromAddress: "bookings@mail.maravillanayarit.com", fromName: "maraVilla"')); }, ["NBC_CLOSURE_MISMATCH"]]]) {
+    const d = mkTool(mut);
+    try {
+      const r = await R.runHosted({ mode: "preflight", env: { E7_TOOLING_DIR: d, PATH: process.env.PATH }, proc: PROC, wrapperDir: ROOT, deps: { importEnv: never, importTooling: never, spawnChild: never, runCore: never } });
+      assert.equal(r.exitCode, 1, kind); assert.ok(codes.includes(r.result.code), `${kind}: ${r.result.code}`);
+    } finally { rmSync(d, { recursive: true, force: true }); }
+  }
+});
+
+test("H4 plan: deterministic; binds intent / op / version / locale / the fixed approved sender / excluded ids / protected ids / one-send budget / tooling / closure / source / schema-23 pin", () => {
   const base = { approvalRef: "label-c50", intentId: IID, opId: OID, expectedVersion: VER, locale: "en", sourceDigest: "a".repeat(64) };
   const h0 = R.buildPlan(C, base).planHash; assert.equal(R.buildPlan(C, { ...base }).planHash, h0);
   for (const [k, v] of [["approvalRef", "x"], ["intentId", "3f1c2b4a-5d6e-4f70-8a91-b2c3d4e5f608"], ["opId", "7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0e"], ["expectedVersion", 10], ["locale", "es"], ["sourceDigest", "b".repeat(64)]])
     assert.notEqual(R.buildPlan(C, { ...base, [k]: v }).planHash, h0, k);
-  for (const over of [{ sender: { fromAddress: "other@sender.mv-test.invalid", fromName: "maraVilla Test" } }, { excludedIntentIds: [] }, { protectedReservationIds: [] }, { closureDigest: "c".repeat(64) },
+  for (const over of [{ sender: { fromAddress: "other@sender.mv-test.invalid", fromName: "maraVilla Test" } }, { sender: { fromAddress: "bookings@sender.mv-test.invalid", fromName: "maraVilla Test" } },
+    { sender: { fromAddress: "bookings@mail.maravillanayarit.com", fromName: "maraVilla" } }, { toolingCommit: "d322d2192b377d18b6a9280ae06c17eddfe3e73e" }, { excludedIntentIds: [] }, { protectedReservationIds: [] }, { closureDigest: "c".repeat(64) },
     { catalogPin23: {} }, { budgets: { ...C.budgets, sends: 2 } }, { executeEnabled: true }])
     assert.notEqual(R.buildPlan({ ...C, ...over }, base).planHash, h0, Object.keys(over)[0]);
-  assert.deepEqual(C.sender, { fromAddress: "bookings@sender.mv-test.invalid", fromName: "maraVilla Test" }, "the fixed reviewed synthetic .invalid sender (not a live identity)");
+  assert.deepEqual(C.sender, { fromAddress: "bookings@mail.micasadirect.com", fromName: "MiCasaDirect" }, "C55: the fixed approved sender (sender only; not a domain-verification claim)");
   assert.deepEqual([...C.excludedIntentIds], ["abede8b1-8ef6-44f2-876e-6a02fc056a96", "c83c1842-d342-4e27-9ab7-dc3d50b7a309"]);
   assert.deepEqual([C.budgets.workerInvocations, C.budgets.sends], [1, 1]);
 });
@@ -325,7 +348,7 @@ test("H9 C51 verified completion (fake): an accepted worker outcome with the rea
 // ---------------------------------------------------------------------------------------------------------------------------------
 // OPT-IN REAL DISPOSABLE POSTGRESQL at schema 23 with the REAL accepted worker / builder / executor / SQL — FAKE exchange only
 if (process.env.E7_HBC_DB_TESTS === "1") {
-  const SRC = "test/db/e7-gn-v2-resend-integration.test.mjs"; const SRC_SHA = "9533197d8661f49c076ca4b9459b480f7b34587bfea89d81769653bb14403201";
+  const SRC = "test/db/e7-gn-v2-resend-integration.test.mjs"; const SRC_SHA = "22ed2f725c049e17c61317914ac8826b41a00b05b0cd48679e23107a038b89f0";   // C55: at 46b3eaf8 (was 9533197d… at d322d219; changed ONLY by the reviewed #120 commits 589fd9ae + 75132753: C54 P9 + expectedV2 sender param)
   const text = readFileSync(join(TOOLING, SRC), "utf8"); assert.equal(sha(text), SRC_SHA, "the pinned accepted helper source");
   const tdir = mkdtempSync(join(tmpdir(), "e7-c50-helpers-")); symlinkSync(join(TOOLING, "node_modules"), join(tdir, "node_modules"));
   const turl = (rel) => pathToFileURL(join(TOOLING, "test/db", rel)).href;
@@ -345,7 +368,9 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
     NOTIFICATION_V2_OPTION_KEY: "confirmationLocale", NOTIFICATION_PROVIDER_OPTION_KEY: "providerExecutor" };
   const db = await Hm.startMigratedDatabase(); Hm.__setDb(db);
   after(async () => { await db.close(); rmSync(tdir, { recursive: true, force: true }); });
-  assert.deepEqual(Hm.SENDER, C.sender, "the runner's fixed sender == the accepted suites' synthetic sender");
+  assert.deepEqual(Hm.SENDER, { fromAddress: "bookings@sender.mv-test.invalid", fromName: "maraVilla Test" }, "the accepted suites' synthetic sender is unchanged");
+  const SI = await import(pathToFileURL(join(TOOLING, "lib/notify/sender-identity.js")).href);
+  assert.deepEqual({ ...C.sender }, { ...SI.APPROVED_REAL_SENDER }, "C55: the runner's fixed sender == the pinned approved identity");
   const fingerprint = async () => (await db.owner.query(`SELECT jsonb_object_agg(t.relname, x.v) AS f FROM pg_class t JOIN pg_namespace s ON s.oid = t.relnamespace,
       LATERAL (SELECT (xpath('/row/v/text()', query_to_xml(format('SELECT count(*) || '':'' || md5(coalesce(string_agg(to_jsonb(x)::text, E''\\n'' ORDER BY to_jsonb(x)::text), '''')) AS v FROM booking.%I x', t.relname), false, true, '')))[1]::text AS v) x
       WHERE s.nspname = 'booking' AND t.relkind = 'r'`)).rows[0].f;
@@ -440,5 +465,23 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
     assert.equal(Number((await db.owner.query("SELECT count(*) AS n FROM booking.notification_renders WHERE operation_id = $1", [bk.op.id])).rows[0].n), 0, "no render: nothing was claimed");
     assert.equal(Number((await db.owner.query("SELECT count(*) AS n FROM booking.notification_provider_receipts WHERE operation_id = $1", [bk.op.id])).rows[0].n), 0);
     assert.doesNotMatch(JSON.stringify(r), PII);
+  });
+
+  test("D6 C55 the exact approved sender on the FAKE wire (real PG23, real worker / executor at 46b3eaf8): from === 'MiCasaDirect <bookings@mail.micasadirect.com>', recipient still the DB's .invalid address; the superseded real sender (seam) is refused before any claim with ZERO exchange calls and no table change", async () => {
+    const bk = await ready(); const reqs = [];
+    const fx = fakeExchange((id, req) => { reqs.push(req); return ok200(id); });
+    const r = await run(bk, bk.op.id, "en", fx);
+    assert.deepEqual([r.code, r.verifiedCompletion, fx.calls], ["PROVIDER_ACCEPTED", true, 1]);
+    const wire = JSON.parse(Buffer.from(reqs[0].body).toString("utf8"));
+    assert.equal(wire.from, "MiCasaDirect <bookings@mail.micasadirect.com>");
+    assert.equal(wire.to.length, 1); assert.match(wire.to[0], /^[a-z0-9._+-]+@([a-z0-9-]+\.)+invalid$/, "recipient scope unchanged (.invalid only)");
+    assert.doesNotMatch(JSON.stringify(r), PII);
+    const bk2 = await ready(); const f0 = await fingerprint();
+    for (const sender of [{ fromAddress: "bookings@mail.maravillanayarit.com", fromName: "maraVilla" }, { fromAddress: "Bookings@mail.micasadirect.com", fromName: "MiCasaDirect" },
+      { fromAddress: "bookings@mail.micasadirect.com", fromName: "micasadirect" }]) {
+      const fx2 = fakeExchange(ok200); const bad = await run(bk2, bk2.op.id, "en", fx2, { c: { sender } });
+      assert.deepEqual([bad.code, bad.admission, bad.workerInvocations, bad.sendsAttempted, fx2.calls], ["NBC_EXECUTOR_INVALID", "ADMITTED", 0, 0, 0], JSON.stringify(sender));
+    }
+    assert.deepEqual(await fingerprint(), f0, "no table change for a refused sender");
   });
 }
