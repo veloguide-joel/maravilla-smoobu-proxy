@@ -10,7 +10,51 @@ import * as F from "./fixtures.mjs";
 import { applyEvent } from "../../db/lib/repo.js";
 import { claimNextOperation, completeOperation, requestRead, recordRecordingAssessment, recordReleaseReviewAssessment, openRecordingPreflightHold } from "../../db/lib/operations.js";
 import { adminReleasePreflightHold, adminResolveRecordingHold } from "../../db/lib/admin.js";
-import { migrateDown, migrateUp } from "../../db/lib/migrate.js";
+import { migrateDown, migrateUp, migrationStatus, loadMigrations } from "../../db/lib/migrate.js";
+
+// ---- C26 migration-boundary helpers (test-local; no harness default changed) ------------------------------------------------------------
+// The repository's migration chain (loadMigrations enforces contiguity 1..TOP). A boundary N is EXPLICIT: every migration above N must roll back
+// mechanically in a fresh, data-free cluster (down == TOP..N+1 exactly), the recorded history must then be exactly 1..N applied / N+1..TOP pending,
+// the schema must equal a fresh cluster migrated UP to N, and the re-up must return exactly N+1..TOP. Nothing here accepts "whatever the top is":
+// the expected lists are derived from the migration files in this tree and re-checked against the bookkeeping table at each boundary.
+const MIGRATION_VERSIONS = loadMigrations().map((m) => m.version); const TOP = MIGRATION_VERSIONS.at(-1);
+assert.deepEqual(MIGRATION_VERSIONS, Array.from({ length: TOP }, (_, i) => i + 1), "contiguous migration chain");
+const range = (from, to) => (from <= to ? Array.from({ length: to - from + 1 }, (_, i) => from + i) : Array.from({ length: from - to + 1 }, (_, i) => from - i));
+/** down from the current top to boundary N in a fresh cluster: exact descending list + exact history */
+async function downToBoundary(c, n) {
+  const ran = await migrateDown(c, { env: "test", to: n });
+  assert.deepEqual(ran, range(TOP, n + 1), `every migration above ${n} rolls back mechanically (fresh, data-free)`);
+  const st = await migrationStatus(c, { env: "test" });
+  assert.deepEqual([st.applied, st.pending], [range(1, n), range(n + 1, TOP)], `history at boundary ${n}`);
+  return ran;
+}
+/** re-up from boundary N to the top: exact ascending list + exact history */
+async function upFromBoundary(c, n) {
+  const ran = await migrateUp(c, { env: "test" });
+  assert.deepEqual(ran, range(n + 1, TOP), `re-up from ${n} applies exactly the rest of the chain`);
+  const st = await migrationStatus(c, { env: "test" });
+  assert.deepEqual([st.applied, st.pending], [range(1, TOP), []], "history at top");
+  return ran;
+}
+/** a dedicated disposable cluster migrated UP to exactly N (the intended boundary built forward, never by rolling back) */
+async function freshAt(n) {
+  const d = await startPostgres(); const c = new pg.Client({ connectionString: d.adminUrl }); await c.connect();
+  assert.deepEqual(await migrateUp(c, { env: "test", to: n }), range(1, n));
+  const st = await migrationStatus(c, { env: "test" }); assert.deepEqual([st.applied, st.pending], [range(1, n), range(n + 1, TOP)]);
+  return { d, c, close: async () => { await c.end(); d.stop(); } };
+}
+/** full schema shape (bodies / ACLs / security / volatility / search_path / triggers / columns / grants / policies / constraints / indexes / RLS) */
+const schemaObjects = async (c) => (await c.query(`
+      SELECT 'fn|' || p.oid::regprocedure::text || '|' || md5(pg_get_functiondef(p.oid)) || '|' || coalesce(array_to_string(p.proacl, ','), '') || '|' ||
+             p.prosecdef::text || '|' || p.provolatile::text || '|' || coalesce(array_to_string(p.proconfig, ','), '') AS o FROM pg_proc p WHERE p.pronamespace = 'booking'::regnamespace
+      UNION ALL SELECT 'trg|' || tgrelid::regclass::text || '|' || tgname || '|' || pg_get_triggerdef(oid) FROM pg_trigger WHERE NOT tgisinternal AND tgrelid::regclass::text LIKE 'booking.%'
+      UNION ALL SELECT 'col|' || table_name || '|' || column_name || '|' || data_type || '|' || is_nullable FROM information_schema.columns WHERE table_schema = 'booking'
+      UNION ALL SELECT 'tbl|' || grantee || '|' || table_name || '|' || privilege_type FROM information_schema.role_table_grants WHERE table_schema = 'booking'
+      UNION ALL SELECT 'pol|' || tablename || '|' || policyname || '|' || array_to_string(roles, ',') || '|' || cmd FROM pg_policies WHERE schemaname = 'booking'
+      UNION ALL SELECT 'con|' || conrelid::regclass::text || '|' || conname || '|' || pg_get_constraintdef(oid) FROM pg_constraint WHERE connamespace = 'booking'::regnamespace
+      UNION ALL SELECT 'idx|' || indexrelid::regclass::text || '|' || pg_get_indexdef(indexrelid) FROM pg_index WHERE indrelid::regclass::text LIKE 'booking.%'
+      UNION ALL SELECT 'rls|' || relname || '|' || relrowsecurity::text FROM pg_class WHERE relnamespace = 'booking'::regnamespace AND relkind = 'r'
+      ORDER BY 1`)).rows.map((r) => r.o);
 
 let db; let report;
 const setupInFlight = [];                                                                    // recordings put in flight as labelled TEST SETUP (no claim)
@@ -601,24 +645,16 @@ test("B-10: no effects across this file — opener / review / release created no
 
 // ---- D: rollback ---------------------------------------------------------------------------------------------------
 test("D-13: 0013 down with ONLY 0012 epoch-0 audit present == fresh cluster at 12 (bodies / ACLs / security / volatility / search_path / triggers / constraints / indexes / policies / RLS), identical re-up; EACH 0013 audit class refuses and changes nothing", async () => {
-  const objects = async (c) => (await c.query(`
-      SELECT 'fn|' || p.oid::regprocedure::text || '|' || md5(pg_get_functiondef(p.oid)) || '|' || coalesce(array_to_string(p.proacl, ','), '') || '|' ||
-             p.prosecdef::text || '|' || p.provolatile::text || '|' || coalesce(array_to_string(p.proconfig, ','), '') AS o FROM pg_proc p WHERE p.pronamespace = 'booking'::regnamespace
-      UNION ALL SELECT 'trg|' || tgrelid::regclass::text || '|' || tgname || '|' || pg_get_triggerdef(oid) FROM pg_trigger WHERE NOT tgisinternal AND tgrelid::regclass::text LIKE 'booking.%'
-      UNION ALL SELECT 'col|' || table_name || '|' || column_name || '|' || data_type || '|' || is_nullable FROM information_schema.columns WHERE table_schema = 'booking'
-      UNION ALL SELECT 'tbl|' || grantee || '|' || table_name || '|' || privilege_type FROM information_schema.role_table_grants WHERE table_schema = 'booking'
-      UNION ALL SELECT 'pol|' || tablename || '|' || policyname || '|' || array_to_string(roles, ',') || '|' || cmd FROM pg_policies WHERE schemaname = 'booking'
-      UNION ALL SELECT 'con|' || conrelid::regclass::text || '|' || conname || '|' || pg_get_constraintdef(oid) FROM pg_constraint WHERE connamespace = 'booking'::regnamespace
-      UNION ALL SELECT 'idx|' || indexrelid::regclass::text || '|' || pg_get_indexdef(indexrelid) FROM pg_index WHERE indrelid::regclass::text LIKE 'booking.%'
-      UNION ALL SELECT 'rls|' || relname || '|' || relrowsecurity::text FROM pg_class WHERE relnamespace = 'booking'::regnamespace AND relkind = 'r'
-      ORDER BY 1`)).rows.map((x) => x.o);
+  const objects = schemaObjects;
   const d2 = await startMigratedDatabase();
   const o = new pg.Client({ connectionString: d2.adminUrl }); await o.connect();
   const fresh = await startPostgres(); const f12 = new pg.Client({ connectionString: fresh.adminUrl }); await f12.connect();
+  const up13 = await freshAt(13);
   try {
-    // E7.4b-D1 (0014): measures 0013 itself, so 0014 (fresh cluster, no data) is rolled back first and re-applied last
-    assert.deepEqual(await migrateDown(o, { env: "test", to: 13 }), [16, 15, 14]);   // E7 (0015): mechanical prefix (function-only 0015)
+    // this measures 0013 itself: every later migration (0014 … TOP; fresh cluster, no data) rolls back first — exact list + history (C26) — and is re-applied last
+    await downToBoundary(o, 13);
     const at13 = await objects(o);
+    assert.deepEqual(at13, await objects(up13.c), "down from the top to 13 == a fresh cluster migrated up to 13");
     // 0012-era audit present: a confirmed booking (epoch-0 preflight assessment + epoch-0 claim audit)
     const c = await F.confirmed(d2.app, { listingId: 849901, from: "2032-03-01", to: "2032-03-04" });
     assert.equal(Number((await o.query("SELECT count(*) AS n FROM booking.recording_claim_assessments")).rows[0].n), 1);
@@ -658,11 +694,11 @@ test("D-13: 0013 down with ONLY 0012 epoch-0 audit present == fresh cluster at 1
     }
     // only 0012 audit (and a 0011 non-preflight hold) remain: 0013 rolls back to exactly a fresh 12, then re-applies identically
     assert.deepEqual(await migrateDown(o, { env: "test", to: 12 }), [13]);
-    await migrateUp(f12, { env: "test", to: 12 });
+    assert.deepEqual(await migrateUp(f12, { env: "test", to: 12 }), range(1, 12));
     assert.deepEqual(await objects(o), await objects(f12), "down 0013 == fresh cluster at 12");
     assert.equal(Number((await o.query("SELECT count(*) AS n FROM booking.recording_claim_assessments")).rows[0].n), 1, "0012 audit preserved");
     assert.deepEqual(await migrateUp(o, { env: "test", to: 13 }), [13]);
     assert.deepEqual(await objects(o), at13, "re-up identical");
-    assert.deepEqual(await migrateUp(o, { env: "test" }), [14, 15, 16]);   // E7 (0015): mechanical suffix
-  } finally { await o.end(); await f12.end(); fresh.stop(); await d2.close(); }
+    await upFromBoundary(o, 13);
+  } finally { await o.end(); await f12.end(); fresh.stop(); await up13.close(); await d2.close(); }
 });
