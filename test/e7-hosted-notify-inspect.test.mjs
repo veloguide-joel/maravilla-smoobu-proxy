@@ -306,6 +306,43 @@ test("N9 hosted verify / inspect gates: main only, run id, every expected digest
   assert.deepEqual([noConn.exitCode, noConn.result.core.code, noConn.result.core.stage], [1, "NIN_DB_FAILED", "connect"]); assert.doesNotMatch(JSON.stringify(noConn), PII);
 });
 
+test("N10 C48-F2 bounded connection lifecycle in THIS wrapper (the frozen tooling pool has no connect timeout): a never-resolving connect → NIN_DB_TIMEOUT / connect within connectMs and a LATE connection is disposed (release(true)); a rejected connect → NIN_DB_FAILED; a never-resolving pool.end() → bounded POOL_END_TIMEOUT; a hung ROLLBACK → bounded; outcomes are code-only", async () => {
+  const fast = { ...C, budgets: { ...C.budgets, connectMs: 80, endMs: 80, rollbackMs: 80 } };
+  const env = () => gated({ E7_DEV_BOOKING_DATABASE_URL: DBURL });
+  const poolOf = (connect, end = async () => {}) => ({ importPool: async () => ({ createBookingPool: () => ({ connect, end }) }) });
+  // (1) connect never resolves; (2) the same pending connect then resolves LATE → disposed, never used
+  let resolveLate; let lateReleased = 0; const st = { queries: 0 };
+  const late = { query: async () => { st.queries += 1; return { rows: [] }; }, release: (d) => { if (d === true) lateReleased += 1; } };
+  const t0 = Date.now();
+  const r1 = await R.runHosted({ mode: "inspect", env: env(), proc: PROC, wrapperDir: ROOT, deps: { ...fakeDeps().deps, constants: fast, ...poolOf(() => new Promise((res) => { resolveLate = res; })) } });
+  assert.ok(Date.now() - t0 < 3000, "bounded by connectMs");
+  assert.deepEqual([r1.exitCode, r1.result.code, r1.result.core.code, r1.result.core.stage, r1.result.core.statements, r1.result.cleanup], [1, "INSPECT_DONE", "NIN_DB_TIMEOUT", "connect", 0, "POOL_ENDED"]);
+  resolveLate(late); await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual([lateReleased, st.queries], [1, 0], "a connection arriving after the bound is destroyed and never queried");
+  // (3) connect rejects (sanitized; the error text never surfaces)
+  const r3 = await R.runHosted({ mode: "inspect", env: env(), proc: PROC, wrapperDir: ROOT, deps: { ...fakeDeps().deps, constants: fast, ...poolOf(async () => { throw new Error("SENTINEL FAKEPW host=x"); }) } });
+  assert.deepEqual([r3.result.core.code, r3.result.core.stage], ["NIN_DB_FAILED", "connect"]); assert.doesNotMatch(JSON.stringify(r3), PII);
+  // (4) pool.end() never resolves: the run still returns (bounded) with the core outcome intact
+  let released = 0; const fc = fakeClient(world());
+  const t4 = Date.now();
+  const r4 = await R.runHosted({ mode: "inspect", env: env(), proc: PROC, wrapperDir: ROOT,
+    deps: { ...fakeDeps().deps, constants: fast, ...poolOf(async () => ({ query: fc.query, release: (d) => { if (d === true) released += 1; } }), () => new Promise(() => {})) } });
+  assert.ok(Date.now() - t4 < 3000, "bounded by endMs");
+  assert.deepEqual([r4.exitCode, r4.result.core.code, r4.result.cleanup, released], [0, "INSPECTED", "POOL_END_TIMEOUT", 1]);
+  assert.match(R.summaryMarkdown(r4.result), / cleanup=POOL_END_TIMEOUT /);
+  // (5) a hung ROLLBACK is bounded by rollbackMs and turns the outcome into a sanitized failure
+  const hung = fakeClient(world()); const q0 = hung.query;
+  const hc = { query: (t, p) => (t === Q.rollback ? new Promise(() => {}) : q0(t, p)) };
+  const t5 = Date.now(); const r5 = await R.inspectNotification({ client: hc, plan: PLAN, c: fast });
+  assert.ok(Date.now() - t5 < 2000); assert.deepEqual([r5.code, r5.stage, r5.admission], ["NIN_DB_FAILED", "rollback", null]);
+  // bounded(): value / rejection / timeout / late disposal
+  assert.deepEqual(await R.bounded(Promise.resolve(7), 50), { ok: true, value: 7 });
+  assert.deepEqual(await R.bounded(Promise.reject(new Error("x")), 50), { ok: false, timedOut: false });
+  let lateV = null; let res; const pending = new Promise((r) => { res = r; });
+  assert.deepEqual(await R.bounded(pending, 20, (v) => { lateV = v; }), { ok: false, timedOut: true }); res(9); await new Promise((r) => setTimeout(r, 10)); assert.equal(lateV, 9);
+  assert.deepEqual([C.budgets.connectMs, C.budgets.overallMs, C.budgets.rollbackMs, C.budgets.endMs], [10000, 30000, 2000, 5000], "database-phase bound 47 s (the workflow's 10-minute job timeout is a separate outer cancellation)");
+});
+
 // ---------------------------------------------------------------------------------------------------------------------------------
 // OPT-IN REAL DISPOSABLE POSTGRESQL (E7_HNI_DB_TESTS=1): the tooling's accepted migrator / harness / fixtures at d322d219; the RUNTIME APP ROLE.
 if (DB_TESTS) {
@@ -329,7 +366,7 @@ if (DB_TESTS) {
   const notifyOf = async (d, id) => (await d.owner.query("SELECT id::text FROM booking.external_operations WHERE intent_id = $1 AND op_type = 'guest.notify'", [id])).rows[0].id;
   const verOf = async (d, id) => (await d.owner.query("SELECT version FROM booking.intents WHERE id = $1", [id])).rows[0].version;
 
-  test("D1 catalog pins == the tooling migrations read as the RUNTIME APP ROLE (and as the owner) at 21 / 22 / 23; the read path is STABLE / IMMUTABLE, calls only itself, and has no write / lock / sequence / dynamic SQL token", async () => {
+  test("D1 catalog pins == the tooling migrations read as the RUNTIME APP ROLE (and as the owner) at 21 / 22 / 23 on THIS server version (run on PG16 and PG17); rel section independently re-derived in JS; owner-default MAINTAIN is the only canonicalised difference while widened / non-owner MAINTAIN / other owner changes refuse; the read path is STABLE / IMMUTABLE, calls only itself, and has no write / lock / sequence / dynamic SQL token", async () => {
     for (const to of [21, 22, 23]) {
       const d = await dbAt(to); try {
         const a = await appClient(d); try {
@@ -346,7 +383,41 @@ if (DB_TESTS) {
           }
           assert.equal((await a.query("SELECT has_function_privilege('booking.list_guest_notifications(integer[],uuid,integer)', 'EXECUTE') AS x")).rows[0].x, true);
           assert.equal((await a.query("SELECT has_function_privilege('booking.guest_notification_refusal(uuid)', 'EXECUTE') AS x")).rows[0].x, false, "refusal detail is owner-only (reported as unavailable)");
+          // C48-F1 INDEPENDENT derivation of the `rel` section from RAW catalog rows with a JS canonicaliser (not the SQL fragment): owner-default MAINTAIN only
+          const canonJs = (item, owner) => { const eq = item.indexOf("="); const sl = item.lastIndexOf("/"); const grantee = item.slice(0, eq); const grantor = item.slice(sl + 1);
+            return grantee === owner && grantor === owner ? `${owner}=${item.slice(eq + 1, sl).replace("m", "")}/${owner}` : item; };
+          const raw = (await a.query("SELECT c.relname, c.relkind::text AS k, pg_get_userbyid(c.relowner) AS owner, c.relrowsecurity AS r, c.relforcerowsecurity AS f, c.relacl::text[] AS acl FROM pg_class c WHERE c.relnamespace = 'booking'::regnamespace AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')")).rows;
+          const lines = raw.map((x) => `${x.relname}|${x.k}|${x.owner}|${x.r}|${x.f}|${x.acl ? x.acl.map((i) => canonJs(i, x.owner)).sort().join(",") : "-"}`).sort((p, q) => (p < q ? -1 : p > q ? 1 : 0));
+          const sortedPg = (await a.query("SELECT array_agg(x ORDER BY x) AS a FROM unnest($1::text[]) x", [lines])).rows[0].a;   // PostgreSQL collation order, as string_agg uses
+          assert.equal(sha(sortedPg.join("\n")), pin(to).sections.rel, `independently derived rel section @${to} == the pin`);
+          const ver = Number((await a.query("SHOW server_version_num")).rows[0].server_version_num);
+          const ownerItem = raw.find((x) => x.relname === "intents").acl.find((i) => i.startsWith("postgres="));
+          assert.equal(ownerItem, ver >= 170000 ? "postgres=arwdDxtm/postgres" : "postgres=arwdDxt/postgres", "the representation difference this canonicalisation exists for");
         } finally { await a.end(); }
+        // the SQL fragment itself, on literal aclitem text: ONLY the owner's self-granted `m` is dropped; everything else is verbatim
+        const canon = async (item, owner = "postgres") => (await d.owner.query(`SELECT ${R.OWNER_ACL_CANON} AS x FROM (SELECT $1::text AS item, $2::text AS owner) a`, [item, owner])).rows[0].x;
+        assert.equal(await canon("postgres=arwdDxtm/postgres"), "postgres=arwdDxt/postgres"); assert.equal(await canon("postgres=arwdDxt/postgres"), "postgres=arwdDxt/postgres");
+        for (const v of ["mv_booking_report=m/postgres", "mv_booking_app=arwdm/postgres", "=m/postgres", "postgres=arwdDxtm/someone_else", "mv_booking_admin=r/postgres"]) assert.equal(await canon(v), v, v);
+        assert.equal(await canon("postgres=arwdDxm/postgres"), "postgres=arwdDx/postgres", "any OTHER owner bit change is still visible (t missing stays missing)");
+        // LIVE regressions as the app role: a widened non-owner grant refuses; on PG17 a non-owner MAINTAIN grant refuses; revoking the owner's own MAINTAIN is harmless
+        const relNow = async () => { const c = await appClient(d); try { return (await c.query(Q.catalog, [[...R.READ_PATH_FUNCTIONS]])).rows[0].id.sections.rel; } finally { await c.end(); } };
+        const inspectCat = async () => (await run(d, "3f1c2b4a-5d6e-4f70-8a91-b2c3d4e5f607", "7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d", 1)).code;
+        assert.equal(await relNow(), pin(to).sections.rel);
+        await d.owner.query("GRANT SELECT ON booking.api_rate_limits TO mv_booking_report");
+        assert.notEqual(await relNow(), pin(to).sections.rel); assert.equal(await inspectCat(), "NIN_CATALOG_UNKNOWN", "widened non-owner grant refuses");
+        await d.owner.query("REVOKE SELECT ON booking.api_rate_limits FROM mv_booking_report"); assert.equal(await relNow(), pin(to).sections.rel);
+        const v17 = Number((await d.owner.query("SHOW server_version_num")).rows[0].server_version_num) >= 170000;
+        if (v17) {
+          await d.owner.query("GRANT MAINTAIN ON booking.intents TO mv_booking_report");
+          assert.notEqual(await relNow(), pin(to).sections.rel); assert.equal(await inspectCat(), "NIN_CATALOG_UNKNOWN", "a non-owner MAINTAIN grant still refuses");
+          await d.owner.query("REVOKE MAINTAIN ON booking.intents FROM mv_booking_report"); assert.equal(await relNow(), pin(to).sections.rel);
+          await d.owner.query("REVOKE MAINTAIN ON booking.intents FROM postgres");
+          assert.equal(await relNow(), pin(to).sections.rel, "PG16-shaped owner item on PG17 == the pin (owner-default MAINTAIN is the ONLY canonicalised difference)");
+          await d.owner.query("GRANT MAINTAIN ON booking.intents TO postgres");
+        }
+        await d.owner.query("REVOKE TRIGGER ON booking.intents FROM postgres");
+        assert.notEqual(await relNow(), pin(to).sections.rel, "any other owner self-revoke is still a drift"); await d.owner.query("GRANT TRIGGER ON booking.intents TO postgres");
+        assert.equal(await relNow(), pin(to).sections.rel);
       } finally { await d.close(); }
     }
   });

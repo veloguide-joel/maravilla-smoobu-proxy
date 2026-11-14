@@ -34,8 +34,9 @@ import { spawn } from "node:child_process";
 const freeze = Object.freeze;
 function deepFreeze(v) { if (v && typeof v === "object") { for (const k of Object.keys(v)) deepFreeze(v[k]); freeze(v); } return v; }
 
-/** the reviewed catalog identities (pg_catalog-only probe CATALOG_SQL, read as the runtime app role) of the tooling migrations 0001..21 / ..22 / ..23 */
-const CATALOG_PINS = {"21":{"catalog":"c81b29c863e577fe6b1b375f5939f1795d50bbab181f888ad71ea84232bf1658","readPath":"b65eddc193d48fe1d03d265084bff9318052226b5f7bc06faa25b881359cea42","readPathCount":6,"sections":{"col":"fc4df946eb4ce7a8973f62ec08f64a4c30af5ff67a9fe16a6d8c1be7c2b3da6d","con":"73e075a81ca19a23eb2aeacd0501e0b81d46457937c45a4e38cd41a7fa65e4fa","fn":"d5f1c5901248783c89fa6346e46c99efd1eb42a2dc4871cf6481f03dc3cb9335","pol":"5d722ffc57a95a8df04328383c7ad56ceb6e6189f15632a218b6bac3d237a16b","rel":"5ddc22a5866f5b3b9c163fd2c93f615322a1fa8468d27463c75f1a44bcd546f7","trg":"e5ecc89050c0d2a3448acc894abf0d6a6930a0927a087e4d632337cb32dfef9a"}},"22":{"catalog":"ff09bb45fdac7a2f88f2f0d41311d3764d8b349b7c5266293a4e6b49ab7b2899","readPath":"b65eddc193d48fe1d03d265084bff9318052226b5f7bc06faa25b881359cea42","readPathCount":6,"sections":{"col":"c3ceb904d9251d9a866bd77f5d1e69096dcb818cc3ffed0745ee06f45839d45b","con":"0d223ff8db8670a8e38feaa448951047b122d9391839f0443391178a39b18f75","fn":"fac3894b2c99ad8abfb84b42b9995e9bfe69df02f84ea7635ad9f63cec8fa237","pol":"5d722ffc57a95a8df04328383c7ad56ceb6e6189f15632a218b6bac3d237a16b","rel":"5ddc22a5866f5b3b9c163fd2c93f615322a1fa8468d27463c75f1a44bcd546f7","trg":"e5ecc89050c0d2a3448acc894abf0d6a6930a0927a087e4d632337cb32dfef9a"}},"23":{"catalog":"80f7360140dd27217941ba41efe97d6399d60e068ee0d3a4cb5cf2dfef36ec19","readPath":"b65eddc193d48fe1d03d265084bff9318052226b5f7bc06faa25b881359cea42","readPathCount":6,"sections":{"col":"60cc4581c26ef735546498ed91fdc15cb28e178978276c90f30eb94e3c5d5efa","con":"0551bcedfedd2195dde1b886f226ad3c571a161ac5ad37680491e8b860de7018","fn":"faa842932cde62c14c41897f12a7ce96b0a155c9b9b2a8d9e2aced13191b1db1","pol":"ae6d6afdc00aff7bb6d809be72d28c9f99f9b29761641c8361cef4282d501cb6","rel":"d42fa6154d8160224460f4975bcc1114268cf7adb9955d12814a9a4e5edb80e5","trg":"8824ff6a6d24a88a164dee959594d44f8e8215423eb082aaea49a9db6d69a874"}}};
+/** the reviewed catalog identities (pg_catalog-only probe CATALOG_SQL, read as the runtime app role) of the tooling migrations 0001..21 / ..22 / ..23 —
+ * derived on disposable PostgreSQL 16 AND 17.11 (identical per section after the C48-F1 owner-default MAINTAIN canonicalisation; app == owner) */
+const CATALOG_PINS = {"21":{"catalog":"b214be27f88ce135ce0430e1f8890f4755de30bd8de3e4e9fcd366119bb64d50","readPath":"b65eddc193d48fe1d03d265084bff9318052226b5f7bc06faa25b881359cea42","readPathCount":6,"sections":{"col":"fc4df946eb4ce7a8973f62ec08f64a4c30af5ff67a9fe16a6d8c1be7c2b3da6d","con":"73e075a81ca19a23eb2aeacd0501e0b81d46457937c45a4e38cd41a7fa65e4fa","fn":"d5f1c5901248783c89fa6346e46c99efd1eb42a2dc4871cf6481f03dc3cb9335","pol":"2e3b80b0f8e5bf4f1aba740c6e09bf9409e01eccc62bac24561de0a93a78599f","rel":"deb54105ceb75882f6a9d8d46edffcfd02abd1daf08a411e78a2c193a5e8ce22","trg":"e5ecc89050c0d2a3448acc894abf0d6a6930a0927a087e4d632337cb32dfef9a"}},"22":{"catalog":"42da3bd5f8923fe70a58ed2ddcf5cfab15371eb77f3c0f51f1792bdeb60b8bac","readPath":"b65eddc193d48fe1d03d265084bff9318052226b5f7bc06faa25b881359cea42","readPathCount":6,"sections":{"col":"c3ceb904d9251d9a866bd77f5d1e69096dcb818cc3ffed0745ee06f45839d45b","con":"0d223ff8db8670a8e38feaa448951047b122d9391839f0443391178a39b18f75","fn":"fac3894b2c99ad8abfb84b42b9995e9bfe69df02f84ea7635ad9f63cec8fa237","pol":"2e3b80b0f8e5bf4f1aba740c6e09bf9409e01eccc62bac24561de0a93a78599f","rel":"deb54105ceb75882f6a9d8d46edffcfd02abd1daf08a411e78a2c193a5e8ce22","trg":"e5ecc89050c0d2a3448acc894abf0d6a6930a0927a087e4d632337cb32dfef9a"}},"23":{"catalog":"84b3e96fb4b709a933ed738d9f6ee284fc667e9ef937cdaf1b230775cfe549d6","readPath":"b65eddc193d48fe1d03d265084bff9318052226b5f7bc06faa25b881359cea42","readPathCount":6,"sections":{"col":"60cc4581c26ef735546498ed91fdc15cb28e178978276c90f30eb94e3c5d5efa","con":"0551bcedfedd2195dde1b886f226ad3c571a161ac5ad37680491e8b860de7018","fn":"faa842932cde62c14c41897f12a7ce96b0a155c9b9b2a8d9e2aced13191b1db1","pol":"6945243972e402d97b02f622a6f833c664c3602930347f760a8e4eb56208778a","rel":"37ad76f27a9725f7fb80ae5587547cbf987e8d49a28469e1a15d3b966f332bd5","trg":"8824ff6a6d24a88a164dee959594d44f8e8215423eb082aaea49a9db6d69a874"}}};
 
 export const CONSTANTS = deepFreeze({
   toolingCommit: "d322d2192b377d18b6a9280ae06c17eddfe3e73e",          // e7-test: #115 merged (C46) on top of #114 (C45); immutable
@@ -50,7 +51,10 @@ export const CONSTANTS = deepFreeze({
   listingId: 606998, dbEnvironment: "test", dbProjectRef: "mxotevtiscernhqilyiu", nodeVersion: "22.22.0",
   protectedReservationIds: ["70636076", "71045356", "71072615", "71081885"],
   catalogPins: CATALOG_PINS,
-  budgets: { statements: 40, pages: 20, pageLimit: 100, statementMs: 5000, lockMs: 1000, idleMs: 20000, overallMs: 30000 },
+  // C48-F2 timing scope: connect ≤ connectMs (the frozen tooling pool has no connect timeout, so THIS wrapper bounds it), the core ≤ overallMs from its
+  // BEGIN (per-statement server bounds statementMs / lockMs / idleMs inside it), its ROLLBACK ≤ rollbackMs, pool.end ≤ endMs ⇒ the database phase is bounded
+  // by connectMs + overallMs + rollbackMs + endMs (47 s). The workflow's 10-minute job timeout is a separate outer cancellation, NOT this bound.
+  budgets: { statements: 40, pages: 20, pageLimit: 100, statementMs: 5000, lockMs: 1000, idleMs: 20000, overallMs: 30000, rollbackMs: 2000, connectMs: 10000, endMs: 5000 },
   synthetic: { approvalRef: "SYNTHETIC-notify-inspect-preflight-not-for-inspect", intentId: "00000000-0000-4000-8000-000000000000",
     opId: "00000000-0000-4000-8000-000000000001", expectedVersion: 1 }
 });
@@ -130,13 +134,22 @@ export function buildPlan(c, { approvalRef, intentId, opId, expectedVersion, sou
 const READ_PATH = freeze(["gn_check_scope", "gn_recipient_in_scope", "guest_notification_class", "guest_notification_protected", "list_guest_notifications",
   "recording_protected_reservation_ids"]);
 export const READ_PATH_FUNCTIONS = READ_PATH;
+/**
+ * C48-F1: the ONE canonicalisation in the catalog identity — PostgreSQL 17 adds MAINTAIN (`m`) to the OWNER's own default aclitem of a relation
+ * (PG16 `postgres=arwdDxt/postgres`, PG17 `postgres=arwdDxtm/postgres`; the shared DEV target is PG 17.11). Only in the owner's SELF-granted item
+ * (grantee = grantor = the relation owner) the `m` bit is dropped; every other bit of that item and EVERY other aclitem (any non-owner grantee incl. a
+ * MAINTAIN grant, PUBLIC, an item granted to the owner by someone else) stays VERBATIM, so a widened or extra grant still changes the identity. The
+ * owner name itself is part of the line. Narrower than the accepted C46 table_acls rule (which reduces the whole owner item to a marker).
+ * Inputs `a.item` (aclitem text) and `a.owner` (the relation owner name).
+ */
+export const OWNER_ACL_CANON = "CASE WHEN split_part(a.item, '=', 1) = a.owner AND split_part(a.item, '/', 2) = a.owner THEN a.owner || '=' || replace(split_part(split_part(a.item, '=', 2), '/', 1), 'm', '') || '/' || a.owner ELSE a.item END";
 export const CATALOG_SQL = `SELECT jsonb_build_object(
   'sections', (SELECT jsonb_object_agg(s.k, s.h) FROM (SELECT q.k, encode(sha256(convert_to(string_agg(q.x, E'\\n' ORDER BY q.x), 'UTF8')), 'hex') AS h FROM (
       SELECT 'fn' AS k, p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')|' || md5(pg_catalog.pg_get_functiondef(p.oid)) || '|' || p.prosecdef::text || '|'
              || p.provolatile::text || '|' || coalesce(array_to_string(p.proconfig, ','), '') || '|' || coalesce((SELECT string_agg(a::text, ',' ORDER BY a::text) FROM unnest(p.proacl) a), '') AS x
         FROM pg_catalog.pg_proc p WHERE p.pronamespace = 'booking'::regnamespace
-      UNION ALL SELECT 'rel', c.relname || '|' || c.relkind::text || '|' || c.relrowsecurity::text || '|' || c.relforcerowsecurity::text || '|'
-             || coalesce((SELECT string_agg(a::text, ',' ORDER BY a::text) FROM unnest(c.relacl) a), '')
+      UNION ALL SELECT 'rel', c.relname || '|' || c.relkind::text || '|' || pg_catalog.pg_get_userbyid(c.relowner) || '|' || c.relrowsecurity::text || '|' || c.relforcerowsecurity::text || '|'
+             || coalesce((SELECT string_agg(z.x, ',' ORDER BY z.x) FROM (SELECT ${OWNER_ACL_CANON} AS x FROM (SELECT unnest(c.relacl)::text AS item, pg_catalog.pg_get_userbyid(c.relowner) AS owner) a) z), '-')
         FROM pg_catalog.pg_class c WHERE c.relnamespace = 'booking'::regnamespace AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
       UNION ALL SELECT 'col', c.relname || '|' || a.attname || '|' || pg_catalog.format_type(a.atttypid, a.atttypmod) || '|' || a.attnotnull::text
         FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
@@ -147,7 +160,7 @@ export const CATALOG_SQL = `SELECT jsonb_build_object(
         FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid WHERE c.relnamespace = 'booking'::regnamespace AND NOT t.tgisinternal
       UNION ALL SELECT 'pol', c.relname || '|' || pl.polname || '|' || pl.polcmd::text || '|' || coalesce(pg_catalog.pg_get_expr(pl.polqual, pl.polrelid), '') || '|'
              || coalesce(pg_catalog.pg_get_expr(pl.polwithcheck, pl.polrelid), '') || '|'
-             || coalesce((SELECT string_agg(CASE WHEN r = 0 THEN 'public' ELSE r::regrole::text END, ',' ORDER BY 1) FROM unnest(pl.polroles) r), '')
+             || coalesce((SELECT string_agg(z.x, ',' ORDER BY z.x) FROM (SELECT CASE WHEN r = 0 THEN 'public' ELSE r::regrole::text END AS x FROM unnest(pl.polroles) r) z), '')
         FROM pg_catalog.pg_policy pl JOIN pg_catalog.pg_class c ON c.oid = pl.polrelid WHERE c.relnamespace = 'booking'::regnamespace) q GROUP BY q.k) s),
   'readPath', (SELECT encode(sha256(convert_to(coalesce(string_agg(p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')|' || pg_catalog.pg_get_functiondef(p.oid),
       E'\\n' ORDER BY p.proname), ''), 'UTF8')), 'hex')
@@ -284,12 +297,24 @@ export async function inspectNotification({ client, plan, c = CONSTANTS, now = D
     out.stage = stage; out.admission = null;
   } finally {
     if (began) {
-      try { out.statements += 1; await Promise.race([client.query(QUERIES.rollback), new Promise((_, rej) => setTimeout(() => rej(new Error("rollback timeout")), 2000).unref?.())]); }
+      let rt; try { out.statements += 1; await Promise.race([client.query(QUERIES.rollback), new Promise((_, rej) => { rt = setTimeout(() => rej(new Error("rollback timeout")), c.budgets.rollbackMs); })]); }
       catch { if (out.code === "INSPECTED") { out.code = "NIN_DB_FAILED"; out.stage = "rollback"; out.admission = null; } }
+      finally { clearTimeout(rt); }
     }
   }
   return deepFreeze(out);
 }
+
+/** bounded(promise, ms) → { ok, value } | { ok: false, timedOut }; never throws; a value arriving AFTER the bound is handed to onLate (disposal). */
+export function bounded(promise, ms, onLate = () => {}) {
+  return new Promise((resolve) => {
+    let done = false;
+    const t = setTimeout(() => { if (!done) { done = true; resolve({ ok: false, timedOut: true }); } }, ms);
+    Promise.resolve(promise).then((v) => { if (done) { try { onLate(v); } catch { /* ignore */ } return; } done = true; clearTimeout(t); resolve({ ok: true, value: v }); },
+      () => { if (done) return; done = true; clearTimeout(t); resolve({ ok: false, timedOut: false }); });
+  });
+}
+const dispose = (cl) => { try { cl?.release?.(true); } catch { /* ignore */ } };
 
 // ---- hosted boot -----------------------------------------------------------------------------------------------------------------------
 export const SOURCE_DIGEST_PREFIX = "e7-hosted-notify-inspect-v1\n";
@@ -311,7 +336,7 @@ export async function runHosted({ mode = "preflight", env, proc, wrapperDir, dep
   const readPgVersion = deps.readPgVersion ?? (async (dir) => JSON.parse(await readFile(`${dir}/node_modules/pg/package.json`, "utf8")).version);
   const readCa = deps.readCa ?? ((p) => readFile(p));
   const r = { schema: "e7-hosted-notify-inspect-hosted-v1", mode: null, code: null, workflowSha: null, toolingCommit: c.toolingCommit, toolingStatus: c.toolingStatus,
-    executeEnabled: c.executeEnabled, sendEnabled: c.sendEnabled, closureDigest: null, sourceDigest: null, planKind: null, planHash: null, runId: null, envCode: null, tests: null, core: null };
+    executeEnabled: c.executeEnabled, sendEnabled: c.sendEnabled, closureDigest: null, sourceDigest: null, planKind: null, planHash: null, runId: null, envCode: null, tests: null, core: null, cleanup: null };
   let pool = null; let client = null;
   try {
     if (!["preflight", "verify", "inspect"].includes(mode)) refuse("NIN_USAGE");
@@ -375,23 +400,25 @@ export async function runHosted({ mode = "preflight", env, proc, wrapperDir, dep
       let P; try { P = await importPool(tooling); } catch { refuse("NIN_IMPORT_FAILED"); }
       try { pool = P.createBookingPool({ connectionString: dbUrl, caPem, max: 1, statementTimeoutMs: c.budgets.statementMs }); } catch { refuse("NIN_DB_TARGET_INVALID"); }
     } finally { dbUrl = null; }
-    try { client = await pool.connect(); } catch { client = null; }
-    r.core = client ? await inspect({ client, plan: built.plan, c }) : deepFreeze({ schema: RESULT_SCHEMA, code: "NIN_DB_FAILED", stage: "connect", statements: 0, catalogSchema: null, catalogSections: null, admission: null });
+    let conn; try { conn = await bounded(pool.connect(), c.budgets.connectMs, dispose); } catch { conn = { ok: false, timedOut: false }; }
+    if (conn.ok && conn.value) client = conn.value;
+    r.core = client ? await inspect({ client, plan: built.plan, c })
+      : deepFreeze({ schema: RESULT_SCHEMA, code: conn.timedOut ? "NIN_DB_TIMEOUT" : "NIN_DB_FAILED", stage: "connect", statements: 0, catalogSchema: null, catalogSections: null, admission: null });
     r.code = "INSPECT_DONE";
     return { exitCode: r.core.code === "INSPECTED" ? 0 : 1, result: r };
   } catch (e) {
     r.code = e instanceof Refusal && HOSTED_CODES.includes(e.code) ? e.code : "NIN_INTERNAL";
     return { exitCode: 1, result: r };
   } finally {
-    if (client) { try { client.release(true); } catch { /* ignore */ } }
-    if (pool) await pool.end().catch(() => {});
+    if (client) dispose(client);
+    if (pool) { let e; try { e = await bounded(pool.end(), c.budgets.endMs); } catch { e = { ok: false, timedOut: false }; } r.cleanup = e.ok ? "POOL_ENDED" : (e.timedOut ? "POOL_END_TIMEOUT" : "POOL_END_FAILED"); }
   }
 }
 
 export function summaryMarkdown(r) {
   const a = r.core && r.core.admission;
   const core = r.core ? ` core=${r.core.code}/${r.core.stage} schema=${r.core.catalogSchema ?? "-"} statements=${r.core.statements}${a ? ` class=${a.notifyClass} latch=${a.latchCode ?? "-"} opState=${a.operation.state} attempts=${a.operation.attempts} render=${a.render ? a.render.templateVersion : "-"} receipts=${typeof a.receipts === "string" ? a.receipts : a.receipts.count}` : ""}` : "";
-  return `e7-hosted-notify-inspect ${r.mode} ${r.code} executeEnabled=${r.executeEnabled} sendEnabled=${r.sendEnabled} plan=${r.planKind ?? "-"}:${r.planHash ?? "-"} runId=${r.runId ?? "-"} closure=${r.closureDigest ?? "-"} source=${r.sourceDigest ?? "-"}${core}\n`;
+  return `e7-hosted-notify-inspect ${r.mode} ${r.code} executeEnabled=${r.executeEnabled} sendEnabled=${r.sendEnabled} plan=${r.planKind ?? "-"}:${r.planHash ?? "-"} runId=${r.runId ?? "-"} closure=${r.closureDigest ?? "-"} source=${r.sourceDigest ?? "-"} cleanup=${r.cleanup ?? "-"}${core}\n`;
 }
 
 // ---- the ONLY top-level effect -----------------------------------------------------------------------------------------------------
