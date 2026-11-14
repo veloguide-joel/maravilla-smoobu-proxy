@@ -510,7 +510,7 @@ test("P7 SQL fences: a gn-v1 render can never complete with a UUID (dedicated co
 
 test("P9 C54 exact approved real sender (SENDER ONLY; recipients stay .invalid): real worker + Resend executor over the FAKE exchange on schema 23 → accepted in gn-v2 with the real `from`; sender bound into contentHash; every other path / variant refused with ZERO queries; UNKNOWN never resent", async () => {
   const REAL = Object.freeze({ ...APPROVED_REAL_SENDER });
-  assert.deepEqual({ ...REAL }, { fromAddress: "bookings@mail.maravillanayarit.com", fromName: "maraVilla" });
+  assert.deepEqual({ ...REAL }, { fromAddress: "bookings@mail.micasadirect.com", fromName: "MiCasaDirect" });
   const realOpts = (bk, fx, locale, over = {}) => provOpts(bk, mkPE(fx, REAL), locale, { sender: { ...REAL }, ...over });
   for (const locale of ["en", "es"]) {
     const bk = await confirmedBooking(); const fx = fakeExchange();
@@ -519,7 +519,7 @@ test("P9 C54 exact approved real sender (SENDER ONLY; recipients stay .invalid):
     const r = CLEAN(await runNotificationStep(db.app, realOpts(bk, fx, locale)));
     assert.deepEqual([r.ok, r.outcome, r.sends, r.requestVersion, r.locale, r.provider, fx.calls], [true, "accepted", 1, "gn-v2", locale, "resend", 1], locale);
     const wire = JSON.parse(Buffer.from(fx.reqs[0].body).toString("utf8"));
-    assert.equal(wire.from, "maraVilla <bookings@mail.maravillanayarit.com>"); assert.deepEqual(wire.to, [exp.request.to]); assert.match(exp.request.to, /\.invalid$/);
+    assert.equal(wire.from, "MiCasaDirect <bookings@mail.micasadirect.com>"); assert.deepEqual(wire.to, [exp.request.to]); assert.match(exp.request.to, /\.invalid$/);
     assert.equal(fx.reqs[0].headers["Idempotency-Key"], `mv-gn2-resend-v1/${bk.op.id}/${exp.contentHash}`);
     assert.equal((await renderOf(bk.op.id)).content_hash, exp.contentHash);
     assert.equal((await receiptOf(bk.op.id)).content_hash, exp.contentHash);
@@ -545,11 +545,12 @@ test("P9 C54 exact approved real sender (SENDER ONLY; recipients stay .invalid):
     ["real sender, synthetic-bound executor", provOpts(bk0, peSyn, "en", { sender: { ...REAL } })],
     ["synthetic sender, real-bound executor", provOpts(bk0, peReal, "en")],
     ["hidden accessor sender", provOpts(bk0, peReal, "en", { sender: acc })],
+    ["superseded maraVilla identity (2026-11-14)", provOpts(bk0, peReal, "en", { sender: { fromAddress: "bookings@mail.maravillanayarit.com", fromName: "maraVilla" } })],
     ["sender extra key", provOpts(bk0, peReal, "en", { sender: { ...REAL, replyTo: "a@b.invalid" } })]];
-  for (const fromAddress of ["Bookings@mail.maravillanayarit.com", "bookings@maravillanayarit.com", "bookings@x.mail.maravillanayarit.com", "booking@mail.maravillanayarit.com", "bookings@mail.maravillanayarit.com."]) {
+  for (const fromAddress of ["Bookings@mail.micasadirect.com", "bookings@micasadirect.com", "bookings@x.mail.micasadirect.com", "booking@mail.micasadirect.com", "bookings@mail.micasadirect.com."]) {
     refusedCases.push([`variant address ${fromAddress}`, provOpts(bk0, peReal, "en", { sender: { ...REAL, fromAddress } })]);
   }
-  for (const fromName of ["maravilla", "maraVilla Test", "maraVilla "]) refusedCases.push([`variant name ${fromName}`, provOpts(bk0, peReal, "en", { sender: { ...REAL, fromName } })]);
+  for (const fromName of ["micasadirect", "MiCasaDirect Test", "MiCasaDirect ", "maraVilla"]) refusedCases.push([`variant name ${fromName}`, provOpts(bk0, peReal, "en", { sender: { ...REAL, fromName } })]);
   for (const [kind, o] of refusedCases) {
     const p = wrapPool(db.app);
     assert.deepEqual(await runNotificationStep(p, o), { ok: false, code: "OPTIONS_INVALID" }, kind);

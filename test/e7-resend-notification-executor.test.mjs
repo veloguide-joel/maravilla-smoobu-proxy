@@ -77,8 +77,8 @@ test("X2b C54 exact approved real sender: construction accepts ONLY the exact pa
   const { APPROVED_REAL_SENDER } = await import("../lib/notify/sender-identity.js");
   const REAL = { ...APPROVED_REAL_SENDER };
   const good = { exchange: () => {}, credential: () => KEY };
-  for (const sender of [{ ...REAL, fromAddress: "Bookings@mail.maravillanayarit.com" }, { ...REAL, fromAddress: "bookings@maravillanayarit.com" }, { ...REAL, fromAddress: "bookings@x.mail.maravillanayarit.com" },
-    { ...REAL, fromAddress: "bookings@mail.maravillanayarit.com." }, { ...REAL, fromName: "maravilla" }, { ...REAL, fromName: "maraVilla Test" }, { ...REAL, replyTo: "a@b.invalid" }, Object.create(REAL)]) {
+  for (const sender of [{ ...REAL, fromAddress: "Bookings@mail.micasadirect.com" }, { ...REAL, fromAddress: "bookings@micasadirect.com" }, { ...REAL, fromAddress: "bookings@x.mail.micasadirect.com" },
+    { ...REAL, fromAddress: "bookings@mail.micasadirect.com." }, { ...REAL, fromName: "micasadirect" }, { ...REAL, fromName: "MiCasaDirect Test" }, { ...REAL, fromName: "maraVilla" }, { ...REAL, replyTo: "a@b.invalid" }, Object.create(REAL), { fromAddress: "bookings@mail.maravillanayarit.com", fromName: "maraVilla" } /* superseded 2026-11-14 */]) {
     assert.deepEqual({ ...E.createResendNotificationExecutor({ ...good, sender }) }, { ok: false, code: "EXECUTOR_SENDER_INVALID" }, JSON.stringify(sender));
   }
   const s = mk(() => ok200(), { sender: { ...REAL } });
@@ -86,7 +86,7 @@ test("X2b C54 exact approved real sender: construction accepts ONLY the exact pa
   const b = built("en", { sender: { ...REAL } });
   const out = await s.ex.send({ request: b.request, opId: OP, contentHash: b.contentHash });
   assert.equal(out.kind, "accepted"); assert.equal(s.calls, 1);
-  assert.equal(JSON.parse(s.reqs[0].body.toString("utf8")).from, "maraVilla <bookings@mail.maravillanayarit.com>");
+  assert.equal(JSON.parse(s.reqs[0].body.toString("utf8")).from, "MiCasaDirect <bookings@mail.micasadirect.com>");
   assert.deepEqual(JSON.parse(s.reqs[0].body.toString("utf8")).to, [GUEST.email]);
   // a synthetic-sender request is NOT accepted by a real-sender executor (sender binding unchanged)
   const s2 = mk(() => ok200(), { sender: { ...REAL } }); const syn = built("en");
