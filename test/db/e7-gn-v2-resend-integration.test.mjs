@@ -20,6 +20,7 @@ import { runRecordingStep } from "../../lib/booking-db/recording-worker.js";
 import { runCleanupStep } from "../../lib/booking-db/compensation-worker.js";
 import { runNotificationStep, NOTIFICATION_V2_OPTION_KEY, NOTIFICATION_PROVIDER_OPTION_KEY, V2_SNAPSHOT_FACT_KEYS } from "../../lib/booking-db/notification-worker.js";
 import { createResendNotificationExecutor, RESEND_USER_AGENT } from "../../lib/notify/resend-notification-executor.js";
+import { APPROVED_REAL_SENDER } from "../../lib/notify/sender-identity.js";
 import { buildBookingConfirmationRequest, REQUEST_KEYS_V2 } from "../../lib/checkout/booking-confirmation-request.js";
 import { contentHash as contentHashV1 } from "../../lib/checkout/guest-notification.js";
 import { priceStay } from "../../lib/checkout/server-pricer.js";
@@ -294,10 +295,10 @@ const latchOf = (opId) => one("SELECT * FROM booking.notification_latches WHERE 
 const casesOf = (intentId) => num("SELECT count(*) AS n FROM booking.reconciliation_cases WHERE intent_id = $1 AND kind = 'NOTIFICATION_OUTCOME_UNKNOWN'", [intentId]);
 const sha = (s) => createHash("sha256").update(s, "utf8").digest("hex");
 /** the frozen gn-v2 request the bound DB rows must produce (independent of the worker: intent + guest rows → seven facts → accepted builder) */
-async function expectedV2(bk, locale) {
+async function expectedV2(bk, locale, sender = SENDER) {
   const i = await one("SELECT ref, from_date::text AS a, to_date::text AS b, (to_date - from_date) AS n, guests, final_total_minor AS t, currency FROM booking.intents WHERE id = $1", [bk.id]);
   const g = await one("SELECT email, first_name FROM booking.intent_guests WHERE intent_id = $1", [bk.id]);
-  return buildBookingConfirmationRequest({ template: "booking_confirmed", locale, opId: bk.op.id, sender: { ...SENDER }, guest: { email: g.email, firstName: g.first_name },
+  return buildBookingConfirmationRequest({ template: "booking_confirmed", locale, opId: bk.op.id, sender: { ...sender }, guest: { email: g.email, firstName: g.first_name },
     facts: { ref: i.ref, checkIn: i.a, checkOut: i.b, nights: Number(i.n), guests: i.guests, totalMinor: Number(i.t), currency: i.currency } });
 }
 /** observe the SQL pre-send exactly as the worker does (fresh connection, RR READ ONLY, one SELECT, COMMIT) */
@@ -505,6 +506,60 @@ test("P7 SQL fences: a gn-v1 render can never complete with a UUID (dedicated co
     ["unknown with id", [v2bk.op.id, "gn2-1", "unknown", UU, null, "HTTP_STATUS"]], ["unknown foreign code", [v2bk.op.id, "gn2-1", "unknown", null, null, "SENTINEL"]], ["bad kind", [v2bk.op.id, "gn2-1", "replayed", UU, true, null]]]) {
     assert.match((await pgErr(() => db.app.query("SELECT booking.complete_guest_notification_resend($1, $2, $3, $4::uuid, $5, $6) AS r", args))).message, /^NOTIFY_ARGUMENT_INVALID/, kind);
   }
+});
+
+test("P9 C54 exact approved real sender (SENDER ONLY; recipients stay .invalid): real worker + Resend executor over the FAKE exchange on schema 23 → accepted in gn-v2 with the real `from`; sender bound into contentHash; every other path / variant refused with ZERO queries; UNKNOWN never resent", async () => {
+  const REAL = Object.freeze({ ...APPROVED_REAL_SENDER });
+  assert.deepEqual({ ...REAL }, { fromAddress: "bookings@mail.micasadirect.com", fromName: "MiCasaDirect" });
+  const realOpts = (bk, fx, locale, over = {}) => provOpts(bk, mkPE(fx, REAL), locale, { sender: { ...REAL }, ...over });
+  for (const locale of ["en", "es"]) {
+    const bk = await confirmedBooking(); const fx = fakeExchange();
+    const exp = await expectedV2(bk, locale, REAL); const syn = await expectedV2(bk, locale);
+    assert.equal(exp.ok, true); assert.notEqual(exp.contentHash, syn.contentHash, "changing the sender changes the bound contentHash");
+    const r = CLEAN(await runNotificationStep(db.app, realOpts(bk, fx, locale)));
+    assert.deepEqual([r.ok, r.outcome, r.sends, r.requestVersion, r.locale, r.provider, fx.calls], [true, "accepted", 1, "gn-v2", locale, "resend", 1], locale);
+    const wire = JSON.parse(Buffer.from(fx.reqs[0].body).toString("utf8"));
+    assert.equal(wire.from, "MiCasaDirect <bookings@mail.micasadirect.com>"); assert.deepEqual(wire.to, [exp.request.to]); assert.match(exp.request.to, /\.invalid$/);
+    assert.equal(fx.reqs[0].headers["Idempotency-Key"], `mv-gn2-resend-v1/${bk.op.id}/${exp.contentHash}`);
+    assert.equal((await renderOf(bk.op.id)).content_hash, exp.contentHash);
+    assert.equal((await receiptOf(bk.op.id)).content_hash, exp.contentHash);
+    assert.equal((await notifyOf(bk.id)).state, "succeeded");
+    const fk = fakeExchange(); assert.equal((await runNotificationStep(db.app, realOpts(bk, fk, locale, { workerId: "gn2-again" }))).outcome, "idle"); assert.equal(fk.calls, 0, "no resend");
+  }
+  { const bk = await confirmedBooking(); const fx = fakeExchange(() => ({ status: 500, headers: H200(), body: Buffer.from("x") }));
+    const r = CLEAN(await runNotificationStep(db.app, realOpts(bk, fx, "en")));
+    assert.deepEqual([r.outcome, r.code, fx.calls, (await notifyOf(bk.id)).state, await receiptOf(bk.op.id)], ["unknown", "HTTP_STATUS", 1, "outcome_unknown", undefined]);
+    const fk = fakeExchange(); assert.equal((await runNotificationStep(db.app, realOpts(bk, fk, "en", { workerId: "gn2-u" }))).outcome, "idle"); assert.equal(fk.calls, 0, "UNKNOWN never resent"); }
+  const bk0 = { id: "00000000-0000-4000-8000-0000000000c9", listingId: 891999 };
+  const fx0 = fakeExchange(); const peReal = mkPE(fx0, REAL); const peSyn = mkPE(fx0);
+  const noV2 = (o) => { delete o[NOTIFICATION_V2_OPTION_KEY]; return o; };
+  const noPE = (o) => { delete o[NOTIFICATION_PROVIDER_OPTION_KEY]; return o; };
+  const acc = { fromName: REAL.fromName }; let getter = 0; Object.defineProperty(acc, "fromAddress", { enumerable: true, get() { getter += 1; return REAL.fromAddress; } });
+  const refusedCases = [
+    ["real sender through default gn-v1 mock path", gnOpts(bk0, sink(), { sender: { ...REAL } })],
+    ["real sender through gn-v2 mock path", gnOpts(bk0, sink(), { sender: { ...REAL }, ...v2("en") })],
+    ["real sender, gn-v1 + provider", noV2(provOpts(bk0, peReal, "en", { sender: { ...REAL } }))],
+    ["real sender, gn-v2 without provider", noPE(provOpts(bk0, peReal, "en", { sender: { ...REAL } }))],
+    ["real sender, provider + mock executors", provOpts(bk0, peReal, "en", { sender: { ...REAL }, executors: { sendMessage: () => {}, label: "mock-x" } })],
+    ["real sender, look-alike executor", provOpts(bk0, { ...peReal }, "en", { sender: { ...REAL } })],
+    ["real sender, synthetic-bound executor", provOpts(bk0, peSyn, "en", { sender: { ...REAL } })],
+    ["synthetic sender, real-bound executor", provOpts(bk0, peReal, "en")],
+    ["hidden accessor sender", provOpts(bk0, peReal, "en", { sender: acc })],
+    ["superseded maraVilla identity (2026-11-14)", provOpts(bk0, peReal, "en", { sender: { fromAddress: "bookings@mail.maravillanayarit.com", fromName: "maraVilla" } })],
+    ["sender extra key", provOpts(bk0, peReal, "en", { sender: { ...REAL, replyTo: "a@b.invalid" } })]];
+  for (const fromAddress of ["Bookings@mail.micasadirect.com", "bookings@micasadirect.com", "bookings@x.mail.micasadirect.com", "booking@mail.micasadirect.com", "bookings@mail.micasadirect.com."]) {
+    refusedCases.push([`variant address ${fromAddress}`, provOpts(bk0, peReal, "en", { sender: { ...REAL, fromAddress } })]);
+  }
+  for (const fromName of ["micasadirect", "MiCasaDirect Test", "MiCasaDirect ", "maraVilla"]) refusedCases.push([`variant name ${fromName}`, provOpts(bk0, peReal, "en", { sender: { ...REAL, fromName } })]);
+  for (const [kind, o] of refusedCases) {
+    const p = wrapPool(db.app);
+    assert.deepEqual(await runNotificationStep(p, o), { ok: false, code: "OPTIONS_INVALID" }, kind);
+    assert.deepEqual(p.log, [], `${kind}: zero queries`);
+  }
+  assert.equal(getter, 0, "hidden accessor never invoked"); assert.equal(fx0.calls, 0);
+  const out = await confirmedBooking({ guestDomain: "mv-test.example" }); const fo = fakeExchange();
+  assert.deepEqual([(await runNotificationStep(db.app, realOpts(out, fo, "en"))).outcome, fo.calls], ["idle", 0], "real sender never widens the recipient scope (.example never acquired)");
+  assert.equal(netAttempts, 0);
 });
 
 test("P8 migration 0023: refused down while Resend evidence exists (audit + schema unchanged); a separate fresh cluster with only gn-v1 audit: exact 23 → 22 == forward-built 22, re-up identical; a planted receipt then refuses", async () => {
