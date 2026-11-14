@@ -13,7 +13,7 @@ import * as F from "./fixtures.mjs";
 import { applyEvent, loadIntent, claimReleaseBlockers, createIntentRecord, collectGuestDetails, beginPayStep, recordCheckoutSession, recordHostawayCreateResult } from "../../lib/booking-db/repo.js";
 import { claimNextOperation, completeOperation, requestRead, recordProviderEvidence, settleOperationFromEvidence } from "../../lib/booking-db/operations.js";
 import { requestTestCleanup, bindCleanupExpectation, testCleanupGate, TEST_CLEANUP_EXPECTATION_KEYS } from "../../lib/booking-db/test-cleanup.js";
-import { migrateUp, migrateDown } from "../../db/lib/migrate.js";
+import { migrateUp, migrateDown, loadMigrations } from "../../db/lib/migrate.js";
 import { transition, EVENTS, STATES, TERMINAL_STATES, refundKey, testCleanupEventId, publicStatus, allowedEvents } from "../../lib/checkout/intent-state.js";
 
 let db;
@@ -331,9 +331,10 @@ test("Q8 migration: 0019 down restores the 0018 schema exactly (constraints, ind
     await migrateUp(c, { env: "test" });
     const at19 = await fnAttrs(c); const at19Objs = await objects(c);
     assert.deepEqual(at19.map((f) => ({ ...f })), base18.map((f) => ({ ...f })), "owner, ACL, SECURITY DEFINER, volatility, search_path, signature unchanged for every replaced function");
-    assert.deepEqual(await migrateDown(c, { env: "test", to: 18 }), [21, 20, 19]);                  // 0020 (cleanup worker slice) and 0021 (recorded cleanup foundation) sit on top
+    const TOP = loadMigrations().at(-1).version;                                                     // C41: expected lists derived from the chain (0020 … TOP sit on top)
+    assert.deepEqual(await migrateDown(c, { env: "test", to: 18 }), Array.from({ length: TOP - 18 }, (_, i) => TOP - i));
     assert.deepEqual(await objects(c), base18Objs, "down = 0018 schema exactly");
-    assert.deepEqual(await migrateUp(c, { env: "test" }), [19, 20, 21]);
+    assert.deepEqual(await migrateUp(c, { env: "test" }), Array.from({ length: TOP - 18 }, (_, i) => 19 + i));
     assert.deepEqual(await objects(c), at19Objs, "up re-applies identically");
     const added = at19Objs.filter((o) => !base18Objs.includes(o)).map((o) => o.split("|").slice(0, 2).join("|"));
     for (const n of ["fn|booking.test_refund_settled_for(uuid,text)", "fn|booking.test_refund_ledgered(uuid,text)", "fn|booking.refund_claim_fence()", "fn|booking.recording_retirement_fence()",

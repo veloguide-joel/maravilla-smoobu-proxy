@@ -1251,10 +1251,15 @@ test("0016 up precondition (legacy duplicate / attempted / in_flight / non-canon
     // forward-built 16, not with the TOP snapshot.
     await F.ownerManagedHistory(m.owner, `INSERT INTO booking.notification_renders (operation_id, intent_id, template, template_version, intent_version, facts, facts_hash, recipient_hash,
        content_hash, message_ref, worker, claimed_at) VALUES ($1, (SELECT intent_id FROM booking.external_operations WHERE id = $1), 'booking_confirmed', 'gn-v1', 0, '{}', $2, $2, $2, 'gn1-' || $1::text, 'w', now())`, [nop, SYN]);
-    const audit0 = (await admin.query("SELECT md5(string_agg(row_to_json(r)::text, '|')) AS d FROM booking.notification_renders r")).rows[0].d;
+    // C41: the audit digest is taken over the twelve 0016 columns explicitly. A refused 0016 down first rolls 0022 back (no gn-v2 render
+    // here), which removes 0022's two nullable columns — a whole-row JSON would change its SHAPE although no 0016 audit value changed.
+    const AUDIT16 = "operation_id, intent_id, template, template_version, intent_version, facts, facts_hash, recipient_hash, content_hash, message_ref, worker, claimed_at";
+    const auditDigest = async () => (await admin.query(`SELECT md5(string_agg(row_to_json(r)::text, '|')) AS d FROM (SELECT ${AUDIT16} FROM booking.notification_renders) r`)).rows[0].d;
+    if (TOP >= 22) assert.deepEqual((await admin.query("SELECT locale, copy_contract_version FROM booking.notification_renders")).rows, [{ locale: null, copy_contract_version: null }], "the gn-v1 render has no gn-v2 metadata");
+    const audit0 = await auditDigest();
     const e = await pgErr(() => migrateDown(admin, { env: "test", to: 15 }));
     assert.match(e.message, /^MIGRATION_0016_DOWN_REFUSED/);
-    assert.equal((await admin.query("SELECT md5(string_agg(row_to_json(r)::text, '|')) AS d FROM booking.notification_renders r")).rows[0].d, audit0, "refused down preserves the audit");
+    assert.equal(await auditDigest(), audit0, "refused down preserves the audit (every 0016 column value)");
     assert.deepEqual(await history(admin), [range(1, 16), range(17, TOP)], "later migrations rolled back, 0016 refused and still applied");
     assert.deepEqual(await fenceCatalog(admin), at16, "refused 0016 down leaves exactly the forward-built 0016 catalog");
     assert.deepEqual(await schemaObjects(admin), await schemaObjects(fresh16c.c), "refused 0016 down leaves exactly the forward-built 0016 schema (full shape)");

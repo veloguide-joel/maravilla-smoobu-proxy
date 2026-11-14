@@ -16,7 +16,7 @@ import { claimNextOperation, completeOperation, requestRead, recordProviderEvide
 import { requestTestCleanup } from "../../lib/booking-db/test-cleanup.js";
 import { requestRecordedTestCleanup, bindRecordedCleanupExpectation, TEST_CLEANUP_RECORDED_EXPECTATION_KEYS } from "../../lib/booking-db/test-cleanup-recorded.js";
 import { rowToIntent, intentToRow, MUTABLE_COLUMNS, MIRROR_COLUMN, hasMirrorLeg } from "../../lib/booking-db/codec.js";
-import { migrateUp, migrateDown } from "../../db/lib/migrate.js";
+import { migrateUp, migrateDown, migrationStatus, loadMigrations } from "../../db/lib/migrate.js";
 import { transition, EVENTS, STATES, TERMINAL_STATES, allowedEvents, refundKey, offlineRefundKey, testCleanupRecordedEventId, createIntent } from "../../lib/checkout/intent-state.js";
 
 let db;
@@ -644,20 +644,27 @@ test("Q10 migration: 0021 down restores the 0020 schema exactly (functions incl.
       UNION ALL SELECT 'pol|' || tablename || '|' || policyname || '|' || cmd || '|' || coalesce(qual, '') FROM pg_policies WHERE schemaname = 'booking' ORDER BY 1`)).rows.map((r) => r.o);
     assert.equal((await migrateUp(admin, { env: "test", to: 20 })).at(-1), 20);
     const at20 = await objects();
-    assert.deepEqual(await migrateUp(admin, { env: "test" }), [21]);
+    assert.deepEqual(await migrateUp(admin, { env: "test", to: 21 }), [21]);   // C41: explicit target 21 — this test measures 0021 itself (0022 sits above)
     const at21 = await objects();
     assert.ok(at21.some((x) => x.startsWith("col|intents|settlement_recording_mirrored|boolean|YES")));
     assert.ok(at21.some((x) => x.startsWith("tbl|notification_suppressions|")));
     assert.deepEqual(await migrateDown(admin, { env: "test", to: 20 }), [21]);
     assert.deepEqual(await objects(), at20, "exact restoration");
-    assert.deepEqual(await migrateUp(admin, { env: "test" }), [21]);
+    assert.deepEqual(await migrateUp(admin, { env: "test", to: 21 }), [21]);
     assert.deepEqual(await objects(), at21, "idempotent re-apply");
-    assert.deepEqual(await migrateUp(admin, { env: "test" }), []);
+    assert.deepEqual(await migrateUp(admin, { env: "test", to: 21 }), []);
   } finally { await admin.end(); fresh.stop(); }
   // the shared test database USED the foundation (recorded requests, mirrors, suppressions): down refuses honestly
   const owner = new pg.Client({ connectionString: db.adminUrl }); await owner.connect();
-  try { await refusal(migrateDown(owner, { env: "test", to: 20 }), /cannot be rolled back/); }
-  finally { await owner.end(); }
+  try {
+    await refusal(migrateDown(owner, { env: "test", to: 20 }), /cannot be rolled back/);
+    // C41: every migration above 0021 (0022: no gn-v2 render in this database) rolls back mechanically first, then 0021 refuses; the exact
+    // history is asserted and the top is restored for the rest of this file (expected lists derived from the migration files in this tree)
+    const TOP = loadMigrations().at(-1).version;
+    const st = await migrationStatus(owner, { env: "test" });
+    assert.deepEqual([st.applied, st.pending], [Array.from({ length: 21 }, (_, i) => i + 1), Array.from({ length: TOP - 21 }, (_, i) => 22 + i)], "0021 refused; still applied");
+    assert.deepEqual(await migrateUp(owner, { env: "test" }), Array.from({ length: TOP - 21 }, (_, i) => 22 + i));
+  } finally { await owner.end(); }
   assert.equal((await db.app.query("SELECT count(*)::int AS n FROM booking.notification_suppressions")).rows[0].n > 0, true);
 });
 

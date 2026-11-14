@@ -129,7 +129,7 @@ test("C1b 0019 / 0020 prerequisite + RLS boundary: a cluster at 0018 (0019 / 002
   { const db = await startPostgres(); const c = new pg.Client({ connectionString: db.adminUrl }); await c.connect();
     try { await migrateUp(c, { env: "test", to: 18 });
       let msg = null; try { await runWrapper(c); } catch (e) { msg = e.message; } assert.match(msg, /E7_21_HISTORY_NOT_1_TO_20/);
-      const st = await migrationStatus(c, { env: "test" }); assert.deepEqual(st.applied, Array.from({ length: 18 }, (_, i) => i + 1)); assert.deepEqual(st.pending, [19, 20, 21]);
+      const st = await migrationStatus(c, { env: "test" }); assert.deepEqual(st.applied, Array.from({ length: 18 }, (_, i) => i + 1)); assert.deepEqual(st.pending, Array.from({ length: loadMigrations().at(-1).version - 18 }, (_, i) => 19 + i));   // C41: 19 … TOP pending (derived)
       assert.equal((await c.query("SELECT to_regprocedure('booking.settle_test_refund_from_evidence(uuid,uuid)') IS NULL AS gone")).rows[0].gone, true, "0020 was NOT applied by this wrapper");
       assert.deepEqual(await gone21(c), { f: true, t: true, col: true, idx: true, rows: true });
     } finally { await c.end(); db.stop(); } }
@@ -238,8 +238,11 @@ test("C4 healthy apply (fresh cluster, nonempty booking fixture): status 21 / th
     assert.deepEqual(post.identity.acls["booking.offline_refund_proof_refusal(p_intent uuid, p_payload jsonb, p_result_ref text, p_dispatched_at timestamp with time zone, p_evidence uuid, p_mode text, p_decision_at timestamp with time zone)"], ["postgres=X/postgres"], "owner only");
     for (const f of ["offline_refund_create_fence", "offline_refund_claim_fence", "offline_refund_success_fence", "offline_refund_ledger_fence", "offline_refund_ledger_required", "notify_suppression_audit_required", "notification_suppressions_bound"]) assert.deepEqual(post.identity.acls[`booking.${f}()`], ["postgres=X/postgres"], f);
     const st = await migrationStatus(B.c, { env: "test" });
-    assert.deepEqual(st.applied, Array.from({ length: 21 }, (_, i) => i + 1)); assert.deepEqual(st.pending, []);
-    assert.deepEqual(await migrateUp(B.c, { env: "test" }), [], "migrator no-op after the wrapper");
+    // historical TARGET 21 (C41, same convention as the 0019/0020 wrapper test): the wrapper applies 1..21 exactly; the tree now also carries
+    // 0022, which the wrapper never embeds / applies — it shows as pending (derived) and the migrator no-op check is capped at to: 21
+    assert.deepEqual(st.applied, Array.from({ length: 21 }, (_, i) => i + 1));
+    assert.deepEqual(st.pending, Array.from({ length: loadMigrations().at(-1).version - 21 }, (_, i) => 22 + i));
+    assert.deepEqual(await migrateUp(B.c, { env: "test", to: 21 }), [], "migrator no-op after the wrapper (historical target 21; 0022 not applied)");
     await expectRaise(B.c, /E7_21_ALREADY_APPLIED_OR_LATER/);
     assert.deepEqual(identity(await inventory(B.c)), identity(PINS.post), "replay changed nothing");
     assert.equal((await B.c.query("SELECT count(*)::int AS n FROM booking_migrations.applied WHERE version = 21")).rows[0].n, 1);

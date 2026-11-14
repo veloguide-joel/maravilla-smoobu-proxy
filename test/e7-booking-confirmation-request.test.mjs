@@ -273,18 +273,19 @@ test("R17 module source: imports only node:crypto + the two accepted pure module
   assert.ok(/Reflect\.ownKeys/.test(code) && /getOwnPropertyDescriptor/.test(code) && !/Object\.keys\(/.test(code), "descriptor-based exact-shape extraction");
 });
 
-test("R18 not integrated: worker / operations / API / 0016 do not import or name the new builder; schema still accepts only gn-v1; gn-v1 builder + vectors unchanged", async () => {
-  const files = ["../lib/booking-db/notification-worker.js", "../lib/booking-db/operations.js", "../lib/checkout/guest-notification.js",
-    "../lib/checkout/booking-confirmation-copy.js", "../db/migrations/0016_guest_notification_fence.up.sql"];
-  for (const p of files) {
+test("R18 integration boundary (C41): ONLY the notification worker imports the builder (opt-in path); operations / 0016 / other migrations do not name gn-v2; only 0022 admits it; 0016 still gn-v1-only; gn-v1 builder + vectors unchanged", async () => {
+  const worker = readFileSync(new URL("../lib/booking-db/notification-worker.js", import.meta.url), "utf8");
+  assert.equal([...worker.matchAll(/from "\.\.\/checkout\/booking-confirmation-request\.js"/g)].length, 1, "the worker imports the gn-v2 builder exactly once");
+  assert.ok(/buildBookingConfirmationRequest\(/.test(worker) && /claim_guest_notification_v2\(/.test(worker), "the opt-in path uses the builder and the dedicated v2 claim");
+  for (const p of ["../lib/booking-db/operations.js", "../lib/checkout/guest-notification.js", "../lib/checkout/booking-confirmation-copy.js",
+    "../db/migrations/0016_guest_notification_fence.up.sql"]) {
     const s = readFileSync(new URL(p, import.meta.url), "utf8");
     assert.ok(!s.includes("booking-confirmation-request") && !s.includes("gn-v2"), p);
   }
-  for (const f of readdirSync(new URL("../db/migrations/", import.meta.url))) {
-    assert.ok(!readFileSync(new URL(`../db/migrations/${f}`, import.meta.url), "utf8").includes("gn-v2"), `no migration accepts gn-v2 yet: ${f}`);
-  }
+  const naming = readdirSync(new URL("../db/migrations/", import.meta.url)).filter((f) => readFileSync(new URL(`../db/migrations/${f}`, import.meta.url), "utf8").includes("gn-v2"));
+  assert.deepEqual(naming.sort(), ["0022_gn_v2_booking_confirmation.down.sql", "0022_gn_v2_booking_confirmation.up.sql"], "only 0022 names gn-v2");
   const fence = readFileSync(new URL("../db/migrations/0016_guest_notification_fence.up.sql", import.meta.url), "utf8");
-  assert.ok(fence.includes("CHECK (template_version = 'gn-v1')") && fence.includes("p_template_version IS DISTINCT FROM 'gn-v1'"), "0016 still refuses any other version");
+  assert.ok(fence.includes("CHECK (template_version = 'gn-v1')") && fence.includes("p_template_version IS DISTINCT FROM 'gn-v1'"), "0016 text unchanged: its six-argument claim refuses any other version");
   assert.equal(gn.TEMPLATE_VERSION, "gn-v1");
   const v1 = gn.buildMessageRequest({ template: "booking_confirmed", facts: { v: 1, template: "booking_confirmed", ...FACTS }, guest: { ...GUEST }, sender: { ...SENDER }, opId: OP });
   assert.equal(v1.ok, true);
