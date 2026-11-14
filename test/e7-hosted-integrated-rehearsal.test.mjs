@@ -2,7 +2,7 @@
 // immutable tooling pins, composed on ONE disposable database migrated to 0021 with FAKE provider exchanges. NOT a runtime change: no runner,
 // worker, wrapper, state, schema or closure file is touched; nothing here reads the runners' `executeEnabled` (R0 only records the shipped flags).
 //
-//   purpose      cross-version composition: Slice 1 (tooling 40779e34) → Slice 2 (59178b04, C1 fix: no final_capture) → Slice 4 recording (5a094b16) → Slice 5 recorded cleanup (e41b654a),
+//   purpose      cross-version composition: Slice 1 (tooling 40779e34) → Slice 2 (59178b04, C1 fix: no final_capture) → Slice 4 recording (4ed7a636, C24 repin) → Slice 5 recorded cleanup (e41b654a),
 //                and Slice 1 / 2 → Slice 4 refusal → Slice 3 pristine captured cleanup (9d86bfa1), all against schema 0021. The per-phase hosted
 //                tests each seed their START state with their own pin's fixtures; none of them proves that the version N runner accepts the
 //                version M runner's actual OUTPUT rows. This file carries the SAME intent / reservation / payment intent / charge / price through.
@@ -23,7 +23,7 @@
 //                closure bytes at its pin are verified BEFORE any tooling import / database start, independent of test filters; a mismatch throws
 //                and nothing below it runs (the child-process control N2 proves zero tooling resolution / zero DB activity on a tampered pin).
 //   isolation    no network (https / fetch refused at module load), no env secrets, no live DB: a throwaway cluster from the e41b654a harness.
-//   opt-in       E7_REHEARSAL_DB_TESTS=1 and E7_REHEARSAL_TOOLING_ROOT=<dir holding checkouts 40779e34/ 59178b04/ 9d86bfa1/ 5a094b16/ e41b654a/ (each with
+//   opt-in       E7_REHEARSAL_DB_TESTS=1 and E7_REHEARSAL_TOOLING_ROOT=<dir holding checkouts 40779e34/ 59178b04/ 9d86bfa1/ 4ed7a636/ e41b654a/ (each with
 //                node_modules)>. Without the flag the file only checks the declared pins and exits.
 //
 // scenario A (ref ECHOED): reservation → capture → recording → recorded cleanup. Ends cancelled, all three settlement legs, claim released; EXACTLY
@@ -57,7 +57,7 @@ const RUNNERS = Object.freeze([
   { name: "reservation", E: RES, pin: "40779e34e8c65ac5c4494bc5a18cd4223ef723fa" },
   { name: "capture", E: CAP, pin: "59178b0468469b6570beab861bbc8e48b3a887d1" },        // C2: Slice 2 at the merged C1 fix (omits final_capture); Slice 1 stays at 40779e34
   { name: "test-cleanup", E: TCL, pin: "9d86bfa1e60779b3794de88bbae151670e8fe515" },
-  { name: "recording", E: REC, pin: "5a094b16c1f84690a738a98ab89140caa69c1e1f" },
+  { name: "recording", E: REC, pin: "4ed7a636fee57981262b9c02574190d225b8a1fc" },         // C24: Slice 4 at the merged C21-F1 fix (null-provider list rows); Slices 1 / 2 / 3 / 5 unchanged
   { name: "recorded-cleanup", E: RCL, pin: "e41b654a667cb0ba8775b5bd0040c28a3d14fda0" },
 ]);
 const enc = (o) => new TextEncoder().encode(JSON.stringify(o));
@@ -70,7 +70,7 @@ test("R0 the five runners declare the expected immutable tooling pins; shipped e
     assert.equal(r.E.CONSTANTS.toolingCommit, r.pin, r.name);
     assert.ok(Array.isArray(r.E.CONSTANTS.closure) && /^[0-9a-f]{64}$/.test(r.E.CONSTANTS.closureDigest), `${r.name} closure`);
   }
-  assert.deepEqual(RUNNERS.map((r) => r.E.CONSTANTS.toolingCommit.slice(0, 8)), ["40779e34", "59178b04", "9d86bfa1", "5a094b16", "e41b654a"]);
+  assert.deepEqual(RUNNERS.map((r) => r.E.CONSTANTS.toolingCommit.slice(0, 8)), ["40779e34", "59178b04", "9d86bfa1", "4ed7a636", "e41b654a"]);
 });
 
 /** the closure gate: every runner's closure BYTES at its pin checkout == its frozen digest (the runner's OWN exported prefix). Pure: reads
@@ -328,7 +328,7 @@ if (DB_ON) {
   const recPlan = async (a, rid, chargeId) => REC.buildPlan(C4, { approvalRef: "SYNTHETIC-rehearsal", intentId: a.id, expectedVersion: await ver(a.id), notBefore: nb(a), paymentIntentId: a.piId, reservationId: rid, chargeId, capturedMinor: a.total,
     from: a.stay.from, to: a.stay.to, guests: a.intent.guests, attemptId: a.attemptId, sessionId: a.sessionId, runnerDigest: ZERO });
   const phaseRec = async (a, w, rid, chargeId, k) => { const b = await recPlan(a, rid, chargeId);
-    return REC.runRecordingCore({ plan: b.plan, planHash: b.planHash, runId: `rehearsal-${k}-rec`, pool: db.app, tooling: toolingRec, exchanges: { hostaway: w.hostaway }, credentials: { hostaway: creds.hostaway }, clock: () => Date.now(), sleep: harnessSleep("recording@5a094b16") }); };
+    return REC.runRecordingCore({ plan: b.plan, planHash: b.planHash, runId: `rehearsal-${k}-rec`, pool: db.app, tooling: toolingRec, exchanges: { hostaway: w.hostaway }, credentials: { hostaway: creds.hostaway }, clock: () => Date.now(), sleep: harnessSleep("recording@4ed7a636") }); };
   const phaseRcl = async (a, w, rid, chargeId, offlineChargeId, k) => { const b = RCL.buildPlan(C5, { approvalRef: "SYNTHETIC-rehearsal", intentId: a.id, expectedVersion: await ver(a.id), notBefore: nb(a), paymentIntentId: a.piId, reservationId: rid, chargeId, offlineChargeId, capturedMinor: a.total,
       from: a.stay.from, to: a.stay.to, guests: a.intent.guests, attemptId: a.attemptId, sessionId: a.sessionId, runnerDigest: ZERO });
     return RCL.runRecordedCleanupCore({ plan: b.plan, planHash: b.planHash, runId: `rehearsal-${k}-rcl`, pool: db.app, tooling: toolingRcl, exchanges: { stripe: w.stripe, hostaway: w.hostaway }, credentials: creds, clock: () => Date.now(), sleep: harnessSleep("recorded-cleanup@e41b654a") }); };
@@ -388,22 +388,22 @@ if (DB_ON) {
     return { rid: r1.reservationId, chargeId: r2.chargeId, transitions: s.transitions, opsAfter2: s.ops.map((x) => `${x.op_type}:${x.state}`) };
   }
 
-  test("A echoed ref: reservation(40779e34) → capture(59178b04, C1 fix) → recording(5a094b16) → recorded cleanup(e41b654a) on schema 0021: cancelled, 3 legs, claim released; exactly 1 create / 1 capture / 1 record / 1 cancel / 1 Stripe refund / 1 mirror; history preserved; notify suppressed never dispatched", async () => {
+  test("A echoed ref: reservation(40779e34) → capture(59178b04, C1 fix) → recording(4ed7a636) → recorded cleanup(e41b654a) on schema 0021: cancelled, 3 legs, claim released; exactly 1 create / 1 capture / 1 record / 1 cancel / 1 Stripe refund / 1 mirror; history preserved; notify suppressed never dispatched", async () => {
     const a = await authorizedIntent("A"); const w = world(a, { echoRef: true });
     const pre = await reserveAndCapture(a, w, "A");
-    // ---- phase 3: Slice 4 recording at 5a094b16 on the 40779e34-produced payment_captured row
+    // ---- phase 3: Slice 4 recording at 4ed7a636 on the 40779e34-produced payment_captured row
     const r3 = await phaseRec(a, w, pre.rid, pre.chargeId, "A");
-    budgetLine("A.3 recording@5a094b16", r3, C4);
+    budgetLine("A.3 recording@4ed7a636", r3, C4);
     assert.equal(r3.outcome, "RECORDING_CONFIRMED", JSON.stringify(r3));
     const recordedId = r3.postcheck.offlineChargeId;
     assert.deepEqual([r3.recordInvocations, r3.writes.record, r3.notifyOps, w.charges.length, String(w.charges[0].id)], [1, 1, ["pristine"], 1, recordedId]);
     assert.deepEqual(w.bodies.record, { title: OP4.offlineChargeTitle(a.id), amount: a.total / 100, paymentMethod: "credit_card", status: "paid", scheduledDate: w.bodies.record.scheduledDate });
-    assert.equal(OP5.offlineChargeTitle(a.id), w.bodies.record.title, "the e41b654a title grammar reads the 5a094b16 title (cleanup classifies it next)");
+    assert.equal(OP5.offlineChargeTitle(a.id), w.bodies.record.title, "the e41b654a title grammar reads the 4ed7a636 title (cleanup classifies it next)");
     let s = await snap(a.id);
     assert.deepEqual([s.st.state, s.st.och, s.claim[0].released, s.cases, s.locks], ["confirmed", recordedId, false, 0, 0]);
     assert.deepEqual(opsOf(s, "guest.notify"), [["pending", 0, false]], "ONE guest.notify queued pristine");
     assert.deepEqual(w.writes, ["H POST /v1/reservations", `S POST /v1/payment_intents/${a.piId}/capture`, `H POST /v1/guestPayments/charges/${pre.rid}`]);
-    // ---- phase 4: Slice 5 recorded cleanup at e41b654a on the 5a094b16-produced confirmed row
+    // ---- phase 4: Slice 5 recorded cleanup at e41b654a on the 4ed7a636-produced confirmed row
     const r4 = await phaseRcl(a, w, pre.rid, pre.chargeId, recordedId, "A");
     budgetLine("A.4 recorded-cleanup@e41b654a", r4, C5);
     assert.equal(r4.outcome, "RECORDED_CLEANUP_COMPLETED", JSON.stringify(r4));
@@ -427,11 +427,11 @@ if (DB_ON) {
     findings.push({ scenario: "A", intent: a.id, reservation: pre.rid, pi: a.piId, charge: pre.chargeId, offlineCharge: recordedId, refund: w.refundId, transitions: s.transitions, writeOrder: w.writes, ops: s.ops.map((x) => `${x.op_type}:${x.state}:${x.attempts}`), ledger: s.ledger });
   });
 
-  test("B ref NOT echoed (observed live case): reservation confirms with no relabel, capture succeeds, recording(5a094b16) refuses REF_NOT_ECHOED with ZERO record POST, pristine captured cleanup(9d86bfa1) cancels + refunds with ZERO record / mirror / notify, claim released", async () => {
+  test("B ref NOT echoed (observed live case): reservation confirms with no relabel, capture succeeds, recording(4ed7a636) refuses REF_NOT_ECHOED with ZERO record POST, pristine captured cleanup(9d86bfa1) cancels + refunds with ZERO record / mirror / notify, claim released", async () => {
     const a = await authorizedIntent("B"); const w = world(a, { echoRef: false });
     const pre = await reserveAndCapture(a, w, "B");
     const r3 = await phaseRec(a, w, pre.rid, pre.chargeId, "B");
-    budgetLine("B.3 recording@5a094b16 (refusal)", r3, C4);
+    budgetLine("B.3 recording@4ed7a636 (refusal)", r3, C4);
     assert.deepEqual([r3.outcome, r3.code, r3.steps, r3.recordInvocations, r3.holds, w.charges.length], ["PROVIDER_PROOF_FAILED", "REF_NOT_ECHOED", 0, 0, null, 0]);
     assert.deepEqual(w.writes, ["H POST /v1/reservations", `S POST /v1/payment_intents/${a.piId}/capture`], "ZERO record POST");
     let s = await snap(a.id);
