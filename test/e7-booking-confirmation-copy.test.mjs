@@ -15,7 +15,7 @@ https.Agent = function () { netAttempts += 1; throw new Error("https.Agent refus
 after(() => { globalThis.fetch = realFetch; https.request = realReq; https.Agent = realAgent; assert.equal(netAttempts, 0, "no network attempt"); });
 
 const mod = await import("../lib/checkout/booking-confirmation-copy.js");
-const { COPY_CONTRACT_VERSION, BRAND, LOCALES, TEMPLATES, FACT_KEYS, COPY_KEYS, LIMITS, calendarDayMs, renderBookingConfirmation } = mod;
+const { COPY_CONTRACT_VERSION, BRAND, LOCALES, TEMPLATES, INPUT_KEYS, FACT_KEYS, COPY_KEYS, LIMITS, calendarDayMs, renderBookingConfirmation } = mod;
 const { formatUsd } = await import("../lib/checkout/guest-notification.js");
 
 const FACTS = Object.freeze({ ref: "MV-ABC123", checkIn: "2026-12-04", checkOut: "2026-12-06", nights: 2, guests: 2, totalMinor: 123456, currency: "USD" });
@@ -33,16 +33,17 @@ const ES_TEXT = ["Tu reservación de maraVilla MV-ABC123 está confirmada.", "Re
 // ---------------------------------------------------------------------------------------------
 // contract surface
 
-test("B1 contract constants: independent version bcc-v1, brand, explicit locales en|es, booking_confirmed only, frozen", () => {
+test("B1 contract constants: independent version bcc-v1, brand, explicit locales en|es, booking_confirmed only, exact key sets, frozen", () => {
   assert.equal(COPY_CONTRACT_VERSION, "bcc-v1");
   assert.notEqual(COPY_CONTRACT_VERSION, "gn-v1");
   assert.equal(BRAND, "maraVilla");
   assert.deepEqual([...LOCALES], ["en", "es"]);
   assert.deepEqual([...TEMPLATES], ["booking_confirmed"]);
+  assert.deepEqual([...INPUT_KEYS], ["facts", "locale", "template"]);
   assert.deepEqual([...FACT_KEYS], ["checkIn", "checkOut", "currency", "guests", "nights", "ref", "totalMinor"]);
   assert.deepEqual([...COPY_KEYS], ["contractVersion", "locale", "subject", "template", "text"]);
-  for (const o of [LOCALES, TEMPLATES, FACT_KEYS, COPY_KEYS, LIMITS]) assert.ok(Object.isFrozen(o));
-  assert.deepEqual(Object.keys(mod).sort(), ["BRAND", "COPY_CONTRACT_VERSION", "COPY_KEYS", "FACT_KEYS", "LIMITS", "LOCALES", "TEMPLATES", "calendarDayMs", "renderBookingConfirmation"]);
+  for (const o of [LOCALES, TEMPLATES, INPUT_KEYS, FACT_KEYS, COPY_KEYS, LIMITS]) assert.ok(Object.isFrozen(o));
+  assert.deepEqual(Object.keys(mod).sort(), ["BRAND", "COPY_CONTRACT_VERSION", "COPY_KEYS", "FACT_KEYS", "INPUT_KEYS", "LIMITS", "LOCALES", "TEMPLATES", "calendarDayMs", "renderBookingConfirmation"]);
 });
 
 test("B2 English: exact subject and plain-text body for synthetic facts; frozen; only the five copy keys", () => {
@@ -177,13 +178,90 @@ test("B13 refusal order is validation order and never echoes input values", () =
 });
 
 // ---------------------------------------------------------------------------------------------
+// C37 (ROOT F1): descriptor-based exact shape — hidden / symbol keys, accessors, hostile traps; code-only, nothing invoked, nothing echoed
+
+const SENTINEL = "sensitive-sentinel";
+const noSentinel = (r) => assert.ok(!JSON.stringify(r).includes(SENTINEL) && !JSON.stringify(r).includes("sentinel"));
+
+test("B16 hidden (non-enumerable) and symbol own keys are extra keys at BOTH levels → INPUT_INVALID / FACTS_SHAPE", () => {
+  const outerHidden = input("en"); Object.defineProperty(outerHidden, "email", { value: SENTINEL, enumerable: false });
+  codeOnly(renderBookingConfirmation(outerHidden), "INPUT_INVALID");
+  const outerSym = input("en"); outerSym[Symbol("email")] = SENTINEL;
+  codeOnly(renderBookingConfirmation(outerSym), "INPUT_INVALID");
+  const fHidden = { ...FACTS }; Object.defineProperty(fHidden, "email", { value: SENTINEL, enumerable: false });
+  codeOnly(renderBookingConfirmation({ template: "booking_confirmed", locale: "en", facts: fHidden }), "FACTS_SHAPE");
+  const fSym = { ...FACTS }; fSym[Symbol("email")] = SENTINEL;
+  codeOnly(renderBookingConfirmation({ template: "booking_confirmed", locale: "en", facts: fSym }), "FACTS_SHAPE");
+  // a hidden key standing IN for a required key is still refused (own enumerable data fields only)
+  const fHiddenReq = { ...FACTS }; delete fHiddenReq.ref; Object.defineProperty(fHiddenReq, "ref", { value: "MV-ABC123", enumerable: false });
+  codeOnly(renderBookingConfirmation({ template: "booking_confirmed", locale: "en", facts: fHiddenReq }), "FACTS_SHAPE");
+  // symbol replacing a required key keeps the count equal but the key missing
+  const fSymReq = { ...FACTS }; delete fSymReq.ref; fSymReq[Symbol("ref")] = "MV-ABC123";
+  codeOnly(renderBookingConfirmation({ template: "booking_confirmed", locale: "en", facts: fSymReq }), "FACTS_SHAPE");
+});
+
+test("B17 accessors are refused WITHOUT invocation at both levels (throwing and value-changing getters never run; counters stay 0)", () => {
+  let calls = 0;
+  const outer = { template: "booking_confirmed", facts: { ...FACTS } };
+  Object.defineProperty(outer, "locale", { enumerable: true, get() { calls += 1; throw new Error(SENTINEL); } });
+  const r1 = renderBookingConfirmation(outer); codeOnly(r1, "INPUT_INVALID"); noSentinel(r1);
+  const f = { ...FACTS }; delete f.ref;
+  Object.defineProperty(f, "ref", { enumerable: true, get() { calls += 1; throw new Error(SENTINEL); } });
+  const r2 = renderBookingConfirmation({ template: "booking_confirmed", locale: "en", facts: f }); codeOnly(r2, "FACTS_SHAPE"); noSentinel(r2);
+  let n = 0; const g = { ...FACTS }; delete g.nights;
+  Object.defineProperty(g, "nights", { enumerable: true, get() { calls += 1; return (n += 1) === 1 ? 2 : 999; } });
+  codeOnly(renderBookingConfirmation({ template: "booking_confirmed", locale: "es", facts: g }), "FACTS_SHAPE");
+  const h = { ...FACTS }; delete h.totalMinor;
+  Object.defineProperty(h, "totalMinor", { enumerable: true, get() { calls += 1; return 123456; }, set() {} });
+  codeOnly(renderBookingConfirmation({ template: "booking_confirmed", locale: "es", facts: h }), "FACTS_SHAPE");
+  assert.equal(calls, 0, "no accessor invoked");
+  assert.equal(n, 0);
+});
+
+test("B18 hostile Proxy traps (ownKeys / getOwnPropertyDescriptor / getPrototypeOf) at both levels → code-only, no throw, no sentinel; [[Get]] never consulted", () => {
+  const boom = () => { throw new Error(SENTINEL); };
+  const traps = [{ ownKeys: boom }, { getOwnPropertyDescriptor: boom }, { getPrototypeOf: boom },
+    { getOwnPropertyDescriptor: (t, k) => (k === "locale" ? { value: "en", enumerable: true, configurable: true, writable: true } : Reflect.getOwnPropertyDescriptor(t, k)), ownKeys: (t) => [...Reflect.ownKeys(t), "ghost"] }];
+  for (const trap of traps) {
+    const r1 = renderBookingConfirmation(new Proxy(input("en"), trap));
+    assert.equal(r1.ok, false); assert.equal(r1.code, "INPUT_INVALID"); noSentinel(r1);
+    const r2 = renderBookingConfirmation({ template: "booking_confirmed", locale: "en", facts: new Proxy({ ...FACTS }, trap) });
+    assert.equal(r2.ok, false); assert.equal(r2.code, "FACTS_SHAPE"); noSentinel(r2);
+  }
+  // [[Get]] is never consulted: a throwing `get` trap cannot fire because values come from own data descriptors (both levels)
+  let gets = 0; const getBoom = { get: () => { gets += 1; throw new Error(SENTINEL); } };
+  assert.deepEqual(renderBookingConfirmation(new Proxy(input("en"), getBoom)), render("en"));
+  assert.deepEqual(renderBookingConfirmation({ template: "booking_confirmed", locale: "es", facts: new Proxy({ ...FACTS }, getBoom) }), render("es"));
+  assert.equal(gets, 0, "no [[Get]] on input objects");
+  // a Proxy that lies about its prototype or hands out accessor descriptors is refused the same way
+  const lie = new Proxy({ ...FACTS }, { getPrototypeOf: () => Array.prototype });
+  codeOnly(renderBookingConfirmation({ template: "booking_confirmed", locale: "en", facts: lie }), "FACTS_SHAPE");
+  const acc = new Proxy({ ...FACTS }, { getOwnPropertyDescriptor: (t, k) => ({ get: () => SENTINEL, enumerable: true, configurable: true }) });
+  const r3 = renderBookingConfirmation({ template: "booking_confirmed", locale: "en", facts: acc }); codeOnly(r3, "FACTS_SHAPE"); noSentinel(r3);
+});
+
+test("B19 controls: frozen and null-prototype plain objects at both levels still render; transparent Proxy passes; values snapshotted once", () => {
+  const frozen = Object.freeze({ template: "booking_confirmed", locale: "en", facts: Object.freeze({ ...FACTS }) });
+  assert.deepEqual(renderBookingConfirmation(frozen), render("en"));
+  const nullProtoFacts = Object.assign(Object.create(null), FACTS);
+  const nullProto = Object.assign(Object.create(null), { template: "booking_confirmed", locale: "es", facts: nullProtoFacts });
+  assert.deepEqual(renderBookingConfirmation(nullProto), render("es"));
+  assert.deepEqual(renderBookingConfirmation(new Proxy(input("en"), {})), render("en"));
+  // snapshot: a getter-free object mutated after the call does not affect the already-returned frozen copy
+  const live = input("en"); const r = renderBookingConfirmation(live); live.facts.ref = "MV-ZZZZZZ"; live.locale = "es";
+  assert.equal(r.copy.subject, EN_SUBJECT);
+});
+
+// ---------------------------------------------------------------------------------------------
 // isolation: pure, no I/O, not wired into gn-v1 / worker / SQL
 
-test("B14 module source: single pure import (formatUsd from guest-notification.js), no node: builtins, no I/O/clock/env/network surface", () => {
+test("B14 module source: single pure import (formatUsd from guest-notification.js), no node: builtins, no I/O/clock/env/network surface; descriptor-based shape", () => {
   const src = readFileSync(new URL("../lib/checkout/booking-confirmation-copy.js", import.meta.url), "utf8");
   const imports = [...src.matchAll(/^import\s.*?from\s+"([^"]+)";?$/gm)].map((m) => m[1]);
   assert.deepEqual(imports, ["./guest-notification.js"]);
-  assert.ok(!/node:|require\(|process\.|Date\.now|new Date\(\)|fetch|https?\.|pg|sql|SELECT|INSERT|sendMessage|fromAddress|to:|email|firstName|setTimeout/i.test(src.replace(/^\/\/.*$/gm, "")), "no I/O / clock / env / contact surface in code");
+  const code = src.replace(/^\s*\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+  assert.ok(!/node:|require\(|process\.|Date\.now|new Date\(\)|fetch|https?\.|pg|sql|SELECT|INSERT|sendMessage|fromAddress|to:|email|firstName|setTimeout/i.test(code), "no I/O / clock / env / contact surface in code");
+  assert.ok(/Reflect\.ownKeys/.test(code) && /getOwnPropertyDescriptor/.test(code) && !/Object\.keys\((input|facts|obj)\)/.test(code), "descriptor-based exact-shape extraction");
 });
 
 test("B15 not integrated: gn-v1 builder/worker/fence do not import this module; gn-v1 constants unchanged", async () => {
