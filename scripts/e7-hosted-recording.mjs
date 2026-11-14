@@ -4,9 +4,12 @@
 // DEV database, with FAKE-free real transports. Bookkeeping only: Hostaway offline charges move no money.
 //
 // HONEST LABEL: MANUAL hosted TEST recording (workflow_dispatch + the existing reviewer gate), NOT automatic customer checkout. Code is NOT
-// consent: executeEnabled is CLOSED here (verify / execute refuse HRC_EXECUTE_CLOSED). D4 BLOCKER (ROOT 5883328669): opening / live recording stays
-// FORBIDDEN until the recorded-state cleanup contract is reviewed + implemented and the migration issuance hold is resolved — a recorded TEST
-// intent (confirmed + queued guest.notify + succeeded recording) cannot enter the Slice 3 pristine cleanup admission. Slice 1 / 2 / 3 stay CLOSED
+// consent: executeEnabled is OPEN in this revision (C29, ROOT GO 5900228555 on the C27/C28 proposal) for ONE reviewed, gated hosted TEST recording of
+// the ONE captured intent; it is closed again by the prepared CLOSE patch immediately after that run. D4's original conditions (ROOT 5883328669:
+// recorded-state cleanup contract implemented — 0021 / mirror worker / Slice 5 runner, all CLOSED; migration issuance hold resolved — shared DEV
+// exactly 0001..0021) are MET. The owner policy decisions D-a / D-b / D-c (manual, policy-assessed refund disposition; no automated exit from a
+// recorded TEST state; a recorded TEST intent — confirmed + ONE queued PRISTINE guest.notify + succeeded recording + two unprocessed
+// recording_conflict_inbox rows — cannot enter the Slice 3 pristine cleanup admission) remain the owner's and are NOT taken by this flag. Slice 1 / 2 / 3 stay CLOSED
 // and pinned to THEIR tooling; this runner pins the LATER immutable MERGED e7-test tooling 4ed7a636 (C24 repin: PR72 outer signal / deadline stop safety + C1 capture no-final_capture + C21-F1 list null-provider admission; 0021 / mirror additions are present in the closure but unused by this runner).
 //   * Inert on import (`import.meta.main` guard): no env / fs / network / DB / timer until a mode runs.
 //   * LABELLED SPECIALISATION of the reviewed Slice 3 runner (scripts/e7-hosted-test-cleanup.mjs): hosted boot / pinning / session lock (5432) /
@@ -49,7 +52,7 @@ import { CONSTANTS as RES, canonical, framedDigest, childEnv, spawnNode, dbTarge
 export const CONSTANTS = Object.freeze({
   toolingCommit: "4ed7a636fee57981262b9c02574190d225b8a1fc",    // e7-test: #99 merged (C21-F1) on top of #84 (C1 capture) / #81 / #78 / #76 / #75 / PR72; immutable (C24 repin from 5a094b16)
   toolingStatus: "MERGED",
-  executeEnabled: false,                                          // Slice 4: recording execution CLOSED (verify / execute refuse HRC_EXECUTE_CLOSED); D4 blocker
+  executeEnabled: true,                                           // Slice 4: OPEN for the ONE reviewed gated TEST recording (C29); CLOSE patch restores false right after
   // the INDEPENDENTLY scanned transitive relative imports of the runner's tooling roots at 4ed7a636 (test C2 recomputes this from the pinned tree; SAME 30-path set as at 5a094b16, 8 members changed bytes):
   // = the Slice 1 closure + lib/booking-db/recording-worker.js (executor-adapters + offline-charge-proof are already in the Slice 1 closure)
   closure: Object.freeze(["lib/bookability.js", "lib/booking-db/codec.js", "lib/booking-db/config.js", "lib/booking-db/operations.js", "lib/booking-db/pool.js",
@@ -725,7 +728,7 @@ export async function runRecordingCore(input) {
 }
 
 // =================================================================================================================================
-// hosted wrapper (GitHub Actions): preflight (no secrets) / verify / execute (CLOSED until executeEnabled is reviewed true AND the D4 blocker is lifted)
+// hosted wrapper (GitHub Actions): preflight (no secrets) / verify / execute (OPEN in this revision for ONE gated run; HRC_EXECUTE_CLOSED whenever executeEnabled is false)
 // LABELLED COPY of the reviewed Slice 3 runHosted, specialised: recording closure / runner files, HRC_ codes, Hostaway-only secrets, two pools (6543 / 5432).
 export const CLOSURE_DIGEST_PREFIX = "e7-hosted-recording-closure-v1\n";
 export const RUNNER_DIGEST_PREFIX = "e7-hosted-recording-runner-v1\n";
@@ -765,7 +768,7 @@ export async function runHosted({ mode = "preflight", env, proc, wrapperDir, dep
     if (inp.approvalRef === c.synthetic.approvalRef || inp.intentId === c.synthetic.intentId) refuse("HRC_INPUT_INVALID");
     const runId = env[RUN_ID_ENV] ?? "";
     if (mode !== "preflight") {
-      if (c.executeEnabled !== true || c.toolingStatus !== "MERGED" || !HEX64.test(String(c.closureDigest))) refuse("HRC_EXECUTE_CLOSED");   // Slice 4: CLOSED (D4 blocker)
+      if (c.executeEnabled !== true || c.toolingStatus !== "MERGED" || !HEX64.test(String(c.closureDigest))) refuse("HRC_EXECUTE_CLOSED");   // Slice 4: refuses whenever the flag is false (CLOSED state); OPEN in this revision (C29)
       if (!anyReal || !HEX64.test(expPlan) || !HEX64.test(expClo) || !HEX64.test(expRun)) refuse("HRC_INPUT_INCOMPLETE");
       if (!RUN_ID_RE.test(runId)) refuse("HRC_INPUT_INVALID");
       if (env.GITHUB_REF !== "refs/heads/main") refuse("HRC_REF_NOT_MAIN");

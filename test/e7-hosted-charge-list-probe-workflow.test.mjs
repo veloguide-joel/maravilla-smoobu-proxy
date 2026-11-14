@@ -128,11 +128,11 @@ test("W6 probe re-check block executed locally (BEFORE the one --probe call; no 
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
 
-test("W7 the five reviewed runners are untouched: the new workflow is in NO runner's runnerFiles, every runner still has executeEnabled false, and the five runner digests (framedDigest over runnerFiles) are exactly the closed values (C24: recording / recorded-cleanup re-derived after the 4ed7a636 repin); the probe script and its test are byte-identical to the merged #95 (probe digest frame covers them)", async () => {
-  const want = { reservation: "5665544de105e4564a57a4434fa32fd2355b9bbd0e756b250d1248e07feb6b19", capture: "5b547a42200b452055d8a718c84ab70f7f2b5a0cd8343f6174c4a75b0c420ed1", "test-cleanup": "33f2ab18984dccd3915a18ff8a55dd4a6e5b6bf89e3d84ba1e578347e6cebd1e", recording: "800002531edcc2be14569830eb0e664c19884512aa0b015fd7ceb4f8c9acf561", "recorded-cleanup": "e9011de76a1737d50ebcf8277e66f8911bcdc888ddf7a620b19c89f9a4699dca" };   // C24: recording repinned to 4ed7a636 (runner + workflow + test bytes); recorded-cleanup test asserts the new Slice 4 pin (runner / workflow bytes unchanged)
+test("W7 the five reviewed runners are untouched: the new workflow is in NO runner's runnerFiles, the shipped flags are [false, false, false, true, false] (C29: only Slice 4 recording OPEN), and the five runner digests (framedDigest over runnerFiles) are exactly the closed values (C24: recording / recorded-cleanup re-derived after the 4ed7a636 repin); the probe script and its test are byte-identical to the merged #95 (probe digest frame covers them)", async () => {
+  const want = { reservation: "5665544de105e4564a57a4434fa32fd2355b9bbd0e756b250d1248e07feb6b19", capture: "5b547a42200b452055d8a718c84ab70f7f2b5a0cd8343f6174c4a75b0c420ed1", "test-cleanup": "33f2ab18984dccd3915a18ff8a55dd4a6e5b6bf89e3d84ba1e578347e6cebd1e", recording: "47d2134e9bfd1971ccbd9b719cd34a3ed0f69fb5ce4d5bc91fa2d1789053423e", "recorded-cleanup": "278a9f4ff82180b276152bfc63fac94f6323777cfddf10c05fe450e9c2e470da" };   // C29 enable: recording (runner flag/comments + test) and recorded-cleanup (cross-runner test assertion) re-derived; other three unchanged
   for (const n of Object.keys(want)) {
     const m = await import(`../scripts/e7-hosted-${n}.mjs`);
-    assert.equal(m.CONSTANTS.executeEnabled, false, n); assert.ok(!m.CONSTANTS.runnerFiles.includes(WF), n);
+    assert.equal(m.CONSTANTS.executeEnabled, n === "recording", n); assert.ok(!m.CONSTANTS.runnerFiles.includes(WF), n);   // C29: recording OPEN for the ONE gated run; the other four FALSE
     assert.equal(await framedDigest(ROOT, m.CONSTANTS.runnerFiles, m.RUNNER_DIGEST_PREFIX), want[n], n);
   }
   assert.equal(P.PROBE_VERSION, "e7-hosted-charge-list-probe-v2");
