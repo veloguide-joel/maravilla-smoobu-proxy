@@ -57,7 +57,7 @@ No synthetic claim is made that any of these is proven; a green run would prove 
 Non-success outcomes write less: `PROVIDER_PROOF_FAILED` / `START_*` / `SCOPE_REFUSED` → zero writes; `RECORDING_HELD` → hold + owner case, zero provider writes; `WRITE_OUTCOME_UNKNOWN` → op `outcome_unknown` + ONE open case, intent still `payment_captured`, at most one charge may exist at the provider.
 
 ## 7. Class-E handling (possibly-sent write without an admissible reply) and read-only reconciliation
-- The runner **never resends** (`record: 1`; a second admission refuses `RECORDING_OUTCOME_UNKNOWN_REQUIRES_REVIEW` / `OPEN_CASE`). There is **no universal retry, no DB repair, no claim release, no inferred manual-disposition ledger**.
+- The runner **never resends** (`record: 1`; a second admission refuses read-only — `RECORDING_NOT_PRISTINE` (op no longer pending) or `OPEN_CASE`). There is **no universal retry, no DB repair, no claim release, no inferred manual-disposition ledger**.
 - Reconciliation is **identity-specific and READ-ONLY**: a ROOT-dispatched read-only LIST for R71700931 (the C25 probe under its own gate, or the recording runner's own evidence reads) establishes whether exactly one marker row exists; the outcome is then resolved by a **specifically reviewed owner action** (existing `admin_resolve_*` / owner-case path with attested evidence, C14 §2.1) — not by code in this proposal.
 - Cancellation and payment stay independent: a Hostaway cancellation (if the owner ever does one) is an A-type observation; the captured payment's disposition is a separate C-type decision; neither is inferred from the other.
 
