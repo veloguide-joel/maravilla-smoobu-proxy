@@ -1,13 +1,14 @@
 // scripts/e7-hosted-booking-confirmation.mjs — E7 C50: HOSTED gn-v2 BOOKING-CONFIRMATION runner for ONE bound TEST guest.notify operation, around the
-// ALREADY ACCEPTED tooling (immutable e7-test d322d219): lib/booking-db/notification-worker.js (gn-v2 opt-in + branded Resend provider opt-in, C41 / C45),
+// ALREADY ACCEPTED tooling (immutable e7-test 46b3eaf8 — C55 repin from d322d219; C54 #120 added lib/notify/sender-identity.js): lib/booking-db/notification-worker.js (gn-v2 opt-in + branded Resend provider opt-in, C41 / C45),
 // lib/checkout/booking-confirmation-request.js (gn-v2 builder), lib/notify/resend-notification-executor.js (branded executor) and
 // scripts/e7-resend/resend-exchange.mjs (the reviewed single-use HTTPS exchange), with the schema-23 typed receipts. Nothing here re-implements the worker.
 //
 // HONEST LABEL: SHIPPED CLOSED. executeEnabled is FALSE: `verify` and `execute` refuse NBC_EXECUTE_CLOSED right after the mode / unexpected-input checks,
 // BEFORE any tooling import, credential read, database or provider access. The execute BODY exists so that it can be reviewed and exercised through the
 // test-local constants / deps seam on disposable PostgreSQL (schema 23) with FAKE exchanges only. Enabling it is a separate reviewed change (no enable diff
-// here). Even then: the sender is the FIXED reviewed synthetic `.invalid` identity (NOT a usable live Resend identity — a live provider would reject it)
-// and the recipient comes ONLY from the database through the accepted `.invalid`-scoped fences (no rewrite, no simulation-sink substitution). This task
+// here). Even then: the sender is the FIXED approved identity bookings@mail.micasadirect.com / MiCasaDirect (C54/C55; equal to the pinned tooling's
+// APPROVED_REAL_SENDER, which the accepted worker admits ONLY with gn-v2 + the branded Resend executor). Its sending domain is NOT verified and this
+// source claims no sender / auth readiness. The recipient comes ONLY from the database through the accepted `.invalid`-scoped fences (no rewrite, no simulation-sink substitution). This task
 // selects NO real recipient / domain policy. Provider acceptance (HTTP 200 + id) is NOT delivery.
 //   * Inert on import (`import.meta.main` guard). Self-contained source frame: this file + its two test files + its workflow. Labelled copies of the
 //     hosted-boot helpers (scripts/e7-hosted-reservation.mjs) and of the C47/C48 catalog identity probe (scripts/e7-hosted-notify-inspect.mjs) are
@@ -42,14 +43,14 @@ function deepFreeze(v) { if (v && typeof v === "object") { for (const k of Objec
 const CATALOG_PIN_23 = {"catalog":"84b3e96fb4b709a933ed738d9f6ee284fc667e9ef937cdaf1b230775cfe549d6","readPath":"b65eddc193d48fe1d03d265084bff9318052226b5f7bc06faa25b881359cea42","readPathCount":6,"sections":{"col":"60cc4581c26ef735546498ed91fdc15cb28e178978276c90f30eb94e3c5d5efa","con":"0551bcedfedd2195dde1b886f226ad3c571a161ac5ad37680491e8b860de7018","fn":"faa842932cde62c14c41897f12a7ce96b0a155c9b9b2a8d9e2aced13191b1db1","pol":"6945243972e402d97b02f622a6f833c664c3602930347f760a8e4eb56208778a","rel":"37ad76f27a9725f7fb80ae5587547cbf987e8d49a28469e1a15d3b966f332bd5","trg":"8824ff6a6d24a88a164dee959594d44f8e8215423eb082aaea49a9db6d69a874"}};
 
 export const CONSTANTS = deepFreeze({
-  toolingCommit: "d322d2192b377d18b6a9280ae06c17eddfe3e73e",          // e7-test: #115 merged (C46) on top of #114 (C45); immutable
+  toolingCommit: "46b3eaf801fd3c85e268e3bbdc7d20b7078cdd89",          // e7-test: #120 merged (C54, exact head 75132753, tree e191c7ab); immutable. C55 repin from d322d219
   toolingStatus: "MERGED",
   executeEnabled: false,                                                // SHIPPED CLOSED: verify / execute refuse NBC_EXECUTE_CLOSED before any import / secret / DB / provider
-  // the INDEPENDENTLY scanned transitive relative imports of the five runtime roots at d322d219 (+ package files); bare imports: node:* and pg only
+  // the INDEPENDENTLY scanned transitive relative imports of the five runtime roots at 46b3eaf8 (+ package files); bare imports: node:* and pg only
   closure: ["lib/booking-db/notification-worker.js", "lib/booking-db/pool.js", "lib/checkout/booking-confirmation-copy.js", "lib/checkout/booking-confirmation-request.js",
-    "lib/checkout/guest-notification.js", "lib/notify/resend-notification-executor.js", "package-lock.json", "package.json", "scripts/e7-connected/probe-env-preflight.mjs",
+    "lib/checkout/guest-notification.js", "lib/notify/resend-notification-executor.js", "lib/notify/sender-identity.js", "package-lock.json", "package.json", "scripts/e7-connected/probe-env-preflight.mjs",
     "scripts/e7-resend/resend-exchange.mjs"],
-  closureDigest: "d11f8070cda02bd634156172d956a26fb75adc10379200f0be1229546badab9c",   // framed SHA-256 of `closure` at d322d219 (the test recomputes it from the pinned tree + an independent import scan)
+  closureDigest: "4203b4517b1059a309a87ec192ce4db5f20bc253ce680a13a993bdaa57176c46",   // framed SHA-256 of `closure` at 46b3eaf8 (the test recomputes it from the pinned tree + an independent import scan)
   pgVersion: "8.18.0",
   runnerFiles: ["scripts/e7-hosted-booking-confirmation.mjs", "test/e7-hosted-booking-confirmation.test.mjs", "test/e7-hosted-booking-confirmation-workflow.test.mjs",
     ".github/workflows/e7-hosted-booking-confirmation.yml"],
@@ -57,8 +58,9 @@ export const CONSTANTS = deepFreeze({
   protectedReservationIds: ["70636076", "71045356", "71072615", "71081885"],
   excludedIntentIds: ["abede8b1-8ef6-44f2-876e-6a02fc056a96", "c83c1842-d342-4e27-9ab7-dc3d50b7a309"],   // historical TEST intents: never admitted
   locales: ["en", "es"],
-  // FIXED reviewed synthetic sender: `.invalid` (the accepted worker / executor / SQL fences require it); NOT a usable live Resend identity
-  sender: { fromAddress: "bookings@sender.mv-test.invalid", fromName: "maraVilla Test" },
+  // FIXED approved sender (C55): == the pinned tooling's lib/notify/sender-identity.js APPROVED_REAL_SENDER (asserted by the tests). SENDER ONLY: the
+  // recipient scope stays the accepted `.invalid` fences. NOT a domain-verification / readiness claim.
+  sender: { fromAddress: "bookings@mail.micasadirect.com", fromName: "MiCasaDirect" },
   workerEnv: { VERCEL_ENV: "preview", MV_E7_NOTIFICATION_WORKER: "enabled" },   // the accepted worker's own gate marker, passed ONLY inside the (closed) execute body
   catalogPin23: CATALOG_PIN_23,
   // timing scope: every connect ≤ connectMs (this wrapper; the frozen pool has no connect timeout), every statement ≤ the pool's statement_timeout
