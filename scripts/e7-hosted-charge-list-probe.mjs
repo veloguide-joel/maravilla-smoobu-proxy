@@ -7,6 +7,10 @@
 // (accepted form H8, the exact selector the recording worker uses). Replies go through the ACCEPTED pure proofs from the pinned tooling
 // (offline-charge-proof.js assessIdentitySnapshot / assessChargeList / preflightListObservation — the observation returns a branded count object
 // without an ok flag; only an explicit { ok:false } is a refusal; hostaway-reservations.js envelope + normalizer), reused UNCHANGED.
+// C25 (repin 5a094b16 → 4ed7a636): same 8-file closure; 4 members changed bytes — offline-charge-proof (C21-F1: an EXPLICIT null paymentProvider is a
+// lawful UNRELATED list row; the probe reports it as the enum "UNKNOWN", never inferred "offline"), capture-proof / http-transports (C1: no
+// final_capture — Stripe capture paths this GET-only probe never reaches), intent-state (0021 events — unreachable here). No enum / amount /
+// pagination / guard / budget / output change. A compatible result is an OBSERVATION only: no recording eligibility or readiness claim.
 //
 // C18 (ROOT review 5899125821):
 //   F1 the ONLY network primitive is the ACCEPTED pinned createE7RealExchange({ provider: "hostaway" }) (streaming maxBytes, no redirect follow,
@@ -34,18 +38,18 @@ import { pathToFileURL } from "node:url";
 
 const freeze = Object.freeze;
 export const PROBE_VERSION = "e7-hosted-charge-list-probe-v2";
-/** the recording runner's tooling pin (Slice 4 closure) */
-export const TOOLING_COMMIT = "5a094b16c1f84690a738a98ab89140caa69c1e1f";
+/** the recording runner's tooling pin (Slice 4 closure; C25 repin from 5a094b16 → 4ed7a636 = C21-F1 null-provider list admission, merged #99/#100) */
+export const TOOLING_COMMIT = "4ed7a636fee57981262b9c02574190d225b8a1fc";
 /** the four import roots; MANIFEST = their complete transitive relative-import closure at the pin (scanned independently, must match exactly) */
 export const ROOTS = freeze(["scripts/e7-connected/http-transports.mjs", "scripts/e7-connected/real-exchange.mjs", "lib/checkout/offline-charge-proof.js", "lib/hostaway-reservations.js"]);
 export const MANIFEST = freeze({
-  "lib/checkout/capture-proof.js": "9a3c7948b6dc80a504fc654c0dcdc47764ac8548f950bc0ea4012a3bc0a2c272",
+  "lib/checkout/capture-proof.js": "b36651cab44056d4640ad2d9303619eed8db7d316418013fa2aad744c1c3e3e5",
   "lib/checkout/compensation-proof.js": "03645839f5a531367f44da0fd1413c2e9cea77efce8eafa3784a377397da5314",
-  "lib/checkout/intent-state.js": "ef132f4e78e75234dba57aaf9ff652458ce490049822b380d882ba4bdbb9674f",
-  "lib/checkout/offline-charge-proof.js": "2469ee967c00efc09d301a0928e56c360bce3d488cd5dbda6ec6467295761902",
+  "lib/checkout/intent-state.js": "e18ad2c81a27d48fa57696e06f67ad22ec8ed2f7f72c4bb7777e76a518909cee",
+  "lib/checkout/offline-charge-proof.js": "e45243875e97a9dbe07299103fb83fef5fa0a7b41096aabf3380988145fc4a1b",
   "lib/checkout/recovery-plan.js": "4ffd8dd4dc6c728bee9660f67b9846e1afad9b067e730bfc7b956ba272591570",
   "lib/hostaway-reservations.js": "d86827cc0f8dee8a02886ef11fcadc12c0a98128607d5399f55d719a9f16e608",
-  "scripts/e7-connected/http-transports.mjs": "2c41847fd44ef2002d05bbd1cdb972436278957daf89d172fdefdaf6178568d8",
+  "scripts/e7-connected/http-transports.mjs": "789c26a9d1fd599608038b0c691f5b179c9f398a3307f9d56cafc621726958f2",
   "scripts/e7-connected/real-exchange.mjs": "bc584758e51fec0fc35e67d05efde8acd1094bf5ea414e280b70a0eadd5a8594"
 });
 /** The ONE approved TEST target (ROOT C17; facts from the merged #92 closure checkpoint). Fixed; no input can change it. */

@@ -26,7 +26,7 @@ after(() => { assert.deepEqual(GUARD, { request: 0, Agent: 0, fetch: 0 }, "no re
 
 const WF = ".github/workflows/e7-hosted-charge-list-probe.yml";
 const yml = readFileSync(join(ROOT, WF), "utf8");
-const PIN = "5a094b16c1f84690a738a98ab89140caa69c1e1f";
+const PIN = "4ed7a636fee57981262b9c02574190d225b8a1fc";   // C25: probe repinned to the recording pin
 const PREFIX = "e7-hosted-charge-list-probe-v1\n";
 const FILES = ["scripts/e7-hosted-charge-list-probe.mjs", "test/e7-hosted-charge-list-probe.test.mjs", WF];
 const count = (re) => (yml.match(re) || []).length;
@@ -94,7 +94,7 @@ const expectedDigest = async () => {
 };
 
 test("W5 preflight gate blocks executed locally: bindings pass with HEAD == dispatch SHA and tooling == pin; REFUSE (exit 3, nothing else) on a foreign dispatch SHA, a foreign tooling pin or an unknown mode; the digest block prints the documented framed SHA-256 (== framedDigest over the 3 files with prefix e7-hosted-charge-list-probe-v1) and refuses a non-matching expected_probe_digest", async () => {
-  assert.equal(toolSha, PIN, "E7_TOOLING_DIR must be the pinned 5a094b16 checkout");
+  assert.equal(toolSha, PIN, "E7_TOOLING_DIR must be the pinned 4ed7a636 checkout");
   const d = sandbox(); try {
     const bind = runBlock("Verify checkout bindings (wrapper HEAD == dispatch SHA; tooling HEAD == pin; no secrets)");
     const ok = sh(bind, { E7_WORKFLOW_SHA: headSha, E7_TOOLING_PIN: PIN, E7_MODE: "preflight" }, d); assert.equal(ok.status, 0, ok.out); assert.match(ok.out, /bindings ok/);
@@ -114,7 +114,7 @@ test("W6 probe re-check block executed locally (BEFORE the one --probe call; no 
     const blk = runBlock("Re-check bindings BEFORE the probe (HEAD == dispatch SHA; tooling pin + full 8-file manifest; expected digest; label; no secrets)");
     assert.doesNotMatch(blk, /E7_HOSTAWAY_TOKEN|--probe/); const want = await expectedDigest();
     const base = { E7_WORKFLOW_SHA: headSha, E7_TOOLING_PIN: PIN, E7_TOOLING_DIR: join(d, "tooling"), E7_APPROVAL_REF: "ROOT-C19-label", E7_EXPECTED_PROBE_DIGEST: want };
-    const ok = sh(blk, base, d); assert.equal(ok.status, 0, ok.out); assert.match(ok.out, /tooling manifest ok: 8 files at 5a094b16/); assert.match(ok.out, new RegExp(`bindings ok: wrapper=${headSha} tooling=${PIN} digest=${want}`));
+    const ok = sh(blk, base, d); assert.equal(ok.status, 0, ok.out); assert.match(ok.out, /tooling manifest ok: 8 files at 4ed7a636/); assert.match(ok.out, new RegExp(`bindings ok: wrapper=${headSha} tooling=${PIN} digest=${want}`));
     for (const [over, why] of [[{ E7_WORKFLOW_SHA: "0".repeat(40) }, /wrapper HEAD != dispatch SHA/], [{ E7_TOOLING_PIN: "1".repeat(40) }, /tooling HEAD != pin/], [{ E7_APPROVAL_REF: "" }, /approval_ref empty/], [{ E7_EXPECTED_PROBE_DIGEST: "" }, /not 64-hex/], [{ E7_EXPECTED_PROBE_DIGEST: want.slice(1) }, /not 64-hex/], [{ E7_EXPECTED_PROBE_DIGEST: want.toUpperCase() }, /not 64-hex/], [{ E7_EXPECTED_PROBE_DIGEST: "f".repeat(64) }, /expected_probe_digest mismatch/]]) {
       const r = sh(blk, { ...base, ...over }, d); assert.deepEqual([r.status, why.test(r.out)], [3, true], JSON.stringify(over) + r.out);
     }

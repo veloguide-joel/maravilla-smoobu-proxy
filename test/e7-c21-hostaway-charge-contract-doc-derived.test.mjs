@@ -1,5 +1,5 @@
 // test/e7-c21-hostaway-charge-contract-doc-derived.test.mjs — C21 OFFLINE compatibility audit of the accepted Hostaway guest-charge contract
-// (pin 5a094b16: lib/checkout/offline-charge-proof.js, lib/hostaway-reservations.js, scripts/e7-connected/http-transports.mjs) against the
+// (HISTORICAL pin 5a094b16 via E7_TOOLING_DIR — the audited bytes; the CURRENT probe's own pin is loaded from E7_PROBE_TOOLING_DIR, C25: lib/checkout/offline-charge-proof.js, lib/hostaway-reservations.js, scripts/e7-connected/http-transports.mjs) against the
 // OFFICIAL PUBLIC documentation https://api.hostaway.com/documentation (sections "Guest payment" → guest charge object, Get guest charges list,
 // Create offline charge, Update / Refund offline charge, the list QUERY-PARAMETER table; standard response description; changelog 2026-10-02 /
 // 2026-09-23) as READ on 2026-11-13 (C22 re-read of the query table).
@@ -22,7 +22,12 @@ https.Agent = class { constructor() { GUARD.Agent += 1; throw new Error("network
 globalThis.fetch = async () => { GUARD.fetch += 1; throw new Error("network refused"); };
 syncBuiltinESMExports();
 const ROOT = realpathSync(join(dirname(fileURLToPath(import.meta.url)), ".."));
+// HISTORICAL proof pin (5a094b16): the audited accepted proofs / normalizers / transport — D2's refusal is a fact about THIS pin and stays asserted.
 const TOOLING = realpathSync(process.env.E7_TOOLING_DIR || join(ROOT, "..", "tooling"));
+// CURRENT probe pin (C25: 4ed7a636): the merged probe loads ONLY its own pinned closure; a SEPARATE, EXPLICIT fixture path — no fallback, no skip.
+if (!process.env.E7_PROBE_TOOLING_DIR) throw new Error("E7_PROBE_TOOLING_DIR (checkout of the probe's TOOLING_COMMIT) is required; the historical E7_TOOLING_DIR is never used for the current probe");
+const PROBE_TOOLING = realpathSync(process.env.E7_PROBE_TOOLING_DIR);
+const HISTORICAL_PIN = "5a094b16c1f84690a738a98ab89140caa69c1e1f"; const PROBE_PIN = "4ed7a636fee57981262b9c02574190d225b8a1fc";
 const tool = (p) => import(pathToFileURL(join(TOOLING, p)).href);
 const [P, H, T, PR] = await Promise.all([tool("lib/checkout/offline-charge-proof.js"), tool("lib/hostaway-reservations.js"), tool("scripts/e7-connected/http-transports.mjs"), import("../scripts/e7-hosted-charge-list-probe.mjs")]);
 after(() => { assert.deepEqual(GUARD, { request: 0, Agent: 0, fetch: 0 }, "no real network primitive was touched"); });
@@ -108,7 +113,7 @@ test("D1 documented list ENVELOPE: the documented example keys (status/result/co
   assert.ok(DOC.genericEnvelopeKeys.filter((k) => !DOC.listEnvelopeExampleKeys.includes(k)).every((k) => k === "limit" || PR.CONTINUATION_KEYS.includes(k)), "every generic-envelope key absent from the guest-charges example is either the limit rule or a continuation key");
 });
 
-test("D2 REPRODUCER — documented NON-EMPTY list example row (paymentProvider: null) is REFUSED by the accepted proof (LIST_ROW_PAYMENTPROVIDER_INVALID): the whole page becomes untrusted; the merged probe would STOP LIST_REFUSED on the same row; the identical row with a documented STRING provider passes and normalises amount 10 → 1000 minor (ASSUMED major units)", async () => {
+test("D2 REPRODUCER (HISTORICAL pin 5a094b16) — documented NON-EMPTY list example row (paymentProvider: null) is REFUSED by that accepted proof (LIST_ROW_PAYMENTPROVIDER_INVALID): the whole page untrusted; the identical row with a documented STRING provider passes and normalises amount 10 → 1000 minor (ASSUMED major units). SEPARATELY, the CURRENT probe (pin 4ed7a636, E7_PROBE_TOOLING_DIR) refuses to load the historical pin at all (TOOLING_CLOSURE_MISMATCH, zero import) and, on its own pin, admits the same row as UNRELATED with provider → UNKNOWN (never offline), outcome SHAPE_COMPATIBLE_WITH_UNKNOWN_VALUES — an observation only, no eligibility / readiness claim", async () => {
   const bad = assess([DOC_LIST_ROW]);
   assert.deepEqual([bad.ok, bad.code], [false, "LIST_ROW_PAYMENTPROVIDER_INVALID"], "documented example row: paymentProvider null vs accepted ROW_STRING_FIELDS");
   assert.ok(ACCEPTED.rowStringFields.includes("paymentProvider"));
@@ -119,15 +124,23 @@ test("D2 REPRODUCER — documented NON-EMPTY list example row (paymentProvider: 
   // documented-but-untitled awaiting online charge: no marker, not paid, not same-amount → no conflict for the preflight observation
   const obs = P.preflightListObservation({ list: ok, intent: intent(), config: cfg() });
   assert.deepEqual([obs.rowCount, obs.matchingChargeCount, obs.lookalikeCount, obs.sameAmountPaidCount], [1, 0, 0, 0]);
-  // the merged probe over a FAKE exchange: same documented row for the fixed TEST target → LIST_REFUSED / LIST_ROW_PAYMENTPROVIDER_INVALID, exactly 2 GETs, nothing echoed
-  const lt = await PR.loadTooling(TOOLING); assert.equal(lt.ok, true, JSON.stringify(lt));
+  // the CURRENT probe over a FAKE exchange on ITS pin: the same documented row for the fixed TEST target is admitted as an unrelated row (C21-F1), provider reported UNKNOWN, exactly 2 GETs, nothing echoed
+  // the current probe is pinned elsewhere: the historical proof tree is refused BEFORE any import (first mismatching member in sorted order)
+  assert.deepEqual([PR.TOOLING_COMMIT, HISTORICAL_PIN !== PROBE_PIN], [PROBE_PIN, true]);
+  const old = await PR.loadTooling(TOOLING, { importModule: async () => { throw new Error("must not import"); } });
+  assert.deepEqual([old.ok, old.code, old.file], [false, "TOOLING_CLOSURE_MISMATCH", "lib/checkout/capture-proof.js"], JSON.stringify(old));
+  const lt = await PR.loadTooling(PROBE_TOOLING); assert.equal(lt.ok, true, JSON.stringify(lt));
   const enc = (o) => new TextEncoder().encode(JSON.stringify(o)); const RID = PR.TARGET.reservationId;
   const targetResv = { id: Number(RID), listingMapId: PR.TARGET.listingId, channelId: 2000, arrivalDate: PR.TARGET.from, departureDate: PR.TARGET.to, totalPrice: PR.TARGET.finalTotalMinor / 100, currency: "USD", status: "new", customFieldValues: [{ customFieldId: PR.CONFIG.refFieldId, value: PR.TARGET.ref }] };
   const docRowForTarget = (over = {}) => ({ ...DOC_LIST_ROW, listingMapId: PR.TARGET.listingId, reservationId: Number(RID), ...over });
   const fake = (rows) => async (req) => ({ status: 200, contentType: "application/json", bytes: enc(/\/v1\/reservations\//.test(req.url) ? { status: "success", result: targetResv } : docListEnvelope(rows)) });
   const stop = await PR.runProbe({ tooling: lt.tooling, exchange: fake([docRowForTarget()]), credential: () => "synthetic-token", clientSnapshotId: "c21" });
-  assert.deepEqual([stop.stop, stop.list.ok, stop.list.code, stop.calls], ["LIST_REFUSED", false, "LIST_ROW_PAYMENTPROVIDER_INVALID", 2], JSON.stringify(stop));
-  assert.doesNotMatch(JSON.stringify(stop) + PR.formatResult(stop), /Charge description|synthetic-token/);
+  assert.deepEqual([stop.stop, stop.outcome, stop.list.ok, stop.list.rows[0].paymentProvider, stop.list.matchingChargeCount, stop.list.unknownValues, stop.calls], [null, "SHAPE_COMPATIBLE_WITH_UNKNOWN_VALUES", true, "UNKNOWN", 0, 3, 2], JSON.stringify(stop));
+  assert.doesNotMatch(JSON.stringify(stop) + PR.formatResult(stop), /Charge description|synthetic-token|offline/);
+  // the historical refusal is still what the OLD proof says (asserted above via P), and a MISSING provider still refuses on the current probe too
+  const miss = docRowForTarget(); delete miss.paymentProvider;
+  const still = await PR.runProbe({ tooling: lt.tooling, exchange: fake([miss]), credential: () => "synthetic-token", clientSnapshotId: "c21" });
+  assert.deepEqual([still.stop, still.list.code, still.calls], ["LIST_REFUSED", "LIST_ROW_PAYMENTPROVIDER_INVALID", 2]);
   // same documented row with a string provider: the probe accepts the page but every documented value outside its enums is UNKNOWN → never "fully compatible"
   const unk = await PR.runProbe({ tooling: lt.tooling, exchange: fake([docRowForTarget({ paymentProvider: "stripe" })]), credential: () => "synthetic-token", clientSnapshotId: "c21" });
   assert.deepEqual([unk.stop, unk.outcome, unk.list.rows[0].status, unk.list.rows[0].paymentMethod, unk.list.rows[0].paymentProvider, unk.list.unknownValues], [null, "SHAPE_COMPATIBLE_WITH_UNKNOWN_VALUES", "UNKNOWN", "UNKNOWN", "stripe", 2], JSON.stringify(unk.list));

@@ -1,6 +1,6 @@
 # E7 C19: HOSTED READ-ONLY Hostaway charge-LIST shape probe for the ONE approved TEST reservation (71700931 / listing 606998 / USD 140.00 = 14000 minor),
 # running the merged, reviewed `scripts/e7-hosted-charge-list-probe.mjs` (#95, C17/C18) UNCHANGED: at most TWO GETs (identity, then charge list),
-# the ACCEPTED pinned real exchange at the immutable tooling commit 5a094b16, hard budgets {maxBytes 262144, callMs 15000, totalMs 30000, calls 2},
+# the ACCEPTED pinned real exchange at the immutable tooling commit 4ed7a636 (C25 repin; C21-F1 null-provider list admission), hard budgets {maxBytes 262144, callMs 15000, totalMs 30000, calls 2},
 # no retry, no redirect follow, no POST / PUT / DELETE, no DB, no Stripe, no recording, no notification. HONEST LABEL: MANUAL hosted READ-ONLY probe
 # (workflow_dispatch + the EXISTING `e7-readonly-probe` reviewer gate), NOT recording, NOT checkout, NOT a refund path (refunds stay manual; all five
 # runner flags stay CLOSED). LABELLED SPECIALISATION of the reviewed e7-hosted-recording.yml execute skeleton (same pinned actions, same checkouts,
@@ -51,11 +51,11 @@ jobs:
           ref: ${{ github.sha }}
           path: wrapper
           persist-credentials: false
-      - name: Checkout merged E7 tooling (fixed commit 5a094b16)
+      - name: Checkout merged E7 tooling (fixed commit 4ed7a636)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: 5a094b16c1f84690a738a98ab89140caa69c1e1f
+          ref: 4ed7a636fee57981262b9c02574190d225b8a1fc
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0
@@ -66,7 +66,7 @@ jobs:
       - name: Verify checkout bindings (wrapper HEAD == dispatch SHA; tooling HEAD == pin; no secrets)
         env:
           E7_WORKFLOW_SHA: ${{ github.sha }}
-          E7_TOOLING_PIN: 5a094b16c1f84690a738a98ab89140caa69c1e1f
+          E7_TOOLING_PIN: 4ed7a636fee57981262b9c02574190d225b8a1fc
           E7_MODE: ${{ inputs.mode }}
         run: |
           set -eu
@@ -105,11 +105,11 @@ jobs:
           ref: ${{ github.sha }}
           path: wrapper
           persist-credentials: false
-      - name: Checkout merged E7 tooling (fixed commit 5a094b16)
+      - name: Checkout merged E7 tooling (fixed commit 4ed7a636)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: 5a094b16c1f84690a738a98ab89140caa69c1e1f
+          ref: 4ed7a636fee57981262b9c02574190d225b8a1fc
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0
@@ -120,7 +120,7 @@ jobs:
       - name: Re-check bindings BEFORE the probe (HEAD == dispatch SHA; tooling pin + full 8-file manifest; expected digest; label; no secrets)
         env:
           E7_WORKFLOW_SHA: ${{ github.sha }}
-          E7_TOOLING_PIN: 5a094b16c1f84690a738a98ab89140caa69c1e1f
+          E7_TOOLING_PIN: 4ed7a636fee57981262b9c02574190d225b8a1fc
           E7_TOOLING_DIR: ${{ github.workspace }}/tooling
           E7_APPROVAL_REF: ${{ inputs.approval_ref }}
           E7_EXPECTED_PROBE_DIGEST: ${{ inputs.expected_probe_digest }}
