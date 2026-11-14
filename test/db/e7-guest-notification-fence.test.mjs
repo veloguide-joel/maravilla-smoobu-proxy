@@ -17,7 +17,7 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import pg from "pg";
-import { startMigratedDatabase } from "./harness.mjs";
+import { startMigratedDatabase, startPostgres } from "./harness.mjs";
 import * as F from "./fixtures.mjs";
 import { applyEvent, loadIntent, createIntentRecord, collectGuestDetails, beginPayStep, recordCheckoutSession, recordHostawayCreateResult, recordHostawayLookup, purgeGuestData } from "../../lib/booking-db/repo.js";
 import { claimNextOperation, completeOperation, recoverExpiredOperations, requestRead, recordProviderEvidence } from "../../lib/booking-db/operations.js";
@@ -29,7 +29,7 @@ import { priceStay } from "../../lib/checkout/server-pricer.js";
 import { readDirectPolicyFromEnv } from "../../lib/direct-policy.js";
 import { todayInTimeZone } from "../../lib/public-api.js";
 import { validateAdapterConfig } from "../../lib/hostaway-reservations.js";
-import { migrateDown, migrateUp } from "../../db/lib/migrate.js";
+import { migrateDown, migrateUp, migrationStatus, loadMigrations } from "../../db/lib/migrate.js";
 
 let netAttempts = 0;
 const realFetch = globalThis.fetch;
@@ -1140,27 +1140,80 @@ test("whole suite: no provider network attempt; protected ids only in fixture re
 });
 
 // =============================================================================================
-// migration up / down (separate disposable cluster)
-test("0016 up precondition (legacy duplicate / attempted / in_flight / non-canonical rows), audit-preserving refused down, exact fresh-0015 down, identical re-up, JS compatibility", async () => {
-  const m = await startMigratedDatabase();
-  const admin = new pg.Client({ connectionString: m.adminUrl }); await admin.connect();
-  const catalog = async () => (await admin.query(`
+// migration up / down (separate disposable clusters)
+// C39 (test-only): the chain no longer ends at 0016. Expectations are DERIVED from the migration files in this tree (accepted C26 exact-boundary
+// pattern) and re-checked against the bookkeeping table at every boundary — never "whatever came back". Boundary 15 (below 0016) and boundary 16
+// (0016 applied, everything later rolled back) are each built FORWARD in their own fresh disposable cluster and compared with the rolled-back
+// catalog, so a down from the top is proven equal to a forward build rather than to its own renamed catalog. Every original 0016 safety case is kept.
+const MIGRATION_VERSIONS = loadMigrations().map((m) => m.version); const TOP = MIGRATION_VERSIONS.at(-1);
+assert.deepEqual(MIGRATION_VERSIONS, Array.from({ length: TOP }, (_, i) => i + 1), "contiguous migration chain 1..TOP");
+assert.ok(TOP >= 16, "0016 is part of the chain");
+const range = (from, to) => (from <= to ? Array.from({ length: to - from + 1 }, (_, i) => from + i) : Array.from({ length: from - to + 1 }, (_, i) => from - i));
+const history = async (c) => { const st = await migrationStatus(c, { env: "test" }); return [st.applied, st.pending]; };
+/** original fence catalog: function bodies + ACLs, triggers, indexes, relations (ACL / RLS), policies — unchanged comparison surface */
+const fenceCatalog = async (c) => (await c.query(`
     SELECT 'f:' || p.oid::regprocedure::text || ':' || md5(pg_get_functiondef(p.oid)) || ':' || coalesce(p.proacl::text, '') AS k FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'booking'
     UNION ALL SELECT 't:' || c.relname || ':' || t.tgname || ':' || md5(pg_get_triggerdef(t.oid)) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'booking' AND NOT t.tgisinternal
     UNION ALL SELECT 'i:' || indexname || ':' || md5(indexdef) FROM pg_indexes WHERE schemaname = 'booking'
     UNION ALL SELECT 'r:' || c.relname || ':' || c.relkind::text || ':' || coalesce(c.relacl::text, '') || ':' || c.relrowsecurity::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'booking'
     UNION ALL SELECT 'p:' || tablename || ':' || policyname || ':' || md5(coalesce(qual, '') || coalesce(with_check, '') || roles::text) FROM pg_policies WHERE schemaname = 'booking'
     ORDER BY 1`)).rows.map((r) => r.k);
+/** C26 full schema shape (bodies / ACLs / security / volatility / search_path / triggers / columns / grants / policies / constraints / indexes / RLS) */
+const schemaObjects = async (c) => (await c.query(`
+      SELECT 'fn|' || p.oid::regprocedure::text || '|' || md5(pg_get_functiondef(p.oid)) || '|' || coalesce(array_to_string(p.proacl, ','), '') || '|' ||
+             p.prosecdef::text || '|' || p.provolatile::text || '|' || coalesce(array_to_string(p.proconfig, ','), '') AS o FROM pg_proc p WHERE p.pronamespace = 'booking'::regnamespace
+      UNION ALL SELECT 'trg|' || tgrelid::regclass::text || '|' || tgname || '|' || pg_get_triggerdef(oid) FROM pg_trigger WHERE NOT tgisinternal AND tgrelid::regclass::text LIKE 'booking.%'
+      UNION ALL SELECT 'col|' || table_name || '|' || column_name || '|' || data_type || '|' || is_nullable FROM information_schema.columns WHERE table_schema = 'booking'
+      UNION ALL SELECT 'tbl|' || grantee || '|' || table_name || '|' || privilege_type FROM information_schema.role_table_grants WHERE table_schema = 'booking'
+      UNION ALL SELECT 'pol|' || tablename || '|' || policyname || '|' || array_to_string(roles, ',') || '|' || cmd FROM pg_policies WHERE schemaname = 'booking'
+      UNION ALL SELECT 'con|' || conrelid::regclass::text || '|' || conname || '|' || pg_get_constraintdef(oid) FROM pg_constraint WHERE connamespace = 'booking'::regnamespace
+      UNION ALL SELECT 'idx|' || indexrelid::regclass::text || '|' || pg_get_indexdef(indexrelid) FROM pg_index WHERE indrelid::regclass::text LIKE 'booking.%'
+      UNION ALL SELECT 'rls|' || relname || '|' || relrowsecurity::text FROM pg_class WHERE relnamespace = 'booking'::regnamespace AND relkind = 'r'
+      ORDER BY 1`)).rows.map((r) => r.o);
+/** a dedicated disposable cluster migrated UP to exactly N (the boundary built forward, never by rolling back) */
+async function freshAt(n) {
+  const d = await startPostgres(); const c = new pg.Client({ connectionString: d.adminUrl }); await c.connect();
   try {
-    const at16 = await catalog();
-    assert.deepEqual(await migrateDown(admin, { env: "test", to: 15 }), [16]);
-    const fresh15 = await catalog();
-    assert.ok(fresh15.length < at16.length);
-    assert.deepEqual(await migrateUp(admin, { env: "test" }), [16]);
-    assert.deepEqual(await catalog(), at16, "identical re-up");
-    assert.deepEqual(await migrateDown(admin, { env: "test", to: 15 }), [16]);
-    assert.deepEqual(await catalog(), fresh15, "allowed down: exact fresh-0015 definitions / ACL / triggers / indexes / policies");
-    // legacy rows on 0015 (TEST SETUP, triggers bypassed for planting only); each refuses the up, rows unchanged
+    assert.deepEqual(await migrateUp(c, { env: "test", to: n }), range(1, n), `fresh cluster migrated up to ${n}`);
+    assert.deepEqual(await history(c), [range(1, n), range(n + 1, TOP)], `fresh history at ${n}`);
+  } catch (e) { await c.end(); d.stop(); throw e; }
+  return { c, close: async () => { await c.end(); d.stop(); } };
+}
+/** exact rollback from the current top to boundary N: descending list TOP..N+1 + exact history */
+async function downToBoundary(c, n) {
+  assert.deepEqual(await migrateDown(c, { env: "test", to: n }), range(TOP, n + 1), `every migration above ${n} rolls back (exact list)`);
+  assert.deepEqual(await history(c), [range(1, n), range(n + 1, TOP)], `history at boundary ${n}`);
+}
+/** exact re-up from boundary N: ascending list N+1..TOP + full history */
+async function upFromBoundary(c, n) {
+  assert.deepEqual(await migrateUp(c, { env: "test" }), range(n + 1, TOP), `re-up from ${n} applies exactly the rest of the chain`);
+  assert.deepEqual(await history(c), [range(1, TOP), []], "history at top");
+}
+
+test("0016 up precondition (legacy duplicate / attempted / in_flight / non-canonical rows), audit-preserving refused down, exact fresh-0015 down, identical re-up, JS compatibility", async () => {
+  const m = await startMigratedDatabase();
+  const admin = new pg.Client({ connectionString: m.adminUrl }); await admin.connect();
+  let fresh15c = null, fresh16c = null;
+  try {
+    assert.deepEqual(await history(admin), [range(1, TOP), []], "migrated cluster starts at the top of the chain");
+    const atTop = await fenceCatalog(admin), atTopShape = await schemaObjects(admin);
+    // (a) exact down to boundary 15 == a SEPARATE fresh cluster migrated UP to 15 (every later migration, 0016 included, is mechanical with no data)
+    fresh15c = await freshAt(15);
+    await downToBoundary(admin, 15);
+    const fresh15 = await fenceCatalog(admin);
+    assert.ok(fresh15.length < atTop.length);
+    assert.deepEqual(fresh15, await fenceCatalog(fresh15c.c), "down to 15 == forward-built 15 (functions / ACL / triggers / indexes / relations / policies)");
+    assert.deepEqual(await schemaObjects(admin), await schemaObjects(fresh15c.c), "down to 15 == forward-built 15 (full schema shape)");
+    // (b) exact re-up reproduces the TOP schema; exact down again reproduces 15
+    await upFromBoundary(admin, 15);
+    assert.deepEqual(await fenceCatalog(admin), atTop, "identical re-up");
+    assert.deepEqual(await schemaObjects(admin), atTopShape, "identical re-up (full shape)");
+    await downToBoundary(admin, 15);
+    assert.deepEqual(await fenceCatalog(admin), fresh15, "allowed down: exact fresh-0015 definitions / ACL / triggers / indexes / policies");
+    // (c) boundary 16 built forward in its own fresh cluster — the reference for everything "at 0016" below (NOT the TOP snapshot)
+    fresh16c = await freshAt(16);
+    const at16 = await fenceCatalog(fresh16c.c);
+    // legacy rows on 0015 (TEST SETUP, triggers bypassed for planting only); each refuses the 0016 up, rows unchanged, nothing applied
     const appPool = m.app;
     const newIntent = async () => (await createIntentRecord(appPool, { ref: F.nextRef(), accessTokenHash: F.tokenHash(), environment: "test", now: Date.now(), listingId: 999001,
       from: "2027-01-10", to: "2027-01-12", guests: 2 })).id;
@@ -1181,7 +1234,8 @@ test("0016 up precondition (legacy duplicate / attempted / in_flight / non-canon
       const e = await pgErr(() => migrateUp(admin, { env: "test" }));
       assert.match(e.message, new RegExp(`^${code}`), label);
       assert.equal((await admin.query("SELECT md5(string_agg(row_to_json(o)::text, '|' ORDER BY o.id)) AS d FROM booking.external_operations o WHERE intent_id = $1", [id])).rows[0].d, before, `${label}: rows unchanged`);
-      assert.deepEqual(await catalog(), fresh15, `${label}: nothing of 0016 left behind`);
+      assert.deepEqual(await fenceCatalog(admin), fresh15, `${label}: nothing of 0016 left behind`);
+      assert.deepEqual(await history(admin), [range(1, 15), range(16, TOP)], `${label}: 0016 refused first, nothing later applied`);
       await F.ownerManagedHistory(m.owner, `DELETE FROM booking.external_operations WHERE intent_id = '${id}' AND op_type = 'guest.notify'`);   // TEST SETUP cleanup
     }
     // JS compatibility after an allowed SQL down: the generic claim still never selects a pending notify row
@@ -1189,14 +1243,28 @@ test("0016 up precondition (legacy duplicate / attempted / in_flight / non-canon
     await F.ownerManagedHistory(m.owner, ins(okId, "booking_confirmed"));
     const nop = (await admin.query("SELECT id FROM booking.external_operations WHERE intent_id = $1 AND op_type = 'guest.notify'", [okId])).rows[0].id;
     assert.equal(await claimNextOperation(appPool, { workerId: "compat", now: Date.now() + DAY, opId: nop }), null, "JS NOTIFY_FENCE survives the SQL down");
-    // up over a canonical pending legacy row succeeds; a render makes the down refuse and keeps the audit byte-equal
-    assert.deepEqual(await migrateUp(admin, { env: "test" }), [16]);
+    // up over a canonical pending legacy row succeeds (exactly 16..TOP, full history, TOP schema reproduced)
+    await upFromBoundary(admin, 15);
+    assert.deepEqual(await fenceCatalog(admin), atTop, "up over a canonical legacy row reproduces the TOP schema");
+    // a render makes the 0016 down refuse and keeps the audit byte-equal. Each migration rolls back in its own transaction, so the later
+    // migrations (TOP..17) come down first and 0016 refuses: the cluster must then stand EXACTLY at boundary 16 — compared with the
+    // forward-built 16, not with the TOP snapshot.
     await F.ownerManagedHistory(m.owner, `INSERT INTO booking.notification_renders (operation_id, intent_id, template, template_version, intent_version, facts, facts_hash, recipient_hash,
        content_hash, message_ref, worker, claimed_at) VALUES ($1, (SELECT intent_id FROM booking.external_operations WHERE id = $1), 'booking_confirmed', 'gn-v1', 0, '{}', $2, $2, $2, 'gn1-' || $1::text, 'w', now())`, [nop, SYN]);
     const audit0 = (await admin.query("SELECT md5(string_agg(row_to_json(r)::text, '|')) AS d FROM booking.notification_renders r")).rows[0].d;
     const e = await pgErr(() => migrateDown(admin, { env: "test", to: 15 }));
     assert.match(e.message, /^MIGRATION_0016_DOWN_REFUSED/);
     assert.equal((await admin.query("SELECT md5(string_agg(row_to_json(r)::text, '|')) AS d FROM booking.notification_renders r")).rows[0].d, audit0, "refused down preserves the audit");
-    assert.deepEqual(await catalog(), at16);
-  } finally { await admin.end(); await m.close(); }
+    assert.deepEqual(await history(admin), [range(1, 16), range(17, TOP)], "later migrations rolled back, 0016 refused and still applied");
+    assert.deepEqual(await fenceCatalog(admin), at16, "refused 0016 down leaves exactly the forward-built 0016 catalog");
+    assert.deepEqual(await schemaObjects(admin), await schemaObjects(fresh16c.c), "refused 0016 down leaves exactly the forward-built 0016 schema (full shape)");
+    // and the chain re-ups from 16 to the exact TOP schema again
+    await upFromBoundary(admin, 16);
+    assert.deepEqual(await fenceCatalog(admin), atTop);
+    assert.deepEqual(await schemaObjects(admin), atTopShape);
+  } finally {
+    if (fresh16c) await fresh16c.close();
+    if (fresh15c) await fresh15c.close();
+    await admin.end(); await m.close();
+  }
 });
