@@ -4,10 +4,9 @@
 // DEV database, with FAKE-free real transports. Bookkeeping only: Hostaway offline charges move no money.
 //
 // HONEST LABEL: MANUAL hosted TEST recording (workflow_dispatch + the existing reviewer gate), NOT automatic customer checkout. Code is NOT
-// consent: this is the PREPARED enable revision (C29) for ONE reviewed, gated hosted TEST recording of the ONE captured intent. ROOT review
-// 5900228555 accepted the C27/C28 PROPOSAL only — proposal GO is NOT execution GO: execution still needs the owner decisions D-a / D-b / D-c, ROOT's
-// fresh pre-GO proofs and the existing environment gate. The reviewed CLOSE patch (c29 operator note) is what ROOT would merge to restore false
-// after the run ENDS or STOPS; nothing closes automatically. D4's original conditions (ROOT 5883328669:
+// consent: executeEnabled is CLOSED again (the reviewed C29 CLOSE patch, merged by ROOT once the ONE gated hosted TEST recording attempt has ENDED or
+// STOPPED — the patch itself asserts nothing about whether or how that attempt ran; verify / execute refuse HRC_EXECUTE_CLOSED). ROOT review 5900228555
+// accepted the C27/C28 PROPOSAL only; execution authority was a separate owner decision (D-a / D-b / D-c) plus the environment gate. D4's original conditions (ROOT 5883328669:
 // recorded-state cleanup contract implemented — 0021 / mirror worker / Slice 5 runner, all CLOSED; migration issuance hold resolved — shared DEV
 // exactly 0001..0021) are MET. The owner policy decisions D-a / D-b / D-c (manual, policy-assessed refund disposition; no automated exit from a
 // recorded TEST state; a recorded TEST intent — confirmed + ONE queued PRISTINE guest.notify + succeeded recording + two unprocessed
@@ -54,7 +53,7 @@ import { CONSTANTS as RES, canonical, framedDigest, childEnv, spawnNode, dbTarge
 export const CONSTANTS = Object.freeze({
   toolingCommit: "4ed7a636fee57981262b9c02574190d225b8a1fc",    // e7-test: #99 merged (C21-F1) on top of #84 (C1 capture) / #81 / #78 / #76 / #75 / PR72; immutable (C24 repin from 5a094b16)
   toolingStatus: "MERGED",
-  executeEnabled: true,                                           // Slice 4: PREPARED enable for the ONE reviewed gated TEST recording (C29; pending D-a / D-b / D-c); the reviewed CLOSE patch restores false after END or STOP
+  executeEnabled: false,                                          // Slice 4: CLOSED again by the reviewed C29 CLOSE patch (after the ONE gated TEST recording attempt ENDED or STOPPED); verify / execute refuse HRC_EXECUTE_CLOSED
   // the INDEPENDENTLY scanned transitive relative imports of the runner's tooling roots at 4ed7a636 (test C2 recomputes this from the pinned tree; SAME 30-path set as at 5a094b16, 8 members changed bytes):
   // = the Slice 1 closure + lib/booking-db/recording-worker.js (executor-adapters + offline-charge-proof are already in the Slice 1 closure)
   closure: Object.freeze(["lib/bookability.js", "lib/booking-db/codec.js", "lib/booking-db/config.js", "lib/booking-db/operations.js", "lib/booking-db/pool.js",
@@ -730,7 +729,7 @@ export async function runRecordingCore(input) {
 }
 
 // =================================================================================================================================
-// hosted wrapper (GitHub Actions): preflight (no secrets) / verify / execute (flag OPEN in this prepared revision for ONE gated run, still behind the environment gate and the owner decision; HRC_EXECUTE_CLOSED whenever executeEnabled is false)
+// hosted wrapper (GitHub Actions): preflight (no secrets) / verify / execute (CLOSED: HRC_EXECUTE_CLOSED whenever executeEnabled is false; reopened only by a reviewed flag PR after an owner decision)
 // LABELLED COPY of the reviewed Slice 3 runHosted, specialised: recording closure / runner files, HRC_ codes, Hostaway-only secrets, two pools (6543 / 5432).
 export const CLOSURE_DIGEST_PREFIX = "e7-hosted-recording-closure-v1\n";
 export const RUNNER_DIGEST_PREFIX = "e7-hosted-recording-runner-v1\n";

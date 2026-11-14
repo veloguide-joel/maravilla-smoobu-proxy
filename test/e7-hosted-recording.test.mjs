@@ -509,8 +509,8 @@ test("F2 (ROOT 5883758657) honest statement accounting: reported dbQueries == EV
     assert.equal(r.dbQueries, pool.reads, "counted even when the residual read fails"); }
 });
 
-test("C1 code ceiling: Slice 4 recording flag OPEN in the PREPARED enable revision (executeEnabled true; C29, pending D-a / D-b / D-c) AND Slice 1 / 2 / 3 CLOSED on THEIR tooling (after the ONE reviewed owner-present TEST); this runner pins the MERGED e7-test 4ed7a636; the plan pins pi / reservation / charge / captured amount / stay / attempt / session, the accepted recording key, credit_card / hostaway-e7-test, title / amount wire forms = the accepted module's; ZERO stripe / capture / void / cancel / refund / notify / create", () => {
-  assert.equal(C.executeEnabled, true); assert.equal(RESRUN.CONSTANTS.executeEnabled, false); assert.equal(CAPRUN.CONSTANTS.executeEnabled, false); assert.equal(TCRUN.CONSTANTS.executeEnabled, false);
+test("C1 code ceiling: Slice 4 recording execution CLOSED again (executeEnabled false; reviewed C29 CLOSE patch after the ONE gated TEST recording attempt ENDED or STOPPED) AND Slice 1 / 2 / 3 CLOSED on THEIR tooling (after the ONE reviewed owner-present TEST); this runner pins the MERGED e7-test 4ed7a636; the plan pins pi / reservation / charge / captured amount / stay / attempt / session, the accepted recording key, credit_card / hostaway-e7-test, title / amount wire forms = the accepted module's; ZERO stripe / capture / void / cancel / refund / notify / create", () => {
+  assert.equal(C.executeEnabled, false); assert.equal(RESRUN.CONSTANTS.executeEnabled, false); assert.equal(CAPRUN.CONSTANTS.executeEnabled, false); assert.equal(TCRUN.CONSTANTS.executeEnabled, false);
   assert.equal(C.toolingCommit, "4ed7a636fee57981262b9c02574190d225b8a1fc"); assert.equal(C.toolingStatus, "MERGED");
   // C2: Slice 2 is repinned to the merged C1 fix (59178b04); Slice 1 (40779e34) and Slice 3 (9d86bfa1) keep their own immutable pins
   assert.equal(RESRUN.CONSTANTS.toolingCommit, "40779e34e8c65ac5c4494bc5a18cd4223ef723fa");
@@ -561,7 +561,7 @@ test("H1 hosted: preflight (no secrets) passes on the pinned closure; the Stripe
   const run = (env, deps = {}) => E.runHosted({ mode: "preflight", env: pick(env), proc: PROC, wrapperDir: ROOT, deps: { spawnChild: okChild, ...deps } });
   const a = await run(envOf());
   assert.equal(a.result.code, "PREFLIGHT_OK_SYNTHETIC_ONLY", JSON.stringify(a.result)); assert.equal(a.exitCode, 0);
-  assert.deepEqual([a.result.closureDigest, a.result.planKind, a.result.executeEnabled, a.result.toolingCommit, a.result.tests.pass], [C.closureDigest, "SYNTHETIC", true, C.toolingCommit, 3]);
+  assert.deepEqual([a.result.closureDigest, a.result.planKind, a.result.executeEnabled, a.result.toolingCommit, a.result.tests.pass], [C.closureDigest, "SYNTHETIC", false, C.toolingCommit, 3]);
   assert.equal(a.result.runnerDigest, await RESRUN.framedDigest(ROOT, C.runnerFiles, E.RUNNER_DIGEST_PREFIX));
   const b = await run(envOf(realEnv()));
   assert.deepEqual([b.result.code, b.result.planKind, b.result.planHash], ["PREFLIGHT_OK_REAL_PLAN", "REAL", E.buildPlan(C, { ...planInput({ approvalRef: "label-1" }), runnerDigest: a.result.runnerDigest }).planHash]);
