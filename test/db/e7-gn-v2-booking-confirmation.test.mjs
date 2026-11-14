@@ -579,10 +579,15 @@ test("A11 migration 0022: refused down while ANY gn-v2 render exists (succeeded 
   const own = new pg.Client({ connectionString: db.adminUrl }); await own.connect();
   try {
     const s0 = await schema(own); const a0 = await audit(own);
-    const e = await pgErr(() => migrateDown(own, { env: "test", to: TOP - 1 }));
+    // C45: target 21 explicitly (0022 itself). Migrations above 0022 with no evidence of their own here (0023: no provider receipt in this
+    // suite's database) roll back mechanically first, each in its own transaction; then 0022 refuses. The exact history is asserted and the
+    // top restored, after which the schema is the original top schema again.
+    const e = await pgErr(() => migrateDown(own, { env: "test", to: 21 }));
     assert.match(e.message, /^MIGRATION_0022_DOWN_REFUSED/);
-    assert.deepEqual(await history(own), [range(1, TOP), []], "nothing rolled back");
+    assert.deepEqual(await history(own), [range(1, 22), range(23, TOP)], "0022 refused and still applied");
     assert.equal(await audit(own), a0, "the gn-v2 audit is byte-equal (never deleted / rewritten)");
+    assert.deepEqual(await migrateUp(own, { env: "test" }), range(23, TOP));
+    assert.deepEqual(await history(own), [range(1, TOP), []]);
     assert.deepEqual(await schema(own), s0);
   } finally { await own.end(); }
   // (2) a separate disposable cluster with ONE gn-v1 render (TEST SETUP, as the 0016 fence suite plants it) → exact rollback / re-up
@@ -621,6 +626,10 @@ test("A11 migration 0022: refused down while ANY gn-v2 render exists (succeeded 
     const a1 = await audit(admin); const s1 = await schema(admin);
     const e2 = await pgErr(() => migrateDown(admin, { env: "test", to: 21 }));
     assert.match(e2.message, /^MIGRATION_0022_DOWN_REFUSED/);
+    // C45: 0023 (no provider receipt here) rolls back mechanically before 0022 refuses; restore the top and compare
+    assert.deepEqual(await history(admin), [range(1, 22), range(23, TOP)]);
+    assert.equal(await audit(admin), a1);
+    assert.deepEqual(await migrateUp(admin, { env: "test" }), range(23, TOP));
     assert.deepEqual(await history(admin), [range(1, TOP), []]);
     assert.equal(await audit(admin), a1); assert.deepEqual(await schema(admin), s1);
   } finally { await admin.end(); await c21.end(); f21.stop(); await m.close(); }
