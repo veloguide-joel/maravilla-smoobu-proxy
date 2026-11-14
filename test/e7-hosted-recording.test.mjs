@@ -509,7 +509,7 @@ test("F2 (ROOT 5883758657) honest statement accounting: reported dbQueries == EV
     assert.equal(r.dbQueries, pool.reads, "counted even when the residual read fails"); }
 });
 
-test("C1 code ceiling: Slice 4 recording execution OPEN for the ONE reviewed gated TEST recording (executeEnabled true; C29) AND Slice 1 / 2 / 3 CLOSED on THEIR tooling (after the ONE reviewed owner-present TEST); this runner pins the MERGED e7-test 5a094b16; the plan pins pi / reservation / charge / captured amount / stay / attempt / session, the accepted recording key, credit_card / hostaway-e7-test, title / amount wire forms = the accepted module's; ZERO stripe / capture / void / cancel / refund / notify / create", () => {
+test("C1 code ceiling: Slice 4 recording flag OPEN in the PREPARED enable revision (executeEnabled true; C29, pending D-a / D-b / D-c) AND Slice 1 / 2 / 3 CLOSED on THEIR tooling (after the ONE reviewed owner-present TEST); this runner pins the MERGED e7-test 4ed7a636; the plan pins pi / reservation / charge / captured amount / stay / attempt / session, the accepted recording key, credit_card / hostaway-e7-test, title / amount wire forms = the accepted module's; ZERO stripe / capture / void / cancel / refund / notify / create", () => {
   assert.equal(C.executeEnabled, true); assert.equal(RESRUN.CONSTANTS.executeEnabled, false); assert.equal(CAPRUN.CONSTANTS.executeEnabled, false); assert.equal(TCRUN.CONSTANTS.executeEnabled, false);
   assert.equal(C.toolingCommit, "4ed7a636fee57981262b9c02574190d225b8a1fc"); assert.equal(C.toolingStatus, "MERGED");
   // C2: Slice 2 is repinned to the merged C1 fix (59178b04); Slice 1 (40779e34) and Slice 3 (9d86bfa1) keep their own immutable pins
@@ -577,11 +577,11 @@ test("H1 hosted: preflight (no secrets) passes on the pinned closure; the Stripe
   assert.equal((await E.runHosted({ mode: "nope", env: {}, proc: PROC, wrapperDir: ROOT })).result.code, "HRC_USAGE");
 });
 
-test("H2 hosted: verify / execute refuse HRC_EXECUTE_CLOSED under a test-local executeEnabled=false config (deps.constants seam) before any pin, ref or import check — the refusal path stays exercised while the shipped constant is OPEN (C29); the shipped constants still refuse off main / wrong digests / missing run id / secrets missing / wrong DB target, wipes secrets, and wires TWO pools (6543 max 3 worker, 5432 max 1 lock) with a Hostaway-only exchange", async () => {
+test("H2 hosted: verify / execute refuse HRC_EXECUTE_CLOSED under a test-local executeEnabled=false config (deps.constants seam) before any pin, ref or import check — a local refusal control valid whatever the shipped flag is; an opened seam still refuses off main / wrong digests / missing run id / secrets missing / wrong DB target, wipes secrets, and wires TWO pools (6543 max 3 worker, 5432 max 1 lock) with a Hostaway-only exchange", async () => {
   const pre = await E.runHosted({ mode: "preflight", env: pick(envOf()), proc: PROC, wrapperDir: ROOT, deps: { spawnChild: okChild } });
   const plan = E.buildPlan(C, { ...planInput({ approvalRef: "label-1" }), runnerDigest: pre.result.runnerDigest });
   const full = (over = {}) => pick(envOf(realEnv({ E7_EXPECTED_PLAN_HASH: plan.planHash, E7_EXPECTED_CLOSURE_DIGEST: C.closureDigest, E7_EXPECTED_RUNNER_DIGEST: pre.result.runnerDigest, GITHUB_REF: "refs/heads/main", ...over })));
-  const CLOSED = { ...C, executeEnabled: false };   // test-local CLOSED control: the refusal path stays exercised while the shipped constant is OPEN (C29)
+  const CLOSED = { ...C, executeEnabled: false };   // test-local CLOSED control: exercises the refusal path independently of the shipped flag (valid in the enable and the closed revision)
   for (const mode of ["verify", "execute"]) {
     const r = await E.runHosted({ mode, env: full({ E7_TOOLING_DIR: "/nonexistent", GITHUB_REF: "refs/heads/other" }), proc: PROC, wrapperDir: ROOT, deps: { constants: CLOSED, importEnv: () => { throw new Error("never"); } } });
     assert.deepEqual([r.result.code, r.exitCode, r.result.closureDigest], ["HRC_EXECUTE_CLOSED", 1, null], mode);
