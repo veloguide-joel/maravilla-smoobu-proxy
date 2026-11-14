@@ -1,6 +1,6 @@
 // test/e7-hosted-charge-list-probe.test.mjs — C17/C18 read-only charge-LIST shape probe: FAKE exchange / FAKE node:https primitive only (every real
 // network primitive is replaced with a throwing guard before anything is imported); REAL accepted transport, REAL accepted real-exchange module
-// and REAL pure proofs from the pinned tooling (E7_TOOLING_DIR = 5a094b16). Zero live network, zero DB, zero credentials.
+// and REAL pure proofs from the pinned tooling (E7_TOOLING_DIR = 4ed7a636; C25 repin). Zero live network, zero DB, zero credentials.
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import https from "node:https";
@@ -90,6 +90,23 @@ test("F3 safe enums + adversarial strings: provider-controlled values (type / st
   const f = fakeExchange(); f.ex = async () => { throw new Error(SENTINEL); };
   const weird = await P.runProbe({ tooling: await load(), exchange: f.ex, credential: () => "synthetic-hostaway-token" });
   assert.deepEqual([weird.stop, weird.transportCode], ["IDENTITY_TRANSPORT_ERROR", "EXCHANGE_FAILED"]); noLeak(weird);
+});
+
+test("N1 (C25 / C21-F1 at 4ed7a636): the DOCUMENTED null-provider list row (public Hostaway docs 2026-11-13) is accepted by the NEW pinned proof as an UNRELATED row → outcome SHAPE_COMPATIBLE_WITH_UNKNOWN_VALUES (provider null → enum UNKNOWN, never inferred offline; awaiting / credit_card_online → UNKNOWN), matching 0, exactly 2 GETs; a missing / undefined / numeric / array provider still STOPs LIST_REFUSED / LIST_ROW_PAYMENTPROVIDER_INVALID; no raw title / description / contact / sentinel leaks; GET-only observation — no eligibility or readiness claim", async () => {
+  const docRow = (over = {}) => ({ id: 8700001, listingMapId: T.listingId, reservationId: Number(RID), autopaymentId: 34231, type: "charge", title: "Charge " + SENTINEL, description: CONTACT, currency: "USD", paymentMethod: "credit_card_online",
+    amount: 10, capturedAmount: null, status: "awaiting", paymentProvider: null, paymentProviderMessage: null, paymentProviderInvoiceId: null, paymentProviderChargeId: null, scheduledDate: null, chargeDate: null, holdReleaseDate: null, isManual: 0, autoChargeId: null, triggerEvent: null, triggerTimeDelta: 0, flatFee: null, percentageFee: null, transactions: [], ...over });
+  const { r, calls } = await run({ list: reply(200, listEnv([docRow()])) });
+  assert.equal(r.stop, null, JSON.stringify(r)); assert.equal(r.outcome, "SHAPE_COMPATIBLE_WITH_UNKNOWN_VALUES");
+  assert.deepEqual(r.list.rows[0], { chargeId: "8700001", type: "charge", status: "UNKNOWN", amountMinor: 1000, currency: "USD", paymentProvider: "UNKNOWN", paymentMethod: "UNKNOWN" });
+  assert.deepEqual([r.list.rowCount, r.list.matchingChargeCount, r.list.unknownValues, r.list.sameAmountPaidCount, r.list.lookalikeCount, calls.length, r.calls], [1, 0, 3, 0, 0, 2, 2]);
+  assert.doesNotMatch(JSON.stringify(r) + P.formatResult(r), /offline/, "a null provider is never inferred to \"offline\" anywhere in the output"); noLeak(r);
+  const missing = docRow(); delete missing.paymentProvider;
+  for (const [row, label] of [[missing, "missing"], [docRow({ paymentProvider: undefined }), "undefined"], [docRow({ paymentProvider: 0 }), "number"], [docRow({ paymentProvider: ["offline"] }), "array"], [docRow({ paymentProvider: { offline: true } }), "object"]]) {
+    const x = await run({ list: reply(200, listEnv([row])) });
+    assert.deepEqual([x.r.stop, x.r.list.ok, x.r.list.code, x.calls.length], ["LIST_REFUSED", false, "LIST_ROW_PAYMENTPROVIDER_INVALID", 2], label); noLeak(x.r); }
+  // a null-provider row that carries the exact marker title for the fixed target is still counted as a marker by the accepted observation (title decides)
+  const m = await run({ list: reply(200, listEnv([docRow({ id: 8700002, title: `maraVilla payment mvoch1-${T.intentId}`, amount: 140, status: "paid" })])) });
+  assert.deepEqual([m.r.stop, m.r.list.matchingChargeCount, m.r.list.rows[0].paymentProvider], [null, 1, "UNKNOWN"], JSON.stringify(m.r.list));
 });
 
 test("P3 identity refusals STOP before any list call (exactly 1 call); codes are allowlisted; nothing from the reply is echoed", async () => {
