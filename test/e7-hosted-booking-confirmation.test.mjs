@@ -151,7 +151,7 @@ function fakeDeps(over = {}) {
   const deps = { spawnChild: okChild, readPgVersion: async () => "8.18.0", readCa: async () => Buffer.from("FAKE-CA"), caSha256: sha(Buffer.from("FAKE-CA")),
     importTooling: async () => { st.imports += 1; return { createBookingPool: (cfg) => { st.pools += 1; st.cfg = { max: cfg.max, statementTimeoutMs: cfg.statementTimeoutMs, ca: cfg.caPem, url: cfg.connectionString === DBURL };
       return { end: async () => { st.ended += 1; } }; }, createResendExchange: () => ({ ok: true, exchange: async () => assert.fail("fake core never calls it") }), tooling: { fake: true } }; },
-    runCore: async (args) => { st.coreArgs = { hasPool: !!args.pool, plan: args.plan, key: args.credential() === KEY, runId: args.runId }; return Object.freeze({ code: "PROVIDER_ACCEPTED", admission: "ADMITTED", sendsAttempted: 1, workerInvocations: 1, statements: 30, providerAccepted: true, providerReplay: false, workerOutcome: "accepted", workerCode: null }); },
+    runCore: async (args) => { st.coreArgs = { hasPool: !!args.pool, plan: args.plan, key: args.credential() === KEY, runId: args.runId }; return Object.freeze({ code: "PROVIDER_ACCEPTED", admission: "ADMITTED", sendsAttempted: 1, workerInvocations: 1, statements: 30, providerAccepted: true, providerReplay: false, verifiedCompletion: true, readback: "VERIFIED", workerOutcome: "accepted", workerCode: null }); },
     ...over };
   return { deps, st };
 }
@@ -190,6 +190,11 @@ test("H6 through the TEST-LOCAL seam (executeEnabled true in constants only): ve
   const hang = await R.runHosted({ mode: "execute", env: gated({ ...OPEN, budgets: { ...OPEN.budgets, endMs: 50 } }, { E7_DEV_BOOKING_DATABASE_URL: DBURL, E7_RESEND_TEST_KEY: KEY }), proc: PROC, wrapperDir: ROOT,
     deps: { ...fakeDeps({ importTooling: async () => ({ createBookingPool: () => ({ end: () => new Promise(() => {}) }), createResendExchange: () => ({ ok: true, exchange: async () => {} }), tooling: {} }) }).deps, constants: { ...OPEN, budgets: { ...OPEN.budgets, endMs: 50 } } } });
   assert.equal(hang.result.cleanup, "POOL_END_TIMEOUT");
+  // C51: an accepted core result WITHOUT a verified completion is never a hosted success (exit 1), whatever its code says
+  for (const core of [{ code: "PROVIDER_ACCEPTED", verifiedCompletion: false }, { code: "PROVIDER_ACCEPTED" }, { code: "ACCEPTED_UNVERIFIED_STOP", verifiedCompletion: false, providerAccepted: true }]) {
+    const r = await R.runHosted({ mode: "execute", env: gated(OPEN, { E7_DEV_BOOKING_DATABASE_URL: DBURL, E7_RESEND_TEST_KEY: KEY }), proc: PROC, wrapperDir: ROOT, deps: { ...fakeDeps({ runCore: async () => Object.freeze({ ...core }) }).deps, constants: OPEN } });
+    assert.deepEqual([r.exitCode, r.result.code], [1, "EXECUTE_DONE"], JSON.stringify(core));
+  }
 });
 
 // ---- admission + core through FAKES ------------------------------------------------------------------------------------------------------
@@ -211,11 +216,12 @@ function fakeClient(w, log) {
       case "catalog": return { rows: [{ id: { sections: w.catalog.sections, readPath: w.catalog.readPath, readPathCount: w.catalog.readPathCount } }] };
       case "instance": return { rows: [w.instance] }; case "intent": return { rows: w.intent }; case "ops": return { rows: w.ops };
       case "page": return { rows: w.pages[page++] ?? [] }; case "artefacts": return { rows: [w.artefacts] };
-      case "postcheck": return { rows: [w.post ?? { state: "succeeded", attempts: 1, resend_ref: true, error_code: null, receipts: 1, replayed: false, template_version: "gn-v2", locale: "en" }] };
+      case "postcheck": return w.postRows !== undefined ? { rows: w.postRows } : { rows: [w.post ?? POST_OK] };
       default: return { rows: [] };
     } }, release: () => {} };
 }
 const fakePool = (w, log) => ({ connect: async () => fakeClient(w, log) });
+const POST_OK = Object.freeze({ state: "succeeded", attempts: 1, resend_ref: true, error_code: null, receipts: 1, replayed: false, template_version: "gn-v2", locale: "en" });
 function fakeTooling(behaviour) {
   const st = { invocations: 0, executors: 0, opts: null };
   const tooling = { NOTIFICATION_V2_OPTION_KEY: "confirmationLocale", NOTIFICATION_PROVIDER_OPTION_KEY: "providerExecutor",
@@ -257,6 +263,7 @@ test("H8 core with FAKE tooling: ONE worker invocation with the bound intent / l
   assert.deepEqual([o.intentId, o.confirmationLocale, o.listingIds, o.sender, o.env, o.workerId, o.providerExecutor], [IID, "en", [606998], { ...C.sender }, { ...C.workerEnv }, "hbc-123456789-1", { fake: true }]);
   assert.deepEqual(Object.keys(o.hooks).sort(), ["afterClaim", "afterInitialObservation"]); assert.equal(a.st.credential(), KEY); assert.deepEqual(a.st.sender, { ...C.sender });
   assert.deepEqual(a.res.postcheck, { state: "succeeded", attempts: 1, resendRef: true, errorCode: null, receipts: 1, replayed: false, templateVersion: "gn-v2", locale: "en" });
+  assert.deepEqual([a.res.verifiedCompletion, a.res.readback], [true, "VERIFIED"]);
   assert.doesNotMatch(JSON.stringify(a.res) + JSON.stringify(a.log), PII);
   const FOREIGN = "7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0e";
   for (const hook of ["afterInitialObservation", "afterClaim"]) {
@@ -266,7 +273,8 @@ test("H8 core with FAKE tooling: ONE worker invocation with the bound intent / l
   const ret = await core(world(), async (opts, st) => { await st.exchange({}); return { ok: true, outcome: "accepted", opId: FOREIGN }; }); assert.equal(ret.res.code, "NBC_BOUND_OP_MISMATCH");
   const twice = await core(world(), async (opts, st) => { await st.exchange({}); let second = null; try { await st.exchange({}); } catch (e) { second = e.code; } assert.equal(second, "EXCHANGE_SPENT"); return { ok: true, outcome: "unknown", opId: OID, code: "EXCHANGE_SPENT" }; });
   assert.deepEqual([twice.res.code, twice.res.sendsAttempted], ["UNKNOWN_STOP", 2], "the second call is counted and refused by the fence (never reaches the exchange)");
-  const replay = await core(world(), async (opts, st) => { await st.exchange({}); return { ok: true, outcome: "accepted", opId: OID, providerReplay: true }; }); assert.deepEqual([replay.res.code, replay.res.providerReplay], ["PROVIDER_ACCEPTED_REPLAY", true]);
+  const replay = await core(world({ post: { ...POST_OK, replayed: true } }), async (opts, st) => { await st.exchange({}); return { ok: true, outcome: "accepted", opId: OID, providerReplay: true }; });
+  assert.deepEqual([replay.res.code, replay.res.providerReplay, replay.res.verifiedCompletion], ["PROVIDER_ACCEPTED_REPLAY", true, true]);
   const unk = await core(world(), async (opts, st) => { await st.exchange({}); return { ok: true, outcome: "unknown", opId: OID, code: "HTTP_STATUS" }; }); assert.deepEqual([unk.res.code, unk.res.workerCode, unk.res.providerAccepted], ["UNKNOWN_STOP", "HTTP_STATUS", false]);
   const idle = await core(world(), async () => ({ ok: true, outcome: "not_claimable", opId: OID, code: "PROVIDER_PREPARE_REFUSED", sends: 0 })); assert.deepEqual([idle.res.code, idle.res.sendsAttempted], ["NOT_SENT", 0]);
   const refused = await core(world(), async () => ({ ok: false, code: "OPTIONS_INVALID" })); assert.deepEqual([refused.res.code, refused.res.workerCode], ["NBC_WORKER_REFUSED", "OPTIONS_INVALID"]);
@@ -276,6 +284,42 @@ test("H8 core with FAKE tooling: ONE worker invocation with the bound intent / l
   const badEx = await R.runBookingConfirmationCore({ pool: fakePool(world(), []), plan: PLAN, c: OPEN, tooling: { ...fakeTooling(() => assert.fail("never")).tooling, createResendNotificationExecutor: () => ({ ok: false, code: "EXECUTOR_SENDER_INVALID" }) },
     exchange: async () => {}, credential: () => KEY, runId: "123456789-1" });
   assert.deepEqual([badEx.code, badEx.workerInvocations], ["NBC_EXECUTOR_INVALID", 0]);
+});
+
+test("H9 C51 verified completion (fake): an accepted worker outcome with the readback unavailable / missing / malformed (strict raw types) / contradicting the durable accepted shape → ACCEPTED_UNVERIFIED_STOP with providerAccepted / replay RETAINED, ONE send, ONE invocation; matching EN / ES / replay readbacks verify; non-accepted outcomes are never upgraded", async () => {
+  const accepted = (replay = false) => async (opts, st) => { await opts.hooks.afterInitialObservation(OID); await st.exchange({}); return { ok: true, outcome: "accepted", opId: OID, providerReplay: replay }; };
+  const PES = R.buildPlan(OPEN, { approvalRef: "l", intentId: IID, opId: OID, expectedVersion: VER, locale: "es", sourceDigest: "a".repeat(64) }).plan;
+  for (const [w, plan, replay, code] of [[world(), PLAN, false, "PROVIDER_ACCEPTED"], [world({ post: { ...POST_OK, locale: "es" } }), PES, false, "PROVIDER_ACCEPTED"],
+    [world({ post: { ...POST_OK, replayed: true } }), PLAN, true, "PROVIDER_ACCEPTED_REPLAY"]]) {
+    const r = await core(w, accepted(replay), OPEN, plan);
+    assert.deepEqual([r.res.code, r.res.verifiedCompletion, r.res.readback, r.res.providerAccepted, r.res.sendsAttempted], [code, true, "VERIFIED", true, 1], plan.locale);
+  }
+  const bad = [
+    [{ throwAt: "postcheck" }, "UNAVAILABLE"], [{ postRows: [] }, "MISSING"], [{ postRows: [POST_OK, POST_OK] }, "MALFORMED"],
+    [{ post: { ...POST_OK, attempts: "1" } }, "MALFORMED"], [{ post: { ...POST_OK, attempts: 1.5 } }, "MALFORMED"], [{ post: { ...POST_OK, resend_ref: null } }, "MALFORMED"],
+    [{ post: { ...POST_OK, replayed: null } }, "MALFORMED"], [{ post: { ...POST_OK, error_code: "lower case" } }, "MALFORMED"], [{ post: { ...POST_OK, locale: "fr" } }, "MALFORMED"],
+    [{ post: { ...POST_OK, template_version: "gn-v3" } }, "MALFORMED"], [{ post: { ...POST_OK, receipts: -1 } }, "MALFORMED"], [{ post: { ...POST_OK, state: "SUCCEEDED" } }, "MALFORMED"],
+    [{ post: { ...POST_OK, extra: 1 } }, "MALFORMED"], [{ post: (({ locale, ...x }) => x)(POST_OK) }, "MALFORMED"],
+    [{ post: { ...POST_OK, state: "outcome_unknown" } }, "CONTRADICTS"], [{ post: { ...POST_OK, state: "in_flight" } }, "CONTRADICTS"], [{ post: { ...POST_OK, attempts: 2 } }, "CONTRADICTS"],
+    [{ post: { ...POST_OK, attempts: 0 } }, "CONTRADICTS"], [{ post: { ...POST_OK, resend_ref: false } }, "CONTRADICTS"], [{ post: { ...POST_OK, error_code: "HTTP_STATUS" } }, "CONTRADICTS"],
+    [{ post: { ...POST_OK, receipts: 0 } }, "CONTRADICTS"], [{ post: { ...POST_OK, receipts: 2 } }, "CONTRADICTS"], [{ post: { ...POST_OK, template_version: "gn-v1" } }, "CONTRADICTS"],
+    [{ post: { ...POST_OK, template_version: null } }, "CONTRADICTS"], [{ post: { ...POST_OK, locale: "es" } }, "CONTRADICTS"], [{ post: { ...POST_OK, locale: null } }, "CONTRADICTS"],
+    [{ post: { ...POST_OK, replayed: true } }, "CONTRADICTS"]];
+  for (const [over, rb] of bad) {
+    const r = await core(world(over), accepted(false));
+    assert.deepEqual([r.res.code, r.res.readback, r.res.verifiedCompletion, r.res.providerAccepted, r.res.providerReplay, r.res.sendsAttempted, r.res.workerInvocations, r.res.deliveryProven],
+      ["ACCEPTED_UNVERIFIED_STOP", rb, false, true, false, 1, 1, false], JSON.stringify(over));
+    assert.equal(r.res.postcheck === null, rb !== "CONTRADICTS", "a malformed / missing / unavailable readback is never mapped into a plausible value");
+    assert.doesNotMatch(JSON.stringify(r.res), PII);
+  }
+  const replayButFresh = await core(world(), accepted(true));
+  assert.deepEqual([replayButFresh.res.code, replayButFresh.res.readback, replayButFresh.res.providerReplay], ["ACCEPTED_UNVERIFIED_STOP", "CONTRADICTS", true], "replay consistency both ways");
+  const unk = await core(world({ post: { ...POST_OK, state: "outcome_unknown", resend_ref: false, receipts: 0, error_code: "HTTP_STATUS" } }), async (opts, st) => { await st.exchange({}); return { ok: true, outcome: "unknown", opId: OID, code: "HTTP_STATUS" }; });
+  assert.deepEqual([unk.res.code, unk.res.readback, unk.res.verifiedCompletion], ["UNKNOWN_STOP", "NOT_REQUIRED", false]);
+  const unkDown = await core(world({ throwAt: "postcheck" }), async (opts, st) => { await st.exchange({}); return { ok: true, outcome: "unknown", opId: OID, code: "HTTP_STATUS" }; });
+  assert.deepEqual([unkDown.res.code, unkDown.res.readback], ["UNKNOWN_STOP", "UNAVAILABLE"], "a non-accepted outcome keeps its honest classification");
+  assert.deepEqual(R.parseReadback({ rows: [{ ...POST_OK }] }), { kind: "OK", value: { state: "succeeded", attempts: 1, resendRef: true, errorCode: null, receipts: 1, replayed: false, templateVersion: "gn-v2", locale: "en" } });
+  assert.match(R.POSTCHECK_QUERY, /coalesce\(o\.result_ref LIKE 'resend:%', false\) AS resend_ref/, "the SQL itself yields a strict boolean (no NULL coerced in JS)");
 });
 
 // ---------------------------------------------------------------------------------------------------------------------------------
@@ -321,6 +365,7 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
     const r = await run(bk, bk.op.id, "en", fx);
     assert.deepEqual([r.code, r.admission, r.workerOutcome, r.workerInvocations, r.sendsAttempted, fx.calls, r.providerAccepted, r.providerReplay, r.deliveryProven], ["PROVIDER_ACCEPTED", "ADMITTED", "accepted", 1, 1, 1, true, false, false], JSON.stringify(r));
     assert.deepEqual(r.postcheck, { state: "succeeded", attempts: 1, resendRef: true, errorCode: null, receipts: 1, replayed: false, templateVersion: "gn-v2", locale: "en" });
+    assert.deepEqual([r.verifiedCompletion, r.readback], [true, "VERIFIED"]);
     assert.doesNotMatch(JSON.stringify(r), PII); assert.ok(r.statements > 0 && r.statements <= C.budgets.statements);
     const fx2 = fakeExchange(ok200); const again = await run(bk, bk.op.id, "en", fx2);
     assert.deepEqual([again.code, again.admission, again.workerInvocations, fx2.calls], ["NBC_ADMISSION_REFUSED", "OP_NOT_PRISTINE", 0, 0]);
@@ -355,5 +400,45 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
       const app21 = new pg.Pool({ connectionString: p21.appUrl(), max: 2 });
       try { const r = await run(bk, bk.op.id, "en", fakeExchange(ok200), { pool: app21 }); assert.deepEqual([r.code, r.admission], ["NBC_ADMISSION_REFUSED", "CATALOG_NOT_23"]); } finally { await app21.end(); }
     } finally { await a21.end(); p21.stop(); }
+  });
+
+  /** db.app with ONLY the final readback faulted (thrown or dropped); every other statement — admission, the real worker, its SQL — is untouched */
+  const faultReadback = (mode) => ({ query: (t, p) => db.app.query(t, p), connect: async () => { const cl = await db.app.connect();
+    return { query: (t, p) => (t === R.POSTCHECK_QUERY ? (mode === "throw" ? Promise.reject(new Error("SENTINEL readback fault")) : Promise.resolve({ rows: [] })) : cl.query(t, p)), release: (d) => cl.release(d) }; } });
+
+  test("D4 C51 a real durable ACCEPTED completion whose final readback is faulted (thrown / dropped) → ACCEPTED_UNVERIFIED_STOP with acceptance retained and ONE provider call; the operation / receipt really are succeeded / 1; a rerun is refused at admission with ZERO calls", async () => {
+    for (const [mode, rb] of [["throw", "UNAVAILABLE"], ["drop", "MISSING"]]) {
+      const bk = await ready(); const fx = fakeExchange(ok200);
+      const r = await run(bk, bk.op.id, mode === "throw" ? "en" : "es", fx, { pool: faultReadback(mode) });
+      assert.deepEqual([r.code, r.readback, r.verifiedCompletion, r.providerAccepted, r.workerOutcome, r.sendsAttempted, fx.calls, r.postcheck], ["ACCEPTED_UNVERIFIED_STOP", rb, false, true, "accepted", 1, 1, null], mode);
+      const op = (await db.owner.query("SELECT state, attempts, result_ref LIKE 'resend:%' AS rr FROM booking.external_operations WHERE id = $1", [bk.op.id])).rows[0];
+      const rc = Number((await db.owner.query("SELECT count(*) AS n FROM booking.notification_provider_receipts WHERE operation_id = $1", [bk.op.id])).rows[0].n);
+      assert.deepEqual([op.state, op.attempts, op.rr, rc], ["succeeded", 1, true, 1], "the acceptance is durable; only the readback failed");
+      const fx2 = fakeExchange(ok200); const again = await run(bk, bk.op.id, "en", fx2);
+      assert.deepEqual([again.code, again.admission, again.workerInvocations, fx2.calls], ["NBC_ADMISSION_REFUSED", "OP_NOT_PRISTINE", 0, 0], "never a permission to resend");
+      assert.doesNotMatch(JSON.stringify(r), PII);
+    }
+  });
+
+  test("D5 C51 the documented class-ELIGIBLE-but-SQL-refused path on real PG23 (source version drift): admission passes (class ELIGIBLE), the accepted worker's v2 claim records its refusal → NOT_SENT with ZERO provider calls — and NOT zero database effects: exactly ONE durable effect, the latch VERSION_DRIFT; the op stays pending / attempts 0, no render / receipt", async () => {
+    const bk = await ready();
+    await Hm.F.ownerManagedHistory(db.owner, "UPDATE booking.intents SET version = version + 1 WHERE id = $1", [bk.id]);   // TEST SETUP: intent version ≠ op source_version
+    const v = (await db.owner.query("SELECT version FROM booking.intents WHERE id = $1", [bk.id])).rows[0].version;
+    const f0 = await fingerprint(); const fx = fakeExchange(ok200);
+    const r = await run(bk, bk.op.id, "en", fx, { version: v });
+    assert.equal(r.admission, "ADMITTED", "the runtime role cannot pre-check the owner-only refusal detail");
+    assert.deepEqual([r.code, fx.calls, r.sendsAttempted, r.providerAccepted, r.verifiedCompletion], ["NOT_SENT", 0, 0, false, false], JSON.stringify(r));
+    assert.deepEqual([r.workerOutcome, r.workerCode], ["latched", "VERSION_DRIFT"]);
+    const latch = (await db.owner.query("SELECT code FROM booking.notification_latches WHERE operation_id = $1", [bk.op.id])).rows[0];
+    const f1 = await fingerprint();
+    assert.notDeepEqual(f1, f0, "NOT_SENT is not 'no database effect'");
+    const changed = Object.keys(f1).filter((k) => f1[k] !== f0[k]).sort();
+    assert.deepEqual(changed, ["notification_latches"], "exactly ONE durable effect: the accepted claim's latch (the worker released its own work lease)");
+    assert.equal(latch.code, "VERSION_DRIFT");
+    assert.deepEqual(r.postcheck, { state: "pending", attempts: 0, resendRef: false, errorCode: null, receipts: 0, replayed: false, templateVersion: null, locale: null });
+    assert.equal(r.readback, "NOT_REQUIRED");
+    assert.equal(Number((await db.owner.query("SELECT count(*) AS n FROM booking.notification_renders WHERE operation_id = $1", [bk.op.id])).rows[0].n), 0, "no render: nothing was claimed");
+    assert.equal(Number((await db.owner.query("SELECT count(*) AS n FROM booking.notification_provider_receipts WHERE operation_id = $1", [bk.op.id])).rows[0].n), 0);
+    assert.doesNotMatch(JSON.stringify(r), PII);
   });
 }
