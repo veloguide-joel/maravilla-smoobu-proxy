@@ -11,7 +11,7 @@ import { dirname, join } from "node:path";
 import pg from "pg";
 import { startPostgres } from "./harness.mjs";
 import * as F from "./fixtures.mjs";
-import { migrateUp, migrationStatus } from "../../db/lib/migrate.js";
+import { migrateUp, migrationStatus, loadMigrations } from "../../db/lib/migrate.js";
 
 const ACL_EXACT = ["mv_booking_admin=X/postgres", "mv_booking_app=X/postgres", "postgres=X/postgres"];   // root live baseline
 
@@ -129,7 +129,12 @@ test("C5 healthy apply (fresh cluster) + migrator compatibility + replay refused
     // migrator compatibility: it sees 1..18 applied, no checksum drift, and a further up is a no-op
     const st = await migrationStatus(B.c, { env: "test" });
     assert.deepEqual(st.applied, [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18]);
-    assert.deepEqual(st.pending, [19, 20]);                                               // 0019 / 0020 (local candidates) are the only later migrations
+    // C43 (test-only): every LATER migration in this tree is pending (derived from the contiguous chain, not a hard-coded top — the tree has
+    // grown past 0020); the historical 0018 packet itself still applies EXACTLY 1..18 (asserted above) and the no-op check stays at to: 18
+    const chain = loadMigrations().map((m) => m.version); const TOP = chain.at(-1);
+    assert.deepEqual(chain, Array.from({ length: TOP }, (_, i) => i + 1), "contiguous migration chain 1..TOP");
+    assert.ok(TOP >= 19, "later migrations exist above the 0018 packet");
+    assert.deepEqual(st.pending, Array.from({ length: TOP - 18 }, (_, i) => 19 + i), "19..TOP pending (never applied by the 0018 wrapper)");
     assert.deepEqual(await migrateUp(B.c, { env: "test", to: 18 }), [], "migrator no-op (through 18) after the wrapper applied 18");
     // replay refused
     await expectRaise(B.c, /E7_0018_ALREADY_APPLIED_OR_LATER/);

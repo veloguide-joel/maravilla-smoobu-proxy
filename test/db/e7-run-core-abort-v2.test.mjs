@@ -17,7 +17,7 @@ import { performance } from "node:perf_hooks";
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import pg from "pg";
 import { startMigratedDatabase } from "./harness.mjs";
 import * as F from "./fixtures.mjs";
@@ -645,7 +645,7 @@ test("M6 mode ordering + lock loss: blocked declined → no bridge; lock lost du
   }
 });
 
-test("M7 source pins: exact imports; no timers / env / fs / fetch / Date of its own; SQL limited to the imported v1 statements + ONE claim read; v1 / bridge / workers / migrations bytes unchanged", () => {
+test("M7 source pins: exact imports; no timers / env / fs / fetch / Date of its own; SQL limited to the imported v1 statements + ONE claim read; v1 / bridge / workers / migrations bytes equal the reviewed pins (C1 / C41 accepted changes recorded at PINS); the notification worker is outside the transitive closure", () => {
   const src = readFileSync(join(ROOT, "scripts/e7-connected/run-core-abort-v2.mjs"), "utf8");
   const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
   assert.deepEqual([...code.matchAll(/^import\s[\s\S]*?from\s+"([^"]+)";/gm)].map((x) => x[1]), ["node:util", "./run-journal-memory-v2.mjs", "./run-preflight-r1.mjs", "./run-manifest.mjs", "./run-journal-memory.mjs", "./run-guard.mjs",
@@ -658,12 +658,29 @@ test("M7 source pins: exact imports; no timers / env / fs / fetch / Date of its 
   assert.deepEqual([...src.matchAll(/\b(SELECT|UPDATE|INSERT|DELETE)\b/g)].map((x) => x[1]), ["SELECT"], "the ONE claim read is the only SQL text");
   const sha = (p) => createHashHex(readFileSync(join(ROOT, p)));
   assert.deepEqual(Object.fromEntries(Object.keys(PINS).map((p) => [p, sha(p)])), PINS);
+  // C43: the ACTUAL transitive relative-import closure of run-core-abort-v2 (static scan) does not reach the notification worker
+  const RE = /^\s*(?:import|export)\s[^;]*?from\s+"(\.{1,2}\/[^"]+)"|^\s*import\s+"(\.{1,2}\/[^"]+)"/gm;
+  const seen = new Set(); const queue = ["scripts/e7-connected/run-core-abort-v2.mjs"];
+  while (queue.length) {
+    const rel = queue.shift(); if (seen.has(rel)) continue; seen.add(rel);
+    for (const m of readFileSync(join(ROOT, rel), "utf8").matchAll(RE)) queue.push(relative(ROOT, resolve(dirname(join(ROOT, rel)), m[1] ?? m[2])));
+  }
+  assert.ok(seen.has("scripts/e7-connected/executor-adapters.mjs"), "executor-adapters is a closure member (its pin protects the closure)");
+  assert.equal(seen.has("lib/booking-db/notification-worker.js"), false, "the notification worker is NOT in the run-core-abort-v2 closure");
 });
 const createHashHex = (b) => createHash("sha256").update(b).digest("hex");
 // M2-G2b: run-journal-memory-v2.mjs pin 9fd2a192... -> 4d342357... (the R1 binder / kind / domain; v2 behaviour unchanged — G2a parity suite). M7 imports + ./run-preflight-r1.mjs, ./run-manifest.mjs (the R1 consumer).
 // lib/booking-db/test-abort.js pin: a00952ca... -> 91724d9d... (root ruling b43935f0: the scoped hostaway_reservation evidence classification).
 // lib/booking-db/test-abort.js pin: 91724d9d... -> 2638df7d... (root review of r02 candidate 49e7fe4e, F1/F2: recovered reconciled_found provenance with positivity bound to the one validated evidence read; exact pin, no loosening).
-const PINS = {"scripts/e7-connected/run-core.mjs":"ad1dcbb29e7cb1ce0aac71ac178d903076d4e5cc293dd17f972c04b4beaa5afe","scripts/e7-connected/run-test-abort.mjs":"57d97e1806fbaad83f76cf0b794cb45893a95d36456ad09b5acb7fd8b2f62b21","scripts/e7-connected/run-journal-memory-v2.mjs":"4d342357a29f3e287ca5995737bea47ebdb8b07370a2bcc42c14837d5c8475e0","scripts/e7-connected/run-journal-memory.mjs":"2712f01b0509d343d162b5fe7055878ade40f69d668915671441b81cbf87c700","scripts/e7-connected/run-journal-file.mjs":"265af8195dccbaae34817a9a16e2f09f4498b85638fae4abb779d5b0bd9cc4b1","scripts/e7-connected/run-manifest.mjs":"c47f72eb2b9e898bdaca2ca20ffe7cea0befab006079953133810ce5651f6a56","scripts/e7-connected/run-manifest-v2.mjs":"c19ab009b00b8c3877da53f20e436c1c6d4ac29d051ab1f21705d38fcf3cc7fd","scripts/e7-connected/run-guard.mjs":"5d92cbf8a3dfb345ac876e1140ee6a2d6a27885f8bf6dcb506a5f346024e16a9","scripts/e7-connected/run-facts.mjs":"1be04496eb6617f41f8738617682eb282f2f987cb4d3fe65039892b9eddd6887","scripts/e7-connected/executor-adapters.mjs":"2ac9460fee917305c9e8b81115f1f2f006bd434e3ab8b39835bff9ffa245608e","scripts/e7-operator/test-abort.mjs":"8abcb82ba49ed4b239d2c7a0f5251bb07d24fd95fece1c6580a4cad14532bff3","lib/booking-db/test-abort.js":"2638df7d3cceab9b0720c2ea1c7fa53d439900ef7392d944ef3663c331ebcc86","lib/booking-db/reservation-worker.js":"601f48f67052f5dac40b83354b9cf10d5f81950ff9fe9cbd587288d19ed05e88","lib/booking-db/compensation-worker.js":"200f954a275411f96ad98b9ee577c8a7572ff073e1ce2fd74be7a2db1c242fb5","lib/booking-db/capture-worker.js":"d94d973985ca22eed0bfc54975f1c20159c9452dd3d841f2c7114736b4f37bc2","lib/booking-db/recording-worker.js":"fcdc772f91a18d3cc7aafb767e774017b4f8e8614333b28ea8cbbe9c27c8c930","lib/booking-db/notification-worker.js":"e9fe70d0e79754b2dad2ce91e3b58dc41a3c9e9751e60aa1f3d6e1b3f49dfb8e","lib/checkout/intent-state.js":"e18ad2c81a27d48fa57696e06f67ad22ec8ed2f7f72c4bb7777e76a518909cee","db/migrations/0017_cancelled_pristine_capture_release.up.sql":"880f203b11cb4d2a9fe2317d6cb9fc8e00853b8c8ba41f44026d07aae9fd510e"};
+// C43 (2026-11-14, test-only maintenance; ROOT task C43): two ACCEPTED, REVIEWED source changes re-pinned — exact bytes traced from the merged commits:
+//   scripts/e7-connected/executor-adapters.mjs pin 2ac9460f... -> e775ff20... = C1 capture compatibility (PR #84, merge 59178b04, commit 5b23a63: omit the
+//     multicapture-only `final_capture` from the single FULL capture). 59178b04^ = 2ac9460f..., 59178b04 = e775ff20...; no later commit touches the file. This file IS
+//     a direct import of run-core-abort-v2 (asserted above), so the pin protects the run-core closure; the change is the reviewed C1 fix, not drift.
+//   lib/booking-db/notification-worker.js pin e9fe70d0... -> c5b1a049... = C41 gn-v2 booking-confirmation opt-in (PR #110, merge f05016a7, head bb684bc7):
+//     b0e8ece6 (first parent) = e9fe70d0..., bb684bc7 = f05016a7 = c5b1a049...; the worker CHANGED (default path unchanged; optional confirmationLocale).
+//     It is NOT in the run-core-abort-v2 transitive closure (asserted in M7); the pin remains a no-change guard on the worker bytes from here on.
+//   No other pin changed; no immutable hosted runner / tooling pin is affected (those pin commits, not these test-side hashes).
+const PINS = {"scripts/e7-connected/run-core.mjs":"ad1dcbb29e7cb1ce0aac71ac178d903076d4e5cc293dd17f972c04b4beaa5afe","scripts/e7-connected/run-test-abort.mjs":"57d97e1806fbaad83f76cf0b794cb45893a95d36456ad09b5acb7fd8b2f62b21","scripts/e7-connected/run-journal-memory-v2.mjs":"4d342357a29f3e287ca5995737bea47ebdb8b07370a2bcc42c14837d5c8475e0","scripts/e7-connected/run-journal-memory.mjs":"2712f01b0509d343d162b5fe7055878ade40f69d668915671441b81cbf87c700","scripts/e7-connected/run-journal-file.mjs":"265af8195dccbaae34817a9a16e2f09f4498b85638fae4abb779d5b0bd9cc4b1","scripts/e7-connected/run-manifest.mjs":"c47f72eb2b9e898bdaca2ca20ffe7cea0befab006079953133810ce5651f6a56","scripts/e7-connected/run-manifest-v2.mjs":"c19ab009b00b8c3877da53f20e436c1c6d4ac29d051ab1f21705d38fcf3cc7fd","scripts/e7-connected/run-guard.mjs":"5d92cbf8a3dfb345ac876e1140ee6a2d6a27885f8bf6dcb506a5f346024e16a9","scripts/e7-connected/run-facts.mjs":"1be04496eb6617f41f8738617682eb282f2f987cb4d3fe65039892b9eddd6887","scripts/e7-connected/executor-adapters.mjs":"e775ff20107d31af7c8eece792e86702983976c58f6a82222b516b07f8df671d","scripts/e7-operator/test-abort.mjs":"8abcb82ba49ed4b239d2c7a0f5251bb07d24fd95fece1c6580a4cad14532bff3","lib/booking-db/test-abort.js":"2638df7d3cceab9b0720c2ea1c7fa53d439900ef7392d944ef3663c331ebcc86","lib/booking-db/reservation-worker.js":"601f48f67052f5dac40b83354b9cf10d5f81950ff9fe9cbd587288d19ed05e88","lib/booking-db/compensation-worker.js":"200f954a275411f96ad98b9ee577c8a7572ff073e1ce2fd74be7a2db1c242fb5","lib/booking-db/capture-worker.js":"d94d973985ca22eed0bfc54975f1c20159c9452dd3d841f2c7114736b4f37bc2","lib/booking-db/recording-worker.js":"fcdc772f91a18d3cc7aafb767e774017b4f8e8614333b28ea8cbbe9c27c8c930","lib/booking-db/notification-worker.js":"c5b1a049eafb4924ccfbd9f7eedeffda767991416c86ae18f841e1cc11fe79e2","lib/checkout/intent-state.js":"e18ad2c81a27d48fa57696e06f67ad22ec8ed2f7f72c4bb7777e76a518909cee","db/migrations/0017_cancelled_pristine_capture_release.up.sql":"880f203b11cb4d2a9fe2317d6cb9fc8e00853b8c8ba41f44026d07aae9fd510e"};
 
 const m8ZeroAbort = async (S, r, label) => {
   assert.deepEqual([r.outcome, r.bridgeCalls, r.bridge.operatorCoreInvocations, r.bridge.requestHelperInvocations, r.bridge.receiptAck, r.bridge.dbAbortApplied],
