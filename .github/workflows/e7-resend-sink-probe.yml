@@ -1,0 +1,165 @@
+# E7 C42: Resend SYNTHETIC sink-send TRANSPORT PROBE — the first provider POST shape, BEFORE any real guest send is integrated. Runs
+# `scripts/e7-resend-sink-probe.mjs` + its own `scripts/e7-resend/resend-exchange.mjs` (node built-ins only, no SDK, no install): at most ONE
+# POST https://api.resend.com/emails per dispatch, from the FIXED sender 'maraVilla TEST <onboarding@resend.dev>' to the FIXED singleton
+# ['delivered@resend.dev'] (Resend's documented delivery-SIMULATION sink; no override, no label, no CC / BCC / reply-to / HTML / attachments),
+# subject / text = the ACCEPTED bilingual bcc-v1 booking-confirmation copy from the IMMUTABLE tooling commit f05016a7 with FIXED SYNTHETIC facts
+# (no real booking / intent / reservation). HONEST LABEL: a SYNTHETIC transport probe — NOT a booking notification, NOT a guest send, NOT proof
+# that a real inbox received mail. No retry of any kind, no redirect follow, no decompression, finite body (65 536 bytes), 10 s total deadline,
+# run attempt 1 only (a rerun is refused before the key is read). No DB, no Hostaway, no Stripe, no CA, no worker. Inputs / labels / hashes are
+# NOT consent. MANUAL dispatch only; default mode `preflight` = no environment, no secret, no network: focused FAKE tests + `--dry` + the
+# deterministic source digest + the plan hash for the chosen locale. `send` = ONE `--send` call, main only, after a SUCCESSFUL preflight job
+# of the SAME dispatch, behind the EXISTING `e7-readonly-probe` environment (reviewers / settings unchanged), only after HEAD / tooling pin /
+# copy closure / expected source digest / expected plan hash / label / run attempt re-checks pass. The ONLY secret (E7_RESEND_TEST_KEY) is
+# injected into the LAST send step only; it is merely referenced here (this file creates, reads or requests no credential).
+# Source digest = SHA-256 over: prefix "e7-resend-sink-probe-v1\n", then for each file IN THIS ORDER
+#   1. scripts/e7-resend-sink-probe.mjs  2. scripts/e7-resend/resend-exchange.mjs  3. test/e7-resend-sink-probe.test.mjs  4. .github/workflows/e7-resend-sink-probe.yml
+# the frame  <relative path> NUL <decimal byte length> NUL <file bytes> NUL  (the framedDigest convention of the reviewed runners).
+name: e7-resend-sink-probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "preflight (default: no environment, no secrets, no network) or send (ONE synthetic POST to the Resend sink; main only; needs a successful preflight of this dispatch)"
+        type: choice
+        options: [preflight, send]
+        default: preflight
+      locale:
+        description: "copy locale (the ONLY content choice): en or es — bound into the plan hash, so expected_plan_hash must be the hash printed for THIS locale"
+        type: choice
+        options: [en, es]
+        required: true
+      approval_ref:
+        description: "Approval label (non-secret; a label, never consent). Required non-empty for send."
+        type: string
+        required: false
+        default: ""
+      expected_source_digest:
+        description: "send: exact 64-hex source digest printed by a preflight of this SAME commit (any mismatch refuses before the key is in scope)"
+        type: string
+        required: false
+        default: ""
+      expected_plan_hash:
+        description: "send: exact 64-hex plan hash printed by a preflight of this SAME commit for this SAME locale (any mismatch refuses before the key is in scope)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e7-resend-sink-probe
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout wrapper (this repository, exact dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout accepted bcc-v1 copy tooling (fixed commit f05016a7)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: f05016a7af3f866e7e4d46d219a3b95934ca867c
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Verify checkout bindings (wrapper HEAD == dispatch SHA; tooling HEAD == pin; mode; locale; no secrets)
+        env:
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_TOOLING_PIN: f05016a7af3f866e7e4d46d219a3b95934ca867c
+          E7_MODE: ${{ inputs.mode }}
+          E7_LOCALE: ${{ inputs.locale }}
+        run: |
+          set -eu
+          head="$(git -C wrapper rev-parse HEAD)"
+          [ "$head" = "$E7_WORKFLOW_SHA" ] || { echo "REFUSED: wrapper HEAD != dispatch SHA"; exit 3; }
+          tool="$(git -C tooling rev-parse HEAD)"
+          [ "$tool" = "$E7_TOOLING_PIN" ] || { echo "REFUSED: tooling HEAD != pin"; exit 3; }
+          case "$E7_MODE" in preflight|send) ;; *) echo "REFUSED: mode"; exit 3 ;; esac
+          case "$E7_LOCALE" in en|es) ;; *) echo "REFUSED: locale"; exit 3 ;; esac
+          echo "bindings ok: wrapper=$head tooling=$tool mode=$E7_MODE locale=$E7_LOCALE"
+      - name: Focused FAKE probe tests + --dry (no environment, no secrets, no network, no dependency install)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_LOCALE: ${{ inputs.locale }}
+        run: |
+          set -eu
+          node --test wrapper/test/e7-resend-sink-probe.test.mjs
+          node wrapper/scripts/e7-resend-sink-probe.mjs --dry
+      - name: Source digest (deterministic framed SHA-256; documented order and prefix)
+        env:
+          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
+        run: |
+          set -eu
+          d="$({ printf 'e7-resend-sink-probe-v1\n'; for f in scripts/e7-resend-sink-probe.mjs scripts/e7-resend/resend-exchange.mjs test/e7-resend-sink-probe.test.mjs .github/workflows/e7-resend-sink-probe.yml; do printf '%s\0%s\0' "$f" "$(stat -c%s "wrapper/$f")"; cat "wrapper/$f"; printf '\0'; done; } | sha256sum | cut -d' ' -f1)"
+          echo "sourceDigest=$d"
+          if [ -n "$E7_EXPECTED_SOURCE_DIGEST" ] && [ "$E7_EXPECTED_SOURCE_DIGEST" != "$d" ]; then echo "REFUSED: expected_source_digest mismatch"; exit 3; fi
+
+  send:
+    needs: preflight
+    if: inputs.mode == 'send' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: e7-readonly-probe
+    timeout-minutes: 5
+    steps:
+      - name: Checkout wrapper (this repository, exact dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout accepted bcc-v1 copy tooling (fixed commit f05016a7)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: f05016a7af3f866e7e4d46d219a3b95934ca867c
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Re-check bindings BEFORE the send (HEAD == dispatch SHA; tooling pin + copy closure; source digest; plan hash; label; run attempt 1; no secrets)
+        env:
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_TOOLING_PIN: f05016a7af3f866e7e4d46d219a3b95934ca867c
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_LOCALE: ${{ inputs.locale }}
+          E7_APPROVAL_REF: ${{ inputs.approval_ref }}
+          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
+          E7_EXPECTED_PLAN_HASH: ${{ inputs.expected_plan_hash }}
+        run: |
+          set -eu
+          head="$(git -C wrapper rev-parse HEAD)"
+          [ "$head" = "$E7_WORKFLOW_SHA" ] || { echo "REFUSED: wrapper HEAD != dispatch SHA"; exit 3; }
+          tool="$(git -C tooling rev-parse HEAD)"
+          [ "$tool" = "$E7_TOOLING_PIN" ] || { echo "REFUSED: tooling HEAD != pin"; exit 3; }
+          case "$E7_LOCALE" in en|es) ;; *) echo "REFUSED: locale"; exit 3 ;; esac
+          [ -n "$E7_APPROVAL_REF" ] || { echo "REFUSED: approval_ref empty"; exit 3; }
+          [ "${GITHUB_RUN_ATTEMPT:-}" = "1" ] || { echo "REFUSED: run attempt is not 1 (reruns are never sent)"; exit 3; }
+          printf '%s' "$E7_EXPECTED_SOURCE_DIGEST" | grep -Eq '^[0-9a-f]{64}$' || { echo "REFUSED: expected_source_digest not 64-hex"; exit 3; }
+          printf '%s' "$E7_EXPECTED_PLAN_HASH" | grep -Eq '^[0-9a-f]{64}$' || { echo "REFUSED: expected_plan_hash not 64-hex"; exit 3; }
+          d="$({ printf 'e7-resend-sink-probe-v1\n'; for f in scripts/e7-resend-sink-probe.mjs scripts/e7-resend/resend-exchange.mjs test/e7-resend-sink-probe.test.mjs .github/workflows/e7-resend-sink-probe.yml; do printf '%s\0%s\0' "$f" "$(stat -c%s "wrapper/$f")"; cat "wrapper/$f"; printf '\0'; done; } | sha256sum | cut -d' ' -f1)"
+          [ "$d" = "$E7_EXPECTED_SOURCE_DIGEST" ] || { echo "REFUSED: expected_source_digest mismatch (actual $d)"; exit 3; }
+          node wrapper/scripts/e7-resend-sink-probe.mjs --preflight || { echo "REFUSED: probe preflight (copy closure / plan hash / run gates)"; exit 3; }
+          echo "bindings ok: wrapper=$head tooling=$tool digest=$d"
+      - name: ONE synthetic Resend sink send (the sole secret, this step only; one POST max; no retry; no DB)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_LOCALE: ${{ inputs.locale }}
+          E7_EXPECTED_PLAN_HASH: ${{ inputs.expected_plan_hash }}
+          E7_RESEND_TEST_KEY: ${{ secrets.E7_RESEND_TEST_KEY }}
+        run: node wrapper/scripts/e7-resend-sink-probe.mjs --send
