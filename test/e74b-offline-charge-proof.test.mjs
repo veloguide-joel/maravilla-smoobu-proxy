@@ -492,3 +492,61 @@ test("HOLD-2b confirm: a complete list minted under ANOTHER context is refused e
     assert.deepEqual([r.code, r.disposition], ["CONFIRM_LIST_CONTEXT_CHANGED", "unknown_case"], name);
   }
 });
+
+// ---------------------------------------------------------------------------------------------
+// C21-F1 / C23: the DOCUMENTED "Get guest charges list" example row carries paymentProvider: null (public docs read 2026-11-13). The list read
+// accepts an EXPLICIT null provider (preserved as null — never inferred to "offline", never coerced); undefined / missing / non-string stay
+// refused; every offline-marker requirement (create reply, confirming read, evidence) still demands the literal "offline".
+test("P15 list read: explicit paymentProvider null is a lawful UNRELATED row (preserved as null); missing / undefined / number / boolean / object / array still refuse; every other row rule unchanged", () => {
+  const bad = (rows) => P.assessChargeList({ read: list(rows), intent: intent(), config: cfg(), now: NOW }).code;
+  // DOC-DERIVED: the documented list example row shape (awaiting credit_card_online charge, provider null, documented nulls elsewhere)
+  const docRow = (o = {}) => row({ id: 601, title: "Charge", description: "Charge description", paymentMethod: "credit_card_online", amount: 10, capturedAmount: null,
+    status: "awaiting", paymentProvider: null, paymentProviderMessage: null, paymentProviderInvoiceId: null, paymentProviderChargeId: null, scheduledDate: null,
+    chargeDate: null, holdReleaseDate: null, autoChargeId: null, triggerEvent: null, triggerTimeDelta: 0, flatFee: null, percentageFee: null, ...o });
+  const r = listOk([docRow(), row({ id: 602 })]);
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.deepEqual(r.rows[0], { chargeId: "601", reservationId: "88000001", listingMapId: 990001, type: "charge", title: "Charge", amountMinor: 1000, currency: "USD", status: "awaiting", paymentProvider: null, paymentMethod: "credit_card_online" });
+  assert.equal(r.rows[1].paymentProvider, "offline");
+  // explicit null ONLY: everything else that is not a string still refuses with the same code
+  const noProvider = docRow(); delete noProvider.paymentProvider;
+  assert.equal(bad([noProvider]), "LIST_ROW_PAYMENTPROVIDER_INVALID");
+  for (const v of [undefined, 0, 1, false, true, {}, [], ["offline"], { offline: true }, Symbol.for("offline"), 10n]) assert.equal(bad([docRow({ paymentProvider: v })]), "LIST_ROW_PAYMENTPROVIDER_INVALID", String(v));
+  // null is not accepted for any OTHER string field (the docs give no null example for them)
+  for (const k of ["type", "title", "currency", "status", "paymentMethod"]) assert.equal(bad([docRow({ [k]: null })]), k === "type" ? "LIST_ROW_TYPE_INVALID" : `LIST_ROW_${k.toUpperCase()}_INVALID`, k);
+  // the other row rules are unchanged on a null-provider row: duplicate / foreign / money / type / count
+  assert.equal(bad([docRow(), docRow()]), "LIST_DUPLICATE_ID");
+  assert.equal(bad([docRow({ reservationId: 88000002 })]), "LIST_FOREIGN_RESERVATION_ROW");
+  assert.equal(bad([docRow({ listingMapId: 990002 })]), "LIST_FOREIGN_LISTING_ROW");
+  assert.equal(bad([docRow({ amount: 10.005 })]), "LIST_ROW_AMOUNT_NOT_EXACT");
+  assert.equal(bad([docRow({ amount: "10" })]), "LIST_ROW_AMOUNT_INVALID");
+  assert.equal(bad([docRow({ type: "deposit" })]), "LIST_ROW_TYPE_UNKNOWN");
+  assert.equal(P.assessChargeList({ read: list([docRow()], {}, { count: 2 }), intent: intent(), config: cfg(), now: NOW }).code, "LIST_COUNT_LENGTH_MISMATCH");
+  // a null-provider REFUND row is lawful too (negative exact amount)
+  assert.equal(listOk([docRow({ type: "refund", amount: -10, status: "succeeded" })]).rows[0].amountMinor, -1000);
+});
+
+test("P16 null provider never weakens the marker proofs: an unrelated null-provider row is neither marker, look-alike nor same-amount conflict; the exact-marker row with a NULL provider is counted as a marker (case-only, no eligibility) but can NEVER confirm a recording (CONFIRM_STATE_MISMATCH); same-amount-paid and look-alike rows with null provider keep their conflict outcomes; create reply / confirming read still require the literal \"offline\"", () => {
+  const nullRow = (o = {}) => row({ id: 601, title: "Charge", paymentMethod: "credit_card_online", status: "awaiting", paymentProvider: null, ...o });
+  const q = (rows) => P.qualifyPreflight({ identity: identityOk(), list: listOk(rows), intent: intent(), recordingOp: op(), config: cfg(), now: NOW });
+  const obs = (rows) => P.preflightListObservation({ list: listOk(rows), intent: intent(), config: cfg() });
+  // unrelated documented row: no marker, no look-alike, not paid → eligible with counts 0 (provider absence changes nothing)
+  assert.equal(q([nullRow()]).ok, true);
+  assert.deepEqual([obs([nullRow()]).matchingChargeCount, obs([nullRow()]).lookalikeCount, obs([nullRow()]).sameAmountPaidCount, obs([nullRow()]).rowCount], [0, 0, 0, 1]);
+  // exact-marker title with null provider: it IS the marker (title decides) → case-only, NOT eligible — provider absence is not a free pass
+  const marker = q([nullRow({ title: TITLE, amount: 1234.56, status: "paid" })]);
+  assert.equal(marker.ok, false); assert.equal(marker.disposition, "case_only");
+  assert.deepEqual([obs([nullRow({ title: TITLE, amount: 1234.56, status: "paid" })]).matchingChargeCount, obs([nullRow({ title: TITLE, amount: 1234.56, status: "paid" })]).matchingChargeIds], [1, ["601"]]);
+  // same-amount paid unmarked with null provider → same conflict as with a string provider; look-alike with null provider → same look-alike outcome
+  assert.equal(q([nullRow({ amount: 1234.56, status: "paid" })]).code, "SAME_AMOUNT_PAID_UNMARKED_CONFLICT");
+  assert.equal(q([nullRow({ title: `${TITLE} `, amount: 1234.56, status: "paid" })]).code, q([row({ title: `${TITLE} `, amount: 1234.56 })]).code);
+  assert.equal(obs([nullRow({ title: `${TITLE}x` })]).lookalikeCount, 1);
+  // create reply with null provider → unknown case; confirming read whose exact row has a null provider → CONFIRM_STATE_MISMATCH (never recorded)
+  const e = eligible();
+  const b = P.buildOfflineChargeRequest({ eligibility: e, intent: intent(), recordingOp: op(), config: cfg(), now: NOW });
+  assert.deepEqual([P.assessCreateReply({ reply: reply({ paymentProvider: null }), request: b.request, eligibility: e, intent: intent(), config: cfg() }).code], ["REPLY_PROVIDER"]);
+  const cand = P.assessCreateReply({ reply: reply(), request: b.request, eligibility: e, intent: intent(), config: cfg() }); assert.equal(cand.ok, true);
+  const C = (rows) => P.assessConfirmingRead({ candidate: cand, eligibility: e, intent: intent(), config: cfg(), dispatchedAt: NOW - 2000, now: NOW, list: P.assessChargeList({ read: list(rows), intent: intent(), config: cfg(), now: NOW }) });
+  assert.equal(C([row({ id: 777, title: TITLE, amount: 1234.56, paymentProvider: null })]).code, "CONFIRM_STATE_MISMATCH");
+  assert.equal(C([row({ id: 777, title: TITLE, amount: 1234.56 }), nullRow()]).ok, true, "an unrelated null-provider row on the same page does not block a lawful confirming read");
+  assert.equal(C([row({ id: 777, title: TITLE, amount: 1234.56 }), nullRow()]).observed.paymentProvider, "offline");
+});
