@@ -18,7 +18,7 @@
 // CORS: same allowlist as /api/booking/listings (lib/public-api.js).
 
 import { getHostawayEnvStatus } from "../../lib/hostaway.js";
-import { PUBLIC_LISTING_IDS } from "../../lib/listing-public.js";
+import { resolvePublicCatalog, isPublicCatalogId } from "../../lib/public-catalog.js";   // C85: server-side catalog (pilot default)
 import { fetchCalendarDays } from "../../lib/hostaway-calendar.js";
 import { normalizeCalendar, PUBLIC_CALENDAR_KEYS } from "../../lib/calendar-public.js";
 import { applyPublicCors, withDeadline, todayInTimeZone } from "../../lib/public-api.js";
@@ -44,7 +44,8 @@ export default async function handler(req, res) {
   const idRaw = q(req.query?.id);
   if (typeof idRaw !== "string" || !/^\d{1,12}$/.test(idRaw)) { res.status(400).json({ ok: false, error: "INVALID_LISTING_ID" }); return; }
   const id = Number(idRaw);
-  if (!PUBLIC_LISTING_IDS.includes(id)) { res.status(404).json({ ok: false, error: "LISTING_NOT_FOUND" }); return; }
+  const catalog = resolvePublicCatalog();
+  if (!isPublicCatalogId(id, catalog)) { res.status(404).json({ ok: false, error: "LISTING_NOT_FOUND" }); return; }
 
   const today = todayInTimeZone();
   const fromRaw = q(req.query?.from);
