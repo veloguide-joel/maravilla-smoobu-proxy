@@ -133,7 +133,7 @@ test("W6 execute re-check block executed locally (BEFORE any secret): passes onl
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
 
-test("W7 untouched: the five reviewed runners (executeEnabled false, digests unchanged), the C47 inspection runner (e822a4d6…), the charge-list probe (43715872…) and the Resend sink probe (10c988a3…) source digests; the new files are in no other frame", async () => {
+test("W7 untouched: the five reviewed runners (executeEnabled false, digests unchanged), the C47 inspection runner (889d6a31… since C65; was e822a4d6…), the charge-list probe (43715872…) and the Resend sink probe (aef26da9… since C65; was 10c988a3…) source digests; the new files are in no other frame", async () => {
   const want = { reservation: "5665544de105e4564a57a4434fa32fd2355b9bbd0e756b250d1248e07feb6b19", capture: "5b547a42200b452055d8a718c84ab70f7f2b5a0cd8343f6174c4a75b0c420ed1",
     "test-cleanup": "33f2ab18984dccd3915a18ff8a55dd4a6e5b6bf89e3d84ba1e578347e6cebd1e", recording: "49b5516cb69543a6bd4a697a407d2f2a97a84e18a63f18715338f099917e4824",
     "recorded-cleanup": "9e2021e3ec96bab16869fc194adac672287d559587b2cb7657738ffcd897de1f" };
@@ -143,8 +143,8 @@ test("W7 untouched: the five reviewed runners (executeEnabled false, digests unc
     assert.equal(await R.framedDigest(ROOT, m.CONSTANTS.runnerFiles, m.RUNNER_DIGEST_PREFIX), want[n], n);
   }
   const I = await import("../scripts/e7-hosted-notify-inspect.mjs");
-  assert.equal(await R.framedDigest(ROOT, I.CONSTANTS.runnerFiles, I.SOURCE_DIGEST_PREFIX), "e822a4d61810a9366fe949339a212d85c1849aa1007a5efa0aa3e5d7887060a3", "C47/C48 inspection runner unchanged");
+  assert.equal(await R.framedDigest(ROOT, I.CONSTANTS.runnerFiles, I.SOURCE_DIGEST_PREFIX), "889d6a31af4249cede0bf8b64360b5ca0e7ca2d994c4c882f0348e5f57c2c8e7", "C47/C48 inspection runner unchanged (889d6a31… since C65 cross-pin maintenance; was e822a4d6…)");
   assert.ok(!I.CONSTANTS.runnerFiles.some((f) => FILES.includes(f)));
   assert.equal(await R.framedDigest(ROOT, ["scripts/e7-hosted-charge-list-probe.mjs", "test/e7-hosted-charge-list-probe.test.mjs", ".github/workflows/e7-hosted-charge-list-probe.yml"], "e7-hosted-charge-list-probe-v1\n"), "43715872ddb450889286880c848acefd8757da6fe33bc5c6a3a547bd27219cf3");
-  assert.equal(await R.framedDigest(ROOT, ["scripts/e7-resend-sink-probe.mjs", "scripts/e7-resend/resend-exchange.mjs", "test/e7-resend-sink-probe.test.mjs", ".github/workflows/e7-resend-sink-probe.yml"], "e7-resend-sink-probe-v1\n"), "10c988a3faf7f91c57832f40f1db1aa18bd39ba487e91cc7624318c3dac65464");
+  assert.equal(await R.framedDigest(ROOT, ["scripts/e7-resend-sink-probe.mjs", "scripts/e7-resend/resend-exchange.mjs", "test/e7-resend-sink-probe.test.mjs", ".github/workflows/e7-resend-sink-probe.yml"], "e7-resend-sink-probe-v1\n"), "aef26da954d986dc2d922b607d391be404dd73f1145ece0ae66ea0d80673ade4");
 });
