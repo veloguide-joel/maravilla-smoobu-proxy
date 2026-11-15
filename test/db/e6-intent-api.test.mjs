@@ -202,7 +202,8 @@ test("tokens: Bearer header only; malformed, forged and unknown tokens get the i
   assert.equal(new Set(bodies).size, 1, "every refusal is byte-identical");
   assert.deepEqual(JSON.parse(bodies[0]), { code: "UNAUTHORIZED" });
   const sa = await call(h.intents, { method: "GET", token: a.token }); const sb = await call(h.intents, { method: "GET", token: b.token });
-  assert.deepEqual(sa.body, { status: "awaiting_details", quoteExpiresAt: a.quoteExpiresAt, price: a.price });
+  // C98: the GET body is ADDITIVE — the three existing fields unchanged + bookingProgress (no ref before completion)
+  assert.deepEqual(sa.body, { status: "awaiting_details", quoteExpiresAt: a.quoteExpiresAt, price: a.price, bookingProgress: { stage: "not_paid", bookingRef: null } });
   assert.notDeepEqual(sa.body, sb.body.quoteExpiresAt === sa.body.quoteExpiresAt ? { ...sb.body, x: 1 } : sb.body);
   // B's token cannot move A: details with B's token change only B
   assert.equal((await call(h.step, { token: b.token, body: DETAILS })).statusCode, 200);

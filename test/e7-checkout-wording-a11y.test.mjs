@@ -104,7 +104,8 @@ test("W2 reset kind follows the RENDERED screen: startNew only for terminal / re
     ["not_completed_not_charged", {}, "terminal", "startNew"], ["unavailable_not_charged", {}, "terminal", "startNew"],
     ["unavailable_not_charged", { releaseRequested: true }, "released", "startNew"],
     ["processing", {}, "authorized", "forget"], ["release_requested", {}, "releaseQueued", "forget"], ["under_review", {}, "review", "forget"],
-    ["confirmed", {}, "unexpected", "forget"], ["awaiting_payment", {}, "pay", "forget"], ["awaiting_details", { detailsSaved: false }, "details", "forget"],
+    // C98 (ROOT C98): "confirmed" without a complete projection fails closed to "confirming" (was the authorization-only "unexpected")
+    ["confirmed", {}, "confirming", "forget"], ["awaiting_payment", {}, "pay", "forget"], ["awaiting_details", { detailsSaved: false }, "details", "forget"],
     ["weird", {}, "unreadable", "forget"]];
   for (const [status, seed, screen, reset] of cases) {
     const r = rig([S(status)], { storage: seeded(seed) }); await r.c.init();
@@ -250,4 +251,20 @@ test("A1 DOM: an explicit reset clears the region (no create / loading announcem
   await p.c.create({ from: "2027-01-10", to: "2027-01-11", guests: 1 }); await settle();
   assert.deepEqual(p.said(), ["Enter guest details", "", "Enter guest details"], "new intent: the same status announced once again");
   assert.doesNotMatch(p.said().join(" "), /140|USD|Total/, "no price announced");
+});
+
+// C98 (ROOT C98): rendered DOM (existing fake-document fixture) for the additive bookingProgress projection
+test("W-C98 rendered: complete shows 'TEST booking confirmed' + ref with no Pay / release controls and 'Start a new' wording; finalizing / missing projection never show a ref or a confirmed title; TEST label kept", async () => {
+  const P = (status, bookingProgress) => ({ s: 200, b: { status, ...(bookingProgress === undefined ? {} : { bookingProgress }) } });
+  const c = await open({ status: [P("confirmed", { stage: "complete", bookingRef: "MV-VBQL2LQY" })] });
+  assert.equal(c.$("mv-title").textContent, "TEST booking confirmed"); assert.match(c.$("mv-text").textContent, /MV-VBQL2LQY/);
+  for (const id of ["mv-pay", "mv-release", "mv-details", "mv-create"]) assert.equal(visible(c.$(id)), false, `${id} hidden at complete`);
+  assert.equal(c.$("mv-restart").textContent, "Start a new TEST booking…"); assert.match(HTML, /TEST ONLY/);
+  for (const [label, prog, title] of [["finalizing", { stage: "payment_received_finalizing", bookingRef: null }, "TEST payment received — finalizing"],
+    ["missing (older server)", undefined, "Not yet confirmed — still processing"], ["malformed", { stage: "complete", bookingRef: "<script>" }, "Not yet confirmed — still processing"]]) {
+    const x = await open({ status: [P("confirmed", prog)] });
+    assert.equal(x.$("mv-title").textContent, title, label); assert.doesNotMatch(x.$("mv-text").textContent, /MV-|<script>/, label);
+    assert.equal(visible(x.$("mv-pay")), false, label); assert.equal(visible(x.$("mv-release")), false, label);
+    assert.equal(x.$("mv-restart").textContent, "Forget this TEST booking in this tab…", label);
+  }
 });

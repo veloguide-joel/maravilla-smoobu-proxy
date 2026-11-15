@@ -1,4 +1,7 @@
-// public/checkout-test.js — maraVilla direct-booking TEST checkout page (Stripe TEST mode only; NO reservation is created).
+// public/checkout-test.js — maraVilla direct-booking TEST checkout page (Stripe TEST mode only). The page itself never creates a
+// reservation, captures or records anything: the server-side TEST pipeline is run separately by the test operator (not automatically from
+// here). C98: the page shows "TEST booking confirmed" ONLY when the server's additive bookingProgress projection says "complete"
+// together with status "confirmed"; a missing / malformed projection (e.g. an older server) fails closed to "not yet confirmed".
 // Plain ES module, no dependency, no third-party resource. Talks ONLY to the same-origin intent API:
 //   POST /api/checkout/intents            create (server prices the stay; returns a one-time bearer token)
 //   POST /api/checkout/intent-step        {step:"details"|"pay"|"release"|"status"} with Authorization: Bearer <token>
@@ -14,6 +17,15 @@ export const REQUEST_TIMEOUT_MS = 15000;
 const TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 const STATUS_RE = /^[a-z_]{1,40}$/;
 const CODE_RE = /^[A-Z0-9_]{1,64}$/;
+const BOOKING_REF_RE = /^MV-[A-Z0-9]{6,10}$/;
+/** C98: the server's closed bookingProgress stages (lib/checkout/intent-api-core.js BOOKING_STAGES); anything else is no projection */
+export const PROGRESS_STAGES = Object.freeze(["not_paid", "processing", "payment_received_finalizing", "complete", "needs_review", "ended"]);
+/** a SAFE copy of the projection or null: a known stage; a booking ref ONLY with "complete" (and then required) */
+export function safeProgress(p) {
+  if (!p || typeof p !== "object" || Array.isArray(p) || typeof p.stage !== "string" || !PROGRESS_STAGES.includes(p.stage)) return null;
+  if (p.stage === "complete") return typeof p.bookingRef === "string" && BOOKING_REF_RE.test(p.bookingRef) ? { stage: "complete", bookingRef: p.bookingRef } : null;
+  return { stage: p.stage, bookingRef: null };
+}
 export const UNCERTAIN_ACTIONS = Object.freeze(["create", "details", "pay", "release"]);
 
 // ---------------------------------------------------------------------------------------------------------------------------------
@@ -32,28 +44,37 @@ export const KNOWN_STATUSES = Object.freeze(["awaiting_details", "awaiting_payme
 const safeStatus = (s) => (typeof s === "string" && STATUS_RE.test(s) && KNOWN_STATUSES.includes(s) ? s : null);
 const safeCode = (c) => (typeof c === "string" && CODE_RE.test(c) ? c : "UNEXPECTED_REPLY");
 
-/** Guest-facing description of a server status. `released` = this tab asked for a release earlier. Never "booking confirmed". */
-export function describe(status, { releaseRequested = false } = {}) {
+/** Guest-facing description of a server status. `released` = this tab asked for a release earlier. "TEST booking confirmed" ONLY for status
+ *  "confirmed" WITH a safe "complete" projection (C98); "confirmed" alone (payment captured or an older server) is never shown as complete. */
+export function describe(status, { releaseRequested = false, progress = null } = {}) {
   switch (status) {
     case "awaiting_details": return { kind: "details", title: "Enter guest details", text: "Review the total below, then enter your guest details. Nothing is held yet." };
     case "awaiting_payment": return { kind: "pay", title: "Ready for TEST payment", text: "Next: continue to Stripe TEST Checkout and use a TEST card. If you have already returned from Stripe, use Refresh status instead of making another payment." };
     // "processing" is a COARSE public status (payment_authorized, reservation_pending, capture_unknown, ... all map to it): no positive
     // authorization / uncaptured claim can be made from it
     case "processing": return { kind: "authorized", title: "Processing — not a booking",
-      text: "Keep this tab open and follow the test operator’s instructions. Do not make another TEST payment. A TEST card authorization may be held; this status cannot show whether it has been captured or released. This page does not create a reservation or confirm a booking." };
+      text: "Still processing: this TEST booking is not confirmed yet. Keep this tab open and follow the test operator’s instructions. Do not make another TEST payment. A TEST card authorization may be held; this status cannot show whether it has been captured or released. This page does not create a reservation or confirm a booking." };
     case "release_requested": return { kind: "releaseQueued", title: "Release requested — not released yet",
       text: "Your release request is queued, not finished. Next: wait for the test operator to run cleanup. Refresh status checks the result; it does not release the hold. The TEST hold stays until cleanup verifies the release." };
     case "unavailable_not_charged": return releaseRequested
       ? { kind: "released", title: "Release verified — not charged", text: "The server reports the TEST authorization released. A bank may still show a temporary hold for a while." }
       : { kind: "terminal", title: "Not charged", text: "The server reports this TEST intent closed without a charge." };
-    case "under_review": return { kind: "review", title: "Owner review required",
-      text: "The server could not prove the outcome (for example the release could not be verified). The TEST hold may still exist. Nothing more is sent from this page." };
+    case "under_review": return { kind: "review", title: "Owner review required — not confirmed",
+      text: "The server could not prove the outcome, so this TEST booking is not confirmed (for example the release could not be verified). The TEST hold may still exist. Nothing more is sent from this page." };
     case "expired": return { kind: "terminal", title: "Expired", text: "This TEST intent or its Checkout session expired. No charge was made. You may start a new TEST booking." };
     case "payment_failed": return { kind: "terminal", title: "Payment failed", text: "Stripe did not authorize the TEST payment. You may start a new TEST booking." };
     case "unavailable": return { kind: "terminal", title: "Not available", text: "The server could not price or hold these dates." };
     case "not_completed_not_charged": return { kind: "terminal", title: "Not completed — not charged", text: "The server reports this TEST intent closed without a charge." };
-    case "confirmed": return { kind: "unexpected", title: "Unexpected server status",
-      text: "The server reports 'confirmed', which this TEST page never expects (it creates no reservation). Do not treat this as a booking. Contact the owner." };
+    // C98: publicStatus "confirmed" covers BOTH payment_captured and confirmed; only the complete projection proves the booking finished
+    case "confirmed": {
+      const pg = safeProgress(progress);
+      if (pg && pg.stage === "complete") return { kind: "complete", title: "TEST booking confirmed",
+        text: `The server reports this TEST booking complete: the reservation is recorded and the TEST payment is received. Booking reference: ${pg.bookingRef}. This is a TEST booking; nothing more is needed from this page.` };
+      if (pg && pg.stage === "payment_received_finalizing") return { kind: "finalizing", title: "TEST payment received — finalizing",
+        text: "The server reports the TEST payment received, but the booking is not complete yet. Do not make another TEST payment. The remaining step is run by the test operator, not by this page; use Refresh status to check again." };
+      return { kind: "confirming", title: "Not yet confirmed — still processing",
+        text: "The server has not reported this TEST booking as complete. Do not make another TEST payment. Use Refresh status later and follow the test operator’s instructions." };
+    }
     default: return { kind: "unexpected", title: "Unknown status", text: "The server returned a status this page does not know. Nothing more is sent automatically." };
   }
 }
@@ -76,7 +97,7 @@ const DETAILS_PROBLEM_TEXT = { FIRST_NAME_INVALID: "Enter a first name.", LAST_N
 /** W2: "start new" wording ONLY when the rendered screen is exactly one where the server itself reports this TEST intent closed (terminal)
  *  or the release verified (released). Every other screen (lost, unreadable, review, unexpected, payWait, processing, releaseQueued, ...)
  *  keeps the explicit Forget / loss-of-access warning, even if an earlier status was terminal. Same local reset either way. */
-export const resetFor = (screen) => (screen === "terminal" || screen === "released" ? "startNew" : "forget");
+export const resetFor = (screen) => (screen === "terminal" || screen === "released" || screen === "complete" ? "startNew" : "forget");
 /** A1: what (if anything) the polite live region says for this render. One announcement per change of the displayed screen / title /
  *  notice code / notice sentence; busy and loading renders say nothing and do NOT consume the key (a change seen while busy is announced
  *  once settled); the create screen (explicit reset / no intent) clears the region and the key. Text = title (+ notice sentence) only:
@@ -168,6 +189,7 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
   let busy = false; let pollTimer = null; let stopped = null; let last = null; let notice = null; let price = null; let returned = false;
   let retry = null;                     // the latched action a FRESH status shows may be explicitly resent ("details" | "release")
   let unreadable = false;               // the LAST status reply carried no recognised status: nothing is claimed about the current state
+  let progress = null;                  // C98: the SAFE bookingProgress of the LAST recognised reply (replaced with every status-bearing reply)
   // Release confirmation (two-step, never persisted): `armed` binds the confirmation to the bearer it was opened for. Arming sends nothing;
   // ANY operation start (once), status / error change, latch, unreadable state, busy, token change or reset disarms it.
   let armed = null;
@@ -184,7 +206,7 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
   function releaseEligible() {
     if (!st || !st.token || latch() || unreadable || busy || lost) return false;
     const effective = last === "awaiting_details" && st.detailsSaved ? "awaiting_payment" : last;
-    return effective === "processing" && describe(effective, { releaseRequested: st.releaseRequested }).kind === "authorized";
+    return effective === "processing" && describe(effective, { releaseRequested: st.releaseRequested, progress }).kind === "authorized";
   }
   /** F1: the ONE pay-eligibility predicate (view canPay AND pay()). Initial unpaid checkout: status awaiting_payment (incl. a verified
    *  details reply). Details-latch recovery: an uncertain details write whose fresh status still allows the step. Never while waiting for
@@ -202,7 +224,7 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
     if (armed && (!releaseEligible() || !st || armed.token !== st.token)) { armed = null; if (!focus) focus = "fallback"; }   // auto-dismiss
     // the accepted API reports details_collected as "awaiting_details": a VERIFIED details reply in this tab (session flag) moves the page on
     const effective = last === "awaiting_details" && st && st.detailsSaved ? "awaiting_payment" : last;
-    const d = effective && !unreadable ? describe(effective, { releaseRequested: st && st.releaseRequested }) : null;
+    const d = effective && !unreadable ? describe(effective, { releaseRequested: st && st.releaseRequested, progress }) : null;
     const waitingPay = !!d && d.kind === "pay" && returnedComplete;   // any latch included: never a "Ready for payment" screen after a complete return
     const screen = latch() === "create" && !(st && st.token) ? "createUncertain" : lost ? "lost" : unreadable ? "unreadable"
       : st ? (waitingPay ? "payWait" : d ? d.kind : statusFailed && !busy ? "notChecked" : "loading") : "create";
@@ -255,7 +277,7 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
   }
   function absorb(r) {                          // a status-bearing reply
     const s = safeStatus(r.body && r.body.status);
-    if (s) last = s;
+    if (s) { last = s; progress = safeProgress(r.body && r.body.bookingProgress); }   // status + projection change TOGETHER (never a stale mix)
     const p = priceFrom(r.body && r.body.price);
     if (p) price = p;
     return s;
@@ -268,7 +290,7 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
   }
   function schedule() {
     if (pollTimer !== null || !st || !st.token || !last) return;
-    const kind = describe(last, st).kind;
+    const kind = describe(last, { releaseRequested: st.releaseRequested, progress }).kind;
     // waiting for the authorization is worth re-reading only after a return from Stripe; a queued release always is
     if (!POLL_KINDS.has(kind) || (kind === "pay" && !returned) || latch() !== null) { stopped = null; return; }
     if (autoBudgetLeft() <= 0) { stopped = "BUDGET"; return; }
@@ -284,14 +306,14 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
     }
     const r = await once(() => api.status(st.token));
     if (r === null) return;
-    if (r.kind === "unknown") { statusFailed = false; stopPolling("UNREADABLE"); last = null; unreadable = true; retry = null; setNotice({ level: "warn", code: "STATUS_UNREADABLE", text: "The server's status could not be read. Use Refresh status." }); view(); return; }
+    if (r.kind === "unknown") { statusFailed = false; stopPolling("UNREADABLE"); last = null; progress = null; unreadable = true; retry = null; setNotice({ level: "warn", code: "STATUS_UNREADABLE", text: "The server's status could not be read. Use Refresh status." }); view(); return; }
     if (r.http === 429) { stopPolling("RATE_LIMITED"); statusFailed = true; setNotice({ level: "warn", code: "RATE_LIMITED", text: "Too many requests. Automatic status checks stopped; wait, then use Refresh status." }); view(); return; }
     if (r.http === 401) { stopPolling("UNAUTHORIZED"); lost = true; armed = null; retry = null;
-      setNotice({ level: "error", code: "UNAUTHORIZED", text: "This tab's TEST booking access is no longer accepted by the server." }); last = null; view(); return; }
+      setNotice({ level: "error", code: "UNAUTHORIZED", text: "This tab's TEST booking access is no longer accepted by the server." }); last = null; progress = null; view(); return; }
     if (r.http !== 200) { stopPolling("ERROR"); statusFailed = true; setNotice({ level: "warn", code: safeCode(r.body.code), text: "The status check failed. Use Refresh status." }); view(); return; }
     const s = absorb(r);
     if (s === null) {                             // HTTP 200 without a recognised status: no proof, no previous label reused
-      stopPolling("UNREADABLE"); last = null; unreadable = true; retry = null;
+      stopPolling("UNREADABLE"); last = null; progress = null; unreadable = true; retry = null;
       setNotice({ level: "warn", code: "STATUS_UNRECOGNISED", text: "The server's reply did not contain a recognised status. Use Refresh status." }); view(); return;
     }
     unreadable = false; stopped = null; statusFailed = false;
@@ -357,7 +379,7 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
       if (!tok) { setLatch("create"); setNotice({ level: "error", code: "CREATE_REPLY_UNEXPECTED", latch: true, text: "The server's reply was not a usable create result; a TEST intent may exist. Nothing is retried." }); view(); return; }
       st = { token: tok, releaseRequested: false, detailsSaved: false, polls: [], uncertain: null };
       if (absorb(r) !== "awaiting_details") {      // bearer kept for SAFE status reads; only a recognised status resolves it
-        st.uncertain = "create"; store.save(st); last = null;
+        st.uncertain = "create"; store.save(st); last = null; progress = null;
         setNotice({ level: "warn", code: "CREATE_REPLY_UNEXPECTED", latch: true, text: "The create reply had no recognised status. Use Refresh status; nothing is resent." }); view(); return;
       }
       if (!store.save(st)) setNotice({ level: "error", code: "STORAGE_UNAVAILABLE", text: "This tab cannot remember the TEST booking, so returning from Stripe could not resume it. Payment is disabled in this tab." });
@@ -365,7 +387,7 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
       view();
     },
     /** explicit reset after an unknown create: the guest acknowledges a possible prior TEST intent */
-    acknowledgeUncertainCreate() { if (latch() !== "create") return; armed = null; lost = false; statusFailed = false; store.clear(); st = null; last = null; price = null; setNotice(null); view(); },
+    acknowledgeUncertainCreate() { if (latch() !== "create") return; armed = null; lost = false; statusFailed = false; store.clear(); st = null; last = null; progress = null; price = null; setNotice(null); view(); },
     async details(form) {
       if (!st || !st.token || latch() || unreadable) return;
       if (!config.termsVersion) { setNotice({ level: "error", code: "TERMS_NOT_CONFIGURED", text: "This TEST page has no terms version configured; details cannot be sent." }); view(); return; }
@@ -424,7 +446,7 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
       } else if (retry === "release") await sendRelease();
     },
     async refresh() { stopPolling(null); await readStatus({ auto: false }); },
-    startOver() { armed = null; lost = false; statusFailed = false; returnedComplete = false; stopPolling(null); store.clear(); st = null; last = null; price = null; retry = null; unreadable = false; setNotice(null); view(); }
+    startOver() { armed = null; lost = false; statusFailed = false; returnedComplete = false; stopPolling(null); store.clear(); st = null; last = null; progress = null; price = null; retry = null; unreadable = false; setNotice(null); view(); }
   };
 }
 

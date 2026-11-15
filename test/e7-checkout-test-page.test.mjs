@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { createApi, createController, createStore, describe, validateCheckoutUrl, POLL, STORE_KEY, API } from "../public/checkout-test.js";
+import { createApi, createController, createStore, describe, validateCheckoutUrl, POLL, STORE_KEY, API, safeProgress, PROGRESS_STAGES, resetFor } from "../public/checkout-test.js";
 
 const TOKEN = Buffer.alloc(32, 3).toString("base64url");
 const CFG = Object.freeze({ listingId: 606998, currency: "USD", termsVersion: "terms-2026-11" });
@@ -62,7 +62,10 @@ test("status wording: authorization is a hold, never a booking; queued release !
   assert.equal(describe("unavailable_not_charged", { releaseRequested: true }).kind, "released");
   assert.equal(describe("unavailable_not_charged").kind, "terminal");
   assert.equal(describe("under_review").kind, "review");
-  assert.equal(describe("confirmed").kind, "unexpected"); assert.doesNotMatch(describe("confirmed").title, /confirmed/i);
+  // C98 (ROOT C98; supersedes the authorization-only "unexpected 'confirmed'" expectation): "confirmed" WITHOUT a complete projection is
+  // "not yet confirmed — still processing", never a confirmed booking
+  assert.equal(describe("confirmed").kind, "confirming"); assert.match(describe("confirmed").title, /not yet confirmed/i);
+  assert.doesNotMatch(describe("confirmed").title + describe("confirmed").text, /booking (is )?confirmed|booking reference/i);
   for (const s of ["processing", "release_requested", "under_review", "awaiting_payment"]) assert.doesNotMatch(describe(s).text + describe(s).title, /booking (is )?confirmed|reservation (is )?confirmed/i);
   assert.equal(describe("<img src=x>").kind, "unexpected");
 });
@@ -199,7 +202,7 @@ test("server failures are honest: release flag off, 503, 401 lost token, under_r
   x = mk({ release: [reply(409, { code: "<script>alert(1)</script>" })] }); await rel(x.r.c, x.f); assert.equal(x.r.state.notice.code, "UNEXPECTED_REPLY");
   x = mk({ status: [reply(401, { code: "UNAUTHORIZED" })] }); await x.r.c.init(); assert.deepEqual([x.r.last().screen, x.r.state.notice.code], ["lost", "UNAUTHORIZED"]);
   x = mk({ status: [reply(200, { status: "under_review" })] }); await x.r.c.init(); assert.equal(x.r.last().screen, "review"); assert.equal(x.r.state.polling, false);
-  x = mk({ status: [reply(200, { status: "confirmed" })] }); await x.r.c.init(); assert.equal(x.r.last().screen, "unexpected");
+  x = mk({ status: [reply(200, { status: "confirmed" })] }); await x.r.c.init(); assert.equal(x.r.last().screen, "confirming", "C98: an older server (no projection) fails closed");
   x = mk({ status: [reply(200, { status: "expired" })] }); await x.r.c.init(); assert.equal(x.r.last().screen, "terminal");
   x = mk({ status: [reply(503, { code: "NOT_READY" })] }); await x.r.c.init(); assert.deepEqual([x.r.state.stopped, x.r.state.notice.code], ["ERROR", "NOT_READY"]);
   // cancelled return hint: displayed as a hint, status still read from the server
@@ -414,4 +417,55 @@ test("R-UI1b: every page-load / Stripe-return status read is AUTOMATIC: 30 reloa
   await r.c.refresh(); assert.equal(f.count("status"), POLL.maxAuto + 1, "explicit manual read");
   // storage that cannot persist the budget: a reload sends nothing automatically
   const g = fakeApi(); const r2 = rig({ storage: brokenStorage(), api: g }); await r2.c.init(); assert.equal(g.count("status"), 0);
+});
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// C98: the additive bookingProgress projection on the TEST page (FAKE API only)
+const COMPLETE = { stage: "complete", bookingRef: "MV-VBQL2LQY" };
+const FINALIZING = { stage: "payment_received_finalizing", bookingRef: null };
+const NO_PROMISE = /e-?mail|sent you|inbox|refund|deliver|within \d|minutes?|hours?|automatic(ally)? (complete|finish|confirm)/i;
+test("C98 describe: complete ONLY with status confirmed + a safe complete projection (+ ref); finalizing for payment received; anything else fails closed; no invented email / refund / timing promise", () => {
+  const c = describe("confirmed", { progress: COMPLETE });
+  assert.deepEqual([c.kind, c.title], ["complete", "TEST booking confirmed"]); assert.match(c.text, /MV-VBQL2LQY/); assert.match(c.text, /TEST/);
+  const f = describe("confirmed", { progress: FINALIZING });
+  assert.equal(f.kind, "finalizing"); assert.match(f.title, /payment received/i); assert.match(f.text, /not complete yet/); assert.match(f.text, /Do not make another TEST payment/);
+  assert.doesNotMatch(f.title + f.text, /booking (is )?confirmed|MV-/);
+  for (const p of [null, undefined, {}, [], "complete", { stage: "complete" }, { stage: "complete", bookingRef: "MV-x" }, { stage: "complete", bookingRef: "<b>MV-VBQL2LQY</b>" },
+    { stage: "complete", bookingRef: 42 }, { stage: "done", bookingRef: "MV-VBQL2LQY" }, { stage: "needs_review", bookingRef: null }, { stage: "processing" }, { stage: "ended" }]) {
+    const d = describe("confirmed", { progress: p });
+    assert.equal(d.kind, "confirming", JSON.stringify(p)); assert.doesNotMatch(d.title + d.text, /booking (is )?confirmed|MV-VBQL/, JSON.stringify(p));
+  }
+  for (const s0 of ["processing", "under_review", "awaiting_payment", "release_requested"]) assert.notEqual(describe(s0, { progress: COMPLETE }).kind, "complete", `${s0}: a complete projection never upgrades another status`);
+  assert.match(describe("processing").text, /still processing/i); assert.match(describe("processing").text, /Do not make another TEST payment/); assert.match(describe("under_review").title, /not confirmed/);
+  for (const d of [c, f, describe("confirmed"), describe("processing"), describe("under_review")]) assert.doesNotMatch(d.title + d.text, NO_PROMISE, d.title);
+  assert.deepEqual(safeProgress({ stage: "payment_received_finalizing", bookingRef: "MV-VBQL2LQY" }), FINALIZING, "a ref is dropped outside complete");
+  assert.deepEqual([...PROGRESS_STAGES], ["not_paid", "processing", "payment_received_finalizing", "complete", "needs_review", "ended"]);
+  assert.equal(resetFor("complete"), "startNew"); assert.equal(resetFor("finalizing"), "forget"); assert.equal(resetFor("confirming"), "forget");
+});
+test("C98 controller: finalizing → (Refresh) → complete; complete offers NO pay / release and keeps the ref only while the reply says so; reload shows the server's current projection; a stale complete never survives a newer reply / network error / malformed projection", async () => {
+  const s = memStorage(); createStore(s).save({ token: TOKEN, releaseRequested: false, polls: [] });
+  const f = fakeApi({ status: [reply(200, { status: "confirmed", price: PRICE, bookingProgress: FINALIZING }), reply(200, { status: "confirmed", price: PRICE, bookingProgress: COMPLETE }),
+    reply(200, { status: "confirmed", price: PRICE }), { kind: "unknown" }, reply(200, { status: "confirmed", bookingProgress: COMPLETE }), reply(200, { status: "confirmed", bookingProgress: { stage: "complete", bookingRef: "bad" } })] });
+  const r = rig({ storage: s, api: f, search: "?checkout=complete" }); await r.c.init();
+  let v = r.last(); assert.deepEqual([v.screen, v.canPay, v.canRequestRelease], ["finalizing", false, false]); assert.doesNotMatch(v.title + v.text, /MV-/);
+  await r.c.pay(); await r.c.armRelease?.(); assert.deepEqual([f.count("pay"), f.count("release")], [0, 0], "no payment / release from finalizing");
+  await r.c.refresh(); v = r.last(); assert.deepEqual([v.screen, v.title, v.canPay, v.canRequestRelease, v.reset], ["complete", "TEST booking confirmed", false, false, "startNew"]); assert.match(v.text, /MV-VBQL2LQY/);
+  await r.c.pay(); r.c.armRelease(); await r.c.confirmRelease(); assert.deepEqual([f.count("pay"), f.count("release")], [0, 0], "confirmed removes payment / release actions");
+  await r.c.refresh(); v = r.last(); assert.equal(v.screen, "confirming", "a newer reply WITHOUT the projection: the stale complete is not reused"); assert.doesNotMatch(v.text, /MV-/);
+  await r.c.refresh(); v = r.last(); assert.equal(v.screen, "unreadable", "network error: nothing claimed"); assert.doesNotMatch(v.title + v.text, /confirmed booking|MV-VBQL/);
+  await r.c.refresh(); assert.equal(r.last().screen, "complete");
+  await r.c.refresh(); assert.equal(r.last().screen, "confirming", "malformed ref → fail closed");
+  // reload (a fresh controller over the SAME tab storage): shows whatever the server says NOW; nothing is restored from storage
+  assert.doesNotMatch(s.m.get(STORE_KEY) || "", /MV-|complete|finaliz/i, "the projection / ref is never persisted");
+  const f2 = fakeApi({ status: [reply(200, { status: "confirmed", bookingProgress: COMPLETE })] }); const r2 = rig({ storage: s, api: f2 }); await r2.c.init();
+  assert.deepEqual([r2.last().screen, f2.count("status"), f2.count("pay")], ["complete", 1, 0]);
+  assert.equal(r.state.polling, false, "complete / finalizing / confirming never start automatic polling");
+});
+test("C98 controller: a pay latch is resolved by a confirmed status (no second payment ever); a write reply never carries completion; release_requested / processing with a complete projection stay non-complete", async () => {
+  const s = memStorage(); createStore(s).save({ token: TOKEN, releaseRequested: false, polls: [], uncertain: "pay" });
+  const f = fakeApi({ status: [reply(200, { status: "confirmed", bookingProgress: COMPLETE })] }); const r = rig({ storage: s, api: f }); await r.c.init();
+  assert.deepEqual([r.last().screen, r.state.st.uncertain, f.count("pay")], ["complete", null, 0]);
+  const s2 = memStorage(); createStore(s2).save({ token: TOKEN, releaseRequested: false, polls: [] });
+  const f2 = fakeApi({ status: [reply(200, { status: "processing", bookingProgress: COMPLETE })] }); const r2 = rig({ storage: s2, api: f2 }); await r2.c.init();
+  assert.equal(r2.last().screen, "authorized", "processing + a (bogus) complete projection is still processing");
 });
