@@ -224,6 +224,8 @@ function fpool(w, o = {}) {
       case "claims": return { rows: w.claims };
       case "evidence": return { rows: w.evidence };
       case "work": return { rows: w.work ?? [{ next_action_at: null, work_worker_id: null, work_lease_until: null }] };
+      case "holds": if (w.holdsQuery) return w.holdsQuery(); return { rows: [{ n: w.holds ?? 0 }] };
+      case "inbox": return { rows: [{ n: w.inbox ?? 0 }] };
       case "guest": return { rows: [{ first_name: "Fake", last_name: "Guest", email: "fake.guest@example.test" }] };
       case "role": return { rows: [{ is_app: true, privileged: false }] };
       case "identity": return { rows: [{ db: "fake", environment: "test" }] };
@@ -456,7 +458,7 @@ test("H12 C100 continuation: healthy PENDING NOT_DUE → ONE bounded wait (fake 
   assert.equal(writesOfFake(w), 0, "no provider write reached the fake exchange");
   // the plan explicitly binds the continuation contract
   const pl = plan(); assert.deepEqual(pl.continuation, { maxCoordinatorInvocations: 2, maxWaits: 1, maxWaitMs: 150000,
-    branch: "PENDING:NOT_DUE+reservation_pending+one_settled_create+no_capture_record", readmission: "fresh_durable_facts+same_version+refund_veto+fresh_stripe_proof" });
+    branch: "PENDING:NOT_DUE+reservation_pending+one_settled_create+no_capture_record", readmission: "fresh_durable_facts+same_version+refund_veto+fresh_stripe_proof+final_durable_reread_after_proof+no_active_hold+no_unprocessed_inbox" });
   assert.deepEqual([C.budgets.coordinatorInvocations, C.budgets.maxWaits, C.budgets.maxWaitMs, C.budgets.runMs], [2, 1, 150000, 12 * 60 * 1000]);
 });
 const writesOfFake = (w) => w.calls.filter((x) => /^(S POST|H POST)/.test(x)).length;
@@ -501,6 +503,75 @@ test("H14 C100 the wait is inside the ONE seal: deadline / abort / lock-session 
     assert.equal(w.calls.length, callsAtSeal, `${kind}: no provider call after the seal`); assert.equal(dbAfter, 0, `${kind}: no DB statement after the seal`);
     assert.equal(p.calls(), 1, `${kind}: the late completion resumes nothing`);
   }
+});
+
+/** C101: a Stripe exchange whose CONTINUATION PI read (the 2nd GET /payment_intents) awaits the original valid reply, THEN runs `mut(w)` before resolving */
+const proofMutating = (w, mut) => { const base = fexchanges(w); let piGets = 0;
+  return { hostaway: base.hostaway, stripe: async (req) => { const isPi = req.method === "GET" && req.url.includes("/v1/payment_intents/"); if (isPi) piGets += 1;
+    const out = await base.stripe(req); if (isPi && piGets === 2) { await mut(w); w.mutatedDuringProof = true; } return out; } }; };
+test("H15 C101-F1 facts changed DURING the fresh continuation proof (after the valid PI reply) → the FINAL durable re-read refuses: no second invocation, zero provider writes; the healthy control continues and binds from the final read", async () => {
+  for (const [label, mut, want] of [
+    ["version 6→7", (w) => { w.version = 7; }, "FINAL_STATE_OR_VERSION_DRIFT"],
+    ["open case 0→1", (w) => { w.cases = 1; }, "FINAL_FACTS_OPEN_CASE"],
+    ["refund evidence", (w) => { w.evidence = [{ kind: "payment_intent", external_ref: PI, observed: { amountRefundedMinor: 1 } }]; }, "FINAL_PAYMENT_REFUND_OBSERVED"],
+    ["create identity", (w) => { w.ops[0] = opRow("hostaway.create_reservation", { result_ref: "71999901", attempts: 2 }); }, "FINAL_OPS_DRIFT"],
+    ["rid drift", (w) => { w.ops[0] = opRow("hostaway.create_reservation", { result_ref: "71999909" }); }, null],
+    ["capture key binding drift", (w) => { w.ops.push(opRow("stripe.capture_payment_intent", { state: "pending", attempts: 0, dispatched: false, payload_pi: PI, payload_amount: AMT, payload_key: `cap:${IID}:pi_other` })); }, null],
+    ["next action drift", (w) => { w.work[0].next_action_at = new Date(w.due + 5000); }, "FINAL_NEXT_ACTION_DRIFT"],
+    ["live work lease", (w) => { w.work[0].work_worker_id = "x"; w.work[0].work_lease_until = new Date(w.due + 60000); }, "FINAL_WORK_LEASE_LIVE"],
+    ["state", (w) => { w.status = "reservation_confirmed"; }, "FINAL_STATE_OR_VERSION_DRIFT"]]) {
+    const w = pworld(); let second = 0;
+    const p = pcore(w, [pending1, () => { second += 1; return {}; }], { extra: { exchanges: proofMutating(w, mut) } });
+    const r = await p.run;
+    assert.equal(w.mutatedDuringProof, true, `${label}: the mutation ran inside the continuation proof`);
+    assert.deepEqual([r.outcome, second, p.calls(), r.coordinatorInvocations, writesOfFake(w)], ["STOP", 0, 1, 1, 0], `${label}: ${JSON.stringify(r)}`);
+    if (want) assert.equal(r.code, `CONTINUATION_REFUSED:${want}`, label); else assert.match(r.code, /^CONTINUATION_REFUSED:FINAL_/, `${label}: ${r.code}`);
+    assert.notEqual(r.continuation.readmission, "OK", label); assert.deepEqual(r.proofs, ["STRIPE_AT_START", "STRIPE_AT_CONTINUATION"], `${label}: no extra provider await`);
+  }
+  { const w = pworld(); let seenRid = null;                                                          // healthy control: no mutation → continues, bound to the FINAL rid
+    const p = pcore(w, [pending1, (ww, o) => { seenRid = typeof o.phases.reservation.executors.createReservation; return { outcome: "PENDING", code: "NOT_DUE", steps: [], writes: { create: 0, capture: 0, record: 0 }, nextActionAt: ww.due + 120000 }; }],
+      { extra: { exchanges: proofMutating(w, () => {}) } });
+    const r = await p.run;
+    assert.deepEqual([r.outcome, r.continuation.readmission, p.calls(), seenRid, writesOfFake(w)], ["PENDING", "OK", 2, "function", 0], JSON.stringify(r)); }
+});
+test("H16 C101-F1 the FINAL re-read itself: throw → STOP FINAL_READ_FAILED; hang → its local statement bound SEALS (STOP, connection destroyed); a deadline seal during it → STOP; never a second invocation, zero provider writes", async () => {
+  for (const kind of ["throw", "hang", "deadline"]) {
+    const w = pworld(); let second = 0; let armed = false; const st = { destroyed: 0, hung: null };
+    const base = fpool(w);
+    const wrapQ = (sql, params) => { if (armed && /e7hpl:row\*/.test(String(sql))) { armed = false;
+        if (kind === "throw") return Promise.reject(new Error("final read failed"));
+        st.hung = deferred(); return st.hung.p; }
+      return base.query(sql, params); };
+    const pool = { query: wrapQ, connect: async () => ({ query: wrapQ, release: (x) => { if (x === true) st.destroyed += 1; }, on() {} }) };
+    const p = pcore(w, [pending1, () => { second += 1; return {}; }], { core: { pool }, extra: { exchanges: proofMutating(w, () => { armed = true; }) } });
+    if (kind !== "throw") { for (let i = 0; i < 200 && !st.hung; i++) await tick(2); assert.ok(st.hung, `${kind}: the final read is in flight`); p.T.fire(kind === "hang" ? "db" : "deadline"); }
+    const r = await race40(p.run);
+    assert.notEqual(r, "STILL_PENDING_AFTER_DEADLINE", kind);
+    assert.deepEqual([r.outcome, second, p.calls(), writesOfFake(w)], ["STOP", 0, 1, 0], `${kind}: ${JSON.stringify(r)}`);
+    if (kind === "throw") assert.equal(r.code, "CONTINUATION_REFUSED:FINAL_READ_FAILED");
+    else { assert.equal(r.sealed, true, kind); assert.match(r.code, kind === "hang" ? /STOP_DB_STATEMENT_TIMEOUT/ : /STOP_DEADLINE/, kind); assert.ok(st.destroyed >= 1, `${kind}: connection destroyed`);
+      st.hung.res({ rows: [] }); await tick(10); assert.equal(second, 0, `${kind}: the late completion resumes nothing`); }
+  }
+});
+test("H17 C101-F2 an active recording hold / any unprocessed conflict-inbox row (with ZERO open cases) prevents the wait and the continuation: present after the first invocation → no wait (PENDING, reason); inserted DURING the wait or DURING the fresh proof → CONTINUATION_REFUSED; gate read failure → no continuation; nothing is processed / released", async () => {
+  for (const [label, mut, reason] of [["hold", (w) => { w.holds = 1; }, "RECORDING_HOLD_ACTIVE"], ["inbox", (w) => { w.inbox = 1; }, "CONFLICT_INBOX_UNPROCESSED"],
+    ["gate read throws", (w) => { w.holdsQuery = () => { throw new Error("no table"); }; }, "GATES_READ_FAILED"]]) {
+    const w = pworld(); const p = pcore(w, [(ww) => { mut(ww); return pending1(ww); }]); const r = await p.run;
+    assert.equal(w.cases, 0, label);
+    assert.deepEqual([r.outcome, r.code, p.calls(), r.waits, p.T.waits.length, r.continuation.eligible, r.continuation.reason], ["PENDING", "PENDING:NOT_DUE", 1, 0, 0, false, reason], `${label}: ${JSON.stringify(r)}`);
+  }
+  for (const [label, mut, want] of [["hold", (w) => { w.holds = 1; }, "RECORDING_HOLD_ACTIVE"], ["inbox", (w) => { w.inbox = 2; }, "CONFLICT_INBOX_UNPROCESSED"]]) {
+    { const w = pworld(); let second = 0;                                                             // during the wait
+      const p = pcore(w, [async (ww) => { const x = pending1(ww); setImmediate(() => mut(ww)); return x; }, () => { second += 1; return {}; }]); const r = await p.run;
+      assert.deepEqual([r.outcome, r.code, second, r.waits, writesOfFake(w)], ["STOP", `CONTINUATION_REFUSED:${want}`, 0, 1, 0], `wait ${label}: ${JSON.stringify(r)}`);
+      assert.deepEqual(r.proofs, ["STRIPE_AT_START"], `wait ${label}: refused BEFORE the fresh provider proof`); }
+    { const w = pworld(); let second = 0;                                                             // during the fresh proof
+      const p = pcore(w, [pending1, () => { second += 1; return {}; }], { extra: { exchanges: proofMutating(w, mut) } }); const r = await p.run;
+      assert.deepEqual([r.outcome, r.code, second, writesOfFake(w)], ["STOP", `CONTINUATION_REFUSED:FINAL_${want}`, 0, 0], `proof ${label}: ${JSON.stringify(r)}`); }
+  }
+  assert.match(E.QUERIES.holds, /^\/\*e7hpl:holds\*\/ SELECT count\(\*\)::int AS n FROM booking\.recording_holds WHERE intent_id = \$1 AND released_at IS NULL$/);
+  assert.match(E.QUERIES.inbox, /^\/\*e7hpl:inbox\*\/ SELECT count\(\*\)::int AS n FROM booking\.recording_conflict_inbox WHERE intent_id = \$1 AND processed_at IS NULL$/);
+  for (const k of Object.keys(E.QUERIES)) assert.match(E.QUERIES[k], /^\/\*e7hpl:\w+\*\/ SELECT /, `${k}: pure SELECT`);
 });
 
 // ---------------------------------------------------------------------------------------------------------------------------------
@@ -767,6 +838,45 @@ if (process.env.E7_HPL_DB_TESTS === "1") {
   const refundObs = async (bk, observed) => F.ok(await AD.adminRecordEvidence(db.reconciler, { intentId: bk.id, kind: "payment_intent", externalRef: bk.piId, status: "succeeded",
     observed: { amountMinor: bk.total, currency: "USD", amountReceivedMinor: bk.total, amountCapturableMinor: 0, captured: true, ...observed },
     observedAt: new Date(), attestedBy: "owner", reference: "C90 synthetic stored refund observation" }));
+  // C101: real disposable-DB fixtures for the continuation gates + the post-proof final re-read
+  const offlineEvidence = async (bk) => F.ok(await AD.adminRecordEvidence(db.reconciler, { intentId: bk.id, kind: "hostaway_offline_charges", externalRef: "74000001", status: "listed",
+    observed: { matchingChargeCount: 0, matchingChargeIds: [] }, observedAt: new Date(), attestedBy: "owner", reference: "C101 synthetic offline-charge evidence (enqueues one unprocessed inbox row)" }));
+  /** a schema-INVALID active hold, written with triggers / FKs bypassed: a VALID active hold needs an OPEN OFFLINE_CHARGE_HOLD_* case and a record op, which
+   *  this branch's other gates already refuse; this row isolates the hold gate (zero open cases, no record op) */
+  const bypassHold = async (bk) => { const cl = await db.owner.connect();
+    try { await cl.query("BEGIN"); await cl.query("SET LOCAL session_replication_role = replica");
+      await cl.query(`INSERT INTO booking.recording_holds (id, operation_id, intent_id, reason, case_id, op_state_at_hold, op_key_at_hold, intent_state_at_hold, intent_version_at_hold, created_at, created_by)
+        VALUES (gen_random_uuid(), gen_random_uuid(), $1, 'ATTEMPT_GT1', gen_random_uuid(), 'pending', 'och:x', 'reservation_pending', 0, now(), 'c101-test')`, [bk.id]);
+      await cl.query("COMMIT"); } catch (e) { await cl.query("ROLLBACK"); throw e; } finally { cl.release(); } };
+  const gateCounts = async (bk) => ({ holds: Number((await db.app.query(E.QUERIES.holds, [bk.id])).rows[0].n), inbox: Number((await db.app.query(E.QUERIES.inbox, [bk.id])).rows[0].n) });
+  const proofHook = (w, fn) => { const base = w.stripe; let gets = 0;
+    w.stripe = async (req) => { const isPi = req.method === "GET" && /\/v1\/payment_intents\/[^/]+(\?|$)/.test(req.url); if (isPi) gets += 1; const out = await base(req); if (isPi && gets === 2) { await fn(); w.hooked = true; } return out; }; return w; };
+  test("P17 PG C101-F2 (REAL coordinator + workers, disposable DB): an unprocessed conflict-inbox row (ZERO open cases) or an active hold row → present after the first invocation: no wait; inserted DURING the wait or DURING the fresh proof: CONTINUATION_REFUSED; no second invocation, no capture / record; nothing processed or released", async () => {
+    for (const [kind, ins, want] of [["inbox", offlineEvidence, "CONFLICT_INBOX_UNPROCESSED"], ["hold", bypassHold, "RECORDING_HOLD_ACTIVE"]]) {
+      { const bk = await authorizedBooking(); await ins(bk); const w = pgWorld(bk, { echoCreate: false }); const clk = { t: bk.base + 10 * SEC }; const fw = fastWait(clk);
+        const r = await pgRun(bk, w, { clk, timer: fw.timer, clearTimer: fw.clearTimer });
+        assert.deepEqual([r.outcome, r.code, r.coordinatorInvocations, r.waits, fw.waits, r.continuation && r.continuation.reason, w.creates, w.captures, w.records],
+          ["PENDING", "PENDING:NOT_DUE", 1, 0, 0, want, 1, 0, 0], `${kind} before: ${JSON.stringify(r)}`);
+        assert.equal((await snap(bk.id)).cases, 0, `${kind}: zero OPEN cases (not equivalent)`); assert.deepEqual(await gateCounts(bk), kind === "inbox" ? { holds: 0, inbox: 1 } : { holds: 1, inbox: 0 }, `${kind}: untouched`); }
+      { const bk = await authorizedBooking(); const w = pgWorld(bk, { echoCreate: false }); const clk = { t: bk.base + 10 * SEC }; const fw = fastWait(clk, { during: async () => { await ins(bk); } });
+        const r = await pgRun(bk, w, { clk, timer: fw.timer, clearTimer: fw.clearTimer });
+        assert.deepEqual([r.outcome, r.code, r.coordinatorInvocations, r.waits, w.captures, w.records], ["STOP", `CONTINUATION_REFUSED:${want}`, 1, 1, 0, 0], `${kind} wait: ${JSON.stringify(r)}`);
+        assert.equal((await snap(bk.id)).locks, 0); }
+      { const bk = await authorizedBooking(); const w = proofHook(pgWorld(bk, { echoCreate: false }), () => ins(bk)); const clk = { t: bk.base + 10 * SEC }; const fw = fastWait(clk);
+        const r = await pgRun(bk, w, { clk, timer: fw.timer, clearTimer: fw.clearTimer });
+        assert.equal(w.hooked, true, `${kind}: inserted inside the continuation proof`);
+        assert.deepEqual([r.outcome, r.code, r.coordinatorInvocations, w.captures, w.records], ["STOP", `CONTINUATION_REFUSED:FINAL_${want}`, 1, 0, 0], `${kind} proof: ${JSON.stringify(r)}`); }
+    }
+  });
+  test("P18 PG C101-F1 (REAL coordinator + workers): a refund observation stored DURING the fresh continuation proof (after its valid PI reply) → the FINAL durable re-read refuses: no second invocation, no capture / record; the healthy control (hook, no change) continues to CONFIRMED_VERIFIED", async () => {
+    { const bk = await authorizedBooking(); const w = proofHook(pgWorld(bk, { echoCreate: false }), () => refundObs(bk, { amountRefundedMinor: 1 })); const clk = { t: bk.base + 10 * SEC }; const fw = fastWait(clk);
+      const r = await pgRun(bk, w, { clk, timer: fw.timer, clearTimer: fw.clearTimer });
+      assert.equal(w.hooked, true);
+      assert.deepEqual([r.outcome, r.code, r.coordinatorInvocations, r.waits, w.captures, w.records], ["STOP", "CONTINUATION_REFUSED:FINAL_PAYMENT_REFUND_OBSERVED", 1, 1, 0, 0], JSON.stringify(r)); }
+    { const bk = await authorizedBooking(); const w = proofHook(pgWorld(bk, { echoCreate: false }), async () => {}); const clk = { t: bk.base + 10 * SEC }; const fw = fastWait(clk);
+      const r = await pgRun(bk, w, { clk, timer: fw.timer, clearTimer: fw.clearTimer });
+      assert.deepEqual([r.outcome, r.code, r.coordinatorInvocations, w.creates, w.captures, w.records], ["CONFIRMED_VERIFIED", "CONFIRMED", 2, 1, 1, 1], JSON.stringify(r)); }
+  });
   test("P5 PG stored refund veto: present at admission → refused before the lock, zero provider calls; stored between capture and recording → the coordinator's veto STOPs before the record POST (record 0)", async () => {
     { const bk = await authorizedBooking(); await refundObs(bk, { amountRefundedMinor: 100 }); const w = pgWorld(bk); const r = await pgRun(bk, w);
       assert.deepEqual([r.outcome, r.code, w.calls.length, r.lock], ["STOP", "ADMISSION_REFUSED:PAYMENT_REFUND_OBSERVED", 0, "not_acquired"]); }

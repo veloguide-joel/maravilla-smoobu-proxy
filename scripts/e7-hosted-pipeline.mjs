@@ -46,6 +46,10 @@
 // away and enough whole-run reserve. The wait is inside the ONE seal. After it: ONE fresh re-admission (own lock, same settled version / create
 // identity / due time, due now, no live lease, refund veto, a FRESH raw Stripe proof, recovery executors bound to the durable rid) — any drift /
 // error STOPs. A second PENDING exits PENDING (no third invocation / wait). Anything else returns the existing PENDING / STOP, never a wait.
+// C101: (F1) the fresh Stripe proof is followed by a re-confirmed lock + a FINAL fresh durable re-read / re-validation, and the continuation binds
+// from THOSE facts (no provider await between it and the second invocation; downstream worker fences stay authoritative — not an atomic snapshot);
+// (F2) continuation-only pure counts: ANY active recording hold or ANY unprocessed recording_conflict_inbox row refuses the wait and the
+// re-admission (zero OPEN cases is not equivalent); nothing is processed / released / resolved.
 // Outcomes: CONFIRMED_VERIFIED only when the coordinator says CONFIRMED AND the durable readback verifies confirmed / exactly one succeeded
 // create, capture and recording / captured amount / offline_charge_id linked / claim held / no cases / no forbidden op / notify undispatched.
 // PENDING carries a sanitized nextActionAt and needs a FUTURE, separately dispatched attempt with fresh proof (exit 0, NOT completion).
@@ -200,7 +204,7 @@ export function buildPlan(c, { approvalRef, intentId, ref, expectedVersion, notB
     budgets: { ...c.budgets }, writes: { create: 1, capture: 1, record: 1, refund: 0, cancel: 0, void: 0, notify: 0, account: 0 },
     // C100: the EXPLICITLY bound continuation contract (cumulative writes above are across BOTH invocations; counters never reset)
     continuation: { maxCoordinatorInvocations: c.budgets.coordinatorInvocations, maxWaits: c.budgets.maxWaits, maxWaitMs: c.budgets.maxWaitMs,
-      branch: "PENDING:NOT_DUE+reservation_pending+one_settled_create+no_capture_record", readmission: "fresh_durable_facts+same_version+refund_veto+fresh_stripe_proof" },
+      branch: "PENDING:NOT_DUE+reservation_pending+one_settled_create+no_capture_record", readmission: "fresh_durable_facts+same_version+refund_veto+fresh_stripe_proof+final_durable_reread_after_proof+no_active_hold+no_unprocessed_inbox" },
     executeEnabled: c.executeEnabled };
   return { plan: deepFreeze(plan), planHash: sha(canonical(plan)) };
 }
@@ -222,6 +226,9 @@ export const QUERIES = deepFreeze({
   claims: "/*e7hpl:claims*/ SELECT listing_id, (released_at IS NOT NULL) AS released FROM booking.inventory_claims WHERE intent_id = $1",
   evidence: "/*e7hpl:evidence*/ SELECT kind, external_ref, observed FROM booking.provider_evidence WHERE intent_id = $1 AND kind = 'payment_intent' AND external_ref = $2",
   work: "/*e7hpl:work*/ SELECT next_action_at, work_worker_id, work_lease_until FROM booking.intent_work WHERE intent_id = $1",
+  // C101 F2: continuation-only gates (pure counts; never process / release / resolve). Zero OPEN cases is NOT equivalent: a hold may name a resolved case
+  holds: "/*e7hpl:holds*/ SELECT count(*)::int AS n FROM booking.recording_holds WHERE intent_id = $1 AND released_at IS NULL",
+  inbox: "/*e7hpl:inbox*/ SELECT count(*)::int AS n FROM booking.recording_conflict_inbox WHERE intent_id = $1 AND processed_at IS NULL",
   guest: `/*e7hpl:guest*/ SELECT g.first_name, g.last_name, g.email FROM (SELECT 1) one LEFT JOIN booking.intent_guests g ON g.intent_id = $1`
 });
 const Q = QUERIES;
@@ -232,6 +239,20 @@ const FORBIDDEN_OPS = freeze(["stripe.void_payment_intent", "hostaway.cancel_res
 const PIPELINE_STATES = freeze(["payment_authorized", "reservation_pending", "reservation_confirmed", "payment_captured"]);
 const UNSETTLED_OP_STATES = freeze(["in_flight", "outcome_unknown", "escalated"]);
 const pristine = (o) => o && o.state === "pending" && Number(o.attempts) === 0 && o.dispatched === false;
+
+/** C101 F2: the continuation-only gate counts → { holds, inbox } (numbers) or throws; never part of the ordinary readFacts admission */
+export async function readContinuationGates(q, plan) {
+  const h = await q(Q.holds, [plan.intentId]);
+  const x = await q(Q.inbox, [plan.intentId]);
+  const n = (rows) => (Array.isArray(rows) && rows.length === 1 && Number.isSafeInteger(rows[0].n) && rows[0].n >= 0 ? rows[0].n : null);
+  return freeze({ holds: n(h), inbox: n(x) });
+}
+export function gateRefusal(g) {
+  if (!g || g.holds === null || g.inbox === null) return "GATES_UNREADABLE";
+  if (g.holds !== 0) return "RECORDING_HOLD_ACTIVE";
+  if (g.inbox !== 0) return "CONFLICT_INBOX_UNPROCESSED";
+  return null;
+}
 
 export async function readFacts(q, plan, tooling, raw) {
   const inst = await q(Q.instance, []);
@@ -898,15 +919,14 @@ export async function runPipelineCore(input) {
       snap.version = fx.intent.version; snap.due = due; snap.rid = String(cr[0].result_ref); snap.create = createIdentity(fx); snap.writeRows = writeRows(fx); snap.waitMs = waitMs;
       return null;
     };
-    /** C100: ONE fresh re-admission after the wait — every pin re-proved from fresh durable facts + a fresh raw Stripe proof (never the cached one) */
-    const readmission = async (snap) => {
-      if (!(await ownLock())) { r.lock = "lost"; return "LOCK_LOST"; }
-      if (stopped()) return `STOP_${stopReason}`;
-      const fx = await readOrStop(); if (!fx) return r.sealed ? `STOP_${stopReason}` : "READ_FAILED";
-      if (stopped()) return `STOP_${stopReason}`;
-      if (!fx.intent || fx.intent.status !== "reservation_pending" || fx.intent.version !== snap.version || Number(fx.row.version) !== snap.version) return "STATE_OR_VERSION_DRIFT";
+    const readGatesOrNull = async () => { try { return await readContinuationGates(q, plan); } catch { return null; } };
+    /** C101 F1: the pure durable re-validation of one fresh read against the eligible snapshot (no await, no provider) → null | code */
+    const revalidate = (fx, g, snap) => {
+      if (!fx.intent || fx.intent.status !== "reservation_pending" || fx.intent.version !== snap.version || !fx.row || Number(fx.row.version) !== snap.version
+          || fx.row.state !== "reservation_pending") return "STATE_OR_VERSION_DRIFT";
       const pk = checkPending(fx, plan, c); if (pk) return `FACTS_${pk}`;
       if (createIdentity(fx) !== snap.create || writeRows(fx) !== snap.writeRows) return "OPS_DRIFT";
+      for (const o of fx.ops) if (o.state === "pending" && o.dispatched === true) return "ATTEMPTED_PENDING_OP";
       const cand = candidateOf(fx, c); if (!cand.ok || cand.id !== snap.rid) return "RID_DRIFT";
       const w = workRow(fx); const t = clock();
       if (!w || msOf(w.next_action_at) !== snap.due) return "NEXT_ACTION_DRIFT";
@@ -915,12 +935,39 @@ export async function runPipelineCore(input) {
       if (lease !== null && (Number.isNaN(lease) || lease > t)) return "WORK_LEASE_LIVE";
       if (fx.intent.lease && (!Number.isFinite(fx.intent.lease.until) || fx.intent.lease.until > t)) return "INTENT_LEASE_LIVE";
       const veto = tooling.refundObservationRefusal(fx.evidence, PI); if (veto) return veto;
+      const gr = gateRefusal(g); if (gr) return gr;
+      return null;
+    };
+    const freshRead = async () => {
+      const fx = await readOrStop(); if (!fx) return { why: r.sealed ? `STOP_${stopReason}` : "READ_FAILED" };
+      if (stopped()) return { why: `STOP_${stopReason}` };
+      const g = await readGatesOrNull(); if (!g) return { why: r.sealed || stopped() ? `STOP_${stopReason}` : "GATES_READ_FAILED" };
+      if (stopped()) return { why: `STOP_${stopReason}` };
+      return { fx, g };
+    };
+    /** C100 + C101 F1: ONE re-admission after the wait. (a) lock + fresh durable pre-check (refuses BEFORE any provider call), (b) a fresh raw Stripe
+     *  proof (never the cached one), then (c) AFTER that network await: lock re-confirmed + a FINAL fresh durable re-read / re-validation, and the
+     *  binding is made from THOSE final facts. No provider await follows (c) before the second invocation; invoke() re-checks seal / abort / lock at
+     *  its own boundary. Downstream worker fences stay authoritative: this is NOT an atomic DB / provider snapshot, only a refusal to reuse
+     *  pre-network facts. */
+    const readmission = async (snap) => {
+      if (!(await ownLock())) { r.lock = "lost"; return "LOCK_LOST"; }
+      if (stopped()) return `STOP_${stopReason}`;
+      const pre = await freshRead(); if (pre.why) return pre.why;
+      const w1 = revalidate(pre.fx, pre.g, snap); if (w1) return w1;
       try {
-        const p = await freshProof("authorized", "STRIPE_AT_CONTINUATION", fx.intent);
+        const p = await freshProof("authorized", "STRIPE_AT_CONTINUATION", pre.fx.intent);
         if (p) return `FRESH_PROOF_${p}`;
-        await bind(fx, null);                                                                           // the recovery factory bound to the durable rid (never creates)
-      } catch (e) { if (e instanceof Stopped || stopped()) return `STOP_${stopReason ?? "STOPPED"}`; return e instanceof HookStop ? e.code : "BIND_FAILED"; }
+      } catch (e) { if (e instanceof Stopped || stopped()) return `STOP_${stopReason ?? "STOPPED"}`; return e instanceof HookStop ? e.code : "FRESH_PROOF_FAILED"; }
+      if (stopped()) return `STOP_${stopReason}`;
+      if (!(await ownLock())) { r.lock = "lost"; return "LOCK_LOST_AFTER_PROOF"; }
+      if (stopped()) return `STOP_${stopReason}`;
+      const fin = await freshRead(); if (fin.why) return `FINAL_${fin.why}`;
+      const w2 = revalidate(fin.fx, fin.g, snap); if (w2) return `FINAL_${w2}`;
+      try { await bind(fin.fx, null); }                                                                 // reservation_pending: pure (no network); bound to the FINAL durable rid
+      catch (e) { if (e instanceof Stopped || stopped()) return `STOP_${stopReason ?? "STOPPED"}`; return e instanceof HookStop ? e.code : "BIND_FAILED"; }
       if (bound.resId !== snap.rid) return "RID_NOT_BOUND";
+      if (stopped()) return `STOP_${stopReason}`;
       r.continuationVersion = snap.version;
       return null;
     };
@@ -943,7 +990,12 @@ export async function runPipelineCore(input) {
         const at = sanitizeNextActionAt(co.nextActionAt, clock(), B.pendingHorizonMs);
         if (at === null) return stop(`PENDING_NEXT_ACTION_INVALID:${co.code}`);
         if (r.coordinatorInvocations === 1 && r.waits === 0) {
-          const snap = {}; const why = continuationRefusal(co, fz, snap);
+          const snap = {}; let why = continuationRefusal(co, fz, snap);
+          if (why === null) {                                                                           // C101 F2: holds / unprocessed inbox refuse the wait itself
+            const g = await readGatesOrNull();
+            if (stopped()) return stop(`STOP_${stopReason}`);
+            why = g ? gateRefusal(g) : "GATES_READ_FAILED";
+          }
           r.continuation = freeze({ eligible: why === null, reason: why, dueAt: why === null ? new Date(snap.due).toISOString() : null, waitMs: why === null ? snap.waitMs : null });
           if (why === null) return { cont: snap };
         }
