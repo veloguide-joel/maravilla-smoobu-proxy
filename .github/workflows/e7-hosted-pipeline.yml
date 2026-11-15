@@ -1,0 +1,232 @@
+# E7 C90: HOSTED TEST PIPELINE runner (scripts/e7-hosted-pipeline.mjs): ONE bounded invocation of the ACCEPTED test-pipeline coordinator
+# (lib/booking-db/test-pipeline-coordinator.js, immutable tooling 71c3dcf8) for ONE fresh accepted TEST checkout on listing 606998 — reservation →
+# capture → recording through the ACCEPTED workers / executor adapters / transports, replacing the manual S1 / S2 / S4 dispatch sequence.
+# SHIPPED CLOSED: the runner's executeEnabled is FALSE — `verify` (and therefore the execute job) refuses HPL_EXECUTE_CLOSED before any value,
+# import, credential, database or provider access; the secret step below is never reached while it is closed. HONEST LABEL: MANUAL hosted TEST
+# runner (workflow_dispatch + the EXISTING `e7-readonly-probe` reviewer gate); NOT automatic checkout, NOT a cron / webhook / API / UI path.
+# ONE coordinator invocation per dispatch, <= 1 create / 1 capture / 1 offline-charge record; no sleep / poll / re-dispatch. PENDING (provider echo
+# needs time) reports a sanitized nextActionAt and needs a FUTURE, separately dispatched attempt with fresh proof. Refunds stay MANUAL; no
+# cancel / void / refund / cleanup / notification send. Default mode `preflight` = no environment, no secret, no database: focused FAKE tests
+# (spawned by the runner) + the plan hash + the digests. The ONLY secrets (existing NAMES E7_STRIPE_TEST_KEY, E7_HOSTAWAY_TOKEN,
+# E7_DEV_BOOKING_DATABASE_URL, environment `e7-readonly-probe`) appear in the ONE last execute step only. No new secret, environment, permission or setting.
+# Source digest = SHA-256 over: prefix "e7-hosted-pipeline-v1\n", then for each file IN THIS ORDER
+#   1. scripts/e7-hosted-pipeline.mjs  2. test/e7-hosted-pipeline.test.mjs  3. test/e7-hosted-pipeline-workflow.test.mjs  4. .github/workflows/e7-hosted-pipeline.yml
+# the frame  <relative path> NUL <decimal byte length> NUL <file bytes> NUL  (the framedDigest convention of the reviewed runners).
+name: e7-hosted-pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "preflight (default: no environment, no secrets, no database) or execute (SHIPPED CLOSED: refuses at verify; main only; needs a successful preflight of this dispatch)"
+        type: choice
+        options: [preflight, execute]
+        default: preflight
+      approval_ref:
+        description: "Approval label (non-secret; a label, never consent). All eight plan inputs empty = labelled SYNTHETIC preflight only."
+        type: string
+        required: false
+        default: ""
+      intent_id:
+        description: "The ONE fresh TEST intent (UUID v4); the C82 protected set and anything created before not_before are refused."
+        type: string
+        required: false
+        default: ""
+      booking_ref:
+        description: "The intent's booking ref (MV-…), bound to the coordinator and the Hostaway create."
+        type: string
+        required: false
+        default: ""
+      expected_version:
+        description: "The intent's exact current version (refused at any other version)."
+        type: string
+        required: false
+        default: ""
+      not_before:
+        description: "ISO-8601 UTC instant >= 2026-11-15T18:25:04Z; an intent created before it is refused as HISTORIC."
+        type: string
+        required: false
+        default: ""
+      payment_intent_id:
+        description: "The bound TEST PaymentIntent id (pi_…); re-proved read-only at start and at each stage boundary."
+        type: string
+        required: false
+        default: ""
+      amount_minor:
+        description: "The EXACT price in minor units (= authorized = captured = recorded)."
+        type: string
+        required: false
+        default: ""
+      currency:
+        description: "USD only."
+        type: string
+        required: false
+        default: ""
+      expected_plan_hash:
+        description: "execute only: exact 64-hex planHash printed by a REAL-plan preflight of this SAME commit (no default)"
+        type: string
+        required: false
+        default: ""
+      expected_source_digest:
+        description: "execute only: exact 64-hex source digest printed by a preflight of this SAME commit (no default)"
+        type: string
+        required: false
+        default: ""
+      expected_closure_digest:
+        description: "execute only: exact 64-hex closure digest of the pinned tooling (no default)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e7-hosted-pipeline
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout wrapper (this repository, exact dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout merged E7 tooling (fixed commit 71c3dcf8)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: 71c3dcf83c6b78a2cb0c6a7e829b5ecb23d37af5
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Verify checkout bindings (wrapper HEAD == dispatch SHA; tooling HEAD == pin; no secrets)
+        env:
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_TOOLING_PIN: 71c3dcf83c6b78a2cb0c6a7e829b5ecb23d37af5
+          E7_MODE: ${{ inputs.mode }}
+        run: |
+          set -eu
+          head="$(git -C wrapper rev-parse HEAD)"
+          [ "$head" = "$E7_WORKFLOW_SHA" ] || { echo "REFUSED: wrapper HEAD != dispatch SHA"; exit 3; }
+          tool="$(git -C tooling rev-parse HEAD)"
+          [ "$tool" = "$E7_TOOLING_PIN" ] || { echo "REFUSED: tooling HEAD != pin"; exit 3; }
+          case "$E7_MODE" in preflight|execute) ;; *) echo "REFUSED: mode"; exit 3 ;; esac
+          echo "bindings ok: wrapper=$head tooling=$tool mode=$E7_MODE"
+      - name: Preflight (runner spawns the focused FAKE tests; plan hash + digests; no environment, no secret, no database, no dependency install)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_APPROVAL_REF: ${{ inputs.approval_ref }}
+          E7_INTENT_ID: ${{ inputs.intent_id }}
+          E7_BOOKING_REF: ${{ inputs.booking_ref }}
+          E7_EXPECTED_VERSION: ${{ inputs.expected_version }}
+          E7_NOT_BEFORE: ${{ inputs.not_before }}
+          E7_PAYMENT_INTENT_ID: ${{ inputs.payment_intent_id }}
+          E7_AMOUNT_MINOR: ${{ inputs.amount_minor }}
+          E7_CURRENCY: ${{ inputs.currency }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+        run: node wrapper/scripts/e7-hosted-pipeline.mjs preflight
+      - name: Source digest (deterministic framed SHA-256; documented order and prefix)
+        env:
+          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
+        run: |
+          set -eu
+          d="$({ printf 'e7-hosted-pipeline-v1\n'; for f in scripts/e7-hosted-pipeline.mjs test/e7-hosted-pipeline.test.mjs test/e7-hosted-pipeline-workflow.test.mjs .github/workflows/e7-hosted-pipeline.yml; do printf '%s\0%s\0' "$f" "$(stat -c%s "wrapper/$f")"; cat "wrapper/$f"; printf '\0'; done; } | sha256sum | cut -d' ' -f1)"
+          echo "sourceDigest=$d"
+          if [ -n "$E7_EXPECTED_SOURCE_DIGEST" ] && [ "$E7_EXPECTED_SOURCE_DIGEST" != "$d" ]; then echo "REFUSED: expected_source_digest mismatch"; exit 3; fi
+
+  execute:
+    needs: preflight
+    if: inputs.mode == 'execute' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: e7-readonly-probe
+    timeout-minutes: 20
+    steps:
+      - name: Checkout wrapper (this repository, exact dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout merged E7 tooling (fixed commit 71c3dcf8)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: 71c3dcf83c6b78a2cb0c6a7e829b5ecb23d37af5
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Re-check bindings BEFORE any secret (HEAD == dispatch SHA; tooling pin; label; expected digests 64-hex; source digest)
+        env:
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_TOOLING_PIN: 71c3dcf83c6b78a2cb0c6a7e829b5ecb23d37af5
+          E7_APPROVAL_REF: ${{ inputs.approval_ref }}
+          E7_EXPECTED_PLAN_HASH: ${{ inputs.expected_plan_hash }}
+          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
+          E7_EXPECTED_CLOSURE_DIGEST: ${{ inputs.expected_closure_digest }}
+        run: |
+          set -eu
+          head="$(git -C wrapper rev-parse HEAD)"
+          [ "$head" = "$E7_WORKFLOW_SHA" ] || { echo "REFUSED: wrapper HEAD != dispatch SHA"; exit 3; }
+          tool="$(git -C tooling rev-parse HEAD)"
+          [ "$tool" = "$E7_TOOLING_PIN" ] || { echo "REFUSED: tooling HEAD != pin"; exit 3; }
+          [ -n "$E7_APPROVAL_REF" ] || { echo "REFUSED: approval_ref empty"; exit 3; }
+          for v in "$E7_EXPECTED_PLAN_HASH" "$E7_EXPECTED_SOURCE_DIGEST" "$E7_EXPECTED_CLOSURE_DIGEST"; do printf '%s' "$v" | grep -Eq '^[0-9a-f]{64}$' || { echo "REFUSED: expected digest not 64-hex"; exit 3; }; done
+          d="$({ printf 'e7-hosted-pipeline-v1\n'; for f in scripts/e7-hosted-pipeline.mjs test/e7-hosted-pipeline.test.mjs test/e7-hosted-pipeline-workflow.test.mjs .github/workflows/e7-hosted-pipeline.yml; do printf '%s\0%s\0' "$f" "$(stat -c%s "wrapper/$f")"; cat "wrapper/$f"; printf '\0'; done; } | sha256sum | cut -d' ' -f1)"
+          [ "$d" = "$E7_EXPECTED_SOURCE_DIGEST" ] || { echo "REFUSED: expected_source_digest mismatch (actual $d)"; exit 3; }
+          echo "bindings ok: wrapper=$head tooling=$tool source=$d"
+      - name: Verify (runner; SHIPPED CLOSED → HPL_EXECUTE_CLOSED here; else closure / source / plan / approval bindings; no secret, no database)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_APPROVAL_REF: ${{ inputs.approval_ref }}
+          E7_INTENT_ID: ${{ inputs.intent_id }}
+          E7_BOOKING_REF: ${{ inputs.booking_ref }}
+          E7_EXPECTED_VERSION: ${{ inputs.expected_version }}
+          E7_NOT_BEFORE: ${{ inputs.not_before }}
+          E7_PAYMENT_INTENT_ID: ${{ inputs.payment_intent_id }}
+          E7_AMOUNT_MINOR: ${{ inputs.amount_minor }}
+          E7_CURRENCY: ${{ inputs.currency }}
+          E7_EXPECTED_PLAN_HASH: ${{ inputs.expected_plan_hash }}
+          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
+          E7_EXPECTED_CLOSURE_DIGEST: ${{ inputs.expected_closure_digest }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: node wrapper/scripts/e7-hosted-pipeline.mjs verify
+      - name: Install the pinned dependency from the verified lockfile (no lifecycle scripts)
+        working-directory: tooling
+        run: npm ci --ignore-scripts --omit=dev --no-audit --no-fund
+      - name: Fetch the public Supabase CA (the runner checks its pinned SHA-256)
+        run: curl --fail --silent --show-error --proto '=https' --max-time 20 -o "$RUNNER_TEMP/prod-ca-2021.crt" https://supabase-downloads.s3-ap-southeast-1.amazonaws.com/prod/ssl/prod-ca-2021.crt
+      - name: ONE bounded TEST pipeline coordinator invocation (the only secrets, this step only; <= 1 create / capture / record, no retry)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_APPROVAL_REF: ${{ inputs.approval_ref }}
+          E7_INTENT_ID: ${{ inputs.intent_id }}
+          E7_BOOKING_REF: ${{ inputs.booking_ref }}
+          E7_EXPECTED_VERSION: ${{ inputs.expected_version }}
+          E7_NOT_BEFORE: ${{ inputs.not_before }}
+          E7_PAYMENT_INTENT_ID: ${{ inputs.payment_intent_id }}
+          E7_AMOUNT_MINOR: ${{ inputs.amount_minor }}
+          E7_CURRENCY: ${{ inputs.currency }}
+          E7_EXPECTED_PLAN_HASH: ${{ inputs.expected_plan_hash }}
+          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
+          E7_EXPECTED_CLOSURE_DIGEST: ${{ inputs.expected_closure_digest }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          E7_CA_FILE: ${{ runner.temp }}/prod-ca-2021.crt
+          E7_STRIPE_TEST_KEY: ${{ secrets.E7_STRIPE_TEST_KEY }}
+          E7_HOSTAWAY_TOKEN: ${{ secrets.E7_HOSTAWAY_TOKEN }}
+          E7_DEV_BOOKING_DATABASE_URL: ${{ secrets.E7_DEV_BOOKING_DATABASE_URL }}
+        run: node wrapper/scripts/e7-hosted-pipeline.mjs execute
