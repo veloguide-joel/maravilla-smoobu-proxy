@@ -31,9 +31,9 @@ const WEBHOOK_CLOSURE = Object.freeze([
 // Closures of every other api/ file at the accepted base 0c94b17 (tracer output; must not change).
 const OTHER_API = Object.freeze({
   "api/_db.js": { files: ["api/_db.js"], packages: ["pg"] },
-  "api/booking/calendar.js": { files: ["api/booking/calendar.js", "lib/bookability.js", "lib/calendar-public.js", "lib/hostaway-calendar.js", "lib/hostaway.js", "lib/listing-content.js", "lib/listing-public.js", "lib/public-api.js"], packages: [] },
-  "api/booking/listings.js": { files: ["api/booking/listings.js", "lib/hostaway.js", "lib/listing-content.js", "lib/listing-public.js", "lib/public-api.js"], packages: [] },
-  "api/booking/quote.js": { files: ["api/booking/quote.js", "lib/bookability.js", "lib/direct-policy.js", "lib/direct-pricing.js", "lib/direct-public.js", "lib/hostaway-calendar.js", "lib/hostaway.js", "lib/listing-content.js", "lib/listing-public.js", "lib/public-api.js", "lib/quote-public.js"], packages: [] },
+  "api/booking/calendar.js": { files: ["api/booking/calendar.js", "lib/bookability.js", "lib/calendar-public.js", "lib/hostaway-calendar.js", "lib/hostaway.js", "lib/listing-content.js", "lib/listing-public.js", "lib/public-api.js", "lib/public-catalog.js"], packages: [] },
+  "api/booking/listings.js": { files: ["api/booking/listings.js", "lib/hostaway.js", "lib/listing-content.js", "lib/listing-public.js", "lib/public-api.js", "lib/public-catalog.js"], packages: [] },
+  "api/booking/quote.js": { files: ["api/booking/quote.js", "lib/bookability.js", "lib/direct-policy.js", "lib/direct-pricing.js", "lib/direct-public.js", "lib/hostaway-calendar.js", "lib/hostaway.js", "lib/listing-content.js", "lib/listing-public.js", "lib/public-api.js", "lib/public-catalog.js", "lib/quote-public.js"], packages: [] },
   "api/health.js": { files: ["api/health.js"], packages: [] },
   "api/hostaway/calendar.js": { files: ["api/hostaway/calendar.js", "lib/diag-auth.js", "lib/hostaway.js"], packages: ["node:crypto"] },
   "api/hostaway/listing.js": { files: ["api/hostaway/listing.js", "lib/diag-auth.js", "lib/hostaway.js", "lib/listing-content.js", "lib/listing-public.js"], packages: ["node:crypto"] },

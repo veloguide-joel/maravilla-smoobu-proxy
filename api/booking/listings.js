@@ -5,8 +5,11 @@
 // Security model (differs from api/hostaway/* diagnostics, which stay private):
 //  - No secrets involved on the client side; Hostaway is called server-side
 //    with the same lib/hostaway.js client. HOSTAWAY_DIAG_KEY is never read.
-//  - Inventory is a fixed allowlist (PUBLIC_LISTING_IDS). No query parameters
-//    are accepted or echoed.
+//  - Inventory is a fixed allowlist chosen SERVER-SIDE by lib/public-catalog.js:
+//    the two pilots by default (always in production); the pilots + the exact
+//    28 migrated listings only when MV_PUBLIC_CATALOG=migrated-preview on a
+//    preview/development deployment (C85). No query parameters are accepted or
+//    echoed; the client never supplies ids.
 //  - Output is built by lib/listing-public.js (whitelist by construction) and
 //    re-checked against PUBLIC_LISTING_KEYS before sending. No _schema/_meta,
 //    no upstream status codes, no error details in the public body.
@@ -26,18 +29,25 @@
 //  - No prices. Currency only. No Smoobu data.
 
 import { getHostawayEnvStatus, hostawayGet } from "../../lib/hostaway.js";
-import { PUBLIC_LISTING_IDS, PUBLIC_LISTING_KEYS, toPublicListing } from "../../lib/listing-public.js";
+import { PUBLIC_LISTING_KEYS, toPublicListing } from "../../lib/listing-public.js";
+import { resolvePublicCatalog, LISTINGS_FETCH_CONCURRENCY } from "../../lib/public-catalog.js";
 import { applyPublicCors, withDeadline } from "../../lib/public-api.js"; // shared allowlist (F2)
 
 const UPSTREAM_TIMEOUT_MS = 8000;   // per listing request (after token mint)
 const OVERALL_DEADLINE_MS = 20000;  // whole handler, incl. token mint + retry
 const CACHE_TTL_MS = 10 * 60 * 1000;
+// C87: ONE budget for the WHOLE feed operation (token wait / mint, every data attempt incl. its body, the single 401 refresh and
+// retry). When it expires every in-flight request is aborted through a shared signal, no request starts afterwards, and the
+// listings already fetched are returned (partial). It ends well before OVERALL_DEADLINE_MS, so started work cannot outlive the
+// response. No NEW listing request starts after START_CUTOFF_MS (a request started later would mostly be wasted).
+const FEED_BUDGET_MS = OVERALL_DEADLINE_MS - 2000;
+const START_CUTOFF_MS = FEED_BUDGET_MS - 3000;
 
 // Optimisation only; may be empty on any invocation (Vercel instances are not shared).
-let cache = null; // { expiresAt:number, body:object }
+let cache = null; // { mode:string, expiresAt:number, body:object } — scoped to the catalog mode that produced it
 
-async function fetchPublicListing(id) {
-  const { status, json } = await hostawayGet(`/listings/${id}`, { query: { includeResources: 1 }, timeoutMs: UPSTREAM_TIMEOUT_MS });
+async function fetchPublicListing(id, signal) {
+  const { status, json } = await hostawayGet(`/listings/${id}`, { query: { includeResources: 1 }, timeoutMs: UPSTREAM_TIMEOUT_MS, signal });
   if (status < 200 || status >= 300 || !json || typeof json !== "object") {
     return { ok: false, id, error: "UPSTREAM_STATUS", upstreamStatus: status };
   }
@@ -51,13 +61,30 @@ async function fetchPublicListing(id) {
   return { ok: true, id, listing: mapped.listing };
 }
 
-async function buildBody() {
-  // Sequential on purpose: parallel calls on a cold instance would each mint a
-  // token (the token cache is filled by the first completed mint). Two ids ->
-  // ~0.5 s extra at most; revisit with single-flight minting if the list grows.
-  const results = [];
-  for (const id of PUBLIC_LISTING_IDS) {
-    results.push(await fetchPublicListing(id).catch((err) => ({ ok: false, id, error: err?.code || err?.name || "FETCH_FAILED" })));
+export async function buildBody(ids, { concurrency = LISTINGS_FETCH_CONCURRENCY, startCutoffMs = START_CUTOFF_MS, feedBudgetMs = FEED_BUDGET_MS,
+  fetchOne = fetchPublicListing, now = Date.now } = {}) {
+  // C85: bounded concurrency (<= `concurrency` requests in flight; lib/hostaway.js mints ONE token for all of them),
+  // catalog order preserved, no retry beyond the client's single 401 refresh, no new request after the start cutoff.
+  // C87: the whole operation is bounded by `feedBudgetMs` through ONE AbortController shared by every request.
+  const t0 = now();
+  const feed = new AbortController();
+  const timer = setTimeout(() => feed.abort(Object.assign(new Error("listings feed budget exceeded"), { code: "FEED_DEADLINE" })), feedBudgetMs);
+  const results = new Array(ids.length);
+  let next = 0;
+  const lane = async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= ids.length) return;
+      const id = ids[i];
+      if (feed.signal.aborted || now() - t0 > startCutoffMs) { results[i] = { ok: false, id, error: "NOT_STARTED_DEADLINE" }; continue; }
+      results[i] = await fetchOne(id, feed.signal).catch((err) => ({ ok: false, id, error: err?.code || err?.name || "FETCH_FAILED" }));
+    }
+  };
+  try {
+    await Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, ids.length)) }, lane));
+  } finally {
+    clearTimeout(timer);
+    feed.abort(Object.assign(new Error("listings feed finished"), { code: "FEED_DONE" }));   // nothing started for this feed outlives it
   }
   const listings = results.filter((r) => r.ok).map((r) => r.listing);
   const failed = results.filter((r) => !r.ok);
@@ -98,8 +125,10 @@ export default async function handler(req, res) {
   // C2: never browser-cacheable, for any origin (see the Caching note above).
   const okCacheControl = "no-store";
 
+  const catalog = resolvePublicCatalog();
+  if (catalog.reason) console.error("[booking/listings] catalog fell back to pilot", { reason: catalog.reason });
   const now = Date.now();
-  if (cache && cache.expiresAt > now) {
+  if (cache && cache.mode === catalog.mode && cache.expiresAt > now) {
     res.setHeader("Cache-Control", okCacheControl);
     res.setHeader("X-Listings-Cache", "hit");
     res.status(200).json(cache.body);
@@ -107,13 +136,13 @@ export default async function handler(req, res) {
   }
 
   try {
-    const result = await withDeadline(buildBody(), OVERALL_DEADLINE_MS, "listings");
+    const result = await withDeadline(buildBody(catalog.ids), OVERALL_DEADLINE_MS, "listings");
     if (!result.ok) {
       res.setHeader("Cache-Control", "no-store");
       res.status(result.status).json(result.body);
       return;
     }
-    if (!result.body.partial) cache = { expiresAt: Date.now() + CACHE_TTL_MS, body: result.body }; // only cache complete answers
+    if (!result.body.partial) cache = { mode: catalog.mode, expiresAt: Date.now() + CACHE_TTL_MS, body: result.body }; // only cache complete answers, per catalog mode
     res.setHeader("Cache-Control", okCacheControl);
     res.setHeader("X-Listings-Cache", "miss");
     res.status(200).json(result.body);

@@ -20,7 +20,7 @@
 // CORS: shared allowlist (lib/public-api.js).
 
 import { getHostawayEnvStatus, hostawayGet, hostawayPost } from "../../lib/hostaway.js";
-import { PUBLIC_LISTING_IDS } from "../../lib/listing-public.js";
+import { resolvePublicCatalog, isPublicCatalogId } from "../../lib/public-catalog.js";   // C85: server-side catalog (pilot default)
 import { fetchCalendarDays } from "../../lib/hostaway-calendar.js";
 import { evaluateStay, parseISODate, nightsBetween, DEFAULT_POLICY } from "../../lib/bookability.js";
 import { validatePriceDetails, publicReasons, decisionFor, PUBLIC_QUOTE_KEYS, QUOTE_NOTE } from "../../lib/quote-public.js";
@@ -60,7 +60,8 @@ export default async function handler(req, res) {
   const idRaw = q(req.query?.id);
   if (typeof idRaw !== "string" || !/^\d{1,12}$/.test(idRaw)) { fail(res, 400, "INVALID_LISTING_ID"); return; }
   const id = Number(idRaw);
-  if (!PUBLIC_LISTING_IDS.includes(id)) { fail(res, 404, "LISTING_NOT_FOUND"); return; }
+  const catalog = resolvePublicCatalog();
+  if (!isPublicCatalogId(id, catalog)) { fail(res, 404, "LISTING_NOT_FOUND"); return; }
 
   const from = parseISODate(q(req.query?.from));
   const to = parseISODate(q(req.query?.to));
@@ -97,7 +98,7 @@ export default async function handler(req, res) {
 
       // --- 4. bookability gate ---
       const verdict = evaluateStay({
-        listingId: id, allowedListingIds: PUBLIC_LISTING_IDS, listing: lc.listing, days: cal.days,
+        listingId: id, allowedListingIds: catalog.ids, listing: lc.listing, days: cal.days,
         from, to, guests, today, now: Date.now(), calendarFetchedAt: cal.fetchedAt
       });
       const checkedAt = new Date(cal.fetchedAt).toISOString();
