@@ -97,7 +97,8 @@ const DETAILS_PROBLEM_TEXT = { FIRST_NAME_INVALID: "Enter a first name.", LAST_N
 /** W2: "start new" wording ONLY when the rendered screen is exactly one where the server itself reports this TEST intent closed (terminal)
  *  or the release verified (released). Every other screen (lost, unreadable, review, unexpected, payWait, processing, releaseQueued, ...)
  *  keeps the explicit Forget / loss-of-access warning, even if an earlier status was terminal. Same local reset either way. */
-export const resetFor = (screen) => (screen === "terminal" || screen === "released" || screen === "complete" ? "startNew" : "forget");
+// C99-F2: "complete" keeps Forget (the booking is active and its claim HELD: clearing the tab cancels nothing and loses this tab's checks)
+export const resetFor = (screen) => (screen === "terminal" || screen === "released" ? "startNew" : "forget");
 /** A1: what (if anything) the polite live region says for this render. One announcement per change of the displayed screen / title /
  *  notice code / notice sentence; busy and loading renders say nothing and do NOT consume the key (a change seen while busy is announced
  *  once settled); the create screen (explicit reset / no intent) clears the region and the key. Text = title (+ notice sentence) only:
@@ -307,10 +308,13 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
     const r = await once(() => api.status(st.token));
     if (r === null) return;
     if (r.kind === "unknown") { statusFailed = false; stopPolling("UNREADABLE"); last = null; progress = null; unreadable = true; retry = null; setNotice({ level: "warn", code: "STATUS_UNREADABLE", text: "The server's status could not be read. Use Refresh status." }); view(); return; }
-    if (r.http === 429) { stopPolling("RATE_LIMITED"); statusFailed = true; setNotice({ level: "warn", code: "RATE_LIMITED", text: "Too many requests. Automatic status checks stopped; wait, then use Refresh status." }); view(); return; }
+    // C99-F1: a FAILED read never keeps showing a completion / payment-received projection (or a bare "confirmed"): that state is no longer
+    // current, so the page claims nothing (notChecked) until a fresh valid read — it does NOT claim the booking failed or was cancelled
+    const dropConfirmed = () => { progress = null; if (last === "confirmed") last = null; };
+    if (r.http === 429) { dropConfirmed(); stopPolling("RATE_LIMITED"); statusFailed = true; setNotice({ level: "warn", code: "RATE_LIMITED", text: "Too many requests. Automatic status checks stopped; wait, then use Refresh status." }); view(); return; }
     if (r.http === 401) { stopPolling("UNAUTHORIZED"); lost = true; armed = null; retry = null;
       setNotice({ level: "error", code: "UNAUTHORIZED", text: "This tab's TEST booking access is no longer accepted by the server." }); last = null; progress = null; view(); return; }
-    if (r.http !== 200) { stopPolling("ERROR"); statusFailed = true; setNotice({ level: "warn", code: safeCode(r.body.code), text: "The status check failed. Use Refresh status." }); view(); return; }
+    if (r.http !== 200) { dropConfirmed(); stopPolling("ERROR"); statusFailed = true; setNotice({ level: "warn", code: safeCode(r.body.code), text: "The status check failed. Use Refresh status." }); view(); return; }
     const s = absorb(r);
     if (s === null) {                             // HTTP 200 without a recognised status: no proof, no previous label reused
       stopPolling("UNREADABLE"); last = null; progress = null; unreadable = true; retry = null;

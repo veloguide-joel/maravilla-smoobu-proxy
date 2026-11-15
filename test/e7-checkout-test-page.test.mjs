@@ -440,7 +440,9 @@ test("C98 describe: complete ONLY with status confirmed + a safe complete projec
   for (const d of [c, f, describe("confirmed"), describe("processing"), describe("under_review")]) assert.doesNotMatch(d.title + d.text, NO_PROMISE, d.title);
   assert.deepEqual(safeProgress({ stage: "payment_received_finalizing", bookingRef: "MV-VBQL2LQY" }), FINALIZING, "a ref is dropped outside complete");
   assert.deepEqual([...PROGRESS_STAGES], ["not_paid", "processing", "payment_received_finalizing", "complete", "needs_review", "ended"]);
-  assert.equal(resetFor("complete"), "startNew"); assert.equal(resetFor("finalizing"), "forget"); assert.equal(resetFor("confirming"), "forget");
+  // C99-F2 (ROOT review 5913046488): complete is an ACTIVE booking with a HELD claim → the explicit Forget path, never "start new"
+  assert.equal(resetFor("complete"), "forget"); assert.equal(resetFor("finalizing"), "forget"); assert.equal(resetFor("confirming"), "forget");
+  assert.equal(resetFor("terminal"), "startNew"); assert.equal(resetFor("released"), "startNew");
 });
 test("C98 controller: finalizing → (Refresh) → complete; complete offers NO pay / release and keeps the ref only while the reply says so; reload shows the server's current projection; a stale complete never survives a newer reply / network error / malformed projection", async () => {
   const s = memStorage(); createStore(s).save({ token: TOKEN, releaseRequested: false, polls: [] });
@@ -449,7 +451,7 @@ test("C98 controller: finalizing → (Refresh) → complete; complete offers NO 
   const r = rig({ storage: s, api: f, search: "?checkout=complete" }); await r.c.init();
   let v = r.last(); assert.deepEqual([v.screen, v.canPay, v.canRequestRelease], ["finalizing", false, false]); assert.doesNotMatch(v.title + v.text, /MV-/);
   await r.c.pay(); await r.c.armRelease?.(); assert.deepEqual([f.count("pay"), f.count("release")], [0, 0], "no payment / release from finalizing");
-  await r.c.refresh(); v = r.last(); assert.deepEqual([v.screen, v.title, v.canPay, v.canRequestRelease, v.reset], ["complete", "TEST booking confirmed", false, false, "startNew"]); assert.match(v.text, /MV-VBQL2LQY/);
+  await r.c.refresh(); v = r.last(); assert.deepEqual([v.screen, v.title, v.canPay, v.canRequestRelease, v.reset], ["complete", "TEST booking confirmed", false, false, "forget"]); assert.match(v.text, /MV-VBQL2LQY/);
   await r.c.pay(); r.c.armRelease(); await r.c.confirmRelease(); assert.deepEqual([f.count("pay"), f.count("release")], [0, 0], "confirmed removes payment / release actions");
   await r.c.refresh(); v = r.last(); assert.equal(v.screen, "confirming", "a newer reply WITHOUT the projection: the stale complete is not reused"); assert.doesNotMatch(v.text, /MV-/);
   await r.c.refresh(); v = r.last(); assert.equal(v.screen, "unreadable", "network error: nothing claimed"); assert.doesNotMatch(v.title + v.text, /confirmed booking|MV-VBQL/);
@@ -468,4 +470,24 @@ test("C98 controller: a pay latch is resolved by a confirmed status (no second p
   const s2 = memStorage(); createStore(s2).save({ token: TOKEN, releaseRequested: false, polls: [] });
   const f2 = fakeApi({ status: [reply(200, { status: "processing", bookingProgress: COMPLETE })] }); const r2 = rig({ storage: s2, api: f2 }); await r2.c.init();
   assert.equal(r2.last().screen, "authorized", "processing + a (bogus) complete projection is still processing");
+});
+
+// C99-F1 (ROOT review 5913046488): a FAILED status read after "complete" never keeps presenting that completion as current
+test("C99 controller: complete → each failed read (429 / 500 / 503 / 408 / network / malformed 200 / partial 200) shows NO completion, ref, Pay or release (never 'failed' / 'cancelled'); a fresh valid complete recovers; nothing is resent", async () => {
+  const COMPLETE_R = reply(200, { status: "confirmed", price: PRICE, bookingProgress: { stage: "complete", bookingRef: "MV-VBQL2LQY" } });
+  for (const [label, bad, screen] of [["429", reply(429, { code: "RATE_LIMITED" }), "notChecked"], ["500", reply(500, { code: "INTERNAL" }), "notChecked"],
+    ["503", reply(503, { code: "NOT_READY" }), "notChecked"], ["408", reply(408, { code: "TIMEOUT" }), "notChecked"], ["network", { kind: "unknown" }, "unreadable"],
+    ["malformed 200", reply(200, {}), "unreadable"], ["partial 200 (no projection)", reply(200, { status: "confirmed" }), "confirming"],
+    ["unknown stage", reply(200, { status: "confirmed", bookingProgress: { stage: "maybe" } }), "confirming"]]) {
+    const s = memStorage(); createStore(s).save({ token: TOKEN, releaseRequested: false, polls: [] });
+    const f = fakeApi({ status: [COMPLETE_R, bad, COMPLETE_R] }); const r = rig({ storage: s, api: f }); await r.c.init();
+    assert.equal(r.last().screen, "complete", label);
+    await r.c.refresh(); const v = r.last();
+    assert.equal(v.screen, screen, label); assert.doesNotMatch(v.title + v.text, /MV-VBQL2LQY|TEST booking confirmed|failed booking|cancell?ed|refund/i, label);
+    assert.deepEqual([v.canPay, v.canRequestRelease, v.reset], [false, false, "forget"], label);
+    if (label === "429") assert.deepEqual([r.state.stopped, r.state.notice.code, v.canRefresh], ["RATE_LIMITED", "RATE_LIMITED", true], "429 controls preserved");
+    await r.c.pay(); r.c.armRelease(); await r.c.confirmRelease();
+    await r.c.refresh(); assert.equal(r.last().screen, "complete", `${label}: a fresh valid read recovers`);
+    assert.deepEqual([f.count("pay"), f.count("release"), f.count("details"), f.count("create"), f.count("status")], [0, 0, 0, 0, 3], `${label}: no resend, one read per explicit action`);
+  }
 });

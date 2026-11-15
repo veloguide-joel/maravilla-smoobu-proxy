@@ -254,17 +254,39 @@ test("A1 DOM: an explicit reset clears the region (no create / loading announcem
 });
 
 // C98 (ROOT C98): rendered DOM (existing fake-document fixture) for the additive bookingProgress projection
-test("W-C98 rendered: complete shows 'TEST booking confirmed' + ref with no Pay / release controls and 'Start a new' wording; finalizing / missing projection never show a ref or a confirmed title; TEST label kept", async () => {
+test("W-C98 rendered: complete shows 'TEST booking confirmed' + ref with no Pay / release controls and the explicit Forget warning / confirmation (C99-F2); finalizing / missing projection never show a ref or a confirmed title; TEST label kept", async () => {
   const P = (status, bookingProgress) => ({ s: 200, b: { status, ...(bookingProgress === undefined ? {} : { bookingProgress }) } });
   const c = await open({ status: [P("confirmed", { stage: "complete", bookingRef: "MV-VBQL2LQY" })] });
   assert.equal(c.$("mv-title").textContent, "TEST booking confirmed"); assert.match(c.$("mv-text").textContent, /MV-VBQL2LQY/);
   for (const id of ["mv-pay", "mv-release", "mv-details", "mv-create"]) assert.equal(visible(c.$(id)), false, `${id} hidden at complete`);
-  assert.equal(c.$("mv-restart").textContent, "Start a new TEST booking…"); assert.match(HTML, /TEST ONLY/);
+  // C99-F2: complete keeps the explicit Forget path: warning, confirmation, and NOTHING sent to the server on reset
+  assert.equal(c.$("mv-restart").textContent, "Forget this TEST booking in this tab…"); assert.match(HTML, /TEST ONLY/);
+  assert.match(c.$("mv-forget-warn").textContent, /does not cancel the TEST booking or release any TEST hold/); assert.match(c.$("mv-forget-warn").textContent, /no longer be able to check it/);
+  const n = c.calls.length; c.$("mv-restart").click(); await settle();
+  assert.match(c.confirms[0], /does not cancel the booking or release any TEST hold/); assert.equal(c.calls.length, n, "declined: nothing sent");
+  assert.equal(c.$("mv-title").textContent, "TEST booking confirmed", "declined confirmation keeps the tab");
   for (const [label, prog, title] of [["finalizing", { stage: "payment_received_finalizing", bookingRef: null }, "TEST payment received — finalizing"],
     ["missing (older server)", undefined, "Not yet confirmed — still processing"], ["malformed", { stage: "complete", bookingRef: "<script>" }, "Not yet confirmed — still processing"]]) {
     const x = await open({ status: [P("confirmed", prog)] });
     assert.equal(x.$("mv-title").textContent, title, label); assert.doesNotMatch(x.$("mv-text").textContent, /MV-|<script>/, label);
     assert.equal(visible(x.$("mv-pay")), false, label); assert.equal(visible(x.$("mv-release")), false, label);
     assert.equal(x.$("mv-restart").textContent, "Forget this TEST booking in this tab…", label);
+  }
+});
+
+test("W-C99 rendered (C99-F1): complete → failed read (429 / 503 / network) shows no completion title / ref and no Pay / release; Refresh stays; a fresh valid complete recovers; accepting Forget sends nothing", async () => {
+  const COMPLETE = { s: 200, b: { status: "confirmed", bookingProgress: { stage: "complete", bookingRef: "MV-VBQL2LQY" } } };
+  for (const [label, bad] of [["429", { s: 429, b: { code: "RATE_LIMITED" } }], ["503", { s: 503, b: { code: "NOT_READY" } }], ["network", () => { throw new TypeError("Failed to fetch"); }]]) {
+    const queue = [COMPLETE, bad, COMPLETE];
+    const x = await open({ status: queue.map((q) => (typeof q === "function" ? q : () => q)), confirmAnswer: true });
+    assert.equal(x.$("mv-title").textContent, "TEST booking confirmed", label);
+    x.$("mv-refresh").click(); await settle();
+    assert.doesNotMatch(x.$("mv-title").textContent + x.$("mv-text").textContent, /TEST booking confirmed|MV-VBQL2LQY|cancell?ed|failed booking/i, label);
+    for (const id of ["mv-pay", "mv-release"]) assert.equal(visible(x.$(id)), false, `${label} ${id}`);
+    assert.equal(visible(x.$("mv-refresh")), true, `${label}: Refresh stays`);
+    x.$("mv-refresh").click(); await settle(); assert.equal(x.$("mv-title").textContent, "TEST booking confirmed", `${label}: recovers`); assert.match(x.$("mv-text").textContent, /MV-VBQL2LQY/);
+    const n = x.calls.length; x.$("mv-restart").click(); await settle();
+    assert.equal(x.calls.length, n, `${label}: Forget sends nothing`); assert.match(x.confirms.at(-1), /does not cancel the booking/);
+    assert.deepEqual(x.calls.filter((k) => k !== "status"), [], `${label}: no write ever`);
   }
 });

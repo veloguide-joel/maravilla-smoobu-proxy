@@ -109,7 +109,7 @@ test("A4 REAL page controller → REAL API → REAL DB: payment_captured shows '
   const tf = newToken(); const conf = await F.confirmed(db.app, stay(tf));
   const ref = (await db.owner.query("SELECT ref FROM booking.intents WHERE id = $1", [conf.id])).rows[0].ref;
   const pf = pageFor(tf, h); await pf.c.init();
-  v = pf.last(); assert.deepEqual([v.screen, v.title, v.canPay, v.canRequestRelease, v.reset], ["complete", "TEST booking confirmed", false, false, "startNew"]); assert.ok(v.text.includes(ref));
+  v = pf.last(); assert.deepEqual([v.screen, v.title, v.canPay, v.canRequestRelease, v.reset], ["complete", "TEST booking confirmed", false, false, "forget"]); assert.ok(v.text.includes(ref));
   assert.doesNotMatch(v.text, /e-?mail|refund|deliver/i, "no invented e-mail / refund / delivery promise");
   assert.deepEqual(Object.keys(JSON.parse(pf.storage.m.get(STORE_KEY))).sort(), ["detailsSaved", "polls", "releaseRequested", "token", "uncertain"], "the projection / ref is not persisted");
 });
