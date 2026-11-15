@@ -13,7 +13,8 @@ import { priceStay } from "../../lib/checkout/server-pricer.js";
 import { readDirectPolicyFromEnv } from "../../lib/direct-policy.js";
 import { todayInTimeZone } from "../../lib/public-api.js";
 import { validateAdapterConfig } from "../../lib/hostaway-reservations.js";
-import { runTestPipelineCoordinator, TEST_LISTING_ID, CoordinatorBudgetError, _internal as CI } from "../../lib/booking-db/test-pipeline-coordinator.js";
+import { runTestPipelineCoordinator, TEST_LISTING_ID, CoordinatorBudgetError, refundObservationRefusal, _internal as CI } from "../../lib/booking-db/test-pipeline-coordinator.js";
+import { adminRecordEvidence } from "../../db/lib/admin.js";
 
 let netAttempts = 0;
 const realFetch = globalThis.fetch;
@@ -328,3 +329,90 @@ test("C9 unit: the in-invocation write guard refuses a second write BEFORE the p
   assert.equal(CI.continuable("capture", { status: "reservation_confirmed" }, f({ capture: [{ state: "succeeded", attempts: 1, dispatched_at: new Date() }] })), "CAPTURE_NOT_PRISTINE");
   assert.equal(CI.continuable("recording", { id: "x", status: "payment_captured" }, f({ record: [{ ...pend, idempotency_key: "och:x:2" }] })), "RECORDING_NOT_PRISTINE");
 });
+
+// ---------------------------------------------------------------------------------------------
+// C86 (ROOT #128 review 5912316868) — F1 stored refund veto, F2 attempted-write accounting, F3 per-write abort / deadline guards.
+const refundObs = async (bk, observed) => { const r = await adminRecordEvidence(db.reconciler, { intentId: bk.id, kind: "payment_intent", externalRef: bk.piId, status: "succeeded",
+  observed: { amountMinor: bk.total, currency: "USD", amountReceivedMinor: bk.total, amountCapturableMinor: 0, captured: true, ...observed },
+  observedAt: new Date(), attestedBy: "owner", reference: "ROOT synthetic dashboard refund observation" }); return F.ok(r); };
+
+test("F1a (ROOT repro) a stored refund observation after capture → STOP PAYMENT_REFUND_OBSERVED before the recording worker: record 0", async () => {
+  const w = world(); const bk = await authorizedBooking(w); const c = coord(w, bk);
+  const r = await c.run({ hooks: { afterStep: async (s) => { if (s.phase === "capture") await refundObs(bk, { refunded: true, amountRefundedMinor: bk.total }); } } });
+  assert.deepEqual([r.outcome, r.code, r.writes], ["STOP", "PAYMENT_REFUND_OBSERVED", { create: 1, capture: 1, record: 0 }], JSON.stringify(r));
+  assert.equal(w.writes.createOfflineCharge, 0);
+  assert.equal(r.steps.filter((s) => s.phase === "recording").length, 0, "the recording worker never ran (no lock / claim / provider)");
+  assert.deepEqual((await opsOf(bk.id, "hostaway.record_offline_charge")).map((o) => [o.state, o.dispatched_at]), [["pending", null]]);
+  const n0 = w.calls.length; const r2 = await c.run();
+  assert.deepEqual([r2.outcome, r2.code, w.calls.length], ["STOP", "PAYMENT_REFUND_OBSERVED", n0], "monotonic: a rerun refuses again with zero calls");
+});
+
+test("F1b veto semantics: newer zero cannot erase a positive; malformed present → INVALID; absent → unknown (no veto); other PIs ignored", async () => {
+  const pi = "pi_x"; const row = (o, ref = pi) => ({ kind: "payment_intent", external_ref: ref, observed: o });
+  assert.equal(refundObservationRefusal([row({ amountRefundedMinor: 500 }), row({ amountRefundedMinor: 0, refunded: false })], pi), "PAYMENT_REFUND_OBSERVED");
+  assert.equal(refundObservationRefusal([row({ refunded: "yes" })], pi), "PAYMENT_REFUND_EVIDENCE_INVALID");
+  for (const bad of [null, "10", -1, 1.5, Number.NaN]) assert.equal(refundObservationRefusal([row({ amountRefundedMinor: bad })], pi), "PAYMENT_REFUND_EVIDENCE_INVALID", String(bad));
+  assert.equal(refundObservationRefusal([row({ amountRefundedMinor: 0, refunded: false }), row({ captured: true })], pi), null);
+  assert.equal(refundObservationRefusal([row({ refunded: true }, "pi_other"), { kind: "hostaway_reservation", external_ref: pi, observed: { refunded: true } }], pi), null);
+  assert.equal(refundObservationRefusal([row({ refunded: "x" }), row({ amountRefundedMinor: 1 })], pi), "PAYMENT_REFUND_OBSERVED", "positive wins over malformed");
+  // DB: a malformed stored observation before capture refuses the capture stage
+  const w = world(); const bk = await authorizedBooking(w); const c = coord(w, bk);
+  const r = await c.run({ hooks: { afterStep: async (s) => { if (s.stateAfter === "reservation_confirmed") await refundObs(bk, { amountRefundedMinor: "0" }); } } });
+  assert.deepEqual([r.outcome, r.code, r.writes], ["STOP", "PAYMENT_REFUND_EVIDENCE_INVALID", { create: 1, capture: 0, record: 0 }]);
+});
+
+test("F1c an observation stored BETWEEN recording admission and the record send refuses the send (re-read at the write)", async () => {
+  const w = world(); const bk = await authorizedBooking(w);
+  const list = w.exec.W.listOfflineCharges; let injected = false;
+  w.exec.W.listOfflineCharges = async (req) => { const r = await list(req); if (!injected) { injected = true; await refundObs(bk, { amountRefundedMinor: 1 }); } return r; };
+  const r = await coord(w, bk).run();
+  assert.deepEqual([r.outcome, r.code, r.writes.record, w.writes.createOfflineCharge], ["STOP", "PAYMENT_REFUND_OBSERVED", 0, 0], JSON.stringify(r));
+  assert.notEqual((await loadIntent(db.app, bk.id)).status, "confirmed");
+});
+
+/** pool wrapper: every query (pool + checked-out clients) throws ROOT_DB_FAULT once `fault.on` is set; release forwarded */
+function faultPool(fault) {
+  const boom = () => Object.assign(new Error("synthetic"), { code: "ROOT_DB_FAULT" });
+  return {
+    query: async (...a) => { if (fault.on) { fault.after += 1; throw boom(); } return db.app.query(...a); },
+    connect: async () => {
+      const cl = await db.app.connect();
+      return { query: async (...a) => { if (fault.on) { fault.after += 1; throw boom(); } return cl.query(...a); }, release: (...a) => cl.release(...a) };
+    }
+  };
+}
+for (const [label, phase, key, wkey] of [["create", "R", "createReservation", "create"], ["capture", "C", "capturePaymentIntent", "capture"], ["record", "W", "createOfflineCharge", "record"]]) {
+  test(`F2 ${label}: provider APPLIED then every DB / COMMIT statement fails → STOP STEP_THREW_ROOT_DB_FAULT reports ${wkey}=1 (zero never implies unsent)`, async () => {
+    const w = world(); const bk = await authorizedBooking(w);
+    const fault = { on: false, after: 0 };
+    const orig = w.exec[phase][key];
+    w.exec[phase][key] = async (...a) => { const r = await orig(...a); fault.on = true; return r; };
+    const r = await coord(w, bk).run({}, faultPool(fault));
+    assert.equal(r.code, "STEP_THREW_ROOT_DB_FAULT", JSON.stringify(r));
+    assert.equal(r.writes[wkey], 1);
+    assert.equal(w.writes[key], 1);
+    assert.equal(r.readback, null, "no readback after the fault");
+  });
+}
+
+/** F3 harness: trigger (abort | deadline) inside the READ that precedes each write; the guard must refuse that write */
+const PRE_WRITE_READ = { R: "lookupPage", C: "retrievePaymentIntent", W: "listOfflineCharges" };
+for (const mode of ["abort", "deadline"]) {
+  for (const [label, phase, key, wkey] of [["create", "R", "createReservation", "create"], ["capture", "C", "capturePaymentIntent", "capture"], ["record", "W", "createOfflineCharge", "record"]]) {
+    test(`F3 ${mode} triggered during the read before the ${label}: the ${label} is NEVER sent, STOP, no next financial stage`, async () => {
+      const w = world(); const bk = await authorizedBooking(w);
+      const signal = { aborted: false }; const skew = { ms: 0 };
+      const now = () => Date.now() + skew.ms; const deadlineAt = Date.now() + 10 * MIN;
+      const rk = PRE_WRITE_READ[phase]; const read = w.exec[phase][rk];
+      let armed = true;
+      w.exec[phase][rk] = async (...a) => { const r = await read(...a); if (armed) { armed = false; if (mode === "abort") signal.aborted = true; else skew.ms = 20 * MIN; } return r; };
+      const r = await coord(w, bk).run(mode === "abort" ? { signal } : { deadlineAt, now });
+      // the recording worker also receives the signal and has its own pre-send stop: either guard refusing the write is correct
+      const codes = mode === "abort" ? (phase === "W" ? ["ABORTED_AT_WRITE", "WORKER_STOP_SIGNAL"] : ["ABORTED_AT_WRITE"]) : ["DEADLINE_AT_WRITE"];
+      assert.equal(r.outcome, "STOP", JSON.stringify(r)); assert.ok(codes.includes(r.code), JSON.stringify(r));
+      assert.equal(r.writes[wkey], 0); assert.equal(w.writes[key], 0, "the provider write never happened");
+      const later = { create: ["capturePaymentIntent", "createOfflineCharge"], capture: ["createOfflineCharge"], record: [] }[label];
+      for (const k of later) assert.equal(w.writes[k], 0, `no ${k} after the guard`);
+    });
+  }
+}
