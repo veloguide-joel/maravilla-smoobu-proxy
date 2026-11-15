@@ -4,13 +4,13 @@
 // DEV database, with FAKE-free real transports. Bookkeeping only: Hostaway offline charges move no money.
 //
 // HONEST LABEL: MANUAL hosted TEST recording (workflow_dispatch + the existing reviewer gate), NOT automatic customer checkout. Code is NOT
-// consent: executeEnabled is OPEN in this revision (C73, with Slices 1 / 2) for ONE ROOT-gated fresh TEST checkout run; the prepared C73 CLOSE patch
-// restores false at END / STOP (C29 history: closed again after its ONE gated attempt; verify / execute refuse HRC_EXECUTE_CLOSED whenever false). ROOT review 5900228555
+// consent: executeEnabled is CLOSED again (the reviewed C29 CLOSE patch, merged by ROOT once the ONE gated hosted TEST recording attempt has ENDED or
+// STOPPED — the patch itself asserts nothing about whether or how that attempt ran; verify / execute refuse HRC_EXECUTE_CLOSED). ROOT review 5900228555
 // accepted the C27/C28 PROPOSAL only; execution authority was a separate owner decision (D-a / D-b / D-c) plus the environment gate. D4's original conditions (ROOT 5883328669:
 // recorded-state cleanup contract implemented — 0021 / mirror worker / Slice 5 runner, all CLOSED; migration issuance hold resolved — shared DEV
 // exactly 0001..0021) are MET. The owner policy decisions D-a / D-b / D-c (manual, policy-assessed refund disposition; no automated exit from a
 // recorded TEST state; a recorded TEST intent — confirmed + ONE queued PRISTINE guest.notify + succeeded recording + two unprocessed
-// recording_conflict_inbox rows — cannot enter the Slice 3 pristine cleanup admission) remain the owner's and are NOT taken by this flag. Slice 3 stays CLOSED (Slices 1 / 2 OPEN in C73)
+// recording_conflict_inbox rows — cannot enter the Slice 3 pristine cleanup admission) remain the owner's and are NOT taken by this flag. Slice 1 / 2 / 3 stay CLOSED
 // and pinned to THEIR tooling; this runner pins the LATER immutable MERGED e7-test tooling 4ed7a636 (C24 repin: PR72 outer signal / deadline stop safety + C1 capture no-final_capture + C21-F1 list null-provider admission; 0021 / mirror additions are present in the closure but unused by this runner).
 //   * Inert on import (`import.meta.main` guard): no env / fs / network / DB / timer until a mode runs.
 //   * LABELLED SPECIALISATION of the reviewed Slice 3 runner (scripts/e7-hosted-test-cleanup.mjs): hosted boot / pinning / session lock (5432) /
@@ -53,7 +53,7 @@ import { CONSTANTS as RES, canonical, framedDigest, childEnv, spawnNode, dbTarge
 export const CONSTANTS = Object.freeze({
   toolingCommit: "4ed7a636fee57981262b9c02574190d225b8a1fc",    // e7-test: #99 merged (C21-F1) on top of #84 (C1 capture) / #81 / #78 / #76 / #75 / PR72; immutable (C24 repin from 5a094b16)
   toolingStatus: "MERGED",
-  executeEnabled: true,                                           // Slice 4: OPEN for ONE ROOT-gated fresh TEST run (C73); CLOSE patch restores false; verify / execute refuse HRC_EXECUTE_CLOSED when false
+  executeEnabled: false,                                          // Slice 4: CLOSED again by the reviewed C29 CLOSE patch (after the ONE gated TEST recording attempt ENDED or STOPPED); verify / execute refuse HRC_EXECUTE_CLOSED
   // the INDEPENDENTLY scanned transitive relative imports of the runner's tooling roots at 4ed7a636 (test C2 recomputes this from the pinned tree; SAME 30-path set as at 5a094b16, 8 members changed bytes):
   // = the Slice 1 closure + lib/booking-db/recording-worker.js (executor-adapters + offline-charge-proof are already in the Slice 1 closure)
   closure: Object.freeze(["lib/bookability.js", "lib/booking-db/codec.js", "lib/booking-db/config.js", "lib/booking-db/operations.js", "lib/booking-db/pool.js",
