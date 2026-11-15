@@ -128,12 +128,11 @@ test("W6 probe re-check block executed locally (BEFORE the one --probe call; no 
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
 
-test("W7 the five reviewed runners are untouched: the new workflow is in NO runner's runnerFiles, every runner has EXACTLY its C73 flag (Slices 1 / 2 / 4 true for ONE ROOT-gated run, 3 / 5 false; the prepared CLOSE patch restores all false), and the five runner digests (framedDigest over runnerFiles) are exactly the current C73 ENABLE-revision values (all five re-derived: shared reservation runner + test cross-assertions); the probe script, test and workflow are the current repinned bytes (#101), covered by the probe source digest frame", async () => {
-  const want = { reservation: "6c60d4a5be6882ccdb0aa5c1337c321ea04dc9b860e81cbc5c612841640f1069", capture: "66146523abd3b67b8b32c0e054fac111f019a931b0f35ed61ca364559110c9b2", "test-cleanup": "5f3a9d892f3e6e3aab1123f525c8f6eb9c0f8a0c19fd090f914511e47a2985b1", recording: "9532e4d4bd3aa5edd86d95883791e18b2722b4f2b8ef366857c0fa7e4fff2916", "recorded-cleanup": "4ec2caa7e39742ae4083560f42cc28bc893d2f9bfc2400ad3fce083241f35dcf" };   // C73 ENABLE-revision digests: all five re-derived (shared reservation runner + test cross-assertions)
-  const FLAGS = { reservation: true, capture: true, "test-cleanup": false, recording: true, "recorded-cleanup": false };   // C73 enable: Slices 1 / 2 / 4 OPEN for ONE ROOT-gated run; 3 / 5 CLOSED (CLOSE patch restores all false)
+test("W7 the five reviewed runners are untouched: the new workflow is in NO runner's runnerFiles, every runner has executeEnabled false again (reviewed C29 CLOSE patch after the ONE gated TEST recording attempt ENDED or STOPPED), and the five runner digests (framedDigest over runnerFiles) are exactly the current CLOSE-revision values (recording / recorded-cleanup re-derived; other three unchanged since C24); the probe script, test and workflow are the current repinned bytes (#101), covered by the probe source digest frame", async () => {
+  const want = { reservation: "5665544de105e4564a57a4434fa32fd2355b9bbd0e756b250d1248e07feb6b19", capture: "5b547a42200b452055d8a718c84ab70f7f2b5a0cd8343f6174c4a75b0c420ed1", "test-cleanup": "33f2ab18984dccd3915a18ff8a55dd4a6e5b6bf89e3d84ba1e578347e6cebd1e", recording: "49b5516cb69543a6bd4a697a407d2f2a97a84e18a63f18715338f099917e4824", "recorded-cleanup": "9e2021e3ec96bab16869fc194adac672287d559587b2cb7657738ffcd897de1f" };   // C29/C30 CLOSE-revision digests: all five flags false again; recording / recorded-cleanup re-derived; other three unchanged
   for (const n of Object.keys(want)) {
     const m = await import(`../scripts/e7-hosted-${n}.mjs`);
-    assert.equal(m.CONSTANTS.executeEnabled, FLAGS[n], n); assert.ok(!m.CONSTANTS.runnerFiles.includes(WF), n);
+    assert.equal(m.CONSTANTS.executeEnabled, false, n); assert.ok(!m.CONSTANTS.runnerFiles.includes(WF), n);
     assert.equal(await framedDigest(ROOT, m.CONSTANTS.runnerFiles, m.RUNNER_DIGEST_PREFIX), want[n], n);
   }
   assert.equal(P.PROBE_VERSION, "e7-hosted-charge-list-probe-v2");

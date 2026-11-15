@@ -64,8 +64,8 @@ const enc = (o) => new TextEncoder().encode(JSON.stringify(o));
 const MINUTE = 60000; const DAY = 86400000;
 const REAL_WAIT_CAP_MS = 150000;                      // test-harness scheduling: REAL wait up to 150 s per sleep (covers the E7.1 two-minute read freshness window); longer → throw (see header)
 
-test("R0 the five runners declare the expected immutable tooling pins; shipped executeEnabled = [true, true, false, true, false] (Slices 1 / 2 / 4 OPEN for ONE ROOT-gated fresh TEST run — C73 enable, CLOSE patch restores all false; Slices 3 / 5 CLOSED). The rehearsal itself never reads the flag", () => {
-  assert.deepEqual(RUNNERS.map((r) => r.E.CONSTANTS.executeEnabled), [true, true, false, true, false]);   // C73: Slices 1 / 2 / 4 OPEN for ONE ROOT-gated run; 3 / 5 CLOSED
+test("R0 the five runners declare the expected immutable tooling pins; shipped executeEnabled = all false again (Slices 1–5 CLOSED; Slice 4 closed by the reviewed C29 CLOSE patch after its ONE gated TEST recording attempt ENDED or STOPPED). The rehearsal itself never reads the flag", () => {
+  assert.deepEqual(RUNNERS.map((r) => r.E.CONSTANTS.executeEnabled), [false, false, false, false, false]);   // all CLOSED again (reviewed C29 CLOSE patch after the ONE gated TEST recording attempt ENDED or STOPPED)
   for (const r of RUNNERS) {
     assert.equal(r.E.CONSTANTS.toolingCommit, r.pin, r.name);
     assert.ok(Array.isArray(r.E.CONSTANTS.closure) && /^[0-9a-f]{64}$/.test(r.E.CONSTANTS.closureDigest), `${r.name} closure`);
