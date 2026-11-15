@@ -214,3 +214,101 @@ test("P10 no-booking boundary: checkout code never reads the public catalog; the
     assert.equal(/req\.query\?\.(ids|catalog|mode)|req\.query\.(ids|catalog|mode)/.test(src), false, `${r}: no client-supplied catalog`);
   }
 });
+
+// ---------------------------------------------------------------------------------------------
+// C87 (ROOT #129 review 5912343912): bounded shared token mint + whole-feed budget. Fake network only.
+const jsonResp = (status, body) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+/** a fetch that never settles unless its signal aborts (a stalled socket) */
+const stalled = (init) => new Promise((_, reject) => { if (init && init.signal) init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }); });
+async function freshClient(fetchImpl, timing = { mintBudgetMs: 100, activationDelayMs: 0 }) {
+  const hw = await import(`../lib/hostaway.js?c87=${++seq}`);
+  hw._setHostawayTimingForTests(timing);
+  const prev = globalThis.fetch; globalThis.fetch = fetchImpl;
+  return { hw, restore: () => { globalThis.fetch = prev; } };
+}
+
+test("C87a (ROOT repro) first mint stalls forever: A (timeoutMs 20) and B (joins 25 ms later) both fail within the mint budget; a LATER call re-mints and gets 200", async () => {
+  let mints = 0;
+  const f = async (url, init) => {
+    if (String(url).endsWith("/accessTokens")) { mints += 1; return mints === 1 ? stalled(init) : jsonResp(200, { access_token: "tok-2", expires_in: 3600 }); }
+    return jsonResp(200, { status: "success", result: { id: 1 } });
+  };
+  const { hw, restore } = await freshClient(f);
+  try {
+    const t0 = Date.now();
+    const A = hw.hostawayGet("/listings/628346", { timeoutMs: 20 });
+    await new Promise((r) => setTimeout(r, 25));
+    const B = hw.hostawayGet("/listings/628346");
+    const [ra, rb] = await Promise.allSettled([A, B]);
+    assert.deepEqual([ra.status, ra.reason?.code, rb.status, rb.reason?.code], ["rejected", "HOSTAWAY_AUTH_TIMEOUT", "rejected", "HOSTAWAY_AUTH_TIMEOUT"]);
+    assert.ok(Date.now() - t0 < 1000, "bounded by the mint budget, not forever");
+    const C = await hw.hostawayGet("/listings/628346");
+    assert.deepEqual([C.status, mints], [200, 2], "the expired mint was cleared; a later call recovered with ONE new mint");
+  } finally { restore(); }
+});
+
+test("C87b stalled token BODY is bounded by the same mint budget; failure clears the slot (later recovery)", async () => {
+  let mints = 0;
+  const f = async (url, init) => {
+    if (String(url).endsWith("/accessTokens")) {
+      mints += 1;
+      if (mints > 1) return jsonResp(200, { access_token: "tok-ok", expires_in: 3600 });
+      const body = new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode("{\"access_token\":")); init.signal.addEventListener("abort", () => c.error(init.signal.reason), { once: true }); } });
+      return new Response(body, { status: 200, headers: { "content-type": "application/json" } });
+    }
+    return jsonResp(200, { status: "success", result: {} });
+  };
+  const { hw, restore } = await freshClient(f);
+  try {
+    await assert.rejects(hw.hostawayGet("/listings/1"), (e) => e.code === "HOSTAWAY_AUTH_TIMEOUT");
+    assert.equal((await hw.hostawayGet("/listings/1")).status, 200);
+    assert.equal(mints, 2);
+  } finally { restore(); }
+});
+
+test("C87c a waiter's own cancellation never aborts the shared mint for another waiter", async () => {
+  let mints = 0;
+  const f = async (url) => {
+    if (String(url).endsWith("/accessTokens")) { mints += 1; await new Promise((r) => setTimeout(r, 60)); return jsonResp(200, { access_token: "tok-s", expires_in: 3600 }); }
+    return jsonResp(200, { status: "success", result: {} });
+  };
+  const { hw, restore } = await freshClient(f, { mintBudgetMs: 500, activationDelayMs: 0 });
+  try {
+    const ac = new AbortController(); setTimeout(() => ac.abort(), 10);
+    const [ra, rb] = await Promise.allSettled([hw.hostawayGet("/listings/1", { signal: ac.signal }), hw.hostawayGet("/listings/2")]);
+    assert.deepEqual([ra.status, rb.status, rb.value?.status, mints], ["rejected", "fulfilled", 200, 1]);
+  } finally { restore(); }
+});
+
+test("C87d refresh near the deadline: a 401 after the caller's signal aborts → no refresh mint, no retry request", async () => {
+  let mints = 0, data = 0; const ac = new AbortController();
+  const f = async (url) => {
+    if (String(url).endsWith("/accessTokens")) { mints += 1; return jsonResp(200, { access_token: `tok-${mints}`, expires_in: 3600 }); }
+    data += 1; ac.abort(Object.assign(new Error("feed"), { code: "FEED_DEADLINE" })); return new Response("{}", { status: 401 });
+  };
+  const { hw, restore } = await freshClient(f, { mintBudgetMs: 500, activationDelayMs: 0 });
+  try {
+    await assert.rejects(hw.hostawayGet("/listings/1", { signal: ac.signal }), (e) => e.code === "FEED_DEADLINE");
+    assert.deepEqual([data, mints], [1, 1], "exactly one data request and no refresh after the abort");
+  } finally { restore(); }
+});
+
+test("C87e whole-feed budget: stalled listings are aborted at the budget, existing successes are returned (partial), nothing starts or runs after the response", async () => {
+  const { buildBody } = await import(`../api/booking/listings.js?c87=${++seq}`);
+  const started = []; let liveAfter = 0; let done = false;
+  const fetchOne = (id, signal) => {
+    started.push(id);
+    if (PREVIEW_CATALOG_IDS.indexOf(id) % 3 === 0) return Promise.resolve({ ok: true, id, listing: { id } });   // some succeed immediately
+    return new Promise((_, reject) => signal.addEventListener("abort", () => { if (done) liveAfter += 1; reject(signal.reason); }, { once: true }));  // the rest stall
+  };
+  const t0 = Date.now();
+  const r = await buildBody(PREVIEW_CATALOG_IDS, { feedBudgetMs: 80, startCutoffMs: 60, fetchOne });
+  done = true; const nStarted = started.length;
+  await new Promise((x) => setTimeout(x, 60));
+  assert.ok(Date.now() - t0 < 1000);
+  assert.equal(r.status, 200); assert.equal(r.body.partial, true);
+  assert.ok(r.body.listings.length >= 1, "existing successes are returned");
+  assert.equal(started.length, nStarted, "no request started after the response");
+  assert.equal(liveAfter, 0, "every in-flight request was aborted before the response");
+  assert.ok(nStarted <= LISTINGS_FETCH_CONCURRENCY + r.body.listings.length, "stalled lanes block; nothing starts past the budget");
+});

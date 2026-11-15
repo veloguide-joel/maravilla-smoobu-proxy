@@ -36,15 +36,18 @@ import { applyPublicCors, withDeadline } from "../../lib/public-api.js"; // shar
 const UPSTREAM_TIMEOUT_MS = 8000;   // per listing request (after token mint)
 const OVERALL_DEADLINE_MS = 20000;  // whole handler, incl. token mint + retry
 const CACHE_TTL_MS = 10 * 60 * 1000;
-// C85: no NEW listing request starts after this point, so every started request (UPSTREAM_TIMEOUT_MS) still ends
-// before OVERALL_DEADLINE_MS; listings not started in time are reported as missing (partial), never as a 502 of the whole feed.
-const START_CUTOFF_MS = OVERALL_DEADLINE_MS - UPSTREAM_TIMEOUT_MS - 1000;
+// C87: ONE budget for the WHOLE feed operation (token wait / mint, every data attempt incl. its body, the single 401 refresh and
+// retry). When it expires every in-flight request is aborted through a shared signal, no request starts afterwards, and the
+// listings already fetched are returned (partial). It ends well before OVERALL_DEADLINE_MS, so started work cannot outlive the
+// response. No NEW listing request starts after START_CUTOFF_MS (a request started later would mostly be wasted).
+const FEED_BUDGET_MS = OVERALL_DEADLINE_MS - 2000;
+const START_CUTOFF_MS = FEED_BUDGET_MS - 3000;
 
 // Optimisation only; may be empty on any invocation (Vercel instances are not shared).
 let cache = null; // { mode:string, expiresAt:number, body:object } — scoped to the catalog mode that produced it
 
-async function fetchPublicListing(id) {
-  const { status, json } = await hostawayGet(`/listings/${id}`, { query: { includeResources: 1 }, timeoutMs: UPSTREAM_TIMEOUT_MS });
+async function fetchPublicListing(id, signal) {
+  const { status, json } = await hostawayGet(`/listings/${id}`, { query: { includeResources: 1 }, timeoutMs: UPSTREAM_TIMEOUT_MS, signal });
   if (status < 200 || status >= 300 || !json || typeof json !== "object") {
     return { ok: false, id, error: "UPSTREAM_STATUS", upstreamStatus: status };
   }
@@ -58,10 +61,14 @@ async function fetchPublicListing(id) {
   return { ok: true, id, listing: mapped.listing };
 }
 
-export async function buildBody(ids, { concurrency = LISTINGS_FETCH_CONCURRENCY, startCutoffMs = START_CUTOFF_MS, fetchOne = fetchPublicListing, now = Date.now } = {}) {
+export async function buildBody(ids, { concurrency = LISTINGS_FETCH_CONCURRENCY, startCutoffMs = START_CUTOFF_MS, feedBudgetMs = FEED_BUDGET_MS,
+  fetchOne = fetchPublicListing, now = Date.now } = {}) {
   // C85: bounded concurrency (<= `concurrency` requests in flight; lib/hostaway.js mints ONE token for all of them),
   // catalog order preserved, no retry beyond the client's single 401 refresh, no new request after the start cutoff.
+  // C87: the whole operation is bounded by `feedBudgetMs` through ONE AbortController shared by every request.
   const t0 = now();
+  const feed = new AbortController();
+  const timer = setTimeout(() => feed.abort(Object.assign(new Error("listings feed budget exceeded"), { code: "FEED_DEADLINE" })), feedBudgetMs);
   const results = new Array(ids.length);
   let next = 0;
   const lane = async () => {
@@ -69,11 +76,16 @@ export async function buildBody(ids, { concurrency = LISTINGS_FETCH_CONCURRENCY,
       const i = next++;
       if (i >= ids.length) return;
       const id = ids[i];
-      if (now() - t0 > startCutoffMs) { results[i] = { ok: false, id, error: "NOT_STARTED_DEADLINE" }; continue; }
-      results[i] = await fetchOne(id).catch((err) => ({ ok: false, id, error: err?.code || err?.name || "FETCH_FAILED" }));
+      if (feed.signal.aborted || now() - t0 > startCutoffMs) { results[i] = { ok: false, id, error: "NOT_STARTED_DEADLINE" }; continue; }
+      results[i] = await fetchOne(id, feed.signal).catch((err) => ({ ok: false, id, error: err?.code || err?.name || "FETCH_FAILED" }));
     }
   };
-  await Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, ids.length)) }, lane));
+  try {
+    await Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, ids.length)) }, lane));
+  } finally {
+    clearTimeout(timer);
+    feed.abort(Object.assign(new Error("listings feed finished"), { code: "FEED_DONE" }));   // nothing started for this feed outlives it
+  }
   const listings = results.filter((r) => r.ok).map((r) => r.listing);
   const failed = results.filter((r) => !r.ok);
   for (const f of failed) {
