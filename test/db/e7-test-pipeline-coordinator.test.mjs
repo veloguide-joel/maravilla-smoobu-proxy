@@ -416,3 +416,34 @@ for (const mode of ["abort", "deadline"]) {
     });
   }
 }
+
+// ---------------------------------------------------------------------------------------------
+// C88 (ROOT review 5912351880): abort / deadline / budget re-checked AFTER the awaited veto re-read, immediately before the send.
+/** pool wrapper: after the SECOND provider_evidence veto read (the capture's at-write re-read) returns its rows, run `flip()` */
+function vetoFlipPool(flip) {
+  let n = 0;
+  return { query: async (sql, ...a) => {
+    const r = await db.app.query(sql, ...a);
+    if (typeof sql === "string" && sql.startsWith("SELECT kind, external_ref, observed FROM booking.provider_evidence") && ++n === 2) flip();
+    return r;
+  }, connect: (...a) => db.app.connect(...a) };
+}
+test("C88a (ROOT repro) abort flipped while the at-write veto re-read is in flight → the capture is NEVER sent", async () => {
+  const w = world(); const bk = await authorizedBooking(w); const signal = { aborted: false };
+  const r = await coord(w, bk).run({ signal }, vetoFlipPool(() => { signal.aborted = true; }));
+  assert.deepEqual([r.outcome, r.code, r.writes.capture, w.writes.capturePaymentIntent], ["STOP", "ABORTED_AT_WRITE", 0, 0], JSON.stringify(r));
+  assert.equal(w.writes.createOfflineCharge, 0);
+});
+test("C88b (ROOT repro) the deadline reached while the at-write veto re-read is in flight → the capture is NEVER sent", async () => {
+  const w = world(); const bk = await authorizedBooking(w);
+  const deadlineAt = Date.now() + 10 * MIN; const t = { skew: 0 }; const now = () => Date.now() + t.skew;
+  const r = await coord(w, bk).run({ deadlineAt, now }, vetoFlipPool(() => { t.skew = deadlineAt - Date.now(); }));
+  assert.deepEqual([r.outcome, r.code, r.writes.capture, w.writes.capturePaymentIntent], ["STOP", "DEADLINE_AT_WRITE", 0, 0], JSON.stringify(r));
+});
+test("C88c unit: TWO simultaneous guarded capture calls with an async veto → the provider is called exactly ONCE", async () => {
+  let calls = 0; const counter = { capturePaymentIntent: 0 };
+  const ex = CI.guardExecutors({ capturePaymentIntent: async () => { calls += 1; return "ok"; } }, "capturePaymentIntent", counter, { veto: async () => null });
+  const rs = await Promise.allSettled([ex.capturePaymentIntent(), ex.capturePaymentIntent()]);
+  assert.deepEqual([calls, counter.capturePaymentIntent, rs.filter((x) => x.status === "fulfilled").length], [1, 1, 1]);
+  assert.ok(rs.some((x) => x.status === "rejected" && x.reason instanceof CoordinatorBudgetError));
+});
