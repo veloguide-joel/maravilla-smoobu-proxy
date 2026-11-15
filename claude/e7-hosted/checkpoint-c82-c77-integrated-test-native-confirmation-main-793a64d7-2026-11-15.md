@@ -6,7 +6,7 @@
 - S2 — Stripe TEST capture;
 - S4 — Hostaway offline-charge recording.
 
-The ONE native Hostaway automation (rule `511521`) then generated exactly ONE confirmation message. ROOT verified that message in the owner-controlled inbox. The rule was then turned OFF. The enable PR #125 was closed by the exact reviewed CLOSE PR #126. All seven `executeEnabled` flags are false on main.
+The ONE native Hostaway automation (rule `511521`) then generated exactly ONE confirmation message. ROOT verified that message in the owner-controlled inbox. The rule was then turned OFF. The execution flags opened by #125 were restored to false by the exact reviewed CLOSE PR #126. All seven `executeEnabled` flags are false on main.
 
 **What it validates:** ONE integrated TEST booking end to end:
 - Stripe TEST authorization;
@@ -91,15 +91,15 @@ The ONE native Hostaway automation (rule `511521`) then generated exactly ONE co
 
 ## 4. Runner executions [ROOT-obs; normal gates ≈ 18:02 / 18:08 / 18:13 / 18:19Z, no bypass]
 
-Plan hashes are given in full where ROOT's review records carry them. Abbreviated hashes are reproduced as recorded and not expanded here.
+All times below are on 2026-11-15 UTC. Full plan hashes were independently calculated by ROOT and matched the hosted preflight logs.
 
 | stage | preflight run / job · tests · plan | execute run / job | VERIFY → DONE (UTC) | result |
 |---|---|---|---|---|
 | S1-A create | `43743684345` / `132902187787` · 20/20 · `f157471df920d7fa3ffcb44f0b3f9058e20f5c88cdcf4d0d78958c3d6909cd9d` | `43744398571` / `132904388024` (once) | 18:02:43.676Z → 18:04:09.027Z | STEP_BUDGET_EXHAUSTED / STEPS. createInvocations 1, REPLIED; CREATE_REF_NOT_ECHOED: READS_REQUIRED. DB create op succeeded 1, result ref 71781276; v6 `reservation_pending`. **Not an uncertain create.** |
 | (lease) | — | — | ROOT 18:05:15.221Z | The intent lease marker until 18:04:46.692Z had expired; nextAction 18:04:48.376Z had passed. Work / op unleased; **no DB repair** |
-| S1-B read / reconcile | `43744817338` / `132905680818` · 20/20 at 18:06:27.988Z · `7ed9f7b5…1663af1c` | `43744985414` / `132906196875` | 18:08:39.219Z → 18:08:52.498Z | SUCCESS: RESERVATION_CONFIRMED_INTERMEDIATE v7, createInvocations **0**, R 71781276, capture queued pristine, lock released, no cases |
-| S2 capture | `43745172697` / `132906780133` · 15/15 at 18:10:05.804Z · `8fdff314…9cd6f50` | `43745437216` / `132907591645` | 18:13:37.020Z → 18:13:49.545Z | PAYMENT_CAPTURED_INTERMEDIATE v8; captureInvocations 1, REPLIED; captured 14000; recording op pristine; claim HELD; cases 0 |
-| S4 recording | `43745797865` / `132908693136` · 23/23 at 18:16:30.220Z · `953ea409…711caa63` | `43746039485` / `132909436767` (E7_RUN_ID `43746039485-1`) | 18:19:44.085Z → 18:19:58.360Z | RECORDING_CONFIRMED v9; offline charge **35730158**; ONE POST (recordInvocations 1, REPLIED); 7 exchanges (2 identity, 4 lists); 147 DB statements in total, incl. 15 teardown; four proofs + postcheck; lock released; cases / holds 0 |
+| S1-B read / reconcile | `43744817338` / `132905680818` · 20/20 at 18:06:27.988Z · `7ed9f7b5dc779d4a8e2d96289de3d25b0fe5dc95237f7e3293a326791663af1c` | `43744985414` / `132906196875` | 18:08:39.219Z → 18:08:52.498Z | SUCCESS: RESERVATION_CONFIRMED_INTERMEDIATE v7, createInvocations **0**, R 71781276, capture queued pristine, lock released, no cases |
+| S2 capture | `43745172697` / `132906780133` · 15/15 at 18:10:05.804Z · `8fdff31423ea526f4c4bb05841005f7d70103aa6b2a49f2704ee1f7a69cd6f50` | `43745437216` / `132907591645` | 18:13:37.020Z → 18:13:49.545Z | PAYMENT_CAPTURED_INTERMEDIATE v8; captureInvocations 1, REPLIED; captured 14000; recording op pristine; claim HELD; cases 0 |
+| S4 recording | `43745797865` / `132908693136` · 23/23 at 18:16:30.220Z · `953ea409cdf4ac2bf7d24bcf75bcfe640999490528c0866d30d18b21711caa63` | `43746039485` / `132909436767` (E7_RUN_ID `43746039485-1`) | 18:19:44.085Z → 18:19:58.360Z | RECORDING_CONFIRMED v9; offline charge **35730158**; ONE POST (recordInvocations 1, REPLIED); 7 exchanges (2 identity, 4 lists); 147 DB statements in total, incl. 15 teardown; four proofs + postcheck; lock released; cases / holds 0 |
 
 Approval reviews:
 - #125 enable GO `5911996236`
@@ -154,15 +154,15 @@ Observed timing for this one run: Paid 18:19:53Z → received 18:22:04Z. This is
 
 **END snapshot 18:22:42.415Z**
 - **Identity:** the exact 9 ids = the T0 set plus the target. All 8 foreign rows and their 23 child fingerprints are identical; catalog true; schema 23.
-- **Globals:** api_rate_limits is the only global delta from T0; all globals were unchanged before S4.
-- **Idle:** 0 active leases, in-flight locks, prepared transactions and cases.
+- **Globals:** `booking.api_rate_limits` is the only global delta from T0. Every global fingerprint at END is identical to the pre-S4 snapshot at 18:17:27.340Z.
+- **Idle:** work, intent and operation active leases, in-flight operations, advisory locks, prepared transactions and open cases are each 0.
 
 **S4 target deltas**
 - ops 12 → 16, evidence 8 → 11
-- assessment +1 +1, inbox 0 → 2
+- recording_assessments 0 → 1, recording_claim_assessments 0 → 1, recording_conflict_inbox 0 → 2
 - transitions 9 → 10, applied 7 → 8, ledger 2 → 3
 - intent_work lease cleared
-- claim fingerprint unchanged (HELD); other children unchanged
+- inventory_claims full-row fingerprint unchanged (HELD) versus pre-S4; the other child-table counts and fingerprints are unchanged versus pre-S4
 
 **Read-only detail 18:24:59.968Z / 18:25:03.568Z**
 - Confirmed v9; create, capture and record each succeeded 1; ref bound.
