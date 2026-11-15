@@ -67,7 +67,7 @@ All three runs were attempt 1, SUCCESS. Their send / execute / inspect jobs were
 
 **Result (verbatim sanitized output line):**
 ```
-e7-resend-sink-probe-result-v1 outcome=PROVIDER_ACCEPTED stop=- attempts=1 httpStatus=200 emailId=01a1e01c-4b9a-7b42-9e7a-5cdb5593c953 locale=en planHash=9f57efeac07955990999dbfecaf703ca10a03fc2674aae51b856a0cce0f9a796 bodyHash=47b16d4ca8ba303f79c846d8e566f86ea4855ce9e07198369d0624632f0437aa elapsedMs=73
+e7-resend-sink-probe-result-v1 outcome=PROVIDER_ACCEPTED stop=- attempts=1 httpStatus=200 emailId=01a1e01c-4b9a-7b42-9e7a-5cdb5593c953 locale=en planHash=9f57efeac07955990999dbfecaf703ca10a03fc2674aae51b856a0cce0f9a796 bodyHash=47b16d4ca8ba303f79c846d8e566f86ea4855ce9e07198369d0624632f0437aa elapsedMs=73 note=provider-accepted-for-the-resend-delivery-simulation-sink;not-real-inbox-proof;not-a-booking-notification
 ```
 
 **Reconciliation:**
