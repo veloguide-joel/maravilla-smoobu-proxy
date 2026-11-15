@@ -28,6 +28,16 @@
 //     offline-charge POST (exact title / amount / method / status). Nothing else, ever (no cancel / void / refund / notify / account write).
 //   * Session advisory lock (5432, pid-stable proof) before the coordinator and proven again after every step (hook); runner-owned abort +
 //     wall deadline handed to the coordinator (deadlineAt / signal).
+//   * SECURITY DEPENDENCY (C91 contract, ROOT review 5912770410): the boundary re-proofs (still-authorized before capture, captured + echo before
+//     recording), the late executor binding and the per-step lock proof run in the coordinator's hooks.afterStep. The pinned coordinator documents
+//     that hook as "tests / operator logging only", but it AWAITS it after each step and a throw is a STOP before any next step / write (catch →
+//     STEP_THREW_<code>, no further query). This wrapper RELIES on exactly that awaited throw→STOP behaviour; the real-coordinator test P11 asserts a
+//     failed boundary hook blocks the next worker and its write. The accepted coordinator is NOT repinned or modified for the wording.
+//   * C91-F1 supervision: every DB acquisition / statement and every runner provider await is locally bounded (connectMs / statementMs) and inside
+//     ONE seal (deadline / abort / lock-session error / local timeout): sealing rejects every supervised await, destroys every tracked connection,
+//     closes every fence / executor, discards late results and destroys late clients. A statement in flight at the seal after the coordinator was
+//     admitted is an UNKNOWN DB outcome ⇒ STOP + possiblyEffected. The pinned pool / tooling are not modified.
+//   * C91-F2: the no-dispute / no-refund raw proofs require the explicit boolean false; absent or malformed values refuse (unknown is not proof).
 // Outcomes: CONFIRMED_VERIFIED only when the coordinator says CONFIRMED AND the durable readback verifies confirmed / exactly one succeeded
 // create, capture and recording / captured amount / offline_charge_id linked / claim held / no cases / no forbidden op / notify undispatched.
 // PENDING carries a sanitized nextActionAt and needs a FUTURE, separately dispatched attempt with fresh proof (exit 0, NOT completion).
@@ -73,7 +83,10 @@ export const CONSTANTS = deepFreeze({
   // ONE coordinator invocation; its own step / write budgets are authoritative (≤ 6 steps, ≤ 1 create / capture / record). Fence ceilings ≈ 3x
   // the coordinator happy path (8 Hostaway pricing / lookup reads, 2 Stripe proofs per boundary, 4 charge lists).
   budgets: { coordinatorInvocations: 1, maxSteps: 6, create: 1, capture: 1, record: 1, accountReads: 8, piReads: 10, pricingCalls: 36, hostawayReads: 36,
-    lookupPages: 24, chargeLists: 12, exchanges: 160, dbQueries: 1500, runMs: 12 * 60 * 1000, teardownMs: 5000, pendingHorizonMs: 7 * 24 * 60 * 60 * 1000 },
+    lookupPages: 24, chargeLists: 12, exchanges: 160, dbQueries: 1500, runMs: 12 * 60 * 1000, teardownMs: 5000, pendingHorizonMs: 7 * 24 * 60 * 60 * 1000,
+    // C91-F1 LOCAL bounds (the pinned pool sets a server statement_timeout but no connect / client deadline): every acquisition ≤ connectMs and every
+    // statement ≤ statementMs, enforced HERE; a breach SEALS the run (no further DB / provider admission) and destroys the affected connections
+    connectMs: 10000, statementMs: 30000 },
   synthetic: { approvalRef: "SYNTHETIC-pipeline-preflight-not-for-execute", intentId: "00000000-0000-4000-8000-000000000000", ref: "MV-SYNTH000",
     expectedVersion: 4, notBefore: "2026-11-16T00:00:00.000Z", paymentIntentId: "pi_SYNTHETIC00000000000000", amountMinor: 1, currency: "USD" }
 });
@@ -332,13 +345,15 @@ export function checkPending(f, plan, c = CONSTANTS) {
 
 // =================================================================================================================================
 // fresh Stripe proofs (pure over the accepted v3 observation + raw fields the observation does not copy)
-/** raw refusals the v3 observation does not cover: refund flag, dispute, multicapture (capture ambiguity) */
+/** raw refusals the v3 observation does not cover: refund flag, dispute, multicapture (capture ambiguity). Fail-closed: refunded and disputed must be the
+ *  explicit boolean false (absent / null / string / number / object refuse); listed refunds, multicapture availability / request refuse. */
 export function piRawRefusal(pi) {
   if (!isObj(pi)) return "PI_NOT_OBJECT";
   const ch = pi.latest_charge;
   if (!isObj(ch)) return "CHARGE_NOT_EXPANDED";
   if (ch.refunded !== false) return "CHARGE_REFUNDED_FLAG";
   if (ch.disputed === true) return "CHARGE_DISPUTED";
+  if (ch.disputed !== false) return "CHARGE_DISPUTE_UNKNOWN";                                       // C91-F2: explicit typed false only; absent / malformed = unknown = refused
   if (isObj(ch.refunds) && Array.isArray(ch.refunds.data) && ch.refunds.data.length !== 0) return "CHARGE_REFUND_LISTED";
   const card = isObj(ch.payment_method_details) && isObj(ch.payment_method_details.card) ? ch.payment_method_details.card : null;
   if (card && card.multicapture !== undefined && card.multicapture !== null && !(isObj(card.multicapture) && card.multicapture.status === "unavailable")) return "MULTICAPTURE_AVAILABLE";
@@ -383,20 +398,55 @@ export async function runPipelineCore(input) {
     hostawayReads: 0, lookupPages: 0, chargeLists: 0, refusedAtTransport: 0, refusedByStop: 0, dbQueries: 0, dbBudgetRefused: 0, lock: "not_acquired", lockSession: null,
     stopReason: null, factsObserved: false, postcheck: null };
   const DONE = Symbol("done");
-  const done = (outcome, k = null) => { r.outcome = outcome; r.code = k === null ? null : code(String(k), "CODE"); return DONE; };
+  const done = (outcome, k = null) => { if (!finalized) { r.outcome = outcome; r.code = k === null ? null : code(String(k), "CODE"); } return DONE; };
   const stop = (k) => done("STOP", k);
-  let stopReason = null; let lockClient = null; let lockAcquired = false; let lockErrored = false; let lockPid = null; let timerHandle = null;
+  r.sealed = false; r.sealReason = null; r.dbInFlightAtSeal = 0; r.dbOutcomeUnknown = false; r.lateClientsDestroyed = 0; r.clientsDestroyed = 0; r.coordinatorSettled = null;
+  let stopReason = null; let lockT = null; let lockAcquired = false; let lockErrored = false; let lockPid = null; let timerHandle = null; let finalized = false;
   const stopAc = new AbortController();
-  const stopped = () => {
-    if (stopReason === null) {
-      if (input && input.runSignal && input.runSignal.aborted) stopReason = "ABORTED";
-      else if (lockErrored) stopReason = "LOCK_SESSION_ERROR";
-      else if (stopAc.signal.aborted) stopReason = "DEADLINE";
-      if (stopReason !== null) { r.stopReason = stopReason; try { stopAc.abort(); } catch { /* ignore */ } }
-    }
-    return stopReason;
-  };
+  // ---- C91-F1 SUPERVISION. ONE seal (wall deadline / run abort / lock-session error / a LOCAL connect or statement timeout) ends ALL DB and provider
+  // admission at once: every supervised await rejects, every tracked connection (worker / coordinator / runner / lock) is DESTROYED, every fence and
+  // executor refuses, and a late-arriving client or result is discarded (a late client is destroyed before any use). Statements in flight at the seal
+  // after the coordinator was admitted are an UNKNOWN DB outcome (possiblyEffected); runner reads before it are read-only. Never a bare race: the body,
+  // the coordinator and every DB / provider await are inside the seal, so nothing can continue to a coordinator / provider stage after expiration.
+  const B0 = CONSTANTS.budgets;
+  const setT = input && typeof input.timer === "function" ? input.timer : (fn, ms) => setTimeout(fn, ms);
+  const clearT = input && typeof input.clearTimer === "function" ? input.clearTimer : (h) => clearTimeout(h);
+  const sealHooks = new Set(); const tracked = new Set(); let inFlight = 0; let coordinatorAdmitted = false; let coP = null;
   class Stopped extends Error { constructor() { super("stopped"); this.code = "RUNNER_STOPPED"; } }
+  class DbTimeout extends Error { constructor(k) { super("db timeout"); this.code = k; } }
+  const finish = (t, destroyIt) => { if (!t || t.released) return; t.released = true; tracked.delete(t); if (destroyIt) r.clientsDestroyed += 1; try { t.cl.release(destroyIt ? true : undefined); } catch { /* contained */ } };
+  const destroy = (t) => { if (!t || t.released) return; t.released = true; tracked.delete(t); r.clientsDestroyed += 1; try { t.cl.release(true); } catch { /* contained */ } };
+  const seal = (why) => {
+    if (r.sealed) return;
+    r.sealed = true; r.sealReason = code(String(why), "SEALED");
+    if (stopReason === null) { stopReason = r.sealReason; r.stopReason = stopReason; }
+    r.dbInFlightAtSeal = inFlight;
+    if (coordinatorAdmitted && inFlight > 0) r.dbOutcomeUnknown = true;
+    try { stopAc.abort(); } catch { /* ignore */ }
+    for (const fn of [...sealHooks]) { try { fn(); } catch { /* ignore */ } }
+    sealHooks.clear();
+    for (const t of [...tracked]) destroy(t);
+  };
+  /** supervise(p, ms?, onTimeout?) — the ONLY way this core awaits DB / provider / coordinator work: rejects Stopped on the seal (or if sealed before /
+   *  at resolution), rejects DbTimeout after `ms` (onTimeout runs first: destroy + seal); a late value is DISCARDED, never returned to a stage. */
+  const supervise = (p, ms = null, onTimeout = null, k = "DB_TIMEOUT") => new Promise((resolve, reject) => {
+    const pp = Promise.resolve(p);
+    if (r.sealed) { pp.catch(() => {}); reject(new Stopped()); return; }
+    let settled = false; let th = null;
+    const fin = (fn) => { if (settled) return; settled = true; sealHooks.delete(onSeal); if (th !== null) { try { clearT(th); } catch { /* ignore */ } } fn(); };
+    const onSeal = () => fin(() => reject(new Stopped()));
+    sealHooks.add(onSeal);
+    if (ms !== null) th = setT(() => fin(() => { try { if (onTimeout) onTimeout(); } catch { /* ignore */ } reject(new DbTimeout(k)); }), ms, "db");
+    pp.then((v) => fin(() => (r.sealed ? reject(new Stopped()) : resolve(v))), (e) => fin(() => reject(r.sealed ? new Stopped() : e)));
+  });
+  const stopped = () => {
+    if (!r.sealed) {
+      if (input && input.runSignal && input.runSignal.aborted) seal("ABORTED");
+      else if (lockErrored) seal("LOCK_SESSION_ERROR");
+      else if (stopAc.signal.aborted) seal("DEADLINE");
+    }
+    return r.sealed ? stopReason : null;
+  };
   class HookStop extends Error { constructor(k) { super("hook"); this.code = code(String(k), "HOOK_STOP"); } }
   const guard = () => { if (stopped()) throw new Stopped(); };
   const observe = (f) => {
@@ -422,19 +472,44 @@ export async function runPipelineCore(input) {
     const recordingClock = input.recordingClock ?? clock;
     const now = input.now ?? (() => Date.now());
     const deadlineAt = now() + B.runMs - B.teardownMs;
-    const setT = input.timer ?? ((fn, ms) => { const t = setTimeout(fn, ms); if (t && typeof t.unref === "function") t.unref(); return t; });
-    timerHandle = setT(() => { try { stopAc.abort(); } catch { /* ignore */ } }, B.runMs - B.teardownMs);
-    if (input.runSignal && typeof input.runSignal.addEventListener === "function") input.runSignal.addEventListener("abort", () => { stopped(); }, { once: true });
+    timerHandle = setT(() => seal("DEADLINE"), B.runMs - B.teardownMs, "deadline");                 // C91-F1: the deadline SEALS (not only aborts a signal)
+    if (input.runSignal && typeof input.runSignal.addEventListener === "function") input.runSignal.addEventListener("abort", () => seal("ABORTED"), { once: true });
+    if (input.runSignal && input.runSignal.aborted) seal("ABORTED");
     const lockClientFactory = input.lockClientFactory ?? (() => pool.connect());
     const PI = plan.paymentIntentId; const IID = plan.intentId;
 
     // ---- (1) counted pool: EVERY statement (runner + coordinator + workers, connected clients included) is counted once at this boundary ------
     const count = () => { if (r.dbQueries >= B.dbQueries) { r.dbBudgetRefused += 1; throw new Refusal("DB_BUDGET"); } r.dbQueries += 1; };
+    /** C91-F1 bounded acquisition: ≤ connectMs; a client that arrives after a timeout / the seal is destroyed before any use */
+    const acquire = async (factory, sealCode) => {
+      if (r.sealed) throw new Stopped();
+      let lost = false; let got = null; let t = null;
+      const kill = (cl) => { r.lateClientsDestroyed += 1; try { cl.release(true); } catch { /* contained */ } };
+      const pc = Promise.resolve().then(() => factory());
+      pc.then((cl) => { got = cl; if (lost && cl) kill(cl); }, () => {});
+      try {
+        const cl = await supervise(pc, B.connectMs, () => seal(sealCode), "DB_CONNECT_TIMEOUT");
+        if (!cl || typeof cl.query !== "function" || typeof cl.release !== "function") { lost = true; if (cl) kill(cl); throw new Refusal("DB_CLIENT_INVALID"); }
+        t = { cl, released: false }; tracked.add(t);
+        if (r.sealed) { destroy(t); throw new Stopped(); }
+        return t;
+      } catch (e) { if (!t) { lost = true; if (got) { const g = got; got = null; kill(g); } } throw e; }
+    };
+    /** C91-F1 bounded statement: ≤ statementMs; a timeout destroys that connection and SEALS; in-flight statements are counted for the seal */
+    const tq = (t, args, sealCode = "DB_STATEMENT_TIMEOUT") => {
+      if (r.sealed || t.released) return Promise.reject(new Stopped());
+      count(); inFlight += 1;
+      let qp; try { qp = Promise.resolve(t.cl.query(...args)); } catch (e) { inFlight -= 1; return Promise.reject(e); }
+      return supervise(qp, B.statementMs, () => { destroy(t); seal(sealCode); }, "DB_STATEMENT_TIMEOUT").finally(() => { inFlight -= 1; });
+    };
+    // the counted + SUPERVISED pool handed to the runner reads AND to the coordinator / workers (every statement goes through a tracked client)
     const countedPool = {
-      query: (...a) => { count(); return pool.query(...a); },
-      connect: async () => { const cl = await pool.connect(); const qq = cl.query.bind(cl);
-        return { query: (...a) => { count(); return qq(...a); }, release: (...a) => cl.release(...a), on: (...a) => (typeof cl.on === "function" ? cl.on(...a) : undefined),
-          removeListener: (...a) => (typeof cl.removeListener === "function" ? cl.removeListener(...a) : undefined) }; }
+      query: async (...a) => { const t = await acquire(() => pool.connect(), "DB_CONNECT_TIMEOUT"); let ok = false;
+        try { const res = await tq(t, a); ok = true; return res; } finally { finish(t, !ok); } },
+      connect: async () => { const t = await acquire(() => pool.connect(), "DB_CONNECT_TIMEOUT");
+        return { query: (...a) => tq(t, a), release: (arg) => finish(t, arg === true || arg instanceof Error),
+          on: (...a) => (typeof t.cl.on === "function" ? t.cl.on(...a) : undefined),
+          removeListener: (...a) => (typeof t.cl.removeListener === "function" ? t.cl.removeListener(...a) : undefined) }; }
     };
     const q = async (sql, params) => { guard(); const res = await countedPool.query(sql, params); return res.rows; };
     const raw = { query: (sql, params) => { guard(); return countedPool.query(sql, params); } };
@@ -442,7 +517,7 @@ export async function runPipelineCore(input) {
 
     // ---- (2) read-only admission (pins re-read and cross-checked) + the stored refund veto (UNKNOWN when absent) ---------------------------------
     let f;
-    try { f = await read(); } catch (e) { return e instanceof Stopped ? stop(`STOP_${stopReason}`) : stop("DB_ERROR:START_READ_FAILED"); }
+    try { f = await read(); } catch (e) { return e instanceof Stopped || e instanceof DbTimeout ? stop(`STOP_${stopReason ?? e.code}`) : stop("DB_ERROR:START_READ_FAILED"); }
     r.startState = f.intent ? f.intent.status : null; observe(f);
     const st = checkStart(f, plan, c, tooling);
     if (!st.ok) return stop(`ADMISSION_REFUSED:${st.code}`);
@@ -453,9 +528,10 @@ export async function runPipelineCore(input) {
     if (rate === null) return stop("ADMISSION_REFUSED:PRICE_RATE_MISSING");
 
     // ---- (3) LABELLED COPY (Slice 1 §3, F4): the session lock on a DEDICATED client; pid-stable proof ----------------------------------------------
-    try { lockClient = await lockClientFactory(); } catch { return stop("DB_ERROR:LOCK_CONNECT_FAILED"); }
-    if (typeof lockClient.on === "function") lockClient.on("error", () => { lockErrored = true; r.lockSession = "error_observed"; });
-    const lockQuery = async (sql, params) => { guard(); count(); return lockClient.query(sql, params); };
+    try { lockT = await acquire(lockClientFactory, "LOCK_CONNECT_TIMEOUT"); }
+    catch (e) { return e instanceof Stopped ? stop(`STOP_${stopReason}`) : stop(e instanceof DbTimeout ? "STOP_LOCK_CONNECT_TIMEOUT" : "DB_ERROR:LOCK_CONNECT_FAILED"); }
+    if (typeof lockT.cl.on === "function") lockT.cl.on("error", () => { lockErrored = true; r.lockSession = "error_observed"; seal("LOCK_SESSION_ERROR"); });
+    const lockQuery = async (sql, params) => { guard(); return tq(lockT, [sql, params], "LOCK_STATEMENT_TIMEOUT"); };
     const PROOF_SQL = `SELECT (${tooling.LOCK_PRECHECK_SQL} AND l.pid = pg_catalog.pg_backend_pid()) AS n, pg_catalog.pg_backend_pid() AS pid`;
     const ownLock = async () => {
       if (lockErrored) return false;
@@ -474,7 +550,7 @@ export async function runPipelineCore(input) {
       if (a.rows.length !== 1 || b.length !== 1 || a.rows[0].db !== b[0].db || a.rows[0].environment !== c.dbEnvironment || b[0].environment !== c.dbEnvironment) return stop("SCOPE_REFUSED:POOLS_MISMATCH");
       const role = await q(Q.role, []);
       if (role.length !== 1 || role[0].privileged !== false || role[0].is_app !== true) return stop("SCOPE_REFUSED:ROLE_NOT_APP");
-    } catch (e) { return e instanceof Stopped ? stop(`STOP_${stopReason}`) : stop("DB_ERROR:LOCK_QUERY_FAILED"); }
+    } catch (e) { return e instanceof Stopped || e instanceof DbTimeout ? stop(`STOP_${stopReason ?? e.code}`) : stop("DB_ERROR:LOCK_QUERY_FAILED"); }
 
     // ---- (4) the target-only transport fence (Stripe + Hostaway), counters BEFORE the transport ---------------------------------------------------
     const bound = { resId: null, rid: null, res: null, cap: null, rec: null };
@@ -600,9 +676,9 @@ export async function runPipelineCore(input) {
       guard();
       let acct; let pi;
       try {
-        acct = await ts.transport.send({ op: "accounts.retrieve" }, { signal: composed(null) });
+        acct = await supervise(ts.transport.send({ op: "accounts.retrieve" }, { signal: composed(null) }));
         guard();
-        pi = await ts.transport.send({ op: "paymentIntents.retrieve", id: PI, params: { expand: ["latest_charge"] } }, { signal: composed(null) });
+        pi = await supervise(ts.transport.send({ op: "paymentIntents.retrieve", id: PI, params: { expand: ["latest_charge"] } }, { signal: composed(null) }));
       } catch (e) { if (e instanceof Stopped || stopped()) throw new Stopped(); return "READ_FAILED"; }
       if (!acct || acct.object !== "account" || acct.id !== c.accountId) return "ACCOUNT";
       const k = proofRefusal(kind, pi, intentNow, attemptId, tooling, clock());
@@ -614,7 +690,7 @@ export async function runPipelineCore(input) {
     const echoProof = async (rid, intentNow) => {
       guard();
       let rr;
-      try { rr = await th.transport.send({ method: "GET", path: `/v1/reservations/${rid}`, query: {} }, { signal: composed(null) }); }
+      try { rr = await supervise(th.transport.send({ method: "GET", path: `/v1/reservations/${rid}`, query: {} }, { signal: composed(null) })); }
       catch (e) { if (e instanceof Stopped || stopped()) throw new Stopped(); return "RESERVATION_READ_FAILED"; }
       if (!rr || rr.httpStatus !== 200) return `RESERVATION_READ_${Number.isSafeInteger(rr && rr.httpStatus) ? rr.httpStatus : "FAILED"}`;
       const env = tooling.unwrapEnvelope(rr.json);
@@ -636,7 +712,7 @@ export async function runPipelineCore(input) {
       const g = await q(Q.guest, [IID]);
       if (g.length !== 1 || typeof g[0].email !== "string" || typeof g[0].first_name !== "string" || typeof g[0].last_name !== "string") return stop("ADMISSION_REFUSED:GUEST_NOT_FOUND");
       guest = freeze({ email: g[0].email, firstName: g[0].first_name, lastName: g[0].last_name });
-    } catch (e) { return e instanceof Stopped ? stop(`STOP_${stopReason}`) : stop("DB_ERROR:GUEST_READ_FAILED"); }
+    } catch (e) { return e instanceof Stopped || e instanceof DbTimeout ? stop(`STOP_${stopReason ?? e.code}`) : stop("DB_ERROR:GUEST_READ_FAILED"); }
     const LABEL = freeze({ accountRef: c.accountRef, clientSnapshotId: runId });
     const bindReservation = (id) => {
       const bx = tooling.createPhaseExecutors({ phase: id === null ? "reservation" : "reservation-recovery", binding: { listingId: c.listingId, arrivalDate: intent0.from,
@@ -723,7 +799,7 @@ export async function runPipelineCore(input) {
       if (!(await ownLock())) { r.lock = "lost"; throw new HookStop(lockErrored ? "LOCK_SESSION_ERROR" : r.lockSession === "backend_hop" ? "BACKEND_HOP" : "LOCK_LOST"); }
       if (r.sends.create + r.sends.capture + r.sends.record > 0 && Object.values(r.replies).includes("UNKNOWN")) throw new HookStop("WRITE_REPLY_UNKNOWN");
       let fx;
-      try { fx = await read(); } catch (e) { if (e instanceof Stopped) throw e; throw new HookStop("FACTS_READ_FAILED"); }
+      try { fx = await read(); } catch (e) { if (e instanceof Stopped || r.sealed) throw new Stopped(); throw new HookStop("FACTS_READ_FAILED"); }
       observe(fx);
       if (!fx.intent || fx.intent.status !== step.stateAfter) throw new HookStop("FACTS_STATE_DIVERGED");
       await bind(fx, step.stateBefore);
@@ -738,14 +814,17 @@ export async function runPipelineCore(input) {
       if (!(await ownLock())) { r.lock = "lost"; return stop("LOCK_LOST:BEFORE_COORDINATOR"); }
       if (stopped()) return stop(`STOP_${stopReason}`);
       r.coordinatorInvocations += 1;                                                                    // exactly ONE; there is no loop around it
-      co = await tooling.runTestPipelineCoordinator(countedPool, { workerId: `e7-hpl:${plan.approvalRef.slice(0, 40)}`, env: workerEnv, binding: { intentId: IID, ref: plan.ref },
+      coordinatorAdmitted = true;
+      coP = Promise.resolve().then(() => tooling.runTestPipelineCoordinator(countedPool, { workerId: `e7-hpl:${plan.approvalRef.slice(0, 40)}`, env: workerEnv, binding: { intentId: IID, ref: plan.ref },
         phases: { reservation: { adapterConfig, listings: listingsBase, executors: proxies.reservation },
           capture: { adapterConfig, listings: listingsBase, executors: proxies.capture, stripeAccountId: c.accountId },
           recording: { listings: new Map([[c.listingId, recCfg]]), executors: proxies.recording } },
-        clock, recordingClock, now, maxSteps: B.maxSteps, deadlineAt, signal: stopAc.signal, hooks: { afterStep } });
+        clock, recordingClock, now, maxSteps: B.maxSteps, deadlineAt, signal: stopAc.signal, hooks: { afterStep } }));
+      co = await supervise(coP);                                                                        // sealed: rejects; the sealed coordinator can no longer reach DB / provider
     } catch (e) {
+      if (r.sealed) return stop(`STOP_${stopReason}`);
       if (e instanceof Refusal && e.code === "DB_BUDGET") return stop("BUDGET_EXHAUSTED:DB_QUERY_CEILING");
-      return stop(stopped() ? `STOP_${stopReason}` : "COORDINATOR_THREW");
+      return stop("COORDINATOR_THREW");
     }
     r.coordinator = co && typeof co === "object" ? freeze({ outcome: code(co.outcome, "INVALID"), code: code(co.code, "INVALID"),
       steps: Array.isArray(co.steps) ? co.steps.slice(0, 16).map((s) => freeze({ phase: code(s.phase, "-"), status: code(s.status, "-"), stateBefore: code(s.stateBefore, "-"), stateAfter: code(s.stateAfter, "-") })) : [],
@@ -756,7 +835,7 @@ export async function runPipelineCore(input) {
 
     // ---- (9) durable readback: ONLY a verified CONFIRMED is success; PENDING is reported over settled facts; anything else STOPS -------------------
     let fz;
-    try { fz = await read(); } catch (e) { return stop(e instanceof Stopped ? `STOP_${stopReason}` : "POSTCHECK_MISMATCH:READBACK_FAILED"); }
+    try { fz = await read(); } catch (e) { return stop(r.sealed ? `STOP_${stopReason}` : "POSTCHECK_MISMATCH:READBACK_FAILED"); }
     observe(fz);
     if (r.coordinator.outcome === "CONFIRMED") {
       const pe = checkEnd(fz, plan, c);
@@ -778,26 +857,36 @@ export async function runPipelineCore(input) {
     if (attempted() > 0) r.possiblyEffected = true;
     return stop(`COORDINATOR_${r.coordinator.outcome}:${r.coordinator.code}`);
   };
-  const bounded = (p, ms) => new Promise((resolve) => { let t = null; const fin = (v) => { clearTimeout(t); resolve(v); };
-    t = setTimeout(() => fin({ done: false }), ms); Promise.resolve().then(() => p).then((value) => fin({ done: true, value }), () => fin({ done: true, threw: true })); });
+  const bounded = (p, ms) => new Promise((resolve) => { let t = null; const fin = (v) => { try { clearT(t); } catch { /* ignore */ } resolve(v); };
+    t = setT(() => fin({ done: false }), ms, "teardown"); Promise.resolve().then(() => p).then((value) => fin({ done: true, value }), () => fin({ done: true, threw: true })); });
+  const bodyP = Promise.resolve().then(() => body());
   try {
-    const out = await body();
+    const out = await supervise(bodyP);                                                                // the body itself is inside the seal too
     if (out !== DONE) stop("INTERNAL");
   } catch (e) {
-    stop(e instanceof Refusal && e.code === "DB_BUDGET" ? "BUDGET_EXHAUSTED:DB_QUERY_CEILING" : "INTERNAL");
+    if (r.sealed) {
+      stop(`STOP_${stopReason}`); finalized = true;                                                     // the seal decides; nothing after it can turn this into success
+      await bounded(bodyP, B0.teardownMs);                                                              // let the sealed body unwind (all its awaits are already rejecting)
+    } else stop(e instanceof Refusal && e.code === "DB_BUDGET" ? "BUDGET_EXHAUSTED:DB_QUERY_CEILING" : "INTERNAL");
   } finally {
-    if (timerHandle !== null) { try { clearTimeout(timerHandle); } catch { /* ignore */ } }
-    if (r.sends.create + r.sends.capture + r.sends.record > 0 && r.outcome === "STOP") r.possiblyEffected = true;   // a STOP after any attempted write: owner / ROOT review
-    if (lockClient) {
+    finalized = true;
+    if (timerHandle !== null) { try { clearT(timerHandle); } catch { /* ignore */ } }
+    if (coP !== null) { const s2 = await bounded(coP, B0.teardownMs); r.coordinatorSettled = s2.done === true; }
+    if (r.sealed && r.outcome !== "STOP") { r.outcome = "STOP"; r.code = code(`STOP_${stopReason}`, "STOP_SEALED"); r.verifiedCompletion = false; r.postcheck = null; r.nextActionAt = null; }
+    if (lockT) {
       let released = false;
-      if (lockAcquired && !lockErrored) {
-        const u = await bounded(lockClient.query("SELECT pg_advisory_unlock(pg_catalog.hashtext($1), 0) AS ok, pg_catalog.pg_backend_pid() AS pid", [input?.tooling?.LOCK_KEY ?? ""]), CONSTANTS.budgets.teardownMs);
+      if (lockAcquired && !lockErrored && !r.sealed && !lockT.released) {
+        const u = await bounded(supervise(lockT.cl.query("SELECT pg_advisory_unlock(pg_catalog.hashtext($1), 0) AS ok, pg_catalog.pg_backend_pid() AS pid", [input?.tooling?.LOCK_KEY ?? ""]),
+          B0.statementMs, () => destroy(lockT)), B0.teardownMs);
         released = u.done && !u.threw && u.value && u.value.rows && u.value.rows.length === 1 && u.value.rows[0].ok === true && String(u.value.rows[0].pid) === lockPid && !lockErrored;
       }
-      if (lockAcquired) r.lock = released ? "released" : (lockErrored ? "session_error_connection_destroyed" : "unlock_failed_connection_destroyed");
-      try { lockClient.release(released ? undefined : true); } catch { /* contained */ }
-      if (lockAcquired && !released && r.outcome === "CONFIRMED_VERIFIED") { r.outcome = "STOP"; r.code = "UNLOCK_NOT_PROVEN"; r.verifiedCompletion = false; r.possiblyEffected = true; }
+      if (lockAcquired) r.lock = released ? "released" : (lockErrored ? "session_error_connection_destroyed" : r.sealed ? "sealed_connection_destroyed" : "unlock_failed_connection_destroyed");
+      if (released) finish(lockT, false); else destroy(lockT);
+      if (lockAcquired && !released && r.outcome === "CONFIRMED_VERIFIED") { r.outcome = "STOP"; r.code = "UNLOCK_NOT_PROVEN"; r.verifiedCompletion = false; }
     }
+    for (const t of [...tracked]) destroy(t);                                                           // no connection outlives the core
+    const attempted = r.sends.create + r.sends.capture + r.sends.record;
+    if (r.outcome === "STOP" && (attempted > 0 || r.dbOutcomeUnknown)) r.possiblyEffected = true;     // STOP after any attempted write or an UNKNOWN DB outcome
   }
   return freeze(JSON.parse(JSON.stringify(r)));
 }

@@ -167,7 +167,7 @@ const intentAuth = (o = {}) => ({ id: IID, status: "reservation_confirmed", vers
 const piObj = (o = {}, ch = {}) => ({ object: "payment_intent", id: PI, livemode: false, status: "requires_capture", capture_method: "manual", amount: AMT, amount_received: 0, amount_capturable: AMT,
   currency: "usd", metadata: { mv_intent_id: IID, mv_payment_attempt_id: ATT }, ...o,
   latest_charge: { object: "charge", id: "ch_FAKEpipe01", payment_intent: PI, status: "succeeded", paid: true, captured: false, amount: AMT, amount_captured: 0, amount_refunded: 0,
-    refunded: false, currency: "usd", livemode: false, payment_method_details: { card: { capture_before: CB / 1000 } }, ...ch } });
+    refunded: false, disputed: false, currency: "usd", livemode: false, payment_method_details: { card: { capture_before: CB / 1000 } }, ...ch } });
 const capturedPi = (o = {}, ch = {}) => piObj({ status: "succeeded", amount_received: AMT, amount_capturable: 0, ...o }, { captured: true, amount_captured: AMT, ...ch });
 test("H6 fresh proofs (accepted v3 + captured predicates + raw refusals): authorized / captured pass; amount / currency / livemode / manual capture / metadata / status / refund (amount, flag, listed) / dispute / multicapture / capture_before mismatch refuse", () => {
   const P = (k, pi, i = intentAuth()) => E.proofRefusal(k, pi, i, ATT, pureTooling, 1);
@@ -178,12 +178,22 @@ test("H6 fresh proofs (accepted v3 + captured predicates + raw refusals): author
     ["authorized", piObj({ metadata: { mv_intent_id: "other", mv_payment_attempt_id: ATT } }), "PAYMENT_INTENT_IDENTITY"], ["authorized", piObj({ status: "canceled" }), "NOT_REQUIRES_CAPTURE"],
     ["authorized", capturedPi(), "NOT_REQUIRES_CAPTURE"], ["authorized", piObj({}, { amount_refunded: 1 }), "CHARGE_REFUNDED"], ["authorized", piObj({}, { refunded: true }), "CHARGE_REFUNDED_FLAG"],
     ["authorized", piObj({}, { refunded: undefined }), "CHARGE_REFUNDED_FLAG"], ["authorized", piObj({}, { refunds: { data: [{ id: "re_1" }] } }), "CHARGE_REFUND_LISTED"],
-    ["authorized", piObj({}, { disputed: true }), "CHARGE_DISPUTED"], ["authorized", piObj({}, { payment_method_details: { card: { capture_before: CB / 1000, multicapture: { status: "available" } } } }), "MULTICAPTURE_AVAILABLE"],
+    ["authorized", piObj({}, { disputed: true }), "CHARGE_DISPUTED"], ["authorized", piObj({}, { disputed: "true" }), "CHARGE_DISPUTE_UNKNOWN"], ["authorized", piObj({}, { payment_method_details: { card: { capture_before: CB / 1000, multicapture: { status: "available" } } } }), "MULTICAPTURE_AVAILABLE"],
     ["authorized", piObj({ payment_method_options: { card: { request_multicapture: "if_available" } } }), "MULTICAPTURE_REQUESTED"],
     ["authorized", piObj({}, { payment_method_details: { card: { capture_before: CB / 1000 + 60 } } }), "CAPTURE_BEFORE_MISMATCH"], ["authorized", piObj({}, { captured: true }), "CHARGE_ALREADY_CAPTURED"],
     ["captured", piObj(), "PI_NOT_CAPTURED_PROOF"], ["captured", capturedPi({}, { amount_refunded: 100 }), "PI_NOT_CAPTURED_PROOF"], ["captured", capturedPi({}, { refunded: true }), "CHARGE_REFUNDED_FLAG"],
     ["captured", capturedPi({ amount_received: AMT - 1 }), "PI_NOT_CAPTURED_PROOF"], ["captured", capturedPi({ amount_capturable: 1 }), "PI_CAPTURED_SHAPE"],
     ["authorized", { ...piObj(), latest_charge: "ch_x" }, "CHARGE_NOT_EXPANDED"]]) assert.equal(P(k, pi), want, `${k} ${want}`);
+  // C91-F2 (ROOT review 5912770410): the no-dispute proof needs the explicit typed false; absent / malformed = unknown = refused, authorized AND captured
+  const capI = intentAuth({ status: "payment_captured", payment: { ...intentAuth().payment, capturedMinor: AMT } });
+  const noDisp = (pi) => { const x = structuredClone(pi); delete x.latest_charge.disputed; return x; };
+  for (const v of ["true", "false", 1, 0, {}, [], null]) {
+    assert.equal(P("authorized", piObj({}, { disputed: v })), "CHARGE_DISPUTE_UNKNOWN", `authorized disputed=${JSON.stringify(v)}`);
+    assert.equal(P("captured", capturedPi({}, { disputed: v }), capI), "CHARGE_DISPUTE_UNKNOWN", `captured disputed=${JSON.stringify(v)}`);
+  }
+  assert.equal(P("authorized", noDisp(piObj())), "CHARGE_DISPUTE_UNKNOWN"); assert.equal(P("captured", noDisp(capturedPi()), capI), "CHARGE_DISPUTE_UNKNOWN");
+  assert.equal(P("captured", capturedPi({}, { disputed: true }), capI), "CHARGE_DISPUTED");
+  assert.equal(piObj().latest_charge.disputed, false, "realistic fixtures carry the explicit false"); assert.equal(P("captured", capturedPi(), capI), null, "typed false control");
   assert.equal(E.sanitizeNextActionAt(Date.UTC(2026, 10, 16), Date.UTC(2026, 10, 16) - 120000), "2026-11-16T00:00:00.000Z");
   for (const v of [null, NaN, 1.5, -1, 0, Date.UTC(2026, 11, 30), Date.UTC(2026, 9, 1)]) assert.equal(E.sanitizeNextActionAt(v, Date.UTC(2026, 10, 16)), null, String(v));
 });
@@ -232,9 +242,9 @@ const fexchanges = (w) => ({
   hostaway: (req) => { w.calls.push(`H ${req.method} ${req.url.replace("https://api.hostaway.com", "")}`); return Promise.resolve({ status: 404, contentType: "application/json", bytes: enc({ status: "fail" }) }); }
 });
 const CAPTURED = {};
-const fcore = (w, co, o = {}) => E.runPipelineCore({ plan: plan(o.plan), pool: fpool(w, o), lockClientFactory: async () => fpool(w, o).lock(), runId: "unit-run-0001",
+const fcore = (w, co, o = {}) => E.runPipelineCore({ plan: plan(o.plan), pool: o.pool ?? fpool(w, o), lockClientFactory: o.lockClientFactory ?? (async () => fpool(w, o).lock()), runId: "unit-run-0001",
   tooling: { ...pureTooling, loadIntent: async () => intentAuth({ status: w.status, version: w.version, payment: { ...intentAuth().payment, capturedMinor: w.status === "confirmed" ? AMT : 0 } }),
-    runTestPipelineCoordinator: async (pool, opts) => { w.coOpts = opts; if (o.coordinatorExtra) await o.coordinatorExtra(opts); if (typeof co === "function") return co(w, opts); return co; } },
+    runTestPipelineCoordinator: async (pool, opts) => { w.coOpts = opts; if (o.coordinatorExtra) await o.coordinatorExtra(opts); if (typeof co === "function") return co(w, opts, pool); return co; } },
   exchanges: fexchanges(w), credentials: { stripe: () => "sk_test_fake", hostaway: () => "tok" }, clock: () => Date.UTC(2026, 10, 16, 2), ...(o.extra ?? {}) });
 test("H7 FAKE core: admission refusals BEFORE the lock (stored refund veto / invalid refund evidence / wrong version / open case / released claim / dispatched notify / excluded id) and start-proof refusal — zero provider calls, no coordinator", async () => {
   for (const [mk, k] of [[() => fworld({ evidence: [{ kind: "payment_intent", external_ref: PI, observed: { amountRefundedMinor: 500 } }] }), "ADMISSION_REFUSED:PAYMENT_REFUND_OBSERVED"],
@@ -276,6 +286,95 @@ test("H8 FAKE core outcome mapping: ONE coordinator call with the bound phases /
   { const w = fworld(); const r = await fcore(w, async (ww, o) => { await o.phases.capture.executors.capturePaymentIntent(PI, { amount_to_capture: AMT + 1, expand: ["latest_charge"] }, { idempotencyKey: `cap:${IID}:${PI}` }).catch(() => {});
       return { outcome: "STOP", code: "STEP_THREW_X", steps: [], writes: { create: 0, capture: 0, record: 0 } }; });
     assert.equal(w.calls.filter((x) => x.startsWith("S POST")).length, 0, "the adapter refused the off-plan capture before the fence"); assert.equal(r.sends.capture, 0); }
+});
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// C91-F1 (ROOT review 5912770410) — the reproducer: a never-settling DB await must NOT outlive the run deadline; local connect / statement bounds;
+// late clients / results never resume a stage. Timer seam: "deadline" and "db" timers are captured and fired by the test; the rest are real.
+const timers = () => {
+  const T = { deadline: [], db: [] };
+  T.timer = (fn, ms, kind) => { if (kind === "deadline" || kind === "db") { const h = { fn, kind, ms, cleared: false }; T[kind].push(h); return h; } return setTimeout(fn, ms); };
+  T.clearTimer = (h) => { if (h && typeof h === "object" && "kind" in h) h.cleared = true; else clearTimeout(h); };
+  T.live = (kind) => T[kind].filter((h) => !h.cleared);
+  T.fire = (kind) => { const h = T.live(kind).at(-1); assert.ok(h, `a live ${kind} timer`); h.cleared = true; h.fn(); };
+  return T;
+};
+const deferred = () => { let res; let rej; const p = new Promise((a, b) => { res = a; rej = b; }); return { p, res, rej }; };
+const tick = (ms = 5) => new Promise((r) => setTimeout(r, ms));
+/** a fake pool whose client query for `stallTag` (or every connect, or the lock proof) never settles until the test resolves it LATE */
+function stallPool(w, o = {}) {
+  const base = fpool(w, o); const st = { destroyed: 0, lateUsed: 0, pending: [], connects: [] };
+  const wrap = (cl) => ({ query: (sql, params) => { if (st.sealedSeen) st.lateUsed += 1;
+      if (o.stallTag && new RegExp(`e7hpl:${o.stallTag}\\*`).test(String(sql))) { const d = deferred(); st.pending.push({ d, sql, params, cl }); return d.p; }
+      return cl.query(sql, params); },
+    release: (x) => { if (x === true) st.destroyed += 1; }, on() {} });
+  st.pool = { query: () => { throw new Error("pool.query must not be used: every statement goes through a tracked client"); },
+    connect: () => { if (o.stallConnect) { const d = deferred(); st.connects.push(d); return d.p; } return base.connect().then(wrap); } };
+  st.lateClient = () => ({ query: () => { st.lateUsed += 1; return Promise.resolve({ rows: [] }); }, release: (x) => { if (x === true) st.destroyed += 1; }, on() {} });
+  return st;
+}
+const race40 = (p) => Promise.race([p, new Promise((r) => setTimeout(() => r("STILL_PENDING_AFTER_DEADLINE"), 40))]);
+test("H9 C91-F1 never-settling DB awaits: an admission query / connect / lock acquisition / lock proof that never settles is SEALED by the deadline (STOP within 40 ms, not pending), its connection destroyed; the LATE completion is discarded (a late client is destroyed, never used); zero provider calls; no coordinator", async () => {
+  for (const [label, mk] of [
+    ["admission query", (w) => ({ st: stallPool(w, { stallTag: "row" }) })],
+    ["connect", (w) => ({ st: stallPool(w, { stallConnect: true }) })],
+    ["lock acquisition", (w) => { const st = stallPool(w); const d = deferred(); st.lockD = d; return { st, lockClientFactory: () => d.p }; }],
+    ["lock proof", (w) => { const st = stallPool(w); const lk = fpool(w).lock(); const d = deferred(); st.lockProof = d;
+      return { st, lockClientFactory: async () => ({ query: (sql, p2) => (/AS n/.test(sql) && /pg_backend_pid/.test(sql) ? d.p : lk.query(sql, p2)), release: (x) => { if (x === true) st.destroyed += 1; }, on() {} }) }; }]]) {
+    const w = fworld(); const T = timers(); const m = mk(w); let coordinatorCalls = 0;
+    const core = fcore(w, () => { coordinatorCalls += 1; return {}; }, { pool: m.st.pool, lockClientFactory: m.lockClientFactory, extra: { timer: T.timer, clearTimer: T.clearTimer } });
+    await tick(20);
+    assert.equal(await race40(core), "STILL_PENDING_AFTER_DEADLINE", `${label}: genuinely stalled before the deadline`);
+    T.fire("deadline");
+    const r = await race40(core);
+    assert.notEqual(r, "STILL_PENDING_AFTER_DEADLINE", `${label}: the seal ends the run`);
+    assert.deepEqual([r.outcome, r.code, r.sealed, r.sealReason, r.coordinatorInvocations, coordinatorCalls], ["STOP", "STOP_DEADLINE", true, "DEADLINE", 0, 0], `${label}: ${JSON.stringify(r)}`);
+    assert.equal(r.possiblyEffected, false, `${label}: runner reads before the coordinator are read-only`);
+    const callsAtSeal = w.calls.length; m.st.sealedSeen = true;
+    if (label === "admission query") { assert.ok(r.clientsDestroyed >= 1 && m.st.destroyed >= 1, "the stalled connection is destroyed"); m.st.pending[0].d.res({ rows: [] }); }
+    if (label === "connect") m.st.connects[0].res(m.st.lateClient());
+    if (label === "lock acquisition") m.st.lockD.res(m.st.lateClient());
+    if (label === "lock proof") { assert.equal(r.lock, "sealed_connection_destroyed"); m.st.lockProof.res({ rows: [{ n: 1, pid: 4242 }] }); }
+    await tick(20);
+    if (label === "connect" || label === "lock acquisition") assert.equal(m.st.destroyed, 1, `${label}: the LATE client is destroyed before any use`);
+    assert.equal(m.st.lateUsed, 0, `${label}: nothing ran on a late client / after the seal`); assert.equal(w.calls.length, callsAtSeal, `${label}: no provider call after the seal`);
+    assert.equal(T.live("db").length, 0, `${label}: every local bound timer cleared`);
+  }
+});
+test("H10 C91-F1 LOCAL bounds + mid-coordinator seal: a statement / connect past its local bound SEALS (STOP_DB_STATEMENT_TIMEOUT / STOP_DB_CONNECT_TIMEOUT) and destroys the connection; a coordinator stalled on a DB statement at the deadline → STOP, UNKNOWN DB outcome ⇒ possiblyEffected, and the still-running sealed coordinator can reach NO DB / provider (its calls refuse, late result discarded)", async () => {
+  { const w = fworld(); const T = timers(); const st = stallPool(w, { stallTag: "attempts" });
+    const core = fcore(w, {}, { pool: st.pool, extra: { timer: T.timer, clearTimer: T.clearTimer } }); await tick(20);
+    const h = T.live("db").find((x) => x.ms === C.budgets.statementMs); assert.ok(h, "the stalled statement carries the local statement bound"); h.cleared = true; h.fn();
+    const r = await race40(core);
+    assert.deepEqual([r.outcome, r.code, r.sealed, w.calls.length, st.destroyed >= 1], ["STOP", "STOP_DB_STATEMENT_TIMEOUT", true, 0, true], JSON.stringify(r)); }
+  { const w = fworld(); const T = timers(); const st = stallPool(w, { stallConnect: true });
+    const core = fcore(w, {}, { pool: st.pool, extra: { timer: T.timer, clearTimer: T.clearTimer } }); await tick(20);
+    const h = T.live("db").find((x) => x.ms === C.budgets.connectMs); assert.ok(h, "acquisition carries the local connect bound"); h.cleared = true; h.fn();
+    const r = await race40(core); assert.deepEqual([r.outcome, r.code, w.calls.length], ["STOP", "STOP_DB_CONNECT_TIMEOUT", 0], JSON.stringify(r));
+    st.connects[0].res(st.lateClient()); await tick(10); assert.deepEqual([st.destroyed, st.lateUsed], [1, 0], "late client destroyed, never used"); }
+  { const w = fworld(); const T = timers(); const st = stallPool(w, { stallTag: "stall" }); const after = {}; const settled = deferred();
+    const core = fcore(w, async (ww, o, pool) => {
+      let threw = null;
+      try { await pool.query("/*e7hpl:stall*/ SELECT 1"); } catch (e) { threw = e; }                // a DB statement in flight when the deadline seals
+      try { await pool.query("/*e7hpl:instance*/ SELECT environment FROM booking.instance"); after.query = "RAN"; } catch { after.query = "REFUSED"; }
+      try { await o.phases.capture.executors.retrieveAccount({}); after.executor = "RAN"; } catch { after.executor = "REFUSED"; }
+      try { await o.hooks.afterStep({ phase: "reservation", stateBefore: "payment_authorized", stateAfter: "reservation_confirmed" }); after.hook = "RAN"; } catch { after.hook = "REFUSED"; }
+      after.threw = threw ? threw.code ?? "ERR" : null; settled.res();
+      return { outcome: "CONFIRMED", code: "CONFIRMED", steps: [], writes: { create: 1, capture: 0, record: 0 } };   // a late "CONFIRMED" must never be success
+    }, { pool: st.pool, extra: { timer: T.timer, clearTimer: T.clearTimer } });
+    for (let i = 0; i < 50 && st.pending.length === 0; i++) await tick(5);
+    assert.equal(st.pending.length, 1, "the coordinator holds ONE statement in flight");
+    const callsBefore = w.calls.length;
+    T.fire("deadline");
+    const r = await race40(core);
+    assert.notEqual(r, "STILL_PENDING_AFTER_DEADLINE");
+    assert.deepEqual([r.outcome, r.code, r.sealed, r.dbInFlightAtSeal, r.dbOutcomeUnknown, r.possiblyEffected, r.verifiedCompletion, r.coordinatorInvocations],
+      ["STOP", "STOP_DEADLINE", true, 1, true, true, false, 1], JSON.stringify(r));
+    assert.ok(st.destroyed >= 1, "the coordinator's in-flight connection is destroyed");
+    await settled.p; st.pending[0].d.res({ rows: [{ x: 1 }] }); await tick(10);
+    assert.deepEqual(after, { query: "REFUSED", executor: "REFUSED", hook: "REFUSED", threw: "RUNNER_STOPPED" }, "the sealed coordinator reaches nothing");
+    assert.equal(w.calls.length, callsBefore, "no provider call after the seal"); assert.equal(r.coordinatorSettled, true);
+  }
 });
 
 // ---------------------------------------------------------------------------------------------------------------------------------
@@ -338,13 +437,14 @@ if (process.env.E7_HPL_DB_TESTS === "1") {
   /** fake provider world on the WIRE (requests arrive through the REAL adapters → REAL transports → the runner fence) */
   function pgWorld(bk, o = {}) {
     const w = { calls: [], res: new Map(), charges: [], nextRes: 74000000 + lane * 10, nextCharge: 8800000 + lane * 10, captured: false, refundedAfterCapture: false, piStatus: "requires_capture",
-      creates: 0, captures: 0, records: 0, echoCreate: o.echoCreate ?? true };
+      creates: 0, captures: 0, records: 0, echoCreate: o.echoCreate ?? true, disputed: false, disputeAbsent: o.disputeAbsent === true };
     const reply = (status, x) => Promise.resolve({ status, contentType: "application/json", bytes: enc(x) });
     w.pi = () => ({ object: "payment_intent", id: bk.piId, livemode: false, status: w.captured ? "succeeded" : w.piStatus, capture_method: "manual", amount: o.piAmount ?? bk.total,
       amount_received: w.captured ? bk.total : 0, amount_capturable: !w.captured && w.piStatus === "requires_capture" ? bk.total : 0, currency: "usd",
       metadata: { mv_intent_id: bk.id, mv_payment_attempt_id: bk.attemptId },
       latest_charge: { object: "charge", id: `ch_test_hpl${lane}`, payment_intent: bk.piId, status: "succeeded", paid: true, captured: w.captured, amount: bk.total,
-        amount_captured: w.captured ? bk.total : 0, amount_refunded: w.refundedAfterCapture ? bk.total : 0, refunded: w.refundedAfterCapture, currency: "usd", livemode: false,
+        amount_captured: w.captured ? bk.total : 0, amount_refunded: w.refundedAfterCapture ? bk.total : 0, refunded: w.refundedAfterCapture,
+        ...(w.disputeAbsent ? {} : { disputed: w.disputed }), currency: "usd", livemode: false,
         payment_method_details: { card: { capture_before: bk.captureBefore / 1000 } } } });
     const full = (r, withRef = true) => ({ id: r.id, listingMapId: LIST, channelId: 2000, arrivalDate: bk.stay.from, departureDate: bk.stay.to, totalPrice: bk.total / 100, currency: "USD",
       status: "new", ...(withRef ? { customFieldValues: [{ customFieldId: C.refFieldId, value: bk.ref }] } : {}) });
@@ -358,6 +458,10 @@ if (process.env.E7_HPL_DB_TESTS === "1") {
         if (o.afterCapture) await o.afterCapture(w);
         if (o.captureLost) return Promise.reject(new Error("socket reset"));
         return reply(200, w.pi());
+      }
+      if (o.disputeOnceCapturedDurably !== undefined && w.captured && w.disputed === false) {
+        const st = (await db.owner.query("SELECT state FROM booking.intents WHERE id = $1", [bk.id])).rows[0].state;
+        if (st === "payment_captured") w.disputed = o.disputeOnceCapturedDurably;          // a malformed dispute field observed only AFTER the capture step committed
       }
       if (o.refundOnceCapturedDurably && w.captured && !w.refundedAfterCapture) {
         const st = (await db.owner.query("SELECT state FROM booking.intents WHERE id = $1", [bk.id])).rows[0].state;
@@ -517,9 +621,48 @@ if (process.env.E7_HPL_DB_TESTS === "1") {
 
   test("P9 PG durable-success postcheck failure: the coordinator reports CONFIRMED but the durable readback disagrees (offline_charge_id not linked) → STOP POSTCHECK_MISMATCH, verifiedCompletion false, possiblyEffected true (writes happened; no repair, no repeat)", async () => {
     const bk = await authorizedBooking(); const w = pgWorld(bk);
-    const pool = { query: async (sql, params) => { const res = await db.app.query(sql, params); if (/e7hpl:row/.test(String(sql)) && res.rows[0] && res.rows[0].state === "confirmed") return { ...res, rows: [{ ...res.rows[0], och: "999" }] }; return res; },
-      connect: () => db.app.connect() };
+    const tamper = (res, sql) => (/e7hpl:row/.test(String(sql)) && res.rows[0] && res.rows[0].state === "confirmed" ? { ...res, rows: [{ ...res.rows[0], och: "999" }] } : res);
+    // C91: the runner routes EVERY statement through a tracked client (pool.connect), so the tamper sits on the client
+    const pool = { query: async (sql, params) => tamper(await db.app.query(sql, params), sql),
+      connect: async () => { const cl = await db.app.connect(); return { query: async (sql, params) => tamper(await cl.query(sql, params), sql), release: (x) => cl.release(x), on: (...a) => cl.on(...a), removeListener: (...a) => cl.removeListener(...a) }; } };
     const r = await pgRun(bk, w, { pool });
     assert.deepEqual([r.outcome, r.code, r.verifiedCompletion, r.possiblyEffected, r.coordinator.outcome, r.sends], ["STOP", "POSTCHECK_MISMATCH:OFFLINE_CHARGE_NOT_LINKED", false, true, "CONFIRMED", { create: 1, capture: 1, record: 1 }], JSON.stringify(r));
+  });
+  test("P10 PG C91-F1 mid-run seal (REAL coordinator + workers): a worker statement after the ONE create is held in flight when the deadline fires → STOP STOP_DEADLINE within 40 ms, UNKNOWN DB outcome ⇒ possiblyEffected; its connection (and the lock session) destroyed; the LATE result is discarded — no capture / record send ever; a later dispatch refuses with zero writes", async () => {
+    const bk = await authorizedBooking(); const w = pgWorld(bk); const T = timers(); const held = []; let destroyedReal = 0;
+    const pool = { query: () => { throw new Error("every statement must go through a tracked client"); },
+      connect: async () => { const cl = await db.app.connect(); return {
+        query: (sql, params) => { const qp = cl.query(sql, params);
+          if (w.creates === 1 && held.length === 0 && !/e7hpl:/.test(String(sql))) { const d = deferred(); held.push({ d, qp }); qp.then((v) => held[0].v = v, (e) => held[0].e = e); return d.p; }
+          return qp; },
+        release: (x) => { if (x === true) destroyedReal += 1; cl.release(x); }, on: (...a) => cl.on(...a), removeListener: (...a) => cl.removeListener(...a) }; } };
+    const lockClientFactory = async () => { const cl = await db.app.connect(); return { query: (a, b) => cl.query(a, b), release: (x) => { if (x === true) destroyedReal += 1; cl.release(x); }, on: (...a) => cl.on(...a) }; };
+    const core = pgRun(bk, w, { pool, lockClientFactory, timer: T.timer, clearTimer: T.clearTimer });
+    for (let i = 0; i < 400 && held.length === 0; i++) await tick(10);
+    assert.equal(held.length, 1, "a worker statement is in flight after the create"); assert.equal(w.creates, 1);
+    T.fire("deadline");
+    const r = await race40(core);
+    assert.notEqual(r, "STILL_PENDING_AFTER_DEADLINE", "the seal ends the run even though the statement never returned");
+    assert.deepEqual([r.outcome, r.code, r.sealed, r.dbOutcomeUnknown, r.possiblyEffected, r.verifiedCompletion, r.sends], ["STOP", "STOP_DEADLINE", true, true, true, false, { create: 1, capture: 0, record: 0 }], JSON.stringify(r));
+    assert.ok(destroyedReal >= 2, "the in-flight worker connection and the lock session are destroyed");
+    held[0].d.res({ rows: [], rowCount: 0 }); await tick(300);
+    assert.deepEqual([w.captures, w.records, writesOf(w).length], [0, 0, 1], "the late result resumes nothing");
+    for (let i = 0; i < 50; i++) { if ((await snap(bk.id)).locks === 0) break; await tick(20); }
+    assert.equal((await snap(bk.id)).locks, 0, "the destroyed lock session released the advisory lock");
+    const w2 = pgWorld(bk); const r2 = await pgRun(bk, w2);
+    assert.equal(r2.outcome, "STOP"); assert.equal(writesOf(w2).length, 0, JSON.stringify(r2));
+  });
+
+  test("P11 PG contract + C91-F2 no-write regressions (REAL coordinator): the wrapper's boundary proofs DEPEND on the awaited afterStep throw→STOP seam — a failed boundary hook blocks the NEXT worker and its write: dispute unknown at start → zero sends; malformed dispute after the create → no capture step, capture 0; malformed dispute after the capture committed → no recording step, record 0", async () => {
+    { const bk = await authorizedBooking(); const w = pgWorld(bk, { disputeAbsent: true }); const r = await pgRun(bk, w);
+      assert.deepEqual([r.code, writesOf(w).length, r.coordinatorInvocations], ["PROVIDER_PROOF_FAILED:CHARGE_DISPUTE_UNKNOWN", 0, 0]); }
+    { const bk = await authorizedBooking(); const w = pgWorld(bk, { afterCreate: (ww) => { ww.disputed = "true"; } }); const r = await pgRun(bk, w);
+      assert.deepEqual([r.outcome, r.coordinator.outcome, r.coordinator.code], ["STOP", "STOP", "STEP_THREW_FRESH_PROOF_CHARGE_DISPUTE_UNKNOWN"], JSON.stringify(r));
+      assert.ok(r.coordinator.steps.every((x) => x.phase === "reservation"), "no capture worker step after the failed hook");
+      assert.deepEqual([r.sends.capture, r.coordinator.writes.capture, w.captures], [0, 0, 0]); assert.equal((await snap(bk.id)).st.state, "reservation_confirmed"); }
+    { const bk = await authorizedBooking(); const w = pgWorld(bk, { disputeOnceCapturedDurably: null }); const r = await pgRun(bk, w);
+      assert.deepEqual([r.outcome, r.coordinator.code], ["STOP", "STEP_THREW_FRESH_PROOF_CHARGE_DISPUTE_UNKNOWN"], JSON.stringify(r));
+      assert.ok(!r.coordinator.steps.some((x) => x.phase === "recording"), "no recording worker step after the failed hook");
+      assert.deepEqual([r.sends.capture, r.sends.record, r.coordinator.writes.record, w.records], [1, 0, 0, 0]); assert.equal((await snap(bk.id)).st.state, "payment_captured"); }
   });
 }
