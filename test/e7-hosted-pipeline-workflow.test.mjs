@@ -70,7 +70,7 @@ test("W3 static: execute job needs preflight AND mode == 'execute' && main AND e
   assert.match(jobs.execute, /^\n  execute:\n    needs: preflight\n    if: inputs\.mode == 'execute' && github\.ref == 'refs\/heads\/main'\n    runs-on: ubuntu-24\.04\n    environment: e7-readonly-probe\n    timeout-minutes: 20\n/);
   assert.equal(count(/environment: /g), 1);
   assert.deepEqual(steps(jobs.execute).map((s) => s.split(" (")[0]), ["Checkout wrapper", "Checkout merged E7 tooling", "Set up Node 22.22.0", "Re-check bindings BEFORE any secret",
-    "Verify", "Install the pinned dependency from the verified lockfile", "Fetch the public Supabase CA", "ONE bounded TEST pipeline coordinator invocation"]);
+    "Verify", "Install the pinned dependency from the verified lockfile", "Fetch the public Supabase CA", "ONE gated TEST pipeline run"]);
   assert.match(jobs.execute, /working-directory: tooling\n        run: npm ci --ignore-scripts --omit=dev --no-audit --no-fund\n/);
   assert.equal(count(/curl --fail --silent --show-error --proto '=https' --max-time 20 -o "\$RUNNER_TEMP\/prod-ca-2021\.crt" https:\/\/supabase-downloads\.s3-ap-southeast-1\.amazonaws\.com\/prod\/ssl\/prod-ca-2021\.crt\n/g), 1);
   assert.deepEqual(steps(jobs.preflight).map((s) => s.split(" (")[0]), ["Checkout wrapper", "Checkout merged E7 tooling", "Set up Node 22.22.0", "Verify checkout bindings", "Preflight", "Source digest"]);
@@ -80,7 +80,7 @@ test("W4 static: the ONLY secrets (existing NAMES E7_STRIPE_TEST_KEY, E7_HOSTAWA
   assert.equal(count(/secrets\./g), 3);
   for (const k of ["E7_STRIPE_TEST_KEY", "E7_HOSTAWAY_TOKEN", "E7_DEV_BOOKING_DATABASE_URL"]) assert.equal(count(new RegExp(`\\$\\{\\{ secrets\\.${k} \\}\\}`, "g")), 1, k);
   const last = yml.slice(yml.lastIndexOf("      - name: "));
-  assert.match(last, /^      - name: ONE bounded TEST pipeline coordinator invocation[^\n]*\n        env:\n(?:          [A-Z0-9_]+: [^\n]+\n)+        run: node wrapper\/scripts\/e7-hosted-pipeline\.mjs execute\n$/);
+  assert.match(last, /^      - name: ONE gated TEST pipeline run[^\n]*\n        env:\n(?:          [A-Z0-9_]+: [^\n]+\n)+        run: node wrapper\/scripts\/e7-hosted-pipeline\.mjs execute\n$/);
   assert.match(last, /          E7_STRIPE_TEST_KEY: \$\{\{ secrets\.E7_STRIPE_TEST_KEY \}\}\n          E7_HOSTAWAY_TOKEN: \$\{\{ secrets\.E7_HOSTAWAY_TOKEN \}\}\n          E7_DEV_BOOKING_DATABASE_URL: \$\{\{ secrets\.E7_DEV_BOOKING_DATABASE_URL \}\}\n        run:/);
   assert.equal(count(/e7-hosted-pipeline\.mjs execute\n/g), 1); assert.equal(count(/e7-hosted-pipeline\.mjs verify\n/g), 1); assert.equal(count(/e7-hosted-pipeline\.mjs preflight\n/g), 1);
   assert.doesNotMatch(yml, /E7_RESEND|RESEND|api\.stripe\.com|api\.hostaway\.com|E7_RECIPIENT|E7_SENDER|E7_HPL_DB_TESTS/);

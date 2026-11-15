@@ -63,8 +63,10 @@ test("H1 pins: tooling 71c3dcf8 (contains the accepted C88 coordinator), MERGED,
 });
 
 test("H2 exclusions: the reviewed C82 protected intent set (abede8b1 / c83c1842 / C77 target 954d476c), the historical floor after the C82 END detail, protected reservations, the 28 migrated + never-public + pilot listings refused and disjoint from 606998", () => {
-  assert.deepEqual([...C.excludedIntentIds], ["abede8b1-8ef6-44f2-876e-6a02fc056a96", "c83c1842-d342-4e27-9ab7-dc3d50b7a309", "954d476c-71ea-4824-92f6-2220ae302103"]);
-  assert.ok(Date.parse(C.historicalFloor) > Date.parse("2026-11-15T18:25:03.568Z"));
+  // C100: + the C94 / C95 target 669da884; the floor moves after the C97 final snapshot / the C96 END read
+  assert.deepEqual([...C.excludedIntentIds], ["abede8b1-8ef6-44f2-876e-6a02fc056a96", "c83c1842-d342-4e27-9ab7-dc3d50b7a309", "954d476c-71ea-4824-92f6-2220ae302103",
+    "669da884-02e8-4105-8825-f908e5d22ae9"]);
+  assert.ok(Date.parse(C.historicalFloor) > Date.parse("2026-11-15T21:18:30.000Z"));
   assert.deepEqual([...C.protectedReservationIds], ["70636076", "71045356", "71072615", "71081885"]);
   assert.equal(C.excludedListingIds.length, 32); assert.ok(!C.excludedListingIds.includes(606998));
   for (const id of [628346, 628372, 628400, 628381, 628387, 603564, 603566]) assert.ok(C.excludedListingIds.includes(id), String(id));
@@ -221,6 +223,7 @@ function fpool(w, o = {}) {
       case "cases": return { rows: [{ n: w.cases }] };
       case "claims": return { rows: w.claims };
       case "evidence": return { rows: w.evidence };
+      case "work": return { rows: w.work ?? [{ next_action_at: null, work_worker_id: null, work_lease_until: null }] };
       case "guest": return { rows: [{ first_name: "Fake", last_name: "Guest", email: "fake.guest@example.test" }] };
       case "role": return { rows: [{ is_app: true, privileged: false }] };
       case "identity": return { rows: [{ db: "fake", environment: "test" }] };
@@ -243,7 +246,7 @@ const fexchanges = (w) => ({
 });
 const CAPTURED = {};
 const fcore = (w, co, o = {}) => E.runPipelineCore({ plan: plan(o.plan), pool: o.pool ?? fpool(w, o), lockClientFactory: o.lockClientFactory ?? (async () => fpool(w, o).lock()), runId: "unit-run-0001",
-  tooling: { ...pureTooling, loadIntent: async () => intentAuth({ status: w.status, version: w.version, payment: { ...intentAuth().payment, capturedMinor: w.status === "confirmed" ? AMT : 0 } }),
+  tooling: { ...pureTooling, loadIntent: async () => intentAuth({ status: w.status, version: w.version, lease: w.lease ?? null, payment: { ...intentAuth().payment, capturedMinor: w.status === "confirmed" ? AMT : 0 } }),
     runTestPipelineCoordinator: async (pool, opts) => { w.coOpts = opts; if (o.coordinatorExtra) await o.coordinatorExtra(opts); if (typeof co === "function") return co(w, opts, pool); return co; } },
   exchanges: fexchanges(w), credentials: { stripe: () => "sk_test_fake", hostaway: () => "tok" }, clock: () => Date.UTC(2026, 10, 16, 2), ...(o.extra ?? {}) });
 test("H7 FAKE core: admission refusals BEFORE the lock (stored refund veto / invalid refund evidence / wrong version / open case / released claim / dispatched notify / excluded id) and start-proof refusal — zero provider calls, no coordinator", async () => {
@@ -378,6 +381,129 @@ test("H10 C91-F1 LOCAL bounds + mid-coordinator seal: a statement / connect past
 });
 
 // ---------------------------------------------------------------------------------------------------------------------------------
+// C100: the ONE bounded continuation of the healthy PENDING NOT_DUE branch (FAKE core: scripted coordinator, tagged-SELECT DB, fake clock / wait)
+const T_BASE = Date.UTC(2026, 10, 16, 2);
+/** a healthy first-invocation PENDING NOT_DUE world: reservation_pending, ONE settled succeeded create, no capture / record row, due in 120 s */
+function pworld(o = {}) {
+  const w = fworld(); w.status = "reservation_pending"; w.version = 6;
+  w.ops = [opRow("hostaway.create_reservation", { result_ref: "71999901" })];
+  w.due = T_BASE + (o.dueInMs ?? 120000);
+  w.work = [{ next_action_at: new Date(w.due), work_worker_id: null, work_lease_until: null }];
+  return w;
+}
+/** clock + timer seam: "wait" timers ADVANCE the fake clock by their ms (unless frozen) and fire; deadline / db timers are captured; others real */
+function ptimers(clk, o = {}) {
+  const T = timers(); const base = T.timer;
+  T.waits = [];
+  T.timer = (fn, ms, kind) => {
+    if (kind === "wait") { const h = { fn, kind, ms, cleared: false }; T.waits.push(h); if (!o.holdWait) setImmediate(() => { if (!h.cleared) { if (!o.freezeClock) clk.t += ms; h.cleared = true; fn(); } }); return h; }
+    return base(fn, ms, kind);
+  };
+  return T;
+}
+const pending1 = (w) => ({ outcome: "PENDING", code: "NOT_DUE", steps: [{ phase: "reservation", status: "worked", stateBefore: "payment_authorized", stateAfter: "reservation_pending" }],
+  writes: { create: 1, capture: 0, record: 0 }, nextActionAt: w.due });
+/** run the fake core with a scripted coordinator `script[i](w, opts, pool)` per invocation */
+function pcore(w, script, o = {}) {
+  const clk = { t: T_BASE }; const T = ptimers(clk, o); let calls = 0;
+  const run = fcore(w, async (ww, opts, pool) => { const f = script[calls] ?? (() => { throw new Error("third invocation"); }); calls += 1; return f(ww, opts, pool); },
+    { plan: { expectedVersion: 6 }, extra: { clock: () => clk.t, timer: T.timer, clearTimer: T.clearTimer, ...(o.extra ?? {}) }, ...(o.core ?? {}) });
+  return { run, clk, T, calls: () => calls };
+}
+test("H11 C100 eligibility: ONLY a healthy PENDING NOT_DUE (reservation_pending + ONE settled create, no capture / record, due ≤ 150 s, reserve, no foreign live lease, no unknown) waits; every other first result returns the existing PENDING / STOP with ONE invocation and NO wait", async () => {
+  const cases = [
+    ["code DEADLINE_RESERVE", (w) => {}, (w) => ({ ...pending1(w), code: "DEADLINE_RESERVE" }), "NOT_PENDING_NOT_DUE"],
+    ["state reservation_confirmed", (w) => { w.status = "reservation_confirmed"; }, pending1, "STATE_NOT_RESERVATION_PENDING"],
+    ["create not settled", (w) => { w.ops[0] = opRow("hostaway.create_reservation", { state: "pending", attempts: 0, dispatched: false, result_ref: null }); }, pending1, "CREATE_NOT_SINGLE_SETTLED"],
+    ["create late-result conflict", (w) => { w.ops[0] = opRow("hostaway.create_reservation", { result_ref: "71999901", late_result_ref: "71999902" }); }, pending1, null],
+    ["capture attempted", (w) => { w.ops.push(opRow("stripe.capture_payment_intent", { state: "failed_definite", payload_pi: PI, payload_amount: AMT, payload_key: `cap:${IID}:${PI}` })); }, pending1, "WRITE_ROW_NOT_PRISTINE"],
+    ["due beyond 150 s", (w) => { w.due = T_BASE + 150001; w.work[0].next_action_at = new Date(w.due); }, pending1, "DUE_OUT_OF_RANGE"],
+    ["due not bound", (w) => {}, (w) => ({ ...pending1(w), nextActionAt: w.due + 1000 }), "DUE_NOT_BOUND"],
+    ["no work row", (w) => { w.work = []; }, pending1, "WORK_ROW_MISSING"],
+    ["foreign live work lease", (w) => { w.work[0].work_worker_id = "someone-else:res"; w.work[0].work_lease_until = new Date(T_BASE + 60000); }, pending1, "LIVE_FOREIGN_WORK_LEASE"],
+    ["foreign live intent lease", (w) => { w.lease = { workerId: "other-worker:res", until: T_BASE + 60000 }; }, pending1, "LIVE_FOREIGN_INTENT_LEASE"],
+    ["own lease outliving due", (w) => { w.lease = { workerId: "e7-hpl:SYNTHETIC-hpl-unit:res", until: w.due + 1 }; }, pending1, "LIVE_FOREIGN_INTENT_LEASE"],
+  ];
+  for (const [label, mut, co1, reason] of cases) {
+    const w = pworld();
+    const p = pcore(w, [(ww) => { mut(ww); return co1(ww); }]); const r = await p.run;                // the facts the FIRST invocation leaves behind
+    assert.equal(p.calls(), 1, `${label}: ONE invocation`); assert.equal(r.waits, 0, `${label}: no wait`); assert.equal(p.T.waits.length, 0, label);
+    if (reason) { assert.equal(r.outcome, "PENDING", `${label}: ${JSON.stringify(r)}`); assert.deepEqual([r.continuation.eligible, r.continuation.reason], [false, reason], label); }
+    else { assert.ok(r.outcome === "PENDING" || r.outcome === "STOP", label); assert.ok(!r.continuation || r.continuation.eligible === false, label); }
+  }
+  { const w = pworld(); const p = pcore(w, [(ww) => { ww.cases = 1; return pending1(ww); }]); const r = await p.run;
+    assert.deepEqual([r.outcome, r.code, p.calls(), r.waits], ["STOP", "PENDING_FACTS_OPEN_CASE", 1, 0], "open case: never waits"); }
+  { const w = pworld(); let late = false;                                                            // the first invocation used most of the whole-run budget
+    const p = pcore(w, [(ww) => { late = true; return pending1(ww); }], { extra: { now: () => (late ? T_BASE + C.budgets.runMs - C.budgets.teardownMs - 100000 : T_BASE) } });
+    const r = await p.run; assert.deepEqual([r.outcome, r.continuation && r.continuation.reason, r.waits, p.calls()], ["PENDING", "NO_RUN_RESERVE", 0, 1], JSON.stringify(r)); }
+});
+test("H12 C100 continuation: healthy PENDING NOT_DUE → ONE bounded wait (fake clock, no real sleep) → fresh re-admission (own lock, same version / create / due, refund veto, FRESH Stripe proof, recovery executors bound to the durable rid) → second invocation; a second PENDING exits PENDING (no third invocation / wait); counters / results reported per invocation + cumulative", async () => {
+  const w = pworld();
+  const p = pcore(w, [pending1, async (ww, o) => {
+    assert.equal(typeof o.phases.reservation.executors.createReservation, "function");
+    const c2 = await o.phases.reservation.executors.createReservation({ method: "POST", path: "/v1/reservations", query: {}, body: {} }).then(() => "SENT", (e) => "REFUSED");
+    assert.equal(c2, "REFUSED", "the continuation's reservation executors never create (recovery factory + cumulative fence)");
+    return { outcome: "PENDING", code: "NOT_DUE", steps: [{ phase: "reservation", status: "worked", stateBefore: "reservation_pending", stateAfter: "reservation_pending" }], writes: { create: 0, capture: 0, record: 0 }, nextActionAt: ww.due + 120000 };
+  }]);
+  const piReadsBefore = 0; void piReadsBefore;
+  const r = await p.run;
+  assert.deepEqual([r.outcome, r.code, p.calls(), r.coordinatorInvocations, r.waits], ["PENDING", "PENDING:NOT_DUE", 2, 2, 1], JSON.stringify(r));
+  assert.deepEqual([r.continuation.eligible, r.continuation.reason, r.continuation.readmission, r.continuation.waitMs, r.waitedMs], [true, null, "OK", 120000, 120000]);
+  assert.equal(r.continuationVersion, 6); assert.deepEqual(r.invocations.map((x) => [x.label, x.outcome, x.writes.create]), [["FIRST", "PENDING", 1], ["CONTINUATION", "PENDING", 0]]);
+  assert.deepEqual(r.proofs, ["STRIPE_AT_START", "STRIPE_AT_CONTINUATION"], "a FRESH Stripe proof at the re-admission (not the cached start proof)");
+  assert.equal(w.calls.filter((x) => x.includes("/v1/payment_intents/")).length, 2, "two PI reads: start + continuation");
+  assert.equal(r.nextActionAt, new Date(w.due + 120000).toISOString(), "the second PENDING reports its own sanitized nextActionAt");
+  assert.equal(writesOfFake(w), 0, "no provider write reached the fake exchange");
+  // the plan explicitly binds the continuation contract
+  const pl = plan(); assert.deepEqual(pl.continuation, { maxCoordinatorInvocations: 2, maxWaits: 1, maxWaitMs: 150000,
+    branch: "PENDING:NOT_DUE+reservation_pending+one_settled_create+no_capture_record", readmission: "fresh_durable_facts+same_version+refund_veto+fresh_stripe_proof" });
+  assert.deepEqual([C.budgets.coordinatorInvocations, C.budgets.maxWaits, C.budgets.maxWaitMs, C.budgets.runMs], [2, 1, 150000, 12 * 60 * 1000]);
+});
+const writesOfFake = (w) => w.calls.filter((x) => /^(S POST|H POST)/.test(x)).length;
+test("H13 C100 re-admission drift / error → STOP CONTINUATION_REFUSED (never a second invocation): version / create identity / rid / next action / early due / live lease / refund evidence / fresh PI mismatch / dispute unknown", async () => {
+  for (const [label, during, want] of [
+    ["version", (w) => { w.version = 7; }, "STATE_OR_VERSION_DRIFT"], ["state", (w) => { w.status = "reservation_confirmed"; }, "STATE_OR_VERSION_DRIFT"],
+    ["create identity", (w) => { w.ops[0] = opRow("hostaway.create_reservation", { result_ref: "71999901", attempts: 2 }); }, "OPS_DRIFT"],
+    ["rid", (w) => { w.ops[0] = opRow("hostaway.create_reservation", { result_ref: "71999909" }); }, null],
+    ["new write row", (w) => { w.ops.push(opRow("stripe.capture_payment_intent", { state: "pending", attempts: 0, dispatched: false, payload_pi: PI, payload_amount: AMT, payload_key: `cap:${IID}:${PI}` })); }, "OPS_DRIFT"],
+    ["next action", (w) => { w.work[0].next_action_at = new Date(w.due + 5000); }, "NEXT_ACTION_DRIFT"],
+    ["live work lease", (w) => { w.work[0].work_lease_until = new Date(w.due + 60000); w.work[0].work_worker_id = "x"; }, "WORK_LEASE_LIVE"],
+    ["refund evidence", (w) => { w.evidence = [{ kind: "payment_intent", external_ref: PI, observed: { amountRefundedMinor: 1 } }]; }, "PAYMENT_REFUND_OBSERVED"],
+    ["fresh PI mismatch", (w) => { w.pi = piObj({ amount: AMT + 1 }); }, "FRESH_PROOF_PAYMENT_INTENT_IDENTITY"],
+    ["fresh PI canceled", (w) => { w.pi = piObj({ status: "canceled" }); }, "FRESH_PROOF_NOT_REQUIRES_CAPTURE"],
+    ["dispute unknown", (w) => { w.pi = piObj({}, { disputed: null }); }, "FRESH_PROOF_CHARGE_DISPUTE_UNKNOWN"]]) {
+    const w = pworld(); let second = 0;
+    const p = pcore(w, [async (ww) => { const x = pending1(ww); setImmediate(() => during(ww)); return x; }, () => { second += 1; return {}; }]);
+    // mutate AFTER the first readback (eligibility) but BEFORE the re-admission: run the mutation inside the wait
+    const r = await p.run;
+    assert.equal(second, 0, `${label}: no second invocation`); assert.equal(r.outcome, "STOP", `${label}: ${JSON.stringify(r)}`);
+    if (want) assert.equal(r.code, `CONTINUATION_REFUSED:${want}`, label); else assert.match(r.code, /^CONTINUATION_REFUSED:/, label);
+    assert.equal(writesOfFake(w), 0, label);
+  }
+  { const w = pworld(); const p = pcore(w, [pending1, () => { throw new Error("must not run"); }], { freezeClock: true }); const r = await p.run;
+    assert.deepEqual([r.outcome, r.code, p.calls()], ["STOP", "CONTINUATION_REFUSED:NOT_DUE_AFTER_WAIT", 1], "a wait that ended before the due time never resumes"); }
+});
+test("H14 C100 the wait is inside the ONE seal: deadline / abort / lock-session error during the wait → STOP within 40 ms, the connection(s) destroyed, NO further DB / provider activity, no second invocation; a late wait completion is discarded", async () => {
+  for (const kind of ["deadline", "abort", "lockError"]) {
+    const w = pworld(); const ac = new AbortController(); let lockErr = null; let dbAfter = 0; let sealedAt = null;
+    const lockFactory = async () => { const lk = fpool(w).lock(); return { query: (a, b) => { if (sealedAt !== null) dbAfter += 1; return lk.query(a, b); }, release: lk.release, on: (ev, fn) => { if (ev === "error") lockErr = fn; } }; };
+    const basePool = fpool(w); const pool = { query: basePool.query, connect: async () => { const cl = await basePool.connect(); return { ...cl, query: (a, b) => { if (sealedAt !== null) dbAfter += 1; return cl.query(a, b); } }; } };
+    const p = pcore(w, [pending1, () => { throw new Error("no second invocation"); }], { holdWait: true, core: { pool, lockClientFactory: lockFactory }, extra: { runSignal: ac.signal } });
+    for (let i = 0; i < 100 && p.T.waits.length === 0; i++) await tick(2);
+    assert.equal(p.T.waits.length, 1, `${kind}: waiting`);
+    const callsAtSeal = w.calls.length; sealedAt = Date.now();
+    if (kind === "deadline") p.T.fire("deadline"); else if (kind === "abort") ac.abort(); else lockErr(new Error("terminated"));
+    const r = await race40(p.run);
+    assert.notEqual(r, "STILL_PENDING_AFTER_DEADLINE", kind);
+    assert.deepEqual([r.outcome, r.sealed, r.waits, p.calls()], ["STOP", true, 1, 1], `${kind}: ${JSON.stringify(r)}`);
+    assert.match(r.code, kind === "deadline" ? /STOP_DEADLINE/ : kind === "abort" ? /STOP_ABORTED/ : /STOP_LOCK_SESSION_ERROR/, kind);
+    p.T.waits[0].fn(); await tick(20);                                                                 // the LATE wait completion
+    assert.equal(w.calls.length, callsAtSeal, `${kind}: no provider call after the seal`); assert.equal(dbAfter, 0, `${kind}: no DB statement after the seal`);
+    assert.equal(p.calls(), 1, `${kind}: the late completion resumes nothing`);
+  }
+});
+
+// ---------------------------------------------------------------------------------------------------------------------------------
 // OPT-IN INTEGRATION (E7_HPL_DB_TESTS=1; tooling with its pinned pg; PG_BIN): the REAL merged coordinator + workers + repo + operations + transports +
 // executor adapters on a disposable PostgreSQL. FAKE exchanges ONLY; fixtures through the accepted APIs. The hosted preflight child never sets it.
 if (process.env.E7_HPL_DB_TESTS === "1") {
@@ -437,7 +563,7 @@ if (process.env.E7_HPL_DB_TESTS === "1") {
   /** fake provider world on the WIRE (requests arrive through the REAL adapters → REAL transports → the runner fence) */
   function pgWorld(bk, o = {}) {
     const w = { calls: [], res: new Map(), charges: [], nextRes: 74000000 + lane * 10, nextCharge: 8800000 + lane * 10, captured: false, refundedAfterCapture: false, piStatus: "requires_capture",
-      creates: 0, captures: 0, records: 0, echoCreate: o.echoCreate ?? true, disputed: false, disputeAbsent: o.disputeAbsent === true };
+      creates: 0, captures: 0, records: 0, echoCreate: o.echoCreate ?? true, echoGet: o.echoGet ?? true, disputed: false, disputeAbsent: o.disputeAbsent === true };
     const reply = (status, x) => Promise.resolve({ status, contentType: "application/json", bytes: enc(x) });
     w.pi = () => ({ object: "payment_intent", id: bk.piId, livemode: false, status: w.captured ? "succeeded" : w.piStatus, capture_method: "manual", amount: o.piAmount ?? bk.total,
       amount_received: w.captured ? bk.total : 0, amount_capturable: !w.captured && w.piStatus === "requires_capture" ? bk.total : 0, currency: "usd",
@@ -475,11 +601,12 @@ if (process.env.E7_HPL_DB_TESTS === "1") {
       if (req.method === "GET" && /^\/v1\/listings\/\d+$/.test(p)) return pricing.get(p.slice(3)).then((x) => reply(x.status, x.json));
       if (req.method === "GET" && /^\/v1\/listings\/\d+\/calendar$/.test(u.pathname)) return pricing.get(u.pathname.slice(3), { query: Object.fromEntries(u.searchParams) }).then((x) => reply(x.status, x.json));
       if (req.method === "POST" && /priceDetails$/.test(p)) return pricing.post(p.slice(3), JSON.parse(req.body)).then((x) => reply(x.status, x.json));
-      if (req.method === "GET" && p.startsWith("/v1/reservations?")) return reply(200, { status: "success", result: u.searchParams.has("afterId") ? [] : [...w.res.values()].map((r) => full(r)) });
+      if (req.method === "GET" && p.startsWith("/v1/reservations?")) return reply(200, { status: "success", result: u.searchParams.has("afterId") ? [] : [...w.res.values()].map((r) => full(r, w.echoGet)) });
       if (req.method === "POST" && p === "/v1/reservations") {
         const body = JSON.parse(req.body); assert.equal(body.listingMapId, LIST); assert.equal(body.customFieldValues[0].value, bk.ref); assert.ok(!req.body.includes("forceOverbooking"));
         const r = { id: w.nextRes++ }; w.res.set(r.id, r); w.creates += 1;
         if (o.afterCreate) o.afterCreate(w);
+        if (o.createLost) return Promise.reject(new Error("socket reset"));
         return reply(201, { status: "success", result: full(r, w.echoCreate) });
       }
       if (req.method === "GET" && p.startsWith("/v1/guestPayments/charges?")) {
@@ -496,7 +623,7 @@ if (process.env.E7_HPL_DB_TESTS === "1") {
         return reply(201, { status: "success", result: { ...ch } });
       }
       const m = /^\/v1\/reservations\/(\d+)$/.exec(p);
-      if (req.method === "GET" && m) { const r = w.res.get(Number(m[1])); return r ? reply(200, { status: "success", result: full(r) }) : reply(404, { status: "fail" }); }
+      if (req.method === "GET" && m) { const r = w.res.get(Number(m[1])); return r ? reply(200, { status: "success", result: full(r, w.echoGet) }) : reply(404, { status: "fail" }); }
       return reply(404, { status: "fail" });
     };
     return w;
@@ -539,18 +666,82 @@ if (process.env.E7_HPL_DB_TESTS === "1") {
     assert.deepEqual([r2.outcome, r2.code, w2.calls.length, r2.coordinatorInvocations], ["STOP", "ADMISSION_REFUSED:STATE_NOT_IN_PIPELINE", 0, 0]);
   });
 
-  test("P2 PG non-echo: the create reply lacks the ref → PENDING with a sanitized nextActionAt (create 1, capture 0, record 0; no self-retry); a FUTURE separately dispatched attempt (fresh plan + version, clock past nextActionAt) continues READ-ONLY for the reservation (create 0) and completes capture + recording with fresh proofs", async () => {
-    const bk = await authorizedBooking(); const w = pgWorld(bk, { echoCreate: false }); const clk = { t: bk.base + 10 * SEC };
-    const r = await pgRun(bk, w, { clk });
-    assert.equal(r.outcome, "PENDING", JSON.stringify(r)); assert.match(r.code, /^PENDING:NOT_DUE$/);
-    assert.ok(typeof r.nextActionAt === "string" && Date.parse(r.nextActionAt) > clk.t, r.nextActionAt);
+  /** C100 fake wait seam: "wait" advances the fake business clock by its ms (after an optional async `during` hook) and fires; deadline timers are
+   *  captured (`deadline()` fires the run deadline); everything else is real. No real 150 s sleep. */
+  const fastWait = (clk, o = {}) => { const sx = { deadline: null, waits: 0 };
+    sx.timer = (fn, ms, kind) => {
+      if (kind === "deadline") { const h = { fn, k: "deadline" }; sx.deadline = () => fn(); return h; }
+      if (kind === "wait") { sx.waits += 1; const h = { k: "wait", cleared: false }; (async () => { if (o.during) await o.during(sx); await new Promise((r2) => setImmediate(r2)); if (!h.cleared && !o.hold) { clk.t += ms; fn(); } })(); return h; }
+      return setTimeout(fn, ms);
+    };
+    sx.clearTimer = (h) => { if (h && typeof h === "object" && h.k) h.cleared = true; else clearTimeout(h); };
+    return sx; };
+  test("P2 PG C100 non-echo in ONE run (REAL coordinator + workers): create reply lacks the ref → PENDING NOT_DUE → ONE bounded wait (fake clock) → fresh re-admission → second invocation READS the existing create only (create 0) → CONFIRMED_VERIFIED; cumulative 1 / 1 / 1; per-invocation + cumulative results reported", async () => {
+    const bk = await authorizedBooking(); const w = pgWorld(bk, { echoCreate: false }); const clk = { t: bk.base + 10 * SEC }; const fw = fastWait(clk);
+    const r = await pgRun(bk, w, { clk, timer: fw.timer, clearTimer: fw.clearTimer });
+    assert.deepEqual([r.outcome, r.code, r.verifiedCompletion, r.coordinatorInvocations, r.waits, fw.waits], ["CONFIRMED_VERIFIED", "CONFIRMED", true, 2, 1, 1], JSON.stringify(r));
+    assert.deepEqual(r.invocations.map((x) => [x.label, x.outcome, x.code, x.writes]), [["FIRST", "PENDING", "NOT_DUE", { create: 1, capture: 0, record: 0 }],
+      ["CONTINUATION", "CONFIRMED", "CONFIRMED", { create: 0, capture: 1, record: 1 }]]);
+    assert.deepEqual([r.sends, w.creates, w.captures, w.records], [{ create: 1, capture: 1, record: 1 }, 1, 1, 1], "cumulative exactly one of each");
+    assert.deepEqual([r.continuation.eligible, r.continuation.readmission], [true, "OK"]); assert.ok(r.waitedMs > 0 && r.waitedMs <= 150000, String(r.waitedMs));
+    assert.deepEqual(r.proofs, ["STRIPE_AT_START", "STRIPE_AT_CONTINUATION", "STRIPE_BEFORE_CAPTURE", "STRIPE_BEFORE_RECORDING", "ECHO_BEFORE_RECORDING"]);
+    const s = await snap(bk.id); assert.deepEqual([s.st.state, s.locks, r.lock], ["confirmed", 0, "released"]);
+    console.log(`# P2 (C100): steps=${r.invocations.map((x) => x.steps.length).join("+")} dbQueries=${r.dbQueries} exchanges=${r.exchanges} pi=${r.piReads} waitedMs=${r.waitedMs}`);
+  });
+  test("P2b PG no run reserve after the first invocation → existing PENDING NOT_DUE (no wait); a FUTURE separately dispatched attempt still continues read-only (create 0) to CONFIRMED", async () => {
+    const bk = await authorizedBooking(); const w = pgWorld(bk, { echoCreate: false }); const clk = { t: bk.base + 10 * SEC }; const fw = fastWait(clk);
+    const now = () => (w.creates >= 1 ? Date.now() + C.budgets.runMs - C.budgets.teardownMs - 100000 : Date.now());
+    const r = await pgRun(bk, w, { clk, now, timer: fw.timer, clearTimer: fw.clearTimer });
+    assert.deepEqual([r.outcome, r.code, r.waits, r.coordinatorInvocations, r.continuation && r.continuation.reason], ["PENDING", "PENDING:NOT_DUE", 0, 1, "NO_RUN_RESERVE"], JSON.stringify(r));
     assert.deepEqual([r.sends, w.captures, w.records, r.possiblyEffected, r.verifiedCompletion], [{ create: 1, capture: 0, record: 0 }, 0, 0, false, false]);
-    const s = await snap(bk.id); assert.equal(s.st.state, "reservation_pending"); assert.equal(s.locks, 0);
     clk.t = Date.parse(r.nextActionAt) + SEC;
-    const r2 = await pgRun(bk, w, { clk });
-    assert.deepEqual([r2.outcome, r2.sends, r2.coordinator.writes], ["CONFIRMED_VERIFIED", { create: 0, capture: 1, record: 1 }, { create: 0, capture: 1, record: 1 }], JSON.stringify(r2));
-    assert.deepEqual(r2.proofs, ["STRIPE_AT_START", "STRIPE_BEFORE_CAPTURE", "STRIPE_BEFORE_RECORDING", "ECHO_BEFORE_RECORDING"]);
-    assert.deepEqual([w.creates, w.captures, w.records], [1, 1, 1], "exactly one of each across both attempts");
+    const r2 = await pgRun(bk, w, { clk, timer: fw.timer, clearTimer: fw.clearTimer });
+    assert.deepEqual([r2.outcome, r2.sends, r2.coordinatorInvocations, r2.waits], ["CONFIRMED_VERIFIED", { create: 0, capture: 1, record: 1 }, 1, 0], JSON.stringify(r2));
+    assert.deepEqual([w.creates, w.captures, w.records], [1, 1, 1]);
+  });
+  test("P12 PG C100 never waits after a first write UNKNOWN (lost create reply): STOP, ONE invocation, no wait, no capture", async () => {
+    const bk = await authorizedBooking(); const w = pgWorld(bk, { createLost: true }); const clk = { t: bk.base + 10 * SEC }; const fw = fastWait(clk);
+    const r = await pgRun(bk, w, { clk, timer: fw.timer, clearTimer: fw.clearTimer });
+    assert.deepEqual([r.outcome, r.coordinatorInvocations, r.waits, fw.waits, r.sends.create, r.replies.create, w.captures, r.possiblyEffected], ["STOP", 1, 0, 0, 1, "UNKNOWN", 0, true], JSON.stringify(r));
+  });
+  test("P13 PG C100 re-admission STOPs on facts changed DURING the wait: a stored refund observation / a canceled PI → CONTINUATION_REFUSED, no second invocation, no capture / record", async () => {
+    for (const [label, want] of [["refund", "PAYMENT_REFUND_OBSERVED"], ["pi canceled", "FRESH_PROOF_NOT_REQUIRES_CAPTURE"]]) {
+      const bk = await authorizedBooking(); const w = pgWorld(bk, { echoCreate: false }); const clk = { t: bk.base + 10 * SEC };
+      const fw = fastWait(clk, { during: async () => { if (label === "refund") await refundObs(bk, { amountRefundedMinor: 100 }); else w.piStatus = "canceled"; } });
+      const r = await pgRun(bk, w, { clk, timer: fw.timer, clearTimer: fw.clearTimer });
+      assert.deepEqual([r.outcome, r.code, r.coordinatorInvocations, r.waits, w.captures, w.records, r.sends.create], ["STOP", `CONTINUATION_REFUSED:${want}`, 1, 1, 0, 0, 1], `${label}: ${JSON.stringify(r)}`);
+      assert.equal((await snap(bk.id)).locks, 0);
+    }
+  });
+  test("P14 PG C100 the run deadline DURING the wait seals: STOP_DEADLINE, no second invocation, no capture / record, lock session destroyed (advisory lock released)", async () => {
+    const bk = await authorizedBooking(); const w = pgWorld(bk, { echoCreate: false }); const clk = { t: bk.base + 10 * SEC };
+    const fw = fastWait(clk, { hold: true });
+    const run = pgRun(bk, w, { clk, timer: fw.timer, clearTimer: fw.clearTimer });
+    for (let i = 0; i < 500 && fw.waits === 0; i++) await tick(10);
+    assert.equal(fw.waits, 1, "waiting");
+    fw.deadline();
+    const rr = await race40(run);
+    assert.notEqual(rr, "STILL_PENDING_AFTER_DEADLINE", "the seal ends the run promptly");
+    assert.deepEqual([rr.outcome, rr.code, rr.sealed, rr.coordinatorInvocations, rr.waits, w.captures, w.records], ["STOP", "STOP_DEADLINE", true, 1, 1, 0, 0], JSON.stringify(rr));
+    for (let i = 0; i < 50; i++) { if ((await snap(bk.id)).locks === 0) break; await tick(20); }
+    assert.equal((await snap(bk.id)).locks, 0);
+  });
+  test("P15 PG C100 the reservation still not echoed after the wait: the continuation never creates and never runs a third invocation / wait (the scripted second-PENDING exit is H12); cumulative create 1, capture / record 0", async () => {
+    const bk = await authorizedBooking(); const w = pgWorld(bk, { echoCreate: false, echoGet: false }); const clk = { t: bk.base + 10 * SEC }; const fw = fastWait(clk);
+    const r = await pgRun(bk, w, { clk, timer: fw.timer, clearTimer: fw.clearTimer });
+    assert.equal(fw.waits, r.waits); assert.ok(r.coordinatorInvocations <= 2 && r.waits <= 1, JSON.stringify(r));
+    assert.deepEqual([w.creates, w.captures, w.records, r.verifiedCompletion], [1, 0, 0, false], JSON.stringify(r));
+    assert.ok(r.outcome === "PENDING" || r.outcome === "STOP", r.outcome);              // the REAL worker may settle the unechoed read either way; never a 3rd invocation
+    if (r.coordinatorInvocations === 2) assert.equal(r.invocations[1].writes.create, 0, "the continuation never creates");
+    console.log(`# P15: outcome=${r.outcome} code=${r.code} invocations=${r.coordinatorInvocations} waits=${r.waits} cont=${JSON.stringify(r.continuation)}`);
+  });
+  test("P16 PG C100 late fault after the continuation (durable readback disagrees) → STOP POSTCHECK_MISMATCH, never success, possiblyEffected", async () => {
+    const bk = await authorizedBooking(); const w = pgWorld(bk, { echoCreate: false }); const clk = { t: bk.base + 10 * SEC }; const fw = fastWait(clk);
+    const tamper = (res, sql) => (/e7hpl:row/.test(String(sql)) && res.rows[0] && res.rows[0].state === "confirmed" ? { ...res, rows: [{ ...res.rows[0], och: "999" }] } : res);
+    const pool = { query: async (sql, params) => tamper(await db.app.query(sql, params), sql),
+      connect: async () => { const cl = await db.app.connect(); return { query: async (sql, params) => tamper(await cl.query(sql, params), sql), release: (x) => cl.release(x), on: (...a) => cl.on(...a), removeListener: (...a) => cl.removeListener(...a) }; } };
+    const r = await pgRun(bk, w, { clk, pool, timer: fw.timer, clearTimer: fw.clearTimer });
+    assert.deepEqual([r.outcome, r.code, r.verifiedCompletion, r.possiblyEffected, r.coordinatorInvocations, r.waits], ["STOP", "POSTCHECK_MISMATCH:OFFLINE_CHARGE_NOT_LINKED", false, true, 2, 1], JSON.stringify(r));
   });
 
   test("P3 PG lost capture reply (applied, reply lost) → STOP, ONE capture POST, possiblyEffected, NO record POST; the accepted worker settles capture_unknown; a later dispatch refuses read-only (no second capture)", async () => {

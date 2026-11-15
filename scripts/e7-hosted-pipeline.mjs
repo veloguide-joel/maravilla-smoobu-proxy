@@ -8,7 +8,8 @@
 // mode checks — BEFORE any input value, tooling import, credential, database or provider access. The execute body exists so it can be reviewed
 // and exercised through test seams on disposable PostgreSQL with FAKE provider exchanges only. Opening it is a separate reviewed change.
 // MANUAL hosted TEST runner (workflow_dispatch + the EXISTING `e7-readonly-probe` reviewer gate). NOT automatic checkout, NOT a cron / webhook /
-// API / UI path. ONE coordinator invocation per dispatch; no sleep, poll or re-dispatch loop; never self-retries.
+// API / UI path. ≤ 2 coordinator invocations per dispatch (the second only after the ONE bounded wait of the proven healthy PENDING NOT_DUE
+// branch, C100); no poll or re-dispatch loop; never self-retries an uncertain write.
 //
 // Binding (all in the plan hash): approval label, ONE intent id, its booking ref, expected version, notBefore, PaymentIntent, amount (minor), USD,
 // listing 606998, tooling commit + closure digest, source digest. The run id (E7_RUN_ID) is the recording clientSnapshotId label (outside the hash).
@@ -38,6 +39,13 @@
 //     closes every fence / executor, discards late results and destroys late clients. A statement in flight at the seal after the coordinator was
 //     admitted is an UNKNOWN DB outcome ⇒ STOP + possiblyEffected. The pinned pool / tooling are not modified.
 //   * C91-F2: the no-dispute / no-refund raw proofs require the explicit boolean false; absent or malformed values refuse (unknown is not proof).
+// C100 (healthy PENDING NOT_DUE continuation): ≤ 2 coordinator invocations per run and ≤ 1 bounded wait (≤ 150 s), cumulative ≤ 1 create / capture /
+// record across BOTH (the fences / counters are never reset). The wait happens ONLY when the first invocation returned PENDING NOT_DUE and fresh
+// durable facts prove: reservation_pending; exactly ONE settled succeeded create with one valid rid; no capture / record attempted; no unknown /
+// pending-dispatched write; no open case; no live foreign lease; the bound intent / ref / PI / amount / listing unchanged; a due time ≤ 150 s
+// away and enough whole-run reserve. The wait is inside the ONE seal. After it: ONE fresh re-admission (own lock, same settled version / create
+// identity / due time, due now, no live lease, refund veto, a FRESH raw Stripe proof, recovery executors bound to the durable rid) — any drift /
+// error STOPs. A second PENDING exits PENDING (no third invocation / wait). Anything else returns the existing PENDING / STOP, never a wait.
 // Outcomes: CONFIRMED_VERIFIED only when the coordinator says CONFIRMED AND the durable readback verifies confirmed / exactly one succeeded
 // create, capture and recording / captured amount / offline_charge_id linked / claim held / no cases / no forbidden op / notify undispatched.
 // PENDING carries a sanitized nextActionAt and needs a FUTURE, separately dispatched attempt with fresh proof (exit 0, NOT completion).
@@ -76,13 +84,17 @@ export const CONSTANTS = deepFreeze({
   dbEnvironment: "test", dbProjectRef: "mxotevtiscernhqilyiu", nodeVersion: "22.22.0",
   protectedReservationIds: ["70636076", "71045356", "71072615", "71081885"],
   // the reviewed C82 protected intent set: the two historical TEST intents + the C77 target (MV-XXU5YPDP, R71781276, confirmed). Never admitted.
-  excludedIntentIds: ["abede8b1-8ef6-44f2-876e-6a02fc056a96", "c83c1842-d342-4e27-9ab7-dc3d50b7a309", "954d476c-71ea-4824-92f6-2220ae302103"],
-  historicalFloor: "2026-11-15T18:25:04.000Z",                        // > the C82 END read-only detail (18:25:03.568Z): every C82-era intent is older
+  // C100: + the C94 / C95 target 669da884 (MV-VBQL2LQY, R71789623, confirmed)
+  excludedIntentIds: ["abede8b1-8ef6-44f2-876e-6a02fc056a96", "c83c1842-d342-4e27-9ab7-dc3d50b7a309", "954d476c-71ea-4824-92f6-2220ae302103",
+    "669da884-02e8-4105-8825-f908e5d22ae9"],
+  historicalFloor: "2026-11-15T21:18:31.000Z",                        // C100: > the C97 final snapshot (21:17:43.556Z) and the C96 END read (21:18:30Z): every earlier intent is HISTORIC
   excludedListingIds: [...MIGRATED, 628381, 628387, 603564, 603566],
   paymentMethod: "credit_card", accountRef: "hostaway-e7-test",       // = the reviewed main recording runner's TEST recording configuration
-  // ONE coordinator invocation; its own step / write budgets are authoritative (≤ 6 steps, ≤ 1 create / capture / record). Fence ceilings ≈ 3x
+  // per coordinator invocation its own step / write budgets are authoritative (≤ 6 steps, ≤ 1 create / capture / record). Fence ceilings ≈ 3x
   // the coordinator happy path (8 Hostaway pricing / lookup reads, 2 Stripe proofs per boundary, 4 charge lists).
-  budgets: { coordinatorInvocations: 1, maxSteps: 6, create: 1, capture: 1, record: 1, accountReads: 8, piReads: 10, pricingCalls: 36, hostawayReads: 36,
+  // C100: ≤ 2 coordinator invocations, the second ONLY after the ONE bounded wait (≤ maxWaitMs) of the proven healthy PENDING NOT_DUE branch;
+  // continuationReserveMs = the whole-run budget the second invocation needs after the wait (reservation 45 s + capture 45 s + recording 90 s)
+  budgets: { coordinatorInvocations: 2, maxWaits: 1, maxWaitMs: 150000, continuationReserveMs: 180000, maxSteps: 6, create: 1, capture: 1, record: 1, accountReads: 8, piReads: 10, pricingCalls: 36, hostawayReads: 36,
     lookupPages: 24, chargeLists: 12, exchanges: 160, dbQueries: 1500, runMs: 12 * 60 * 1000, teardownMs: 5000, pendingHorizonMs: 7 * 24 * 60 * 60 * 1000,
     // C91-F1 LOCAL bounds (the pinned pool sets a server statement_timeout but no connect / client deadline): every acquisition ≤ connectMs and every
     // statement ≤ statementMs, enforced HERE; a breach SEALS the run (no further DB / provider admission) and destroys the affected connections
@@ -178,13 +190,18 @@ export function buildPlan(c, { approvalRef, intentId, ref, expectedVersion, notB
   if (typeof paymentIntentId !== "string" || !PI_RE.test(paymentIntentId) || !isAmount(amountMinor) || currency !== c.currency) refuse("HPL_INPUT_INVALID");
   if (typeof sourceDigest !== "string" || !HEX64.test(sourceDigest)) refuse("HPL_INPUT_INVALID");
   if (c.listingId !== 606998 || c.currency !== "USD" || c.dbEnvironment !== "test" || c.budgets.create !== 1 || c.budgets.capture !== 1 || c.budgets.record !== 1
-      || c.budgets.coordinatorInvocations !== 1 || c.budgets.maxSteps > 8 || c.excludedListingIds.includes(c.listingId)) refuse("HPL_INPUT_INVALID");       // code ceiling
+      || c.budgets.coordinatorInvocations !== 2 || c.budgets.maxWaits !== 1 || !(c.budgets.maxWaitMs > 0 && c.budgets.maxWaitMs <= 150000)
+      || c.budgets.maxSteps > 8 || c.excludedListingIds.includes(c.listingId)) refuse("HPL_INPUT_INVALID");       // code ceiling
   const plan = { schema: PLAN_SCHEMA, kind: "e7-test-pipeline-one-bound-intent", approvalRef, intentId, ref, expectedVersion, notBefore, paymentIntentId, amountMinor, currency,
     listingId: c.listingId, accountId: c.accountId, stripeVersion: c.stripeVersion, refFieldId: c.refFieldId, dbEnvironment: c.dbEnvironment, dbProjectRef: c.dbProjectRef,
     toolingCommit: c.toolingCommit, closureDigest: c.closureDigest, sourceDigest, historicalFloor: c.historicalFloor, excludedIntentIds: c.excludedIntentIds,
     protectedReservationIds: c.protectedReservationIds, paymentMethod: c.paymentMethod, accountRef: c.accountRef,
     captureIdempotencyKey: `cap:${intentId}:${paymentIntentId}`, recordingIdempotencyKey: `och:${intentId}:1`, title: offlineChargeTitle(intentId), amount: exactAmount(amountMinor),
-    budgets: { ...c.budgets }, writes: { create: 1, capture: 1, record: 1, refund: 0, cancel: 0, void: 0, notify: 0, account: 0 }, executeEnabled: c.executeEnabled };
+    budgets: { ...c.budgets }, writes: { create: 1, capture: 1, record: 1, refund: 0, cancel: 0, void: 0, notify: 0, account: 0 },
+    // C100: the EXPLICITLY bound continuation contract (cumulative writes above are across BOTH invocations; counters never reset)
+    continuation: { maxCoordinatorInvocations: c.budgets.coordinatorInvocations, maxWaits: c.budgets.maxWaits, maxWaitMs: c.budgets.maxWaitMs,
+      branch: "PENDING:NOT_DUE+reservation_pending+one_settled_create+no_capture_record", readmission: "fresh_durable_facts+same_version+refund_veto+fresh_stripe_proof" },
+    executeEnabled: c.executeEnabled };
   return { plan: deepFreeze(plan), planHash: sha(canonical(plan)) };
 }
 
@@ -204,6 +221,7 @@ export const QUERIES = deepFreeze({
   cases: "/*e7hpl:cases*/ SELECT count(*)::int AS n FROM booking.reconciliation_cases WHERE intent_id = $1 AND status = 'open'",
   claims: "/*e7hpl:claims*/ SELECT listing_id, (released_at IS NOT NULL) AS released FROM booking.inventory_claims WHERE intent_id = $1",
   evidence: "/*e7hpl:evidence*/ SELECT kind, external_ref, observed FROM booking.provider_evidence WHERE intent_id = $1 AND kind = 'payment_intent' AND external_ref = $2",
+  work: "/*e7hpl:work*/ SELECT next_action_at, work_worker_id, work_lease_until FROM booking.intent_work WHERE intent_id = $1",
   guest: `/*e7hpl:guest*/ SELECT g.first_name, g.last_name, g.email FROM (SELECT 1) one LEFT JOIN booking.intent_guests g ON g.intent_id = $1`
 });
 const Q = QUERIES;
@@ -226,7 +244,8 @@ export async function readFacts(q, plan, tooling, raw) {
   const cases = await q(Q.cases, [plan.intentId]);
   const claims = await q(Q.claims, [plan.intentId]);
   const evidence = await q(Q.evidence, [plan.intentId, plan.paymentIntentId]);
-  return freeze({ instance: inst[0]?.environment ?? null, row: row[0] ?? null, intent, attempts, hostaway, ops, openCases: cases[0]?.n ?? null, claims, evidence });
+  const work = await q(Q.work, [plan.intentId]);
+  return freeze({ instance: inst[0]?.environment ?? null, row: row[0] ?? null, intent, attempts, hostaway, ops, openCases: cases[0]?.n ?? null, claims, evidence, work });
 }
 
 /** the facts every admission / readback shares (scope, historical exclusion, protection, binding to the PINNED ref / PI / amount) → null | code */
@@ -384,7 +403,7 @@ export function sanitizeNextActionAt(ms, nowMs, horizonMs = CONSTANTS.budgets.pe
 // =================================================================================================================================
 /**
  * runPipelineCore({ plan, pool, lockClientFactory?, tooling, exchanges: { stripe, hostaway }, credentials: { stripe, hostaway }, runId, clock?, recordingClock?,
- *                   now?, runSignal?, timer? }) → frozen result. ONE coordinator invocation at most.
+ *                   now?, runSignal?, timer? }) → frozen result. ≤ 2 coordinator invocations (C100), ≤ 1 bounded wait.
  * tooling = { runTestPipelineCoordinator, refundObservationRefusal, loadIntent, createPhaseExecutors, createStripeSend, createHostawaySend, validateAdapterConfig,
  *             unwrapEnvelope, normalizeReservation, paymentIntentProofObservationV3, stillAuthorizedV3Refusal, piCapturedProof, captureKey, LOCK_KEY, LOCK_PRECHECK_SQL }
  */
@@ -393,7 +412,8 @@ export const TOOLING_KEYS = freeze(["runTestPipelineCoordinator", "refundObserva
 export async function runPipelineCore(input) {
   const c = CONSTANTS; const B = c.budgets;
   const r = { schema: RESULT_SCHEMA, outcome: null, code: null, startState: null, finalState: null, finalVersion: null, reservationId: null, chargeId: null, offlineChargeId: null,
-    nextActionAt: null, coordinator: null, coordinatorInvocations: 0, proofs: [], possiblyEffected: false, verifiedCompletion: false,
+    nextActionAt: null, coordinator: null, coordinatorInvocations: 0, invocations: [], waits: 0, waitedMs: 0, continuation: null, continuationVersion: null,
+    proofs: [], possiblyEffected: false, verifiedCompletion: false,
     sends: { create: 0, capture: 0, record: 0 }, replies: { create: "NONE", capture: "NONE", record: "NONE" }, exchanges: 0, accountReads: 0, piReads: 0, pricingCalls: 0,
     hostawayReads: 0, lookupPages: 0, chargeLists: 0, refusedAtTransport: 0, refusedByStop: 0, dbQueries: 0, dbBudgetRefused: 0, lock: "not_acquired", lockSession: null,
     stopReason: null, factsObserved: false, postcheck: null };
@@ -401,6 +421,7 @@ export async function runPipelineCore(input) {
   const done = (outcome, k = null) => { if (!finalized) { r.outcome = outcome; r.code = k === null ? null : code(String(k), "CODE"); } return DONE; };
   const stop = (k) => done("STOP", k);
   r.sealed = false; r.sealReason = null; r.dbInFlightAtSeal = 0; r.dbOutcomeUnknown = false; r.lateClientsDestroyed = 0; r.clientsDestroyed = 0; r.coordinatorSettled = null;
+  let waitHandle = null;
   let stopReason = null; let lockT = null; let lockAcquired = false; let lockErrored = false; let lockPid = null; let timerHandle = null; let finalized = false;
   const stopAc = new AbortController();
   // ---- C91-F1 SUPERVISION. ONE seal (wall deadline / run abort / lock-session error / a LOCAL connect or statement timeout) ends ALL DB and provider
@@ -793,7 +814,7 @@ export async function runPipelineCore(input) {
       return stop(e instanceof HookStop ? `PROVIDER_PROOF_FAILED:${e.code}` : "CORE_INVALID:START_BIND");
     }
 
-    // ---- (8) the ONE coordinator invocation; hooks.afterStep: lock proof + facts + the boundary re-proofs / late binding ---------------------------
+    // ---- (8) hooks.afterStep: lock proof + facts + the boundary re-proofs / late binding (shared by both invocations) ----------------------------
     const afterStep = async (step) => {
       if (stopped()) throw new Stopped();
       if (!(await ownLock())) { r.lock = "lost"; throw new HookStop(lockErrored ? "LOCK_SESSION_ERROR" : r.lockSession === "backend_hop" ? "BACKEND_HOP" : "LOCK_LOST"); }
@@ -808,54 +829,151 @@ export async function runPipelineCore(input) {
       MV_E7_RECORDING_WORKER: "enabled", DIRECT_DISCOUNT_BPS: String(rate) });
     const listingsBase = new Map([[c.listingId, { currency: c.currency, timeZone: c.listingTimeZone }]]);
     const recCfg = freeze({ accountRef: c.accountRef, channelId: 2000, currency: c.currency, listingId: c.listingId, paymentMethod: c.paymentMethod, refFieldId: c.refFieldId });
-    if (stopped()) return stop(`STOP_${stopReason}`);
-    let co;
-    try {
-      if (!(await ownLock())) { r.lock = "lost"; return stop("LOCK_LOST:BEFORE_COORDINATOR"); }
-      if (stopped()) return stop(`STOP_${stopReason}`);
-      r.coordinatorInvocations += 1;                                                                    // exactly ONE; there is no loop around it
-      coordinatorAdmitted = true;
-      coP = Promise.resolve().then(() => tooling.runTestPipelineCoordinator(countedPool, { workerId: `e7-hpl:${plan.approvalRef.slice(0, 40)}`, env: workerEnv, binding: { intentId: IID, ref: plan.ref },
-        phases: { reservation: { adapterConfig, listings: listingsBase, executors: proxies.reservation },
-          capture: { adapterConfig, listings: listingsBase, executors: proxies.capture, stripeAccountId: c.accountId },
-          recording: { listings: new Map([[c.listingId, recCfg]]), executors: proxies.recording } },
-        clock, recordingClock, now, maxSteps: B.maxSteps, deadlineAt, signal: stopAc.signal, hooks: { afterStep } }));
-      co = await supervise(coP);                                                                        // sealed: rejects; the sealed coordinator can no longer reach DB / provider
-    } catch (e) {
-      if (r.sealed) return stop(`STOP_${stopReason}`);
-      if (e instanceof Refusal && e.code === "DB_BUDGET") return stop("BUDGET_EXHAUSTED:DB_QUERY_CEILING");
-      return stop("COORDINATOR_THREW");
-    }
-    r.coordinator = co && typeof co === "object" ? freeze({ outcome: code(co.outcome, "INVALID"), code: code(co.code, "INVALID"),
-      steps: Array.isArray(co.steps) ? co.steps.slice(0, 16).map((s) => freeze({ phase: code(s.phase, "-"), status: code(s.status, "-"), stateBefore: code(s.stateBefore, "-"), stateAfter: code(s.stateAfter, "-") })) : [],
+    // ---- (8) at most TWO coordinator invocations (C100): the second ONLY after the ONE bounded wait of the healthy PENDING NOT_DUE branch ----------
+    const sanitizeCo = (co) => (co && typeof co === "object" ? freeze({ outcome: code(co.outcome, "INVALID"), code: code(co.code, "INVALID"),
+      steps: Array.isArray(co.steps) ? co.steps.slice(0, 16).map((x) => freeze({ phase: code(x.phase, "-"), status: code(x.status, "-"), stateBefore: code(x.stateBefore, "-"), stateAfter: code(x.stateAfter, "-") })) : [],
       writes: co.writes && typeof co.writes === "object" ? freeze({ create: Number(co.writes.create) || 0, capture: Number(co.writes.capture) || 0, record: Number(co.writes.record) || 0 }) : null,
-      nextActionAt: Number.isSafeInteger(co.nextActionAt) ? co.nextActionAt : null }) : null;
-    const attempted = () => r.sends.create + r.sends.capture + r.sends.record + (r.coordinator && r.coordinator.writes ? r.coordinator.writes.create + r.coordinator.writes.capture + r.coordinator.writes.record : 0);
-    if (!r.coordinator) return stop("COORDINATOR_INVALID_RESULT");
+      nextActionAt: Number.isSafeInteger(co.nextActionAt) ? co.nextActionAt : null }) : null);
+    const cumulative = () => r.invocations.reduce((a, x) => ({ create: a.create + (x.writes ? x.writes.create : 0), capture: a.capture + (x.writes ? x.writes.capture : 0),
+      record: a.record + (x.writes ? x.writes.record : 0), steps: a.steps + x.steps.length }), { create: 0, capture: 0, record: 0, steps: 0 });
+    const attempted = () => { const k = cumulative(); return r.sends.create + r.sends.capture + r.sends.record + k.create + k.capture + k.record; };
+    /** ONE coordinator invocation (the counters r.sends / the fences are NEVER reset between invocations: cumulative ≤ 1 / 1 / 1) */
+    const invoke = async (label) => {
+      if (stopped()) return { stop: `STOP_${stopReason}` };
+      if (r.coordinatorInvocations >= B.coordinatorInvocations) return { stop: "COORDINATOR_INVOCATION_BUDGET" };
+      try {
+        if (!(await ownLock())) { r.lock = "lost"; return { stop: `LOCK_LOST:BEFORE_${label}` }; }
+        if (stopped()) return { stop: `STOP_${stopReason}` };
+        r.coordinatorInvocations += 1;
+        coordinatorAdmitted = true;
+        coP = Promise.resolve().then(() => tooling.runTestPipelineCoordinator(countedPool, { workerId: `e7-hpl:${plan.approvalRef.slice(0, 40)}`, env: workerEnv, binding: { intentId: IID, ref: plan.ref },
+          phases: { reservation: { adapterConfig, listings: listingsBase, executors: proxies.reservation },
+            capture: { adapterConfig, listings: listingsBase, executors: proxies.capture, stripeAccountId: c.accountId },
+            recording: { listings: new Map([[c.listingId, recCfg]]), executors: proxies.recording } },
+          clock, recordingClock, now, maxSteps: B.maxSteps, deadlineAt, signal: stopAc.signal, hooks: { afterStep } }));
+        const co = await supervise(coP);                                                                // sealed: rejects; the sealed coordinator can no longer reach DB / provider
+        const sc = sanitizeCo(co);
+        if (!sc) return { stop: "COORDINATOR_INVALID_RESULT" };
+        r.invocations.push(freeze({ label, ...sc })); r.coordinator = sc;
+        return { co: sc };
+      } catch (e) {
+        if (r.sealed) return { stop: `STOP_${stopReason}` };
+        if (e instanceof Refusal && e.code === "DB_BUDGET") return { stop: "BUDGET_EXHAUSTED:DB_QUERY_CEILING" };
+        return { stop: "COORDINATOR_THREW" };
+      }
+    };
+    const readOrStop = async () => { try { const fx = await read(); observe(fx); return fx; } catch { return null; } };
+    const workRow = (fx) => (fx && Array.isArray(fx.work) && fx.work.length === 1 ? fx.work[0] : null);
+    const msOf = (v) => (v === null || v === undefined ? null : Number.isFinite(new Date(v).getTime()) ? new Date(v).getTime() : NaN);
+    const createIdentity = (fx) => { const cr = fx.ops.filter((o) => o.op_type === CREATE); return cr.length === 1 ? canonical({ s: cr[0].state, a: Number(cr[0].attempts), d: cr[0].dispatched, rr: cr[0].result_ref ?? null, lr: cr[0].late_result_ref ?? null }) : null; };
+    const writeRows = (fx) => canonical(fx.ops.filter((o) => o.op_type === CAPTURE || o.op_type === RECORD).map((o) => [o.op_type, o.state, Number(o.attempts), o.dispatched]));
+    /** C100: the ONE narrowly proven continuation branch. null = eligible snapshot is returned via `snap`; else the reason it is NOT eligible */
+    const continuationRefusal = (co, fx, snap) => {
+      if (co.outcome !== "PENDING" || co.code !== "NOT_DUE") return "NOT_PENDING_NOT_DUE";
+      if (r.coordinatorInvocations !== 1 || r.waits !== 0) return "NOT_FIRST_INVOCATION";
+      if (r.sealed || r.dbOutcomeUnknown || Object.values(r.replies).includes("UNKNOWN")) return "UNKNOWN_OUTCOME";
+      if (!["NONE", "REPLIED"].includes(r.replies.create) || r.replies.capture !== "NONE" || r.replies.record !== "NONE") return "WRITE_REPLY_STATE";
+      const k = cumulative();
+      if (r.sends.capture !== 0 || r.sends.record !== 0 || k.capture !== 0 || k.record !== 0 || r.sends.create > 1 || k.create > 1) return "WRITES_ATTEMPTED";
+      if (!fx || !fx.intent || fx.intent.status !== "reservation_pending" || !fx.row || fx.row.state !== "reservation_pending") return "STATE_NOT_RESERVATION_PENDING";
+      const pk = checkPending(fx, plan, c);
+      if (pk) return `FACTS_${pk}`;
+      const cr = fx.ops.filter((o) => o.op_type === CREATE);
+      if (cr.length !== 1 || cr[0].state !== "succeeded" || cr[0].dispatched !== true || Number(cr[0].attempts) !== 1 || !RID_RE.test(String(cr[0].result_ref ?? ""))
+          || (cr[0].late_result_ref !== null && cr[0].late_result_ref !== undefined && String(cr[0].late_result_ref) !== String(cr[0].result_ref))) return "CREATE_NOT_SINGLE_SETTLED";
+      const cand = candidateOf(fx, c);
+      if (!cand.ok || cand.id !== String(cr[0].result_ref)) return "CREATE_ID_NOT_BOUND";
+      if (fx.ops.some((o) => (o.op_type === CAPTURE || o.op_type === RECORD) && !pristine(o))) return "WRITE_ROW_NOT_PRISTINE";
+      for (const o of fx.ops) if (o.state === "pending" && o.dispatched === true) return "ATTEMPTED_PENDING_OP";
+      const w = workRow(fx); if (!w) return "WORK_ROW_MISSING";
+      const due = msOf(w.next_action_at); const t = clock();
+      if (!Number.isSafeInteger(due) || due !== co.nextActionAt) return "DUE_NOT_BOUND";
+      if (due - t > B.maxWaitMs || due < t - 60000) return "DUE_OUT_OF_RANGE";
+      const lease = msOf(w.work_lease_until);
+      if (lease !== null && (Number.isNaN(lease) || (lease > t && !String(w.work_worker_id || "").startsWith(`e7-hpl:${plan.approvalRef.slice(0, 40)}:`)) || lease > due)) return "LIVE_FOREIGN_WORK_LEASE";
+      const il = fx.intent.lease;
+      if (il && (!Number.isFinite(il.until) || (il.until > t && !String(il.workerId || "").startsWith(`e7-hpl:${plan.approvalRef.slice(0, 40)}:`)) || il.until > due)) return "LIVE_FOREIGN_INTENT_LEASE";
+      const waitMs = Math.max(0, due - t);
+      if (now() + waitMs + B.continuationReserveMs > deadlineAt) return "NO_RUN_RESERVE";
+      snap.version = fx.intent.version; snap.due = due; snap.rid = String(cr[0].result_ref); snap.create = createIdentity(fx); snap.writeRows = writeRows(fx); snap.waitMs = waitMs;
+      return null;
+    };
+    /** C100: ONE fresh re-admission after the wait — every pin re-proved from fresh durable facts + a fresh raw Stripe proof (never the cached one) */
+    const readmission = async (snap) => {
+      if (!(await ownLock())) { r.lock = "lost"; return "LOCK_LOST"; }
+      if (stopped()) return `STOP_${stopReason}`;
+      const fx = await readOrStop(); if (!fx) return r.sealed ? `STOP_${stopReason}` : "READ_FAILED";
+      if (stopped()) return `STOP_${stopReason}`;
+      if (!fx.intent || fx.intent.status !== "reservation_pending" || fx.intent.version !== snap.version || Number(fx.row.version) !== snap.version) return "STATE_OR_VERSION_DRIFT";
+      const pk = checkPending(fx, plan, c); if (pk) return `FACTS_${pk}`;
+      if (createIdentity(fx) !== snap.create || writeRows(fx) !== snap.writeRows) return "OPS_DRIFT";
+      const cand = candidateOf(fx, c); if (!cand.ok || cand.id !== snap.rid) return "RID_DRIFT";
+      const w = workRow(fx); const t = clock();
+      if (!w || msOf(w.next_action_at) !== snap.due) return "NEXT_ACTION_DRIFT";
+      if (snap.due > t) return "NOT_DUE_AFTER_WAIT";
+      const lease = msOf(w.work_lease_until);
+      if (lease !== null && (Number.isNaN(lease) || lease > t)) return "WORK_LEASE_LIVE";
+      if (fx.intent.lease && (!Number.isFinite(fx.intent.lease.until) || fx.intent.lease.until > t)) return "INTENT_LEASE_LIVE";
+      const veto = tooling.refundObservationRefusal(fx.evidence, PI); if (veto) return veto;
+      try {
+        const p = await freshProof("authorized", "STRIPE_AT_CONTINUATION", fx.intent);
+        if (p) return `FRESH_PROOF_${p}`;
+        await bind(fx, null);                                                                           // the recovery factory bound to the durable rid (never creates)
+      } catch (e) { if (e instanceof Stopped || stopped()) return `STOP_${stopReason ?? "STOPPED"}`; return e instanceof HookStop ? e.code : "BIND_FAILED"; }
+      if (bound.resId !== snap.rid) return "RID_NOT_BOUND";
+      r.continuationVersion = snap.version;
+      return null;
+    };
+    /** durable readback after an invocation → a final done/stop, or (only for the first invocation's eligible branch) "CONTINUE" */
+    const settle = async (co) => {
+      const fz = await readOrStop();
+      if (!fz) return stop(r.sealed ? `STOP_${stopReason}` : "POSTCHECK_MISMATCH:READBACK_FAILED");
+      if (co.outcome === "CONFIRMED") {
+        const pe = checkEnd(fz, plan, c);
+        if (pe) return stop(`POSTCHECK_MISMATCH:${pe}`);
+        if (stopped()) return stop(`STOP_${stopReason}`);
+        r.postcheck = freeze({ state: "confirmed", create: 1, capture: 1, record: 1, capturedMinor: plan.amountMinor, offlineChargeId: r.offlineChargeId, claimHeld: true, openCases: 0 });
+        r.verifiedCompletion = true;
+        return done("CONFIRMED_VERIFIED", "CONFIRMED");
+      }
+      if (co.outcome === "PENDING") {
+        const pk = checkPending(fz, plan, c);
+        if (pk) return stop(`PENDING_FACTS_${pk}`);
+        if (Object.values(r.replies).includes("UNKNOWN")) return stop("PENDING_FACTS_WRITE_REPLY_UNKNOWN");
+        const at = sanitizeNextActionAt(co.nextActionAt, clock(), B.pendingHorizonMs);
+        if (at === null) return stop(`PENDING_NEXT_ACTION_INVALID:${co.code}`);
+        if (r.coordinatorInvocations === 1 && r.waits === 0) {
+          const snap = {}; const why = continuationRefusal(co, fz, snap);
+          r.continuation = freeze({ eligible: why === null, reason: why, dueAt: why === null ? new Date(snap.due).toISOString() : null, waitMs: why === null ? snap.waitMs : null });
+          if (why === null) return { cont: snap };
+        }
+        r.nextActionAt = at;
+        return done("PENDING", `PENDING:${co.code}`);
+      }
+      if (attempted() > 0) r.possiblyEffected = true;
+      return stop(`COORDINATOR_${co.outcome}:${co.code}`);
+    };
 
-    // ---- (9) durable readback: ONLY a verified CONFIRMED is success; PENDING is reported over settled facts; anything else STOPS -------------------
-    let fz;
-    try { fz = await read(); } catch (e) { return stop(r.sealed ? `STOP_${stopReason}` : "POSTCHECK_MISMATCH:READBACK_FAILED"); }
-    observe(fz);
-    if (r.coordinator.outcome === "CONFIRMED") {
-      const pe = checkEnd(fz, plan, c);
-      if (pe) return stop(`POSTCHECK_MISMATCH:${pe}`);
+    const first = await invoke("FIRST");
+    if (first.stop) return stop(first.stop);
+    const s1 = await settle(first.co);
+    if (s1 !== null && typeof s1 === "object" && s1.cont) {
+      // ---- the ONE bounded wait, inside the ONE seal (abort / deadline / lock-session error reject it and destroy every connection) -------------
+      const snap = s1.cont; r.waits += 1;
+      const tw = clock();
+      try { await supervise(new Promise((res) => { waitHandle = setT(res, snap.waitMs, "wait"); })); }
+      catch { return stop(`STOP_${stopReason ?? "STOPPED"}`); }
+      finally { if (waitHandle !== null) { try { clearT(waitHandle); } catch { /* ignore */ } waitHandle = null; } }
+      r.waitedMs = Math.max(0, clock() - tw);
       if (stopped()) return stop(`STOP_${stopReason}`);
-      r.postcheck = freeze({ state: "confirmed", create: 1, capture: 1, record: 1, capturedMinor: plan.amountMinor, offlineChargeId: r.offlineChargeId, claimHeld: true, openCases: 0 });
-      r.verifiedCompletion = true;
-      return done("CONFIRMED_VERIFIED", "CONFIRMED");
+      const ra = await readmission(snap);
+      if (ra) { r.continuation = freeze({ ...r.continuation, readmission: code(String(ra), "REFUSED") }); return stop(`CONTINUATION_REFUSED:${ra}`); }
+      r.continuation = freeze({ ...r.continuation, readmission: "OK" });
+      const second = await invoke("CONTINUATION");
+      if (second.stop) return stop(second.stop);
+      return settle(second.co);                                                                         // a second PENDING exits as PENDING (no third invocation / wait)
     }
-    if (r.coordinator.outcome === "PENDING") {
-      const pk = checkPending(fz, plan, c);
-      if (pk) return stop(`PENDING_FACTS_${pk}`);
-      if (Object.values(r.replies).includes("UNKNOWN")) return stop("PENDING_FACTS_WRITE_REPLY_UNKNOWN");
-      const at = sanitizeNextActionAt(r.coordinator.nextActionAt, clock(), B.pendingHorizonMs);
-      if (at === null) return stop(`PENDING_NEXT_ACTION_INVALID:${r.coordinator.code}`);
-      r.nextActionAt = at;
-      return done("PENDING", `PENDING:${r.coordinator.code}`);
-    }
-    if (attempted() > 0) r.possiblyEffected = true;
-    return stop(`COORDINATOR_${r.coordinator.outcome}:${r.coordinator.code}`);
+    return s1;
   };
   const bounded = (p, ms) => new Promise((resolve) => { let t = null; const fin = (v) => { try { clearT(t); } catch { /* ignore */ } resolve(v); };
     t = setT(() => fin({ done: false }), ms, "teardown"); Promise.resolve().then(() => p).then((value) => fin({ done: true, value }), () => fin({ done: true, threw: true })); });
@@ -871,6 +989,7 @@ export async function runPipelineCore(input) {
   } finally {
     finalized = true;
     if (timerHandle !== null) { try { clearT(timerHandle); } catch { /* ignore */ } }
+    if (waitHandle !== null) { try { clearT(waitHandle); } catch { /* ignore */ } waitHandle = null; }
     if (coP !== null) { const s2 = await bounded(coP, B0.teardownMs); r.coordinatorSettled = s2.done === true; }
     if (r.sealed && r.outcome !== "STOP") { r.outcome = "STOP"; r.code = code(`STOP_${stopReason}`, "STOP_SEALED"); r.verifiedCompletion = false; r.postcheck = null; r.nextActionAt = null; }
     if (lockT) {
