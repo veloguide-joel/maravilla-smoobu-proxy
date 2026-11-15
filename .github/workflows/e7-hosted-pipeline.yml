@@ -1,8 +1,8 @@
 # E7 C90: HOSTED TEST PIPELINE runner (scripts/e7-hosted-pipeline.mjs): ONE bounded invocation of the ACCEPTED test-pipeline coordinator
 # (lib/booking-db/test-pipeline-coordinator.js, immutable tooling 71c3dcf8) for ONE fresh accepted TEST checkout on listing 606998 — reservation →
 # capture → recording through the ACCEPTED workers / executor adapters / transports, replacing the manual S1 / S2 / S4 dispatch sequence.
-# SHIPPED CLOSED: the runner's executeEnabled is FALSE — `verify` (and therefore the execute job) refuses HPL_EXECUTE_CLOSED before any value,
-# import, credential, database or provider access; the secret step below is never reached while it is closed. HONEST LABEL: MANUAL hosted TEST
+# C92 ENABLE: the runner's executeEnabled is TRUE for ONE gated TEST run (the reverse CLOSE patch restores false; closed, `verify` refuses
+# HPL_EXECUTE_CLOSED before any value, import, credential, database or provider access, so the secret step is never reached). HONEST LABEL: MANUAL hosted TEST
 # runner (workflow_dispatch + the EXISTING `e7-readonly-probe` reviewer gate); NOT automatic checkout, NOT a cron / webhook / API / UI path.
 # ONE coordinator invocation per dispatch, <= 1 create / 1 capture / 1 offline-charge record; no sleep / poll / re-dispatch. PENDING (provider echo
 # needs time) reports a sanitized nextActionAt and needs a FUTURE, separately dispatched attempt with fresh proof. Refunds stay MANUAL; no
@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "preflight (default: no environment, no secrets, no database) or execute (SHIPPED CLOSED: refuses at verify; main only; needs a successful preflight of this dispatch)"
+        description: "preflight (default: no environment, no secrets, no database) or execute (C92 OPENED for ONE gated TEST run; main only; needs a successful preflight of this dispatch + the exact bindings)"
         type: choice
         options: [preflight, execute]
         default: preflight
@@ -187,7 +187,7 @@ jobs:
           d="$({ printf 'e7-hosted-pipeline-v1\n'; for f in scripts/e7-hosted-pipeline.mjs test/e7-hosted-pipeline.test.mjs test/e7-hosted-pipeline-workflow.test.mjs .github/workflows/e7-hosted-pipeline.yml; do printf '%s\0%s\0' "$f" "$(stat -c%s "wrapper/$f")"; cat "wrapper/$f"; printf '\0'; done; } | sha256sum | cut -d' ' -f1)"
           [ "$d" = "$E7_EXPECTED_SOURCE_DIGEST" ] || { echo "REFUSED: expected_source_digest mismatch (actual $d)"; exit 3; }
           echo "bindings ok: wrapper=$head tooling=$tool source=$d"
-      - name: Verify (runner; SHIPPED CLOSED → HPL_EXECUTE_CLOSED here; else closure / source / plan / approval bindings; no secret, no database)
+      - name: Verify (runner; closed → HPL_EXECUTE_CLOSED here; opened → closure / source / plan / approval / main bindings; no secret, no database)
         env:
           E7_TOOLING_DIR: ${{ github.workspace }}/tooling
           E7_APPROVAL_REF: ${{ inputs.approval_ref }}
