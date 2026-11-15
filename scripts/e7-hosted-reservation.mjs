@@ -3,7 +3,7 @@
 //
 // HONEST LABEL: this is MANUAL hosted TEST processing (workflow_dispatch + the existing reviewer gate), NOT automatic customer checkout.
 // `reservation_confirmed` is an INTERMEDIATE state: nothing is captured, recorded or notified by this runner; a capture row may be
-// QUEUED PRISTINE by the accepted state machine and is reported, never dispatched. Code is NOT consent; executeEnabled is CLOSED here.
+// QUEUED PRISTINE by the accepted state machine and is reported, never dispatched. Code is NOT consent; executeEnabled is OPEN in this revision (C73) for ONE ROOT-gated fresh TEST checkout run; the prepared CLOSE patch restores false at END / STOP.
 //   * Inert on import (`import.meta.main` guard): no env / fs / network / DB / timer until a mode runs.
 //   * Reuses the accepted lineage at ONE fixed tooling commit (checked out separately): runOrchestratorStep (E7.2 + PR56), createPhaseExecutors
 //     ('reservation' | 'reservation-recovery'), createE7HostawaySend / createE7StripeTestSend / createE7RealExchange, pool, repo.loadIntent,
@@ -30,7 +30,7 @@ export const CONSTANTS = Object.freeze({
   // the MERGED e7-test integration head (PR58–63; tree 004316db) — immutable tooling for this runner
   toolingCommit: "40779e34e8c65ac5c4494bc5a18cd4223ef723fa",
   toolingStatus: "MERGED",
-  executeEnabled: false,                                   // Slice 1: execution default CLOSED (verify / execute refuse ATC_EXECUTE_CLOSED)
+  executeEnabled: true,                                    // Slice 1: OPEN for ONE ROOT-gated fresh TEST run (C73); CLOSE patch restores false (verify / execute refuse HRS_EXECUTE_CLOSED when false)
   closure: Object.freeze(["package.json", "package-lock.json", "lib/bookability.js", "lib/booking-db/codec.js", "lib/booking-db/config.js",
     "lib/booking-db/operations.js", "lib/booking-db/pool.js", "lib/booking-db/recovery.js", "lib/booking-db/repo.js",
     "lib/booking-db/reservation-worker.js", "lib/checkout/capture-proof.js", "lib/checkout/compensation-proof.js", "lib/checkout/final-price.js",
