@@ -2,7 +2,7 @@
 
 **Status: CLOSED.** ONE fresh TEST checkout went through ONE manually gated dispatch of the merged hosted pipeline runner. Inside that single run the
 coordinator was invoked twice: the first returned `PENDING NOT_DUE` after ONE Hostaway create; after ONE bounded wait and a FINAL fresh
-re-admission, the second returned `CONFIRMED_VERIFIED`. Cumulative 1 create / 1 capture / 1 offline-charge record; no uncertain-write retry,
+re-admission, the second returned `CONFIRMED` and the runner verified `CONFIRMED_VERIFIED`. Cumulative 1 create / 1 capture / 1 offline-charge record; no uncertain-write retry,
 no third invocation. The pipeline was closed again (#141). All eight **tracked** runner `executeEnabled` flags are false on main `b637253a`.
 
 **What it validates:** one manually gated dispatch can bridge a healthy Hostaway non-echo delay to a verified completion (reservation → Stripe
@@ -46,7 +46,7 @@ PI `pi_3UcCBg2B9LTneQgw1FnY0jHm`, charge `ch_3UcCBg2B9LTneQgw1GRpciwq`, Hostaway
 | — | ROOT's ONE submit request was **denied by the automatic browser approval review before submission** (prior-submission outcome uncertain / retry risk); **no workaround, no retry** |
 | 22:26:14Z | DB: `payment_pending` v3, no PI, authorized null, captured 0, no reservation / offline charge (provider state not inferred) |
 | — | Joel reported clicking Pay once on the EXISTING checkout; exact click time unrecorded |
-| 22:47:08.392849Z | DB: `authorized` v4, authorized 14000, captured 0, no reservation / offline charge (no earlier provider state inferred) |
+| 22:47:08.392849Z | DB: `payment_authorized` v4, authorized 14000, captured 0, no reservation / offline charge (no earlier provider state inferred) |
 | 22:48:55.440Z | fresh baseline (§4) |
 | 22:50–22:53Z | the ONE run (§3) |
 | 22:54:34.624Z | ROOT END snapshot (§4) |
@@ -76,7 +76,7 @@ No repeated checkout was created.
 
 ## 4. Database [ROOT-obs]
 
-**Baseline (22:48:55.440Z):** exactly 11 ids; schema 23; catalog 23-child match; target `authorized` v4; the 10 foreign intents' whole rows and 23
+**Baseline (22:48:55.440Z):** exactly 11 ids; schema 23; catalog 23-child match; target `payment_authorized` v4; the 10 foreign intents' whole rows and 23
 children equal the previous C95 final snapshot; no leases, in-flight ops, cases, advisory locks or prepared transactions.
 
 **END (22:54:34.624Z):** the same 11 ids; the 10 foreign whole rows + 23 children byte-identical to the baseline; **all 7 globals identical** to the
