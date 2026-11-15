@@ -27,7 +27,7 @@ after(() => { assert.deepEqual(GUARD, { request: 0, Agent: 0, fetch: 0 }, "no re
 
 const WF = ".github/workflows/e7-resend-sink-probe.yml";
 const yml = readFileSync(join(ROOT, WF), "utf8");
-const PIN = "f05016a7af3f866e7e4d46d219a3b95934ca867c";
+const PIN = "46b3eaf801fd3c85e268e3bbdc7d20b7078cdd89";   // C65 repin (was f05016a7, C42)
 const PREFIX = "e7-resend-sink-probe-v1\n";
 const FILES = ["scripts/e7-resend-sink-probe.mjs", "scripts/e7-resend/resend-exchange.mjs", "test/e7-resend-sink-probe.test.mjs", WF];
 const count = (re) => (yml.match(re) || []).length;
@@ -49,7 +49,7 @@ test("W1 static: workflow_dispatch ONLY; inputs exactly mode (choice [preflight,
   assert.equal(count(/timeout-minutes: 5\n/g), 2); assert.doesNotMatch(yml, /timeout-minutes: (?!5\n)/); assert.equal(count(/runs-on: ubuntu-24\.04/g), 2);
 });
 
-test("W2 static: both jobs check out the wrapper at the EXACT dispatch SHA and the tooling at the immutable pin f05016a7, persist-credentials false; the same reviewed action pins as the existing hosted workflows; Node 22.22.0 without cache; no dependency install / curl / SDK anywhere", () => {
+test("W2 static: both jobs check out the wrapper at the EXACT dispatch SHA and the tooling at the immutable pin 46b3eaf8, persist-credentials false; the same reviewed action pins as the existing hosted workflows; Node 22.22.0 without cache; no dependency install / curl / SDK anywhere", () => {
   assert.equal(count(/ref: \$\{\{ github\.sha \}\}\n          path: wrapper\n          persist-credentials: false/g), 2);
   assert.equal(count(new RegExp(`repository: veloguide-joel/maravilla-smoobu-proxy\\n          ref: ${PIN}\\n          path: tooling\\n          persist-credentials: false`, "g")), 2);
   assert.equal(count(/persist-credentials: false/g), 4); assert.doesNotMatch(yml, /ref: main|ref: refs\/heads|ref: \$\{\{ github\.ref/);
@@ -96,7 +96,7 @@ const expectedDigest = async () => {
 const planHash = async (locale) => { const lt = await P.loadTooling(TOOLING); return P.buildPlan({ render: lt.render, locale }).plan.planHash; };
 
 test("W5 preflight gate blocks executed locally: bindings pass with HEAD == dispatch SHA, tooling == pin, a known mode and locale; REFUSE (exit 3) on a foreign SHA / pin, unknown mode or locale; the digest block prints the documented framed SHA-256 and refuses a non-matching expected_source_digest", async () => {
-  assert.equal(toolSha, PIN, "E7_TOOLING_DIR must be the pinned f05016a7 checkout");
+  assert.equal(toolSha, PIN, "E7_TOOLING_DIR must be the pinned 46b3eaf8 checkout");
   const d = sandbox(); try {
     const bind = runBlock("Verify checkout bindings (wrapper HEAD == dispatch SHA; tooling HEAD == pin; mode; locale; no secrets)");
     for (const [mode, locale] of [["preflight", "en"], ["send", "es"]]) { const ok = sh(bind, { E7_WORKFLOW_SHA: headSha, E7_TOOLING_PIN: PIN, E7_MODE: mode, E7_LOCALE: locale }, d); assert.equal(ok.status, 0, ok.out); assert.match(ok.out, /bindings ok/); }

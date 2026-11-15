@@ -30,7 +30,7 @@ const X = await import("../scripts/e7-resend/resend-exchange.mjs");
 const sha = (b) => createHash("sha256").update(b).digest("hex");
 
 const LT = await P.loadTooling(TOOLING);
-assert.equal(LT.ok, true, "E7_TOOLING_DIR must be the immutable f05016a7 checkout");
+assert.equal(LT.ok, true, "E7_TOOLING_DIR must be the immutable 46b3eaf8 checkout");
 const plan = (locale) => { const r = P.buildPlan({ render: LT.render, locale }); assert.equal(r.ok, true); return r.plan; };
 const KEY = "re_SENTINELkey0123456789";
 const RUN = "43999000111";
@@ -50,21 +50,30 @@ const EN = { subject: "Your maraVilla booking MV-SINKPROBE is confirmed", text: 
   "Check-out: 2030-01-16", "Nights: 2", "Guests: 2", "Payment received: $123.45 USD", "", "maraVilla"].join("\n") };
 const ES = { subject: "Tu reservación de maraVilla MV-SINKPROBE está confirmada", text: ["Tu reservación de maraVilla MV-SINKPROBE está confirmada.", "Referencia de la reservación: MV-SINKPROBE",
   "Llegada (check-in): 2030-01-14", "Salida (check-out): 2030-01-16", "Noches: 2", "Huéspedes: 2", "Pago recibido: $123.45 USD", "", "maraVilla"].join("\n") };
-const PINNED = { en: { bodyHash: "6645ae194d8eff4c992c214baa5eccfcfe53c1a9771d6f73afafbe34408cae32", planHash: "7cb4f50f6e51346685eef120460e2728566304107105d9067d2c8e34a12397b2", bytes: 343 },
-  es: { bodyHash: "b59f5703b2aaf53e9c806eaab052867d305626e16c6a5c9a307e91dd123e3705", planHash: "811d7bdbde333a3909895bc94cbf07788584132dc0bc2259803cf69f38fb4814", bytes: 395 } };
+// C65 pins (sender MiCasaDirect, tooling 46b3eaf8). The C42 / C44 plans (onboarding sender, tooling f05016a7) are listed in OLD and must be refused.
+const PINNED = { en: { bodyHash: "47b16d4ca8ba303f79c846d8e566f86ea4855ce9e07198369d0624632f0437aa", planHash: "9f57efeac07955990999dbfecaf703ca10a03fc2674aae51b856a0cce0f9a796", bytes: 350 },
+  es: { bodyHash: "d18c85cdc5785267235a54bdbf03175e749ddd8ef2d1b80fea56f9550f931929", planHash: "62d5750ed7ea386a74452e1cb16dfe8221f3f3d24ca3553f976d44de7b0e1c8d", bytes: 402 } };
+const OLD = { sender: "maraVilla TEST <onboarding@resend.dev>", toolingCommit: "f05016a7af3f866e7e4d46d219a3b95934ca867c",
+  en: { bodyHash: "6645ae194d8eff4c992c214baa5eccfcfe53c1a9771d6f73afafbe34408cae32", planHash: "7cb4f50f6e51346685eef120460e2728566304107105d9067d2c8e34a12397b2" },
+  es: { bodyHash: "b59f5703b2aaf53e9c806eaab052867d305626e16c6a5c9a307e91dd123e3705", planHash: "811d7bdbde333a3909895bc94cbf07788584132dc0bc2259803cf69f38fb4814" } };
 
 // =============================================================================================
 
-test("R1 constants: fixed sender / singleton sink recipient / synthetic facts (no real booking ref) / route / budgets / pin / 2-file copy closure + node:crypto", () => {
-  assert.equal(P.SENDER, "maraVilla TEST <onboarding@resend.dev>");
+test("R1 constants: fixed approved MiCasaDirect sender / singleton sink recipient / synthetic facts (no real booking ref) / route / budgets / pin / 3-file closure + node:crypto", async () => {
+  assert.equal(P.SENDER, "MiCasaDirect <bookings@mail.micasadirect.com>");
+  const SI = await import(join(TOOLING, "lib/notify/sender-identity.js"));
+  assert.equal(P.SENDER, `${SI.APPROVED_REAL_SENDER.fromName} <${SI.APPROVED_REAL_SENDER.fromAddress}>`, "taken from / equal to the pinned approved identity");
+  assert.notEqual(P.SENDER, OLD.sender);
   assert.deepEqual([...P.RECIPIENTS], ["delivered@resend.dev"]);
   assert.deepEqual([...P.LOCALES], ["en", "es"]);
   assert.deepEqual({ ...P.SYNTHETIC_FACTS }, { ref: "MV-SINKPROBE", checkIn: "2030-01-14", checkOut: "2030-01-16", nights: 2, guests: 2, totalMinor: 12345, currency: "USD" });
   for (const real of ["MV-8L79DEJ7", "MV-5RBRW6CM", "71700931", "abede8b1", "c83c1842", "70636076", "71045356", "71072615", "71081885"]) assert.ok(!JSON.stringify(P.SYNTHETIC_FACTS).includes(real), real);
   assert.deepEqual([X.RESEND_METHOD, X.RESEND_HOST, X.RESEND_PORT, X.RESEND_PATH], ["POST", "api.resend.com", 443, "/emails"]);
   assert.deepEqual({ ...P.BUDGETS }, { maxBytes: 65536, deadlineMs: 10000, attempts: 1 });
-  assert.equal(P.TOOLING_COMMIT, "f05016a7af3f866e7e4d46d219a3b95934ca867c");
-  assert.deepEqual(Object.keys(P.MANIFEST).sort(), ["lib/checkout/booking-confirmation-copy.js", "lib/checkout/guest-notification.js"]);
+  assert.equal(P.TOOLING_COMMIT, "46b3eaf801fd3c85e268e3bbdc7d20b7078cdd89");
+  assert.deepEqual([...P.ROOTS], ["lib/checkout/booking-confirmation-copy.js", "lib/notify/sender-identity.js"]);
+  assert.deepEqual(Object.keys(P.MANIFEST).sort(), ["lib/checkout/booking-confirmation-copy.js", "lib/checkout/guest-notification.js", "lib/notify/sender-identity.js"]);
+  assert.equal(P.MANIFEST["lib/notify/sender-identity.js"], "1430b2a60940aa4f7f82f834a2ac99df82cb607b198aab801dca1f2b5a12008a");
   assert.deepEqual([...P.BUILTIN_IMPORTS], ["node:crypto"]);
   assert.deepEqual([...P.HEADER_NAMES], ["Authorization", "Content-Type", "Content-Length", "User-Agent", "Idempotency-Key", "Accept", "Accept-Encoding"]);
   assert.match(P.USER_AGENT, /^[\x21-\x7E]+\/1$/, "a User-Agent is REQUIRED by the API introduction (403 without one)");
@@ -83,7 +92,7 @@ test("R2 copy closure: an INDEPENDENT scan of the pinned checkout is exactly the
 test("R3 EN / ES exact JSON body bytes (accepted bcc-v1 copy unchanged), body / plan hashes pinned and content-derived; locale is the ONLY content choice", () => {
   for (const [locale, c] of [["en", EN], ["es", ES]]) {
     const pl = plan(locale);
-    const want = `{"from":"maraVilla TEST <onboarding@resend.dev>","to":["delivered@resend.dev"],"subject":${JSON.stringify(c.subject)},"text":${JSON.stringify(c.text)}}`;
+    const want = `{"from":"MiCasaDirect <bookings@mail.micasadirect.com>","to":["delivered@resend.dev"],"subject":${JSON.stringify(c.subject)},"text":${JSON.stringify(c.text)}}`;
     assert.ok(pl.body.equals(Buffer.from(want, "utf8")), `${locale}: exact body bytes (boolean compare)`);
     assert.deepEqual([pl.bodyHash, pl.planHash, pl.bodyBytes], [PINNED[locale].bodyHash, PINNED[locale].planHash, PINNED[locale].bytes], locale);
     assert.equal(pl.bodyHash, sha(Buffer.from(want, "utf8")));
@@ -97,6 +106,34 @@ test("R3 EN / ES exact JSON body bytes (accepted bcc-v1 copy unchanged), body / 
   // a renderer that changes the copy (contract / locale / shape) is refused
   for (const bad of [() => ({ ok: true, copy: { contractVersion: "bcc-v2", locale: "en", subject: "x", text: "y" } }), () => ({ ok: true, copy: { contractVersion: "bcc-v1", locale: "es", subject: "x", text: "y" } }),
     () => ({ ok: false, code: "X" }), () => { throw new Error("SENTINEL"); }]) assert.deepEqual({ ...P.buildPlan({ render: bad, locale: "en" }) }, { ok: false, code: "COPY_REFUSED" });
+});
+
+test("R3b C65 the OLD C42 / C44 sender / plans / tooling are refused BEFORE any network: old plan hashes → PLAN_HASH_MISMATCH (no key read); an old-sender body → GUARD_REFUSED; the f05016a7 closure shape (no sender-identity.js) and a tampered / mismatching identity → refused before / at load", async () => {
+  for (const l of ["en", "es"]) {
+    const pl = plan(l);
+    assert.notEqual(pl.planHash, OLD[l].planHash); assert.notEqual(pl.bodyHash, OLD[l].bodyHash);
+    const { r, s, cred } = await send(pl, { input: { expectedPlanHash: OLD[l].planHash } });
+    assert.deepEqual([r.outcome, r.stop, s.calls, cred.n], ["REFUSED_BEFORE_NETWORK", "PLAN_HASH_MISMATCH", 0, 0], l);
+  }
+  const pl = plan("en");
+  const oldBody = Buffer.from(JSON.stringify({ ...JSON.parse(pl.body.toString("utf8")), from: OLD.sender }), "utf8");
+  const req = { method: "POST", host: "api.resend.com", path: "/emails", body: oldBody, headers: { Authorization: `Bearer ${KEY}`, "Content-Type": "application/json", "Content-Length": String(pl.bodyBytes),
+    "User-Agent": P.USER_AGENT, "Idempotency-Key": P.idempotencyKey(pl.planHash, RUN), Accept: "application/json", "Accept-Encoding": "identity" } };
+  assert.equal(P.guardRequest(req, pl), "GUARD_REFUSED");
+  const mk = (mut) => { const d = mkdtempSync(join(tmpdir(), "e7-c65-tool-")); for (const f of Object.keys(P.MANIFEST)) cpSync(join(TOOLING, f), join(d, f)); mut(d); return d; };
+  for (const [kind, mut, code] of [["f05016a7 shape (no sender-identity.js)", (d) => rmSync(join(d, "lib/notify/sender-identity.js")), "TOOLING_INVALID"],
+    ["identity rewritten to the old onboarding sender", (d) => { const f = join(d, "lib/notify/sender-identity.js"); writeFileSync(f, readFileSync(f, "utf8").replace('fromName: "MiCasaDirect"', 'fromName: "maraVilla TEST"')); }, "TOOLING_CLOSURE_MISMATCH"]]) {
+    const d = mk(mut); let imports = 0;
+    try { const r = await P.loadTooling(d, { importModule: async () => { imports += 1; return {}; } }); assert.deepEqual([r.ok, r.code, imports], [false, code, 0], kind); } finally { rmSync(d, { recursive: true, force: true }); }
+  }
+  // even with a matching closure, an imported identity that differs from the fixed sender (or a predicate that rejects it) is refused before any plan
+  const copy = await import(join(TOOLING, "lib/checkout/booking-confirmation-copy.js"));
+  for (const si of [{ APPROVED_REAL_SENDER: Object.freeze({ fromAddress: "onboarding@resend.dev", fromName: "maraVilla TEST" }), isApprovedRealSender: () => true },
+    { APPROVED_REAL_SENDER: Object.freeze({ fromAddress: "bookings@mail.micasadirect.com", fromName: "MiCasaDirect" }), isApprovedRealSender: () => false },
+    { APPROVED_REAL_SENDER: { fromAddress: "bookings@mail.micasadirect.com", fromName: "MiCasaDirect" }, isApprovedRealSender: () => true }, {}]) {
+    let n = 0; const r = await P.loadTooling(TOOLING, { importModule: async (p) => { n += 1; return p.endsWith("sender-identity.js") ? si : copy; } });
+    assert.deepEqual([r.ok, r.code, n], [false, "TOOLING_INVALID", 2]);
+  }
 });
 
 test("R4 ONE fake POST, exact request bytes: route, header object (names / order / values), Authorization only from the key seam, Idempotency-Key = probe/run/attempt-1/planHash (≤ 256); happy → PROVIDER_ACCEPTED with the allowlisted UUID", async () => {
@@ -345,7 +382,7 @@ test("R12 end to end through the REAL exchange (fake primitive): runSend → ONE
     outs.push(JSON.stringify(r), P.formatResult(r));
   }
   for (const o of outs) {
-    for (const bad of [KEY, "Bearer", "SENTINEL", "guest@example.com", "delivered@resend.dev", "onboarding@resend.dev", "maraVilla booking", "reservaci", "Payment received", "Pago recibido", "validation_error"]) {
+    for (const bad of [KEY, "Bearer", "SENTINEL", "guest@example.com", "delivered@resend.dev", "onboarding@resend.dev", "micasadirect", "MiCasaDirect", "maraVilla booking", "reservaci", "Payment received", "Pago recibido", "validation_error"]) {
       assert.ok(!o.includes(bad), `sanitized output excludes ${bad.slice(0, 12)}`);
     }
   }

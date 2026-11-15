@@ -3,10 +3,12 @@
 // NOT proof that any real inbox received mail. The gn-v2 builder / notification worker / SQL fences are NOT imported, changed or wired to Resend.
 //
 // What it sends (and ALL it can send), per reviewed dispatch: exactly ONE POST https://api.resend.com/emails with the JSON body
-//   {"from":"maraVilla TEST <onboarding@resend.dev>","to":["delivered@resend.dev"],"subject":<bcc-v1 subject>,"text":<bcc-v1 text>}
+//   {"from":"MiCasaDirect <bookings@mail.micasadirect.com>","to":["delivered@resend.dev"],"subject":<bcc-v1 subject>,"text":<bcc-v1 text>}
+// (C65: the sender is the source-approved MiCasaDirect identity, taken from / asserted equal to the immutable tooling's lib/notify/sender-identity.js
+// APPROVED_REAL_SENDER; its Resend domain was reported VERIFIED by ROOT on 2026-11-15. C42 / C44 used 'maraVilla TEST <onboarding@resend.dev>', now refused.)
 // — sender and recipient FIXED (the recipient is Resend's documented delivery-simulation sink, an exact singleton: no caller / address override,
 // no +label, no CC / BCC / reply-to / HTML / attachments / tags / headers / scheduling / template). The subject / text are the ACCEPTED bilingual
-// booking-confirmation copy (renderBookingConfirmation, contract bcc-v1) loaded from the IMMUTABLE tooling commit f05016a7 and fed FIXED SYNTHETIC
+// booking-confirmation copy (renderBookingConfirmation, contract bcc-v1) loaded from the IMMUTABLE tooling commit 46b3eaf8 and fed FIXED SYNTHETIC
 // facts (ref MV-SINKPROBE, 2030 dates, USD 123.45 = 12345 minor) that match no real intent / reservation. The explicit locale en | es is the ONLY
 // content choice.
 //
@@ -30,16 +32,21 @@ import { createResendExchange, RESEND_HOST, RESEND_PATH, RESEND_METHOD, EXCHANGE
 
 const freeze = Object.freeze;
 export const PROBE_VERSION = "e7-resend-sink-probe-v1";
-/** IMMUTABLE tooling commit carrying the accepted bcc-v1 copy (e7-test merge of #110) */
-export const TOOLING_COMMIT = "f05016a7af3f866e7e4d46d219a3b95934ca867c";
-/** the ONE import root; MANIFEST = its complete transitive relative-import closure at the pin (scanned independently; + node:crypto only) */
-export const ROOTS = freeze(["lib/checkout/booking-confirmation-copy.js"]);
+/** IMMUTABLE tooling commit carrying the accepted bcc-v1 copy + the approved sender identity (e7-test merge of #120, C54; C65 repin from f05016a7 —
+ *  the two copy files are byte-identical at both pins) */
+export const TOOLING_COMMIT = "46b3eaf801fd3c85e268e3bbdc7d20b7078cdd89";
+/** the import roots; MANIFEST = their complete transitive relative-import closure at the pin (scanned independently; + node:crypto only) */
+export const ROOTS = freeze(["lib/checkout/booking-confirmation-copy.js", "lib/notify/sender-identity.js"]);
 export const MANIFEST = freeze({
   "lib/checkout/booking-confirmation-copy.js": "b393f9b60098c002db3e1d0fcc2966bf52aede4c0a337c9c64bdfe3a9304ef91",
-  "lib/checkout/guest-notification.js": "0bea6251a70fe7d47cd1175effd63815d65f905a6ee20bc5311a93eba518251c"
+  "lib/checkout/guest-notification.js": "0bea6251a70fe7d47cd1175effd63815d65f905a6ee20bc5311a93eba518251c",
+  "lib/notify/sender-identity.js": "1430b2a60940aa4f7f82f834a2ac99df82cb607b198aab801dca1f2b5a12008a"
 });
 export const BUILTIN_IMPORTS = freeze(["node:crypto"]);
-export const SENDER = "maraVilla TEST <onboarding@resend.dev>";
+/** FIXED sender = `${APPROVED_REAL_SENDER.fromName} <${APPROVED_REAL_SENDER.fromAddress}>` of the pinned tooling (checked in loadTooling before any plan) */
+export const SENDER_ADDRESS = "bookings@mail.micasadirect.com";
+export const SENDER_NAME = "MiCasaDirect";
+export const SENDER = `${SENDER_NAME} <${SENDER_ADDRESS}>`;
 export const RECIPIENTS = freeze(["delivered@resend.dev"]);
 export const LOCALES = freeze(["en", "es"]);
 /** FIXED SYNTHETIC facts — no real intent / reservation / booking ref (≠ MV-8L79DEJ7, MV-5RBRW6CM) */
@@ -99,6 +106,11 @@ export async function loadTooling(dir, deps = {}) {
   try {
     const m = await imp(`${root}/${ROOTS[0]}`);
     if (typeof m.renderBookingConfirmation !== "function" || m.COPY_CONTRACT_VERSION !== "bcc-v1") return freeze({ ok: false, code: "TOOLING_INVALID" });
+    // the fixed sender MUST equal the pinned approved identity exactly (and be the one the identity predicate accepts); else refuse before any plan
+    const si = await imp(`${root}/${ROOTS[1]}`);
+    const a = si.APPROVED_REAL_SENDER;
+    if (!isObj(a) || !Object.isFrozen(a) || JSON.stringify(Object.keys(a).sort()) !== '["fromAddress","fromName"]' || a.fromAddress !== SENDER_ADDRESS || a.fromName !== SENDER_NAME
+        || typeof si.isApprovedRealSender !== "function" || si.isApprovedRealSender(SENDER_ADDRESS, SENDER_NAME) !== true) return freeze({ ok: false, code: "TOOLING_INVALID" });
     return freeze({ ok: true, render: m.renderBookingConfirmation, copyContractVersion: m.COPY_CONTRACT_VERSION, manifest: scan.files });
   } catch { return freeze({ ok: false, code: "TOOLING_INVALID" }); }
 }

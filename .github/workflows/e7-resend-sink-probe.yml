@@ -1,8 +1,9 @@
 # E7 C42: Resend SYNTHETIC sink-send TRANSPORT PROBE — the first provider POST shape, BEFORE any real guest send is integrated. Runs
 # `scripts/e7-resend-sink-probe.mjs` + its own `scripts/e7-resend/resend-exchange.mjs` (node built-ins only, no SDK, no install): at most ONE
-# POST https://api.resend.com/emails per dispatch, from the FIXED sender 'maraVilla TEST <onboarding@resend.dev>' to the FIXED singleton
+# POST https://api.resend.com/emails per dispatch, from the FIXED sender 'MiCasaDirect <bookings@mail.micasadirect.com>' (C65; was the C42/C44
+# 'maraVilla TEST <onboarding@resend.dev>') to the FIXED singleton
 # ['delivered@resend.dev'] (Resend's documented delivery-SIMULATION sink; no override, no label, no CC / BCC / reply-to / HTML / attachments),
-# subject / text = the ACCEPTED bilingual bcc-v1 booking-confirmation copy from the IMMUTABLE tooling commit f05016a7 with FIXED SYNTHETIC facts
+# subject / text = the ACCEPTED bilingual bcc-v1 booking-confirmation copy (+ the approved sender identity) from the IMMUTABLE tooling commit 46b3eaf8 with FIXED SYNTHETIC facts
 # (no real booking / intent / reservation). HONEST LABEL: a SYNTHETIC transport probe — NOT a booking notification, NOT a guest send, NOT proof
 # that a real inbox received mail. No retry of any kind, no redirect follow, no decompression, finite body (65 536 bytes), 10 s total deadline,
 # run attempt 1 only (a rerun is refused before the key is read). No DB, no Hostaway, no Stripe, no CA, no worker. Inputs / labels / hashes are
@@ -63,11 +64,11 @@ jobs:
           ref: ${{ github.sha }}
           path: wrapper
           persist-credentials: false
-      - name: Checkout accepted bcc-v1 copy tooling (fixed commit f05016a7)
+      - name: Checkout accepted bcc-v1 copy + sender-identity tooling (fixed commit 46b3eaf8)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: f05016a7af3f866e7e4d46d219a3b95934ca867c
+          ref: 46b3eaf801fd3c85e268e3bbdc7d20b7078cdd89
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0
@@ -78,7 +79,7 @@ jobs:
       - name: Verify checkout bindings (wrapper HEAD == dispatch SHA; tooling HEAD == pin; mode; locale; no secrets)
         env:
           E7_WORKFLOW_SHA: ${{ github.sha }}
-          E7_TOOLING_PIN: f05016a7af3f866e7e4d46d219a3b95934ca867c
+          E7_TOOLING_PIN: 46b3eaf801fd3c85e268e3bbdc7d20b7078cdd89
           E7_MODE: ${{ inputs.mode }}
           E7_LOCALE: ${{ inputs.locale }}
         run: |
@@ -120,11 +121,11 @@ jobs:
           ref: ${{ github.sha }}
           path: wrapper
           persist-credentials: false
-      - name: Checkout accepted bcc-v1 copy tooling (fixed commit f05016a7)
+      - name: Checkout accepted bcc-v1 copy + sender-identity tooling (fixed commit 46b3eaf8)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: f05016a7af3f866e7e4d46d219a3b95934ca867c
+          ref: 46b3eaf801fd3c85e268e3bbdc7d20b7078cdd89
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0
@@ -135,7 +136,7 @@ jobs:
       - name: Re-check bindings BEFORE the send (HEAD == dispatch SHA; tooling pin + copy closure; source digest; plan hash; label; run attempt 1; no secrets)
         env:
           E7_WORKFLOW_SHA: ${{ github.sha }}
-          E7_TOOLING_PIN: f05016a7af3f866e7e4d46d219a3b95934ca867c
+          E7_TOOLING_PIN: 46b3eaf801fd3c85e268e3bbdc7d20b7078cdd89
           E7_TOOLING_DIR: ${{ github.workspace }}/tooling
           E7_LOCALE: ${{ inputs.locale }}
           E7_APPROVAL_REF: ${{ inputs.approval_ref }}
