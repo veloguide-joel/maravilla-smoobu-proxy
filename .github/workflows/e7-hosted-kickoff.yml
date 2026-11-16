@@ -102,7 +102,7 @@ jobs:
           [ "$head" = "$E7_WORKFLOW_SHA" ] || { echo "REFUSED: wrapper HEAD != dispatch SHA"; exit 3; }
           tool="$(git -C tooling rev-parse HEAD)"
           [ "$tool" = "$E7_TOOLING_PIN" ] || { echo "REFUSED: tooling HEAD != pin"; exit 3; }
-          case "$E7_MODE" in preflight|verify|execute) ;; *) echo "REFUSED: mode"; exit 3 ;; esac
+          case "$E7_MODE" in preflight|verify|execute|detect) ;; *) echo "REFUSED: mode"; exit 3 ;; esac
           echo "bindings ok: wrapper=$head tooling=$tool mode=$E7_MODE"
       - name: Preflight (runner spawns the focused FAKE tests; digests; no environment, no secret, no database, no dependency install)
         env:
