@@ -10,6 +10,11 @@
 # The existing DB secret NAME E7_DEV_BOOKING_DATABASE_URL + the pinned Supabase CA appear in that SAME final step only.
 # RELEASE BINDING: the transport's expectedMainSha is this run's own github.sha, used only after the SAME checkout's pipeline runnerFiles frame to
 # the reviewed ENABLE source digest f09bcbbd…0999 (closure f7d7cad6…7273) — checked below in shell BEFORE any secret and again by the runner.
+# C113 DETECT (MANUAL workflow_dispatch only; no schedule): mode `detect` = preflight → verify (CLOSED flags → CLOSED_NOOP exit 0, open=false:
+# the gated jobs are SKIPPED, 0 DB-secret reads, 0 approval prompts) → `detect` (environment e7-readonly-probe = APPROVAL #1; the DB secret
+# in its final step only; ONE rolled-back read-only snapshot; NO token, NO transport; declared outputs outcome + fingerprint only, never an
+# identifier) → `execute` (APPROVAL #2, ONLY when detect output outcome == ONE; re-selects server-side and requires the same fingerprint).
+# Manual `execute` stays reachable when `detect` is SKIPPED; a failed / cancelled preflight / verify / detect never reaches a secret job.
 # Source digest = SHA-256 over: prefix "e7-hosted-kickoff-v1\n", then for each file IN THIS ORDER
 #   1. scripts/e7-hosted-kickoff.mjs  2. test/e7-hosted-kickoff.test.mjs  3. test/e7-hosted-kickoff-workflow.test.mjs  4. .github/workflows/e7-hosted-kickoff.yml
 # the frame  <relative path> NUL <decimal byte length> NUL <file bytes> NUL  (the framedDigest convention of the reviewed runners).
@@ -19,9 +24,9 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "preflight (default: no environment, no secrets, no database), verify (no secret) or execute (SHIPPED CLOSED; main only; e7-readonly-probe gate)"
+        description: "preflight (default: no environment, no secrets, no database), verify (no secret), execute (manual bindings; SHIPPED CLOSED; main only; gate) or detect (C113: NO binding inputs; two gates)"
         type: choice
-        options: [preflight, verify, execute]
+        options: [preflight, verify, execute, detect]
         default: preflight
       intent_id:
         description: "The ONE bound durable kickoff request's intent id (UUID); all five empty = SYNTHETIC preflight only."
@@ -112,11 +117,13 @@ jobs:
 
   verify:
     needs: preflight
-    if: inputs.mode == 'verify' || inputs.mode == 'execute'
+    if: inputs.mode == 'verify' || inputs.mode == 'execute' || inputs.mode == 'detect'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
+    outputs:
+      open: ${{ steps.verify.outputs.open }}
     steps:
       - name: Checkout wrapper (this repository, exact dispatched commit)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -136,8 +143,10 @@ jobs:
         with:
           node-version: "22.22.0"
           package-manager-cache: false
-      - name: Verify (runner; SHIPPED CLOSED → HKO_EXECUTE_CLOSED here; no secret, no database, no environment)
+      - name: Verify (runner; SHIPPED CLOSED → HKO_EXECUTE_CLOSED here, or CLOSED_NOOP for detect; no secret, no database, no environment)
+        id: verify
         env:
+          E7_INPUT_MODE: ${{ inputs.mode }}
           E7_TOOLING_DIR: ${{ github.workspace }}/tooling
           E7_INTENT_ID: ${{ inputs.intent_id }}
           E7_BOOKING_REF: ${{ inputs.booking_ref }}
@@ -149,9 +158,74 @@ jobs:
           E7_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
         run: node wrapper/scripts/e7-hosted-kickoff.mjs verify
 
-  execute:
+  detect:
     needs: [preflight, verify]
-    if: inputs.mode == 'execute' && github.ref == 'refs/heads/main'
+    if: inputs.mode == 'detect' && needs.verify.outputs.open == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: e7-readonly-probe
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      outcome: ${{ steps.detect.outputs.outcome }}
+      fingerprint: ${{ steps.detect.outputs.fingerprint }}
+    steps:
+      - name: Checkout wrapper (this repository, exact dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout E7 kickoff tooling (fixed commit 4e79f266)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: 4e79f26619c26954fe89c1b626e7be0e138ef383
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Re-check bindings BEFORE the DB secret, detect (HEAD == dispatch SHA; tooling pin; kickoff source digest; pipeline release binding f09bcbbd)
+        env:
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_TOOLING_PIN: 4e79f26619c26954fe89c1b626e7be0e138ef383
+          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
+          E7_PIPELINE_SOURCE_PIN: f09bcbbdfac88ca8dfd212a386d2af03698f9b710a49189b0ac9262531510999
+        run: |
+          set -eu
+          head="$(git -C wrapper rev-parse HEAD)"
+          [ "$head" = "$E7_WORKFLOW_SHA" ] || { echo "REFUSED: wrapper HEAD != dispatch SHA"; exit 3; }
+          tool="$(git -C tooling rev-parse HEAD)"
+          [ "$tool" = "$E7_TOOLING_PIN" ] || { echo "REFUSED: tooling HEAD != pin"; exit 3; }
+          printf '%s' "$E7_EXPECTED_SOURCE_DIGEST" | grep -Eq '^[0-9a-f]{64}$' || { echo "REFUSED: expected_source_digest not 64-hex"; exit 3; }
+          d="$({ printf 'e7-hosted-kickoff-v1\n'; for f in scripts/e7-hosted-kickoff.mjs test/e7-hosted-kickoff.test.mjs test/e7-hosted-kickoff-workflow.test.mjs .github/workflows/e7-hosted-kickoff.yml; do printf '%s\0%s\0' "$f" "$(stat -c%s "wrapper/$f")"; cat "wrapper/$f"; printf '\0'; done; } | sha256sum | cut -d' ' -f1)"
+          [ "$d" = "$E7_EXPECTED_SOURCE_DIGEST" ] || { echo "REFUSED: expected_source_digest mismatch (actual $d)"; exit 3; }
+          p="$({ printf 'e7-hosted-pipeline-v1\n'; for f in scripts/e7-hosted-pipeline.mjs test/e7-hosted-pipeline.test.mjs test/e7-hosted-pipeline-workflow.test.mjs .github/workflows/e7-hosted-pipeline.yml; do printf '%s\0%s\0' "$f" "$(stat -c%s "wrapper/$f")"; cat "wrapper/$f"; printf '\0'; done; } | sha256sum | cut -d' ' -f1)"
+          [ "$p" = "$E7_PIPELINE_SOURCE_PIN" ] || { echo "REFUSED: pipeline at this commit is not the reviewed ENABLE source (actual $p)"; exit 3; }
+          echo "bindings ok: wrapper=$head tooling=$tool source=$d pipeline=$p"
+      - name: Install the pinned dependency from the verified lockfile (no lifecycle scripts)
+        working-directory: tooling
+        run: npm ci --ignore-scripts --omit=dev --no-audit --no-fund
+      - name: Fetch the public Supabase CA (the runner checks its pinned SHA-256)
+        run: curl --fail --silent --show-error --proto '=https' --max-time 20 -o "$RUNNER_TEMP/prod-ca-2021.crt" https://supabase-downloads.s3-ap-southeast-1.amazonaws.com/prod/ssl/prod-ca-2021.crt
+      - name: ONE gated read-only detection (the DB secret only, this step only; one rolled-back snapshot; no token, no dispatch)
+        id: detect
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_INPUT_MODE: ${{ inputs.mode }}
+          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          E7_CA_FILE: ${{ runner.temp }}/prod-ca-2021.crt
+          E7_DEV_BOOKING_DATABASE_URL: ${{ secrets.E7_DEV_BOOKING_DATABASE_URL }}
+        run: node wrapper/scripts/e7-hosted-kickoff.mjs detect
+
+  execute:
+    needs: [preflight, verify, detect]
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.preflight.result == 'success' && needs.verify.result == 'success' && ((inputs.mode == 'execute' && needs.detect.result == 'skipped') || (inputs.mode == 'detect' && needs.detect.result == 'success' && needs.detect.outputs.outcome == 'ONE')) }}
     runs-on: ubuntu-24.04
     environment: e7-readonly-probe
     timeout-minutes: 10
@@ -212,6 +286,8 @@ jobs:
           E7_WORKFLOW_SHA: ${{ github.sha }}
           E7_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
           E7_CA_FILE: ${{ runner.temp }}/prod-ca-2021.crt
+          E7_INPUT_MODE: ${{ inputs.mode }}
+          E7_EXPECTED_CANDIDATE_FINGERPRINT: ${{ needs.detect.outputs.fingerprint }}
           E7_DEV_BOOKING_DATABASE_URL: ${{ secrets.E7_DEV_BOOKING_DATABASE_URL }}
           E7_DISPATCH_TOKEN: ${{ github.token }}
         run: node wrapper/scripts/e7-hosted-kickoff.mjs execute

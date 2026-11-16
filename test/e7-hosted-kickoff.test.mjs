@@ -470,6 +470,236 @@ test("K10 C112 the CONSUMER's own acquisition is checked too: an unverified clie
 // ---------------------------------------------------------------------------------------------------------------------------------
 // OPT-IN INTEGRATION (E7_HKO_DB_TESTS=1; tooling with its pinned pg; PG_BIN): REAL 0024 + webhook authorization + consumer + transport on a
 // disposable PostgreSQL, a FAKE GitHub exchange. The hosted preflight child never sets it.
+// ---- C113: detect / selected through the SAME core (one seal, one deadline, one counter) -----------------------------------------------
+const ROW = Object.freeze({ intent_id: IID, ref: REF, authorized_version: 6, payment_intent_id: PI, amount_minor: "56000" });
+const ROW2 = Object.freeze({ ...ROW, intent_id: "11111111-2222-4333-8444-666666666666", ref: "MV-FAKE0002" });
+const CAND = Object.freeze({ intentId: IID, ref: REF, version: 6, paymentIntentId: PI, amountMinor: 56000 });
+const FP = E.candidateFingerprint(CAND);
+const FACTS_OK = Object.freeze({ request: { state: "requested", intent_id: IID, ref: REF, authorized_version: 6, payment_intent_id: PI, amount_minor: 56000, currency: "USD", listing_id: 606998 },
+  intent: { version: 6, status: "payment_authorized", payment: { paymentIntentId: PI, amountMinor: 56000 } } });
+/** a 5-statement facts reader on the client it is handed (the real readKickoffFacts is 5 statements; tagged so the ORDER is observable) */
+const factsVia = (facts, n = 5) => async (cl) => { for (let i = 0; i < n; i += 1) await cl.query("/*e7hko:facts*/ SELECT 1"); return facts; };
+const ADMISSION_TAGS = ["session", "env", ...E.CATALOG_PINS.functions.map(() => "fn"), "table"];
+const DMODS = Object.freeze({ readKickoffFacts: factsVia(FACTS_OK), kickoffAdmission: () => null, KICKOFF_SCOPE: PL.KICKOFF_SCOPE,
+  runPipelineKickoffOnce: trap("consumer"), createGithubWorkflowDispatch: () => { throw new Error("detect must not create a transport"); },
+  createGithubExchange: () => { throw new Error("detect must not create an exchange"); } });
+const detCore = (st, over = {}) => E.runKickoffCore({ mods: DMODS, pool: st.pool, binding: { source: "detect" }, constants: OPEN_CORE, ...over });
+const SEL = Object.freeze({ source: "selected", expectedFingerprint: FP, releaseSha: SHA_A });
+
+test("K11 C113 binding seam: source-less == manual (compat); source manual / selected / detect take EXACT keys; unknown tags, extra / missing keys, a bad fingerprint / SHA, or a credential / worker on detect → CORE_INVALID with 0 connect; the shipped CLOSED constants stop detect too", async () => {
+  assert.equal(E.CANDIDATE_PREFIX, "e7-kickoff-candidate-v1");
+  assert.equal(E.candidateFingerprint({ intentId: "00000000-0000-4000-8000-000000000001", ref: "MV-TEST0001", version: 4, paymentIntentId: "pi_SYNTHETIC0001", amountMinor: 14000 }),
+    "13e93ba6950bf74d5b1931cb4d95ad69ad4f90faf6c649878052d3347db905ea", "the contract test vector");
+  assert.equal(E.candidateFingerprint({ ...CAND, intentId: IID.toUpperCase() }), FP, "uuid lower-cased");
+  for (const bad of [{ ...CAND, version: 0 }, { ...CAND, amountMinor: 1.5 }, { ...CAND, ref: "" }, { ...CAND, intentId: "x" }, { ...CAND, paymentIntentId: "ch_1" }, null])
+    assert.equal(E.candidateFingerprint(bad), null, JSON.stringify(bad));
+  const st0 = fakePool(); const m = await core(st0); const m2 = await core(fakePool(), { binding: { source: "manual", ...BIND } });
+  assert.deepEqual([m.code, m.source, m2.code, m2.source], ["NO_BOUND_REQUEST", "manual", "NO_BOUND_REQUEST", "manual"]);
+  assert.ok(!st0.queries.some((t) => t === "snapbegin" || t === "detect"), "the manual path runs NO selection statement");
+  const st = fakePool();
+  for (const [label, o] of [
+    ["unknown tag", { binding: { ...BIND, source: "auto" } }], ["manual + extra key", { binding: { ...BIND, extra: 1 } }], ["manual missing key", { binding: { ...BIND, ref: undefined } }],
+    ["selected + extra", { binding: { ...SEL, intentId: IID } }], ["selected bad fp", { binding: { ...SEL, expectedFingerprint: FP.toUpperCase() } }],
+    ["selected empty fp", { binding: { ...SEL, expectedFingerprint: "" } }], ["selected bad sha", { binding: { ...SEL, releaseSha: "main" } }],
+    ["detect + extra", { binding: { source: "detect", intentId: IID } }], ["binding null", { binding: null }]])
+    assert.equal((await core(st, o)).code, "CORE_INVALID", label);
+  assert.equal((await detCore(st, { credential: () => "x" })).code, "CORE_INVALID", "detect never takes a credential");
+  assert.equal((await detCore(st, { workerId: "hko:x" })).code, "CORE_INVALID", "detect never takes a worker");
+  assert.equal((await detCore(st, { constants: C })).code, "HKO_DISPATCH_CLOSED");
+  assert.equal(st.connects, 0);
+});
+
+test("K12 C113 detect outcomes from ONE rolled-back snapshot on ONE client (BEGIN RR READ ONLY → SELECT … LIMIT 2 [→ 5 facts] → ROLLBACK): 0 → NO_REQUEST, >1 → AMBIGUOUS (never the oldest), 1 eligible → ONE + fingerprint; returns BEFORE any consumer / transport / exchange / credential; ≤ 18 statements, all clients clean", async () => {
+  const snapSeq = (facts) => [...ADMISSION_TAGS, "snapbegin", "detect", ...(facts ? Array(5).fill("facts") : []), "snapend"];
+  for (const [label, rows, want, fp, facts] of [["0 rows", [], "NO_REQUEST", null, false], ["2 rows", [ROW, ROW2], "AMBIGUOUS", null, false], ["1 row", [ROW], "ONE", FP, true]]) {
+    let params = null; const st = fakePool({ detect: (p) => { params = p; return { rows }; } }); const r = await detCore(st);
+    assert.deepEqual(params, [606998, "USD", C.scope.cutoff, [...C.scope.excludedIntentIds]], `${label}: bound params incl. the reviewed exclusions`);
+    assert.deepEqual([r.outcome, r.code, r.source, r.detect, r.claimed, r.gets, r.posts, r.credentialReads], ["DETECTED", want, "detect", { candidates: rows.length, fingerprint: fp }, false, 0, 0, 0], label);
+    assert.deepEqual(st.queries, snapSeq(facts), `${label}: statement order — facts INSIDE the snapshot`);
+    assert.equal(r.dbQueries, snapSeq(facts).length); assert.ok(r.dbQueries <= 18);
+    assert.ok(st.released.every((x) => x === "clean"), `${label}: released clean`);
+    assert.equal(r.tlsClientChecks, r.tlsClientVerified, `${label}: every acquired client verified`); assert.equal(r.tlsClientChecks, ADMISSION_TAGS.length + 1, "ONE snapshot client");
+  }
+  // the selection SQL itself: pending scope, LIMIT 2 (cardinality, not an order pick), excluded() + test / livemode / version guards
+  assert.match(E.QUERIES.detect, /WHERE r\.state = 'requested' AND r\.listing_id = \$1 AND r\.currency = \$2 AND r\.intent_created_at >= \$3::timestamptz/);
+  assert.match(E.QUERIES.detect, /AND NOT \(r\.intent_id = ANY \(\$4::uuid\[\]\)\)/); assert.doesNotMatch(E.QUERIES.detect, /pipeline_kickoff_excluded/, "the app role has no EXECUTE on it"); assert.match(E.QUERIES.detect, /ORDER BY r\.intent_id LIMIT 2$/);
+  assert.match(E.QUERIES.detect, /i\.environment = 'test' AND i\.payment_livemode = false AND i\.state = 'payment_authorized' AND i\.version = r\.authorized_version/);
+  assert.equal(E.QUERIES.snapBegin, "/*e7hko:snapbegin*/ BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"); assert.equal(E.QUERIES.snapEnd, "/*e7hko:snapend*/ ROLLBACK");
+});
+
+test("K13 C113 detect INELIGIBLE / STOP: historical target, not pristine, binding / intent mismatch, a consumer admission refusal → DETECTED INELIGIBLE:<code> (no write); a malformed row → STOP CANDIDATE_INVALID; a row-shape / statement error destroys the snapshot client (server rolls back) → STOP", async () => {
+  const hist = PL.KICKOFF_SCOPE.excludedIntentIds[0];
+  for (const [label, rows, mods, want] of [
+    ["historical", [{ ...ROW, intent_id: hist }], DMODS, "INELIGIBLE:HISTORICAL_TARGET"],
+    ["claimed", [ROW], { ...DMODS, readKickoffFacts: factsVia({ ...FACTS_OK, request: { ...FACTS_OK.request, state: "claimed" } }) }, "INELIGIBLE:NOT_PRISTINE:CLAIMED"],
+    ["vanished", [ROW], { ...DMODS, readKickoffFacts: factsVia({ request: null, intent: null }) }, "INELIGIBLE:NO_BOUND_REQUEST"],
+    ["amount", [ROW], { ...DMODS, readKickoffFacts: factsVia({ ...FACTS_OK, request: { ...FACTS_OK.request, amount_minor: 1 } }) }, "INELIGIBLE:BINDING_MISMATCH"],
+    ["intent moved", [ROW], { ...DMODS, readKickoffFacts: factsVia({ ...FACTS_OK, intent: { ...FACTS_OK.intent, version: 7 } }) }, "INELIGIBLE:INTENT_BINDING_MISMATCH"],
+    ["open case", [ROW], { ...DMODS, kickoffAdmission: () => "OPEN_CASE" }, "INELIGIBLE:OPEN_CASE"]]) {
+    const st = fakePool({ detect: () => ({ rows }) }); const r = await detCore(st, { mods });
+    assert.deepEqual([r.outcome, r.code, r.detect.fingerprint, r.claimed, r.credentialReads], ["DETECTED", want, null, false, 0], label);
+    assert.ok(!st.queries.includes("consumer"), `${label}: no write statement`);
+  }
+  const bad = fakePool({ detect: () => ({ rows: [{ ...ROW, amount_minor: "x" }] }) });
+  assert.deepEqual([(await detCore(bad)).outcome, (await detCore(fakePool({ detect: () => ({ rows: [{ ...ROW, amount_minor: "x" }] }) }))).code], ["STOP", "CANDIDATE_INVALID"]);
+  for (const [label, script] of [["rows not an array", { detect: () => ({ rows: null }) }], ["select error", { detect: () => { throw Object.assign(new Error("x"), { code: "40001" }); } }],
+    ["rollback error", { detect: () => ({ rows: [] }), snapend: () => { throw new Error("lost"); } }]]) {
+    const st = fakePool(script); const r = await detCore(st);
+    assert.equal(r.outcome, "STOP", label); assert.match(r.code, /^ADMISSION_READ_FAILED:/, label);
+    assert.equal(st.released.at(-1), "destroy", `${label}: the snapshot client is destroyed, never returned to the pool mid-transaction`);
+  }
+});
+
+test("K14 C113 budgets: detect runs under the DETECT budgets (60 s / 5 s teardown, 24 statements) in the SAME single seal; slow selection gets NO reset — one deadline timer for the whole core, a hung snapshot statement / the deadline / an abort seal it; the selected path keeps the execute budgets (90 s, 48)", async () => {
+  const D = C.detect.budgets;
+  assert.deepEqual({ ...D }, { runMs: 60000, teardownMs: 5000, connectMs: 8000, statementMs: 6000, dbQueries: 24, gets: 0, posts: 0, poolMax: 1 });
+  assert.deepEqual([C.budgets.runMs, C.budgets.teardownMs, C.budgets.dbQueries, C.budgets.gets, C.budgets.posts], [90000, 5000, 48, 1, 1], "execute budgets unchanged");
+  { const tm = fakeTimers(); const st = fakePool({ detect: () => ({ rows: [ROW] }) }); const r = await detCore(st, { timer: tm.timer, clearTimer: tm.clearTimer });
+    assert.equal(r.code, "ONE"); assert.equal(tm.ts.filter((h) => h.ms === D.runMs - D.teardownMs).length, 1, "ONE detect deadline");
+    assert.equal(tm.ts.filter((h) => h.ms === C.budgets.runMs - C.budgets.teardownMs).length, 0); }
+  { const st = fakePool({ detect: () => ({ rows: [ROW] }) });
+    const r = await detCore(st, { constants: { ...OPEN_CORE, detect: { budgets: { ...D, dbQueries: 12 } }, budgets: { ...C.budgets, dbQueries: 1 } } });
+    assert.deepEqual([r.outcome, r.code, r.dbQueries, r.dbBudgetRefused], ["STOP", "ADMISSION_READ_FAILED:DB_BUDGET", 12, 1], "the detect cap applies (the execute cap does not)");
+    assert.equal(st.released.at(-1), "destroy"); }
+  for (const src of ["detect", "selected"]) {
+    const B = src === "detect" ? D : C.budgets; const run = (st, o) => (src === "detect" ? detCore(st, o) : core(st, { binding: SEL, ...o }));
+    { const tm = fakeTimers(); const st = fakePool({ detect: () => new Promise(() => {}) }); const p = run(st, { timer: tm.timer, clearTimer: tm.clearTimer });
+      for (let i = 0; i < 40 && !st.queries.includes("detect"); i += 1) await new Promise((x) => setImmediate(x));
+      const deadlines = tm.ts.filter((h) => h.ms === B.runMs - B.teardownMs);
+      assert.equal(deadlines.length, 1, `${src}: ONE deadline, set before admission`); assert.equal(deadlines[0].cleared, false, `${src}: still running through the slow selection`);
+      tm.fire(B.runMs - B.teardownMs); const r = await p;
+      assert.deepEqual([r.outcome, r.code, r.sealed, r.dbInFlightAtSeal], ["STOP", "SEALED_ADMISSION:DEADLINE", true, 1], `${src}: slow selection → deadline seal`);
+      assert.equal(tm.ts.filter((h) => h.ms === B.runMs - B.teardownMs).length, 1, `${src}: no second deadline / budget reset`); }
+    { const tm = fakeTimers(); const st = fakePool({ snapbegin: () => new Promise(() => {}) }); const p = run(st, { timer: tm.timer, clearTimer: tm.clearTimer });
+      for (let i = 0; i < 40 && !st.queries.includes("snapbegin"); i += 1) await new Promise((x) => setImmediate(x));
+      tm.fire(B.statementMs); const r = await p; assert.equal(r.code, "SEALED_ADMISSION:DB_STATEMENT_TIMEOUT", src); assert.equal(st.released.at(-1), "destroy"); }
+    { const ac = new AbortController(); const st = fakePool({ detect: () => { ac.abort(); return new Promise(() => {}); } });
+      const r = await run(st, { runSignal: ac.signal }); assert.equal(r.code, "SEALED_ADMISSION:ABORTED", src); }
+  }
+});
+
+test("K15 C113 selected: re-selects in the SAME snapshot shape, then fingerprint EQUALITY, then the EXISTING facts / binding / admission / consumer path with the derived binding (releaseSha from the workflow); 0 / >1 / changed → STOP before any facts read, consumer, credential, GET or POST", async () => {
+  for (const [label, rows, want] of [["0 (a request settled / vanished after detect)", [], "NO_REQUEST"], ["2 (a second candidate before this snapshot)", [ROW, ROW2], "AMBIGUOUS"],
+    ["changed version", [{ ...ROW, authorized_version: 7 }], "CANDIDATE_CHANGED"], ["changed amount", [{ ...ROW, amount_minor: "56001" }], "CANDIDATE_CHANGED"],
+    ["another single request", [ROW2], "CANDIDATE_CHANGED"]]) {
+    const st = fakePool({ detect: () => ({ rows }) }); let calls = 0;
+    const r = await core(st, { binding: SEL, mods: { ...MODS, readKickoffFacts: async () => { calls += 1; return FACTS_OK; }, runPipelineKickoffOnce: trap("consumer") } });
+    assert.deepEqual([r.outcome, r.code, r.source, calls, r.claimed, r.gets, r.posts, r.credentialReads], ["STOP", want, "selected", 0, false, 0, 0, 0], label);
+    assert.deepEqual(st.queries, [...ADMISSION_TAGS, "snapbegin", "detect", "snapend"], `${label}: exactly the 3 re-selection statements`);
+  }
+  // equality → the existing path: facts on a NEW client AFTER the snapshot; the consumer gets the derived intent; phase-sensitive outcomes are preserved
+  for (const [consumerCode, outcome] of [["CLAIM_UNCERTAIN", "CLAIM_UNCERTAIN"], ["REFUSE_UNCERTAIN", "REFUSE_UNCERTAIN"], ["TX_NOT_CLEAN", "CLAIM_UNCERTAIN"], ["REFUSED:OPEN_CASE", "REFUSED"]]) {
+    let seen = null; const st = fakePool({ detect: () => ({ rows: [ROW] }) });
+    const r = await core(st, { binding: SEL, mods: { ...MODS, readKickoffFacts: factsVia(FACTS_OK), kickoffAdmission: () => null,
+      runPipelineKickoffOnce: async (pool, o) => { seen = o.intentId; return Object.freeze({ code: consumerCode, intentId: IID, claimed: false, dispatchAttempted: false, outcome: null, settled: false }); } } });
+    assert.deepEqual([r.outcome, r.code, seen, r.gets, r.posts, r.credentialReads], [outcome, consumerCode, IID, 0, 0, 0], consumerCode);
+    assert.deepEqual(st.queries, [...ADMISSION_TAGS, "snapbegin", "detect", "snapend", ...Array(5).fill("facts")]);
+    assert.ok(r.dbQueries <= 35 && r.dbQueries <= C.budgets.dbQueries);
+  }
+  // the facts read after the snapshot can still refuse with the EXISTING codes (a claim / settle landed between the two reads)
+  for (const [label, facts, want] of [["claimed meanwhile", { ...FACTS_OK, request: { ...FACTS_OK.request, state: "claimed" } }, "NOT_PRISTINE:CLAIMED"],
+    ["intent moved", { ...FACTS_OK, intent: { ...FACTS_OK.intent, status: "confirmed" } }, "INTENT_BINDING_MISMATCH"]]) {
+    const st = fakePool({ detect: () => ({ rows: [ROW] }) });
+    const r = await core(st, { binding: SEL, mods: { ...MODS, readKickoffFacts: factsVia(facts), runPipelineKickoffOnce: trap("consumer") } });
+    assert.deepEqual([r.outcome, r.code], ["STOP", want], label);
+  }
+  const hist = fakePool({ detect: () => ({ rows: [{ ...ROW, intent_id: PL.KICKOFF_SCOPE.excludedIntentIds[1] }] }) });
+  const hfp = E.candidateFingerprint({ ...CAND, intentId: PL.KICKOFF_SCOPE.excludedIntentIds[1] });
+  assert.equal((await core(hist, { binding: { ...SEL, expectedFingerprint: hfp } })).code, "HISTORICAL_TARGET");
+});
+
+test("K16 C113 summary / outputs never carry an identifier: summaryMarkdown shows the flow + detect outcome + candidate count, never the fingerprint", () => {
+  const md = E.summaryMarkdown({ mode: "detect", flow: "detect", code: "DETECT_DONE", executeEnabled: true, dispatchEnabled: true, pipeline: { bound: true }, runId: "1-1", closureDigest: "c", sourceDigest: "s",
+    cleanup: "POOL_ENDED", outputs: { outcome: "ONE", fingerprint: FP }, core: { outcome: "DETECTED", code: "ONE", detect: { candidates: 1, fingerprint: FP }, gets: 0, posts: 0, sealed: false } });
+  assert.match(md, /detect\/detect DETECT_DONE detect=ONE candidates=1/);
+  assert.ok(!md.includes(FP) && !md.includes(IID) && !md.includes(PI) && !md.includes(REF));
+});
+
+// ---- C113 hosted gates (runHosted) ----------------------------------------------------------------------------------------------------
+/** an env whose SECRET values are counted (non-secret public inputs may be read) */
+const secretCounted = (o) => { const n = { reads: 0, byKey: {} }; return { n, env: new Proxy(o, { get: (t, k) => { if (E.SECRET_KEYS.includes(k)) { n.reads += 1; n.byKey[k] = (n.byKey[k] ?? 0) + 1; } return t[k]; } }) }; };
+const detEnv = (over = {}) => ({ E7_TOOLING_DIR: TOOLING, E7_INPUT_MODE: "detect", E7_INTENT_ID: "", E7_BOOKING_REF: "", E7_EXPECTED_VERSION: "", E7_PAYMENT_INTENT_ID: "", E7_AMOUNT_MINOR: "",
+  E7_WORKFLOW_SHA: SHA_A, GITHUB_SHA: SHA_A, GITHUB_REF: "refs/heads/main", E7_RUN_ID: "123456-1", ...over });
+
+test("H9 C113 SHIPPED CLOSED detect flow: verify → CLOSED_NOOP exit 0 with output open=false (the gated jobs are skipped: 0 prompts, 0 DB secret); a secret / fingerprint NAME or any binding input refuses; a CLOSED detect / detect-flow execute → HKO_EXECUTE_CLOSED; unknown / inconsistent modes refuse — 0 secret reads, 0 import / head / core", async () => {
+  { const { n, env } = secretCounted(detEnv()); const r = await E.runHosted({ mode: "verify", env, proc: PROC, wrapperDir: ROOT, deps: TRAPS });
+    assert.deepEqual([r.exitCode, r.result.code, r.result.flow, r.result.outputs, n.reads], [0, "CLOSED_NOOP", "detect", { open: "false" }, 0]);
+    assert.equal(E.outputLines(r.result), "open=false\n"); }
+  for (const [label, mode, over, k] of [
+    ["verify + DB secret name", "verify", { E7_DEV_BOOKING_DATABASE_URL: "x" }, "HKO_SECRET_SCOPE_VIOLATION"],
+    ["verify + token name", "verify", { E7_DISPATCH_TOKEN: "x" }, "HKO_SECRET_SCOPE_VIOLATION"],
+    ["verify + fingerprint name", "verify", { E7_EXPECTED_CANDIDATE_FINGERPRINT: "" }, "HKO_SECRET_SCOPE_VIOLATION"],
+    ["verify + a binding input", "verify", { E7_INTENT_ID: IID }, "HKO_INPUT_INVALID"],
+    ["detect (closed)", "detect", { E7_DEV_BOOKING_DATABASE_URL: "x" }, "HKO_EXECUTE_CLOSED"],
+    ["detect-flow execute (closed)", "execute", { E7_EXPECTED_CANDIDATE_FINGERPRINT: FP, E7_DEV_BOOKING_DATABASE_URL: "x", E7_DISPATCH_TOKEN: "x" }, "HKO_EXECUTE_CLOSED"],
+    ["unknown input mode", "verify", { E7_INPUT_MODE: "auto" }, "HKO_INPUT_INVALID"],
+    ["detect command, manual input mode", "detect", { E7_INPUT_MODE: "execute" }, "HKO_INPUT_INVALID"]]) {
+    const { n, env } = secretCounted(detEnv(over)); const r = await E.runHosted({ mode, env, proc: PROC, wrapperDir: ROOT, deps: TRAPS });
+    assert.deepEqual([r.exitCode, r.result.code, n.reads, r.result.outputs], [1, k, 0, null], label); assert.equal(E.outputLines(r.result), "", label);
+  }
+  // the manual flow is unchanged when CLOSED (verify / execute → HKO_EXECUTE_CLOSED, no outputs)
+  for (const mode of ["verify", "execute"]) { const r = await E.runHosted({ mode, env: realEnv({ E7_INPUT_MODE: mode }), proc: PROC, wrapperDir: ROOT, deps: TRAPS });
+    assert.deepEqual([r.result.code, r.result.flow, E.outputLines(r.result)], ["HKO_EXECUTE_CLOSED", "manual", ""], mode); }
+});
+
+test("H10 C113 OPEN seam: verify(detect) → open=true; detect holds ONLY the DB secret (a token NAME / fingerprint key / binding input refuses), pool max 1, runCore gets binding {source:'detect'} with NO credential / worker; outputs map only a DETECTED enum (+ fingerprint for ONE) — anything else → STOP exit 1; detect-flow execute requires a 64-hex fingerprint and hands {source:'selected', fp, github.sha}; manual execute refuses a non-empty fingerprint", async () => {
+  const w = wrapperFixture();
+  try {
+    const bc = await boundConstants(w); const src = await E.framedDigest(w, E.RUNNER_FILES, E.SOURCE_PREFIX);
+    const GOOD_DB = `postgresql://${encodeURIComponent("mv_booking_app_dev.mxotevtiscernhqilyiu")}:pw@aws-0-us-east-1.pooler.supabase.com:6543/postgres`;
+    const CA = Buffer.from("-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n");
+    const deps = { ...TRAPS, readHead: async () => SHA_A, importEnv: () => C1, readPgVersion: async () => "8.18.0", readCa: async () => CA, caSha256: sha(CA), constants: bc };
+    const ver = await E.runHosted({ mode: "verify", env: detEnv({ E7_EXPECTED_SOURCE_DIGEST: src }), proc: PROC, wrapperDir: w, deps });
+    assert.deepEqual([ver.exitCode, ver.result.code, ver.result.outputs], [0, "VERIFY_OK", { open: "true" }]);
+    const vm = await E.runHosted({ mode: "verify", env: realEnv({ E7_INPUT_MODE: "verify", E7_EXPECTED_SOURCE_DIGEST: src }), proc: PROC, wrapperDir: w, deps });
+    assert.deepEqual([vm.result.code, vm.result.outputs, E.outputLines(vm.result)], ["VERIFY_OK", null, ""], "manual verify writes NO output (detect never runs)");
+    const de = (over = {}) => detEnv({ E7_EXPECTED_SOURCE_DIGEST: src, E7_DEV_BOOKING_DATABASE_URL: GOOD_DB, E7_CA_FILE: "/ca", ...over });
+    for (const [label, e, k] of [["token name", de({ E7_DISPATCH_TOKEN: "x" }), "HKO_SECRET_SCOPE_VIOLATION"], ["fingerprint key", de({ E7_EXPECTED_CANDIDATE_FINGERPRINT: FP }), "HKO_INPUT_UNEXPECTED"],
+      ["binding input", de({ E7_INTENT_ID: IID, E7_BOOKING_REF: REF, E7_EXPECTED_VERSION: "6", E7_PAYMENT_INTENT_ID: PI, E7_AMOUNT_MINOR: "56000" }), "HKO_INPUT_INVALID"],
+      ["no DB secret", de({ E7_DEV_BOOKING_DATABASE_URL: "" }), "HKO_CREDENTIALS_MISSING"], ["owner user", de({ E7_DEV_BOOKING_DATABASE_URL: GOOD_DB.replace("mv_booking_app_dev", "postgres") }), "HKO_DB_TARGET_INVALID"]]) {
+      const r = await E.runHosted({ mode: "detect", env: e, proc: PROC, wrapperDir: w, deps }); assert.deepEqual([r.exitCode, r.result.code, r.result.outputs], [1, k, null], label);
+    }
+    const tooling = (seen) => async () => ({ ...MODS, PINNED_REVISION: PL.PINNED_REVISION, createBookingPool: (o) => { seen.max = o.max; return { end: async () => { seen.ended = (seen.ended ?? 0) + 1; } }; } });
+    for (const [label, coreOut, outcome, fp, exit] of [
+      ["ONE", { outcome: "DETECTED", code: "ONE", detect: { candidates: 1, fingerprint: FP } }, "ONE", FP, 0],
+      ["NO_REQUEST", { outcome: "DETECTED", code: "NO_REQUEST", detect: { candidates: 0, fingerprint: null } }, "NO_REQUEST", "", 0],
+      ["AMBIGUOUS", { outcome: "DETECTED", code: "AMBIGUOUS", detect: { candidates: 2, fingerprint: null } }, "AMBIGUOUS", "", 0],
+      ["INELIGIBLE", { outcome: "DETECTED", code: "INELIGIBLE:OPEN_CASE", detect: { candidates: 1, fingerprint: null } }, "INELIGIBLE:OPEN_CASE", "", 0],
+      ["core STOP", { outcome: "STOP", code: "ROLE_REFUSED", detect: null }, "STOP", "", 1],
+      ["ONE without a fingerprint", { outcome: "DETECTED", code: "ONE", detect: { candidates: 1, fingerprint: null } }, "STOP", "", 1],
+      ["ONE with a malformed fingerprint", { outcome: "DETECTED", code: "ONE", detect: { candidates: 1, fingerprint: "zz" } }, "STOP", "", 1],
+      ["unrecognised code", { outcome: "DETECTED", code: "MV-FAKE0001", detect: null }, "STOP", "", 1],
+      ["fingerprint on a non-ONE", { outcome: "DETECTED", code: "AMBIGUOUS", detect: { candidates: 2, fingerprint: FP } }, "AMBIGUOUS", "", 0]]) {
+      const seen = {}; let inp = null;
+      const { n, env } = secretCounted(de());
+      const r = await E.runHosted({ mode: "detect", env, proc: PROC, wrapperDir: w, deps: { ...deps, importTooling: tooling(seen), runCore: async (x) => { inp = x; return coreOut; } } });
+      assert.deepEqual([r.exitCode, r.result.code, r.result.outputs, seen.max, seen.ended, r.result.cleanup], [exit, "DETECT_DONE", { outcome, fingerprint: fp }, 1, 1, "POOL_ENDED"], label);
+      assert.deepEqual(Object.keys(inp).sort(), ["binding", "constants", "mods", "pool", "runSignal"], `${label}: no credential / workerId key`);
+      assert.deepEqual(inp.binding, { source: "detect" }); assert.deepEqual(Object.keys(n.byKey), ["E7_DEV_BOOKING_DATABASE_URL"], `${label}: ONLY the DB secret is read (never the dispatch token)`);
+      assert.ok(!Object.hasOwn(env, "E7_DEV_BOOKING_DATABASE_URL"), `${label}: the DB secret removed from env`);
+      assert.equal(E.outputLines(r.result), `outcome=${outcome}\nfingerprint=${fp}\n`);
+    }
+    // execute: detect flow needs a valid fingerprint; manual flow must carry an EMPTY one
+    const ex = (over = {}) => realEnv({ E7_EXPECTED_SOURCE_DIGEST: src, E7_DEV_BOOKING_DATABASE_URL: GOOD_DB, E7_DISPATCH_TOKEN: "t".repeat(40), E7_CA_FILE: "/ca", ...over });
+    const exDet = (over = {}) => ex({ E7_INPUT_MODE: "detect", E7_INTENT_ID: "", E7_BOOKING_REF: "", E7_EXPECTED_VERSION: "", E7_PAYMENT_INTENT_ID: "", E7_AMOUNT_MINOR: "", ...over });
+    for (const [label, e, k] of [["detect flow, no fingerprint key", exDet(), "HKO_INPUT_INVALID"], ["detect flow, empty fingerprint (skipped / failed detect)", exDet({ E7_EXPECTED_CANDIDATE_FINGERPRINT: "" }), "HKO_INPUT_INVALID"],
+      ["detect flow, malformed", exDet({ E7_EXPECTED_CANDIDATE_FINGERPRINT: FP.slice(1) }), "HKO_INPUT_INVALID"], ["detect flow, upper-case", exDet({ E7_EXPECTED_CANDIDATE_FINGERPRINT: FP.toUpperCase() }), "HKO_INPUT_INVALID"],
+      ["detect flow + binding inputs", exDet({ E7_EXPECTED_CANDIDATE_FINGERPRINT: FP, E7_INTENT_ID: IID, E7_BOOKING_REF: REF, E7_EXPECTED_VERSION: "6", E7_PAYMENT_INTENT_ID: PI, E7_AMOUNT_MINOR: "56000" }), "HKO_INPUT_INVALID"],
+      ["manual + fingerprint", ex({ E7_INPUT_MODE: "execute", E7_EXPECTED_CANDIDATE_FINGERPRINT: FP }), "HKO_INPUT_INVALID"]]) {
+      const { n, env } = secretCounted(e); const r = await E.runHosted({ mode: "execute", env, proc: PROC, wrapperDir: w, deps });
+      assert.deepEqual([r.result.code, n.reads], [k, 0], label);
+    }
+    for (const [label, e, want] of [
+      ["detect flow", exDet({ E7_EXPECTED_CANDIDATE_FINGERPRINT: FP }), { source: "selected", expectedFingerprint: FP, releaseSha: SHA_A }],
+      ["manual (empty fingerprint from the skipped detect job)", ex({ E7_INPUT_MODE: "execute", E7_EXPECTED_CANDIDATE_FINGERPRINT: "" }), BIND],
+      ["manual (legacy: no mode / fingerprint keys)", ex(), BIND]]) {
+      const seen = {}; let inp = null;
+      const r = await E.runHosted({ mode: "execute", env: e, proc: PROC, wrapperDir: w, deps: { ...deps, importTooling: tooling(seen), runCore: async (x) => { inp = x; return { outcome: "STOP", code: "NO_BOUND_REQUEST" }; } } });
+      assert.deepEqual([r.result.code, inp.binding, typeof inp.credential, inp.workerId, seen.max, r.result.outputs], ["EXECUTE_DONE", want, "function", "hko:123456-1", 2, null], label);
+    }
+  } finally { rmSync(w, { recursive: true, force: true }); }
+});
+
 if (process.env.E7_HKO_DB_TESTS === "1") {
   const [{ startMigratedDatabase }, F, R, W, IA, FX] = await Promise.all([tool("test/db/harness.mjs"), tool("test/db/fixtures.mjs"), tool("lib/booking-db/repo.js"),
     tool("lib/checkout/stripe-test-webhook.js"), tool("lib/checkout/intent-api-core.js"), tool("test/e5a-fixtures.mjs")]);
@@ -807,5 +1037,108 @@ if (process.env.E7_HKO_DB_TESTS === "1") {
     assert.deepEqual([r.outcome, r.code, r.claimed, r.backendSsl, r.tlsClientVerified, r.gets, r.posts, credCount.n - c0, ex.calls.length],
       ["STOP", "TLS_REQUIRED:CLIENT_NOT_TLS", false, true, admission, 0, 0, 0, 0], JSON.stringify(r));
     assert.equal(n, admission + 1); assert.equal((await row(k.id)).state, "requested");
+  });
+
+  // ---- C113 REAL: selection under real REPEATABLE READ READ ONLY snapshots on the disposable cluster (verified TLS on both hops) ----
+  /** disposable-fixture only: retire every pending request left by earlier tests through the app role's own terminal transition */
+  const quiesce = async () => { await q1("SELECT booking.refuse_pipeline_kickoff(intent_id, 'E7_TEST_QUIESCE') FROM booking.pipeline_kickoff_requests WHERE state = 'requested'"); };
+  const kickoffRows = async () => (await db.owner.query("SELECT intent_id::text, state, claim_worker, outcome_code FROM booking.pipeline_kickoff_requests ORDER BY intent_id")).rows;
+  /** wraps the app pool: after(sql) runs AFTER that statement's real reply and before the runner sees it (to commit concurrent work at an exact point) */
+  const hookPool = (after) => ({ connect: async () => { const cl = await itApp.connect();
+    return ev(cl, { query: async (sql, p) => { const res = await cl.query(sql, p); if (after) await after(String(sql)); return res; }, release: (x) => cl.release(x) }); } });
+  const detectRun = (over = {}) => E.runKickoffCore({ mods: MODS, pool: appPool(), binding: { source: "detect" }, constants: OPEN_IT, ...over });
+  const fpOf = (k) => E.candidateFingerprint({ intentId: k.id, ref: k.bind.ref, version: k.bind.expectedVersion, paymentIntentId: k.bind.paymentIntentId, amountMinor: k.bind.amountMinor });
+  const selected = (k, fp = fpOf(k)) => ({ source: "selected", expectedFingerprint: fp, releaseSha: SHA_A });
+
+  itest("I16 C113 REAL detect: 0 → NO_REQUEST, 1 → ONE with the candidate fingerprint, 2 → AMBIGUOUS (never the oldest); read-only — every booking table AND the kickoff table byte-identical; 0 credential / GET / POST; ≤ 18 statements; both hops verified on the ONE snapshot client", async () => {
+    await quiesce();
+    const before0 = [await fingerprint(), await kickoffRows()];
+    const r0 = await detectRun();
+    assert.deepEqual([r0.outcome, r0.code, r0.detect, r0.dbQueries, r0.backendSsl], ["DETECTED", "NO_REQUEST", { candidates: 0, fingerprint: null }, 13, true], JSON.stringify(r0));
+    assert.deepEqual([await fingerprint(), await kickoffRows()], before0);
+    const k = await authorizedFresh(); const before1 = [await fingerprint(), await kickoffRows()]; const c0 = credCount.n;
+    const r1 = await detectRun();
+    assert.deepEqual([r1.outcome, r1.code, r1.detect, r1.dbQueries, r1.claimed, r1.gets, r1.posts, credCount.n - c0], ["DETECTED", "ONE", { candidates: 1, fingerprint: fpOf(k) }, 18, false, 0, 0, 0], JSON.stringify(r1));
+    assert.equal(r1.tlsClientChecks, r1.tlsClientVerified); assert.equal(r1.tlsClientChecks, E.CATALOG_PINS.functions.length + 4);
+    assert.deepEqual([await fingerprint(), await kickoffRows()], before1, "detect wrote nothing"); assert.equal((await row(k.id)).state, "requested");
+    const k2 = await authorizedFresh(); const r2 = await detectRun();
+    assert.deepEqual([r2.outcome, r2.code, r2.detect], ["DETECTED", "AMBIGUOUS", { candidates: 2, fingerprint: null }]);
+    assert.deepEqual([(await row(k.id)).state, (await row(k2.id)).state], ["requested", "requested"], "AMBIGUOUS picks neither");
+    await quiesce();
+  });
+
+  itest("I17 C113 REAL detect → selected end-to-end: the selected run re-selects, fingerprint-matches, then the EXISTING path → ACCEPTED_VERIFIED with ONE GET + ONE POST for the selected intent; a re-detect is NO_REQUEST; a stale fingerprint → STOP CANDIDATE_CHANGED with the row untouched", async () => {
+    await quiesce();
+    const k = await authorizedFresh(); const d = await detectRun(); assert.equal(d.code, "ONE");
+    const stale = fakeGithub(k.id); const rs = await run(k, stale, { binding: selected(k, "0".repeat(64)) });
+    assert.deepEqual([rs.outcome, rs.code, rs.source, stale.calls.length, rs.dbQueries], ["STOP", "CANDIDATE_CHANGED", "selected", 0, 13]); assert.equal((await row(k.id)).state, "requested");
+    const fp0 = await fingerprint(); const ex = fakeGithub(k.id); const c0 = credCount.n;
+    const r = await run(k, ex, { binding: selected(k, d.detect.fingerprint) });
+    assert.deepEqual([r.outcome, r.code, r.source, r.verified, r.gets, r.posts, credCount.n - c0], ["ACCEPTED_VERIFIED", "HANDOFF_ACCEPTED", "selected", true, 1, 1, 1], JSON.stringify(r));
+    assert.deepEqual([ex.calls[1].body.inputs.intent_id, ex.calls[1].body.inputs.payment_intent_id], [k.id, k.bind.paymentIntentId]);
+    assert.ok(r.dbQueries <= 35, `selected worst-case statements: ${r.dbQueries}`);
+    assert.deepEqual(await fingerprint(), fp0); assert.equal((await row(k.id)).state, "dispatch_accepted");
+    assert.equal((await detectRun()).code, "NO_REQUEST");
+  });
+
+  itest("I18 C113 REAL second candidate vs the snapshot: committed BEFORE the selected snapshot → STOP AMBIGUOUS (0 GET / POST, both stay requested); committed AFTER the snapshot's SELECT (inside detect's open snapshot, or after the selected snapshot) → not seen: detect ONE / selected proceeds for the FIRST only, and the second stays requested for a later run", async () => {
+    await quiesce();
+    { const a = await authorizedFresh(); const d = await detectRun(); assert.equal(d.code, "ONE");
+      const b = await authorizedFresh(); const ex = fakeGithub(a.id);
+      const r = await run(a, ex, { binding: selected(a, d.detect.fingerprint) });
+      assert.deepEqual([r.outcome, r.code, ex.calls.length, (await row(a.id)).state, (await row(b.id)).state], ["STOP", "AMBIGUOUS", 0, "requested", "requested"]);
+      await quiesce(); }
+    { const a = await authorizedFresh(); let b = null;
+      const pool = hookPool(async (sql) => { if (b === null && /e7hko:detect/.test(sql)) b = await authorizedFresh(); });   // commits while detect's snapshot is OPEN
+      const d = await detectRun({ pool });
+      assert.ok(b !== null); assert.deepEqual([d.code, d.detect.fingerprint], ["ONE", fpOf(a)], "REPEATABLE READ: a row committed after the SELECT is invisible to the rest of the snapshot");
+      assert.equal((await detectRun()).code, "AMBIGUOUS", "a fresh snapshot sees both"); await quiesce(); }
+    { const a = await authorizedFresh(); const d = await detectRun(); let b = null;
+      const pool = hookPool(async (sql) => { if (b === null && /e7hko:snapend/.test(sql)) b = await authorizedFresh(); });     // commits right after the selected snapshot ends
+      const ex = fakeGithub(a.id); const r = await run(a, ex, { pool, binding: selected(a, d.detect.fingerprint) });
+      assert.ok(b !== null);
+      assert.deepEqual([r.outcome, r.code, r.gets, r.posts, ex.calls[1].body.inputs.intent_id], ["ACCEPTED_VERIFIED", "HANDOFF_ACCEPTED", 1, 1, a.id], JSON.stringify(r));
+      assert.deepEqual([(await row(a.id)).state, (await row(b.id)).state], ["dispatch_accepted", "requested"], "the late request is NOT claimed: it waits for a later supervised run");
+      await quiesce(); }
+  });
+
+  itest("I19 C113 REAL slow selection: a snapshot statement that never replies is sealed by the ONE core deadline (no budget reset) for detect and for selected; the snapshot client is destroyed (server rolls back); 0 claim / GET / POST; the row stays requested", async () => {
+    await quiesce();
+    for (const src of ["detect", "selected"]) {
+      const k = await authorizedFresh(); const tm = fakeTimers(); let armed = false; const ex = fakeGithub(k.id);
+      const pool = appPool((sql) => { if (/e7hko:detect/.test(sql)) { armed = true; return true; } return false; });
+      const B = src === "detect" ? C.detect.budgets : C.budgets;
+      const p = src === "detect" ? detectRun({ pool, timer: tm.timer, clearTimer: tm.clearTimer }) : run(k, ex, { pool, binding: selected(k), timer: tm.timer, clearTimer: tm.clearTimer });
+      for (let i = 0; i < 400 && !armed; i += 1) await new Promise((res) => setTimeout(res, 5));
+      assert.ok(armed, src); assert.equal(tm.ts.filter((h) => h.ms === B.runMs - B.teardownMs).length, 1, `${src}: one deadline`);
+      tm.fire(B.runMs - B.teardownMs); const r = await p;
+      assert.deepEqual([r.outcome, r.code, r.claimed, r.gets, r.posts, ex.calls.length, r.clientsDestroyed >= 1], ["STOP", "SEALED_ADMISSION:DEADLINE", false, 0, 0, 0, true], `${src}: ${JSON.stringify(r)}`);
+      assert.equal((await row(k.id)).state, "requested", src); await quiesce();
+    }
+  });
+
+  itest("I20 C113 REAL selected keeps the phase-sensitive human-owned outcomes (no flattening / late upgrade): lost claim COMMIT → CLAIM_UNCERTAIN (0 GET / POST); a POST that never replies → UNKNOWN SEALED_AFTER_POST (a late 204 never upgrades); a lost readback → ACCEPTED_UNVERIFIED; none re-posts", async () => {
+    await quiesce();
+    { const k = await authorizedFresh(); const tm = fakeTimers(); const ex = fakeGithub(k.id); let armed = false;
+      const pool = appPool((sql) => { if (/claim_pipeline_kickoff/.test(sql)) armed = true; return armed && sql === "COMMIT"; });
+      const p = run(k, ex, { pool, binding: selected(k), timer: tm.timer, clearTimer: tm.clearTimer });
+      for (let i = 0; i < 400 && !armed; i += 1) await new Promise((res) => setTimeout(res, 5));
+      await new Promise((res) => setTimeout(res, 30)); tm.fire(C.budgets.statementMs);
+      const r = await p; assert.deepEqual([r.outcome, r.source, r.gets, r.posts, ex.calls.length], ["CLAIM_UNCERTAIN", "selected", 0, 0, 0], JSON.stringify(r));
+      assert.ok(["requested", "claimed"].includes((await row(k.id)).state)); await quiesce(); }
+    { const k = await authorizedFresh(); let late204; const tm = fakeTimers();
+      const ex = fakeGithub(k.id, { dispatch: () => new Promise((res) => { late204 = () => res(reply(204)); }) });
+      const p = run(k, ex, { binding: selected(k), timer: tm.timer, clearTimer: tm.clearTimer });
+      for (let i = 0; i < 400 && ex.calls.length < 2; i += 1) await new Promise((res) => setTimeout(res, 5));
+      assert.equal(ex.calls.length, 2); tm.fire(C.budgets.runMs - C.budgets.teardownMs);
+      const r = await p; late204(); await new Promise((res) => setTimeout(res, 20));
+      assert.deepEqual([r.outcome, r.code.startsWith("SEALED_AFTER_POST"), r.posts, r.verified], ["UNKNOWN", true, 1, false]);
+      assert.equal((await row(k.id)).state, "claimed", "human-owned"); }
+    { const k = await authorizedFresh(); const ex = fakeGithub(k.id);
+      const pool = { connect: async () => { const c = await itApp.connect(); return ev(c, { query: (sql, p) => (/e7hko:readback/.test(sql) ? Promise.reject(new Error("readback lost")) : c.query(sql, p)), release: (x) => c.release(x) }); } };
+      const r = await run(k, ex, { pool, binding: selected(k) });
+      assert.deepEqual([r.outcome, r.code, r.posts, r.verified], ["ACCEPTED_UNVERIFIED", "READBACK_MISSING_OR_CONTRADICTORY", 1, false]);
+      assert.equal((await row(k.id)).state, "dispatch_accepted"); }
+    await quiesce();
   });
 }
