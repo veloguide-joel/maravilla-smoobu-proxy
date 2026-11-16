@@ -43,8 +43,8 @@ const pureTooling = { refundObservationRefusal: RECRUN.refundObservationRefusal,
   captureKey: IS.captureKey, LOCK_KEY: LK.LOCK_KEY, LOCK_PRECHECK_SQL: LK.LOCK_PRECHECK_SQL };
 
 // ---------------------------------------------------------------------------------------------------------------------------------
-test("H1 pins: tooling 71c3dcf8 (contains the accepted C88 coordinator), MERGED, SHIPPED CLOSED; closure = an INDEPENDENT transitive import scan of the twelve roots at the pin (+ package files), its framed digest recomputed; bare imports node:* + pg only; pg 8.18.0 in the lockfile", async () => {
-  assert.equal(C.toolingCommit, PIN); assert.equal(C.toolingStatus, "MERGED"); assert.equal(C.executeEnabled, false);
+test("H1 pins: tooling 71c3dcf8 (contains the accepted C88 coordinator), MERGED, C102 OPENED (executeEnabled true; closed refusals via the closed-constants seam); closure = an INDEPENDENT transitive import scan of the twelve roots at the pin (+ package files), its framed digest recomputed; bare imports node:* + pg only; pg 8.18.0 in the lockfile", async () => {
+  assert.equal(C.toolingCommit, PIN); assert.equal(C.toolingStatus, "MERGED"); assert.equal(C.executeEnabled, true, "C102 ENABLE");
   const roots = ["lib/booking-db/test-pipeline-coordinator.js", "lib/booking-db/repo.js", "scripts/e7-connected/executor-adapters.mjs", "scripts/e7-connected/http-transports.mjs",
     "scripts/e7-connected/real-exchange.mjs", "lib/booking-db/pool.js", "lib/hostaway-reservations.js", "lib/checkout/capture-proof.js", "lib/checkout/recovery-plan.js",
     "lib/checkout/intent-state.js", "scripts/e7-connected/run-lock-precheck.mjs", "scripts/e7-connected/probe-env-preflight.mjs"];
@@ -95,7 +95,7 @@ const SYNTH = {};
 const realEnv = (over = {}) => ({ E7_TOOLING_DIR: TOOLING, E7_APPROVAL_REF: "ROOT-C90-label", E7_INTENT_ID: "11111111-2222-4333-8444-555555555555", E7_BOOKING_REF: "MV-FAKE0001",
   E7_EXPECTED_VERSION: "4", E7_NOT_BEFORE: "2026-11-16T00:00:00.000Z", E7_PAYMENT_INTENT_ID: "pi_FAKEpipeline001", E7_AMOUNT_MINOR: "14000", E7_CURRENCY: "USD", ...over });
 const okChild = async () => ({ status: 0, signal: null, stdout: "# tests 9\n# pass 9\n# fail 0\n# skipped 0\n", truncated: false, spawnFailed: false });
-test("H4 runHosted CLOSED: preflight (synthetic + real plan) passes with no secret; verify / execute refuse HPL_EXECUTE_CLOSED BEFORE any value read / import (spies untouched); secret / unexpected key / incomplete / invalid / excluded inputs refuse", async () => {
+test("H4 runHosted CLOSED (closed-constants seam; C102 ships opened): preflight (synthetic + real plan) passes with no secret; verify / execute refuse HPL_EXECUTE_CLOSED BEFORE any value read / import (spies untouched); secret / unexpected key / incomplete / invalid / excluded inputs refuse", async () => {
   const spies = { env: 0, tooling: 0, core: 0 };
   const deps = { spawnChild: okChild, importEnv: async (d) => { spies.env += 1; return tool("scripts/e7-connected/probe-env-preflight.mjs"); },
     importTooling: async () => { spies.tooling += 1; throw new Error("x"); }, runCore: async () => { spies.core += 1; return null; } };
@@ -106,8 +106,9 @@ test("H4 runHosted CLOSED: preflight (synthetic + real plan) passes with no secr
   assert.deepEqual([rp.exitCode, rp.result.code], [0, "PREFLIGHT_OK_REAL_PLAN"]); assert.notEqual(rp.result.planHash, s.result.planHash);
   assert.equal(rp.result.planHash, (await E.runHosted({ mode: "preflight", env: realEnv(), proc: PROC, wrapperDir: ROOT, deps })).result.planHash, "deterministic");
   const before = { ...spies };
+  const closed = { ...C, executeEnabled: false };                                                     // the exact CLOSE state (reverse patch) — refusal unchanged
   for (const mode of ["verify", "execute"]) {
-    const x = await E.runHosted({ mode, env: realEnv({ E7_STRIPE_TEST_KEY: "sk_test_x", E7_RUN_ID: "1234567-1" }), proc: PROC, wrapperDir: ROOT, deps });
+    const x = await E.runHosted({ mode, env: realEnv({ E7_STRIPE_TEST_KEY: "sk_test_x", E7_RUN_ID: "1234567-1" }), proc: PROC, wrapperDir: ROOT, deps: { ...deps, constants: closed } });
     assert.deepEqual([x.exitCode, x.result.code, x.result.planHash, x.result.closureDigest], [1, "HPL_EXECUTE_CLOSED", null, null], mode);
   }
   assert.deepEqual(spies, before, "closed before any import / core");

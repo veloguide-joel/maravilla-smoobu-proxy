@@ -88,7 +88,7 @@ test("W4 static: the ONLY secrets (existing NAMES E7_STRIPE_TEST_KEY, E7_HOSTAWA
   const envKeys = [...yml.matchAll(/^          (E7_[A-Z0-9_]+):/gm)].map((m) => m[1]);
   for (const k of envKeys) if (k !== "E7_TOOLING_PIN" && k !== "E7_MODE") assert.ok(R.ALLOWED_E7_KEYS.includes(k), `${k} is an admitted runner key`);
   assert.equal(count(new RegExp(FILES.map((f) => f.replace(/[.\/]/g, "\\$&")).join(" "), "g")), 2, "digest file list identical in both jobs, documented order");
-  assert.equal(R.CONSTANTS.executeEnabled, false, "SHIPPED CLOSED: the verify step refuses HPL_EXECUTE_CLOSED, so no secret step can run");
+  assert.equal(R.CONSTANTS.executeEnabled, true, "C102 ENABLE: ONE gated TEST run (main only, e7-readonly-probe reviewers, exact bindings); the reverse CLOSE patch restores false");
 });
 
 // ---- LOCAL execution of the gate blocks ----------------------------------------------------------------------------------------------
