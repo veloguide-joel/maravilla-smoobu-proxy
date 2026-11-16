@@ -694,7 +694,10 @@ export function outputLines(r) {
 export function summaryMarkdown(r) {
   const k = r.core ? ` core=${r.core.outcome}/${r.core.code} consumer=${r.core.consumerCode ?? "-"} gets=${r.core.gets} posts=${r.core.posts} verified=${r.core.verified === true} sealed=${r.core.sealed}` : "";
   const d = r.core && r.core.detect ? ` detect=${r.core.code} candidates=${r.core.detect.candidates}` : "";
-  return `e7-hosted-kickoff ${r.mode}${r.flow ? `/${r.flow}` : ""} ${r.code}${d} executeEnabled=${r.executeEnabled} dispatchEnabled=${r.dispatchEnabled} pipelineBound=${r.pipeline ? r.pipeline.bound : "-"} runId=${r.runId ?? "-"} closure=${r.closureDigest ?? "-"} source=${r.sourceDigest ?? "-"} cleanup=${r.cleanup ?? "-"}${k}\n`;
+  // C114 F1: the gate #2 reviewer must SEE the detected fingerprint to compare it with an independent recompute. Shown ONLY from the
+  // runner's own validated job output (outcome ONE + 64-lowercase-hex, the value written to $GITHUB_OUTPUT); never an identifier
+  const o = r.outputs; const f = o && o.outcome === "ONE" && HEX64.test(String(o.fingerprint)) ? ` candidateFingerprint=${o.fingerprint}` : "";
+  return `e7-hosted-kickoff ${r.mode}${r.flow ? `/${r.flow}` : ""} ${r.code}${d}${f} executeEnabled=${r.executeEnabled} dispatchEnabled=${r.dispatchEnabled} pipelineBound=${r.pipeline ? r.pipeline.bound : "-"} runId=${r.runId ?? "-"} closure=${r.closureDigest ?? "-"} source=${r.sourceDigest ?? "-"} cleanup=${r.cleanup ?? "-"}${k}\n`;
 }
 
 // ---- the ONLY top-level effect -----------------------------------------------------------------------------------------------------
