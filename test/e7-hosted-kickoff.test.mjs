@@ -9,8 +9,10 @@ import { test, after } from "node:test";
 import { EventEmitter } from "node:events";
 import assert from "node:assert/strict";
 import https from "node:https";
+import tls from "node:tls";
+import net from "node:net";
 import { syncBuiltinESMExports } from "node:module";
-import { readFileSync, writeFileSync, realpathSync, mkdtempSync, mkdirSync, cpSync, rmSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, realpathSync, mkdtempSync, mkdirSync, cpSync, rmSync, existsSync, chownSync } from "node:fs";
 import { join, dirname, normalize } from "node:path";
 import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
@@ -284,6 +286,17 @@ const MODS = Object.freeze({ runPipelineKickoffOnce: K.runPipelineKickoffOnce, r
   createGithubExchange: () => async () => { throw new Error("no exchange in the fake-pool suite"); } });
 const BIND = Object.freeze({ intentId: IID, ref: REF, expectedVersion: 6, paymentIntentId: PI, amountMinor: 56000, releaseSha: SHA_A });
 const SESSION_OK = { is_app: true, is_admin: false, privileged: false, owns_schema: false, tls: true, server_version_num: 160015 };
+/** C112: FAKE client-hop evidence (test-only shape of a pg client: connection.stream is a node:tls TLSSocket-prototyped object; host; ssl config) */
+const FAKE_CA = "-----BEGIN CERTIFICATE-----\nE7-FAKE-FIXTURE-CA\n-----END CERTIFICATE-----\n";
+const TLS_POL = Object.freeze({ host: C.tls.host, caSha256: sha(FAKE_CA) });
+function fakeTlsSocket(over = {}) {
+  const s = Object.create(tls.TLSSocket.prototype);
+  const d = { encrypted: true, destroyed: false, readyState: "open", authorized: true, authorizationError: null, isSessionReused: () => false, getProtocol: () => "TLSv1.3",
+    getPeerCertificate: () => ({ subject: { CN: C.tls.host }, subjectaltname: `DNS:${C.tls.host}` }), ...over };
+  for (const [k, v] of Object.entries(d)) Object.defineProperty(s, k, { value: v, enumerable: true });
+  return s;
+}
+const withTls = (base, sock = {}, cfg = {}, host = C.tls.host) => Object.assign(base, { connection: { stream: fakeTlsSocket(sock) }, host, ssl: { rejectUnauthorized: true, ca: FAKE_CA, ...cfg } });
 function fakePool(script = {}) {
   const st = { connects: 0, queries: [], released: [], pending: [] };
   const answer = (sql, params) => {
@@ -297,14 +310,15 @@ function fakePool(script = {}) {
     return { rows: [] };                                                                     // readKickoffFacts → no request
   };
   st.pool = { connect: () => { st.connects += 1; if (script.connect) return script.connect(st);
-    return Promise.resolve({ query: (sql, params) => Promise.resolve(answer(sql, params)), release: (x) => st.released.push(x === true ? "destroy" : "clean") }); } };
+    const base = { query: (sql, params) => Promise.resolve(answer(sql, params)), release: (x) => st.released.push(x === true ? "destroy" : "clean") };
+    return Promise.resolve(script.client ? script.client(base, st) : withTls(base)); } };
   return st;
 }
 function fakeTimers() { const ts = []; return { ts, timer: (fn, ms) => { const h = { fn, ms, cleared: false }; ts.push(h); return h; }, clearTimer: (h) => { h.cleared = true; },
   fire: (ms) => { for (const h of ts.filter((x) => x.ms === ms && !x.cleared)) { h.cleared = true; h.fn(); } } }; }
-const OPEN_CORE = Object.freeze({ ...C, dispatchEnabled: true });
+const OPEN_CORE = Object.freeze({ ...C, dispatchEnabled: true, tls: TLS_POL });
 const core = (st, over = {}) => E.runKickoffCore({ mods: MODS, pool: st.pool, binding: BIND, credential: () => { throw new Error("credential must not be read"); }, workerId: "hko:test-0001",
-  constants: OPEN_CORE, tlsRequired: true, ...over });
+  constants: OPEN_CORE, ...over });
 
 test("K1 the core is CLOSED with the shipped constants: HKO_DISPATCH_CLOSED before ANY pool acquisition; invalid inputs / scope drift / historical binding also refuse with 0 connect", async () => {
   const st = fakePool();
@@ -316,14 +330,15 @@ test("K1 the core is CLOSED with the shipped constants: HKO_DISPATCH_CLOSED befo
   assert.equal(st.connects, 0);
 });
 
-test("K2 admission refusals (read-only; the consumer is never invoked): foreign / admin / privileged role, no TLS, schema 23 (0024 absent), catalog / ACL drift, not test, no bound request", async () => {
+test("K2 admission refusals (read-only; the consumer is never invoked): foreign / admin / privileged role, backend hop not SSL, schema 23 (0024 absent), catalog / ACL drift, not test, no bound request", async () => {
   const fnMissing = (p) => ({ rows: p[0].includes("claim_pipeline_kickoff") ? [] : [{ ...E.CATALOG_PINS.functions.find((f) => f.sig === p[0]) }] });
   for (const [label, script, k] of [
     ["foreign role", { session: () => ({ rows: [{ ...SESSION_OK, is_app: false }] }) }, "ROLE_REFUSED"],
     ["admin role", { session: () => ({ rows: [{ ...SESSION_OK, is_admin: true }] }) }, "ROLE_REFUSED"],
     ["owner", { session: () => ({ rows: [{ ...SESSION_OK, owns_schema: true }] }) }, "ROLE_REFUSED"],
     ["superuser / bypassrls", { session: () => ({ rows: [{ ...SESSION_OK, privileged: true }] }) }, "ROLE_REFUSED"],
-    ["no TLS", { session: () => ({ rows: [{ ...SESSION_OK, tls: false }] }) }, "TLS_REQUIRED"],
+    ["backend hop not SSL (server-reported)", { session: () => ({ rows: [{ ...SESSION_OK, tls: false }] }) }, "TLS_REQUIRED:BACKEND_HOP"],
+    ["backend hop unknown (NULL)", { session: () => ({ rows: [{ ...SESSION_OK, tls: null }] }) }, "TLS_REQUIRED:BACKEND_HOP"],
     ["PG15", { session: () => ({ rows: [{ ...SESSION_OK, server_version_num: 150010 }] }) }, "SERVER_VERSION_REFUSED"],
     ["not test", { env: () => ({ rows: [{ environment: "production" }] }) }, "NOT_TEST"],
     ["schema 23", { fn: fnMissing }, "SCHEMA_NOT_0024"],
@@ -393,6 +408,65 @@ test("K7 C111 F1: a consumer result with claimed:false but an UNCERTAIN code (CL
   assert.deepEqual(Object.keys(E.UNCERTAIN_CONSUMER_CODES).sort(), ["CLAIM_UNCERTAIN", "REFUSE_UNCERTAIN", "TX_NOT_CLEAN"]);
 });
 
+test("K8 C112 CLIENT hop: EVERY acquired client needs its OWN live, authorized TLS socket (pinned CA, rejectUnauthorized, hostname re-checked) BEFORE its first statement — each defect → STOP TLS_REQUIRED:CLIENT_<reason>, client destroyed unused, sealed, 0 statements / consumer / credential / GET / POST; there is no opt-out", async () => {
+  assert.deepEqual({ ...C.tls }, { host: "aws-0-us-east-1.pooler.supabase.com", caSha256: E.OFFICIAL_CA_SHA256 }, "client-hop identity == the reviewed pooler host + OFFICIAL CA");
+  assert.ok(E.dbTargetOk(`postgresql://mv_booking_app_dev.${C.dbProjectRef}:x@${C.tls.host}:6543/postgres`), "the TLS host is the only admitted DB target host");
+  const plainSock = new net.Socket();
+  const cases = [
+    ["no evidence", (b) => b, "NO_EVIDENCE"],
+    ["plain net.Socket", (b) => Object.assign(withTls(b), { connection: { stream: plainSock } }), "NOT_TLS"],
+    ["not encrypted", (b) => withTls(b, { encrypted: false }), "NOT_TLS"],
+    ["destroyed", (b) => withTls(b, { destroyed: true }), "DISCONNECTED"],
+    ["not open", (b) => withTls(b, { readyState: "readOnly" }), "DISCONNECTED"],
+    ["unauthorized", (b) => withTls(b, { authorized: false, authorizationError: "UNABLE_TO_VERIFY_LEAF_SIGNATURE" }), "UNAUTHORIZED"],
+    ["authorized with an error", (b) => withTls(b, { authorizationError: "X" }), "UNAUTHORIZED"],
+    ["resumed session (identity check skipped)", (b) => withTls(b, { isSessionReused: () => true }), "SESSION_REUSED"],
+    ["TLSv1.1", (b) => withTls(b, { getProtocol: () => "TLSv1.1" }), "PROTOCOL"],
+    ["no peer certificate", (b) => withTls(b, { getPeerCertificate: () => ({}) }), "NO_PEER_CERT"],
+    ["certificate for another host", (b) => withTls(b, { getPeerCertificate: () => ({ subject: { CN: "evil.example" }, subjectaltname: "DNS:evil.example" }) }), "HOSTNAME_MISMATCH"],
+    ["client host differs", (b) => withTls(b, {}, {}, "db.other.example"), "HOST_MISMATCH"],
+    ["rejectUnauthorized false", (b) => withTls(b, {}, { rejectUnauthorized: false }), "CONFIG_NOT_PINNED"],
+    ["CA not pinned", (b) => withTls(b, {}, { ca: FAKE_CA + "x" }), "CONFIG_NOT_PINNED"],
+    ["custom identity callback", (b) => withTls(b, {}, { checkServerIdentity: () => undefined }), "CONFIG_NOT_PINNED"],
+    ["evidence getter throws", (b) => withTls(b, { getPeerCertificate: () => { throw new Error("x"); } }), "EVIDENCE_ERROR"]];
+  for (const [label, mk, why] of cases) {
+    const st = fakePool({ client: (b) => mk(b) });
+    const r = await core(st, { tlsRequired: false });                                   // a stray opt-out key has NO effect
+    assert.deepEqual([r.outcome, r.code, r.tlsClientRefusal, r.tlsClientChecks, r.tlsClientVerified, r.dbQueries, r.sealed, r.sealReason],
+      ["STOP", `TLS_REQUIRED:CLIENT_${why}`, why, 1, 0, 0, true, "TLS_CLIENT_UNVERIFIED"], label);
+    assert.deepEqual([st.queries, st.released, r.backendSsl, r.claimed, r.gets, r.posts, r.credentialReads], [[], ["destroy"], null, false, 0, 0, 0], label);
+    assert.equal(E.clientTlsRefusal(mk({ query() {}, release() {} }), TLS_POL), why, `${label}: exported predicate`);
+  }
+  assert.equal(E.clientTlsRefusal(withTls({}), TLS_POL), null);
+  assert.equal(E.clientTlsRefusal(withTls({}), { host: C.tls.host }), "POLICY_INVALID");
+});
+
+test("K9 C112 BACKEND hop is still REQUIRED and labelled separately: a VERIFIED client whose server-reported pg_stat_ssl.ssl is false (the shared pooler's pooler→Postgres hop) → STOP TLS_REQUIRED:BACKEND_HOP after exactly the session statement; the client evidence never substitutes for it", async () => {
+  const st = fakePool({ session: () => ({ rows: [{ ...SESSION_OK, tls: false }] }) });
+  const r = await core(st);
+  assert.deepEqual([r.outcome, r.code, r.backendSsl, r.tlsClientChecks, r.tlsClientVerified, r.tlsClientRefusal, r.dbQueries, st.queries],
+    ["STOP", "TLS_REQUIRED:BACKEND_HOP", false, 1, 1, null, 1, ["session"]]);
+  const ok = fakePool(); const r2 = await core(ok);
+  assert.deepEqual([r2.code, r2.backendSsl, r2.tlsClientChecks === r2.tlsClientVerified, r2.tlsClientChecks, r2.tlsClientRefusal], ["NO_BOUND_REQUEST", true, true, r2.dbQueries, null],
+    "one verified client per acquisition; admission proceeds only with BOTH hops");
+});
+
+test("K10 C112 the CONSUMER's own acquisition is checked too: an unverified client handed to the consumer before its claim → STOP TLS_REQUIRED:CLIENT_<reason>; sealed; no claim / credential / GET / POST; the client destroyed unused", async () => {
+  const FACTS = { request: { state: "requested", intent_id: IID, ref: REF, authorized_version: 6, payment_intent_id: PI, amount_minor: 56000, currency: "USD", listing_id: 606998 },
+    intent: { version: 6, status: "payment_authorized", payment: { paymentIntentId: PI, amountMinor: 56000 } } };
+  let consumerPhase = false; let consumerSaw = null; let calls = 0;
+  const st = fakePool({ client: (b) => (consumerPhase ? withTls(b, { authorized: false, authorizationError: "CERT_HAS_EXPIRED" }) : withTls(b)) });
+  const mods = { ...MODS, readKickoffFacts: async () => FACTS, kickoffAdmission: () => { consumerPhase = true; return null; },
+    runPipelineKickoffOnce: async (pool, o) => { calls += 1;
+      try { const c = await pool.connect(); await o.hooks.beforeClaim(); c.release(); } catch (e) { consumerSaw = e && e.code; }
+      return Object.freeze({ code: "CONNECT_FAILED", intentId: IID, claimed: false, dispatchAttempted: false, outcome: null, settled: false }); } };
+  const r = await core(st, { mods });
+  await new Promise((res) => setImmediate(res));                                           // the core returned at the seal; the consumer's connect then rejected
+  assert.deepEqual([r.outcome, r.code, calls, consumerSaw, r.claimed, r.sealed, r.gets, r.posts, r.credentialReads, r.tlsClientRefusal],
+    ["STOP", "TLS_REQUIRED:CLIENT_UNAUTHORIZED", 1, "TLS_REQUIRED:CLIENT_UNAUTHORIZED", false, true, 0, 0, 0, "UNAUTHORIZED"]);
+  assert.equal(st.released.at(-1), "destroy"); assert.ok(!st.queries.includes("consumer"));
+});
+
 // ---------------------------------------------------------------------------------------------------------------------------------
 // OPT-IN INTEGRATION (E7_HKO_DB_TESTS=1; tooling with its pinned pg; PG_BIN): REAL 0024 + webhook authorization + consumer + transport on a
 // disposable PostgreSQL, a FAKE GitHub exchange. The hosted preflight child never sets it.
@@ -401,6 +475,76 @@ if (process.env.E7_HKO_DB_TESTS === "1") {
     tool("lib/checkout/stripe-test-webhook.js"), tool("lib/checkout/intent-api-core.js"), tool("test/e5a-fixtures.mjs")]);
   const db = await startMigratedDatabase();
   after(async () => { await db.close(); });
+  // ---- C112 REAL TLS fixtures (disposable): a throwaway CA + leaf certificates (openssl), server SSL on the disposable cluster, and a
+  // pooler-shaped proxy (accepts the PG SSLRequest, terminates the CLIENT hop with its own certificate, then opens the BACKEND hop to
+  // Postgres either over verified TLS — the shared pooler with "Enforce SSL" ON — or in plaintext — the pooler with it OFF).
+  // built LAZILY inside the first DB test (ready()): a long top-level await would let the root test finish and run the after() hooks early
+  let pg, fx, proxies, itApp, itOwner, OPEN_IT, VERIFIED; const pools = []; let readyP = null;
+  const buildFx = () => {
+    const d = mkdtempSync(join(tmpdir(), "hko-tls-"));
+    const ossl = (...a) => execFileSync("openssl", a, { cwd: d, stdio: ["ignore", "ignore", "pipe"] });
+    const ca = (n) => { ossl("req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-keyout", `${n}.key`, "-out", `${n}.pem`, "-days", "2",
+      "-subj", `/CN=e7-hko-${n}`, "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign"); };
+    const leaf = (n, cn, issuer) => {
+      ossl("req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-keyout", `${n}.key`, "-out", `${n}.csr`, "-subj", `/CN=${cn}`);
+      writeFileSync(join(d, `${n}.ext`), `subjectAltName=DNS:${cn}\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n`);
+      ossl("x509", "-req", "-in", `${n}.csr`, "-CA", `${issuer}.pem`, "-CAkey", `${issuer}.key`, "-CAcreateserial", "-out", `${n}.pem`, "-days", "2", "-extfile", `${n}.ext`); };
+    ca("ca1"); ca("ca2"); leaf("good", "localhost", "ca1"); leaf("wronghost", "wronghost.invalid", "ca1"); leaf("foreign", "localhost", "ca2");
+    const rd = (f) => readFileSync(join(d, f), "utf8");
+    return { dir: d, ca1: rd("ca1.pem"), ca2: rd("ca2.pem"), good: { key: rd("good.key"), cert: rd("good.pem") },
+      wronghost: { key: rd("wronghost.key"), cert: rd("wronghost.pem") }, foreign: { key: rd("foreign.key"), cert: rd("foreign.pem") } };
+  };
+  after(() => { if (fx) rmSync(fx.dir, { recursive: true, force: true }); });
+  const serverSsl = async () => { // server SSL on the disposable cluster (key readable by its OS user only), reloaded — the BACKEND hop can now be verified TLS
+    const sd = mkdtempSync(join(tmpdir(), "hko-pgssl-"));
+    writeFileSync(join(sd, "server.crt"), fx.good.cert); writeFileSync(join(sd, "server.key"), fx.good.key, { mode: 0o600 });
+    if (process.getuid && process.getuid() === 0) { const u = Number(execFileSync("id", ["-u", "postgres"]).toString()); const g = Number(execFileSync("id", ["-g", "postgres"]).toString());
+      for (const f of ["", "server.crt", "server.key"]) chownSync(join(sd, f), u, g); }
+    await db.owner.query(`ALTER SYSTEM SET ssl_cert_file = '${join(sd, "server.crt")}'`); await db.owner.query(`ALTER SYSTEM SET ssl_key_file = '${join(sd, "server.key")}'`);
+    await db.owner.query("ALTER SYSTEM SET ssl = on"); await db.owner.query("SELECT pg_reload_conf()"); await new Promise((res) => setTimeout(res, 300));
+    after(() => { rmSync(sd, { recursive: true, force: true }); });
+  };
+  const SSL_REQUEST = Buffer.from([0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f]);
+  /** pooler-shaped proxy: front "tls" (SSLRequest → 'S' → TLS with `cert`) | "plain"; back "tls" (SSLRequest → verified TLS to PG) | "plain" */
+  async function startProxy({ front, back, cert = fx.good }) {
+    const socks = new Set();
+    const backLeg = () => new Promise((resolve, reject) => {
+      const up = net.connect(db.port, "127.0.0.1"); socks.add(up); up.once("error", reject);
+      if (back === "plain") { up.once("connect", () => resolve(up)); return; }
+      up.once("connect", () => up.write(SSL_REQUEST));
+      up.once("data", (b) => { if (b.toString() !== "S") { reject(new Error("backend refused SSL")); return; }
+        const t = tls.connect({ socket: up, ca: fx.ca1, servername: "localhost", rejectUnauthorized: true }); socks.add(t);
+        t.once("secureConnect", () => resolve(t)); t.once("error", reject); });
+    });
+    const server = net.createServer((sock) => {
+      socks.add(sock); sock.on("error", () => {});
+      const wire = (fr) => { fr.pause(); backLeg().then((up) => { up.on("error", () => fr.destroy()); fr.on("error", () => up.destroy());
+        fr.pipe(up); up.pipe(fr); fr.resume(); }, () => fr.destroy()); };
+      if (front === "plain") { wire(sock); return; }
+      sock.once("data", (b) => {
+        if (!b.equals(SSL_REQUEST)) { sock.destroy(); return; }
+        const t = new tls.TLSSocket(sock, { isServer: true, key: cert.key, cert: cert.cert }); socks.add(t); t.on("error", () => {});
+        sock.write("S"); t.once("secure", () => wire(t));
+      });
+    });
+    await new Promise((res) => server.listen(0, "127.0.0.1", res));
+    return { port: server.address().port, close: () => new Promise((res) => { for (const x of socks) x.destroy(); server.close(() => res()); }) };
+  }
+  const tlsPool = (port, user = "test_app", ssl = undefined, host = "localhost") => { const p = new pg.Pool({ host, port, user, database: "postgres", ssl: ssl === undefined ? VERIFIED : ssl, max: 8 }); pools.push(p); return p; };
+  after(async () => { for (const p of pools) await p.end().catch(() => {}); for (const x of Object.values(proxies ?? {})) await x.close(); });
+  const ready = () => (readyP ??= (async () => {
+    pg = (await tool("node_modules/pg/lib/index.js")).default; fx = buildFx(); await serverSsl();
+    proxies = { both: await startProxy({ front: "tls", back: "tls" }), offBack: await startProxy({ front: "tls", back: "plain" }),
+      plainFront: await startProxy({ front: "plain", back: "tls" }), wronghost: await startProxy({ front: "tls", back: "tls", cert: fx.wronghost }),
+      foreign: await startProxy({ front: "tls", back: "tls", cert: fx.foreign }) };
+    VERIFIED = Object.freeze({ rejectUnauthorized: true, ca: fx.ca1 });
+    itApp = tlsPool(proxies.both.port); itOwner = tlsPool(proxies.both.port, "postgres");
+    OPEN_IT = Object.freeze({ ...OPEN_CORE, tls: Object.freeze({ host: "localhost", caSha256: sha(fx.ca1) }) });
+  })());
+  /** every DB test first awaits the lazily built TLS fixtures */
+  const itest = (name, fn) => test(name, async () => { await ready(); return fn(); });
+  /** a test wrapper exposes the REAL acquired client's evidence (its own socket, host, ssl config) — never synthesized */
+  const ev = (cl, w) => Object.assign(w, { connection: cl.connection, host: cl.host, ssl: cl.ssl });
   const ACCT = FX.ENV_OK.STRIPE_TEST_ACCOUNT_ID;
   const clone = (o) => JSON.parse(JSON.stringify(o)); const sec = (ms) => Math.floor(ms / 1000);
   let seq = 0; let stayN = 0;
@@ -453,12 +597,12 @@ if (process.env.E7_HKO_DB_TESTS === "1") {
     ex.calls = calls; return ex;
   }
   // a pool that wraps db.app (the runtime app role) and can be scripted to hang specific statements
-  const appPool = (hang = null) => ({ connect: async () => { const cl = await db.app.connect();
-    return { query: (sql, p) => (hang && hang(sql) ? new Promise(() => {}) : cl.query(sql, p)), release: (x) => cl.release(x) }; } });
+  const appPool = (hang = null) => ({ connect: async () => { const cl = await itApp.connect();
+    return ev(cl, { query: (sql, p) => (hang && hang(sql) ? new Promise(() => {}) : cl.query(sql, p)), release: (x) => cl.release(x) }); } });
   const mods = (ex) => ({ ...MODS, createGithubExchange: () => ex });
   const credCount = { n: 0 };
   const run = (k, ex, over = {}) => E.runKickoffCore({ mods: mods(ex), pool: appPool(), binding: k.bind, credential: () => { credCount.n += 1; return TOKEN; }, workerId: "hko:it-0001",
-    constants: OPEN_CORE, tlsRequired: false, ...over });
+    constants: OPEN_IT, ...over });
   /** fingerprint EVERY booking table except the kickoff table (row count + md5 of the ordered row text), as the owner */
   const fingerprint = async () => {
     const ts = (await db.owner.query("SELECT tablename FROM pg_tables WHERE schemaname = 'booking' AND tablename <> 'pipeline_kickoff_requests' ORDER BY tablename")).rows.map((x) => x.tablename);
@@ -467,7 +611,7 @@ if (process.env.E7_HKO_DB_TESTS === "1") {
     return out;
   };
 
-  test("I1 REAL path: ONE bound request → admission (role / exact 0024 catalog / bindings) → owned claim COMMIT (durable 'claimed' at the GET and the POST) → release-bound GET == github.sha → ONE POST 204 → ACCEPTED_VERIFIED readback; every non-kickoff booking table unchanged; a re-run posts nothing", async () => {
+  itest("I1 REAL path: ONE bound request → admission (role / exact 0024 catalog / bindings) → owned claim COMMIT (durable 'claimed' at the GET and the POST) → release-bound GET == github.sha → ONE POST 204 → ACCEPTED_VERIFIED readback; every non-kickoff booking table unchanged; a re-run posts nothing", async () => {
     const k = await authorizedFresh(); const fp0 = await fingerprint(); const ex = fakeGithub(k.id);
     const r = await run(k, ex);
     assert.deepEqual([r.outcome, r.code, r.verified, r.claimed, r.gets, r.posts, r.credentialReads], ["ACCEPTED_VERIFIED", "HANDOFF_ACCEPTED", true, true, 1, 1, 1], JSON.stringify(r));
@@ -482,7 +626,7 @@ if (process.env.E7_HKO_DB_TESTS === "1") {
     assert.deepEqual([r2.code, ex2.calls.length], ["NOT_PRISTINE:DISPATCH_ACCEPTED", 0], "rerun: 0 GET / POST");
   });
 
-  test("I2 release binding: main moved (GET != github.sha) or today's CLOSED main → NOT_SENT, 0 POST; failures / late POST / timeout → UNKNOWN, exactly ONE POST, never re-posted", async () => {
+  itest("I2 release binding: main moved (GET != github.sha) or today's CLOSED main → NOT_SENT, 0 POST; failures / late POST / timeout → UNKNOWN, exactly ONE POST, never re-posted", async () => {
     for (const [label, script, outcome, posts] of [
       ["main moved", { getMain: async () => reply(200, refJson(SHA_B)) }, "NOT_SENT", 0],
       ["closed main", { getMain: async () => reply(200, refJson("a726d8ca80ec55c4334ba1bc88e4cd7cac8aa4fb")) }, "NOT_SENT", 0],
@@ -495,7 +639,7 @@ if (process.env.E7_HKO_DB_TESTS === "1") {
     }
   });
 
-  test("I3 seal around the POST: a POST that never replies → deadline seal → UNKNOWN (SEALED_AFTER_POST); a late 204 never upgrades it; the row stays claimed (human-owned), 0 retry", async () => {
+  itest("I3 seal around the POST: a POST that never replies → deadline seal → UNKNOWN (SEALED_AFTER_POST); a late 204 never upgrades it; the row stays claimed (human-owned), 0 retry", async () => {
     const k = await authorizedFresh(); let late204; const tm = fakeTimers();
     const ex = fakeGithub(k.id, { dispatch: () => new Promise((res) => { late204 = () => res(reply(204)); }) });
     const p = run(k, ex, { timer: tm.timer, clearTimer: tm.clearTimer });
@@ -508,7 +652,7 @@ if (process.env.E7_HKO_DB_TESTS === "1") {
     const ex2 = fakeGithub(k.id); await run(k, ex2); assert.equal(ex2.calls.length, 0);
   });
 
-  test("I4 COMMIT uncertainty: the claim COMMIT never replies → statement seal → CLAIM_UNCERTAIN, 0 GET / POST / credential; late connections destroyed", async () => {
+  itest("I4 COMMIT uncertainty: the claim COMMIT never replies → statement seal → CLAIM_UNCERTAIN, 0 GET / POST / credential; late connections destroyed", async () => {
     const k = await authorizedFresh(); const tm = fakeTimers(); const ex = fakeGithub(k.id); const c0 = credCount.n;
     let armed = false;
     const pool = appPool((sql) => { if (/claim_pipeline_kickoff/.test(sql)) armed = true; return armed && sql === "COMMIT"; });
@@ -521,16 +665,16 @@ if (process.env.E7_HKO_DB_TESTS === "1") {
     const st = (await row(k.id)).state; assert.ok(["requested", "claimed"].includes(st), st);
   });
 
-  test("I5 readback failure after a 204 → ACCEPTED_UNVERIFIED (STOP), no extra POST", async () => {
+  itest("I5 readback failure after a 204 → ACCEPTED_UNVERIFIED (STOP), no extra POST", async () => {
     const k = await authorizedFresh(); const ex = fakeGithub(k.id);
     const pool = appPool((sql) => /e7hko:readback/.test(sql) && false);
-    const pool2 = { connect: async () => { const c = await pool.connect(); return { query: (sql, p) => (/e7hko:readback/.test(sql) ? Promise.reject(new Error("readback lost")) : c.query(sql, p)), release: c.release }; } };
+    const pool2 = { connect: async () => { const c = await pool.connect(); return ev(c, { query: (sql, p) => (/e7hko:readback/.test(sql) ? Promise.reject(new Error("readback lost")) : c.query(sql, p)), release: c.release }); } };
     const r = await run(k, ex, { pool: pool2 });
     assert.deepEqual([r.outcome, r.code, r.posts, r.verified, r.readback], ["ACCEPTED_UNVERIFIED", "READBACK_MISSING_OR_CONTRADICTORY", 1, false, null]);
     assert.equal((await row(k.id)).state, "dispatch_accepted");
   });
 
-  test("I6 admission refusals on the REAL schema: wrong ref / version / PI / amount binding, an open case, a foreign role (report role), the owner role, and schema 23 (the claim function absent from the catalog read) → STOP with 0 GET / POST and the request untouched", async () => {
+  itest("I6 admission refusals on the REAL schema: wrong ref / version / PI / amount binding, an open case, a foreign role (report role), the owner role, and schema 23 (the claim function absent from the catalog read) → STOP with 0 GET / POST and the request untouched", async () => {
     for (const [label, mut] of [["ref", { ref: "MV-OTHER0001" }], ["version", { expectedVersion: 99 }], ["PI", { paymentIntentId: "pi_other" }], ["amount", { amountMinor: 1 }]]) {
       const k = await authorizedFresh(); const ex = fakeGithub(k.id);
       const r = await run({ ...k, bind: { ...k.bind, ...mut } }, ex);
@@ -542,24 +686,24 @@ if (process.env.E7_HKO_DB_TESTS === "1") {
       const ex = fakeGithub(k.id); const r = await run(k, ex);
       assert.deepEqual([r.code, ex.calls.length, (await row(k.id)).state], ["ADMISSION:OPEN_CASE", 0, "requested"]); }
     { const k = await authorizedFresh(); const ex = fakeGithub(k.id);
-      const rep = { connect: async () => { const cl = await db.owner.connect(); await cl.query("SET ROLE test_report"); return { query: (s, p) => cl.query(s, p), release: (x) => { cl.query("RESET ROLE").finally(() => cl.release(x)); } }; } };
+      const rep = { connect: async () => { const cl = await itOwner.connect(); await cl.query("SET ROLE test_report"); return ev(cl, { query: (s, p) => cl.query(s, p), release: (x) => { cl.query("RESET ROLE").finally(() => cl.release(x)); } }); } };
       const r = await run(k, ex, { pool: rep }); assert.deepEqual([r.code, ex.calls.length], ["ROLE_REFUSED", 0]); }
     { const k = await authorizedFresh(); const ex = fakeGithub(k.id);
-      const own = { connect: async () => { const cl = await db.owner.connect(); return { query: (s, p) => cl.query(s, p), release: (x) => cl.release(x) }; } };
+      const own = { connect: async () => { const cl = await itOwner.connect(); return ev(cl, { query: (s, p) => cl.query(s, p), release: (x) => cl.release(x) }); } };
       const r = await run(k, ex, { pool: own }); assert.deepEqual([r.code, ex.calls.length], ["ROLE_REFUSED", 0], "owner never admitted"); }
     { const k = await authorizedFresh(); const ex = fakeGithub(k.id);
-      const s23 = { connect: async () => { const cl = await db.app.connect();
-        return { query: (s, p) => (/e7hko:fn/.test(s) && /claim_pipeline_kickoff/.test(String(p && p[0])) ? cl.query("SELECT NULL::text AS sig WHERE false") : cl.query(s, p)), release: (x) => cl.release(x) }; } };
+      const s23 = { connect: async () => { const cl = await itApp.connect();
+        return ev(cl, { query: (s, p) => (/e7hko:fn/.test(s) && /claim_pipeline_kickoff/.test(String(p && p[0])) ? cl.query("SELECT NULL::text AS sig WHERE false") : cl.query(s, p)), release: (x) => cl.release(x) }); } };
       const r = await run(k, ex, { pool: s23 }); assert.deepEqual([r.code, ex.calls.length], ["SCHEMA_NOT_0024", 0]); }
   });
 
-  test("I7 C111 F1 — REAL consumer, claim COMMIT acknowledgement LOST after the server committed: CLAIM_UNCERTAIN, 0 credential / GET / POST, ONE claim statement (no retry); the durable row is 'claimed' (human-owned) and a rerun posts nothing", async () => {
+  itest("I7 C111 F1 — REAL consumer, claim COMMIT acknowledgement LOST after the server committed: CLAIM_UNCERTAIN, 0 credential / GET / POST, ONE claim statement (no retry); the durable row is 'claimed' (human-owned) and a rerun posts nothing", async () => {
     const k = await authorizedFresh(); const ex = fakeGithub(k.id); const c0 = credCount.n; let claims = 0; let armed = false;
-    const pool = { connect: async () => { const cl = await db.app.connect();
-      return { query: async (sql, p) => {
+    const pool = { connect: async () => { const cl = await itApp.connect();
+      return ev(cl, { query: async (sql, p) => {
         if (/claim_pipeline_kickoff/.test(sql)) { claims += 1; armed = true; }
         if (armed && sql === "COMMIT") { armed = false; await cl.query("COMMIT"); const e = new Error("Connection terminated unexpectedly"); e.code = "ECONNRESET"; throw e; }
-        return cl.query(sql, p); }, release: (x) => cl.release(x) }; } };
+        return cl.query(sql, p); }, release: (x) => cl.release(x) }); } };
     const r = await run(k, ex, { pool });
     assert.deepEqual([r.outcome, r.code, r.claimed, r.gets, r.posts, credCount.n - c0, claims, ex.calls.length], ["CLAIM_UNCERTAIN", "CLAIM_UNCERTAIN", false, 0, 0, 0, 1, 0], JSON.stringify(r));
     const durable = await row(k.id);
@@ -568,33 +712,100 @@ if (process.env.E7_HKO_DB_TESTS === "1") {
     assert.deepEqual([r2.code, ex2.calls.length, r2.credentialReads], ["NOT_PRISTINE:CLAIMED", 0, 0], "no automatic retry / recovery");
   });
 
-  test("I8 C111 F1 — REAL consumer, claim COMMIT REJECTED before the server committed: CLAIM_UNCERTAIN (never STOP), 0 credential / GET / POST, ONE claim statement; the destroyed session rolls back so the row stays 'requested'", async () => {
+  itest("I8 C111 F1 — REAL consumer, claim COMMIT REJECTED before the server committed: CLAIM_UNCERTAIN (never STOP), 0 credential / GET / POST, ONE claim statement; the destroyed session rolls back so the row stays 'requested'", async () => {
     const k = await authorizedFresh(); const ex = fakeGithub(k.id); const c0 = credCount.n; let claims = 0; let armed = false;
-    const pool = { connect: async () => { const cl = await db.app.connect();
-      return { query: async (sql, p) => {
+    const pool = { connect: async () => { const cl = await itApp.connect();
+      return ev(cl, { query: async (sql, p) => {
         if (/claim_pipeline_kickoff/.test(sql)) { claims += 1; armed = true; }
         if (armed && sql === "COMMIT") { armed = false; const e = new Error("write ECONNRESET"); e.code = "ECONNRESET"; throw e; }
-        return cl.query(sql, p); }, release: (x) => cl.release(x) }; } };
+        return cl.query(sql, p); }, release: (x) => cl.release(x) }); } };
     const r = await run(k, ex, { pool });
     assert.deepEqual([r.outcome, r.code, r.gets, r.posts, credCount.n - c0, claims, ex.calls.length], ["CLAIM_UNCERTAIN", "CLAIM_UNCERTAIN", 0, 0, 0, 1, 0], JSON.stringify(r));
     for (let i = 0; i < 50 && (await row(k.id)).state !== "requested"; i += 1) await new Promise((res) => setTimeout(res, 10));
     assert.equal((await row(k.id)).state, "requested");
   });
 
-  test("I9 C111 F1 — REAL consumer, its owned connection is not clean (TX_NOT_CLEAN) → CLAIM_UNCERTAIN, never STOP; 0 credential / GET / POST; nothing written", async () => {
+  itest("I9 C111 F1 — REAL consumer, its owned connection is not clean (TX_NOT_CLEAN) → CLAIM_UNCERTAIN, never STOP; 0 credential / GET / POST; nothing written", async () => {
     const k = await authorizedFresh(); const ex = fakeGithub(k.id); const c0 = credCount.n;
-    const pool = { connect: async () => { const cl = await db.app.connect();
-      return { query: (sql, p) => (/AS clean/.test(sql) ? Promise.resolve({ rows: [{ clean: false }] }) : cl.query(sql, p)), release: (x) => cl.release(x) }; } };
+    const pool = { connect: async () => { const cl = await itApp.connect();
+      return ev(cl, { query: (sql, p) => (/AS clean/.test(sql) ? Promise.resolve({ rows: [{ clean: false }] }) : cl.query(sql, p)), release: (x) => cl.release(x) }); } };
     const r = await run(k, ex, { pool });
     assert.deepEqual([r.outcome, r.code, r.gets, r.posts, credCount.n - c0], ["CLAIM_UNCERTAIN", "TX_NOT_CLEAN", 0, 0, 0], JSON.stringify(r));
     assert.equal((await row(k.id)).state, "requested");
   });
 
-  test("I10 C112-F1 the stateless ghs_ token shape through the REAL consumer + transport (fake GitHub exchange): ACCEPTED_VERIFIED, the exchange receives exactly that token, ONE GET + ONE POST", async () => {
+  itest("I10 C112-F1 the stateless ghs_ token shape through the REAL consumer + transport (fake GitHub exchange): ACCEPTED_VERIFIED, the exchange receives exactly that token, ONE GET + ONE POST", async () => {
     const k = await authorizedFresh(); const seenTok = []; const base = fakeGithub(k.id);
     const ex = async (spec) => { seenTok.push(spec.token === NEW_TOKEN); return base(spec); };
     const r = await run(k, ex, { credential: () => NEW_TOKEN });
     assert.deepEqual([r.outcome, r.gets, r.posts, r.verified], ["ACCEPTED_VERIFIED", 1, 1, true], JSON.stringify(r)); assert.deepEqual(seenTok, [true, true]);
     assert.ok(!JSON.stringify(r).includes(NEW_TOKEN.slice(4, 24)));
+  });
+
+  // ---- C112 TLS on BOTH hops, against REAL sockets (disposable CA / proxy / server SSL) -------------------------------------------------
+  const wrapPool = (P, onConnect = null) => ({ connect: async () => { const cl = await P.connect(); if (onConnect) onConnect(cl);
+    return ev(cl, { query: (s, p) => cl.query(s, p), release: (x) => cl.release(x) }); } });
+  const backendSsl = async (P) => { const cl = await P.connect(); try { return (await cl.query("SELECT coalesce((SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()), false) AS s")).rows[0].s; } finally { cl.release(); } };
+
+  itest("I11 C112 BOTH hops verified (pooler-shaped proxy, verified TLS to the client AND to Postgres): every acquired client's own socket is authorized for the reviewed host + pinned CA, the server reports ssl=true, and the REAL path reaches ACCEPTED_VERIFIED", async () => {
+    assert.equal(await backendSsl(itApp), true, "server-reported backend hop");
+    const k = await authorizedFresh(); const ex = fakeGithub(k.id);
+    const r = await run(k, ex);
+    assert.deepEqual([r.outcome, r.code, r.backendSsl, r.tlsClientRefusal, r.tlsClientChecks === r.tlsClientVerified, r.tlsClientChecks >= 2, r.gets, r.posts],
+      ["ACCEPTED_VERIFIED", "HANDOFF_ACCEPTED", true, null, true, true, 1, 1], JSON.stringify(r));
+  });
+
+  itest("I12 C112 the OBSERVED hosted discrepancy, reproduced: the CLIENT hop is verified TLS but the pooler→Postgres hop is plaintext (server pg_stat_ssl.ssl=false, the shared pooler with Enforce SSL OFF) → STOP TLS_REQUIRED:BACKEND_HOP after ONE statement; the request untouched; 0 credential / GET / POST — client evidence never waives the backend hop", async () => {
+    const P = tlsPool(proxies.offBack.port);
+    assert.equal(await backendSsl(P), false, "server-reported: backend hop plaintext");
+    let sock = null; const k = await authorizedFresh(); const ex = fakeGithub(k.id); const c0 = credCount.n;
+    const r = await run(k, ex, { pool: wrapPool(P, (cl) => { sock = cl.connection.stream; }) });
+    assert.ok(sock instanceof tls.TLSSocket && sock.authorized === true, "the client socket itself was an authorized TLS socket");
+    assert.deepEqual([r.outcome, r.code, r.backendSsl, r.tlsClientVerified, r.tlsClientRefusal, r.dbQueries, r.gets, r.posts, credCount.n - c0, ex.calls.length],
+      ["STOP", "TLS_REQUIRED:BACKEND_HOP", false, 1, null, 1, 0, 0, 0, 0], JSON.stringify(r));
+    assert.equal((await row(k.id)).state, "requested");
+  });
+
+  itest("I13 C112 server text is NOT client-hop proof: a PLAINTEXT client behind a proxy whose backend hop is TLS (the server reports ssl=true) and a client that does not verify the chain (rejectUnauthorized:false) would both pass a pg_stat_ssl-only gate — the runner refuses each BEFORE its first statement", async () => {
+    const plain = tlsPool(proxies.plainFront.port, "test_app", false);
+    const noVerify = tlsPool(db.port, "test_app", { rejectUnauthorized: false });                       // direct TLS to Postgres, chain NOT verified
+    const noVerifyWrongHost = tlsPool(proxies.wronghost.port, "test_app", { rejectUnauthorized: false, ca: fx.ca1 });
+    for (const [label, P, why] of [["plaintext client, TLS backend", plain, "NOT_TLS"], ["unverified chain", noVerify, "UNAUTHORIZED"],
+      ["wrong-host certificate accepted unverified", noVerifyWrongHost, "UNAUTHORIZED"]]) {
+      assert.equal(await backendSsl(P), true, `${label}: a server-text-only gate (the pre-C112 rule) would admit this`);
+      const k = await authorizedFresh(); const ex = fakeGithub(k.id); const c0 = credCount.n;
+      const r = await run(k, ex, { pool: wrapPool(P) });
+      assert.deepEqual([r.outcome, r.code, r.tlsClientRefusal, r.dbQueries, r.backendSsl, r.gets, r.posts, credCount.n - c0, ex.calls.length],
+        ["STOP", `TLS_REQUIRED:CLIENT_${why}`, why, 0, null, 0, 0, 0, 0], `${label}: ${JSON.stringify(r)}`);
+      assert.equal((await row(k.id)).state, "requested", label);
+    }
+  });
+
+  itest("I14 C112 REAL handshake negatives with rejectUnauthorized:true: a certificate for another host, a certificate from a foreign CA → the connection itself fails (0 evidence checks, 0 statements); the policy host / CA pin also bind a valid socket (HOSTNAME_MISMATCH / CONFIG_NOT_PINNED); a socket destroyed before use → DISCONNECTED", async () => {
+    for (const [label, port] of [["wrong host", proxies.wronghost.port], ["foreign CA", proxies.foreign.port]]) {
+      const k = await authorizedFresh(); const ex = fakeGithub(k.id);
+      const r = await run(k, ex, { pool: wrapPool(tlsPool(port)) });
+      assert.deepEqual([r.outcome, r.code.startsWith("ADMISSION_READ_FAILED:"), r.tlsClientChecks, r.dbQueries, ex.calls.length], ["STOP", true, 0, 0, 0], `${label}: ${r.code}`);
+    }
+    for (const [label, tlsPol, why] of [["policy host", { host: "db.other.invalid", caSha256: sha(fx.ca1) }, "HOSTNAME_MISMATCH"], ["CA pin", { host: "localhost", caSha256: sha(fx.ca2) }, "CONFIG_NOT_PINNED"]]) {
+      const k = await authorizedFresh(); const ex = fakeGithub(k.id);
+      const r = await run(k, ex, { constants: { ...OPEN_IT, tls: tlsPol } });
+      assert.deepEqual([r.code, r.dbQueries, ex.calls.length], [`TLS_REQUIRED:CLIENT_${why}`, 0, 0], label);
+    }
+    const k = await authorizedFresh(); const ex = fakeGithub(k.id);
+    const r = await run(k, ex, { pool: wrapPool(itApp, (cl) => cl.connection.stream.destroy()) });
+    assert.deepEqual([r.code, r.dbQueries, ex.calls.length], ["TLS_REQUIRED:CLIENT_DISCONNECTED", 0, 0]);
+  });
+
+  itest("I15 C112 the CONSUMER's acquisition is checked on its own socket: admission on verified clients, then a PLAINTEXT client handed to the REAL consumer → STOP TLS_REQUIRED:CLIENT_NOT_TLS before any claim; the row stays requested; 0 credential / GET / POST", async () => {
+    const plain = tlsPool(proxies.plainFront.port, "test_app", false);
+    const admission = E.CATALOG_PINS.functions.length + 4; let n = 0;
+    const pool = { connect: async () => { n += 1; const P = n <= admission ? itApp : plain; const cl = await P.connect();
+      return ev(cl, { query: (s, p) => cl.query(s, p), release: (x) => cl.release(x) }); } };
+    const k = await authorizedFresh(); const ex = fakeGithub(k.id); const c0 = credCount.n;
+    const r = await run(k, ex, { pool });
+    assert.deepEqual([r.outcome, r.code, r.claimed, r.backendSsl, r.tlsClientVerified, r.gets, r.posts, credCount.n - c0, ex.calls.length],
+      ["STOP", "TLS_REQUIRED:CLIENT_NOT_TLS", false, true, admission, 0, 0, 0, 0], JSON.stringify(r));
+    assert.equal(n, admission + 1); assert.equal((await row(k.id)).state, "requested");
   });
 }

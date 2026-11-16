@@ -21,6 +21,12 @@
 // statements are refused, the guarded exchange refuses any GET / POST after the seal, and a late consumer result is DISCARDED (never upgraded).
 // In-flight claim / COMMIT at the seal → 0 dispatch (human-owned). A possibly started POST → UNKNOWN, never upgraded by a late 204.
 // The DB session is the runtime app role over TLS with the pinned CA (never the owner / admin role); ONE consumer invocation for ONE bound
+// C112 TLS (BOTH hops, no exception path): (a) CLIENT hop — EVERY acquired client (admission AND consumer) must show, on its OWN socket and
+// BEFORE its first statement, a live node:tls socket that completed an authorized handshake (CA chain + hostname, no resumed session) whose
+// peer certificate independently passes tls.checkServerIdentity(CONSTANTS.tls.host), with the pinned CA and rejectUnauthorized:true in force;
+// otherwise the client is destroyed unused, the core is sealed and the run STOPs TLS_REQUIRED:CLIENT_<reason>. (b) BACKEND hop — the
+// server-reported pg_stat_ssl.ssl of the backend serving the session query must be true (through the Supabase shared pooler this is the
+// pooler→Postgres hop, which the project's "Enforce SSL" setting governs); otherwise STOP TLS_REQUIRED:BACKEND_HOP. Neither proves the other.
 // request (never a queue sweep, never an auto-resume). UNKNOWN / claimed uncertainty is human-owned: no retry, recovery or repair.
 //
 // The ONLY top-level effect is the guarded main() at the bottom. No schedule / cron / webhook / route triggers this file (dispatch only).
@@ -28,6 +34,7 @@ import process from "node:process";
 import { readFile, realpath, lstat } from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
+import tls from "node:tls";
 import { spawn } from "node:child_process";
 
 const freeze = Object.freeze;
@@ -66,6 +73,7 @@ export const CONSTANTS = deepFreeze({
     excludedIntentIds: ["abede8b1-8ef6-44f2-876e-6a02fc056a96", "c83c1842-d342-4e27-9ab7-dc3d50b7a309", "954d476c-71ea-4824-92f6-2220ae302103",
       "669da884-02e8-4105-8825-f908e5d22ae9", "1d6e770f-ba3d-40f7-92c1-ee01be7da532"]
   },
+  tls: { host: "aws-0-us-east-1.pooler.supabase.com", caSha256: "700723581420dd1ac98fd7e9ac529f0ef210eadcaf87fc868a3ad7d114c2f3b7" },  // C112: client-hop identity (== dbTargetOk host, OFFICIAL_CA_SHA256)
   dbProjectRef: "mxotevtiscernhqilyiu", environment: "test", nodeVersion: "22.22.0", pgVersion: "8.18.0",
   budgets: { runMs: 90000, teardownMs: 5000, connectMs: 8000, statementMs: 6000, dbQueries: 48, gets: 1, posts: 1, poolMax: 2 }
 });
@@ -177,6 +185,34 @@ export const QUERIES = freeze({
 export const UNCERTAIN_CONSUMER_CODES = deepFreeze({ CLAIM_UNCERTAIN: "CLAIM_UNCERTAIN", TX_NOT_CLEAN: "CLAIM_UNCERTAIN", REFUSE_UNCERTAIN: "REFUSE_UNCERTAIN" });
 const READBACK_STATES = freeze(["requested", "claimed", "dispatch_accepted", "dispatch_unknown", "dispatch_refused", "refused"]);
 
+/**
+ * C112 CLIENT-hop TLS evidence for ONE acquired pg client, read from the client's OWN socket (never from server text, env or input).
+ * → null (verified) or a reason. Node sets socket.authorized only after the CA chain AND checkServerIdentity passed (lib/_tls_wrap.js
+ * onConnectSecure); a resumed session skips that identity check, so it is refused, and the identity is re-checked here against the reviewed
+ * host independently of the name the socket used. The pg config must still carry rejectUnauthorized:true and the pinned CA bytes.
+ */
+export function clientTlsRefusal(cl, policy) {
+  try {
+    if (!isObj(policy) || typeof policy.host !== "string" || !HEX64.test(String(policy.caSha256))) return "POLICY_INVALID";
+    const st = cl && cl.connection && cl.connection.stream;
+    if (!st) return "NO_EVIDENCE";
+    if (!(st instanceof tls.TLSSocket) || st.encrypted !== true) return "NOT_TLS";
+    if (st.destroyed !== false || st.readyState !== "open") return "DISCONNECTED";
+    if (st.authorized !== true || st.authorizationError != null) return "UNAUTHORIZED";
+    if (typeof st.isSessionReused !== "function" || st.isSessionReused() !== false) return "SESSION_REUSED";
+    const proto = typeof st.getProtocol === "function" ? st.getProtocol() : null;
+    if (proto !== "TLSv1.3" && proto !== "TLSv1.2") return "PROTOCOL";
+    const cert = typeof st.getPeerCertificate === "function" ? st.getPeerCertificate() : null;
+    if (!isObj(cert) || Object.keys(cert).length === 0) return "NO_PEER_CERT";
+    if (tls.checkServerIdentity(policy.host, cert) !== undefined) return "HOSTNAME_MISMATCH";
+    if (cl.host !== policy.host) return "HOST_MISMATCH";
+    const ssl = cl.ssl;
+    if (!isObj(ssl) || ssl.rejectUnauthorized !== true || typeof ssl.ca !== "string" || sha(Buffer.from(ssl.ca, "utf8")) !== policy.caSha256
+        || ssl.checkServerIdentity !== undefined) return "CONFIG_NOT_PINNED";
+    return null;
+  } catch { return "EVIDENCE_ERROR"; }
+}
+
 /** the exact catalog proof: every reviewed 0024 function / ACL / table privilege / trigger, nothing adopted; schema 23 → refused */
 export function catalogRefusal(fns, table, pins = CATALOG_PINS) {
   for (let i = 0; i < pins.functions.length; i += 1) {
@@ -190,7 +226,7 @@ export function catalogRefusal(fns, table, pins = CATALOG_PINS) {
 }
 
 /**
- * runKickoffCore(input) → result. input = { mods, pool, binding, credential, workerId, runSignal?, timer?, clearTimer?, now?, tlsRequired?, constants? }
+ * runKickoffCore(input) → result. input = { mods, pool, binding, credential, workerId, runSignal?, timer?, clearTimer?, now?, constants? }  (no TLS opt-out exists)
  *   mods = { runPipelineKickoffOnce, readKickoffFacts, kickoffAdmission, KICKOFF_CONSTANTS, KICKOFF_SCOPE, createGithubWorkflowDispatch,
  *            createGithubExchange, GITHUB_DISPATCH_CONSTANTS, GithubExchangeError }
  *   binding = { intentId, ref, expectedVersion, paymentIntentId, amountMinor, releaseSha }
@@ -200,7 +236,8 @@ export async function runKickoffCore(input) {
   const c = (input && input.constants) ?? CONSTANTS; const B = c.budgets;
   const r = { schema: "e7-hosted-kickoff-core-v1", outcome: null, code: null, consumerCode: null, claimed: false, dispatchAttempted: false, dispatchOutcome: null,
     gets: 0, posts: 0, postPossiblyStarted: false, credentialReads: 0, dbQueries: 0, dbBudgetRefused: 0, sealed: false, sealReason: null, dbInFlightAtSeal: 0,
-    claimInFlightAtSeal: false, clientsDestroyed: 0, lateClientsDestroyed: 0, lateDispatchRefused: 0, readback: null, verified: false };
+    claimInFlightAtSeal: false, clientsDestroyed: 0, lateClientsDestroyed: 0, lateDispatchRefused: 0, readback: null, verified: false,
+    tlsClientChecks: 0, tlsClientVerified: 0, tlsClientRefusal: null, backendSsl: null };   // backendSsl = server-reported pg_stat_ssl.ssl (backend hop), never client proof
   let finalized = false;
   const done = (outcome, k) => { if (!finalized) { finalized = true; r.outcome = outcome; r.code = code(String(k), "CODE"); } return r; };
   const setT = input && typeof input.timer === "function" ? input.timer : (fn, ms) => setTimeout(fn, ms);
@@ -257,6 +294,14 @@ export async function runKickoffCore(input) {
       try {
         const cl = await supervise(pc, B.connectMs, () => seal("DB_CONNECT_TIMEOUT"), "DB_CONNECT_TIMEOUT");
         if (!cl || typeof cl.query !== "function" || typeof cl.release !== "function") { lost = true; if (cl) kill(cl); throw new Refusal("DB_CLIENT_INVALID"); }
+        r.tlsClientChecks += 1;
+        const why = clientTlsRefusal(cl, c.tls);                                                    // C112: client-hop evidence BEFORE the first statement
+        if (why !== null) {
+          lost = true; got = null; r.clientsDestroyed += 1; try { cl.release(true); } catch { /* contained */ }
+          if (r.tlsClientRefusal === null) r.tlsClientRefusal = code(why, "EVIDENCE_ERROR");
+          seal("TLS_CLIENT_UNVERIFIED"); throw new Refusal(`TLS_REQUIRED:CLIENT_${r.tlsClientRefusal}`);
+        }
+        r.tlsClientVerified += 1;
         t = { cl, released: false }; tracked.add(t);
         if (r.sealed) { destroy(t); throw new Stopped(); }
         return t;
@@ -280,7 +325,8 @@ export async function runKickoffCore(input) {
     try {
       const s = (await q(QUERIES.session))[0];
       if (!s || s.is_app !== true || s.is_admin !== false || s.privileged !== false || s.owns_schema !== false) return done("STOP", "ROLE_REFUSED");
-      if ((input.tlsRequired ?? true) && s.tls !== true) return done("STOP", "TLS_REQUIRED");
+      r.backendSsl = s.tls === true ? true : s.tls === false ? false : null;
+      if (s.tls !== true) return done("STOP", "TLS_REQUIRED:BACKEND_HOP");                          // C112: backend hop is still REQUIRED (no waiver)
       if (!Number.isSafeInteger(s.server_version_num) || s.server_version_num < 160000 || s.server_version_num >= 180000) return done("STOP", "SERVER_VERSION_REFUSED");
       const env = (await q(QUERIES.environment))[0];
       if (!env || env.environment !== c.environment) return done("STOP", "NOT_TEST");
@@ -291,7 +337,10 @@ export async function runKickoffCore(input) {
       if (cw) return done("STOP", cw);
       const t = await acquire(); let ok = false;
       try { adm = await mods.readKickoffFacts({ query: (...a) => tq(t, a) }, binding.intentId); ok = true; } finally { finish(t, !ok); }
-    } catch (e) { return done("STOP", r.sealed ? `SEALED_ADMISSION:${r.sealReason}` : `ADMISSION_READ_FAILED:${code(e && e.code, "ERR")}`); }
+    } catch (e) {
+      if (r.tlsClientRefusal !== null) return done("STOP", `TLS_REQUIRED:CLIENT_${r.tlsClientRefusal}`);
+      return done("STOP", r.sealed ? `SEALED_ADMISSION:${r.sealReason}` : `ADMISSION_READ_FAILED:${code(e && e.code, "ERR")}`);
+    }
     const rq = adm && adm.request; const it = adm && adm.intent;
     if (!rq) return done("STOP", "NO_BOUND_REQUEST");
     if (rq.state !== "requested") return done("STOP", `NOT_PRISTINE:${String(rq.state).toUpperCase()}`);
@@ -333,6 +382,7 @@ export async function runKickoffCore(input) {
     } catch {
       if (r.postPossiblyStarted) return done("UNKNOWN", `SEALED_AFTER_POST:${r.sealReason}`);                 // never upgraded by a late 204
       if (phase === "claim" || phase === "claimed" || phase === "dispatch" || phase === "settle") return done("CLAIM_UNCERTAIN", `SEALED_IN_${phase.toUpperCase()}:${r.sealReason}`);
+      if (r.tlsClientRefusal !== null) return done("STOP", `TLS_REQUIRED:CLIENT_${r.tlsClientRefusal}`);   // consumer client refused before its claim
       return done("STOP", `SEALED:${r.sealReason ?? "ERR"}`);
     }
     r.consumerCode = code(out && out.code, "UNRECOGNIZED"); r.claimed = out && out.claimed === true; r.dispatchAttempted = out && out.dispatchAttempted === true;
