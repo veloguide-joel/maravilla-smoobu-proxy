@@ -311,6 +311,19 @@ test("K6 catalogRefusal + readback / summary shapes: exact pins only; summaryMar
   assert.match(md, /core=ACCEPTED_VERIFIED\/HANDOFF_ACCEPTED .* gets=1 posts=1 verified=true/); assert.doesNotMatch(md, /token|postgres|@|email/i);
 });
 
+test("K7 C111 F1: a consumer result with claimed:false but an UNCERTAIN code (CLAIM_UNCERTAIN / TX_NOT_CLEAN / REFUSE_UNCERTAIN) is classified human-owned BEFORE the unclaimed STOP; 0 credential / GET / POST; the consumer is invoked exactly once", async () => {
+  const FACTS = { request: { state: "requested", intent_id: IID, ref: REF, authorized_version: 6, payment_intent_id: PI, amount_minor: 56000, currency: "USD", listing_id: 606998 },
+    intent: { version: 6, status: "payment_authorized", payment: { paymentIntentId: PI, amountMinor: 56000 } } };
+  for (const [consumerCode, outcome] of [["CLAIM_UNCERTAIN", "CLAIM_UNCERTAIN"], ["TX_NOT_CLEAN", "CLAIM_UNCERTAIN"], ["REFUSE_UNCERTAIN", "REFUSE_UNCERTAIN"], ["REFUSED:OPEN_CASE", "REFUSED"], ["NO_REQUEST", "STOP"]]) {
+    let calls = 0; const st = fakePool();
+    const mods = { ...MODS, readKickoffFacts: async () => FACTS, kickoffAdmission: () => null,
+      runPipelineKickoffOnce: async () => { calls += 1; return Object.freeze({ code: consumerCode, intentId: IID, claimed: false, dispatchAttempted: false, outcome: null, settled: false }); } };
+    const r = await core(st, { mods });
+    assert.deepEqual([r.outcome, r.code, r.claimed, calls, r.gets, r.posts, r.credentialReads], [outcome, consumerCode, false, 1, 0, 0, 0], consumerCode);
+  }
+  assert.deepEqual(Object.keys(E.UNCERTAIN_CONSUMER_CODES).sort(), ["CLAIM_UNCERTAIN", "REFUSE_UNCERTAIN", "TX_NOT_CLEAN"]);
+});
+
 // ---------------------------------------------------------------------------------------------------------------------------------
 // OPT-IN INTEGRATION (E7_HKO_DB_TESTS=1; tooling with its pinned pg; PG_BIN): REAL 0024 + webhook authorization + consumer + transport on a
 // disposable PostgreSQL, a FAKE GitHub exchange. The hosted preflight child never sets it.
@@ -469,5 +482,42 @@ if (process.env.E7_HKO_DB_TESTS === "1") {
       const s23 = { connect: async () => { const cl = await db.app.connect();
         return { query: (s, p) => (/e7hko:fn/.test(s) && /claim_pipeline_kickoff/.test(String(p && p[0])) ? cl.query("SELECT NULL::text AS sig WHERE false") : cl.query(s, p)), release: (x) => cl.release(x) }; } };
       const r = await run(k, ex, { pool: s23 }); assert.deepEqual([r.code, ex.calls.length], ["SCHEMA_NOT_0024", 0]); }
+  });
+
+  test("I7 C111 F1 — REAL consumer, claim COMMIT acknowledgement LOST after the server committed: CLAIM_UNCERTAIN, 0 credential / GET / POST, ONE claim statement (no retry); the durable row is 'claimed' (human-owned) and a rerun posts nothing", async () => {
+    const k = await authorizedFresh(); const ex = fakeGithub(k.id); const c0 = credCount.n; let claims = 0; let armed = false;
+    const pool = { connect: async () => { const cl = await db.app.connect();
+      return { query: async (sql, p) => {
+        if (/claim_pipeline_kickoff/.test(sql)) { claims += 1; armed = true; }
+        if (armed && sql === "COMMIT") { armed = false; await cl.query("COMMIT"); const e = new Error("Connection terminated unexpectedly"); e.code = "ECONNRESET"; throw e; }
+        return cl.query(sql, p); }, release: (x) => cl.release(x) }; } };
+    const r = await run(k, ex, { pool });
+    assert.deepEqual([r.outcome, r.code, r.claimed, r.gets, r.posts, credCount.n - c0, claims, ex.calls.length], ["CLAIM_UNCERTAIN", "CLAIM_UNCERTAIN", false, 0, 0, 0, 1, 0], JSON.stringify(r));
+    const durable = await row(k.id);
+    assert.deepEqual([durable.state, durable.claim_worker], ["claimed", "hko:it-0001"], "the COMMIT landed: durable, human-owned claim");
+    const ex2 = fakeGithub(k.id); const r2 = await run(k, ex2);
+    assert.deepEqual([r2.code, ex2.calls.length, r2.credentialReads], ["NOT_PRISTINE:CLAIMED", 0, 0], "no automatic retry / recovery");
+  });
+
+  test("I8 C111 F1 — REAL consumer, claim COMMIT REJECTED before the server committed: CLAIM_UNCERTAIN (never STOP), 0 credential / GET / POST, ONE claim statement; the destroyed session rolls back so the row stays 'requested'", async () => {
+    const k = await authorizedFresh(); const ex = fakeGithub(k.id); const c0 = credCount.n; let claims = 0; let armed = false;
+    const pool = { connect: async () => { const cl = await db.app.connect();
+      return { query: async (sql, p) => {
+        if (/claim_pipeline_kickoff/.test(sql)) { claims += 1; armed = true; }
+        if (armed && sql === "COMMIT") { armed = false; const e = new Error("write ECONNRESET"); e.code = "ECONNRESET"; throw e; }
+        return cl.query(sql, p); }, release: (x) => cl.release(x) }; } };
+    const r = await run(k, ex, { pool });
+    assert.deepEqual([r.outcome, r.code, r.gets, r.posts, credCount.n - c0, claims, ex.calls.length], ["CLAIM_UNCERTAIN", "CLAIM_UNCERTAIN", 0, 0, 0, 1, 0], JSON.stringify(r));
+    for (let i = 0; i < 50 && (await row(k.id)).state !== "requested"; i += 1) await new Promise((res) => setTimeout(res, 10));
+    assert.equal((await row(k.id)).state, "requested");
+  });
+
+  test("I9 C111 F1 — REAL consumer, its owned connection is not clean (TX_NOT_CLEAN) → CLAIM_UNCERTAIN, never STOP; 0 credential / GET / POST; nothing written", async () => {
+    const k = await authorizedFresh(); const ex = fakeGithub(k.id); const c0 = credCount.n;
+    const pool = { connect: async () => { const cl = await db.app.connect();
+      return { query: (sql, p) => (/AS clean/.test(sql) ? Promise.resolve({ rows: [{ clean: false }] }) : cl.query(sql, p)), release: (x) => cl.release(x) }; } };
+    const r = await run(k, ex, { pool });
+    assert.deepEqual([r.outcome, r.code, r.gets, r.posts, credCount.n - c0], ["CLAIM_UNCERTAIN", "TX_NOT_CLEAN", 0, 0, 0], JSON.stringify(r));
+    assert.equal((await row(k.id)).state, "requested");
   });
 }

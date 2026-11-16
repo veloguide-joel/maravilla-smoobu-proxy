@@ -167,6 +167,8 @@ export const QUERIES = freeze({
   readback: `/*e7hko:readback*/ SELECT r.state, r.outcome_code, r.claim_worker, r.plan_hash, (r.dispatch_inputs IS NOT NULL) AS has_inputs, (r.settled_at IS NOT NULL) AS settled,
     i.state AS intent_status, i.version AS intent_version FROM booking.pipeline_kickoff_requests r JOIN booking.intents i ON i.id = r.intent_id WHERE r.intent_id = $1`
 });
+/** consumer codes whose durable effect is UNKNOWN even though claimed:false (C111 F1) → human-owned outcome */
+export const UNCERTAIN_CONSUMER_CODES = deepFreeze({ CLAIM_UNCERTAIN: "CLAIM_UNCERTAIN", TX_NOT_CLEAN: "CLAIM_UNCERTAIN", REFUSE_UNCERTAIN: "REFUSE_UNCERTAIN" });
 const READBACK_STATES = freeze(["requested", "claimed", "dispatch_accepted", "dispatch_unknown", "dispatch_refused", "refused"]);
 
 /** the exact catalog proof: every reviewed 0024 function / ACL / table privilege / trigger, nothing adopted; schema 23 → refused */
@@ -329,8 +331,10 @@ export async function runKickoffCore(input) {
     }
     r.consumerCode = code(out && out.code, "UNRECOGNIZED"); r.claimed = out && out.claimed === true; r.dispatchAttempted = out && out.dispatchAttempted === true;
     r.dispatchOutcome = out && typeof out.outcome === "string" ? code(out.outcome, null) : null;
+    // C111 F1: uncertainty is classified BEFORE the unclaimed return — the consumer reports a lost / rejected claim COMMIT acknowledgement
+    // (or a dirty owned connection, or a lost refuse COMMIT) with claimed:false, yet the COMMIT may have landed. Human-owned: no retry.
+    if (Object.hasOwn(UNCERTAIN_CONSUMER_CODES, r.consumerCode)) return done(UNCERTAIN_CONSUMER_CODES[r.consumerCode], r.consumerCode);
     if (!r.claimed) return done(r.consumerCode.startsWith("REFUSED:") ? "REFUSED" : "STOP", r.consumerCode);
-    if (r.consumerCode === "CLAIM_UNCERTAIN" || r.consumerCode === "TX_NOT_CLEAN") return done("CLAIM_UNCERTAIN", r.consumerCode);
 
     // ---- (4) strict sanitized readback (typed allowlist); acceptance is VERIFIED only when the durable row agrees exactly ----
     const accepted = r.dispatchOutcome === "dispatch_accepted" && r.consumerCode === "HANDOFF_ACCEPTED" && out.settled === true && r.posts === 1;
