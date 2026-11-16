@@ -48,12 +48,12 @@ export const CATALOG_PINS = deepFreeze({                         // derived from
 export const CONSTANTS = deepFreeze({
   executeEnabled: false,                                           // SHIPPED CLOSED: verify / execute refuse HKO_EXECUTE_CLOSED from key names only
   dispatchEnabled: false,                                          // SHIPPED CLOSED: the core refuses HKO_DISPATCH_CLOSED before any DB acquisition
-  toolingCommit: "e11650ecafb54083d06f8efcf6500764e6534948",       // e7-test C112-F1 DRAFT head (ghs_ token shape); ROOT repins to its merge after review
-  toolingStatus: "DRAFT_UNMERGED",                                 // verify / execute refuse HKO_CLOSURE_MISMATCH unless MERGED
+  toolingCommit: "4e79f26619c26954fe89c1b626e7be0e138ef383",       // e7-test #153 MERGE commit (C112-F1 ghs_ token shape); tree 91c1f08c == the reviewed #153 head e11650ec
+  toolingStatus: "MERGED",                                         // verify / execute refuse HKO_CLOSURE_MISMATCH unless MERGED
   closure: ["lib/booking-db/codec.js", "lib/booking-db/config.js", "lib/booking-db/pipeline-dispatch-transport.js", "lib/booking-db/pipeline-kickoff.js",
     "lib/booking-db/pool.js", "lib/booking-db/repo.js", "lib/checkout/intent-state.js", "lib/checkout/pipeline-kickoff-plan.js",
     "package-lock.json", "package.json", "scripts/e7-connected/probe-env-preflight.mjs"],
-  closureDigest: "07fedfcaec968aef325f2bdd6bdc40697504058cf8fd3dd0a30795d445e5e87b",   // framed SHA-256 of `closure` at e11650ec (only the transport differs from 8af49e87) (the test recomputes it from the pinned tree + an independent import scan)
+  closureDigest: "07fedfcaec968aef325f2bdd6bdc40697504058cf8fd3dd0a30795d445e5e87b",   // framed SHA-256 of `closure` at 4e79f266 (== e11650ec bytes; only the transport differs from 8af49e87) (the test recomputes it from the pinned tree + an independent import scan)
   pipeline: {                                                       // the reviewed C102 ENABLE revision the dispatch targets (9455bc9e)
     runnerFiles: ["scripts/e7-hosted-pipeline.mjs", "test/e7-hosted-pipeline.test.mjs", "test/e7-hosted-pipeline-workflow.test.mjs", ".github/workflows/e7-hosted-pipeline.yml"],
     sourcePrefix: "e7-hosted-pipeline-v1\n",
