@@ -48,12 +48,12 @@ export const CATALOG_PINS = deepFreeze({                         // derived from
 export const CONSTANTS = deepFreeze({
   executeEnabled: false,                                           // SHIPPED CLOSED: verify / execute refuse HKO_EXECUTE_CLOSED from key names only
   dispatchEnabled: false,                                          // SHIPPED CLOSED: the core refuses HKO_DISPATCH_CLOSED before any DB acquisition
-  toolingCommit: "8af49e87149ed7ed83d212714b1f1d173e08c189",       // e7-test #145 MERGE commit (C111 release binding); tree d19b15d6 == the reviewed #145 head c98e8b96
-  toolingStatus: "MERGED",                                         // verify / execute refuse HKO_CLOSURE_MISMATCH unless MERGED
+  toolingCommit: "e11650ecafb54083d06f8efcf6500764e6534948",       // e7-test C112-F1 DRAFT head (ghs_ token shape); ROOT repins to its merge after review
+  toolingStatus: "DRAFT_UNMERGED",                                 // verify / execute refuse HKO_CLOSURE_MISMATCH unless MERGED
   closure: ["lib/booking-db/codec.js", "lib/booking-db/config.js", "lib/booking-db/pipeline-dispatch-transport.js", "lib/booking-db/pipeline-kickoff.js",
     "lib/booking-db/pool.js", "lib/booking-db/repo.js", "lib/checkout/intent-state.js", "lib/checkout/pipeline-kickoff-plan.js",
     "package-lock.json", "package.json", "scripts/e7-connected/probe-env-preflight.mjs"],
-  closureDigest: "4c2a57bde2bb9b073b1b4e443288448aeb96d1f9f96a93412e58149d14e00d2e",   // framed SHA-256 of `closure` at 8af49e87 (identical to the reviewed c98e8b96 bytes) (the test recomputes it from the pinned tree + an independent import scan)
+  closureDigest: "07fedfcaec968aef325f2bdd6bdc40697504058cf8fd3dd0a30795d445e5e87b",   // framed SHA-256 of `closure` at e11650ec (only the transport differs from 8af49e87) (the test recomputes it from the pinned tree + an independent import scan)
   pipeline: {                                                       // the reviewed C102 ENABLE revision the dispatch targets (9455bc9e)
     runnerFiles: ["scripts/e7-hosted-pipeline.mjs", "test/e7-hosted-pipeline.test.mjs", "test/e7-hosted-pipeline-workflow.test.mjs", ".github/workflows/e7-hosted-pipeline.yml"],
     sourcePrefix: "e7-hosted-pipeline-v1\n",
@@ -81,7 +81,7 @@ export const INPUT_ENV = freeze({ intentId: "E7_INTENT_ID", ref: "E7_BOOKING_REF
 export const ALLOWED_E7_KEYS = freeze([...Object.values(INPUT_ENV), "E7_TOOLING_DIR", "E7_EXPECTED_SOURCE_DIGEST", "E7_WORKFLOW_SHA", "E7_RUN_ID", "E7_CA_FILE", ...SECRET_KEYS]);
 export const HOSTED_CODES = freeze(["HKO_USAGE", "HKO_INPUT_UNEXPECTED", "HKO_EXECUTE_CLOSED", "HKO_SECRET_SCOPE_VIOLATION", "HKO_INPUT_INCOMPLETE", "HKO_INPUT_INVALID",
   "HKO_INTENT_EXCLUDED", "HKO_REF_NOT_MAIN", "HKO_BINDING_MISMATCH", "HKO_CLOSURE_MISMATCH", "HKO_LAYOUT_INVALID", "HKO_SOURCE_UNREADABLE", "HKO_SOURCE_MISMATCH",
-  "HKO_PIPELINE_NOT_BOUND", "HKO_DEPENDENCY_MISMATCH", "HKO_IMPORT_FAILED", "HKO_ENV_REFUSED", "HKO_CHILD_FAILED", "HKO_TESTS_FAILED", "HKO_CREDENTIALS_MISSING",
+  "HKO_PIPELINE_NOT_BOUND", "HKO_DEPENDENCY_MISMATCH", "HKO_IMPORT_FAILED", "HKO_ENV_REFUSED", "HKO_CHILD_FAILED", "HKO_TESTS_FAILED", "HKO_CREDENTIALS_MISSING", "HKO_CREDENTIAL_FORMAT_UNSUPPORTED",
   "HKO_DB_TARGET_INVALID", "HKO_CA_INVALID", "HKO_TOOLING_PIN_MISMATCH"]);
 
 const HEX64 = /^[0-9a-f]{64}$/; const HEX40 = /^[0-9a-f]{40}$/;
@@ -89,7 +89,13 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const PI_RE = /^pi_[A-Za-z0-9_]{1,250}$/;
 const REF_RE = /^MV-[A-Z0-9]{6,10}$/;
 const RUN_ID_RE = /^[A-Za-z0-9._:-]{8,64}$/;
-const TOKEN_RE = /^[A-Za-z0-9_]{20,255}$/;
+// C112 F1: the SAME opaque GitHub token-shape rule as the tooling transport's githubTokenRefusal (parity is test-asserted): classic
+// [A-Za-z0-9_]{20,255} OR the stateless ghs_ GITHUB_TOKEN (a ghs_-prefixed JWT, ~520 chars, dots / hyphens), total cap 2048. Never decoded;
+// no claim trusted; no whitespace / CR / LF / control character can pass (no header injection). Checked BEFORE any tooling import.
+export const TOKEN_MAX_LENGTH = 2048;
+export function tokenShapeOk(t) {
+  return typeof t === "string" && t.length > 0 && t.length <= TOKEN_MAX_LENGTH && (/^[A-Za-z0-9_]{20,255}$/.test(t) || /^ghs_[A-Za-z0-9._-]{36,2044}$/.test(t));
+}
 const CODE_RE = /^[A-Za-z0-9_:>!.-]{1,96}$/;
 const code = (v, fb) => (typeof v === "string" && CODE_RE.test(v) ? v : fb);
 const sha = (s) => createHash("sha256").update(s).digest("hex");
@@ -440,7 +446,7 @@ export async function runHosted({ mode = "preflight", env, proc, wrapperDir, dep
     let dbUrl = env.E7_DEV_BOOKING_DATABASE_URL; delete env.E7_DEV_BOOKING_DATABASE_URL;
     let tok = env.E7_DISPATCH_TOKEN; delete env.E7_DISPATCH_TOKEN;
     try {
-      if (!TOKEN_RE.test(tok)) refuse("HKO_CREDENTIALS_MISSING");
+      if (!tokenShapeOk(tok)) refuse("HKO_CREDENTIAL_FORMAT_UNSUPPORTED");   // present but an unsupported shape (no value-derived detail)
       let pgv; try { pgv = await readPgVersion(tooling); } catch { pgv = null; }
       if (pgv !== c.pgVersion) refuse("HKO_DEPENDENCY_MISMATCH");
       if (!dbTargetOk(dbUrl, c)) refuse("HKO_DB_TARGET_INVALID");

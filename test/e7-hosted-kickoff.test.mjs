@@ -6,6 +6,7 @@
 //   * OPT-IN INTEGRATION (E7_HKO_DB_TESTS=1 + PG_BIN + tooling node_modules): the REAL 0024 schema + REAL webhook authorization + REAL consumer +
 //     REAL transport on a DISPOSABLE PostgreSQL with a FAKE GitHub exchange. The hosted preflight child never sets it (childEnv allowlist).
 import { test, after } from "node:test";
+import { EventEmitter } from "node:events";
 import assert from "node:assert/strict";
 import https from "node:https";
 import { syncBuiltinESMExports } from "node:module";
@@ -30,7 +31,7 @@ const [K, T, PL, C1] = await Promise.all([tool("lib/booking-db/pipeline-kickoff.
 after(() => { assert.deepEqual(GUARD, { request: 0, Agent: 0, fetch: 0 }, "no real network primitive was touched"); });
 
 const C = E.CONSTANTS;
-const TOOL_PIN = "8af49e87149ed7ed83d212714b1f1d173e08c189";
+const TOOL_PIN = "e11650ecafb54083d06f8efcf6500764e6534948";
 const PROC = { versions: { node: "22.22.0" }, platform: "linux", execArgv: [], getuid: () => 1000 };
 const SHA_A = "a".repeat(40); const SHA_B = "b".repeat(40);
 const IID = "11111111-2222-4333-8444-555555555555"; const PI = "pi_3FakeKickoff0001"; const REF = "MV-FAKE0001";
@@ -56,7 +57,7 @@ const realEnv = (over = {}) => ({ E7_TOOLING_DIR: TOOLING, E7_INTENT_ID: IID, E7
   E7_WORKFLOW_SHA: SHA_A, GITHUB_SHA: SHA_A, GITHUB_REF: "refs/heads/main", E7_RUN_ID: "123456-1", ...over });
 
 test("H1 SHIPPED CLOSED: executeEnabled / dispatchEnabled FALSE; verify and execute refuse HKO_EXECUTE_CLOSED from KEY NAMES only — 0 env value reads, 0 import / spawn / head / pg / CA / core", async () => {
-  assert.equal(C.executeEnabled, false); assert.equal(C.dispatchEnabled, false); assert.equal(C.toolingStatus, "MERGED"); assert.equal(C.toolingCommit, TOOL_PIN);
+  assert.equal(C.executeEnabled, false); assert.equal(C.dispatchEnabled, false); assert.equal(C.toolingStatus, "DRAFT_UNMERGED"); assert.equal(C.toolingCommit, TOOL_PIN);
   for (const mode of ["verify", "execute"]) {
     const { env, reads } = namesOnly(["E7_TOOLING_DIR", "E7_INTENT_ID", "E7_DEV_BOOKING_DATABASE_URL", "E7_DISPATCH_TOKEN", "GITHUB_SHA"]);
     const r = await E.runHosted({ mode, env, proc: PROC, wrapperDir: ROOT, deps: TRAPS });
@@ -194,7 +195,9 @@ test("H7 execute target checks (seam constants, bound): token shape, pg version,
     const deps = { ...TRAPS, readHead: async () => SHA_A, importEnv: () => C1, readPgVersion: async () => "8.18.0", readCa: async () => CA, caSha256: sha(CA), constants: bc };
     const env = (over) => realEnv({ E7_EXPECTED_SOURCE_DIGEST: src, E7_DEV_BOOKING_DATABASE_URL: GOOD_DB, E7_DISPATCH_TOKEN: "t".repeat(40), E7_CA_FILE: "/ca", ...over });
     for (const [label, e, d, k] of [
-      ["token shape", env({ E7_DISPATCH_TOKEN: "bad token" }), deps, "HKO_CREDENTIALS_MISSING"],
+      ["token shape", env({ E7_DISPATCH_TOKEN: "bad token" }), deps, "HKO_CREDENTIAL_FORMAT_UNSUPPORTED"],
+      ["token CRLF", env({ E7_DISPATCH_TOKEN: `ghs_${"a".repeat(40)}\r\nX-Evil: 1` }), deps, "HKO_CREDENTIAL_FORMAT_UNSUPPORTED"],
+      ["token oversize", env({ E7_DISPATCH_TOKEN: `ghs_${"a".repeat(2048)}` }), deps, "HKO_CREDENTIAL_FORMAT_UNSUPPORTED"],
       ["token missing", env({ E7_DISPATCH_TOKEN: "" }), deps, "HKO_CREDENTIALS_MISSING"],
       ["pg version", env(), { ...deps, readPgVersion: async () => "8.17.0" }, "HKO_DEPENDENCY_MISMATCH"],
       ["owner user", env({ E7_DEV_BOOKING_DATABASE_URL: GOOD_DB.replace("mv_booking_app_dev", "postgres") }), deps, "HKO_DB_TARGET_INVALID"],
@@ -219,6 +222,59 @@ test("H7 execute target checks (seam constants, bound): token shape, pg version,
     const uv = await E.runHosted({ mode: "execute", env: env(), proc: PROC, wrapperDir: w, deps: { ...deps,
       importTooling: async () => ({ PINNED_REVISION: PL.PINNED_REVISION, createBookingPool: () => ({ end: async () => {} }) }), runCore: async () => ({ outcome: "ACCEPTED_UNVERIFIED", verified: false }) } });
     assert.equal(uv.exitCode, 1);
+  } finally { rmSync(w, { recursive: true, force: true }); }
+});
+
+// ---- C112 F1: GitHub stateless ghs_ GITHUB_TOKEN shape through the hosted credential gate + the REAL tooling transport (fake https) ----
+const seg = (n, salt) => Array.from({ length: n }, (_, i) => "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_"[(i * 7 + salt) % 38]).join("");
+const NEW_TOKEN = `ghs_${seg(36, 1)}.${seg(380, 3)}.${seg(98, 5)}`;                     // synthetic, shape-only (~520 chars, 2 dots); never a credential
+function fakeHttps(sha) {
+  const log = { requests: [] };
+  class Agent { constructor() { this.destroyed = false; } destroy() { this.destroyed = true; } }
+  const request = (opts) => { const req = new EventEmitter(); req.opts = opts; req.end = () => setImmediate(() => {
+      const res = new EventEmitter(); res.statusCode = opts.method === "GET" ? 200 : 204; res.headers = opts.method === "GET" ? { "content-type": "application/json; charset=utf-8" } : {};
+      res.destroy = () => {}; req.emit("response", res);
+      if (opts.method === "GET") res.emit("data", Buffer.from(JSON.stringify({ ref: "refs/heads/main", node_id: "REF_x", url: "u", object: { type: "commit", sha, url: "u" } })));
+      res.emit("end"); res.emit("close"); });
+    req.destroy = () => {}; log.requests.push(req); return req; };
+  return { primitive: { request, Agent }, log };
+}
+
+test("H8 C112-F1 credential gate: the runner's token rule == the tooling transport's githubTokenRefusal on every sample; a stateless ghs_ token (~520 chars, dots, hyphens) passes the hosted execute gate and the REAL transport sends it opaquely as the exact Bearer header (fake https); missing → HKO_CREDENTIALS_MISSING, unsupported → HKO_CREDENTIAL_FORMAT_UNSUPPORTED; no token-derived byte in any result", async () => {
+  const samples = ["", "a".repeat(19), "a".repeat(20), "synthetic_token_for_tests_only_0000", `ghs_${"a".repeat(36)}`, NEW_TOKEN, `${NEW_TOKEN} `, `${NEW_TOKEN}\r\n`, `ghs_${"a".repeat(2044)}`,
+    `ghs_${"a".repeat(2045)}`, `gho_${seg(40, 1)}.${seg(40, 2)}`, `ghs_${seg(40, 1)}+`, `ghs_${seg(40, 1)}=`, "ghs_ab.cd", `Bearer ${NEW_TOKEN}`, `ghs_${seg(40, 1)}é`];
+  for (const t of samples) assert.equal(E.tokenShapeOk(t), T.githubTokenRefusal(t) === null, `parity: ${t.length}`);
+  assert.equal(E.TOKEN_MAX_LENGTH, T.TOKEN_MAX_LENGTH);
+  const w = wrapperFixture();
+  try {
+    const bc = await boundConstants(w);
+    const src = await E.framedDigest(w, E.RUNNER_FILES, E.SOURCE_PREFIX);
+    const GOOD_DB = `postgresql://${encodeURIComponent("mv_booking_app_dev.mxotevtiscernhqilyiu")}:pw@aws-0-us-east-1.pooler.supabase.com:6543/postgres`;
+    const CA = Buffer.from("-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n");
+    const base = { ...TRAPS, readHead: async () => SHA_A, importEnv: () => C1, readPgVersion: async () => "8.18.0", readCa: async () => CA, caSha256: sha(CA), constants: bc };
+    const env = (tok) => realEnv({ E7_EXPECTED_SOURCE_DIGEST: src, E7_DEV_BOOKING_DATABASE_URL: GOOD_DB, E7_DISPATCH_TOKEN: tok, E7_CA_FILE: "/ca" });
+    let seen = null;
+    const https = fakeHttps(SHA_A);
+    const r = await E.runHosted({ mode: "execute", env: env(NEW_TOKEN), proc: PROC, wrapperDir: w, deps: { ...base,
+      importTooling: async () => ({ PINNED_REVISION: PL.PINNED_REVISION, createBookingPool: () => ({ end: async () => {} }) }),
+      runCore: async (inp) => {
+        const d = T.createGithubWorkflowDispatch({ credential: inp.credential, constants: Object.freeze({ ...T.GITHUB_DISPATCH_CONSTANTS, enabled: true }),
+          exchange: T.createGithubExchange({ primitive: https.primitive }), releaseBinding: { expectedMainSha: inp.binding.releaseSha } });
+        const call = Object.freeze({ workflow: "e7-hosted-pipeline.yml", ref: "main", inputs: PL.kickoffDispatch({ intentId: inp.binding.intentId, ref: inp.binding.ref,
+          authorizedVersion: inp.binding.expectedVersion, paymentIntentId: inp.binding.paymentIntentId, amountMinor: inp.binding.amountMinor, currency: "USD", listingId: 606998,
+          notBefore: "2026-11-16T13:55:15.000Z" }).inputs });
+        seen = await d(call, { signal: new AbortController().signal });
+        return { outcome: seen.accepted ? "ACCEPTED_VERIFIED" : "STOP", verified: seen.accepted === true, code: "SYNTHETIC" };
+      } } });
+    assert.deepEqual(seen, { accepted: true }); assert.equal(r.exitCode, 0);
+    assert.equal(https.log.requests.length, 2); assert.ok(https.log.requests.every((q) => q.opts.headers.Authorization === `Bearer ${NEW_TOKEN}`), "opaque pass-through");
+    const out = JSON.stringify(r.result) + E.summaryMarkdown(r.result);
+    for (const piece of [NEW_TOKEN, NEW_TOKEN.slice(4, 24), NEW_TOKEN.split(".")[1].slice(0, 16), String(NEW_TOKEN.length)]) assert.ok(!out.includes(piece), "no token-derived bytes / length in the result");
+    for (const [tok, code] of [["", "HKO_CREDENTIALS_MISSING"], [`${NEW_TOKEN}\n`, "HKO_CREDENTIAL_FORMAT_UNSUPPORTED"], [`ghs_${"Q".repeat(2048)}`, "HKO_CREDENTIAL_FORMAT_UNSUPPORTED"],
+      [`ghs_${seg(40, 1)}=`, "HKO_CREDENTIAL_FORMAT_UNSUPPORTED"]]) {
+      const x = await E.runHosted({ mode: "execute", env: env(tok), proc: PROC, wrapperDir: w, deps: base });
+      assert.equal(x.result.code, code); assert.ok(tok === "" || !JSON.stringify(x.result).includes(tok.slice(4, 20)));
+    }
   } finally { rmSync(w, { recursive: true, force: true }); }
 });
 
@@ -532,5 +588,13 @@ if (process.env.E7_HKO_DB_TESTS === "1") {
     const r = await run(k, ex, { pool });
     assert.deepEqual([r.outcome, r.code, r.gets, r.posts, credCount.n - c0], ["CLAIM_UNCERTAIN", "TX_NOT_CLEAN", 0, 0, 0], JSON.stringify(r));
     assert.equal((await row(k.id)).state, "requested");
+  });
+
+  test("I10 C112-F1 the stateless ghs_ token shape through the REAL consumer + transport (fake GitHub exchange): ACCEPTED_VERIFIED, the exchange receives exactly that token, ONE GET + ONE POST", async () => {
+    const k = await authorizedFresh(); const seenTok = []; const base = fakeGithub(k.id);
+    const ex = async (spec) => { seenTok.push(spec.token === NEW_TOKEN); return base(spec); };
+    const r = await run(k, ex, { credential: () => NEW_TOKEN });
+    assert.deepEqual([r.outcome, r.gets, r.posts, r.verified], ["ACCEPTED_VERIFIED", 1, 1, true], JSON.stringify(r)); assert.deepEqual(seenTok, [true, true]);
+    assert.ok(!JSON.stringify(r).includes(NEW_TOKEN.slice(4, 24)));
   });
 }

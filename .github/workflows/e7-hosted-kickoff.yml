@@ -74,11 +74,11 @@ jobs:
           ref: ${{ github.sha }}
           path: wrapper
           persist-credentials: false
-      - name: Checkout E7 kickoff tooling (fixed commit 8af49e87)
+      - name: Checkout E7 kickoff tooling (fixed commit e11650ec)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: 8af49e87149ed7ed83d212714b1f1d173e08c189
+          ref: e11650ecafb54083d06f8efcf6500764e6534948
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0
@@ -89,7 +89,7 @@ jobs:
       - name: Verify checkout bindings (wrapper HEAD == dispatch SHA; tooling HEAD == pin; no secrets)
         env:
           E7_WORKFLOW_SHA: ${{ github.sha }}
-          E7_TOOLING_PIN: 8af49e87149ed7ed83d212714b1f1d173e08c189
+          E7_TOOLING_PIN: e11650ecafb54083d06f8efcf6500764e6534948
           E7_MODE: ${{ inputs.mode }}
         run: |
           set -eu
@@ -124,11 +124,11 @@ jobs:
           ref: ${{ github.sha }}
           path: wrapper
           persist-credentials: false
-      - name: Checkout E7 kickoff tooling (fixed commit 8af49e87)
+      - name: Checkout E7 kickoff tooling (fixed commit e11650ec)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: 8af49e87149ed7ed83d212714b1f1d173e08c189
+          ref: e11650ecafb54083d06f8efcf6500764e6534948
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0
@@ -165,11 +165,11 @@ jobs:
           ref: ${{ github.sha }}
           path: wrapper
           persist-credentials: false
-      - name: Checkout E7 kickoff tooling (fixed commit 8af49e87)
+      - name: Checkout E7 kickoff tooling (fixed commit e11650ec)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: 8af49e87149ed7ed83d212714b1f1d173e08c189
+          ref: e11650ecafb54083d06f8efcf6500764e6534948
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0
@@ -180,7 +180,7 @@ jobs:
       - name: Re-check bindings BEFORE any secret (HEAD == dispatch SHA; tooling pin; kickoff source digest; pipeline release binding f09bcbbd)
         env:
           E7_WORKFLOW_SHA: ${{ github.sha }}
-          E7_TOOLING_PIN: 8af49e87149ed7ed83d212714b1f1d173e08c189
+          E7_TOOLING_PIN: e11650ecafb54083d06f8efcf6500764e6534948
           E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
           E7_PIPELINE_SOURCE_PIN: f09bcbbdfac88ca8dfd212a386d2af03698f9b710a49189b0ac9262531510999
         run: |
