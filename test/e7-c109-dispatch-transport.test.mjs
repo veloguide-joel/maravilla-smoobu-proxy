@@ -328,3 +328,25 @@ test("G13 C110-F3 the exchange is a ONE-GET-then-ONE-POST capability: a direct P
     const mine = Buffer.from(body); const p = ex(spec({ body: mine })); mine.fill(0x20); assert.equal(await codeOf(p), 204);
     assert.ok(log.requests[1].written.equals(body)); assert.notEqual(log.requests[1].written, mine); }
 });
+
+test("G14 C111 explicit construction-time release binding: { expectedMainSha } replaces ONLY the GET pin (descriptor-only snapshot); without it the default 9455 pin holds; malformed / accessor / extra-key / throwing bindings → CONFIG_REFUSED with 0 credential reads and 0 network; the call can never carry a binding", async () => {
+  const REL = "0123456789abcdef0123456789abcdef01234567";
+  const mkB = (releaseBinding, getSha) => { let credCalls = 0; const ex = fakeEx({ getMain: async () => reply(200, refJson(getSha)) });
+    const d = T.createGithubWorkflowDispatch({ credential: () => { credCalls += 1; return TOKEN; }, constants: OPEN, exchange: ex, releaseBinding }); return { d, ex, creds: () => credCalls }; };
+  { const m = mkB({ expectedMainSha: REL }, REL); assert.deepEqual(await m.d(goodCall(), { signal: sig() }), { accepted: true }); assert.deepEqual(m.ex.calls.map((c) => c.kind), ["getMain", "dispatch"]); }
+  { const m = mkB({ expectedMainSha: REL }, PIN); assert.deepEqual(await m.d(goodCall(), { signal: sig() }), { notSent: true, code: "MAIN_NOT_PINNED_ENABLE" }, "the default pin no longer matches once bound"); assert.equal(m.ex.calls.length, 1); }
+  { const m = mkB(Object.freeze(Object.assign(Object.create(null), { expectedMainSha: REL })), REL); assert.deepEqual(await m.d(goodCall(), { signal: sig() }), { accepted: true }, "null-proto data"); }
+  { const m = mkB(undefined, PIN); assert.deepEqual(await m.d(goodCall(), { signal: sig() }), { accepted: true }, "no binding → default 9455 pin"); }
+  { const m = mkB(undefined, REL); assert.equal((await m.d(goodCall(), { signal: sig() })).code, "MAIN_NOT_PINNED_ENABLE"); }
+  const bad = [REL.toUpperCase(), REL.slice(1), `${REL}0`, "", null, 42];
+  const getterB = {}; Object.defineProperty(getterB, "expectedMainSha", { enumerable: true, get: () => REL });
+  const negatives = [...bad.map((v) => ({ expectedMainSha: v })), { expectedMainSha: REL, extra: 1 }, {}, getterB, null, "sha", new Proxy({ expectedMainSha: REL }, { ownKeys() { throw new Error("t"); } })];
+  for (const b of negatives) {
+    const m = mkB(b, REL); assert.deepEqual(await m.d(goodCall(), { signal: sig() }), { notSent: true, code: "CONFIG_REFUSED" }, String(b && b.expectedMainSha));
+    assert.deepEqual([m.creds(), m.ex.calls.length], [0, 0]);
+  }
+  { const m = mkB({ expectedMainSha: REL }, REL); const call = Object.freeze({ ...goodCall(), expectedMainSha: REL });
+    assert.equal((await m.d(call, { signal: sig() })).code, "CALL_CONTRACT_REFUSED"); assert.equal(m.ex.calls.length, 0); }
+  { const m = T.createGithubWorkflowDispatch({ credential: () => TOKEN, constants: T.GITHUB_DISPATCH_CONSTANTS, exchange: fakeEx(), releaseBinding: { expectedMainSha: REL } });
+    assert.deepEqual(await m(goodCall(), { signal: sig() }), { notSent: true, code: "TRANSPORT_CLOSED" }, "a binding never opens a closed transport"); }
+});
