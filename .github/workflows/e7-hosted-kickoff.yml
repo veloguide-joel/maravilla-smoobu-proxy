@@ -1,0 +1,217 @@
+# E7 C111: HOSTED KICKOFF runner (scripts/e7-hosted-kickoff.mjs): ONE bounded invocation of the ACCEPTED C108 kickoff consumer with the C110
+# GitHub workflow_dispatch transport for ONE explicitly bound durable 0024 request (booking.pipeline_kickoff_requests) — it hands that request's
+# stored inputs to e7-hosted-pipeline.yml on main and STOPS. Dispatch accepted (HTTP 204) is NOT a pipeline run result and NOT a booking.
+# SHIPPED CLOSED: the runner's executeEnabled and dispatchEnabled are FALSE — `verify` (and therefore the execute job) refuses HKO_EXECUTE_CLOSED
+# from key names only, before any value, import, credential, database or network; the secret step below is never reached while it is closed.
+# HONEST LABEL: MANUAL workflow_dispatch only (no schedule / cron / webhook / repository_dispatch / route). The automatic consumer trigger is an
+# explicit REMAINING GAP. Default mode `preflight` = no environment, no secret, no database, no dependency install (focused FAKE tests + digests).
+# PERMISSIONS: workflow default `contents: read`. ONLY the gated execute job (main only, environment `e7-readonly-probe`) adds `actions: write`,
+# and ONLY its final step receives the built-in, EPHEMERAL, job-scoped `github.token` (as E7_DISPATCH_TOKEN) — no PAT, no new secret, no App.
+# The existing DB secret NAME E7_DEV_BOOKING_DATABASE_URL + the pinned Supabase CA appear in that SAME final step only.
+# RELEASE BINDING: the transport's expectedMainSha is this run's own github.sha, used only after the SAME checkout's pipeline runnerFiles frame to
+# the reviewed ENABLE source digest f09bcbbd…0999 (closure f7d7cad6…7273) — checked below in shell BEFORE any secret and again by the runner.
+# Source digest = SHA-256 over: prefix "e7-hosted-kickoff-v1\n", then for each file IN THIS ORDER
+#   1. scripts/e7-hosted-kickoff.mjs  2. test/e7-hosted-kickoff.test.mjs  3. test/e7-hosted-kickoff-workflow.test.mjs  4. .github/workflows/e7-hosted-kickoff.yml
+# the frame  <relative path> NUL <decimal byte length> NUL <file bytes> NUL  (the framedDigest convention of the reviewed runners).
+name: e7-hosted-kickoff
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "preflight (default: no environment, no secrets, no database), verify (no secret) or execute (SHIPPED CLOSED; main only; e7-readonly-probe gate)"
+        type: choice
+        options: [preflight, verify, execute]
+        default: preflight
+      intent_id:
+        description: "The ONE bound durable kickoff request's intent id (UUID); all five empty = SYNTHETIC preflight only."
+        type: string
+        required: false
+        default: ""
+      booking_ref:
+        description: "That intent's booking ref (MV-…)."
+        type: string
+        required: false
+        default: ""
+      expected_version:
+        description: "The request's exact authorized_version (= the intent's current version)."
+        type: string
+        required: false
+        default: ""
+      payment_intent_id:
+        description: "The request's bound TEST PaymentIntent id (pi_…)."
+        type: string
+        required: false
+        default: ""
+      amount_minor:
+        description: "The request's EXACT amount in minor units (USD)."
+        type: string
+        required: false
+        default: ""
+      expected_source_digest:
+        description: "verify / execute only: exact 64-hex kickoff source digest printed by a preflight of this SAME commit (no default)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e7-hosted-kickoff
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout wrapper (this repository, exact dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout E7 kickoff tooling (fixed commit c98e8b96)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: c98e8b965a5556b664606110c125bf74166c2903
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Verify checkout bindings (wrapper HEAD == dispatch SHA; tooling HEAD == pin; no secrets)
+        env:
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_TOOLING_PIN: c98e8b965a5556b664606110c125bf74166c2903
+          E7_MODE: ${{ inputs.mode }}
+        run: |
+          set -eu
+          head="$(git -C wrapper rev-parse HEAD)"
+          [ "$head" = "$E7_WORKFLOW_SHA" ] || { echo "REFUSED: wrapper HEAD != dispatch SHA"; exit 3; }
+          tool="$(git -C tooling rev-parse HEAD)"
+          [ "$tool" = "$E7_TOOLING_PIN" ] || { echo "REFUSED: tooling HEAD != pin"; exit 3; }
+          case "$E7_MODE" in preflight|verify|execute) ;; *) echo "REFUSED: mode"; exit 3 ;; esac
+          echo "bindings ok: wrapper=$head tooling=$tool mode=$E7_MODE"
+      - name: Preflight (runner spawns the focused FAKE tests; digests; no environment, no secret, no database, no dependency install)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_INTENT_ID: ${{ inputs.intent_id }}
+          E7_BOOKING_REF: ${{ inputs.booking_ref }}
+          E7_EXPECTED_VERSION: ${{ inputs.expected_version }}
+          E7_PAYMENT_INTENT_ID: ${{ inputs.payment_intent_id }}
+          E7_AMOUNT_MINOR: ${{ inputs.amount_minor }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+        run: node wrapper/scripts/e7-hosted-kickoff.mjs preflight
+
+  verify:
+    needs: preflight
+    if: inputs.mode == 'verify' || inputs.mode == 'execute'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout wrapper (this repository, exact dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout E7 kickoff tooling (fixed commit c98e8b96)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: c98e8b965a5556b664606110c125bf74166c2903
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Verify (runner; SHIPPED CLOSED → HKO_EXECUTE_CLOSED here; no secret, no database, no environment)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_INTENT_ID: ${{ inputs.intent_id }}
+          E7_BOOKING_REF: ${{ inputs.booking_ref }}
+          E7_EXPECTED_VERSION: ${{ inputs.expected_version }}
+          E7_PAYMENT_INTENT_ID: ${{ inputs.payment_intent_id }}
+          E7_AMOUNT_MINOR: ${{ inputs.amount_minor }}
+          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: node wrapper/scripts/e7-hosted-kickoff.mjs verify
+
+  execute:
+    needs: [preflight, verify]
+    if: inputs.mode == 'execute' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: e7-readonly-probe
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Checkout wrapper (this repository, exact dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout E7 kickoff tooling (fixed commit c98e8b96)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: c98e8b965a5556b664606110c125bf74166c2903
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Re-check bindings BEFORE any secret (HEAD == dispatch SHA; tooling pin; kickoff source digest; pipeline release binding f09bcbbd)
+        env:
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_TOOLING_PIN: c98e8b965a5556b664606110c125bf74166c2903
+          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
+          E7_PIPELINE_SOURCE_PIN: f09bcbbdfac88ca8dfd212a386d2af03698f9b710a49189b0ac9262531510999
+        run: |
+          set -eu
+          head="$(git -C wrapper rev-parse HEAD)"
+          [ "$head" = "$E7_WORKFLOW_SHA" ] || { echo "REFUSED: wrapper HEAD != dispatch SHA"; exit 3; }
+          tool="$(git -C tooling rev-parse HEAD)"
+          [ "$tool" = "$E7_TOOLING_PIN" ] || { echo "REFUSED: tooling HEAD != pin"; exit 3; }
+          printf '%s' "$E7_EXPECTED_SOURCE_DIGEST" | grep -Eq '^[0-9a-f]{64}$' || { echo "REFUSED: expected_source_digest not 64-hex"; exit 3; }
+          d="$({ printf 'e7-hosted-kickoff-v1\n'; for f in scripts/e7-hosted-kickoff.mjs test/e7-hosted-kickoff.test.mjs test/e7-hosted-kickoff-workflow.test.mjs .github/workflows/e7-hosted-kickoff.yml; do printf '%s\0%s\0' "$f" "$(stat -c%s "wrapper/$f")"; cat "wrapper/$f"; printf '\0'; done; } | sha256sum | cut -d' ' -f1)"
+          [ "$d" = "$E7_EXPECTED_SOURCE_DIGEST" ] || { echo "REFUSED: expected_source_digest mismatch (actual $d)"; exit 3; }
+          p="$({ printf 'e7-hosted-pipeline-v1\n'; for f in scripts/e7-hosted-pipeline.mjs test/e7-hosted-pipeline.test.mjs test/e7-hosted-pipeline-workflow.test.mjs .github/workflows/e7-hosted-pipeline.yml; do printf '%s\0%s\0' "$f" "$(stat -c%s "wrapper/$f")"; cat "wrapper/$f"; printf '\0'; done; } | sha256sum | cut -d' ' -f1)"
+          [ "$p" = "$E7_PIPELINE_SOURCE_PIN" ] || { echo "REFUSED: pipeline at this commit is not the reviewed ENABLE source (actual $p)"; exit 3; }
+          echo "bindings ok: wrapper=$head tooling=$tool source=$d pipeline=$p"
+      - name: Install the pinned dependency from the verified lockfile (no lifecycle scripts)
+        working-directory: tooling
+        run: npm ci --ignore-scripts --omit=dev --no-audit --no-fund
+      - name: Fetch the public Supabase CA (the runner checks its pinned SHA-256)
+        run: curl --fail --silent --show-error --proto '=https' --max-time 20 -o "$RUNNER_TEMP/prod-ca-2021.crt" https://supabase-downloads.s3-ap-southeast-1.amazonaws.com/prod/ssl/prod-ca-2021.crt
+      - name: ONE gated kickoff handoff (the only secrets + the job-scoped token, this step only; <= 1 GET + 1 POST; no retry)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_INTENT_ID: ${{ inputs.intent_id }}
+          E7_BOOKING_REF: ${{ inputs.booking_ref }}
+          E7_EXPECTED_VERSION: ${{ inputs.expected_version }}
+          E7_PAYMENT_INTENT_ID: ${{ inputs.payment_intent_id }}
+          E7_AMOUNT_MINOR: ${{ inputs.amount_minor }}
+          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          E7_CA_FILE: ${{ runner.temp }}/prod-ca-2021.crt
+          E7_DEV_BOOKING_DATABASE_URL: ${{ secrets.E7_DEV_BOOKING_DATABASE_URL }}
+          E7_DISPATCH_TOKEN: ${{ github.token }}
+        run: node wrapper/scripts/e7-hosted-kickoff.mjs execute
