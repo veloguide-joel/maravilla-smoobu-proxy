@@ -98,8 +98,8 @@ test("W5 static: the ONLY secret (existing NAME E7_DEV_BOOKING_DATABASE_URL) and
   const envKeys = [...yml.matchAll(/^          (E7_[A-Z0-9_]+):/gm)].map((m) => m[1]);
   for (const k of envKeys) if (!["E7_TOOLING_PIN", "E7_MODE", "E7_PIPELINE_SOURCE_PIN"].includes(k)) assert.ok(R.ALLOWED_E7_KEYS.includes(k), `${k} is an admitted runner key`);
   assert.deepEqual([...R.SECRET_KEYS], ["E7_DEV_BOOKING_DATABASE_URL", "E7_DISPATCH_TOKEN"]);
-  assert.equal(R.CONSTANTS.executeEnabled, true, "C112b ENABLE: verify proceeds to the bindings (the stacked CLOSE PR restores false)");
-  assert.equal(R.CONSTANTS.dispatchEnabled, true);
+  assert.equal(R.CONSTANTS.executeEnabled, false, "SHIPPED CLOSED: the verify job refuses HKO_EXECUTE_CLOSED, so the execute job never runs");
+  assert.equal(R.CONSTANTS.dispatchEnabled, false);
 });
 
 // ---- LOCAL execution of the gate blocks ----------------------------------------------------------------------------------------------
@@ -128,20 +128,19 @@ test("W6 preflight bindings block executed locally: passes only with HEAD == dis
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
 
-test("W7 execute re-check block executed locally (BEFORE any secret): HEAD / tooling / 64-hex / own source digest, then the PIPELINE release binding — C112b: this main's ENABLE pipeline PASSES with the reviewed pin f09bcbbd; a stale pin (seam) is REFUSED; the shell frame equals the runner's pipelineBinding", async () => {
+test("W7 execute re-check block executed locally (BEFORE any secret): HEAD / tooling / 64-hex / own source digest, then the PIPELINE release binding — today's CLOSED main pipeline is REFUSED with the reviewed pin f09bcbbd; the shell frame equals the runner's pipelineBinding", async () => {
   const d = sandbox(); try {
     const blk = runBlock("Re-check bindings BEFORE any secret (HEAD == dispatch SHA; tooling pin; kickoff source digest; pipeline release binding f09bcbbd)");
     assert.doesNotMatch(blk, /E7_DEV_BOOKING_DATABASE_URL|E7_DISPATCH_TOKEN|github\.token|\.mjs execute|secrets\./);
     assert.match(jobs.execute, new RegExp(`E7_PIPELINE_SOURCE_PIN: ${PIPE_PIN}\\n`)); assert.equal(R.CONSTANTS.pipeline.sourceDigest, PIPE_PIN);
     const want = await expectedDigest(); const pipe = await R.pipelineBinding(ROOT);
     const base = { E7_WORKFLOW_SHA: headSha, E7_TOOLING_PIN: PIN, E7_EXPECTED_SOURCE_DIGEST: want, E7_PIPELINE_SOURCE_PIN: PIPE_PIN };
-    assert.equal(pipe.sourceDigest, PIPE_PIN, "C112b: this checkout's pipeline frames to the reviewed ENABLE source");
-    const real = sh(blk, base, d);
-    assert.equal(real.status, 0, real.out); assert.match(real.out, new RegExp(`bindings ok: wrapper=${headSha} tooling=${PIN} source=${want} pipeline=${PIPE_PIN}`));
-    // LABELLED SEAM: a stale pin proves the refusal path of the same block (and that the shell frame == the runner's pipelineBinding)
-    const stale = sh(blk, { ...base, E7_PIPELINE_SOURCE_PIN: "f".repeat(64) }, d);
-    assert.deepEqual([stale.status, /pipeline at this commit is not the reviewed ENABLE source \(actual ([0-9a-f]{64})\)/.test(stale.out)], [3, true], stale.out);
-    assert.match(stale.out, new RegExp(`actual ${pipe.sourceDigest}`), "the shell pipeline frame == the runner's pipelineBinding");
+    const closed = sh(blk, base, d);
+    assert.deepEqual([closed.status, /pipeline at this commit is not the reviewed ENABLE source \(actual ([0-9a-f]{64})\)/.test(closed.out)], [3, true], closed.out);
+    assert.match(closed.out, new RegExp(`actual ${pipe.sourceDigest}`), "the shell pipeline frame == the runner's pipelineBinding");
+    // LABELLED SEAM: the pin set to the actual digest proves the pass path of the same block
+    const seam = sh(blk, { ...base, E7_PIPELINE_SOURCE_PIN: pipe.sourceDigest }, d);
+    assert.equal(seam.status, 0, seam.out); assert.match(seam.out, new RegExp(`bindings ok: wrapper=${headSha} tooling=${PIN} source=${want} pipeline=${pipe.sourceDigest}`));
     for (const [over, why] of [[{ E7_WORKFLOW_SHA: "0".repeat(40) }, /wrapper HEAD != dispatch SHA/], [{ E7_TOOLING_PIN: "1".repeat(40) }, /tooling HEAD != pin/],
       [{ E7_EXPECTED_SOURCE_DIGEST: "" }, /not 64-hex/], [{ E7_EXPECTED_SOURCE_DIGEST: "f".repeat(64) }, /expected_source_digest mismatch/]]) {
       const r = sh(blk, { ...base, E7_PIPELINE_SOURCE_PIN: pipe.sourceDigest, ...over }, d); assert.deepEqual([r.status, why.test(r.out)], [3, true], JSON.stringify(over) + r.out);
@@ -149,10 +148,10 @@ test("W7 execute re-check block executed locally (BEFORE any secret): HEAD / too
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
 
-test("W8 C112b: the pipeline is EXACTLY the reviewed ENABLE source (executeEnabled TRUE, frame f09bcbbd = 9455bc9e); the seven other tracked runners stay CLOSED and byte-unchanged (five reviewed runners, C47 inspection, C50 booking-confirmation); the new files are in no other frame", async () => {
+test("W8 untouched: main's eight tracked runners stay CLOSED and byte-unchanged (pipeline, five reviewed runners, C47 inspection, C50 booking-confirmation); the new files are in no other frame", async () => {
   const P = await import("../scripts/e7-hosted-pipeline.mjs");
-  assert.equal(P.CONSTANTS.executeEnabled, true, "pipeline (C102 ENABLE source restored)");
-  assert.equal(await R.framedDigest(ROOT, P.CONSTANTS.runnerFiles, "e7-hosted-pipeline-v1\n"), PIPE_PIN, "the reviewed ENABLE pipeline source (9455bc9e)");
+  assert.equal(P.CONSTANTS.executeEnabled, false, "pipeline");
+  assert.equal(await R.framedDigest(ROOT, P.CONSTANTS.runnerFiles, "e7-hosted-pipeline-v1\n"), "ce13841b28cbe1677c19b1b21b11b139050e7bdad4c32c47bf1c91240bbf4005", "the CLOSED pipeline source on main a726d8ca");
   assert.ok(!P.CONSTANTS.runnerFiles.some((f) => FILES.includes(f)));
   const want = { reservation: "5665544de105e4564a57a4434fa32fd2355b9bbd0e756b250d1248e07feb6b19", capture: "5b547a42200b452055d8a718c84ab70f7f2b5a0cd8343f6174c4a75b0c420ed1",
     "test-cleanup": "33f2ab18984dccd3915a18ff8a55dd4a6e5b6bf89e3d84ba1e578347e6cebd1e", recording: "49b5516cb69543a6bd4a697a407d2f2a97a84e18a63f18715338f099917e4824",

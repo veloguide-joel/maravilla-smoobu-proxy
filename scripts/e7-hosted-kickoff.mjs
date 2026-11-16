@@ -46,8 +46,8 @@ export const CATALOG_PINS = deepFreeze({                         // derived from
 });
 
 export const CONSTANTS = deepFreeze({
-  executeEnabled: true,                                            // C112b ENABLE (ONE supervised run; the stacked CLOSE PR restores false); closed constants refuse HKO_EXECUTE_CLOSED
-  dispatchEnabled: true,                                           // C112b ENABLE (ONE supervised run; the stacked CLOSE PR restores false); closed constants refuse HKO_DISPATCH_CLOSED
+  executeEnabled: false,                                           // SHIPPED CLOSED: verify / execute refuse HKO_EXECUTE_CLOSED from key names only
+  dispatchEnabled: false,                                          // SHIPPED CLOSED: the core refuses HKO_DISPATCH_CLOSED before any DB acquisition
   toolingCommit: "8af49e87149ed7ed83d212714b1f1d173e08c189",       // e7-test #145 MERGE commit (C111 release binding); tree d19b15d6 == the reviewed #145 head c98e8b96
   toolingStatus: "MERGED",                                         // verify / execute refuse HKO_CLOSURE_MISMATCH unless MERGED
   closure: ["lib/booking-db/codec.js", "lib/booking-db/config.js", "lib/booking-db/pipeline-dispatch-transport.js", "lib/booking-db/pipeline-kickoff.js",
