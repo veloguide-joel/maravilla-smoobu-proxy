@@ -9,7 +9,7 @@ import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import https from "node:https";
 import { syncBuiltinESMExports } from "node:module";
-import { readFileSync, realpathSync, mkdtempSync, mkdirSync, cpSync, rmSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, realpathSync, mkdtempSync, mkdirSync, cpSync, rmSync, existsSync } from "node:fs";
 import { join, dirname, normalize } from "node:path";
 import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
@@ -120,19 +120,32 @@ test("H4 INDEPENDENT closure: a fresh import scan from the four tooling roots (c
   assert.equal(typeof T.releaseBindingSnapshot, "function", "the tooling pin carries the C111 release binding");
 });
 
-test("H5 release binding from BYTES (never imported): the reviewed ENABLE revision 9455bc9e binds (source f09bcbbd…0999, closure f7d7cad6, tooling 71c3dcf8) when its objects are present; a one-byte change or the CLOSED main pipeline does not", async (t) => {
-  const d = mkdtempSync(join(tmpdir(), "hko-e-"));
+test("H5 release binding from BYTES (never imported; NO git history — runs in the hosted depth-1 checkout): the reviewed C102 ENABLE delta (fixture) maps this checkout's pipeline bytes between the CLOSED frame ce13841b and the ENABLE frame f09bcbbd exactly; the ENABLE bytes bind (closure f7d7cad6, tooling 71c3dcf8); a one-byte change does not; this checkout binds iff it carries the ENABLE source", async () => {
+  const DELTA = JSON.parse(readFileSync(join(ROOT, "test/fixtures/e7-c102-pipeline-enable-delta.json"), "utf8"));
+  assert.equal(DELTA.schema, "e7-c102-pipeline-enable-delta-v1"); assert.equal(DELTA.enableFrame, C.pipeline.sourceDigest);
+  assert.equal(DELTA.enableCommit, "9455bc9ee15370b5321b7a04a96e893e9e80080b"); assert.ok(DELTA.ops.length > 0);
+  for (const op of DELTA.ops) assert.ok(C.pipeline.runnerFiles.includes(op.file), op.file);
+  const write = (dir, files) => { for (const [f, text] of Object.entries(files)) { mkdirSync(dirname(join(dir, f)), { recursive: true }); writeFileSync(join(dir, f), text); } };
+  const apply = (files, from, to) => { const out = { ...files };
+    for (const op of DELTA.ops) { const t = out[op.file]; assert.equal(t.split(op[from]).length, 2, `the ${from} side occurs exactly once in ${op.file}`); out[op.file] = t.replace(op[from], () => op[to]); }
+    return out; };
+  const here = Object.fromEntries(C.pipeline.runnerFiles.map((f) => [f, readFileSync(join(ROOT, f), "utf8")]));
+  const hereFrame = (await E.pipelineBinding(ROOT)).sourceDigest;
+  assert.ok([DELTA.closedFrame, DELTA.enableFrame].includes(hereFrame), `this checkout's pipeline is the CLOSED or the ENABLE reviewed source (got ${hereFrame})`);
+  const closed = hereFrame === DELTA.closedFrame ? here : apply(here, "enable", "closed");
+  const enable = hereFrame === DELTA.enableFrame ? here : apply(here, "closed", "enable");
+  const d = mkdtempSync(join(tmpdir(), "hko-e-")); const dc = mkdtempSync(join(tmpdir(), "hko-c-"));
   try {
-    let ok = true;
-    try { execFileSync("git", ["-C", ROOT, "cat-file", "-e", "9455bc9ee15370b5321b7a04a96e893e9e80080b^{commit}"], { stdio: "ignore" }); } catch { ok = false; }
-    if (!ok) { t.skip("ENABLE revision objects not present in this clone (shallow) — the binding logic is still covered by H6 with a seam constant"); return; }
-    for (const f of C.pipeline.runnerFiles) { mkdirSync(dirname(join(d, f)), { recursive: true }); execFileSync("sh", ["-c", `git -C '${ROOT}' show 9455bc9ee15370b5321b7a04a96e893e9e80080b:'${f}' > '${join(d, f)}'`]); }
+    write(d, enable); write(dc, closed);
     const b = await E.pipelineBinding(d);
-    assert.deepEqual([b.sourceDigest, b.closureDigest, b.toolingCommit, b.bound], [C.pipeline.sourceDigest, C.pipeline.closureDigest, C.pipeline.toolingCommit, true]);
-    execFileSync("sh", ["-c", `printf ' ' >> '${join(d, C.pipeline.runnerFiles[3])}'`]);
-    assert.equal((await E.pipelineBinding(d)).bound, false);
-    assert.equal((await E.pipelineBinding(ROOT)).bound, false, "today's CLOSED main pipeline is not the ENABLE source");
-  } finally { rmSync(d, { recursive: true, force: true }); }
+    assert.deepEqual([b.sourceDigest, b.closureDigest, b.toolingCommit, b.bound], [C.pipeline.sourceDigest, C.pipeline.closureDigest, C.pipeline.toolingCommit, true], "ENABLE bytes reproduce f09bcbbd and bind");
+    const bc = await E.pipelineBinding(dc);
+    assert.deepEqual([bc.sourceDigest, bc.bound], [DELTA.closedFrame, false], "CLOSED bytes reproduce ce13841b and do not bind");
+    assert.deepEqual(apply(enable, "enable", "closed"), closed); assert.deepEqual(apply(closed, "closed", "enable"), enable);
+    writeFileSync(join(d, C.pipeline.runnerFiles[3]), `${enable[C.pipeline.runnerFiles[3]]} `);
+    assert.equal((await E.pipelineBinding(d)).bound, false, "a one-byte change does not bind");
+    assert.equal((await E.pipelineBinding(ROOT)).bound, hereFrame === DELTA.enableFrame, "this checkout binds iff it carries the ENABLE source");
+  } finally { rmSync(d, { recursive: true, force: true }); rmSync(dc, { recursive: true, force: true }); }
 });
 
 test("H6 verify / execute ORDER (open seam constants): not MERGED / no inputs / ref / GITHUB_SHA / own source / pipeline NOT bound / foreign HEAD each refuse BEFORE any secret value read, import, pg read, CA or core", async () => {

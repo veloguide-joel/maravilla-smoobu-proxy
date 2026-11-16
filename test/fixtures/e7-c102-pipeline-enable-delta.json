@@ -1,0 +1,74 @@
+{
+ "schema": "e7-c102-pipeline-enable-delta-v1",
+ "note": "The EXACT reviewed C102 ENABLE delta (accepted #140 / 9455bc9e) as ordered single-occurrence text replacements over the CLOSED pipeline runnerFiles (frame ce13841b…4005). Applied forward to the closed bytes it must reproduce the ENABLE frame f09bcbbd…0999 byte-for-byte; applied in reverse to the ENABLE bytes it must reproduce ce13841b. Used by test/e7-hosted-kickoff.test.mjs H5 so the historical-byte parity proof runs in the hosted depth-1 checkout (no git history needed). Not executable; the frame digests are the integrity check.",
+ "closedFrame": "ce13841b28cbe1677c19b1b21b11b139050e7bdad4c32c47bf1c91240bbf4005",
+ "enableFrame": "f09bcbbdfac88ca8dfd212a386d2af03698f9b710a49189b0ac9262531510999",
+ "enableCommit": "9455bc9ee15370b5321b7a04a96e893e9e80080b",
+ "ops": [
+  {
+   "file": "scripts/e7-hosted-pipeline.mjs",
+   "closed": "// HONEST LABEL: SHIPPED CLOSED. CONSTANTS.executeEnabled is FALSE: `verify` and `execute` refuse HPL_EXECUTE_CLOSED right after the key-name /\n// mode checks — BEFORE any input value, tooling import, credential, database or provider access. The execute body exists so it can be reviewed\n// and exercised through test seams on disposable PostgreSQL with FAKE provider exchanges only. Opening it is a separate reviewed change.\n",
+   "enable": "// HONEST LABEL: OPENED (C102 ENABLE, separately reviewed) for ONE gated TEST run. CONSTANTS.executeEnabled is TRUE, so `verify` / `execute` proceed to\n// the exact closure / source / plan / approval / main-ref bindings (closed constants still refuse HPL_EXECUTE_CLOSED right after the key-name / mode\n// checks — BEFORE any input value, tooling import, credential, database or provider access; asserted through the closed-constants test seam). The\n// exact reverse CLOSE patch is in the ENABLE PR body and restores executeEnabled false at END or STOP.\n"
+  },
+  {
+   "file": "scripts/e7-hosted-pipeline.mjs",
+   "closed": "  executeEnabled: false,                                              // SHIPPED CLOSED: verify / execute refuse HPL_EXECUTE_CLOSED before any value / import / secret / DB / provider\n",
+   "enable": "  executeEnabled: true,                                               // C102 ENABLE (ONE gated TEST run; reverse CLOSE patch restores false); closed constants refuse HPL_EXECUTE_CLOSED\n"
+  },
+  {
+   "file": "scripts/e7-hosted-pipeline.mjs",
+   "closed": "// hosted wrapper (GitHub Actions): preflight (no secrets) / verify / execute (SHIPPED CLOSED)\n",
+   "enable": "// hosted wrapper (GitHub Actions): preflight (no secrets) / verify / execute (C102: OPENED; closed constants refuse)\n"
+  },
+  {
+   "file": "scripts/e7-hosted-pipeline.mjs",
+   "closed": "    if (mode !== \"preflight\" && c.executeEnabled !== true) refuse(\"HPL_EXECUTE_CLOSED\");   // SHIPPED: refuses HERE — before any value / import / credential / DB / provider\n",
+   "enable": "    if (mode !== \"preflight\" && c.executeEnabled !== true) refuse(\"HPL_EXECUTE_CLOSED\");   // CLOSED constants refuse HERE — before any value / import / credential / DB / provider\n"
+  },
+  {
+   "file": "test/e7-hosted-pipeline.test.mjs",
+   "closed": "test(\"H1 pins: tooling 71c3dcf8 (contains the accepted C88 coordinator), MERGED, SHIPPED CLOSED; closure = an INDEPENDENT transitive import scan of the twelve roots at the pin (+ package files), its framed digest recomputed; bare imports node:* + pg only; pg 8.18.0 in the lockfile\", async () => {\n  assert.equal(C.toolingCommit, PIN); assert.equal(C.toolingStatus, \"MERGED\"); assert.equal(C.executeEnabled, false);\n",
+   "enable": "test(\"H1 pins: tooling 71c3dcf8 (contains the accepted C88 coordinator), MERGED, C102 OPENED (executeEnabled true; closed refusals via the closed-constants seam); closure = an INDEPENDENT transitive import scan of the twelve roots at the pin (+ package files), its framed digest recomputed; bare imports node:* + pg only; pg 8.18.0 in the lockfile\", async () => {\n  assert.equal(C.toolingCommit, PIN); assert.equal(C.toolingStatus, \"MERGED\"); assert.equal(C.executeEnabled, true, \"C102 ENABLE\");\n"
+  },
+  {
+   "file": "test/e7-hosted-pipeline.test.mjs",
+   "closed": "test(\"H4 runHosted CLOSED: preflight (synthetic + real plan) passes with no secret; verify / execute refuse HPL_EXECUTE_CLOSED BEFORE any value read / import (spies untouched); secret / unexpected key / incomplete / invalid / excluded inputs refuse\", async () => {\n",
+   "enable": "test(\"H4 runHosted CLOSED (closed-constants seam; C102 ships opened): preflight (synthetic + real plan) passes with no secret; verify / execute refuse HPL_EXECUTE_CLOSED BEFORE any value read / import (spies untouched); secret / unexpected key / incomplete / invalid / excluded inputs refuse\", async () => {\n"
+  },
+  {
+   "file": "test/e7-hosted-pipeline.test.mjs",
+   "closed": "  const before = { ...spies };\n",
+   "enable": "  const before = { ...spies };\n  const closed = { ...C, executeEnabled: false };                                                     // the exact CLOSE state (reverse patch) — refusal unchanged\n"
+  },
+  {
+   "file": "test/e7-hosted-pipeline.test.mjs",
+   "closed": "    const x = await E.runHosted({ mode, env: realEnv({ E7_STRIPE_TEST_KEY: \"sk_test_x\", E7_RUN_ID: \"1234567-1\" }), proc: PROC, wrapperDir: ROOT, deps });\n",
+   "enable": "    const x = await E.runHosted({ mode, env: realEnv({ E7_STRIPE_TEST_KEY: \"sk_test_x\", E7_RUN_ID: \"1234567-1\" }), proc: PROC, wrapperDir: ROOT, deps: { ...deps, constants: closed } });\n"
+  },
+  {
+   "file": "test/e7-hosted-pipeline-workflow.test.mjs",
+   "closed": "  assert.equal(R.CONSTANTS.executeEnabled, false, \"SHIPPED CLOSED: the verify step refuses HPL_EXECUTE_CLOSED, so no secret step can run\");\n",
+   "enable": "  assert.equal(R.CONSTANTS.executeEnabled, true, \"C102 ENABLE: ONE gated TEST run (main only, e7-readonly-probe reviewers, exact bindings); the reverse CLOSE patch restores false\");\n"
+  },
+  {
+   "file": ".github/workflows/e7-hosted-pipeline.yml",
+   "closed": "# SHIPPED CLOSED: the runner's executeEnabled is FALSE — `verify` (and therefore the execute job) refuses HPL_EXECUTE_CLOSED before any value,\n# import, credential, database or provider access; the secret step below is never reached while it is closed. HONEST LABEL: MANUAL hosted TEST\n",
+   "enable": "# C102 ENABLE: the runner's executeEnabled is TRUE for ONE gated TEST run (the reverse CLOSE patch restores false; closed, `verify` refuses\n# HPL_EXECUTE_CLOSED before any value, import, credential, database or provider access, so the secret step is never reached). HONEST LABEL: MANUAL hosted TEST\n"
+  },
+  {
+   "file": ".github/workflows/e7-hosted-pipeline.yml",
+   "closed": "        description: \"preflight (default: no environment, no secrets, no database) or execute (SHIPPED CLOSED: refuses at verify; main only; needs a successful preflight of this dispatch)\"\n",
+   "enable": "        description: \"preflight (default: no environment, no secrets, no database) or execute (C102 OPENED for ONE gated TEST run; main only; needs a successful preflight of this dispatch + the exact bindings)\"\n"
+  },
+  {
+   "file": ".github/workflows/e7-hosted-pipeline.yml",
+   "closed": "        description: \"ISO-8601 UTC instant >= 2026-11-15T18:25:04Z; an intent created before it is refused as HISTORIC.\"\n",
+   "enable": "        description: \"ISO-8601 UTC instant >= 2026-11-15T21:18:31Z; an intent created before it is refused as HISTORIC.\"\n"
+  },
+  {
+   "file": ".github/workflows/e7-hosted-pipeline.yml",
+   "closed": "      - name: Verify (runner; SHIPPED CLOSED → HPL_EXECUTE_CLOSED here; else closure / source / plan / approval bindings; no secret, no database)\n",
+   "enable": "      - name: Verify (runner; closed → HPL_EXECUTE_CLOSED here; opened → closure / source / plan / approval / main bindings; no secret, no database)\n"
+  }
+ ]
+}
