@@ -608,11 +608,28 @@ test("K15 C113 selected: re-selects in the SAME snapshot shape, then fingerprint
   assert.equal((await core(hist, { binding: { ...SEL, expectedFingerprint: hfp } })).code, "HISTORICAL_TARGET");
 });
 
-test("K16 C113 summary / outputs never carry an identifier: summaryMarkdown shows the flow + detect outcome + candidate count, never the fingerprint", () => {
-  const md = E.summaryMarkdown({ mode: "detect", flow: "detect", code: "DETECT_DONE", executeEnabled: true, dispatchEnabled: true, pipeline: { bound: true }, runId: "1-1", closureDigest: "c", sourceDigest: "s",
-    cleanup: "POOL_ENDED", outputs: { outcome: "ONE", fingerprint: FP }, core: { outcome: "DETECTED", code: "ONE", detect: { candidates: 1, fingerprint: FP }, gets: 0, posts: 0, sealed: false } });
-  assert.match(md, /detect\/detect DETECT_DONE detect=ONE candidates=1/);
-  assert.ok(!md.includes(FP) && !md.includes(IID) && !md.includes(PI) && !md.includes(REF));
+test("K16 C113 / C114-F1 summary: flow + detect outcome + candidate count; the candidate fingerprint is shown ONLY for outcome ONE, ONLY from the validated job output (the same value as $GITHUB_OUTPUT), so the gate #2 reviewer can compare it with an independent recompute; never an identifier", () => {
+  const base = { mode: "detect", flow: "detect", code: "DETECT_DONE", executeEnabled: true, dispatchEnabled: true, pipeline: { bound: true }, runId: "1-1", closureDigest: "c", sourceDigest: "s", cleanup: "POOL_ENDED" };
+  const coreOf = (code, fp, n = 1) => ({ outcome: "DETECTED", code, detect: { candidates: n, fingerprint: fp }, gets: 0, posts: 0, sealed: false });
+  const noIds = (md, label) => { for (const x of [IID, PI, REF, "56000"]) assert.ok(!md.includes(x), `${label}: no identifier ${x}`); };
+  // ONE: exactly the allowed hash, once, and it equals the $GITHUB_OUTPUT line
+  const r1 = { ...base, outputs: { outcome: "ONE", fingerprint: FP }, core: coreOf("ONE", FP) };
+  const md = E.summaryMarkdown(r1);
+  assert.match(md, new RegExp(`detect/detect DETECT_DONE detect=ONE candidates=1 candidateFingerprint=${FP} executeEnabled=`));
+  assert.equal(md.split(FP).length - 1, 1); assert.ok(E.outputLines(r1).includes(`fingerprint=${FP}\n`), "the same value the job outputs"); noIds(md, "ONE");
+  // non-ONE outcomes: no candidate hash, even if a fingerprint is (wrongly) present anywhere
+  for (const [label, outputs, core] of [["NO_REQUEST", { outcome: "NO_REQUEST", fingerprint: "" }, coreOf("NO_REQUEST", null, 0)],
+    ["AMBIGUOUS", { outcome: "AMBIGUOUS", fingerprint: "" }, coreOf("AMBIGUOUS", FP, 2)], ["INELIGIBLE", { outcome: "INELIGIBLE:OPEN_CASE", fingerprint: "" }, coreOf("INELIGIBLE:OPEN_CASE", FP)],
+    ["STOP (ONE without a valid hash)", { outcome: "STOP", fingerprint: "" }, coreOf("ONE", "zz")], ["non-ONE output carrying a hash", { outcome: "AMBIGUOUS", fingerprint: FP }, coreOf("AMBIGUOUS", FP, 2)],
+    ["core hash but no outputs", null, coreOf("ONE", FP)], ["verify CLOSED_NOOP", { open: "false" }, null]]) {
+    const m = E.summaryMarkdown({ ...base, outputs, core });
+    assert.ok(!m.includes("candidateFingerprint") && !m.includes(FP), label); noIds(m, label);
+  }
+  // malformed / raw-identifier values claimed as ONE are never displayed as a candidate
+  for (const bad of [FP.toUpperCase(), FP.slice(1), `${FP}0`, `${FP}\nfingerprint=x`, IID, REF, PI, "", null, undefined, 123]) {
+    const m = E.summaryMarkdown({ ...base, outputs: { outcome: "ONE", fingerprint: bad }, core: coreOf("ONE", bad) });
+    assert.ok(!m.includes("candidateFingerprint"), String(bad)); noIds(m, String(bad));
+  }
 });
 
 // ---- C113 hosted gates (runHosted) ----------------------------------------------------------------------------------------------------
@@ -678,6 +695,8 @@ test("H10 C113 OPEN seam: verify(detect) → open=true; detect holds ONLY the DB
       assert.deepEqual(inp.binding, { source: "detect" }); assert.deepEqual(Object.keys(n.byKey), ["E7_DEV_BOOKING_DATABASE_URL"], `${label}: ONLY the DB secret is read (never the dispatch token)`);
       assert.ok(!Object.hasOwn(env, "E7_DEV_BOOKING_DATABASE_URL"), `${label}: the DB secret removed from env`);
       assert.equal(E.outputLines(r.result), `outcome=${outcome}\nfingerprint=${fp}\n`);
+      assert.equal(E.summaryMarkdown(r.result).includes("candidateFingerprint="), outcome === "ONE", `${label}: reviewer-visible hash only for ONE`);
+      if (outcome === "ONE") assert.ok(E.summaryMarkdown(r.result).includes(` candidateFingerprint=${fp} `), `${label}: the summary shows exactly the output hash`);
     }
     // execute: detect flow needs a valid fingerprint; manual flow must carry an EMPTY one
     const ex = (over = {}) => realEnv({ E7_EXPECTED_SOURCE_DIGEST: src, E7_DEV_BOOKING_DATABASE_URL: GOOD_DB, E7_DISPATCH_TOKEN: "t".repeat(40), E7_CA_FILE: "/ca", ...over });
