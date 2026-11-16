@@ -11,8 +11,10 @@
 --         Scope (server facts only): TEST instance + TEST intent, listing 606998, USD, payment livemode false, PaymentIntent set,
 --         authorized = final total, created_at >= 2026-11-15T22:58:01Z, not one of the known historical targets.
 --       - booking.claim_pipeline_kickoff(): requested → claimed (single winner, row lock), after re-proving EVERY binding against the
---         locked intent row; any failed fact makes the row refused (terminal). Claimed is the ONE point after which a dispatch may be
---         attempted; it never returns to requested.
+--         locked intent row and requiring the EXACT 12 workflow inputs (binding fields from the row; the reviewed ENABLE source / closure
+--         digests as literals). The SQL does NOT recompute the plan hash: it only binds p_plan_hash to expected_plan_hash; the reviewed JS
+--         builder (and the workflow's own recompute at verify) is the cryptographic plan boundary. Any failed fact makes the row refused
+--         (terminal). Claimed is the ONE point after which a dispatch may be attempted; it never returns to requested.
 --       - booking.refuse_pipeline_kickoff(): requested → refused (a consumer-side admission refusal; terminal, no dispatch).
 --       - booking.settle_pipeline_kickoff(): claimed → dispatch_accepted | dispatch_unknown | dispatch_refused (by the claiming worker
 --         only; terminal). An ambiguous dispatch is dispatch_unknown — human-owned read-only reconciliation, NEVER re-dispatched. A row
@@ -167,9 +169,10 @@ BEGIN
       'expected_version', r.authorized_version::text,
       'not_before', to_char(date_trunc('milliseconds', r.intent_created_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
       'payment_intent_id', r.payment_intent_id, 'amount_minor', r.amount_minor::text, 'currency', 'USD', 'expected_plan_hash', p_plan_hash,
-      'expected_source_digest', p_inputs ->> 'expected_source_digest', 'expected_closure_digest', p_inputs ->> 'expected_closure_digest');
-    IF p_inputs IS DISTINCT FROM v_expected OR coalesce(p_inputs ->> 'expected_source_digest', '') !~ '^[0-9a-f]{64}$'
-       OR coalesce(p_inputs ->> 'expected_closure_digest', '') !~ '^[0-9a-f]{64}$' THEN
+      -- C108-F2: the reviewed ENABLE revision's source / closure digests are LITERAL here (never copied from the caller)
+      'expected_source_digest', 'f09bcbbdfac88ca8dfd212a386d2af03698f9b710a49189b0ac9262531510999',
+      'expected_closure_digest', 'f7d7cad646eaed2fb37a63e031157732ee6e2a44824f9d935d6b9104e08f7273');
+    IF p_inputs IS DISTINCT FROM v_expected THEN
       v_why := 'INPUTS_NOT_BOUND';
     END IF;
   END IF;

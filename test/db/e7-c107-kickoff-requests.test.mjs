@@ -127,7 +127,7 @@ test("P3 scope is server-derived: a pilot listing, a non-USD price, an intent cr
 
 test("P4 SHIPPED CLOSED / no dispatcher: refused before any read; the request stays requested and is never dispatched", async () => {
   const k = await authorizedFresh(); let reads = 0;
-  const spy = { query: async (...a) => { reads += 1; return db.app.query(...a); } };
+  const spy = { query: async (...a) => { reads += 1; return db.app.query(...a); }, connect: async () => { reads += 1; return db.app.connect(); } };
   const d = fakeDispatch();
   assert.equal((await runPipelineKickoffOnce(spy, { workerId: "kw-c", dispatch: d, intentId: k.id })).code, "KICKOFF_CLOSED");
   assert.equal((await runPipelineKickoffOnce(spy, { workerId: "kw-c", constants: OPEN, intentId: k.id })).code, "DISPATCH_ABSENT");
@@ -175,15 +175,30 @@ test("P6 duplicate consumers race on ONE request (both pass admission, then clai
   assert.equal(d2.calls.length, 1);
 });
 
-test("P7 uncertainty is human-owned, NEVER re-dispatched: lost claim reply (claim committed) → no dispatch; accepted-then-lost reply / throw / timeout → dispatch_unknown; lost settle reply → row stays claimed; re-runs dispatch nothing", async () => {
-  // (a) the claim COMMITS but its reply is lost
+/** a POOL whose clients misbehave at a chosen statement: mode 'after' runs it then throws (reply lost after it landed); 'before' throws instead */
+const faultyPool = (match, nth = 1, mode = "after") => { let seen = 0;
+  return { connect: async () => { const cl = await db.app.connect();
+    return { query: async (sql, p) => { const hit = match(String(sql)) && ++seen === nth;
+      if (hit && mode === "before") throw new Error("connection lost before the statement");
+      const out = await cl.query(sql, p); if (hit) throw new Error("connection lost after the statement"); return out; },
+    release: (x) => cl.release(x) }; } }; };
+const isCommit = (sql) => sql === "COMMIT";
+test("P7 uncertainty is human-owned, NEVER re-dispatched: claim COMMIT landed + reply lost → 0 dispatch, row claimed; failure BEFORE the claim COMMIT → 0 dispatch, row requested (a later clean run may dispatch once); accepted-then-lost / timeout / malformed → dispatch_unknown; settle lost after / before its COMMIT → terminal / claimed; re-runs never re-dispatch", async () => {
+  // (a) the claim COMMIT lands, its reply is lost
   { const k = await authorizedFresh(); const d = fakeDispatch();
-    const lossy = { query: async (sql, p) => { const out = await db.app.query(sql, p); if (/claim_pipeline_kickoff/.test(sql)) throw new Error("connection lost after commit"); return out; } };
-    assert.equal((await runPipelineKickoffOnce(lossy, { workerId: "kw-l", dispatch: d, constants: OPEN, intentId: k.id })).code, "CLAIM_UNCERTAIN");
-    assert.deepEqual([d.calls.length, (await req(k.id))[0].state], [0, "claimed"]);
+    const r = await runPipelineKickoffOnce(faultyPool(isCommit, 1, "after"), { workerId: "kw-l", dispatch: d, constants: OPEN, intentId: k.id });
+    assert.deepEqual([r.code, r.claimed, r.dispatchAttempted, d.calls.length], ["CLAIM_UNCERTAIN", false, false, 0]);
+    assert.deepEqual([(await req(k.id))[0].state, (await req(k.id))[0].claim_worker], ["claimed", "kw-l"], "durable: the COMMIT landed");
     assert.equal((await runPipelineKickoffOnce(db.app, { workerId: "kw-l2", dispatch: d, constants: OPEN, intentId: k.id })).code, "SKIPPED:NOT_REQUESTED:CLAIMED");
     assert.equal(d.calls.length, 0, "a claimed row is never re-claimed"); }
-  // (b) the provider accepted, the reply is lost (throw after the call) / (c) a hung dispatcher times out / (d) a malformed reply
+  // (b) failure BEFORE the claim COMMIT (the COMMIT never runs; the connection is destroyed → rolled back)
+  { const k = await authorizedFresh(); const d = fakeDispatch();
+    const r = await runPipelineKickoffOnce(faultyPool(isCommit, 1, "before"), { workerId: "kw-b", dispatch: d, constants: OPEN, intentId: k.id });
+    assert.deepEqual([r.code, d.calls.length], ["CLAIM_UNCERTAIN", 0]);
+    assert.deepEqual([(await req(k.id))[0].state, (await req(k.id))[0].claim_worker], ["requested", null], "durable: nothing committed");
+    assert.equal((await runPipelineKickoffOnce(db.app, { workerId: "kw-b2", dispatch: d, constants: OPEN, intentId: k.id })).code, "HANDOFF_ACCEPTED");
+    assert.equal(d.calls.length, 1, "exactly one dispatch in total (the first claim never committed)"); }
+  // (c) the provider accepted, the reply is lost / a hung dispatcher times out / a malformed reply
   for (const [label, reply, extra] of [
     ["accepted then lost", async () => { throw new Error("socket hang up"); }, {}],
     ["timeout", () => new Promise(() => {}), { constants: { ...OPEN, dispatchTimeoutMs: 20 } }],
@@ -191,18 +206,57 @@ test("P7 uncertainty is human-owned, NEVER re-dispatched: lost claim reply (clai
     const k = await authorizedFresh(); const d = fakeDispatch(reply);
     const r = await runPipelineKickoffOnce(db.app, { workerId: "kw-u", dispatch: d, constants: OPEN, intentId: k.id, ...extra });
     assert.deepEqual([r.outcome, r.settled, d.calls.length], ["dispatch_unknown", true, 1], label);
-    assert.match((await req(k.id))[0].outcome_code, /^DISPATCH_/, label);
+    assert.deepEqual([(await req(k.id))[0].state, /^DISPATCH_/.test((await req(k.id))[0].outcome_code)], ["dispatch_unknown", true], label);
     assert.equal((await runPipelineKickoffOnce(db.app, { workerId: "kw-u2", dispatch: d, constants: OPEN, intentId: k.id })).code, "SKIPPED:NOT_REQUESTED:DISPATCH_UNKNOWN", label);
     assert.equal(d.calls.length, 1, `${label}: never re-dispatched`);
   }
-  // (e) the settle reply is lost: the row stays claimed (dispatched once); nothing re-dispatches it
-  { const k = await authorizedFresh(); const d = fakeDispatch();
-    const lossy = { query: async (sql, p) => { const out = await db.app.query(sql, p); if (/settle_pipeline_kickoff/.test(sql)) throw new Error("lost"); return out; } };
-    assert.equal((await runPipelineKickoffOnce(lossy, { workerId: "kw-s", dispatch: d, constants: OPEN, intentId: k.id })).code, "SETTLE_UNCERTAIN");
-    // the settle statement itself committed here; a lost reply BEFORE it committed leaves 'claimed' — both are terminal for the consumer
-    assert.ok(["claimed", "dispatch_accepted"].includes((await req(k.id))[0].state));
+  // (d) the settle COMMIT lands, its reply is lost → terminal; (e) failure before the settle COMMIT → still claimed. Neither re-dispatches.
+  for (const [mode, want] of [["after", "dispatch_accepted"], ["before", "claimed"]]) {
+    const k = await authorizedFresh(); const d = fakeDispatch();
+    const r = await runPipelineKickoffOnce(faultyPool(isCommit, 2, mode), { workerId: "kw-s", dispatch: d, constants: OPEN, intentId: k.id });
+    assert.deepEqual([r.code, r.claimed, d.calls.length], ["SETTLE_UNCERTAIN", true, 1], mode);
+    assert.equal((await req(k.id))[0].state, want, `${mode}: durable row`);
     await runPipelineKickoffOnce(db.app, { workerId: "kw-s2", dispatch: d, constants: OPEN, intentId: k.id });
-    assert.equal(d.calls.length, 1); }
+    assert.equal(d.calls.length, 1, `${mode}: never re-dispatched`);
+  }
+});
+
+test("P11 C108-F1 ROOT reproducer: a caller-held transaction can never carry the claim — BEGIN → consumer(client) → ROLLBACK → consumer(pool): the client is refused (0 dispatch), a pool handing out that dirty connection fails the clean-boundary proof (0 dispatch), the row stays requested, and the pool run dispatches exactly ONCE in total", async () => {
+  const k = await authorizedFresh(); const d = fakeDispatch();
+  const c = await db.app.connect();
+  try {
+    await c.query("BEGIN");
+    await c.query("SELECT 1");
+    const first = await runPipelineKickoffOnce(c, { workerId: "root-tx", dispatch: d, constants: OPEN, intentId: k.id });
+    assert.deepEqual([first.code, first.claimed, d.calls.length], ["POOL_CONTRACT_REFUSED", false, 0]);
+    const dirtyPool = { connect: async () => ({ query: (sql, p) => c.query(sql, p), release: () => {} }) };   // hands out the caller's open transaction
+    const second = await runPipelineKickoffOnce(dirtyPool, { workerId: "root-tx", dispatch: d, constants: OPEN, intentId: k.id });
+    assert.deepEqual([second.code, second.claimed, d.calls.length], ["TX_NOT_CLEAN", false, 0]);
+    await c.query("ROLLBACK");
+  } finally { c.release(); }
+  assert.deepEqual([(await req(k.id))[0].state, (await req(k.id))[0].claim_worker], ["requested", null], "durable: never claimed by the caller transaction");
+  const third = await runPipelineKickoffOnce(db.app, { workerId: "root-tx2", dispatch: d, constants: OPEN, intentId: k.id });
+  assert.equal(third.code, "HANDOFF_ACCEPTED");
+  assert.equal(d.calls.length, 1, "total dispatches across all three runs <= 1");
+  assert.deepEqual([(await req(k.id))[0].state, (await req(k.id))[0].claim_worker], ["dispatch_accepted", "root-tx2"]);
+});
+
+test("P12 C108-F2 the SQL claim binds the reviewed source / closure digests as literals: drifting either one (or both, or the key set) → REFUSED:INPUTS_NOT_BOUND, nothing claimed, 0 dispatch; the exact inputs still claim", async () => {
+  const goodFor = async (k) => { const i = await loadIntent(db.app, k.id);
+    const nb = (await q1(`SELECT to_char(date_trunc('milliseconds', created_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS nb FROM booking.intents WHERE id = $1`, [k.id]))[0].nb;
+    return kickoffDispatch({ intentId: k.id, ref: i.ref, authorizedVersion: i.version, paymentIntentId: k.piId, amountMinor: i.price.finalTotalMinor, currency: "USD", listingId: 606998, notBefore: nb }); };
+  for (const [label, drift] of [["source", { expected_source_digest: "a".repeat(64) }], ["closure", { expected_closure_digest: "b".repeat(64) }],
+    ["both", { expected_source_digest: "a".repeat(64), expected_closure_digest: "b".repeat(64) }], ["extra key", { extra: "x" }]]) {
+    const k = await authorizedFresh(); const g = await goodFor(k);
+    const bad = { ...g.inputs, ...drift };
+    assert.equal((await q1("SELECT booking.claim_pipeline_kickoff($1, 'root-pins', $2, $3) AS r", [k.id, g.planHash, bad]))[0].r, "REFUSED:INPUTS_NOT_BOUND", label);
+    assert.deepEqual([(await req(k.id))[0].state, (await req(k.id))[0].outcome_code, (await req(k.id))[0].plan_hash], ["refused", "INPUTS_NOT_BOUND", null], label);
+  }
+  const k = await authorizedFresh(); const g = await goodFor(k);
+  assert.deepEqual(Object.keys(g.inputs), [...WORKFLOW_INPUT_KEYS]);
+  assert.equal(g.inputs.expected_source_digest, "f09bcbbdfac88ca8dfd212a386d2af03698f9b710a49189b0ac9262531510999");
+  assert.equal(g.inputs.expected_closure_digest, "f7d7cad646eaed2fb37a63e031157732ee6e2a44824f9d935d6b9104e08f7273");
+  assert.equal((await q1("SELECT booking.claim_pipeline_kickoff($1, 'root-pins', $2, $3) AS r", [k.id, g.planHash, g.inputs]))[0].r, "CLAIMED");
 });
 
 test("P8 a dispatch refusal never rolls back the authorized payment nor advances the booking: typed notSent → dispatch_refused; the intent stays payment_authorized with its accepted authorization", async () => {
