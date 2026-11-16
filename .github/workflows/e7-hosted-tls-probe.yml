@@ -1,0 +1,169 @@
+# E7 C112: READ-ONLY hosted TLS PROBE (scripts/e7-hosted-tls-probe.mjs) for the DEV booking database — proves BOTH TLS hops with the EXISTING
+# app credential and the pinned Supabase CA through the SAME pooler target the hosted runners use: (a) the CLIENT hop on each acquired socket
+# (merged C112 clientTlsRefusal), (b) the BACKEND hop (server-reported pg_stat_ssl.ssl), over EXACTLY five fresh connections, each in ONE
+# read-only transaction that is always rolled back. PASS only if all five prove both hops + app-role / TEST identity + read-only.
+# NO write, NO consumer / claim / dispatch, NO GitHub token, NO provider call / provider secret, NO arbitrary SQL / target / credential / TLS input.
+# HONEST LABEL: MANUAL workflow_dispatch only. Default mode `preflight` = no environment, no secret, no database, no dependency install.
+# PERMISSIONS: `contents: read` everywhere (no write permission anywhere). The probe job is main-only behind the existing `e7-readonly-probe`
+# environment gate; the existing DB secret NAME E7_DEV_BOOKING_DATABASE_URL + the pinned CA appear in its FINAL step only.
+# Source digest = SHA-256 over: prefix "e7-hosted-tls-probe-v1\n", then for each file IN THIS ORDER
+#   1. scripts/e7-hosted-tls-probe.mjs  2. test/e7-hosted-tls-probe.test.mjs  3. test/e7-hosted-tls-probe-workflow.test.mjs
+#   4. .github/workflows/e7-hosted-tls-probe.yml  5. scripts/e7-hosted-kickoff.mjs (the imported clientTlsRefusal)
+# the frame  <relative path> NUL <decimal byte length> NUL <file bytes> NUL  (the framedDigest convention of the reviewed runners).
+name: e7-hosted-tls-probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "preflight (default: no environment, no secrets, no database), verify (no secret) or probe (READ-ONLY; main only; e7-readonly-probe gate)"
+        type: choice
+        options: [preflight, verify, probe]
+        default: preflight
+      expected_source_digest:
+        description: "verify / probe only: exact 64-hex probe source digest printed by a preflight of this SAME commit (no default)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e7-hosted-tls-probe
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout wrapper (this repository, exact dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout E7 tooling (fixed commit 4e79f266)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: 4e79f26619c26954fe89c1b626e7be0e138ef383
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Verify checkout bindings (wrapper HEAD == dispatch SHA; tooling HEAD == pin; no secrets)
+        env:
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_TOOLING_PIN: 4e79f26619c26954fe89c1b626e7be0e138ef383
+          E7_MODE: ${{ inputs.mode }}
+        run: |
+          set -eu
+          head="$(git -C wrapper rev-parse HEAD)"
+          [ "$head" = "$E7_WORKFLOW_SHA" ] || { echo "REFUSED: wrapper HEAD != dispatch SHA"; exit 3; }
+          tool="$(git -C tooling rev-parse HEAD)"
+          [ "$tool" = "$E7_TOOLING_PIN" ] || { echo "REFUSED: tooling HEAD != pin"; exit 3; }
+          case "$E7_MODE" in preflight|verify|probe) ;; *) echo "REFUSED: mode"; exit 3 ;; esac
+          echo "bindings ok: wrapper=$head tooling=$tool mode=$E7_MODE"
+      - name: Preflight (runner spawns the focused FAKE tests — all pass, zero skips; digests; no environment, no secret, no database, no dependency install)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+        run: node wrapper/scripts/e7-hosted-tls-probe.mjs preflight
+
+  verify:
+    needs: preflight
+    if: inputs.mode == 'verify' || inputs.mode == 'probe'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout wrapper (this repository, exact dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout E7 tooling (fixed commit 4e79f266)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: 4e79f26619c26954fe89c1b626e7be0e138ef383
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Verify (runner; main + exact SHA + source digest; no secret, no database, no environment)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: node wrapper/scripts/e7-hosted-tls-probe.mjs verify
+
+  probe:
+    needs: [preflight, verify]
+    if: inputs.mode == 'probe' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: e7-readonly-probe
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout wrapper (this repository, exact dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout E7 tooling (fixed commit 4e79f266)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: 4e79f26619c26954fe89c1b626e7be0e138ef383
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Re-check bindings BEFORE any secret (HEAD == dispatch SHA; tooling pin; probe source digest)
+        env:
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_TOOLING_PIN: 4e79f26619c26954fe89c1b626e7be0e138ef383
+          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
+        run: |
+          set -eu
+          head="$(git -C wrapper rev-parse HEAD)"
+          [ "$head" = "$E7_WORKFLOW_SHA" ] || { echo "REFUSED: wrapper HEAD != dispatch SHA"; exit 3; }
+          tool="$(git -C tooling rev-parse HEAD)"
+          [ "$tool" = "$E7_TOOLING_PIN" ] || { echo "REFUSED: tooling HEAD != pin"; exit 3; }
+          printf '%s' "$E7_EXPECTED_SOURCE_DIGEST" | grep -Eq '^[0-9a-f]{64}$' || { echo "REFUSED: expected_source_digest not 64-hex"; exit 3; }
+          d="$({ printf 'e7-hosted-tls-probe-v1\n'; for f in scripts/e7-hosted-tls-probe.mjs test/e7-hosted-tls-probe.test.mjs test/e7-hosted-tls-probe-workflow.test.mjs .github/workflows/e7-hosted-tls-probe.yml scripts/e7-hosted-kickoff.mjs; do printf '%s\0%s\0' "$f" "$(stat -c%s "wrapper/$f")"; cat "wrapper/$f"; printf '\0'; done; } | sha256sum | cut -d' ' -f1)"
+          [ "$d" = "$E7_EXPECTED_SOURCE_DIGEST" ] || { echo "REFUSED: expected_source_digest mismatch (actual $d)"; exit 3; }
+          echo "bindings ok: wrapper=$head tooling=$tool source=$d"
+      - name: Install the pinned dependency from the verified lockfile (no lifecycle scripts)
+        working-directory: tooling
+        run: npm ci --ignore-scripts --omit=dev --no-audit --no-fund
+      - name: Fetch the public Supabase CA (the runner checks its pinned SHA-256)
+        run: curl --fail --silent --show-error --proto '=https' --max-time 20 -o "$RUNNER_TEMP/prod-ca-2021.crt" https://supabase-downloads.s3-ap-southeast-1.amazonaws.com/prod/ssl/prod-ca-2021.crt
+      - name: ONE read-only TLS probe (the only secret, this step only; 5 fresh connections; read-only transactions, rolled back; no retry)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          E7_CA_FILE: ${{ runner.temp }}/prod-ca-2021.crt
+          E7_DEV_BOOKING_DATABASE_URL: ${{ secrets.E7_DEV_BOOKING_DATABASE_URL }}
+        run: node wrapper/scripts/e7-hosted-tls-probe.mjs probe
