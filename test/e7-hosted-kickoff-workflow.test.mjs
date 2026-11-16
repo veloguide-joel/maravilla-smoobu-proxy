@@ -37,26 +37,28 @@ function runBlock(stepName) {
   const rest = yml.slice(i); const m = rest.match(/\n        run: \|\n((?:          .*\n)+)/); assert.ok(m, `run block of ${stepName}`);
   return m[1].split("\n").map((l) => l.replace(/^ {10}/, "")).join("\n");
 }
-const jobs = { preflight: yml.slice(yml.indexOf("\n  preflight:\n"), yml.indexOf("\n  verify:\n")), verify: yml.slice(yml.indexOf("\n  verify:\n"), yml.indexOf("\n  execute:\n")),
-  execute: yml.slice(yml.indexOf("\n  execute:\n")) };
+const jobs = { preflight: yml.slice(yml.indexOf("\n  preflight:\n"), yml.indexOf("\n  verify:\n")), verify: yml.slice(yml.indexOf("\n  verify:\n"), yml.indexOf("\n  detect:\n")),
+  detect: yml.slice(yml.indexOf("\n  detect:\n"), yml.indexOf("\n  execute:\n")), execute: yml.slice(yml.indexOf("\n  execute:\n")) };
 const steps = (job) => [...job.matchAll(/\n      - name: ([^\n]+)/g)].map((m) => m[1]);
 
 test("W1 static: workflow_dispatch ONLY (no schedule / cron / webhook / repository_dispatch / push / workflow_run); inputs exactly mode (choice, default preflight) + the five bindings + expected_source_digest — no contact / guest input; concurrency serialised", () => {
   assert.match(yml, /^on:\n  workflow_dispatch:\n    inputs:\n      mode:\n/m);
   assert.doesNotMatch(yml.replace(/^#.*$/gm, ""), /\n  (push|pull_request|pull_request_target|schedule|workflow_call|repository_dispatch|workflow_run|issue_comment):|cron:/);
-  assert.match(yml, /      mode:\n(?:        .*\n)*?        type: choice\n        options: \[preflight, verify, execute\]\n        default: preflight\n/);
+  assert.match(yml, /      mode:\n(?:        .*\n)*?        type: choice\n        options: \[preflight, verify, execute, detect\]\n        default: preflight\n/);
   assert.deepEqual([...yml.matchAll(/^      ([a-z_]+):\n        description/gm)].map((m) => m[1]),
     ["mode", "intent_id", "booking_ref", "expected_version", "payment_intent_id", "amount_minor", "expected_source_digest"]);
   assert.doesNotMatch(yml.slice(0, yml.indexOf("\npermissions:")).replace(/^#.*$/gm, ""), /recipient|sender|email|subject|guest_name|to_address|reservation_id|listing_id|token|sha:/i);
   assert.match(yml, /\nconcurrency:\n  group: e7-hosted-kickoff\n  cancel-in-progress: false\n/);
-  assert.deepEqual([...yml.matchAll(/^  ([a-z-]+):\n    (?:needs|runs-on|if)/gm)].map((m) => m[1]), ["preflight", "verify", "execute"]);
+  assert.deepEqual([...yml.matchAll(/^  ([a-z-]+):\n    (?:needs|runs-on|if)/gm)].map((m) => m[1]), ["preflight", "verify", "detect", "execute"]);
+  assert.doesNotMatch(code, /schedule:|cron:/, "C113: manual workflow_dispatch only");
   assert.deepEqual([...R.RUNNER_FILES], FILES);
 });
 
 test("W2 PERMISSIONS (for ROOT security review): workflow default contents: read; preflight + verify contents: read ONLY; ONLY the gated execute job adds `actions: write` (+ contents: read); no other write / id-token / PAT / App", () => {
   assert.match(yml, /\npermissions:\n  contents: read\n\nconcurrency:/);
   assert.match(jobs.preflight, /\n    permissions:\n      contents: read\n    steps:/); assert.doesNotMatch(jobs.preflight, /: write/);
-  assert.match(jobs.verify, /\n    permissions:\n      contents: read\n    steps:/); assert.doesNotMatch(jobs.verify, /: write/);
+  assert.match(jobs.verify, /\n    permissions:\n      contents: read\n    outputs:\n      open: \$\{\{ steps\.verify\.outputs\.open \}\}\n    steps:/); assert.doesNotMatch(jobs.verify, /: write/);
+  assert.match(jobs.detect, /\n    permissions:\n      contents: read\n    outputs:\n/); assert.doesNotMatch(jobs.detect, /: write|github\.token|E7_DISPATCH_TOKEN/);
   assert.match(jobs.execute, /\n    permissions:\n      contents: read\n      actions: write\n    steps:/);
   assert.equal(count(/: write/g), 1, "exactly ONE write permission in the file"); assert.equal(count(/actions: write/g), 1);
   assert.doesNotMatch(yml, /id-token:|pull-requests:|packages:|deployments:|issues:|checks:|statuses:|contents: write|permissions: write-all|write-all/);
@@ -64,21 +66,23 @@ test("W2 PERMISSIONS (for ROOT security review): workflow default contents: read
 });
 
 test("W3 static: checkouts at the EXACT dispatch SHA + the immutable tooling pin 4e79f266 (persist-credentials false) in all three jobs; the reviewed action pins; Node 22.22.0; preflight / verify have no environment / secret / token / npm / curl", () => {
-  assert.equal(count(/ref: \$\{\{ github\.sha \}\}\n          path: wrapper\n          persist-credentials: false/g), 3);
-  assert.equal(count(new RegExp(`repository: veloguide-joel/maravilla-smoobu-proxy\\n          ref: ${PIN}\\n          path: tooling\\n          persist-credentials: false`, "g")), 3);
-  assert.equal(count(/persist-credentials: false/g), 6); assert.doesNotMatch(yml, /ref: main|ref: refs\/heads|ref: \$\{\{ github\.ref/);
+  assert.equal(count(/ref: \$\{\{ github\.sha \}\}\n          path: wrapper\n          persist-credentials: false/g), 4);
+  assert.equal(count(new RegExp(`repository: veloguide-joel/maravilla-smoobu-proxy\\n          ref: ${PIN}\\n          path: tooling\\n          persist-credentials: false`, "g")), 4);
+  assert.equal(count(/persist-credentials: false/g), 8); assert.doesNotMatch(yml, /ref: main|ref: refs\/heads|ref: \$\{\{ github\.ref/);
   const rec = readFileSync(join(ROOT, ".github/workflows/e7-hosted-pipeline.yml"), "utf8");
   const pins = (s) => [...new Set([...s.matchAll(/uses: (actions\/[a-z-]+@[0-9a-f]{40})/g)].map((m) => m[1]))].sort();
-  assert.deepEqual(pins(yml), pins(rec)); assert.equal(count(/uses: /g), 9);
-  assert.equal(count(/node-version: "22\.22\.0"\n          package-manager-cache: false/g), 3);
+  assert.deepEqual(pins(yml), pins(rec)); assert.equal(count(/uses: /g), 12);
+  assert.equal(count(/node-version: "22\.22\.0"\n          package-manager-cache: false/g), 4);
   for (const j of [jobs.preflight, jobs.verify]) assert.doesNotMatch(j, /environment:|secrets\.|github\.token|E7_DISPATCH_TOKEN|E7_DEV_BOOKING_DATABASE_URL|npm |curl |E7_CA_FILE/);
-  assert.equal(R.CONSTANTS.toolingCommit, PIN); assert.equal(yml.split(`E7_TOOLING_PIN: ${PIN}`).length - 1, 2);
+  assert.equal(R.CONSTANTS.toolingCommit, PIN); assert.equal(yml.split(`E7_TOOLING_PIN: ${PIN}`).length - 1, 3);
 });
 
 test("W4 static: execute needs [preflight, verify] AND mode == 'execute' && main AND environment e7-readonly-probe (the only environment); step order: checkouts → node → pre-secret re-check (incl. the pipeline release binding) → npm ci → CA fetch → the ONE execute step LAST", () => {
-  assert.match(jobs.execute, /^\n  execute:\n    needs: \[preflight, verify\]\n    if: inputs\.mode == 'execute' && github\.ref == 'refs\/heads\/main'\n    runs-on: ubuntu-24\.04\n    environment: e7-readonly-probe\n    timeout-minutes: 10\n/);
-  assert.match(jobs.verify, /^\n  verify:\n    needs: preflight\n    if: inputs\.mode == 'verify' \|\| inputs\.mode == 'execute'\n/);
-  assert.equal(count(/environment: /g), 1);
+  assert.match(jobs.execute, /^\n  execute:\n    needs: \[preflight, verify, detect\]\n    if: \$\{\{ !cancelled\(\) && github\.ref == 'refs\/heads\/main' && needs\.preflight\.result == 'success' && needs\.verify\.result == 'success' && \(\(inputs\.mode == 'execute' && needs\.detect\.result == 'skipped'\) \|\| \(inputs\.mode == 'detect' && needs\.detect\.result == 'success' && needs\.detect\.outputs\.outcome == 'ONE'\)\) \}\}\n    runs-on: ubuntu-24\.04\n    environment: e7-readonly-probe\n    timeout-minutes: 10\n/);
+  assert.match(jobs.verify, /^\n  verify:\n    needs: preflight\n    if: inputs\.mode == 'verify' \|\| inputs\.mode == 'execute' \|\| inputs\.mode == 'detect'\n/);
+  assert.match(jobs.detect, /^\n  detect:\n    needs: \[preflight, verify\]\n    if: inputs\.mode == 'detect' && needs\.verify\.outputs\.open == 'true' && github\.ref == 'refs\/heads\/main'\n    runs-on: ubuntu-24\.04\n    environment: e7-readonly-probe\n    timeout-minutes: 10\n/);
+  assert.equal(count(/environment: /g), 2, "two jobs, ONE environment name (two sequential approvals)"); assert.equal(count(/environment: e7-readonly-probe\n/g), 2);
+  assert.doesNotMatch(code, /always\(\)/, "no unconditional always() path");
   assert.deepEqual(steps(jobs.execute).map((s) => s.split(" (")[0]), ["Checkout wrapper", "Checkout E7 kickoff tooling", "Set up Node 22.22.0", "Re-check bindings BEFORE any secret",
     "Install the pinned dependency from the verified lockfile", "Fetch the public Supabase CA", "ONE gated kickoff handoff"]);
   assert.deepEqual(steps(jobs.verify).map((s) => s.split(" (")[0]), ["Checkout wrapper", "Checkout E7 kickoff tooling", "Set up Node 22.22.0", "Verify"]);
@@ -87,12 +91,17 @@ test("W4 static: execute needs [preflight, verify] AND mode == 'execute' && main
 });
 
 test("W5 static: the ONLY secret (existing NAME E7_DEV_BOOKING_DATABASE_URL) and the built-in job-scoped github.token (as E7_DISPATCH_TOKEN) appear exactly once each, in the env of the LAST execute step whose run is the one `execute` command; no expression inside any run; every E7_* env name is an admitted runner key", () => {
-  assert.equal(count(/secrets\./g), 1); assert.equal(count(/\$\{\{ secrets\.E7_DEV_BOOKING_DATABASE_URL \}\}/g), 1);
+  assert.equal(count(/secrets\./g), 2); assert.equal(count(/\$\{\{ secrets\.E7_DEV_BOOKING_DATABASE_URL \}\}/g), 2);
+  const lastDetect = jobs.detect.slice(jobs.detect.lastIndexOf("      - name: "));
+  assert.match(lastDetect, /^      - name: ONE gated read-only detection[^\n]*\n        id: detect\n        env:\n(?:          [A-Z0-9_]+: [^\n]+\n)+        run: node wrapper\/scripts\/e7-hosted-kickoff\.mjs detect\n\n?$/);
+  assert.match(lastDetect, /          E7_DEV_BOOKING_DATABASE_URL: \$\{\{ secrets\.E7_DEV_BOOKING_DATABASE_URL \}\}\n        run:/);
+  assert.doesNotMatch(jobs.detect.slice(0, jobs.detect.lastIndexOf("      - name: ")), /secrets\./, "the DB secret only in the detect job's FINAL step");
   assert.equal(count(/github\.token/g), 1); assert.equal(count(/GITHUB_TOKEN/g), 0);
   const last = yml.slice(yml.lastIndexOf("      - name: "));
   assert.match(last, /^      - name: ONE gated kickoff handoff[^\n]*\n        env:\n(?:          [A-Z0-9_]+: [^\n]+\n)+        run: node wrapper\/scripts\/e7-hosted-kickoff\.mjs execute\n$/);
-  assert.match(last, /          E7_DEV_BOOKING_DATABASE_URL: \$\{\{ secrets\.E7_DEV_BOOKING_DATABASE_URL \}\}\n          E7_DISPATCH_TOKEN: \$\{\{ github\.token \}\}\n        run:/);
-  assert.equal(count(/e7-hosted-kickoff\.mjs execute\n/g), 1); assert.equal(count(/e7-hosted-kickoff\.mjs verify\n/g), 1); assert.equal(count(/e7-hosted-kickoff\.mjs preflight\n/g), 1);
+  assert.match(last, /          E7_INPUT_MODE: \$\{\{ inputs\.mode \}\}\n          E7_EXPECTED_CANDIDATE_FINGERPRINT: \$\{\{ needs\.detect\.outputs\.fingerprint \}\}\n          E7_DEV_BOOKING_DATABASE_URL: \$\{\{ secrets\.E7_DEV_BOOKING_DATABASE_URL \}\}\n          E7_DISPATCH_TOKEN: \$\{\{ github\.token \}\}\n        run:/);
+  assert.equal(count(/e7-hosted-kickoff\.mjs execute\n/g), 1); assert.equal(count(/e7-hosted-kickoff\.mjs detect\n/g), 1);
+  assert.equal(count(/needs\.detect\.outputs\.fingerprint/g), 1, "the fingerprint reaches ONLY the execute step"); assert.equal(count(/e7-hosted-kickoff\.mjs verify\n/g), 1); assert.equal(count(/e7-hosted-kickoff\.mjs preflight\n/g), 1);
   assert.doesNotMatch(yml, /E7_STRIPE|E7_HOSTAWAY|RESEND|api\.stripe\.com|api\.hostaway\.com|E7_HKO_DB_TESTS/);
   for (const blk of yml.split(/\n      - name: /).slice(1)) { const r = blk.match(/\n        run: \|\n((?:          .*\n)+)|\n        run: (.*)\n/); if (r) assert.doesNotMatch(r[1] ?? r[2], /\$\{\{/, "no expression interpolation inside run"); }
   const envKeys = [...yml.matchAll(/^          (E7_[A-Z0-9_]+):/gm)].map((m) => m[1]);
@@ -167,4 +176,70 @@ test("W8 untouched: main's eight tracked runners stay CLOSED and byte-unchanged 
   const N = await import("../scripts/e7-hosted-booking-confirmation.mjs");
   assert.equal(N.CONSTANTS.executeEnabled, false);
   assert.equal(await R.framedDigest(ROOT, N.CONSTANTS.runnerFiles, "e7-hosted-booking-confirmation-v1\n"), "aff728cf8b3867a2580c8159f73081bccf2fd1659b4e07075822e14a7c4c16a0");
+});
+
+// ---- C113: the detect job + the trusted job-output routing --------------------------------------------------------------------------
+test("W9 C113 detect job: checkouts → node → the SAME pre-secret re-check block as execute (byte-identical; executed locally) → npm ci → CA → the ONE detect step LAST; declared outputs outcome + fingerprint only; no token", async () => {
+  assert.deepEqual(steps(jobs.detect).map((s) => s.split(" (")[0].split(",")[0]), ["Checkout wrapper", "Checkout E7 kickoff tooling", "Set up Node 22.22.0", "Re-check bindings BEFORE the DB secret",
+    "Install the pinned dependency from the verified lockfile", "Fetch the public Supabase CA", "ONE gated read-only detection"]);
+  const det = runBlock("Re-check bindings BEFORE the DB secret, detect (HEAD == dispatch SHA; tooling pin; kickoff source digest; pipeline release binding f09bcbbd)");
+  const exe = runBlock("Re-check bindings BEFORE any secret (HEAD == dispatch SHA; tooling pin; kickoff source digest; pipeline release binding f09bcbbd)");
+  assert.equal(det, exe, "identical pre-secret checks in both secret-bearing jobs");
+  assert.match(jobs.detect, /\n    outputs:\n      outcome: \$\{\{ steps\.detect\.outputs\.outcome \}\}\n      fingerprint: \$\{\{ steps\.detect\.outputs\.fingerprint \}\}\n    steps:/);
+  assert.doesNotMatch(jobs.detect, /E7_INTENT_ID|E7_BOOKING_REF|E7_EXPECTED_VERSION|E7_PAYMENT_INTENT_ID|E7_AMOUNT_MINOR|github\.token|E7_DISPATCH_TOKEN|actions: write/, "no binding input, no token");
+  const d = sandbox(); try {
+    const want = await expectedDigest(); const pipe = await R.pipelineBinding(ROOT);
+    const r = sh(det, { E7_WORKFLOW_SHA: headSha, E7_TOOLING_PIN: PIN, E7_EXPECTED_SOURCE_DIGEST: want, E7_PIPELINE_SOURCE_PIN: pipe.sourceDigest }, d);
+    assert.equal(r.status, 0, r.out);
+    const bad = sh(det, { E7_WORKFLOW_SHA: headSha, E7_TOOLING_PIN: PIN, E7_EXPECTED_SOURCE_DIGEST: "f".repeat(64), E7_PIPELINE_SOURCE_PIN: pipe.sourceDigest }, d);
+    assert.deepEqual([bad.status, /expected_source_digest mismatch/.test(bad.out)], [3, true]);
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+/** evaluate a job's `if:` exactly as written (GitHub expression subset used here) against a run context; jobs without a status function get the implicit success() */
+function jobIf(job) {
+  const m = job.match(/\n    if: (.*)\n/); assert.ok(m, "job has if"); let e = m[1].trim();
+  if (e.startsWith("${{")) e = e.replace(/^\$\{\{\s*/, "").replace(/\s*\}\}$/, "");
+  assert.match(e, /^[a-zA-Z0-9_.'()!&|= \/-]+$/, "only the reviewed operators / literals");
+  const js = e.replace(/==/g, "===").replace(/!===/g, "!==").replace(/\bcancelled\(\)/g, "ctx.cancelled()").replace(/\b(inputs|github|needs)\./g, "ctx.$1.");
+  const explicit = /\b(cancelled|always|success|failure)\(\)/.test(e);
+  const fn = new Function("ctx", `return (${js});`);
+  return (ctx, needs) => (explicit ? true : needs.every((n) => ctx.needs[n].result === "success")) && fn(ctx) === true;
+}
+test("W10 C113 needs / if truth table (the REAL expressions): manual execute stays reachable when detect is SKIPPED; detect mode reaches execute ONLY via detect success + outcome ONE; any failed / cancelled / skipped preflight, verify or detect, a CLOSED verify (open=false) or a non-main ref reaches NEITHER secret job; no always()", () => {
+  const ifDetect = jobIf(jobs.detect); const ifExec = jobIf(jobs.execute);
+  const ctx = ({ mode, ref = "refs/heads/main", pre = "success", ver = "success", open = "", det = "skipped", outcome = "", cancelled = false }) =>
+    ({ inputs: { mode }, github: { ref }, cancelled: () => cancelled, needs: { preflight: { result: pre }, verify: { result: ver, outputs: { open } }, detect: { result: det, outputs: { outcome } } } });
+  const run = (o) => { const c = ctx(o); const d = ifDetect(c, ["preflight", "verify"]); return { detect: d, execute: ifExec(c, ["preflight", "verify", "detect"]) }; };
+  const cases = [
+    [{ mode: "execute" }, { detect: false, execute: true }],                                              // manual: detect skipped → execute reachable
+    [{ mode: "execute", ver: "failure" }, { detect: false, execute: false }],                              // CLOSED manual verify fails
+    [{ mode: "execute", pre: "failure", ver: "skipped" }, { detect: false, execute: false }],
+    [{ mode: "execute", ref: "refs/heads/feature" }, { detect: false, execute: false }],
+    [{ mode: "execute", cancelled: true }, { detect: false, execute: false }],
+    [{ mode: "verify" }, { detect: false, execute: false }],
+    [{ mode: "detect", open: "false" }, { detect: false, execute: false }],                               // CLOSED_NOOP: both gated jobs skipped
+    [{ mode: "detect", open: "true", det: "success", outcome: "ONE" }, { detect: true, execute: true }],
+    [{ mode: "detect", open: "true", det: "success", outcome: "NO_REQUEST" }, { detect: true, execute: false }],
+    [{ mode: "detect", open: "true", det: "success", outcome: "AMBIGUOUS" }, { detect: true, execute: false }],
+    [{ mode: "detect", open: "true", det: "success", outcome: "INELIGIBLE:OPEN_CASE" }, { detect: true, execute: false }],
+    [{ mode: "detect", open: "true", det: "failure", outcome: "ONE" }, { detect: true, execute: false }],
+    [{ mode: "detect", open: "true", det: "cancelled", outcome: "ONE" }, { detect: true, execute: false }],
+    [{ mode: "detect", open: "true", det: "skipped" }, { detect: true, execute: false }],                 // detect skipped in detect mode ≠ manual path
+    [{ mode: "detect", open: "true", det: "success", outcome: "ONE", cancelled: true }, { detect: true, execute: false }],
+    [{ mode: "detect", ver: "failure", det: "success", outcome: "ONE" }, { detect: false, execute: false }],
+    [{ mode: "detect", open: "true", ref: "refs/heads/feature", det: "success", outcome: "ONE" }, { detect: false, execute: false }],
+    [{ mode: "detect", pre: "failure", open: "true", det: "success", outcome: "ONE" }, { detect: false, execute: false }]];
+  for (const [o, want] of cases) assert.deepEqual(run(o), want, JSON.stringify(o));
+});
+
+test("W11 C113 trusted outputs: the runner writes ONLY allowlisted $GITHUB_OUTPUT lines (open true/false; outcome enum; fingerprint 64-hex or empty) — anything else writes NOTHING", () => {
+  const fp = "a".repeat(64);
+  assert.equal(R.outputLines({ outputs: { open: "false" } }), "open=false\n");
+  assert.equal(R.outputLines({ outputs: { outcome: "ONE", fingerprint: fp } }), `outcome=ONE\nfingerprint=${fp}\n`);
+  assert.equal(R.outputLines({ outputs: { outcome: "NO_REQUEST", fingerprint: "" } }), "outcome=NO_REQUEST\nfingerprint=\n");
+  assert.equal(R.outputLines({ outputs: { outcome: "INELIGIBLE:OPEN_CASE", fingerprint: "" } }), "outcome=INELIGIBLE:OPEN_CASE\nfingerprint=\n");
+  for (const bad of [{ open: "yes" }, { outcome: "ONE\nfingerprint=x" }, { outcome: "one" }, { fingerprint: "A".repeat(64) }, { fingerprint: "a".repeat(63) }, { intent: "x" }, { outcome: "MV-ABC123" }])
+    assert.equal(R.outputLines({ outputs: bad }), "", JSON.stringify(bad));
+  assert.equal(R.outputLines({}), ""); assert.equal(R.outputLines({ outputs: null }), "");
 });
