@@ -145,3 +145,20 @@ test("I4 CLOSED: the shipped consumer refuses before any DB read, credential rea
     const r = await kick(k, transport(ex, GITHUB_DISPATCH_CONSTANTS));
     assert.deepEqual([r.code, r.outcome, credReads - before, ex.calls.length, (await row(k.id)).state], ["NOT_SENT:TRANSPORT_CLOSED", "dispatch_refused", 0, 0, "dispatch_refused"]); }
 });
+
+test("I5 C110-F1 through the REAL C108 consumer: a 204 that arrives only after the transport's deadline, or after the consumer's own bound aborted the dispatch, settles durably as dispatch_unknown (never accepted); exactly ONE POST; a re-run posts nothing", async () => {
+  { const k = await authorizedFresh(); let t = 0;
+    const ex = fakeGithub(k.id, { dispatch: async () => { t += OPEN_TRANSPORT.totalTimeoutMs; return reply(204); } });
+    const d = createGithubWorkflowDispatch({ credential: () => TOKEN, constants: OPEN_TRANSPORT, exchange: ex, now: () => t });
+    const r = await kick(k, d);
+    assert.deepEqual([r.outcome, r.settled, (await row(k.id)).state], ["dispatch_unknown", true, "dispatch_unknown"], "late 204 past the transport deadline");
+    assert.deepEqual(ex.calls.map((c) => c.kind), ["getMain", "dispatch"]);
+    const ex2 = fakeGithub(k.id); await kick(k, transport(ex2), "kw-late-r"); assert.equal(ex2.calls.length, 0); }
+  { const k = await authorizedFresh();
+    const ex = fakeGithub(k.id, { dispatch: () => new Promise((res) => setTimeout(() => res(reply(204)), 120)) });
+    const r = await runPipelineKickoffOnce(db.app, { workerId: "kw-abort", dispatch: transport(ex), constants: { ...OPEN_CONSUMER, dispatchTimeoutMs: 40 }, intentId: k.id });
+    assert.deepEqual([r.outcome, (await row(k.id)).state, (await row(k.id)).outcome_code], ["dispatch_unknown", "dispatch_unknown", "DISPATCH_TIMEOUT"], "consumer bound aborted the POST");
+    await new Promise((res) => setTimeout(res, 150));                               // the late 204 lands after settle: nothing changes
+    assert.equal((await row(k.id)).state, "dispatch_unknown"); assert.equal(ex.calls.filter((c) => c.kind === "dispatch").length, 1);
+    const ex2 = fakeGithub(k.id); await kick(k, transport(ex2), "kw-abort-r"); assert.equal(ex2.calls.length, 0); }
+});

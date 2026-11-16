@@ -173,7 +173,7 @@ const respond = (req, status, headers = {}, chunks = [], o = {}) => {
   if (o.closeEarly) { res.emit("close"); return; }
   res.emit("end"); res.emit("close");
 };
-const body = Buffer.from(JSON.stringify({ ref: "main", inputs: {}, return_run_details: false }));
+const body = T.dispatchBodyFor(goodCall().inputs);                                  // the ONE approved body grammar (C110-F3)
 
 test("G8 exchange wire: fixed host api.github.com:443 + SNI, rejectUnauthorized true, no ca / proxy / lookup override, own non-keep-alive Agent (destroyed every time), exact method / path / headers per kind, body written once", async () => {
   const { primitive, log } = fakePrimitive((req) => respond(req, req.opts.method === "GET" ? 200 : 204, req.opts.method === "GET" ? { "content-type": "application/json" } : {},
@@ -218,7 +218,9 @@ test("G9 exchange faults: oversize (header and streamed), gzip, a 3xx is never f
     await assert.rejects(ex({ kind: "getMain", token: TOKEN, signal: ac.signal, timeoutMs: 1000 }), (e) => e.code === "EXCHANGE_ABORTED"); assert.ok(log.requests[0].destroyed && log.agents[0].destroyed); }
   for (const spec of [{ kind: "delete" }, { token: "bad token" }, { timeoutMs: 999999 }, { body }, { kind: "dispatch", body: Buffer.alloc(T.GITHUB_DISPATCH_CONSTANTS.maxPostBodyBytes + 1) },
     { kind: "dispatch", body: "string" }, { signal: null }]) {
-    const { e, log } = await run(() => {}, spec); assert.equal(e.code, "EXCHANGE_INPUT_INVALID", JSON.stringify(Object.keys(spec))); assert.equal(log.requests.length + log.agents.length, 0);
+    const { e, log } = await run(() => {}, spec);
+    assert.equal(e.code, spec.kind === "dispatch" ? "EXCHANGE_PHASE_REFUSED" : "EXCHANGE_INPUT_INVALID", JSON.stringify(Object.keys(spec)));   // a POST before the GET is a phase refusal
+    assert.equal(log.requests.length + log.agents.length, 0);
   }
 });
 
@@ -235,4 +237,94 @@ test("G10 static: no process.env / no other host / only the two fixed paths / no
   assert.equal(KICKOFF_CONSTANTS.dispatchEnabled, false); assert.equal(T.GITHUB_DISPATCH_CONSTANTS.enabled, false);
   assert.equal(T.GITHUB_DISPATCH_CONSTANTS.expectedMainSha, "9455bc9ee15370b5321b7a04a96e893e9e80080b");
   assert.ok(T.GITHUB_DISPATCH_CONSTANTS.totalTimeoutMs < KICKOFF_CONSTANTS.dispatchTimeoutMs, "the transport settles before the consumer's own bound");
+});
+
+// ---- C110 regressions -------------------------------------------------------------------------------------------------------------
+test("G11 C110-F1 late POST acceptance: an abort or the total deadline reached while the ONE POST is outstanding → UNKNOWN even if a 204 arrives afterwards (immediately or delayed); still exactly ONE POST, never re-sent", async () => {
+  { const ac = new AbortController(); const m = mk({ script: { dispatch: async () => { ac.abort(); return reply(204); } } });
+    assert.deepEqual(await m.d(goodCall(), { signal: ac.signal }), { unknown: true, code: "POST_ABORTED_BEFORE_REPLY_ACCEPTED" }); assert.equal(m.ex.calls.length, 2); }
+  { const ac = new AbortController(); const m = mk({ script: { dispatch: () => new Promise((r) => { setTimeout(() => ac.abort(), 5); setTimeout(() => r(reply(204)), 20); }) } });
+    assert.deepEqual(await m.d(goodCall(), { signal: ac.signal }), { unknown: true, code: "POST_ABORTED_BEFORE_REPLY_ACCEPTED" }, "delayed 204 after abort"); }
+  { let t = 0; const m = mk({ now: () => t, script: { dispatch: async () => { t += OPEN.totalTimeoutMs; return reply(204); } } });
+    assert.deepEqual(await m.d(goodCall(), { signal: sig() }), { unknown: true, code: "POST_DEADLINE_BEFORE_REPLY_ACCEPTED" }); assert.equal(m.ex.calls.length, 2);
+    assert.equal((await m.d(goodCall(), { signal: sig() })).code, "TRANSPORT_SINGLE_USE"); assert.equal(m.ex.calls.length, 2); }
+  { let t = 0; const m = mk({ now: () => t, script: { dispatch: () => new Promise((r) => setTimeout(() => { t += OPEN.totalTimeoutMs + 1; r(reply(204)); }, 10)) } });
+    assert.equal((await m.d(goodCall(), { signal: sig() })).code, "POST_DEADLINE_BEFORE_REPLY_ACCEPTED", "delayed 204 past the deadline"); }
+  { const m = mk(); assert.deepEqual(await m.d(goodCall(), { signal: sig() }), { accepted: true }, "the normal 204 path is unchanged"); }
+});
+
+test("G12 C110-F2 descriptor-only snapshots: an accessor whose value flips after the GET (ROOT reproducer), accessor / hidden / symbol / extra / same-length-renamed / non-plain-prototype / throwing-proxy inputs or call → notSent with 0 credential reads, 0 network and NO getter invoked; frozen null-proto and transparent-proxy data are accepted; the config is snapshotted once at construction (a getter refuses; a proxy's later [[Get]] values are never used)", async () => {
+  const g = goodCall();
+  // ROOT reproducer: frozen object, enumerable getter for amount_minor that changes after the GET
+  { let changed = false; let getterCalls = 0; const i = { ...g.inputs };
+    Object.defineProperty(i, "amount_minor", { enumerable: true, get: () => { getterCalls += 1; return changed ? "14001" : "14000"; } }); Object.freeze(i);
+    const call = Object.freeze({ workflow: g.workflow, ref: g.ref, inputs: i });
+    const m = mk({ script: { getMain: async () => { changed = true; return reply(200, refJson()); } } });
+    assert.deepEqual(await m.d(call, { signal: sig() }), { notSent: true, code: "INPUTS_REFUSED" });
+    assert.deepEqual([getterCalls, m.creds(), m.ex.calls.length], [0, 0, 0], "no getter invoked, 0 credential, 0 network"); }
+  const withInputs = (i) => Object.freeze({ workflow: g.workflow, ref: g.ref, inputs: i });
+  const negatives = [];
+  { const i = { ...g.inputs }; Object.defineProperty(i, "zz_hidden", { enumerable: false, value: "x" }); negatives.push(["hidden key", withInputs(Object.freeze(i))]); }
+  { const i = { ...g.inputs, [Symbol("s")]: "x" }; negatives.push(["symbol key", withInputs(Object.freeze(i))]); }
+  { const i = {}; for (const k of WORKFLOW_INPUT_KEYS) i[k === "currency" ? "currencz" : k] = g.inputs[k]; negatives.push(["same-length rename", withInputs(Object.freeze(i))]); }
+  { class Bag {} const i = Object.assign(new Bag(), g.inputs); negatives.push(["class prototype", withInputs(Object.freeze(i))]); }
+  { const i = new Proxy(Object.freeze({ ...g.inputs }), { ownKeys() { throw new Error("trap"); } }); negatives.push(["throwing ownKeys trap", withInputs(i)]); }
+  { const i = new Proxy(Object.freeze({ ...g.inputs }), { getOwnPropertyDescriptor(t, k) { if (k === "amount_minor") throw new Error("trap"); return Reflect.getOwnPropertyDescriptor(t, k); } });
+    negatives.push(["throwing descriptor trap", withInputs(i)]); }
+  { let n = 0; const c = { workflow: g.workflow, ref: g.ref }; Object.defineProperty(c, "inputs", { enumerable: true, get: () => { n += 1; return g.inputs; } });
+    negatives.push(["accessor on call.inputs", Object.freeze(c)]); }
+  { const c = { workflow: g.workflow, ref: g.ref, inputs: g.inputs }; Object.defineProperty(c, "x", { enumerable: false, value: 1 }); negatives.push(["hidden call key", Object.freeze(c)]); }
+  for (const [label, call] of negatives) {
+    const m = mk(); const r = await m.d(call, { signal: sig() });
+    assert.equal(r.notSent, true, label); assert.match(r.code, /^(CALL_CONTRACT_REFUSED|INPUTS_REFUSED)$/, label); assert.deepEqual([m.creds(), m.ex.calls.length], [0, 0], label);
+  }
+  // a signal behind an accessor is refused too
+  { const m = mk(); const o = {}; Object.defineProperty(o, "signal", { enumerable: true, get: () => sig() }); assert.equal((await m.d(goodCall(), o)).code, "SIGNAL_ABSENT"); assert.equal(m.ex.calls.length, 0); }
+  // positive controls: null-prototype frozen data, a transparent proxy over frozen data
+  { const i = Object.freeze(Object.assign(Object.create(null), g.inputs)); const m = mk(); assert.deepEqual(await m.d(withInputs(i), { signal: sig() }), { accepted: true }, "null-proto data"); }
+  { const m = mk(); assert.deepEqual(await m.d(Object.freeze({ workflow: g.workflow, ref: g.ref, inputs: new Proxy(g.inputs, {}) }), { signal: sig() }), { accepted: true }, "transparent proxy"); }
+  // the config: a getter → CONFIG_REFUSED, 0 credential VALUE reads; a proxy's [[Get]] is never consulted (only its data descriptors)
+  { const c = { ...OPEN }; let n = 0; Object.defineProperty(c, "enabled", { enumerable: true, get: () => { n += 1; return true; } });
+    const m = mk({ constants: c }); assert.deepEqual(await m.d(goodCall(), { signal: sig() }), { notSent: true, code: "CONFIG_REFUSED" }); assert.deepEqual([n, m.creds(), m.ex.calls.length], [0, 0, 0]); }
+  { let gets = 0; const c = new Proxy({ ...OPEN }, { get(t, k) { gets += 1; return k === "expectedMainSha" ? CLOSED_MAIN : k === "enabled" ? false : Reflect.get(t, k); } });
+    const m = mk({ constants: c }); assert.deepEqual(await m.d(goodCall(), { signal: sig() }), { accepted: true }, "the construction snapshot (descriptors) decides"); assert.equal(gets, 0); }
+  { const c = { ...T.GITHUB_DISPATCH_CONSTANTS }; const m = mk({ constants: c }); c.enabled = true;   // mutated after construction: the snapshot (closed) holds
+    assert.deepEqual(await m.d(goodCall(), { signal: sig() }), { notSent: true, code: "TRANSPORT_CLOSED" }); assert.deepEqual([m.creds(), m.ex.calls.length], [0, 0]); }
+});
+
+test("G13 C110-F3 the exchange is a ONE-GET-then-ONE-POST capability: a direct POST, a POST after a failed GET, a second / concurrent POST, a third call and a GET after the POST are refused pre-socket (code only, never reset); the POST body is independently validated (fixed grammar, ref main, return false, exact 12 bound inputs) and the APPROVED private copy is sent even if the caller's Buffer is mutated", async () => {
+  const ok204 = (req) => respond(req, req.opts.method === "GET" ? 200 : 204, req.opts.method === "GET" ? { "content-type": "application/json" } : {}, req.opts.method === "GET" ? [refJson()] : []);
+  const spec = (o) => ({ kind: "dispatch", token: TOKEN, body, signal: sig(), timeoutMs: 1000, ...o });
+  const getSpec = { kind: "getMain", token: TOKEN, signal: sig(), timeoutMs: 1000 };
+  const codeOf = (p) => p.then((v) => v.status, (e) => e.code);
+  // ROOT reproducer: two direct POSTs on one instance
+  { const { primitive, log } = fakePrimitive(ok204); const ex = T.createGithubExchange({ primitive });
+    assert.deepEqual([await codeOf(ex(spec())), await codeOf(ex(spec()))], ["EXCHANGE_PHASE_REFUSED", "EXCHANGE_PHASE_REFUSED"]); assert.equal(log.requests.length, 0); }
+  // the one allowed sequence, then everything after it is refused
+  { const { primitive, log } = fakePrimitive(ok204); const ex = T.createGithubExchange({ primitive });
+    assert.equal(await codeOf(ex(getSpec)), 200); assert.equal(await codeOf(ex(spec())), 204);
+    assert.deepEqual([await codeOf(ex(spec())), await codeOf(ex(getSpec))], ["EXCHANGE_PHASE_REFUSED", "EXCHANGE_PHASE_REFUSED"]); assert.equal(log.requests.length, 2); }
+  // concurrent POSTs after the GET → ONE request
+  { const { primitive, log } = fakePrimitive(ok204); const ex = T.createGithubExchange({ primitive }); await ex(getSpec);
+    const r = await Promise.all([codeOf(ex(spec())), codeOf(ex(spec()))]); assert.deepEqual(r.sort(), [204, "EXCHANGE_PHASE_REFUSED"].sort()); assert.equal(log.requests.length, 2); }
+  // a failed / non-200 GET never unlocks the POST; a second GET is refused
+  for (const resp of [(req) => respond(req, 500, {}, ["{}"]), (req) => req.emit("error", new Error("x")), (req) => respond(req, 301, {})]) {
+    const { primitive, log } = fakePrimitive(resp); const ex = T.createGithubExchange({ primitive }); await codeOf(ex(getSpec));
+    assert.deepEqual([await codeOf(ex(spec())), await codeOf(ex(getSpec))], ["EXCHANGE_PHASE_REFUSED", "EXCHANGE_PHASE_REFUSED"]); assert.equal(log.requests.length, 1); }
+  // the body grammar (after a valid GET): every deviation → refused before a socket, and the instance is spent
+  const g = goodCall(); const enc = (o) => Buffer.from(JSON.stringify(o));
+  for (const [label, b] of [["empty inputs", enc({ ref: "main", inputs: {}, return_run_details: false })], ["ref dev", enc({ ref: "dev", inputs: g.inputs, return_run_details: false })],
+    ["return true", enc({ ref: "main", inputs: g.inputs, return_run_details: true })], ["no return flag", enc({ ref: "main", inputs: g.inputs })],
+    ["amount drift", enc({ ref: "main", inputs: { ...g.inputs, amount_minor: "14001" }, return_run_details: false })],
+    ["plan hash drift", enc({ ref: "main", inputs: { ...g.inputs, expected_plan_hash: "0".repeat(64) }, return_run_details: false })],
+    ["extra key", enc({ ref: "main", inputs: g.inputs, return_run_details: false, x: 1 })], ["key order", enc({ inputs: g.inputs, ref: "main", return_run_details: false })],
+    ["whitespace", Buffer.from(JSON.stringify({ ref: "main", inputs: g.inputs, return_run_details: false }, null, 1))], ["not a Buffer", JSON.stringify({ ref: "main" })]]) {
+    const { primitive, log } = fakePrimitive(ok204); const ex = T.createGithubExchange({ primitive }); await ex(getSpec);
+    assert.equal(await codeOf(ex(spec({ body: b }))), "EXCHANGE_INPUT_INVALID", label); assert.equal(log.requests.length, 1, `${label}: no POST socket`);
+    assert.equal(await codeOf(ex(spec())), "EXCHANGE_PHASE_REFUSED", `${label}: never reset for a retry`);
+  }
+  // the approved private copy is what goes on the wire, even if the caller's Buffer is mutated right after the call
+  { const { primitive, log } = fakePrimitive(ok204); const ex = T.createGithubExchange({ primitive }); await ex(getSpec);
+    const mine = Buffer.from(body); const p = ex(spec({ body: mine })); mine.fill(0x20); assert.equal(await codeOf(p), 204);
+    assert.ok(log.requests[1].written.equals(body)); assert.notEqual(log.requests[1].written, mine); }
 });
