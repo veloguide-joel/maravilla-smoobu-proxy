@@ -144,7 +144,7 @@ test("G6 cancellation: aborted DURING the GET whose result arrives LATE → notS
 });
 
 test("G7 the credential: read once, only after the gate / config / contract / signal pass; a throwing getter or a malformed value → notSent, 0 network; it is never echoed in any result", async () => {
-  for (const [label, credential, code] of [["throws", () => { throw new Error("vault down"); }, "CREDENTIAL_UNAVAILABLE"], ["empty", () => "", "CREDENTIAL_INVALID"],
+  for (const [label, credential, code] of [["throws", () => { throw new Error("vault down"); }, "CREDENTIAL_UNAVAILABLE"], ["empty", () => "", "CREDENTIAL_EMPTY"],
     ["whitespace", () => `${TOKEN} `, "CREDENTIAL_INVALID"], ["newline", () => `${TOKEN}\nX-Evil: 1`, "CREDENTIAL_INVALID"], ["number", () => 42, "CREDENTIAL_INVALID"]]) {
     const m = mk({ credential }); assert.deepEqual(await m.d(goodCall(), { signal: sig() }), { notSent: true, code }, label); assert.equal(m.ex.calls.length, 0, label);
   }
@@ -349,4 +349,44 @@ test("G14 C111 explicit construction-time release binding: { expectedMainSha } r
     assert.equal((await m.d(call, { signal: sig() })).code, "CALL_CONTRACT_REFUSED"); assert.equal(m.ex.calls.length, 0); }
   { const m = T.createGithubWorkflowDispatch({ credential: () => TOKEN, constants: T.GITHUB_DISPATCH_CONSTANTS, exchange: fakeEx(), releaseBinding: { expectedMainSha: REL } });
     assert.deepEqual(await m(goodCall(), { signal: sig() }), { notSent: true, code: "TRANSPORT_CLOSED" }, "a binding never opens a closed transport"); }
+});
+
+// ---- C112 F1: GitHub built-in token shapes (synthetic, shape-only; never a credential, never decoded) ----
+const seg = (n, salt) => Array.from({ length: n }, (_, i) => "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_"[(i * 7 + salt) % 38]).join("");
+/** the stateless format: a ghs_-prefixed JWT-shaped string, ~520 chars, two dots, base64url hyphens / underscores (synthetic bytes) */
+const NEW_TOKEN = `ghs_${seg(36, 1)}.${seg(380, 3)}.${seg(98, 5)}`;
+const CLASSIC_GHS = `ghs_${seg(36, 2).replace(/-/g, "x")}`;
+test("G15 C112-F1 token shapes: classic opaque AND the stateless ghs_ JWT-shaped GITHUB_TOKEN are accepted end-to-end through the REAL exchange (fake https) with the exact Bearer header; empty / non-string / whitespace / CR / LF / tab / NUL / unicode / standard-base64 '+' '/' '=' / dots outside ghs_ / oversize → notSent pre-network with a typed code and NO value-derived detail", async () => {
+  assert.ok(NEW_TOKEN.length > 500 && NEW_TOKEN.length < 600 && NEW_TOKEN.split(".").length === 3 && /-/.test(NEW_TOKEN) && /_/.test(NEW_TOKEN.slice(4)));
+  for (const tok of [TOKEN, CLASSIC_GHS, NEW_TOKEN, `ghs_${"a".repeat(36)}`, `ghs_${"a-b.c_".repeat(340)}`.slice(0, T.TOKEN_MAX_LENGTH)]) {
+    assert.equal(T.githubTokenRefusal(tok), null, `accepted (len ${tok.length})`);
+    const { primitive, log } = fakePrimitive((req) => respond(req, req.opts.method === "GET" ? 200 : 204, req.opts.method === "GET" ? { "content-type": "application/json" } : {},
+      req.opts.method === "GET" ? [refJson()] : []));
+    const m = mk({ token: tok, ex: T.createGithubExchange({ primitive }) });
+    assert.deepEqual(await m.d(goodCall(), { signal: sig() }), { accepted: true });
+    assert.equal(log.requests.length, 2); assert.ok(log.requests.every((r) => r.opts.headers.Authorization === `Bearer ${tok}`), "exact Bearer header, token passed through opaquely");
+    assert.equal(m.creds(), 1);
+  }
+  const bad = [["empty", "", "CREDENTIAL_EMPTY"], ["number", 42, "CREDENTIAL_INVALID"], ["null", null, "CREDENTIAL_INVALID"],
+    ["space", `${NEW_TOKEN} `, "CREDENTIAL_INVALID"], ["CRLF", `${NEW_TOKEN}\r\nX-Evil: 1`, "CREDENTIAL_INVALID"], ["LF", `ghs_${seg(40, 1)}\nx`, "CREDENTIAL_INVALID"],
+    ["tab", `ghs_${seg(40, 1)}\t`, "CREDENTIAL_INVALID"], ["NUL", `ghs_${seg(40, 1)}\u0000`, "CREDENTIAL_INVALID"], ["unicode", `ghs_${seg(40, 1)}é`, "CREDENTIAL_INVALID"],
+    ["plus", `ghs_${seg(40, 1)}+`, "CREDENTIAL_INVALID"], ["slash", `ghs_${seg(40, 1)}/`, "CREDENTIAL_INVALID"], ["equals", `ghs_${seg(40, 1)}=`, "CREDENTIAL_INVALID"],
+    ["dots without ghs_", `gho_${seg(40, 1)}.${seg(40, 2)}`, "CREDENTIAL_INVALID"], ["hyphen without ghs_", `abc-${"a".repeat(30)}`, "CREDENTIAL_INVALID"],
+    ["ghs_ too short with dot", "ghs_ab.cd", "CREDENTIAL_INVALID"], ["oversize", `ghs_${"a".repeat(T.TOKEN_MAX_LENGTH)}`, "CREDENTIAL_INVALID"],
+    ["classic too short", "a".repeat(19), "CREDENTIAL_INVALID"], ["Bearer prefix", `Bearer ${TOKEN}`, "CREDENTIAL_INVALID"]];
+  for (const [label, tok, code] of bad) {
+    assert.equal(T.githubTokenRefusal(tok), code, label);
+    const { primitive, log } = fakePrimitive(() => { throw new Error("no request may be made"); });
+    const m = mk({ credential: () => tok, ex: T.createGithubExchange({ primitive }) });
+    const r = await m.d(goodCall(), { signal: sig() });
+    assert.deepEqual(r, { notSent: true, code }, label); assert.equal(log.requests.length, 0, label);
+    assert.deepEqual(Object.keys(r).sort(), ["code", "notSent"]);
+  }
+  // the exchange layer refuses an unsupported shape on its own (defence in depth), pre-socket, code only
+  for (const tok of ["", `${NEW_TOKEN}\r\n`, `ghs_${"a".repeat(T.TOKEN_MAX_LENGTH)}`]) {
+    const { primitive, log } = fakePrimitive(() => { throw new Error("no request may be made"); });
+    const ex = T.createGithubExchange({ primitive });
+    await assert.rejects(ex({ kind: "getMain", token: tok, signal: sig(), timeoutMs: 1000 }), (e) => e.code === "EXCHANGE_INPUT_INVALID" && (tok === "" || !String(e.message).includes(tok.slice(0, 8))));
+    assert.equal(log.requests.length, 0);
+  }
 });
