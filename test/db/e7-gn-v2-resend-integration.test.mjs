@@ -583,8 +583,12 @@ test("P8 migration 0023: refused down while Resend evidence exists (audit + sche
   try {
     const s0 = await schema(own); const a0 = await audit(own);
     assert.match((await pgErr(() => migrateDown(own, { env: "test", to: 22 }))).message, /^MIGRATION_0023_DOWN_REFUSED/);
-    assert.deepEqual(await history(own), [range(1, TOP), []]);
-    assert.equal(await audit(own), a0, "provider evidence byte-equal"); assert.deepEqual(await schema(own), s0);
+    // C107: migrations above 0023 with no evidence of their own here (0024: no claimed kickoff request in this suite's database) roll back
+    // mechanically first, each in its own transaction; then 0023 refuses. The exact history is asserted and the top restored (C45 convention).
+    assert.deepEqual(await history(own), [range(1, 23), TOP > 23 ? range(24, TOP) : []]);
+    assert.equal(await audit(own), a0, "provider evidence byte-equal");
+    assert.deepEqual(await migrateUp(own, { env: "test" }), TOP > 23 ? range(24, TOP) : []);
+    assert.deepEqual(await history(own), [range(1, TOP), []]); assert.deepEqual(await schema(own), s0);
   } finally { await own.end(); }
   // (2) a separate disposable cluster (only a gn-v1 render, TEST SETUP) vs a forward-built 22
   const m = await startMigratedDatabase(); const f22 = await startPostgres();
@@ -620,8 +624,10 @@ test("P8 migration 0023: refused down while Resend evidence exists (audit + sche
     await plant("gn-v2");
     const a1 = await audit(admin); const s1 = await schema(admin);
     assert.match((await pgErr(() => migrateDown(admin, { env: "test", to: 22 }))).message, /^MIGRATION_0023_DOWN_REFUSED/);
-    assert.deepEqual(await history(admin), [range(1, TOP), []]);
-    assert.equal(await audit(admin), a1); assert.deepEqual(await schema(admin), s1);
+    assert.deepEqual(await history(admin), [range(1, 23), TOP > 23 ? range(24, TOP) : []]);   // C107: 0024 rolled back first (no claimed request)
+    assert.equal(await audit(admin), a1);
+    assert.deepEqual(await migrateUp(admin, { env: "test" }), TOP > 23 ? range(24, TOP) : []);
+    assert.deepEqual(await history(admin), [range(1, TOP), []]); assert.deepEqual(await schema(admin), s1);
   } finally { await admin.end(); await c22.end(); f22.stop(); await m.close(); }
   assert.equal(netAttempts, 0, "no network attempt in the whole suite");
 });
