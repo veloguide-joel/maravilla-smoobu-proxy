@@ -48,12 +48,12 @@ export const CATALOG_PINS = deepFreeze({                         // derived from
 export const CONSTANTS = deepFreeze({
   executeEnabled: false,                                           // SHIPPED CLOSED: verify / execute refuse HKO_EXECUTE_CLOSED from key names only
   dispatchEnabled: false,                                          // SHIPPED CLOSED: the core refuses HKO_DISPATCH_CLOSED before any DB acquisition
-  toolingCommit: "c98e8b965a5556b664606110c125bf74166c2903",       // e7-test PR #145 head (C111 release binding) — DRAFT, unmerged; ROOT repins after merge
-  toolingStatus: "DRAFT_UNMERGED",                                 // verify / execute refuse HKO_CLOSURE_MISMATCH unless MERGED
+  toolingCommit: "8af49e87149ed7ed83d212714b1f1d173e08c189",       // e7-test #145 MERGE commit (C111 release binding); tree d19b15d6 == the reviewed #145 head c98e8b96
+  toolingStatus: "MERGED",                                         // verify / execute refuse HKO_CLOSURE_MISMATCH unless MERGED
   closure: ["lib/booking-db/codec.js", "lib/booking-db/config.js", "lib/booking-db/pipeline-dispatch-transport.js", "lib/booking-db/pipeline-kickoff.js",
     "lib/booking-db/pool.js", "lib/booking-db/repo.js", "lib/checkout/intent-state.js", "lib/checkout/pipeline-kickoff-plan.js",
     "package-lock.json", "package.json", "scripts/e7-connected/probe-env-preflight.mjs"],
-  closureDigest: "4c2a57bde2bb9b073b1b4e443288448aeb96d1f9f96a93412e58149d14e00d2e",   // framed SHA-256 of `closure` at c98e8b96 (the test recomputes it from the pinned tree + an independent import scan)
+  closureDigest: "4c2a57bde2bb9b073b1b4e443288448aeb96d1f9f96a93412e58149d14e00d2e",   // framed SHA-256 of `closure` at 8af49e87 (identical to the reviewed c98e8b96 bytes) (the test recomputes it from the pinned tree + an independent import scan)
   pipeline: {                                                       // the reviewed C102 ENABLE revision the dispatch targets (9455bc9e)
     runnerFiles: ["scripts/e7-hosted-pipeline.mjs", "test/e7-hosted-pipeline.test.mjs", "test/e7-hosted-pipeline-workflow.test.mjs", ".github/workflows/e7-hosted-pipeline.yml"],
     sourcePrefix: "e7-hosted-pipeline-v1\n",

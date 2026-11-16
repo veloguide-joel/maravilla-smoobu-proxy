@@ -30,7 +30,7 @@ const [K, T, PL, C1] = await Promise.all([tool("lib/booking-db/pipeline-kickoff.
 after(() => { assert.deepEqual(GUARD, { request: 0, Agent: 0, fetch: 0 }, "no real network primitive was touched"); });
 
 const C = E.CONSTANTS;
-const TOOL_PIN = "c98e8b965a5556b664606110c125bf74166c2903";
+const TOOL_PIN = "8af49e87149ed7ed83d212714b1f1d173e08c189";
 const PROC = { versions: { node: "22.22.0" }, platform: "linux", execArgv: [], getuid: () => 1000 };
 const SHA_A = "a".repeat(40); const SHA_B = "b".repeat(40);
 const IID = "11111111-2222-4333-8444-555555555555"; const PI = "pi_3FakeKickoff0001"; const REF = "MV-FAKE0001";
@@ -56,7 +56,7 @@ const realEnv = (over = {}) => ({ E7_TOOLING_DIR: TOOLING, E7_INTENT_ID: IID, E7
   E7_WORKFLOW_SHA: SHA_A, GITHUB_SHA: SHA_A, GITHUB_REF: "refs/heads/main", E7_RUN_ID: "123456-1", ...over });
 
 test("H1 SHIPPED CLOSED: executeEnabled / dispatchEnabled FALSE; verify and execute refuse HKO_EXECUTE_CLOSED from KEY NAMES only — 0 env value reads, 0 import / spawn / head / pg / CA / core", async () => {
-  assert.equal(C.executeEnabled, false); assert.equal(C.dispatchEnabled, false); assert.equal(C.toolingStatus, "DRAFT_UNMERGED"); assert.equal(C.toolingCommit, TOOL_PIN);
+  assert.equal(C.executeEnabled, false); assert.equal(C.dispatchEnabled, false); assert.equal(C.toolingStatus, "MERGED"); assert.equal(C.toolingCommit, TOOL_PIN);
   for (const mode of ["verify", "execute"]) {
     const { env, reads } = namesOnly(["E7_TOOLING_DIR", "E7_INTENT_ID", "E7_DEV_BOOKING_DATABASE_URL", "E7_DISPATCH_TOKEN", "GITHUB_SHA"]);
     const r = await E.runHosted({ mode, env, proc: PROC, wrapperDir: ROOT, deps: TRAPS });
@@ -143,7 +143,7 @@ test("H6 verify / execute ORDER (open seam constants): not MERGED / no inputs / 
     const base = (over = {}) => realEnv({ E7_EXPECTED_SOURCE_DIGEST: src, ...over });
     const head = async () => SHA_A;
     const cases = [
-      ["not merged", "verify", base(), { ...C, executeEnabled: true }, "HKO_CLOSURE_MISMATCH"],
+      ["not merged (seam)", "verify", base(), { ...C, executeEnabled: true, toolingStatus: "DRAFT_UNMERGED" }, "HKO_CLOSURE_MISMATCH"],
       ["no inputs", "verify", { E7_TOOLING_DIR: TOOLING, E7_EXPECTED_SOURCE_DIGEST: src, E7_RUN_ID: "123456-1", GITHUB_REF: "refs/heads/main" }, bc, "HKO_INPUT_INCOMPLETE"],
       ["partial", "verify", base({ E7_AMOUNT_MINOR: "" }), bc, "HKO_INPUT_INCOMPLETE"],
       ["bad PI", "verify", base({ E7_PAYMENT_INTENT_ID: "ch_x" }), bc, "HKO_INPUT_INVALID"],
