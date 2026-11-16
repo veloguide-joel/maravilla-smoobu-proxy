@@ -125,13 +125,14 @@ const expectedDigest = async () => {
   const mine = h.digest("hex"); assert.equal(mine, await R.framedDigest(ROOT, FILES, PREFIX), "shell frame == the runner's framedDigest"); return mine;
 };
 
-test("W6 preflight bindings block executed locally: passes only with HEAD == dispatch SHA, tooling == pin and a known mode", () => {
+test("W6 preflight bindings block executed locally: passes only with HEAD == dispatch SHA, tooling == pin and a known mode (C113: incl. detect — run 43929404455 refused it); unknown / empty modes refuse", () => {
   assert.equal(toolSha, PIN, "E7_TOOLING_DIR must be the pinned 4e79f266 checkout");
   const d = sandbox(); try {
     const bind = runBlock("Verify checkout bindings (wrapper HEAD == dispatch SHA; tooling HEAD == pin; no secrets)");
-    for (const mode of ["preflight", "verify", "execute"]) { const ok = sh(bind, { E7_WORKFLOW_SHA: headSha, E7_TOOLING_PIN: PIN, E7_MODE: mode }, d); assert.equal(ok.status, 0, ok.out); }
+    for (const mode of ["preflight", "verify", "execute", "detect"]) { const ok = sh(bind, { E7_WORKFLOW_SHA: headSha, E7_TOOLING_PIN: PIN, E7_MODE: mode }, d); assert.equal(ok.status, 0, ok.out); }
     for (const [env, why] of [[{ E7_WORKFLOW_SHA: "0".repeat(40), E7_TOOLING_PIN: PIN, E7_MODE: "preflight" }, /wrapper HEAD != dispatch SHA/],
-      [{ E7_WORKFLOW_SHA: headSha, E7_TOOLING_PIN: "1".repeat(40), E7_MODE: "preflight" }, /tooling HEAD != pin/], [{ E7_WORKFLOW_SHA: headSha, E7_TOOLING_PIN: PIN, E7_MODE: "dispatch" }, /REFUSED: mode/]]) {
+      [{ E7_WORKFLOW_SHA: headSha, E7_TOOLING_PIN: "1".repeat(40), E7_MODE: "preflight" }, /tooling HEAD != pin/], [{ E7_WORKFLOW_SHA: headSha, E7_TOOLING_PIN: PIN, E7_MODE: "dispatch" }, /REFUSED: mode/],
+      [{ E7_WORKFLOW_SHA: headSha, E7_TOOLING_PIN: PIN, E7_MODE: "" }, /REFUSED: mode/], [{ E7_WORKFLOW_SHA: headSha, E7_TOOLING_PIN: PIN, E7_MODE: "detect;true" }, /REFUSED: mode/]]) {
       const r = sh(bind, env, d); assert.deepEqual([r.status, why.test(r.out)], [3, true], r.out);
     }
   } finally { rmSync(d, { recursive: true, force: true }); }
