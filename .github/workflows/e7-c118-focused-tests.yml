@@ -1,4 +1,4 @@
-# C118 / N1 (PR #188, DRAFT) — FOCUSED TEST EVIDENCE ONLY. Runs the 20 C118 DB cases plus the affected status / page / API suites against a
+# C118 / N1 (PR #188) + the 0027 apply packet — FOCUSED TEST EVIDENCE ONLY. Runs the 20 C118 DB cases plus the affected status / page / API suites against a
 # DISPOSABLE localhost PostgreSQL (16 and 17) that each test creates and deletes itself (test/db/harness.mjs). Synthetic fixtures and
 # in-memory fake provider exchanges only: no secrets, no environment, no provider credentials, no shared database, no deploy.
 # Outside every runtime source frame (nothing under lib/ scripts/ api/ public/ reads it). contents: read only.
@@ -13,6 +13,10 @@ on:
       - "test/e7-checkout-test-page.test.mjs"
       - "test/e7-c98-booking-progress.test.mjs"
       - ".github/workflows/e7-c118-focused-tests.yml"
+      - "claude/e7-0027-*"
+      - "claude/gen-0027-wrapper.py"
+      - "claude/derive-0027-pins.mjs"
+      - "test/db/e7-0027-*"
   workflow_dispatch:
 permissions:
   contents: read
@@ -60,3 +64,4 @@ jobs:
           test/db/e7-c118-external-cancellation.test.mjs test/db/e7-c118-notification-worker.test.mjs
           test/db/e6-intent-api.test.mjs test/db/e7-c98-booking-progress-api.test.mjs
           test/db/e7-checkout-test-page-integration.test.mjs test/db/e7-checkout-test-release.test.mjs
+          test/db/e7-0027-sqleditor-apply-wrapper.test.mjs
