@@ -1,5 +1,5 @@
 // scripts/e7-hosted-booking-confirmation.mjs — E7 C50: HOSTED gn-v2 BOOKING-CONFIRMATION runner for ONE bound TEST guest.notify operation, around the
-// ALREADY ACCEPTED tooling (e7-test d7e39ae3 = C116 #178 draft head: the recipient-only simulation-sink scope + migration 0025; C55 pin was 46b3eaf8; C54 #120 added lib/notify/sender-identity.js): lib/booking-db/notification-worker.js (gn-v2 opt-in + branded Resend provider opt-in, C41 / C45),
+// ALREADY ACCEPTED tooling (e7-test 9b7a96bf = C116 #178 merged (reviewed head d7e39ae3, tree 40dbe13f): the recipient-only simulation-sink scope + migration 0025; C55 pin was 46b3eaf8; C54 #120 added lib/notify/sender-identity.js): lib/booking-db/notification-worker.js (gn-v2 opt-in + branded Resend provider opt-in, C41 / C45),
 // lib/checkout/booking-confirmation-request.js (gn-v2 builder), lib/notify/resend-notification-executor.js (branded executor) and
 // scripts/e7-resend/resend-exchange.mjs (the reviewed single-use HTTPS exchange), with the schema-23 typed receipts (0023) on the reviewed schema 25. Nothing here re-implements the worker.
 //
@@ -45,14 +45,14 @@ function deepFreeze(v) { if (v && typeof v === "object") { for (const k of Objec
 const CATALOG_PIN_25 = {"catalog":"5406ae74e87ae74d1438052225ae88c280494dda0d9e0bb89a667c6a2eb908f4","readPath":"31f23b641bb57d5cbdec1aa4896447a574190dd057e4b92e6c5fdf8326220baf","readPathCount":6,"sections":{"con":"550534b1daca47fc1df90a557d5dd28a7f6e1f1df11c581cdbd7a671eb95c188","col":"9d645f671980c7a2e0e679aa07d9a3c30a937e488236f132b589a0a162237fbe","fn":"c94fa4c11e95e593ba55c095267f08088d6780dbcff8994a148c3a9c3ef27d4e","pol":"7c69ad5c06cae91f06e96c8ac9d86d97dbc09e94d95a8afb399b141162ee83ee","rel":"359796c40820562166a4f10dce97ae433fe7ae53c5fd2b3385fc41f179437e89","trg":"13e79df7b90097f365a7f3f15337e58c7b7d5277378608fd482c77e2051982f5"}};
 
 export const CONSTANTS = deepFreeze({
-  toolingCommit: "d7e39ae327e4740e4c90dd71b3f9b89ab9686db1",          // C116: e7-test #178 DRAFT HEAD (sink recipient scope + 0025); REPIN to its merge SHA before review. C55 pin was 46b3eaf8
-  toolingStatus: "DRAFT_HEAD",
+  toolingCommit: "9b7a96bfe9dcc702b8389129cf4191032e716aaf",          // C116: e7-test #178 merge commit (tree 40dbe13f == reviewed head d7e39ae3; sink recipient scope + 0025). C55 pin was 46b3eaf8
+  toolingStatus: "MERGED",
   executeEnabled: false,                                                // SHIPPED CLOSED: verify / execute refuse NBC_EXECUTE_CLOSED before any import / secret / DB / provider
-  // the INDEPENDENTLY scanned transitive relative imports of the five runtime roots at d7e39ae3 (+ package files); bare imports: node:* and pg only
+  // the INDEPENDENTLY scanned transitive relative imports of the five runtime roots at 9b7a96bf (+ package files); bare imports: node:* and pg only
   closure: ["lib/booking-db/notification-worker.js", "lib/booking-db/pool.js", "lib/checkout/booking-confirmation-copy.js", "lib/checkout/booking-confirmation-request.js",
     "lib/checkout/guest-notification.js", "lib/notify/resend-notification-executor.js", "lib/notify/sender-identity.js", "package-lock.json", "package.json", "scripts/e7-connected/probe-env-preflight.mjs",
     "scripts/e7-resend/resend-exchange.mjs"],
-  closureDigest: "6f02ce24f92dc0ef4a4d4bbe22adc4203f15f7ec64f36909dd0b1a8d2bd55d06",   // C116: framed SHA-256 of `closure` at d7e39ae3 (was 4203b451… at 46b3eaf8; only the three C116 files changed) (the test recomputes it from the pinned tree + an independent import scan)
+  closureDigest: "6f02ce24f92dc0ef4a4d4bbe22adc4203f15f7ec64f36909dd0b1a8d2bd55d06",   // C116: framed SHA-256 of `closure` at 9b7a96bf (== d7e39ae3 bytes) (was 4203b451… at 46b3eaf8; only the three C116 files changed) (the test recomputes it from the pinned tree + an independent import scan)
   pgVersion: "8.18.0",
   runnerFiles: ["scripts/e7-hosted-booking-confirmation.mjs", "test/e7-hosted-booking-confirmation.test.mjs", "test/e7-hosted-booking-confirmation-workflow.test.mjs",
     ".github/workflows/e7-hosted-booking-confirmation.yml"],
