@@ -1,0 +1,571 @@
+{
+  "schema": "e7-0025-0026-pins-v1",
+  "inventorySql": "b911b4d543dcf180136b3da791a69c16154e137bd0fe40c6589f4a65402d91ed",
+  "derivedOnPg": "16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)",
+  "files": {
+    "up25": "160127cf57c65a7d370515c3a5a48384fa4061b03358d3c2ec5d8c72ca4612c3",
+    "down25": "16b392c60b53a95bca5fba39219fe86991eaa498ae0fab10ebdefd7914cfde6f",
+    "name25": "gn_sink_recipient_scope",
+    "up26": "4ad443e635b716a73bd22bd99c3e04cd5781d8a8aeef4fb2fa596e380fc58528",
+    "down26": "5d3f5219fb561d242c6119794d0cb43883e38da07c89945325bfa724f980ece0",
+    "name26": "pipeline_kickoff_source_rebind"
+  },
+  "tables": [
+    "api_rate_limits",
+    "definite_refusal_codes",
+    "external_operations",
+    "hostaway_reservation_attempts",
+    "instance",
+    "intent_applied_events",
+    "intent_guests",
+    "intent_transitions",
+    "intent_work",
+    "intents",
+    "inventory_claims",
+    "notification_latches",
+    "notification_provider_receipts",
+    "notification_renders",
+    "notification_suppressions",
+    "notification_write_authority",
+    "payment_attempts",
+    "payment_ledger",
+    "payment_refunds",
+    "pipeline_kickoff_requests",
+    "provider_evidence",
+    "reconciliation_cases",
+    "reconciliation_resolutions",
+    "recording_assessment_codes",
+    "recording_assessments",
+    "recording_claim_assessments",
+    "recording_conflict_inbox",
+    "recording_hold_decisions",
+    "recording_hold_observations",
+    "recording_holds",
+    "stripe_webhook_events"
+  ],
+  "addedColumns": {},
+  "newTables": [],
+  "kickoffCatalogPre": {
+    "functions": [
+      {
+        "sig": "booking.claim_pipeline_kickoff(uuid,text,text,jsonb)",
+        "src": "ede022a83e0869ec2194470665cab759",
+        "secdef": true,
+        "vol": "v",
+        "cfg": "search_path=pg_catalog, booking",
+        "acl": "mv_booking_app:EXECUTE"
+      },
+      {
+        "sig": "booking.refuse_pipeline_kickoff(uuid,text)",
+        "src": "fe1b6c137b618527bd5d03b7944e212a",
+        "secdef": true,
+        "vol": "v",
+        "cfg": "search_path=pg_catalog, booking",
+        "acl": "mv_booking_app:EXECUTE"
+      },
+      {
+        "sig": "booking.settle_pipeline_kickoff(uuid,text,text,text)",
+        "src": "35ec51fa266e024de510073414d6e307",
+        "secdef": true,
+        "vol": "v",
+        "cfg": "search_path=pg_catalog, booking",
+        "acl": "mv_booking_app:EXECUTE"
+      },
+      {
+        "sig": "booking.pipeline_kickoff_record()",
+        "src": "f2df109c551f28799a5d107547c90ebc",
+        "secdef": true,
+        "vol": "v",
+        "cfg": "search_path=pg_catalog, booking",
+        "acl": ""
+      },
+      {
+        "sig": "booking.pipeline_kickoff_refusal(booking.intents,booking.pipeline_kickoff_requests)",
+        "src": "1616ea311e3da7261bc308ac64293d6c",
+        "secdef": true,
+        "vol": "s",
+        "cfg": "search_path=pg_catalog, booking",
+        "acl": ""
+      },
+      {
+        "sig": "booking.pipeline_kickoff_excluded(uuid)",
+        "src": "279b1c33d03002d21757c5848056db1a",
+        "secdef": false,
+        "vol": "i",
+        "cfg": "search_path=pg_catalog",
+        "acl": ""
+      },
+      {
+        "sig": "booking.pipeline_kickoff_guard()",
+        "src": "01d5d885bcde5cb2f7d0f67aee53fdf9",
+        "secdef": false,
+        "vol": "v",
+        "cfg": "search_path=pg_catalog, booking",
+        "acl": ""
+      }
+    ],
+    "table": {
+      "rls": true,
+      "sel": true,
+      "ins": false,
+      "upd": false,
+      "del": false,
+      "trg": 1
+    }
+  },
+  "kickoffCatalogPins": {
+    "functions": [
+      {
+        "sig": "booking.claim_pipeline_kickoff(uuid,text,text,jsonb)",
+        "src": "fb103173762c5dc6565338d2a15dd067",
+        "secdef": true,
+        "vol": "v",
+        "cfg": "search_path=pg_catalog, booking",
+        "acl": "mv_booking_app:EXECUTE"
+      },
+      {
+        "sig": "booking.refuse_pipeline_kickoff(uuid,text)",
+        "src": "fe1b6c137b618527bd5d03b7944e212a",
+        "secdef": true,
+        "vol": "v",
+        "cfg": "search_path=pg_catalog, booking",
+        "acl": "mv_booking_app:EXECUTE"
+      },
+      {
+        "sig": "booking.settle_pipeline_kickoff(uuid,text,text,text)",
+        "src": "35ec51fa266e024de510073414d6e307",
+        "secdef": true,
+        "vol": "v",
+        "cfg": "search_path=pg_catalog, booking",
+        "acl": "mv_booking_app:EXECUTE"
+      },
+      {
+        "sig": "booking.pipeline_kickoff_record()",
+        "src": "f2df109c551f28799a5d107547c90ebc",
+        "secdef": true,
+        "vol": "v",
+        "cfg": "search_path=pg_catalog, booking",
+        "acl": ""
+      },
+      {
+        "sig": "booking.pipeline_kickoff_refusal(booking.intents,booking.pipeline_kickoff_requests)",
+        "src": "1616ea311e3da7261bc308ac64293d6c",
+        "secdef": true,
+        "vol": "s",
+        "cfg": "search_path=pg_catalog, booking",
+        "acl": ""
+      },
+      {
+        "sig": "booking.pipeline_kickoff_excluded(uuid)",
+        "src": "279b1c33d03002d21757c5848056db1a",
+        "secdef": false,
+        "vol": "i",
+        "cfg": "search_path=pg_catalog",
+        "acl": ""
+      },
+      {
+        "sig": "booking.pipeline_kickoff_guard()",
+        "src": "01d5d885bcde5cb2f7d0f67aee53fdf9",
+        "secdef": false,
+        "vol": "v",
+        "cfg": "search_path=pg_catalog, booking",
+        "acl": ""
+      }
+    ],
+    "table": {
+      "rls": true,
+      "sel": true,
+      "ins": false,
+      "upd": false,
+      "del": false,
+      "trg": 1
+    }
+  },
+  "notificationCatalogPin": {
+    "catalog": "47b1d904a25cde0f4f9f85b8554b93cd914364d70ef1091cb273ce68043379da",
+    "readPath": "31f23b641bb57d5cbdec1aa4896447a574190dd057e4b92e6c5fdf8326220baf",
+    "readPathCount": 6,
+    "sections": {
+      "con": "550534b1daca47fc1df90a557d5dd28a7f6e1f1df11c581cdbd7a671eb95c188",
+      "col": "9d645f671980c7a2e0e679aa07d9a3c30a937e488236f132b589a0a162237fbe",
+      "fn": "501f34f7f4db9a5a5fb98c00046013a7904745faea78cd731bbafa23ddf8fb7c",
+      "pol": "7c69ad5c06cae91f06e96c8ac9d86d97dbc09e94d95a8afb399b141162ee83ee",
+      "rel": "359796c40820562166a4f10dce97ae433fe7ae53c5fd2b3385fc41f179437e89",
+      "trg": "13e79df7b90097f365a7f3f15337e58c7b7d5277378608fd482c77e2051982f5"
+    }
+  },
+  "runners": {
+    "mainCommit": "adacbdad5aad0f28c7d1ce4e6ac10a0abe657eb1",
+    "mainTree": "601fb09191989f8f6cb9f866eef4c9c70025bb75",
+    "kickoff": {
+      "path": "scripts/e7-hosted-kickoff.mjs",
+      "sha256": "5d7ffd39af6a997534e17141dd36d73cb996845bb1475e4658e16994ff20ea74",
+      "export": "CATALOG_PINS"
+    },
+    "notification": {
+      "path": "scripts/e7-hosted-booking-confirmation.mjs",
+      "sha256": "9842aaa776eb319448a0e5bd1cf0d87e81744ec4165b53dae172090dc14945b5",
+      "export": "CONSTANTS.catalogPin26"
+    }
+  },
+  "pre": {
+    "rls": "50911c6a23c17806cf720729c1b47da160823fa03e9a8379d0e2ffa29e6fd4a8",
+    "acls": {
+      "booking.is_privileged()": [
+        "mv_booking_admin=X/postgres",
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.reject_change()": [
+        "mv_booking_admin=X/postgres",
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.is_intent_state(s text)": [
+        "mv_booking_admin=X/postgres",
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.pipeline_kickoff_guard()": [
+        "postgres=X/postgres"
+      ],
+      "booking.pipeline_kickoff_record()": [
+        "postgres=X/postgres"
+      ],
+      "booking.gn_recipient_in_scope(p_email text)": [
+        "postgres=X/postgres"
+      ],
+      "booking.notification_provider_receipt_binding()": [
+        "postgres=X/postgres"
+      ],
+      "booking.pipeline_kickoff_excluded(p_intent uuid)": [
+        "postgres=X/postgres"
+      ],
+      "booking.refuse_pipeline_kickoff(p_intent uuid, p_code text)": [
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.guest_notification_presend(p_op uuid, p_worker text)": [
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.pipeline_kickoff_refusal(i booking.intents, r booking.pipeline_kickoff_requests)": [
+        "postgres=X/postgres"
+      ],
+      "booking.settle_pipeline_kickoff(p_intent uuid, p_worker text, p_outcome text, p_code text)": [
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.claim_pipeline_kickoff(p_intent uuid, p_worker text, p_plan_hash text, p_inputs jsonb)": [
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.complete_guest_notification_resend(p_op uuid, p_worker text, p_kind text, p_provider_message_id uuid, p_replayed boolean, p_code text)": [
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.claim_guest_notification_v2(p_op uuid, p_worker text, p_locale text, p_content_hash text, p_expected_facts_hash text, p_expected_recipient_hash text)": [
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ]
+    },
+    "columns": "e7398e75931966b992b576c8d4ef2d1f4ac48d2dba7eaf118a1ed7602e96d8c7",
+    "indexes": "a5fa045f676a397d50e3e84110f9917a588509bdb97e8410cff4d3722c5e4a0b",
+    "objects": {
+      "trg_requests_guard": true,
+      "claim_pipeline_kickoff": true,
+      "pipeline_kickoff_guard": true,
+      "trg_requests_no_delete": true,
+      "pipeline_kickoff_record": true,
+      "refuse_pipeline_kickoff": true,
+      "settle_pipeline_kickoff": true,
+      "pipeline_kickoff_refusal": true,
+      "trg_requests_no_truncate": true,
+      "pipeline_kickoff_excluded": true,
+      "pipeline_kickoff_requests": true,
+      "trg_intents_pipeline_kickoff": true,
+      "policy_requests_app_admin_read": true,
+      "pipeline_kickoff_requests_requested_idx": true
+    },
+    "policies": "883d47dcd3fa05a5531aaf7be66bef48f49e0203daf4bddbb9766265abc18b75",
+    "triggers": "3fdde46313a893f5d7eae176369532a2e4832767102897d9c3c578a05ef9d5f6",
+    "functions": "8e73bb25c38f0a6e32566483c9a6cf57a6faa9f5feebdee34ec381564265304d",
+    "relations": "8996fdd3be0885a7d7cb984eba05a3299583a5a150de8123f48ccc661200c916",
+    "migrations": {
+      "max": 24,
+      "min": 1,
+      "v25": null,
+      "v26": null,
+      "count": 24,
+      "aggregate": "bcd453f800c037e978138d5d6bf979baaa00b46cbe807fb7aca8281a9cacc7f2",
+      "all_env_test": true,
+      "aggregate_1_24": "bcd453f800c037e978138d5d6bf979baaa00b46cbe807fb7aca8281a9cacc7f2"
+    },
+    "table_acls": "881bdf5e0ee4c1c1724f0319a9429ff10225531625c8e182bfdef25bb61ea5ed",
+    "constraints": "c3ef5e45a077852c5d0a1f435706d2425a47c7a0a5bfbd4d1895ef6d79daec05",
+    "policy_count": 75,
+    "schema_owner": "postgres",
+    "trigger_count": 89,
+    "function_count": 153,
+    "relation_count": 31,
+    "is_privileged_src": "a14a1dc5befcd96d03ca1c7e28020c5b07b6d1b212510cc1ad715368bc43fb9d",
+    "prerequisite_0023": {
+      "intents": true,
+      "reconciliation_cases": true,
+      "claim_guest_notification_v2": true,
+      "notification_provider_receipts": true,
+      "complete_guest_notification_resend": true
+    },
+    "rls_enabled_count": 31,
+    "is_privileged_config": [
+      "search_path=pg_catalog, pg_temp"
+    ],
+    "test_cleanup_pending_state": true
+  },
+  "mid": {
+    "rls": "50911c6a23c17806cf720729c1b47da160823fa03e9a8379d0e2ffa29e6fd4a8",
+    "acls": {
+      "booking.is_privileged()": [
+        "mv_booking_admin=X/postgres",
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.reject_change()": [
+        "mv_booking_admin=X/postgres",
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.is_intent_state(s text)": [
+        "mv_booking_admin=X/postgres",
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.pipeline_kickoff_guard()": [
+        "postgres=X/postgres"
+      ],
+      "booking.pipeline_kickoff_record()": [
+        "postgres=X/postgres"
+      ],
+      "booking.gn_recipient_in_scope(p_email text)": [
+        "postgres=X/postgres"
+      ],
+      "booking.notification_provider_receipt_binding()": [
+        "postgres=X/postgres"
+      ],
+      "booking.pipeline_kickoff_excluded(p_intent uuid)": [
+        "postgres=X/postgres"
+      ],
+      "booking.refuse_pipeline_kickoff(p_intent uuid, p_code text)": [
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.guest_notification_presend(p_op uuid, p_worker text)": [
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.pipeline_kickoff_refusal(i booking.intents, r booking.pipeline_kickoff_requests)": [
+        "postgres=X/postgres"
+      ],
+      "booking.settle_pipeline_kickoff(p_intent uuid, p_worker text, p_outcome text, p_code text)": [
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.claim_pipeline_kickoff(p_intent uuid, p_worker text, p_plan_hash text, p_inputs jsonb)": [
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.complete_guest_notification_resend(p_op uuid, p_worker text, p_kind text, p_provider_message_id uuid, p_replayed boolean, p_code text)": [
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.claim_guest_notification_v2(p_op uuid, p_worker text, p_locale text, p_content_hash text, p_expected_facts_hash text, p_expected_recipient_hash text)": [
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ]
+    },
+    "columns": "e7398e75931966b992b576c8d4ef2d1f4ac48d2dba7eaf118a1ed7602e96d8c7",
+    "indexes": "a5fa045f676a397d50e3e84110f9917a588509bdb97e8410cff4d3722c5e4a0b",
+    "objects": {
+      "trg_requests_guard": true,
+      "claim_pipeline_kickoff": true,
+      "pipeline_kickoff_guard": true,
+      "trg_requests_no_delete": true,
+      "pipeline_kickoff_record": true,
+      "refuse_pipeline_kickoff": true,
+      "settle_pipeline_kickoff": true,
+      "pipeline_kickoff_refusal": true,
+      "trg_requests_no_truncate": true,
+      "pipeline_kickoff_excluded": true,
+      "pipeline_kickoff_requests": true,
+      "trg_intents_pipeline_kickoff": true,
+      "policy_requests_app_admin_read": true,
+      "pipeline_kickoff_requests_requested_idx": true
+    },
+    "policies": "883d47dcd3fa05a5531aaf7be66bef48f49e0203daf4bddbb9766265abc18b75",
+    "triggers": "3fdde46313a893f5d7eae176369532a2e4832767102897d9c3c578a05ef9d5f6",
+    "functions": "706baa77108525f0e150a586189f76420321fe73f261b4468a3d55085b5c2a70",
+    "relations": "8996fdd3be0885a7d7cb984eba05a3299583a5a150de8123f48ccc661200c916",
+    "migrations": {
+      "max": 25,
+      "min": 1,
+      "v25": {
+        "name": "gn_sink_recipient_scope",
+        "version": 25,
+        "environment": "test",
+        "up_checksum": "160127cf57c65a7d370515c3a5a48384fa4061b03358d3c2ec5d8c72ca4612c3",
+        "down_checksum": "16b392c60b53a95bca5fba39219fe86991eaa498ae0fab10ebdefd7914cfde6f"
+      },
+      "v26": null,
+      "count": 25,
+      "aggregate": "1708843710edab29a5e7bb5d2afd6d444c9fcbe1b3ca74c22b4978d416c36706",
+      "all_env_test": true,
+      "aggregate_1_24": "bcd453f800c037e978138d5d6bf979baaa00b46cbe807fb7aca8281a9cacc7f2"
+    },
+    "table_acls": "881bdf5e0ee4c1c1724f0319a9429ff10225531625c8e182bfdef25bb61ea5ed",
+    "constraints": "c3ef5e45a077852c5d0a1f435706d2425a47c7a0a5bfbd4d1895ef6d79daec05",
+    "policy_count": 75,
+    "schema_owner": "postgres",
+    "trigger_count": 89,
+    "function_count": 153,
+    "relation_count": 31,
+    "is_privileged_src": "a14a1dc5befcd96d03ca1c7e28020c5b07b6d1b212510cc1ad715368bc43fb9d",
+    "prerequisite_0023": {
+      "intents": true,
+      "reconciliation_cases": true,
+      "claim_guest_notification_v2": true,
+      "notification_provider_receipts": true,
+      "complete_guest_notification_resend": true
+    },
+    "rls_enabled_count": 31,
+    "is_privileged_config": [
+      "search_path=pg_catalog, pg_temp"
+    ],
+    "test_cleanup_pending_state": true
+  },
+  "post": {
+    "rls": "50911c6a23c17806cf720729c1b47da160823fa03e9a8379d0e2ffa29e6fd4a8",
+    "acls": {
+      "booking.is_privileged()": [
+        "mv_booking_admin=X/postgres",
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.reject_change()": [
+        "mv_booking_admin=X/postgres",
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.is_intent_state(s text)": [
+        "mv_booking_admin=X/postgres",
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.pipeline_kickoff_guard()": [
+        "postgres=X/postgres"
+      ],
+      "booking.pipeline_kickoff_record()": [
+        "postgres=X/postgres"
+      ],
+      "booking.gn_recipient_in_scope(p_email text)": [
+        "postgres=X/postgres"
+      ],
+      "booking.notification_provider_receipt_binding()": [
+        "postgres=X/postgres"
+      ],
+      "booking.pipeline_kickoff_excluded(p_intent uuid)": [
+        "postgres=X/postgres"
+      ],
+      "booking.refuse_pipeline_kickoff(p_intent uuid, p_code text)": [
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.guest_notification_presend(p_op uuid, p_worker text)": [
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.pipeline_kickoff_refusal(i booking.intents, r booking.pipeline_kickoff_requests)": [
+        "postgres=X/postgres"
+      ],
+      "booking.settle_pipeline_kickoff(p_intent uuid, p_worker text, p_outcome text, p_code text)": [
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.claim_pipeline_kickoff(p_intent uuid, p_worker text, p_plan_hash text, p_inputs jsonb)": [
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.complete_guest_notification_resend(p_op uuid, p_worker text, p_kind text, p_provider_message_id uuid, p_replayed boolean, p_code text)": [
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ],
+      "booking.claim_guest_notification_v2(p_op uuid, p_worker text, p_locale text, p_content_hash text, p_expected_facts_hash text, p_expected_recipient_hash text)": [
+        "mv_booking_app=X/postgres",
+        "postgres=X/postgres"
+      ]
+    },
+    "columns": "e7398e75931966b992b576c8d4ef2d1f4ac48d2dba7eaf118a1ed7602e96d8c7",
+    "indexes": "a5fa045f676a397d50e3e84110f9917a588509bdb97e8410cff4d3722c5e4a0b",
+    "objects": {
+      "trg_requests_guard": true,
+      "claim_pipeline_kickoff": true,
+      "pipeline_kickoff_guard": true,
+      "trg_requests_no_delete": true,
+      "pipeline_kickoff_record": true,
+      "refuse_pipeline_kickoff": true,
+      "settle_pipeline_kickoff": true,
+      "pipeline_kickoff_refusal": true,
+      "trg_requests_no_truncate": true,
+      "pipeline_kickoff_excluded": true,
+      "pipeline_kickoff_requests": true,
+      "trg_intents_pipeline_kickoff": true,
+      "policy_requests_app_admin_read": true,
+      "pipeline_kickoff_requests_requested_idx": true
+    },
+    "policies": "883d47dcd3fa05a5531aaf7be66bef48f49e0203daf4bddbb9766265abc18b75",
+    "triggers": "3fdde46313a893f5d7eae176369532a2e4832767102897d9c3c578a05ef9d5f6",
+    "functions": "bf0085e31e7cd75feefd20ea930bb4220d895c2a1135bd587e94ca9ad502d3b5",
+    "relations": "8996fdd3be0885a7d7cb984eba05a3299583a5a150de8123f48ccc661200c916",
+    "migrations": {
+      "max": 26,
+      "min": 1,
+      "v25": {
+        "name": "gn_sink_recipient_scope",
+        "version": 25,
+        "environment": "test",
+        "up_checksum": "160127cf57c65a7d370515c3a5a48384fa4061b03358d3c2ec5d8c72ca4612c3",
+        "down_checksum": "16b392c60b53a95bca5fba39219fe86991eaa498ae0fab10ebdefd7914cfde6f"
+      },
+      "v26": {
+        "name": "pipeline_kickoff_source_rebind",
+        "version": 26,
+        "environment": "test",
+        "up_checksum": "4ad443e635b716a73bd22bd99c3e04cd5781d8a8aeef4fb2fa596e380fc58528",
+        "down_checksum": "5d3f5219fb561d242c6119794d0cb43883e38da07c89945325bfa724f980ece0"
+      },
+      "count": 26,
+      "aggregate": "3dae7c0df75f4f51c4acdec3d79af4bb35050ee1d49c23c47e36b05f3d469ab1",
+      "all_env_test": true,
+      "aggregate_1_24": "bcd453f800c037e978138d5d6bf979baaa00b46cbe807fb7aca8281a9cacc7f2"
+    },
+    "table_acls": "881bdf5e0ee4c1c1724f0319a9429ff10225531625c8e182bfdef25bb61ea5ed",
+    "constraints": "c3ef5e45a077852c5d0a1f435706d2425a47c7a0a5bfbd4d1895ef6d79daec05",
+    "policy_count": 75,
+    "schema_owner": "postgres",
+    "trigger_count": 89,
+    "function_count": 153,
+    "relation_count": 31,
+    "is_privileged_src": "a14a1dc5befcd96d03ca1c7e28020c5b07b6d1b212510cc1ad715368bc43fb9d",
+    "prerequisite_0023": {
+      "intents": true,
+      "reconciliation_cases": true,
+      "claim_guest_notification_v2": true,
+      "notification_provider_receipts": true,
+      "complete_guest_notification_resend": true
+    },
+    "rls_enabled_count": 31,
+    "is_privileged_config": [
+      "search_path=pg_catalog, pg_temp"
+    ],
+    "test_cleanup_pending_state": true
+  }
+}
