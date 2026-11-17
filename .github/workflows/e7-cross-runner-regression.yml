@@ -1,0 +1,30 @@
+# C116 cross-runner regression (READ-ONLY): runs test/e7-cross-runner-regression.test.mjs — the C50 notification runner's exact reviewed digest and
+# CLOSED assertions, kept OUTSIDE every runtime source frame so a notification repin can never rewrite the pipeline / kickoff frames (the C116
+# cycle). No secrets, no environment, no install, no network beyond the checkout; contents: read only. Intended as a REQUIRED status check.
+name: e7-cross-runner-regression
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: e7-cross-runner-regression-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  regression:
+    name: e7-cross-runner-regression
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout (exact event SHA)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+      - name: Cross-runner regression (read-only)
+        run: node --test test/e7-cross-runner-regression.test.mjs

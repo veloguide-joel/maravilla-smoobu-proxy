@@ -36,6 +36,7 @@ const SHA_A = "a".repeat(40);
 const FAKE_CA = "-----BEGIN CERTIFICATE-----\nE7-FAKE-PROBE-CA\n-----END CERTIFICATE-----\n";
 const POL = Object.freeze({ host: C.tls.host, caSha256: sha(FAKE_CA) });
 const OPEN = Object.freeze({ ...C, tls: POL });
+const DRAFT_SEAM = Object.freeze({ ...C, toolingStatus: "DRAFT_HEAD" });   // C116: TEST-LOCAL non-MERGED seam (must refuse HTP_CLOSURE_MISMATCH)
 const ROW_OK = Object.freeze({ is_app: true, is_admin: false, privileged: false, owns_schema: false, backend_ssl: true, server_version_num: 170011, tx_read_only: "on",
   environment: "test", backend_pid: 424242 });
 
@@ -178,6 +179,8 @@ test("H3 verify / probe ORDER (no secret before every binding): main only, GITHU
     assert.equal((await P.runHosted({ mode: "verify", env: base(), proc: PROC, wrapperDir: w, deps: { ...TRAPS, readHead: async () => "d".repeat(40) } })).result.code, "HTP_BINDING_MISMATCH");
     const v = await P.runHosted({ mode: "verify", env: base(), proc: PROC, wrapperDir: w, deps: { ...TRAPS, readHead: head } });
     assert.deepEqual([v.exitCode, v.result.code], [0, "VERIFY_OK"]);
+    const draft = await P.runHosted({ mode: "verify", env: base(), proc: PROC, wrapperDir: w, deps: { ...TRAPS, constants: DRAFT_SEAM, readHead: head } });
+    assert.deepEqual([draft.exitCode, draft.result.code], [1, "HTP_CLOSURE_MISMATCH"], "C116: a non-MERGED tooling pin never verifies");
   } finally { rmSync(w, { recursive: true, force: true }); }
 });
 

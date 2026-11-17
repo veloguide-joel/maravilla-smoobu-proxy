@@ -26,7 +26,7 @@ after(() => { assert.deepEqual(GUARD, { request: 0, Agent: 0, fetch: 0 }, "no re
 
 const WF = ".github/workflows/e7-hosted-tls-probe.yml";
 const yml = readFileSync(join(ROOT, WF), "utf8");
-const PIN = "4e79f26619c26954fe89c1b626e7be0e138ef383";
+const PIN = "66133a22edca925e6386c4d178c251fa5f11c82e";   // C116: the kickoff's #180 merge tooling (was 4e79f266)
 const PREFIX = "e7-hosted-tls-probe-v1\n";
 const FILES = ["scripts/e7-hosted-tls-probe.mjs", "test/e7-hosted-tls-probe.test.mjs", "test/e7-hosted-tls-probe-workflow.test.mjs", WF, "scripts/e7-hosted-kickoff.mjs"];
 const code = yml.replace(/^#.*\n/gm, "");
@@ -57,7 +57,7 @@ test("W2 PERMISSIONS: contents: read at the workflow and in EVERY job; NO write 
   assert.doesNotMatch(code, /github\.token|GITHUB_TOKEN|id-token:|write-all|secrets\.[A-Z_]*PAT|app-id|private-key|create-github-app-token/i);
 });
 
-test("W3 static: checkouts at the EXACT dispatch SHA + the immutable tooling pin 4e79f266 (persist-credentials false) in all three jobs; the reviewed action pins (== the kickoff workflow); Node 22.22.0; preflight / verify have no environment / secret / npm / curl / CA", () => {
+test("W3 static: checkouts at the EXACT dispatch SHA + the tooling pin 66133a22 (persist-credentials false) in all three jobs; the reviewed action pins (== the kickoff workflow); Node 22.22.0; preflight / verify have no environment / secret / npm / curl / CA", () => {
   assert.equal(count(/ref: \$\{\{ github\.sha \}\}\n          path: wrapper\n          persist-credentials: false/g), 3);
   assert.equal(count(new RegExp(`repository: veloguide-joel/maravilla-smoobu-proxy\\n          ref: ${PIN}\\n          path: tooling\\n          persist-credentials: false`, "g")), 3);
   assert.equal(count(/persist-credentials: false/g), 6); assert.doesNotMatch(yml, /ref: main|ref: refs\/heads|ref: \$\{\{ github\.ref/);
@@ -109,7 +109,7 @@ const expectedDigest = async () => {
 };
 
 test("W6 preflight bindings block executed locally: passes only with HEAD == dispatch SHA, tooling == pin and a known mode (preflight / verify / probe)", () => {
-  assert.equal(toolSha, PIN, "E7_TOOLING_DIR must be the pinned 4e79f266 checkout");
+  assert.equal(toolSha, PIN, "E7_TOOLING_DIR must be the pinned 66133a22 checkout");
   const d = sandbox(); try {
     const bind = runBlock("Verify checkout bindings (wrapper HEAD == dispatch SHA; tooling HEAD == pin; no secrets)");
     for (const mode of ["preflight", "verify", "probe"]) { const ok = sh(bind, { E7_WORKFLOW_SHA: headSha, E7_TOOLING_PIN: PIN, E7_MODE: mode }, d); assert.equal(ok.status, 0, ok.out); }
