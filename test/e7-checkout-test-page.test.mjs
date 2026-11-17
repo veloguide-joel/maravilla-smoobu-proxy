@@ -528,3 +528,22 @@ test("C118 controller: complete → (Refresh) → booking_cancelled replaces the
   await r.c.refresh(); v = r.last(); assert.equal(v.title, "Cancelled — details unavailable", "status without a readable projection fails closed");
   await r.c.pay(); assert.deepEqual([f.count("pay"), f.count("release")], [0, 0]);
 });
+test("C118-F1b controller: complete → (Refresh) → an uncertain reply (under_review / needs_review, no ref) replaces the success; no pay / release / details resend", async () => {
+  const s = memStorage(); createStore(s).save({ token: TOKEN, releaseRequested: false, polls: [] });
+  const f = fakeApi({ status: [reply(200, { status: "confirmed", price: PRICE, bookingProgress: COMPLETE }),
+    reply(200, { status: "under_review", price: PRICE, bookingProgress: { stage: "needs_review", bookingRef: null } }),
+    reply(200, { status: "confirmed", price: PRICE, bookingProgress: COMPLETE }),
+    reply(200, { status: "booking_cancelled", price: PRICE, bookingProgress: { stage: "cancelled", bookingRef: "MV-VBQL2LQY", refundStatus: "pending" } }),
+    reply(200, { status: "under_review", price: PRICE, bookingProgress: { stage: "needs_review", bookingRef: null } })] });
+  const r = rig({ storage: s, api: f }); await r.c.init();
+  assert.equal(r.last().screen, "complete");
+  await r.c.refresh(); let v = r.last();
+  assert.equal(v.screen, "review"); assert.match(v.title, /not confirmed/);
+  assert.doesNotMatch(v.title + v.text, /TEST booking confirmed|MV-VBQL|recorded a (partial|full) refund/, "the earlier success is replaced, no ref / refund claim");
+  assert.deepEqual([v.canPay, v.canRequestRelease], [false, false]);
+  await r.c.refresh(); assert.equal(r.last().screen, "complete");
+  await r.c.refresh(); assert.equal(r.last().title, "TEST booking cancelled");
+  await r.c.refresh(); v = r.last(); assert.equal(v.screen, "review", "a cancelled screen is also replaced by uncertainty");
+  assert.doesNotMatch(v.title + v.text, /cancelled this TEST booking|MV-VBQL/);
+  await r.c.pay(); assert.deepEqual([f.count("pay"), f.count("release"), f.count("details"), f.count("create")], [0, 0, 0, 0]);
+});

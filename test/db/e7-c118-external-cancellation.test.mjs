@@ -404,3 +404,89 @@ test("I1 (corrected): direct DML is denied to app / report / admin by ACL even w
   } finally { await o.query("ROLLBACK"); o.release(); }
   assert.equal(await n("SELECT count(*) AS n FROM booking.external_refund_attestations WHERE cancellation_id = $1", [r.cancellationId]), 1);
 });
+
+// ---------------------------------------------------------------------------------------------
+// F1b (ROOT review 6963601053): three explicit projection outcomes through the ACTUAL intentStatus handler.
+// SIMULATED where labelled: a pool wrapper answers ONLY the projection query (every other query, incl. loadIntent, is the real runtime pool).
+function projectionPool(base, answer) {
+  return { query: (sql, params) => (/external_cancellation_public|to_regprocedure/.test(sql) ? answer(sql, params) : base.query(sql, params)) };
+}
+const UNDER_REVIEW = (b) => {
+  assert.equal(b.status, "under_review");
+  assert.deepEqual({ ...b.bookingProgress }, { stage: "needs_review", bookingRef: null });
+  assert.doesNotMatch(JSON.stringify(b), /MV-|refund|cancelled|complete/i, "no booking ref, no refund / cancellation / success claim");
+};
+const err = (code, message = "x") => Object.assign(new Error(message), { code });
+
+test("F1b: valid null = no record (complete stays); valid object = cancelled; every malformed / missing / failed projection = under_review with no ref or refund claim", async () => {
+  const c = await F.confirmed(db.app, { listingId: L(24) });
+  const status = async (pool) => (await intentStatus({ pool }, c.id)).body;
+  // 1. valid single-row SQL null (REAL): no record → the normal complete projection
+  const real = await status(db.app);
+  assert.deepEqual([real.status, real.bookingProgress.stage], ["confirmed", "complete"]);
+  // 2. valid cancellation object (SIMULATED answer of the exact shape the SQL returns)
+  for (const label of ["pending", "none", "partial", "full"]) {
+    const b = await status(projectionPool(db.app, async () => ({ rows: [{ x: { cancelled: true, refundStatus: label } }] })));
+    assert.deepEqual([b.status, b.bookingProgress.stage, b.bookingProgress.refundStatus], ["booking_cancelled", "cancelled", label]);
+  }
+  // 3. malformed / missing (SIMULATED answers)
+  const bad = [
+    ["no rows", { rows: [] }], ["two rows", { rows: [{ x: null }, { x: null }] }], ["missing alias", { rows: [{ y: null }] }], ["no rows field", {}],
+    ["row not object", { rows: [null] }], ["string json", { rows: [{ x: "{\"cancelled\":true}" }] }], ["number", { rows: [{ x: 1 }] }], ["array", { rows: [{ x: [] }] }],
+    ["boolean value", { rows: [{ x: true }] }], ["empty object", { rows: [{ x: {} }] }],
+    ["cancelled false", { rows: [{ x: { cancelled: false, refundStatus: "none" } }] }], ["cancelled 'true'", { rows: [{ x: { cancelled: "true", refundStatus: "none" } }] }],
+    ["cancelled 1", { rows: [{ x: { cancelled: 1, refundStatus: "none" } }] }], ["label unknown", { rows: [{ x: { cancelled: true, refundStatus: "refunded" } }] }],
+    ["label null", { rows: [{ x: { cancelled: true, refundStatus: null } }] }], ["label missing", { rows: [{ x: { cancelled: true } }] }],
+    ["extra key", { rows: [{ x: { cancelled: true, refundStatus: "none", amountMinor: 1 } }] }]];
+  for (const [label, ans] of bad) UNDER_REVIEW(await status(projectionPool(db.app, async () => ans)), label);
+  // 4. query errors (SIMULATED): permission, connection, timeout, unexpected
+  for (const e of [err("42501", "permission denied"), err("ECONNRESET"), err("57P01", "terminating connection"), err("57014", "canceling statement"), new Error("boom")]) {
+    UNDER_REVIEW(await status(projectionPool(db.app, async () => { throw e; })));
+  }
+  // 5. 42883 is pre-0027 ONLY with verified absence (SIMULATED both reads); unverifiable / present → under_review
+  const pre = projectionPool(db.app, async (sql) => { if (/to_regprocedure/.test(sql)) return { rows: [{ absent: true }] }; throw err("42883"); });
+  assert.deepEqual([(await status(pre)).status, (await status(pre)).bookingProgress.stage], ["confirmed", "complete"]);
+  for (const second of [async () => ({ rows: [{ absent: false }] }), async () => ({ rows: [] }), async () => ({ rows: [{ absent: "true" }] }), async () => { throw err("ECONNRESET"); }]) {
+    UNDER_REVIEW(await status(projectionPool(db.app, async (sql) => { if (/to_regprocedure/.test(sql)) return second(); throw err("42883"); })));
+  }
+});
+
+test("F1b REAL clusters: genuinely pre-0027 schema → unchanged confirmed / complete; existing projection raising an INTERNAL undefined function → under_review; revoked EXECUTE → under_review", async () => {
+  // a disposable cluster at schema 26 with the same login roles as the harness (no 0027 objects at all)
+  const mk = async (to) => {
+    const p = await startPostgres(); const a = new pg.Client({ connectionString: p.adminUrl }); await a.connect();
+    try {
+      await migrateUp(a, { env: "test", ...(to ? { to } : {}) });
+      await a.query("CREATE ROLE test_app LOGIN IN ROLE mv_booking_app");
+    } finally { await a.end(); }
+    return { p, app: new pg.Pool({ connectionString: p.appUrl(), max: 4 }), owner: new pg.Pool({ connectionString: p.adminUrl, max: 2 }) };
+  };
+  const c26 = await mk(26);
+  try {
+    assert.equal((await c26.owner.query("SELECT to_regprocedure('booking.external_cancellation_public(uuid)') AS f")).rows[0].f, null, "0027 genuinely absent");
+    const k = await F.confirmed(c26.app, { listingId: L(25) });
+    const b = (await intentStatus({ pool: c26.app }, k.id)).body;
+    assert.deepEqual([b.status, b.bookingProgress.stage], ["confirmed", "complete"], "pre-0027 behaviour unchanged");
+  } finally { await c26.app.end(); await c26.owner.end(); c26.p.stop(); }
+  const c27 = await mk(null);
+  try {
+    const k = await F.confirmed(c27.app, { listingId: L(26) });
+    const s = async () => (await intentStatus({ pool: c27.app }, k.id)).body;
+    assert.equal((await s()).bookingProgress.stage, "complete", "baseline on this cluster");
+    // TEST-ONLY owner change on this throwaway cluster: the projection exists but calls an undefined function internally
+    await c27.owner.query("SET check_function_bodies = off");
+    const o = await c27.owner.connect();
+    try {
+      await o.query("SET check_function_bodies = off");
+      await o.query(`CREATE OR REPLACE FUNCTION booking.external_cancellation_public(p_intent uuid) RETURNS jsonb LANGUAGE sql STABLE SECURITY DEFINER
+                     SET search_path = pg_catalog, booking AS $$ SELECT booking.c118_no_such_function(p_intent) $$`);
+    } finally { o.release(); }
+    const e = await errOf(c27.app.query("SELECT booking.external_cancellation_public(gen_random_uuid())"));
+    assert.equal(e?.code, "42883", "the internal call really raises undefined_function");
+    UNDER_REVIEW(await s());
+    // and a REAL permission failure: EXECUTE revoked from the runtime role on this throwaway cluster
+    await c27.owner.query("REVOKE EXECUTE ON FUNCTION booking.external_cancellation_public(uuid) FROM mv_booking_app");
+    assert.equal((await errOf(c27.app.query("SELECT booking.external_cancellation_public(gen_random_uuid())")))?.code, "42501");
+    UNDER_REVIEW(await s());
+  } finally { await c27.app.end(); await c27.owner.end(); c27.p.stop(); }
+});
