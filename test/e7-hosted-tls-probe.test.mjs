@@ -36,6 +36,7 @@ const SHA_A = "a".repeat(40);
 const FAKE_CA = "-----BEGIN CERTIFICATE-----\nE7-FAKE-PROBE-CA\n-----END CERTIFICATE-----\n";
 const POL = Object.freeze({ host: C.tls.host, caSha256: sha(FAKE_CA) });
 const OPEN = Object.freeze({ ...C, tls: POL });
+const MERGED_SEAM = Object.freeze({ ...C, toolingStatus: "MERGED" });   // C116: TEST-LOCAL seam for H3 / H4 only (shipped: the inherited kickoff DRAFT_HEAD refuses HTP_CLOSURE_MISMATCH — asserted in H3)
 const ROW_OK = Object.freeze({ is_app: true, is_admin: false, privileged: false, owns_schema: false, backend_ssl: true, server_version_num: 170011, tx_read_only: "on",
   environment: "test", backend_pid: 424242 });
 
@@ -66,7 +67,7 @@ const core = (st, over = {}) => P.runProbeCore({ pool: st.pool, constants: OPEN,
 test("P1 contract: EXACTLY five samples; the client-hop identity / tooling / closure are the merged kickoff's; ONLY three fixed parameterless statements (BEGIN READ ONLY, one read-only SELECT, ROLLBACK) — no write, no request / intent / claim access; source frame includes the imported kickoff runner", () => {
   assert.equal(C.samples, 5); assert.equal(C.probeEnabled, true);
   assert.deepEqual({ ...C.tls }, { ...K.CONSTANTS.tls }); assert.equal(C.tls.caSha256, K.OFFICIAL_CA_SHA256);
-  assert.deepEqual([C.toolingCommit, C.toolingStatus, C.closureDigest, C.pgVersion, C.nodeVersion], [K.CONSTANTS.toolingCommit, "MERGED", K.CONSTANTS.closureDigest, "8.18.0", "22.22.0"]);
+  assert.deepEqual([C.toolingCommit, C.toolingStatus, C.closureDigest, C.pgVersion, C.nodeVersion], [K.CONSTANTS.toolingCommit, "DRAFT_HEAD" /* C116: until the #180 merge repin */, K.CONSTANTS.closureDigest, "8.18.0", "22.22.0"]);
   assert.deepEqual(Object.keys(P.QUERIES), ["begin", "probe", "rollback"]);
   assert.equal(P.QUERIES.begin, "BEGIN READ ONLY"); assert.equal(P.QUERIES.rollback, "ROLLBACK");
   assert.doesNotMatch(P.QUERIES.probe, /\$\d|\b(INSERT|UPDATE|DELETE|MERGE|TRUNCATE|CALL|COPY|ALTER|CREATE|DROP|GRANT|SET\s|DO\b)|nextval|pg_advisory|claim|kickoff|intents|reservation|payment/i);
@@ -173,18 +174,20 @@ test("H3 verify / probe ORDER (no secret before every binding): main only, GITHU
     const head = async () => SHA_A;
     for (const [env, k] of [[base({ GITHUB_REF: "refs/heads/feature" }), "HTP_REF_NOT_MAIN"], [base({ GITHUB_SHA: "b".repeat(40) }), "HTP_BINDING_MISMATCH"],
       [base({ E7_EXPECTED_SOURCE_DIGEST: "" }), "HTP_INPUT_INCOMPLETE"], [base({ E7_EXPECTED_SOURCE_DIGEST: "c".repeat(64) }), "HTP_SOURCE_MISMATCH"], [base({ E7_RUN_ID: "x" }), "HTP_INPUT_INVALID"]]) {
-      assert.equal((await P.runHosted({ mode: "verify", env, proc: PROC, wrapperDir: w, deps: { ...TRAPS, readHead: head } })).result.code, k);
+      assert.equal((await P.runHosted({ mode: "verify", env, proc: PROC, wrapperDir: w, deps: { ...TRAPS, constants: MERGED_SEAM, readHead: head } })).result.code, k);
     }
-    assert.equal((await P.runHosted({ mode: "verify", env: base(), proc: PROC, wrapperDir: w, deps: { ...TRAPS, readHead: async () => "d".repeat(40) } })).result.code, "HTP_BINDING_MISMATCH");
-    const v = await P.runHosted({ mode: "verify", env: base(), proc: PROC, wrapperDir: w, deps: { ...TRAPS, readHead: head } });
+    assert.equal((await P.runHosted({ mode: "verify", env: base(), proc: PROC, wrapperDir: w, deps: { ...TRAPS, constants: MERGED_SEAM, readHead: async () => "d".repeat(40) } })).result.code, "HTP_BINDING_MISMATCH");
+    const v = await P.runHosted({ mode: "verify", env: base(), proc: PROC, wrapperDir: w, deps: { ...TRAPS, constants: MERGED_SEAM, readHead: head } });
     assert.deepEqual([v.exitCode, v.result.code], [0, "VERIFY_OK"]);
+    const shipped = await P.runHosted({ mode: "verify", env: base(), proc: PROC, wrapperDir: w, deps: { ...TRAPS, readHead: head } });
+    assert.deepEqual([shipped.exitCode, shipped.result.code], [1, "HTP_CLOSURE_MISMATCH"], "C116: the shipped (inherited DRAFT_HEAD) tooling never verifies");
   } finally { rmSync(w, { recursive: true, force: true }); }
 });
 
 test("H4 probe step: secret present → pg 8.18.0 → the ONLY admitted target (pooler 6543, app role, project) → the PINNED CA bytes → the tooling's createBookingPool({connectionString, caPem, max:1}) → the core; exit 0 ONLY on PASS; the secret is removed from env; the output carries no URL / credential", async () => {
   const w = wrapperFixture(); try {
     const src = await K.framedDigest(w, P.RUNNER_FILES, P.SOURCE_PREFIX); const CA = readFileSync(join(TOOLING, "package.json")); // stand-in bytes, pinned via a seam constant
-    const cst = Object.freeze({ ...C, tls: Object.freeze({ ...C.tls, caSha256: sha(CA) }) });
+    const cst = Object.freeze({ ...C, toolingStatus: "MERGED" /* C116 seam: shipped inherits the kickoff DRAFT_HEAD */, tls: Object.freeze({ ...C.tls, caSha256: sha(CA) }) });
     const env = (o = {}) => ({ E7_TOOLING_DIR: TOOLING, E7_EXPECTED_SOURCE_DIGEST: src, E7_WORKFLOW_SHA: SHA_A, GITHUB_SHA: SHA_A, GITHUB_REF: "refs/heads/main", E7_RUN_ID: "123456-1",
       E7_CA_FILE: "/ca.crt", E7_DEV_BOOKING_DATABASE_URL: URL_OK, ...o });
     let made = null; const ended = { n: 0 };

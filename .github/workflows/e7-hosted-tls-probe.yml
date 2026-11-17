@@ -46,11 +46,11 @@ jobs:
           ref: ${{ github.sha }}
           path: wrapper
           persist-credentials: false
-      - name: Checkout E7 tooling (fixed commit 4e79f266)
+      - name: Checkout E7 tooling (fixed commit 5ba7f793)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: 4e79f26619c26954fe89c1b626e7be0e138ef383
+          ref: 5ba7f793be8ca4e09ec3ce7a7388b34e97dd7cba
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0
@@ -61,7 +61,7 @@ jobs:
       - name: Verify checkout bindings (wrapper HEAD == dispatch SHA; tooling HEAD == pin; no secrets)
         env:
           E7_WORKFLOW_SHA: ${{ github.sha }}
-          E7_TOOLING_PIN: 4e79f26619c26954fe89c1b626e7be0e138ef383
+          E7_TOOLING_PIN: 5ba7f793be8ca4e09ec3ce7a7388b34e97dd7cba
           E7_MODE: ${{ inputs.mode }}
         run: |
           set -eu
@@ -91,11 +91,11 @@ jobs:
           ref: ${{ github.sha }}
           path: wrapper
           persist-credentials: false
-      - name: Checkout E7 tooling (fixed commit 4e79f266)
+      - name: Checkout E7 tooling (fixed commit 5ba7f793)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: 4e79f26619c26954fe89c1b626e7be0e138ef383
+          ref: 5ba7f793be8ca4e09ec3ce7a7388b34e97dd7cba
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0
@@ -126,11 +126,11 @@ jobs:
           ref: ${{ github.sha }}
           path: wrapper
           persist-credentials: false
-      - name: Checkout E7 tooling (fixed commit 4e79f266)
+      - name: Checkout E7 tooling (fixed commit 5ba7f793)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: 4e79f26619c26954fe89c1b626e7be0e138ef383
+          ref: 5ba7f793be8ca4e09ec3ce7a7388b34e97dd7cba
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0
@@ -141,7 +141,7 @@ jobs:
       - name: Re-check bindings BEFORE any secret (HEAD == dispatch SHA; tooling pin; probe source digest)
         env:
           E7_WORKFLOW_SHA: ${{ github.sha }}
-          E7_TOOLING_PIN: 4e79f26619c26954fe89c1b626e7be0e138ef383
+          E7_TOOLING_PIN: 5ba7f793be8ca4e09ec3ce7a7388b34e97dd7cba
           E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
         run: |
           set -eu
