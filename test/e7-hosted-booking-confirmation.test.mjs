@@ -35,18 +35,17 @@ const IID = "3f1c2b4a-5d6e-4f70-8a91-b2c3d4e5f607"; const OID = "7a8b9c0d-1e2f-4
 const PII = /@|SENTINEL|Synthia|Zanabria|re_[A-Za-z0-9]|Bearer|FAKEPW|maraVilla booking|reservaci|Payment received|Pago recibido|Hello/;
 const KEY = "re_SENTINELkey0123456789";
 const PROC = { versions: { node: "22.22.0" }, platform: "linux", execArgv: [], getuid: () => 1000 };
-const OPEN = Object.freeze({ ...C, executeEnabled: true });           // the TEST-LOCAL seam (C116 ENABLE B ships true; CLOSE B restores false)
-const SHUT = Object.freeze({ ...C, executeEnabled: false });          // C116 ENABLE B: the CLOSED behaviour is proven through this closed-constants seam
+const OPEN = Object.freeze({ ...C, executeEnabled: true });           // the TEST-LOCAL seam only; the shipped constant stays false
 
 // ---------------------------------------------------------------------------------------------------------------------------------
-test("H1 C116 ENABLE B ships executeEnabled TRUE; with CLOSED constants (seam) verify AND execute refuse NBC_EXECUTE_CLOSED before ANY tooling import, env VALUE read (secrets present), DB, spawn or provider — proven with throwing deps and a recording env proxy", async () => {
-  assert.equal(C.executeEnabled, true); assert.equal(SHUT.executeEnabled, false); assert.ok(Object.isFrozen(C) && Object.isFrozen(C.sender) && Object.isFrozen(C.budgets));
+test("H1 SHIPPED CLOSED: executeEnabled false; verify AND execute refuse NBC_EXECUTE_CLOSED before ANY tooling import, env VALUE read (secrets present), DB, spawn or provider — proven with throwing deps and a recording env proxy", async () => {
+  assert.equal(C.executeEnabled, false); assert.ok(Object.isFrozen(C) && Object.isFrozen(C.sender) && Object.isFrozen(C.budgets));
   for (const mode of ["verify", "execute"]) {
     const reads = []; const base = { E7_DEV_BOOKING_DATABASE_URL: "postgresql://x", E7_RESEND_TEST_KEY: KEY, E7_APPROVAL_REF: "label", E7_INTENT_ID: IID, E7_OP_ID: OID,
       E7_EXPECTED_VERSION: "9", E7_LOCALE: "en", E7_TOOLING_DIR: TOOLING, GITHUB_REF: "refs/heads/main" };
     const env = new Proxy(base, { get(t, k) { reads.push(String(k)); return t[k]; } });
     const never = () => { throw new Error("must not be called"); };
-    const r = await R.runHosted({ mode, env, proc: PROC, wrapperDir: ROOT, deps: { constants: SHUT, importEnv: never, importTooling: never, runCore: never, spawnChild: never, readPgVersion: never, readCa: never } });
+    const r = await R.runHosted({ mode, env, proc: PROC, wrapperDir: ROOT, deps: { importEnv: never, importTooling: never, runCore: never, spawnChild: never, readPgVersion: never, readCa: never } });
     assert.deepEqual([r.exitCode, r.result.code, r.result.executeEnabled, r.result.core, r.result.closureDigest, r.result.planHash], [1, "NBC_EXECUTE_CLOSED", false, null, null, null], mode);
     assert.deepEqual(reads, [], `${mode}: not one env value was read (key names only)`);
     assert.equal(base.E7_RESEND_TEST_KEY, KEY, "nothing deleted / touched");
@@ -133,7 +132,7 @@ test("H4 plan: deterministic; binds intent / op / version / locale / the fixed a
     assert.notEqual(R.buildPlan(C, { ...base, [k]: v }).planHash, h0, k);
   for (const over of [{ sender: { fromAddress: "other@sender.mv-test.invalid", fromName: "maraVilla Test" } }, { sender: { fromAddress: "bookings@sender.mv-test.invalid", fromName: "maraVilla Test" } },
     { sender: { fromAddress: "bookings@mail.maravillanayarit.com", fromName: "maraVilla" } }, { toolingCommit: "d322d2192b377d18b6a9280ae06c17eddfe3e73e" }, { excludedIntentIds: [] }, { protectedReservationIds: [] }, { closureDigest: "c".repeat(64) },
-    { catalogPin26: {} }, { budgets: { ...C.budgets, sends: 2 } }, { executeEnabled: false } /* C116 ENABLE B: the flag flip is still a plan change */])
+    { catalogPin26: {} }, { budgets: { ...C.budgets, sends: 2 } }, { executeEnabled: true }])
     assert.notEqual(R.buildPlan({ ...C, ...over }, base).planHash, h0, Object.keys(over)[0]);
   assert.deepEqual(C.sender, { fromAddress: "bookings@mail.micasadirect.com", fromName: "MiCasaDirect" }, "C55: the fixed approved sender (sender only; not a domain-verification claim)");
   assert.deepEqual([...C.excludedIntentIds], ["abede8b1-8ef6-44f2-876e-6a02fc056a96", "c83c1842-d342-4e27-9ab7-dc3d50b7a309"]);
