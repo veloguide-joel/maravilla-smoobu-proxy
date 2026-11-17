@@ -1,0 +1,62 @@
+# C118 / N1 (PR #188, DRAFT) — FOCUSED TEST EVIDENCE ONLY. Runs the 20 C118 DB cases plus the affected status / page / API suites against a
+# DISPOSABLE localhost PostgreSQL (16 and 17) that each test creates and deletes itself (test/db/harness.mjs). Synthetic fixtures and
+# in-memory fake provider exchanges only: no secrets, no environment, no provider credentials, no shared database, no deploy.
+# Outside every runtime source frame (nothing under lib/ scripts/ api/ public/ reads it). contents: read only.
+name: e7-c118-focused-tests
+on:
+  pull_request:
+    paths:
+      - "db/migrations/0027_*"
+      - "lib/checkout/intent-api-core.js"
+      - "public/checkout-test.js"
+      - "test/db/e7-c118-*"
+      - "test/e7-checkout-test-page.test.mjs"
+      - "test/e7-c98-booking-progress.test.mjs"
+      - ".github/workflows/e7-c118-focused-tests.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: e7-c118-focused-tests-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  focused:
+    name: c118-focused (PG ${{ matrix.pg }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["16", "17"]
+    steps:
+      - name: Checkout (exact event SHA)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+      - name: Install PostgreSQL ${{ matrix.pg }} binaries (no service is started; tests run their own throwaway cluster)
+        run: |
+          set -euo pipefail
+          if [ ! -x "/usr/lib/postgresql/${{ matrix.pg }}/bin/initdb" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq postgresql-common
+            sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+            sudo apt-get install -y -qq "postgresql-${{ matrix.pg }}"
+          fi
+          sudo systemctl stop postgresql || true
+          "/usr/lib/postgresql/${{ matrix.pg }}/bin/postgres" --version
+      - name: Install dependencies (lockfile, no scripts)
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Unit — affected status / page / API suites
+        run: node --test test/e7-checkout-test-page.test.mjs test/e7-c98-booking-progress.test.mjs test/e6-intent-api-http.test.mjs test/import-closure.test.mjs test/packaging-closure.test.mjs
+      - name: DB — 20 C118 cases + affected intent / status / page DB suites (disposable localhost PostgreSQL ${{ matrix.pg }})
+        env:
+          PG_BIN: /usr/lib/postgresql/${{ matrix.pg }}/bin
+        run: >-
+          node --test --test-concurrency=2
+          test/db/e7-c118-external-cancellation.test.mjs test/db/e7-c118-notification-worker.test.mjs
+          test/db/e6-intent-api.test.mjs test/db/e7-c98-booking-progress-api.test.mjs
+          test/db/e7-checkout-test-page-integration.test.mjs test/db/e7-checkout-test-release.test.mjs
