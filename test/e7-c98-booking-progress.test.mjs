@@ -13,7 +13,7 @@ test("P1 complete ONLY with confirmed + bound reservation id + capturedMinor == 
   assert.deepEqual(p, { stage: "complete", bookingRef: "MV-VBQL2LQY" }); assert.ok(Object.isFrozen(p)); assert.deepEqual(Object.keys(p), ["stage", "bookingRef"]);
   assert.deepEqual(bookingProgress(base({ reservation: { reservationId: 71789623 } })).stage, "complete", "a safe-integer id (pg bigint as number) is accepted");
   assert.doesNotMatch(JSON.stringify(p), /pi_|71789623|35735899|11111111/, "no PI / reservation / charge / intent id");
-  assert.deepEqual(BOOKING_STAGES, ["not_paid", "processing", "payment_received_finalizing", "complete", "needs_review", "ended"]);
+  assert.deepEqual(BOOKING_STAGES, ["not_paid", "processing", "payment_received_finalizing", "complete", "needs_review", "ended", "cancelled"]);   // C118 draft: + cancelled (host-cancelled booking projection)
 });
 
 test("P2 malformed / missing / conflicting proof facts are NEVER complete (needs_review, no ref)", () => {

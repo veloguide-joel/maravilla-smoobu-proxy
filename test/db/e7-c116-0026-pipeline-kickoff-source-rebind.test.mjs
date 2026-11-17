@@ -38,13 +38,13 @@ const others = () => q1(`SELECT md5(string_agg(x, E'\\n' ORDER BY x)) AS h FROM 
 
 test("C116-D2 0026 on base schema 25: claim_pipeline_kickoff replaced IN PLACE with ONLY the expected_source_digest literal changed (f09bcbbd → 880db5b3 == PINNED_REVISION.sourceDigest); OID / owner / ACL / volatility / definer / search_path / signature / return / strict / parallel kept; no privilege change; every other booking object identical; exact down; re-up identical", async () => {
   assert.equal(PINNED_REVISION.sourceDigest, NEW, "SQL literal == tooling PINNED_REVISION.sourceDigest");
-  const M = loadMigrations(); assert.equal(M.at(-1).version, 26); assert.equal(M.at(-1).name, "pipeline_kickoff_source_rebind");
+  const M = loadMigrations(); const m26 = M.find((m) => m.version === 26); assert.equal(m26.name, "pipeline_kickoff_source_rebind");   // C118 draft: 0027 may follow
   assert.deepEqual(await migrateUp(c, { env: "test", to: 25 }), Array.from({ length: 25 }, (_, i) => i + 1));
   const a25 = await attrs(); const p25 = await privs(); const o25 = await others();
   assert.deepEqual([a25.srcmd5, a25.secdef, a25.vol, a25.config, a25.lang], ["ede022a83e0869ec2194470665cab759", true, "v", "{\"search_path=pg_catalog, booking\"}", "plpgsql"], "base = the reviewed 0024 claim (the kickoff CATALOG_PINS src)");
   assert.equal(a25.src.split(OLD).length, 2); assert.equal(a25.src.split(CLOSURE).length, 2);
 
-  assert.deepEqual(await migrateUp(c, { env: "test" }), [26]);
+  assert.deepEqual(await migrateUp(c, { env: "test", to: 26 }), [26]);
   const a26 = await attrs();
   for (const k of ["oid", "owner", "acl", "vol", "secdef", "config", "lang", "args", "ret", "strict", "parallel"]) assert.equal(a26[k], a25[k], `0026 preserves ${k}`);
   assert.equal(a26.src, a25.src.replace(OLD, NEW), "the body is the 0024 body with EXACTLY the one literal replaced");
@@ -57,7 +57,7 @@ test("C116-D2 0026 on base schema 25: claim_pipeline_kickoff replaced IN PLACE w
   const d25 = await attrs(); for (const k of Object.keys(a25)) assert.equal(d25[k], a25[k], `down restores ${k} exactly (the 0024 body)`);
   assert.deepEqual(await privs(), p25); assert.equal((await others()).h, o25.h);
 
-  assert.deepEqual(await migrateUp(c, { env: "test" }), [26]);
+  assert.deepEqual(await migrateUp(c, { env: "test", to: 26 }), [26]);
   const r26 = await attrs(); for (const k of Object.keys(a26)) assert.equal(r26[k], a26[k], `re-up identical ${k}`);
   console.log(`# C116 claim prosrc md5 at 26: ${a26.srcmd5}`);
 });
