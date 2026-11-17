@@ -719,6 +719,33 @@ test("H10 C113 OPEN seam: verify(detect) → open=true; detect holds ONLY the DB
   } finally { rmSync(w, { recursive: true, force: true }); }
 });
 
+test("H11 C115 scheduled source pin (the value the workflow passes for a schedule: vars.E7_KICKOFF_EXPECTED_SOURCE or the literal 'MISSING'): CLOSED → CLOSED_NOOP whatever the pin (0 secret reads); OPEN verify / detect / execute with a missing / malformed / stale pin refuse BEFORE any secret read, import, pool or core; only the exact reviewed pin passes — never a fallback to the computed digest", async () => {
+  { for (const pin of ["MISSING", "f".repeat(64), ""]) { const { n, env } = secretCounted(detEnv({ E7_EXPECTED_SOURCE_DIGEST: pin }));
+    const r = await E.runHosted({ mode: "verify", env, proc: PROC, wrapperDir: ROOT, deps: TRAPS });
+    assert.deepEqual([r.exitCode, r.result.code, r.result.outputs, n.reads], [0, "CLOSED_NOOP", { open: "false" }, 0], pin); } }
+  const w = wrapperFixture();
+  try {
+    const bc = await boundConstants(w); const src = await E.framedDigest(w, E.RUNNER_FILES, E.SOURCE_PREFIX);
+    const GOOD_DB = `postgresql://${encodeURIComponent("mv_booking_app_dev.mxotevtiscernhqilyiu")}:pw@aws-0-us-east-1.pooler.supabase.com:6543/postgres`;
+    const CA = Buffer.from("-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n");
+    let cores = 0; const deps = { ...TRAPS, readHead: async () => SHA_A, importEnv: () => C1, readPgVersion: async () => "8.18.0", readCa: async () => CA, caSha256: sha(CA), constants: bc, runCore: async () => { cores += 1; return { outcome: "DETECTED", code: "NO_REQUEST", detect: { candidates: 0, fingerprint: null } }; } };
+    for (const [pin, want] of [["MISSING", "HKO_INPUT_INCOMPLETE"], ["", "HKO_INPUT_INCOMPLETE"], [src.toUpperCase(), "HKO_INPUT_INCOMPLETE"], ["f".repeat(64), "HKO_SOURCE_MISMATCH"]]) {
+      for (const [mode, over] of [["verify", {}], ["detect", { E7_DEV_BOOKING_DATABASE_URL: GOOD_DB, E7_CA_FILE: "/ca" }]]) {
+        const { n, env } = secretCounted(detEnv({ E7_EXPECTED_SOURCE_DIGEST: pin, ...over }));
+        const r = await E.runHosted({ mode, env, proc: PROC, wrapperDir: w, deps });
+        assert.deepEqual([r.exitCode, r.result.code, n.reads, r.result.outputs], [1, want, 0, null], `${mode} pin=${pin.slice(0, 8)}`);
+      }
+      const ex = secretCounted(realEnv({ E7_INPUT_MODE: "detect", E7_INTENT_ID: "", E7_BOOKING_REF: "", E7_EXPECTED_VERSION: "", E7_PAYMENT_INTENT_ID: "", E7_AMOUNT_MINOR: "",
+        E7_EXPECTED_CANDIDATE_FINGERPRINT: "a".repeat(64), E7_EXPECTED_SOURCE_DIGEST: pin, E7_DEV_BOOKING_DATABASE_URL: GOOD_DB, E7_DISPATCH_TOKEN: "t".repeat(40), E7_CA_FILE: "/ca" }));
+      const rx = await E.runHosted({ mode: "execute", env: ex.env, proc: PROC, wrapperDir: w, deps });
+      assert.deepEqual([rx.result.code, ex.n.reads], [want, 0], `execute pin=${pin.slice(0, 8)}`);
+    }
+    assert.equal(cores, 0, "no refused pin reached the core");
+    const ok = await E.runHosted({ mode: "verify", env: detEnv({ E7_EXPECTED_SOURCE_DIGEST: src }), proc: PROC, wrapperDir: w, deps });
+    assert.deepEqual([ok.exitCode, ok.result.code, ok.result.outputs], [0, "VERIFY_OK", { open: "true" }], "the exact reviewed pin passes");
+  } finally { rmSync(w, { recursive: true, force: true }); }
+});
+
 if (process.env.E7_HKO_DB_TESTS === "1") {
   const [{ startMigratedDatabase }, F, R, W, IA, FX] = await Promise.all([tool("test/db/harness.mjs"), tool("test/db/fixtures.mjs"), tool("lib/booking-db/repo.js"),
     tool("lib/checkout/stripe-test-webhook.js"), tool("lib/checkout/intent-api-core.js"), tool("test/e5a-fixtures.mjs")]);

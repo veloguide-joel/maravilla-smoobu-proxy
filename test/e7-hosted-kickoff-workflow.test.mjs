@@ -41,16 +41,17 @@ const jobs = { preflight: yml.slice(yml.indexOf("\n  preflight:\n"), yml.indexOf
   detect: yml.slice(yml.indexOf("\n  detect:\n"), yml.indexOf("\n  execute:\n")), execute: yml.slice(yml.indexOf("\n  execute:\n")) };
 const steps = (job) => [...job.matchAll(/\n      - name: ([^\n]+)/g)].map((m) => m[1]);
 
-test("W1 static: workflow_dispatch ONLY (no schedule / cron / webhook / repository_dispatch / push / workflow_run); inputs exactly mode (choice, default preflight) + the five bindings + expected_source_digest — no contact / guest input; concurrency serialised", () => {
-  assert.match(yml, /^on:\n  workflow_dispatch:\n    inputs:\n      mode:\n/m);
-  assert.doesNotMatch(yml.replace(/^#.*$/gm, ""), /\n  (push|pull_request|pull_request_target|schedule|workflow_call|repository_dispatch|workflow_run|issue_comment):|cron:/);
+test("W1 static: C115 triggers = ONE schedule (cron 13,43 * * * *) + workflow_dispatch ONLY (no webhook / repository_dispatch / push / workflow_run / pull_request); inputs exactly mode (choice, default preflight) + the five bindings + expected_source_digest — no contact / guest input; concurrency serialised", () => {
+  assert.match(yml, /^on:\n  schedule:\n    - cron: '13,43 \* \* \* \*'\n  workflow_dispatch:\n    inputs:\n      mode:\n/m);
+  assert.doesNotMatch(yml.replace(/^#.*$/gm, ""), /\n  (push|pull_request|pull_request_target|workflow_call|repository_dispatch|workflow_run|issue_comment):/);
+  assert.equal((yml.replace(/^#.*$/gm, "").match(/cron:/g) || []).length, 1, "exactly ONE cron");
   assert.match(yml, /      mode:\n(?:        .*\n)*?        type: choice\n        options: \[preflight, verify, execute, detect\]\n        default: preflight\n/);
   assert.deepEqual([...yml.matchAll(/^      ([a-z_]+):\n        description/gm)].map((m) => m[1]),
     ["mode", "intent_id", "booking_ref", "expected_version", "payment_intent_id", "amount_minor", "expected_source_digest"]);
   assert.doesNotMatch(yml.slice(0, yml.indexOf("\npermissions:")).replace(/^#.*$/gm, ""), /recipient|sender|email|subject|guest_name|to_address|reservation_id|listing_id|token|sha:/i);
   assert.match(yml, /\nconcurrency:\n  group: e7-hosted-kickoff\n  cancel-in-progress: false\n/);
   assert.deepEqual([...yml.matchAll(/^  ([a-z-]+):\n    (?:needs|runs-on|if)/gm)].map((m) => m[1]), ["preflight", "verify", "detect", "execute"]);
-  assert.doesNotMatch(code, /schedule:|cron:/, "C113: manual workflow_dispatch only");
+  assert.equal((code.match(/\n  schedule:\n/g) || []).length, 1, "C115: exactly one schedule trigger");
   assert.deepEqual([...R.RUNNER_FILES], FILES);
 });
 
@@ -78,9 +79,9 @@ test("W3 static: checkouts at the EXACT dispatch SHA + the immutable tooling pin
 });
 
 test("W4 static: execute needs [preflight, verify] AND mode == 'execute' && main AND environment e7-readonly-probe (the only environment); step order: checkouts → node → pre-secret re-check (incl. the pipeline release binding) → npm ci → CA fetch → the ONE execute step LAST", () => {
-  assert.match(jobs.execute, /^\n  execute:\n    needs: \[preflight, verify, detect\]\n    if: \$\{\{ !cancelled\(\) && github\.ref == 'refs\/heads\/main' && needs\.preflight\.result == 'success' && needs\.verify\.result == 'success' && \(\(inputs\.mode == 'execute' && needs\.detect\.result == 'skipped'\) \|\| \(inputs\.mode == 'detect' && needs\.detect\.result == 'success' && needs\.detect\.outputs\.outcome == 'ONE'\)\) \}\}\n    runs-on: ubuntu-24\.04\n    environment: e7-readonly-probe\n    timeout-minutes: 10\n/);
-  assert.match(jobs.verify, /^\n  verify:\n    needs: preflight\n    if: inputs\.mode == 'verify' \|\| inputs\.mode == 'execute' \|\| inputs\.mode == 'detect'\n/);
-  assert.match(jobs.detect, /^\n  detect:\n    needs: \[preflight, verify\]\n    if: inputs\.mode == 'detect' && needs\.verify\.outputs\.open == 'true' && github\.ref == 'refs\/heads\/main'\n    runs-on: ubuntu-24\.04\n    environment: e7-readonly-probe\n    timeout-minutes: 10\n/);
+  assert.match(jobs.execute, /^\n  execute:\n    needs: \[preflight, verify, detect\]\n    if: \$\{\{ !cancelled\(\) && github\.ref == 'refs\/heads\/main' && needs\.preflight\.result == 'success' && needs\.verify\.result == 'success' && \(\(github\.event_name == 'workflow_dispatch' && inputs\.mode == 'execute' && needs\.detect\.result == 'skipped'\) \|\| \(\(inputs\.mode == 'detect' \|\| github\.event_name == 'schedule'\) && needs\.detect\.result == 'success' && needs\.detect\.outputs\.outcome == 'ONE'\)\) \}\}\n    runs-on: ubuntu-24\.04\n    environment: e7-readonly-probe\n    timeout-minutes: 10\n/);
+  assert.match(jobs.verify, /^\n  verify:\n    needs: preflight\n    if: inputs\.mode == 'verify' \|\| inputs\.mode == 'execute' \|\| inputs\.mode == 'detect' \|\| github\.event_name == 'schedule'\n/);
+  assert.match(jobs.detect, /^\n  detect:\n    needs: \[preflight, verify\]\n    if: \(inputs\.mode == 'detect' \|\| github\.event_name == 'schedule'\) && needs\.verify\.outputs\.open == 'true' && github\.ref == 'refs\/heads\/main'\n    runs-on: ubuntu-24\.04\n    environment: e7-readonly-probe\n    timeout-minutes: 10\n/);
   assert.equal(count(/environment: /g), 2, "two jobs, ONE environment name (two sequential approvals)"); assert.equal(count(/environment: e7-readonly-probe\n/g), 2);
   assert.doesNotMatch(code, /always\(\)/, "no unconditional always() path");
   assert.deepEqual(steps(jobs.execute).map((s) => s.split(" (")[0]), ["Checkout wrapper", "Checkout E7 kickoff tooling", "Set up Node 22.22.0", "Re-check bindings BEFORE any secret",
@@ -99,7 +100,7 @@ test("W5 static: the ONLY secret (existing NAME E7_DEV_BOOKING_DATABASE_URL) and
   assert.equal(count(/github\.token/g), 1); assert.equal(count(/GITHUB_TOKEN/g), 0);
   const last = yml.slice(yml.lastIndexOf("      - name: "));
   assert.match(last, /^      - name: ONE gated kickoff handoff[^\n]*\n        env:\n(?:          [A-Z0-9_]+: [^\n]+\n)+        run: node wrapper\/scripts\/e7-hosted-kickoff\.mjs execute\n$/);
-  assert.match(last, /          E7_INPUT_MODE: \$\{\{ inputs\.mode \}\}\n          E7_EXPECTED_CANDIDATE_FINGERPRINT: \$\{\{ needs\.detect\.outputs\.fingerprint \}\}\n          E7_DEV_BOOKING_DATABASE_URL: \$\{\{ secrets\.E7_DEV_BOOKING_DATABASE_URL \}\}\n          E7_DISPATCH_TOKEN: \$\{\{ github\.token \}\}\n        run:/);
+  assert.match(last, /          E7_INPUT_MODE: \$\{\{ github\.event_name == 'schedule' && 'detect' \|\| inputs\.mode \}\}\n          E7_EXPECTED_CANDIDATE_FINGERPRINT: \$\{\{ needs\.detect\.outputs\.fingerprint \}\}\n          E7_DEV_BOOKING_DATABASE_URL: \$\{\{ secrets\.E7_DEV_BOOKING_DATABASE_URL \}\}\n          E7_DISPATCH_TOKEN: \$\{\{ github\.token \}\}\n        run:/);
   assert.equal(count(/e7-hosted-kickoff\.mjs execute\n/g), 1); assert.equal(count(/e7-hosted-kickoff\.mjs detect\n/g), 1);
   assert.equal(count(/needs\.detect\.outputs\.fingerprint/g), 1, "the fingerprint reaches ONLY the execute step"); assert.equal(count(/e7-hosted-kickoff\.mjs verify\n/g), 1); assert.equal(count(/e7-hosted-kickoff\.mjs preflight\n/g), 1);
   assert.doesNotMatch(yml, /E7_STRIPE|E7_HOSTAWAY|RESEND|api\.stripe\.com|api\.hostaway\.com|E7_HKO_DB_TESTS/);
@@ -209,8 +210,8 @@ function jobIf(job) {
 }
 test("W10 C113 needs / if truth table (the REAL expressions): manual execute stays reachable when detect is SKIPPED; detect mode reaches execute ONLY via detect success + outcome ONE; any failed / cancelled / skipped preflight, verify or detect, a CLOSED verify (open=false) or a non-main ref reaches NEITHER secret job; no always()", () => {
   const ifDetect = jobIf(jobs.detect); const ifExec = jobIf(jobs.execute);
-  const ctx = ({ mode, ref = "refs/heads/main", pre = "success", ver = "success", open = "", det = "skipped", outcome = "", cancelled = false }) =>
-    ({ inputs: { mode }, github: { ref }, cancelled: () => cancelled, needs: { preflight: { result: pre }, verify: { result: ver, outputs: { open } }, detect: { result: det, outputs: { outcome } } } });
+  const ctx = ({ mode, ev = "workflow_dispatch", ref = "refs/heads/main", pre = "success", ver = "success", open = "", det = "skipped", outcome = "", cancelled = false }) =>
+    ({ inputs: ev === "schedule" ? {} : { mode }, github: { ref, event_name: ev }, cancelled: () => cancelled, needs: { preflight: { result: pre }, verify: { result: ver, outputs: { open } }, detect: { result: det, outputs: { outcome } } } });
   const run = (o) => { const c = ctx(o); const d = ifDetect(c, ["preflight", "verify"]); return { detect: d, execute: ifExec(c, ["preflight", "verify", "detect"]) }; };
   const cases = [
     [{ mode: "execute" }, { detect: false, execute: true }],                                              // manual: detect skipped → execute reachable
@@ -230,7 +231,18 @@ test("W10 C113 needs / if truth table (the REAL expressions): manual execute sta
     [{ mode: "detect", open: "true", det: "success", outcome: "ONE", cancelled: true }, { detect: true, execute: false }],
     [{ mode: "detect", ver: "failure", det: "success", outcome: "ONE" }, { detect: false, execute: false }],
     [{ mode: "detect", open: "true", ref: "refs/heads/feature", det: "success", outcome: "ONE" }, { detect: false, execute: false }],
-    [{ mode: "detect", pre: "failure", open: "true", det: "success", outcome: "ONE" }, { detect: false, execute: false }]];
+    [{ mode: "detect", pre: "failure", open: "true", det: "success", outcome: "ONE" }, { detect: false, execute: false }],
+    // C115 schedule: inputs are EMPTY; always the detect flow; never the manual execute path
+    [{ ev: "schedule", open: "false" }, { detect: false, execute: false }],                                // CLOSED scheduled tick: CLOSED_NOOP, 0 approvals
+    [{ ev: "schedule", ver: "failure" }, { detect: false, execute: false }],                               // missing / wrong pin → verify refuses
+    [{ ev: "schedule", open: "true" }, { detect: true, execute: false }],                                  // gate #1 only (detect not yet ONE)
+    [{ ev: "schedule", open: "true", det: "success", outcome: "ONE" }, { detect: true, execute: true }],   // gate #2 only after detect ONE
+    [{ ev: "schedule", open: "true", det: "success", outcome: "NO_REQUEST" }, { detect: true, execute: false }],
+    [{ ev: "schedule", open: "true", det: "skipped" }, { detect: true, execute: false }],                  // a skipped detect NEVER routes a schedule to manual execute
+    [{ ev: "schedule", open: "true", det: "failure", outcome: "ONE" }, { detect: true, execute: false }],
+    [{ ev: "schedule", open: "true", det: "success", outcome: "ONE", cancelled: true }, { detect: true, execute: false }],
+    [{ ev: "schedule", pre: "failure", ver: "skipped" }, { detect: false, execute: false }],
+    [{ ev: "schedule", open: "true", ref: "refs/heads/feature", det: "success", outcome: "ONE" }, { detect: false, execute: false }]];
   for (const [o, want] of cases) assert.deepEqual(run(o), want, JSON.stringify(o));
 });
 
@@ -243,4 +255,47 @@ test("W11 C113 trusted outputs: the runner writes ONLY allowlisted $GITHUB_OUTPU
   for (const bad of [{ open: "yes" }, { outcome: "ONE\nfingerprint=x" }, { outcome: "one" }, { fingerprint: "A".repeat(64) }, { fingerprint: "a".repeat(63) }, { intent: "x" }, { outcome: "MV-ABC123" }])
     assert.equal(R.outputLines({ outputs: bad }), "", JSON.stringify(bad));
   assert.equal(R.outputLines({}), ""); assert.equal(R.outputLines({ outputs: null }), "");
+});
+
+// ---- C115: scheduled detect routing (the REAL step expressions) -------------------------------------------------------------------
+/** evaluate a `${{ … }}` value expression exactly as written (the subset used here: ==, &&, ||, (), 'literals', github / inputs / vars) */
+function evalExpr(raw, ctx) {
+  const e = raw.replace(/^\$\{\{\s*/, "").replace(/\s*\}\}$/, "");
+  assert.match(e, /^[a-zA-Z0-9_.'()|&= -]+$/, "only the reviewed operators / literals");
+  const js = e.replace(/==/g, "===").replace(/\b(github|inputs|vars)\./g, "ctx.$1.");
+  return new Function("ctx", `return (${js});`)(ctx);
+}
+const stepEnv = (key) => [...new Set([...yml.matchAll(new RegExp(`^          ${key}: (.*)$`, "gm"))].map((m) => m[1]))];
+test("W12 C115 event routing (REAL expressions + REAL shell): every E7_MODE / E7_INPUT_MODE is ONE expression → schedule ALWAYS 'detect' (empty bindings), manual = inputs.mode unchanged; every E7_EXPECTED_SOURCE_DIGEST is ONE expression → schedule = vars.E7_KICKOFF_EXPECTED_SOURCE or the literal 'MISSING' (never a computed digest), manual = inputs.expected_source_digest unchanged; verify runs for every schedule tick; the preflight shell admits the scheduled mode", () => {
+  const modes = [...new Set([...stepEnv("E7_MODE"), ...stepEnv("E7_INPUT_MODE")])];
+  assert.deepEqual(modes, ["${{ github.event_name == 'schedule' && 'detect' || inputs.mode }}"]);
+  assert.equal(yml.split("E7_INPUT_MODE: ").length - 1, 3); assert.equal(yml.split("E7_MODE: ").length - 1, 1);
+  const digs = stepEnv("E7_EXPECTED_SOURCE_DIGEST");
+  assert.deepEqual(digs, ["${{ github.event_name == 'schedule' && (vars.E7_KICKOFF_EXPECTED_SOURCE || 'MISSING') || inputs.expected_source_digest }}"]);
+  assert.equal(yml.split("E7_EXPECTED_SOURCE_DIGEST: ").length - 1, 5, "verify + both pre-secret re-checks + detect + execute steps");
+  assert.equal((yml.replace(/^#.*$/gm, "").match(/vars\./g) || []).length, 5, "the variable is read ONLY in the digest expression");
+  assert.doesNotMatch(yml.replace(/^#.*$/gm, ""), /secrets\.E7_KICKOFF|vars\.(?!E7_KICKOFF_EXPECTED_SOURCE\b)/, "one variable name, never a secret");
+  const pin = "a".repeat(64); const man = "b".repeat(64);
+  const sched = (v) => ({ github: { event_name: "schedule" }, inputs: {}, vars: v === undefined ? {} : { E7_KICKOFF_EXPECTED_SOURCE: v } });
+  const manual = (mode, d = "") => ({ github: { event_name: "workflow_dispatch" }, inputs: { mode, expected_source_digest: d }, vars: { E7_KICKOFF_EXPECTED_SOURCE: pin } });
+  assert.equal(evalExpr(modes[0], sched(pin)), "detect");
+  for (const m of ["preflight", "verify", "execute", "detect"]) assert.equal(evalExpr(modes[0], manual(m)), m, `manual ${m} unchanged`);
+  assert.equal(evalExpr(digs[0], sched(pin)), pin, "schedule: the exact reviewed pin");
+  assert.equal(evalExpr(digs[0], sched(undefined)), "MISSING"); assert.equal(evalExpr(digs[0], sched("")), "MISSING");
+  assert.equal(evalExpr(digs[0], manual("execute", man)), man, "manual input wins even when a variable exists");
+  assert.equal(evalExpr(digs[0], manual("detect", "")), "", "manual detect without a digest stays empty (refused by verify as before)");
+  // binding inputs on a schedule are empty: every E7_<binding> env is a bare inputs.* reference → "" (undefined) on schedule
+  for (const k of ["E7_INTENT_ID", "E7_BOOKING_REF", "E7_EXPECTED_VERSION", "E7_PAYMENT_INTENT_ID", "E7_AMOUNT_MINOR"])
+    for (const v of stepEnv(k)) { assert.match(v, /^\$\{\{ inputs\.[a-z_]+ \}\}$/); assert.equal(evalExpr(v, sched(pin)) ?? "", ""); }
+  // verify's if: every schedule tick runs verify (that is where CLOSED_NOOP / a missing or wrong pin stops it); manual preflight does not
+  const ifVerify = jobIf(jobs.verify);
+  const vctx = (ev, mode) => ({ inputs: ev === "schedule" ? {} : { mode }, github: { event_name: ev, ref: "refs/heads/main" }, cancelled: () => false, needs: { preflight: { result: "success" } } });
+  assert.equal(ifVerify(vctx("schedule"), ["preflight"]), true);
+  assert.deepEqual(["preflight", "verify", "execute", "detect"].map((m) => ifVerify(vctx("workflow_dispatch", m), ["preflight"])), [false, true, true, true]);
+  // the REAL preflight shell block with the evaluated scheduled mode
+  const bind = runBlock("Verify checkout bindings (wrapper HEAD == dispatch SHA; tooling HEAD == pin; no secrets)");
+  const d = sandbox(); try {
+    const ok = sh(bind, { E7_WORKFLOW_SHA: headSha, E7_TOOLING_PIN: PIN, E7_MODE: evalExpr(modes[0], sched(undefined)) }, d);
+    assert.deepEqual([ok.status, /mode=detect/.test(ok.out)], [0, true], ok.out);
+  } finally { rmSync(d, { recursive: true, force: true }); }
 });
