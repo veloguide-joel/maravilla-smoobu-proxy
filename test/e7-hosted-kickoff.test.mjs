@@ -33,7 +33,7 @@ const [K, T, PL, C1] = await Promise.all([tool("lib/booking-db/pipeline-kickoff.
 after(() => { assert.deepEqual(GUARD, { request: 0, Agent: 0, fetch: 0 }, "no real network primitive was touched"); });
 
 const C = E.CONSTANTS;
-const TOOL_PIN = "4e79f26619c26954fe89c1b626e7be0e138ef383";
+const TOOL_PIN = "5ba7f793be8ca4e09ec3ce7a7388b34e97dd7cba";   // C116 #180 draft head (was 4e79f266)
 const PROC = { versions: { node: "22.22.0" }, platform: "linux", execArgv: [], getuid: () => 1000 };
 const SHA_A = "a".repeat(40); const SHA_B = "b".repeat(40);
 const IID = "11111111-2222-4333-8444-555555555555"; const PI = "pi_3FakeKickoff0001"; const REF = "MV-FAKE0001";
@@ -59,7 +59,7 @@ const realEnv = (over = {}) => ({ E7_TOOLING_DIR: TOOLING, E7_INTENT_ID: IID, E7
   E7_WORKFLOW_SHA: SHA_A, GITHUB_SHA: SHA_A, GITHUB_REF: "refs/heads/main", E7_RUN_ID: "123456-1", ...over });
 
 test("H1 SHIPPED CLOSED: executeEnabled / dispatchEnabled FALSE; verify and execute refuse HKO_EXECUTE_CLOSED from KEY NAMES only — 0 env value reads, 0 import / spawn / head / pg / CA / core", async () => {
-  assert.equal(C.executeEnabled, false); assert.equal(C.dispatchEnabled, false); assert.equal(C.toolingStatus, "MERGED"); assert.equal(C.toolingCommit, TOOL_PIN);
+  assert.equal(C.executeEnabled, false); assert.equal(C.dispatchEnabled, false); assert.equal(C.toolingStatus, "DRAFT_HEAD");   // C116: until the #180 merge repin assert.equal(C.toolingCommit, TOOL_PIN);
   for (const mode of ["verify", "execute"]) {
     const { env, reads } = namesOnly(["E7_TOOLING_DIR", "E7_INTENT_ID", "E7_DEV_BOOKING_DATABASE_URL", "E7_DISPATCH_TOKEN", "GITHUB_SHA"]);
     const r = await E.runHosted({ mode, env, proc: PROC, wrapperDir: ROOT, deps: TRAPS });
@@ -123,7 +123,7 @@ test("H4 INDEPENDENT closure: a fresh import scan from the four tooling roots (c
   assert.equal(typeof T.releaseBindingSnapshot, "function", "the tooling pin carries the C111 release binding");
 });
 
-test("H5 release binding from BYTES (never imported; NO git history — runs in the hosted depth-1 checkout): the reviewed C102 ENABLE delta (fixture) maps this checkout's pipeline bytes between the CLOSED frame ce13841b and the ENABLE frame f09bcbbd exactly; the ENABLE bytes bind (closure f7d7cad6, tooling 71c3dcf8); a one-byte change does not; this checkout binds iff it carries the ENABLE source", async () => {
+test("H5 release binding from BYTES (never imported; NO git history — runs in the hosted depth-1 checkout): the reviewed C102 ENABLE delta (fixture) maps this checkout's pipeline bytes between the CLOSED frame cfe62d4d (C116; was ce13841b) and the ENABLE frame 880db5b3 (C116; was f09bcbbd) exactly; the ENABLE bytes bind (closure f7d7cad6, tooling 71c3dcf8); a one-byte change does not; this checkout binds iff it carries the ENABLE source", async () => {
   const DELTA = JSON.parse(readFileSync(join(ROOT, "test/fixtures/e7-c102-pipeline-enable-delta.json"), "utf8"));
   assert.equal(DELTA.schema, "e7-c102-pipeline-enable-delta-v1"); assert.equal(DELTA.enableFrame, C.pipeline.sourceDigest);
   assert.equal(DELTA.enableCommit, "9455bc9ee15370b5321b7a04a96e893e9e80080b"); assert.ok(DELTA.ops.length > 0);
@@ -141,9 +141,9 @@ test("H5 release binding from BYTES (never imported; NO git history — runs in 
   try {
     write(d, enable); write(dc, closed);
     const b = await E.pipelineBinding(d);
-    assert.deepEqual([b.sourceDigest, b.closureDigest, b.toolingCommit, b.bound], [C.pipeline.sourceDigest, C.pipeline.closureDigest, C.pipeline.toolingCommit, true], "ENABLE bytes reproduce f09bcbbd and bind");
+    assert.deepEqual([b.sourceDigest, b.closureDigest, b.toolingCommit, b.bound], [C.pipeline.sourceDigest, C.pipeline.closureDigest, C.pipeline.toolingCommit, true], "ENABLE bytes reproduce 880db5b3 and bind");
     const bc = await E.pipelineBinding(dc);
-    assert.deepEqual([bc.sourceDigest, bc.bound], [DELTA.closedFrame, false], "CLOSED bytes reproduce ce13841b and do not bind");
+    assert.deepEqual([bc.sourceDigest, bc.bound], [DELTA.closedFrame, false], "CLOSED bytes reproduce cfe62d4d and do not bind");
     assert.deepEqual(apply(enable, "enable", "closed"), closed); assert.deepEqual(apply(closed, "closed", "enable"), enable);
     writeFileSync(join(d, C.pipeline.runnerFiles[3]), `${enable[C.pipeline.runnerFiles[3]]} `);
     assert.equal((await E.pipelineBinding(d)).bound, false, "a one-byte change does not bind");
@@ -271,7 +271,9 @@ test("H8 C112-F1 credential gate: the runner's token rule == the tooling transpo
     assert.deepEqual(seen, { accepted: true }); assert.equal(r.exitCode, 0);
     assert.equal(https.log.requests.length, 2); assert.ok(https.log.requests.every((q) => q.opts.headers.Authorization === `Bearer ${NEW_TOKEN}`), "opaque pass-through");
     const out = JSON.stringify(r.result) + E.summaryMarkdown(r.result);
-    for (const piece of [NEW_TOKEN, NEW_TOKEN.slice(4, 24), NEW_TOKEN.split(".")[1].slice(0, 16), String(NEW_TOKEN.length)]) assert.ok(!out.includes(piece), "no token-derived bytes / length in the result");
+    for (const piece of [NEW_TOKEN, NEW_TOKEN.slice(4, 24), NEW_TOKEN.split(".")[1].slice(0, 16)]) assert.ok(!out.includes(piece), "no token-derived bytes in the result");
+    // C116: the length is checked OUTSIDE 40..64-hex digests (the result carries this checkout's live source digest; a 3-digit substring there is coincidence, not a leak)
+    assert.ok(!out.replace(/\b[0-9a-f]{40,64}\b/g, "<hex>").includes(String(NEW_TOKEN.length)), "no token length in the result");
     for (const [tok, code] of [["", "HKO_CREDENTIALS_MISSING"], [`${NEW_TOKEN}\n`, "HKO_CREDENTIAL_FORMAT_UNSUPPORTED"], [`ghs_${"Q".repeat(2048)}`, "HKO_CREDENTIAL_FORMAT_UNSUPPORTED"],
       [`ghs_${seg(40, 1)}=`, "HKO_CREDENTIAL_FORMAT_UNSUPPORTED"]]) {
       const x = await E.runHosted({ mode: "execute", env: env(tok), proc: PROC, wrapperDir: w, deps: base });

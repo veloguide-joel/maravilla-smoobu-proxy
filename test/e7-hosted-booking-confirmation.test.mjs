@@ -1,7 +1,7 @@
 // test/e7-hosted-booking-confirmation.test.mjs — C50: the SHIPPED-CLOSED hosted gn-v2 booking-confirmation runner (scripts/e7-hosted-booking-confirmation.mjs).
 // Always-on: the CLOSED proof (zero imports / env value reads / DB / provider), labelled copies, closure, plan binding, hosted gates, and the admission /
-// core flow through FAKE clients / fake tooling. OPT-IN (E7_HBC_DB_TESTS=1; PG_BIN; E7_TOOLING_DIR = the pinned 9b7a96bf checkout with its pinned pg (C116 repin from 46b3eaf8)):
-// the execute BODY through the test-local constants / deps seam on DISPOSABLE PostgreSQL at schema 25 with the REAL accepted worker, builder, branded
+// core flow through FAKE clients / fake tooling. OPT-IN (E7_HBC_DB_TESTS=1; PG_BIN; E7_TOOLING_DIR = the pinned 5ba7f793 checkout with its pinned pg (C116 repin from 46b3eaf8)):
+// the execute BODY through the test-local constants / deps seam on DISPOSABLE PostgreSQL at schema 26 with the REAL accepted worker, builder, branded
 // executor and SQL 23 receipts — the exchange is ALWAYS FAKE (no network). Lifecycle helpers are generated at runtime from the pinned tooling file
 // test/db/e7-gn-v2-resend-integration.test.mjs (sha-checked; verbatim; imports rewritten to the tooling checkout). The hosted preflight child never sets
 // E7_HBC_DB_TESTS. Nothing here touches a shared database, a provider or the network.
@@ -35,7 +35,7 @@ const IID = "3f1c2b4a-5d6e-4f70-8a91-b2c3d4e5f607"; const OID = "7a8b9c0d-1e2f-4
 const PII = /@|SENTINEL|Synthia|Zanabria|re_[A-Za-z0-9]|Bearer|FAKEPW|maraVilla booking|reservaci|Payment received|Pago recibido|Hello/;
 const KEY = "re_SENTINELkey0123456789";
 const PROC = { versions: { node: "22.22.0" }, platform: "linux", execArgv: [], getuid: () => 1000 };
-const OPEN = Object.freeze({ ...C, executeEnabled: true });           // the TEST-LOCAL seam only; the shipped constant stays false
+const OPEN = Object.freeze({ ...C, executeEnabled: true, toolingStatus: "MERGED" });   // the TEST-LOCAL seam only (shipped: executeEnabled false; toolingStatus DRAFT_HEAD until the #180 merge repin)
 
 // ---------------------------------------------------------------------------------------------------------------------------------
 test("H1 SHIPPED CLOSED: executeEnabled false; verify AND execute refuse NBC_EXECUTE_CLOSED before ANY tooling import, env VALUE read (secrets present), DB, spawn or provider — proven with throwing deps and a recording env proxy", async () => {
@@ -77,13 +77,13 @@ test("H2 labelled copies: hosted-boot helpers == scripts/e7-hosted-reservation.m
   assert.equal(R.OFFICIAL_CA_SHA256, H.OFFICIAL_CA_SHA256);
   assert.deepEqual([C.listingId, C.dbEnvironment, C.dbProjectRef, C.nodeVersion, [...C.protectedReservationIds]], [H.CONSTANTS.listingId, H.CONSTANTS.dbEnvironment, H.CONSTANTS.dbProjectRef, H.CONSTANTS.nodeVersion, [...H.CONSTANTS.protectedReservationIds]]);
   assert.equal(R.CATALOG_SQL, I.CATALOG_SQL); assert.equal(R.OWNER_ACL_CANON, I.OWNER_ACL_CANON); assert.deepEqual([...R.READ_PATH_FUNCTIONS], [...I.READ_PATH_FUNCTIONS]);
-  // C116: the schema-25 pin is DERIVED on disposable PG (D0 reproduces the accepted schema-23 pin with the same query); it is none of the inspector's 21 / 22 / 23
-  assert.deepEqual(Object.keys(C.catalogPin25).sort(), Object.keys(I.CONSTANTS.catalogPins["23"]).sort());
-  for (const v of ["21", "22", "23"]) assert.notEqual(C.catalogPin25.catalog, I.CONSTANTS.catalogPins[v].catalog, `pin 25 != inspector pin ${v}`); assert.equal(R.bounded.toString(), I.bounded.toString());
+  // C116: the schema-26 pin is DERIVED on disposable PG (D0 reproduces the accepted schema-23 pin with the same query); it is none of the inspector's 21 / 22 / 23
+  assert.deepEqual(Object.keys(C.catalogPin26).sort(), Object.keys(I.CONSTANTS.catalogPins["23"]).sort());
+  for (const v of ["21", "22", "23"]) assert.notEqual(C.catalogPin26.catalog, I.CONSTANTS.catalogPins[v].catalog, `pin 26 != inspector pin ${v}`); assert.equal(R.bounded.toString(), I.bounded.toString());
 });
 
-test("H3 independent closure at the pinned MERGED tooling 9b7a96bf (C116 #178; was 46b3eaf8) (five runtime roots → 9 modules incl. C54 lib/notify/sender-identity.js + package files; bare imports node:* and pg only); digest; pg 8.18.0; the tooling exchange is byte-identical to main's reviewed scripts/e7-resend/resend-exchange.mjs", async () => {
-  assert.equal(execFileSync("git", ["-C", TOOLING, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), C.toolingCommit, "E7_TOOLING_DIR must be the pinned 9b7a96bf checkout");
+test("H3 independent closure at the pinned tooling 5ba7f793 (C116 #180 draft head on the #178 merge 9b7a96bf; was 46b3eaf8) (five runtime roots → 9 modules incl. C54 lib/notify/sender-identity.js + package files; bare imports node:* and pg only); digest; pg 8.18.0; the tooling exchange is byte-identical to main's reviewed scripts/e7-resend/resend-exchange.mjs", async () => {
+  assert.equal(execFileSync("git", ["-C", TOOLING, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), C.toolingCommit, "E7_TOOLING_DIR must be the pinned 5ba7f793 checkout");
   const bare = new Set();
   const scan = (rel, seen = new Set()) => {
     if (seen.has(rel)) return seen; seen.add(rel);
@@ -132,7 +132,7 @@ test("H4 plan: deterministic; binds intent / op / version / locale / the fixed a
     assert.notEqual(R.buildPlan(C, { ...base, [k]: v }).planHash, h0, k);
   for (const over of [{ sender: { fromAddress: "other@sender.mv-test.invalid", fromName: "maraVilla Test" } }, { sender: { fromAddress: "bookings@sender.mv-test.invalid", fromName: "maraVilla Test" } },
     { sender: { fromAddress: "bookings@mail.maravillanayarit.com", fromName: "maraVilla" } }, { toolingCommit: "d322d2192b377d18b6a9280ae06c17eddfe3e73e" }, { excludedIntentIds: [] }, { protectedReservationIds: [] }, { closureDigest: "c".repeat(64) },
-    { catalogPin25: {} }, { budgets: { ...C.budgets, sends: 2 } }, { executeEnabled: true }])
+    { catalogPin26: {} }, { budgets: { ...C.budgets, sends: 2 } }, { executeEnabled: true }])
     assert.notEqual(R.buildPlan({ ...C, ...over }, base).planHash, h0, Object.keys(over)[0]);
   assert.deepEqual(C.sender, { fromAddress: "bookings@mail.micasadirect.com", fromName: "MiCasaDirect" }, "C55: the fixed approved sender (sender only; not a domain-verification claim)");
   assert.deepEqual([...C.excludedIntentIds], ["abede8b1-8ef6-44f2-876e-6a02fc056a96", "c83c1842-d342-4e27-9ab7-dc3d50b7a309"]);
@@ -181,8 +181,8 @@ function fakeDeps(over = {}) {
   return { deps, st };
 }
 
-test("H6b C116 shipped toolingStatus MERGED (the #178 merge 9b7a96bf); a non-MERGED (DRAFT_HEAD) pin can never verify / execute even with executeEnabled true in the seam: NBC_CLOSURE_MISMATCH before any tooling import / secret / DB / provider", async () => {
-  assert.equal(C.toolingStatus, "MERGED");
+test("H6b C116 shipped toolingStatus DRAFT_HEAD (#180 draft head 5ba7f793; flips to MERGED only with the repin to #180's merge commit); a non-MERGED pin can never verify / execute even with executeEnabled true in the seam: NBC_CLOSURE_MISMATCH before any tooling import / secret / DB / provider", async () => {
+  assert.equal(C.toolingStatus, "DRAFT_HEAD");
   for (const mode of ["verify", "execute"]) {
     const c = { ...C, executeEnabled: true, toolingStatus: "DRAFT_HEAD" };
     const { deps, st } = fakeDeps(); const r = await R.runHosted({ mode, env: gated(c, mode === "execute" ? { E7_DEV_BOOKING_DATABASE_URL: DBURL, E7_RESEND_TEST_KEY: KEY } : {}), proc: PROC, wrapperDir: ROOT, deps: { ...deps, constants: c } });
@@ -235,7 +235,7 @@ test("H6 through the TEST-LOCAL seam (executeEnabled true in constants only): ve
 // ---- admission + core through FAKES ------------------------------------------------------------------------------------------------------
 const PLAN = R.buildPlan(OPEN, { approvalRef: "l", intentId: IID, opId: OID, expectedVersion: VER, locale: "en", sourceDigest: "a".repeat(64) }).plan;
 function world(over = {}) {
-  return { role: { ro: "on", iso: "repeatable read", su: false, app: true, adm: false, rep: false, own: false }, catalog: C.catalogPin25, instance: { n: 1, env: "test" },
+  return { role: { ro: "on", iso: "repeatable read", su: false, app: true, adm: false, rep: false, own: false }, catalog: C.catalogPin26, instance: { n: 1, env: "test" },
     intent: [{ id: IID, state: "confirmed", version: VER, listing_id: 606998, currency: "USD", protected_reservation: false, email: "SENTINEL@example.test" }],
     ops: [{ id: OID, state: "pending", attempts: 0, dispatched: false, leased: false, completed: false, has_result: false, template: "booking_confirmed", payload_keys: ["template"], protected_payload: false }],
     pages: [[{ op_id: OID, intent_id: IID, class: "ELIGIBLE" }]], artefacts: { renders: 0, latches: 0, receipts: 0, work_leased: 0 }, throwAt: null, ...over };
@@ -270,8 +270,8 @@ const core = (w, behaviour, c = OPEN, plan = PLAN) => { const log = []; const t 
 test("H7 admission (fake): every refusal is a code, zero worker invocations, zero executors, ROLLBACK; schema must be EXACTLY 23; excluded / protected / version / listing / currency / state / op count / unbound op / non-pristine / payload / template / class / render / latch / receipt / work lease", async () => {
   const i1 = (o) => [{ ...world().intent[0], ...o }]; const o1 = (o) => [{ ...world().ops[0], ...o }];
   const cases = [[{ role: { ...world().role, ro: "off" } }, "NOT_READ_ONLY"], [{ role: { ...world().role, su: true } }, "ROLE_REFUSED"], [{ role: { ...world().role, adm: true } }, "ROLE_REFUSED"],
-    [{ role: { ...world().role, own: true } }, "ROLE_REFUSED"], [{ catalog: (await import("../scripts/e7-hosted-notify-inspect.mjs")).CONSTANTS.catalogPins["21"] }, "CATALOG_NOT_25"], [{ catalog: (await import("../scripts/e7-hosted-notify-inspect.mjs")).CONSTANTS.catalogPins["23"] }, "CATALOG_NOT_25"],
-    [{ catalog: { ...C.catalogPin25, sections: { ...C.catalogPin25.sections, rel: "e".repeat(64) } } }, "CATALOG_NOT_25"], [{ instance: { n: 1, env: "live" } }, "NOT_TEST"],
+    [{ role: { ...world().role, own: true } }, "ROLE_REFUSED"], [{ catalog: (await import("../scripts/e7-hosted-notify-inspect.mjs")).CONSTANTS.catalogPins["21"] }, "CATALOG_NOT_26"], [{ catalog: (await import("../scripts/e7-hosted-notify-inspect.mjs")).CONSTANTS.catalogPins["23"] }, "CATALOG_NOT_26"],
+    [{ catalog: { ...C.catalogPin26, sections: { ...C.catalogPin26.sections, rel: "e".repeat(64) } } }, "CATALOG_NOT_26"], [{ instance: { n: 1, env: "live" } }, "NOT_TEST"],
     [{ intent: [] }, "INTENT_NOT_FOUND"], [{ intent: i1({ protected_reservation: true }) }, "PROTECTED"], [{ intent: i1({ listing_id: 603566 }) }, "LISTING_MISMATCH"],
     [{ intent: i1({ version: VER + 1 }) }, "VERSION_MISMATCH"], [{ intent: i1({ currency: "MXN" }) }, "CURRENCY_NOT_USD"], [{ intent: i1({ state: "payment_captured" }) }, "STATE_NOT_CONFIRMED"],
     [{ ops: [] }, "OP_COUNT"], [{ ops: [...o1({}), { ...o1({})[0], id: "7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0e" }] }, "OP_COUNT"], [{ ops: o1({ id: "7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0e" }) }, "OP_NOT_BOUND"],
@@ -358,9 +358,9 @@ test("H9 C51 verified completion (fake): an accepted worker outcome with the rea
 });
 
 // ---------------------------------------------------------------------------------------------------------------------------------
-// OPT-IN REAL DISPOSABLE POSTGRESQL at schema 25 (C116) with the REAL accepted worker / builder / executor / SQL — FAKE exchange only
+// OPT-IN REAL DISPOSABLE POSTGRESQL at schema 26 (C116) with the REAL accepted worker / builder / executor / SQL — FAKE exchange only
 if (process.env.E7_HBC_DB_TESTS === "1") {
-  const SRC = "test/db/e7-gn-v2-resend-integration.test.mjs"; const SRC_SHA = "1c847a2d6ade0e3aa3f7e8bbdeb7727a4456cb49ad93ecdbe3b9be56ac5d63a0";   // C116: at 9b7a96bf (authorizedBooking gained the guestEmail option + P10); C55: 22ed2f72… at 46b3eaf8 (was 9533197d… at d322d219; changed ONLY by the reviewed #120 commits 589fd9ae + 75132753: C54 P9 + expectedV2 sender param)
+  const SRC = "test/db/e7-gn-v2-resend-integration.test.mjs"; const SRC_SHA = "1c847a2d6ade0e3aa3f7e8bbdeb7727a4456cb49ad93ecdbe3b9be56ac5d63a0";   // C116: at 5ba7f793 (authorizedBooking gained the guestEmail option + P10); C55: 22ed2f72… at 46b3eaf8 (was 9533197d… at d322d219; changed ONLY by the reviewed #120 commits 589fd9ae + 75132753: C54 P9 + expectedV2 sender param)
   const text = readFileSync(join(TOOLING, SRC), "utf8"); assert.equal(sha(text), SRC_SHA, "the pinned accepted helper source");
   const tdir = mkdtempSync(join(tmpdir(), "e7-c50-helpers-")); symlinkSync(join(TOOLING, "node_modules"), join(tdir, "node_modules"));
   const turl = (rel) => pathToFileURL(join(TOOLING, "test/db", rel)).href;
@@ -408,21 +408,24 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
       } finally { await c.end(); }
     } finally { await a.end(); p.stop(); }
   };
-  test("D0 C116 schema-25 pin DERIVED, not copied: the runner's catalog query as the runtime app role on THIS PostgreSQL reproduces the accepted schema-23 pin byte-for-byte at 23, yields EXACTLY CONSTANTS.catalogPin25 at 25, and a schema-24 cluster (shared DEV's current schema) is refused CATALOG_NOT_25 before any worker / exchange", async () => {
+  test("D0 C116 schema-26 pin DERIVED, not copied: the runner's catalog query as the runtime app role on THIS PostgreSQL reproduces the accepted schema-23 pin byte-for-byte at 23, yields EXACTLY CONSTANTS.catalogPin26 at 26 (25 → 26 changes only the function section), and a schema-25 cluster (the pre-0026 state) and a schema-24 cluster (shared DEV's current schema) are each refused CATALOG_NOT_26 before any worker / exchange", async () => {
     const I = await import("../scripts/e7-hosted-notify-inspect.mjs");
     assert.deepEqual(await identityAt(23), I.CONSTANTS.catalogPins["23"], "the derivation reproduces the accepted schema-23 pin");
-    const i24 = await identityAt(24); assert.notEqual(i24.catalog, C.catalogPin25.catalog);
-    assert.deepEqual(Object.keys(i24.sections).filter((k) => i24.sections[k] !== C.catalogPin25.sections[k]), ["fn"], "24 → 25 changes only the function section");
-    assert.deepEqual(await identityAt(25), C.catalogPin25, "the pinned schema-25 identity");
-    const p24 = await Hm.startPostgres(); const a24 = new pg.Client({ connectionString: p24.adminUrl }); await a24.connect();
-    try {
-      await Hm.migrateUp(a24, { env: "test", to: 24 }); await a24.query("CREATE ROLE test_app LOGIN IN ROLE mv_booking_app");
-      const app24 = new pg.Pool({ connectionString: p24.appUrl(), max: 2 }); const bk = await ready(); const fx = fakeExchange(ok200);
-      try { const r = await run(bk, bk.op.id, "en", fx, { pool: app24 }); assert.deepEqual([r.code, r.admission, r.workerInvocations, fx.calls], ["NBC_ADMISSION_REFUSED", "CATALOG_NOT_25", 0, 0]); } finally { await app24.end(); }
-    } finally { await a24.end(); p24.stop(); }
+    const i25 = await identityAt(25); assert.notEqual(i25.catalog, C.catalogPin26.catalog);
+    assert.deepEqual(Object.keys(i25.sections).filter((k) => i25.sections[k] !== C.catalogPin26.sections[k]), ["fn"], "25 → 26 changes only the function section");
+    assert.equal(i25.readPath, C.catalogPin26.readPath, "the read path is unchanged by 0026");
+    assert.deepEqual(await identityAt(26), C.catalogPin26, "the pinned schema-26 identity");
+    for (const to of [25, 24]) {
+      const p = await Hm.startPostgres(); const a = new pg.Client({ connectionString: p.adminUrl }); await a.connect();
+      try {
+        await Hm.migrateUp(a, { env: "test", to }); await a.query("CREATE ROLE test_app LOGIN IN ROLE mv_booking_app");
+        const app = new pg.Pool({ connectionString: p.appUrl(), max: 2 }); const bk = await ready(); const fx = fakeExchange(ok200);
+        try { const r = await run(bk, bk.op.id, "en", fx, { pool: app }); assert.deepEqual([r.code, r.admission, r.workerInvocations, fx.calls], ["NBC_ADMISSION_REFUSED", "CATALOG_NOT_26", 0, 0], `schema ${to}`); } finally { await app.end(); }
+      } finally { await a.end(); p.stop(); }
+    }
   });
 
-  test("D7 C116 the EXACT simulation sink on the FAKE wire (real PG25, real worker / executor at 9b7a96bf): a guest stored as delivered@resend.dev is admitted (class ELIGIBLE) → ONE fake 200 → PROVIDER_ACCEPTED + VERIFIED readback; wire `to` === [the stored email] (no rewrite); a rerun is refused OP_NOT_PRISTINE with ZERO calls; a look-alike guest is CLASS_NOT_ELIGIBLE with ZERO calls and no table change", async () => {
+  test("D7 C116 the EXACT simulation sink on the FAKE wire (real PG26, real worker / executor at 5ba7f793): a guest stored as delivered@resend.dev is admitted (class ELIGIBLE) → ONE fake 200 → PROVIDER_ACCEPTED + VERIFIED readback; wire `to` === [the stored email] (no rewrite); a rerun is refused OP_NOT_PRISTINE with ZERO calls; a look-alike guest is CLASS_NOT_ELIGIBLE with ZERO calls and no table change", async () => {
     const bk = await ready({ guestEmail: "delivered@resend.dev" }); const reqs = [];
     const stored = (await db.owner.query("SELECT email FROM booking.intent_guests WHERE intent_id = $1", [bk.id])).rows[0].email;
     assert.equal(stored === "delivered@resend.dev", true);
@@ -441,7 +444,7 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
     assert.deepEqual(await fingerprint(), f0, "no table change for the refused look-alike");
   });
 
-  test("D1 execute body (seam) on disposable PG25 — EN: admission → ONE real worker invocation → ONE fake 200 → PROVIDER_ACCEPTED; durable succeeded / resend ref / ONE receipt / gn-v2 en render; a rerun (fresh executor) is refused at admission with ZERO exchange calls (durable no-resend)", async () => {
+  test("D1 execute body (seam) on disposable PG26 — EN: admission → ONE real worker invocation → ONE fake 200 → PROVIDER_ACCEPTED; durable succeeded / resend ref / ONE receipt / gn-v2 en render; a rerun (fresh executor) is refused at admission with ZERO exchange calls (durable no-resend)", async () => {
     const bk = await ready(); const fx = fakeExchange(ok200);
     const r = await run(bk, bk.op.id, "en", fx);
     assert.deepEqual([r.code, r.admission, r.workerOutcome, r.workerInvocations, r.sendsAttempted, fx.calls, r.providerAccepted, r.providerReplay, r.deliveryProven], ["PROVIDER_ACCEPTED", "ADMITTED", "accepted", 1, 1, 1, true, false, false], JSON.stringify(r));
@@ -461,7 +464,7 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
     assert.deepEqual([again.code, again.admission, fx2.calls], ["NBC_ADMISSION_REFUSED", "OP_NOT_PRISTINE", 0]); assert.doesNotMatch(JSON.stringify(r) + JSON.stringify(again), PII);
   });
 
-  test("D3 binding refusals on real PG25 leave EVERY booking table unchanged with ZERO exchange calls: wrong version / foreign op / excluded intent id / out-of-scope (.example) recipient / owner role / foreign listing; a schema-21 database → CATALOG_NOT_23", async () => {
+  test("D3 binding refusals on real PG26 leave EVERY booking table unchanged with ZERO exchange calls: wrong version / foreign op / excluded intent id / out-of-scope (.example) recipient / owner role / foreign listing; a schema-21 database → CATALOG_NOT_23", async () => {
     const bk = await ready(); const out = await ready({ guestDomain: "mv-test.example" });
     const f0 = await fingerprint();
     const ownerPool = new pg.Pool({ connectionString: db.adminUrl, max: 2 });
@@ -479,7 +482,7 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
     try {
       await Hm.migrateUp(a21, { env: "test", to: 21 }); await a21.query("CREATE ROLE test_app LOGIN IN ROLE mv_booking_app");
       const app21 = new pg.Pool({ connectionString: p21.appUrl(), max: 2 });
-      try { const r = await run(bk, bk.op.id, "en", fakeExchange(ok200), { pool: app21 }); assert.deepEqual([r.code, r.admission], ["NBC_ADMISSION_REFUSED", "CATALOG_NOT_25"]); } finally { await app21.end(); }
+      try { const r = await run(bk, bk.op.id, "en", fakeExchange(ok200), { pool: app21 }); assert.deepEqual([r.code, r.admission], ["NBC_ADMISSION_REFUSED", "CATALOG_NOT_26"]); } finally { await app21.end(); }
     } finally { await a21.end(); p21.stop(); }
   });
 
@@ -501,7 +504,7 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
     }
   });
 
-  test("D5 C51 the documented class-ELIGIBLE-but-SQL-refused path on real PG25 (source version drift): admission passes (class ELIGIBLE), the accepted worker's v2 claim records its refusal → NOT_SENT with ZERO provider calls — and NOT zero database effects: exactly ONE durable effect, the latch VERSION_DRIFT; the op stays pending / attempts 0, no render / receipt", async () => {
+  test("D5 C51 the documented class-ELIGIBLE-but-SQL-refused path on real PG26 (source version drift): admission passes (class ELIGIBLE), the accepted worker's v2 claim records its refusal → NOT_SENT with ZERO provider calls — and NOT zero database effects: exactly ONE durable effect, the latch VERSION_DRIFT; the op stays pending / attempts 0, no render / receipt", async () => {
     const bk = await ready();
     await Hm.F.ownerManagedHistory(db.owner, "UPDATE booking.intents SET version = version + 1 WHERE id = $1", [bk.id]);   // TEST SETUP: intent version ≠ op source_version
     const v = (await db.owner.query("SELECT version FROM booking.intents WHERE id = $1", [bk.id])).rows[0].version;
@@ -523,7 +526,7 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
     assert.doesNotMatch(JSON.stringify(r), PII);
   });
 
-  test("D6 C55 the exact approved sender on the FAKE wire (real PG25, real worker / executor at 9b7a96bf): from === 'MiCasaDirect <bookings@mail.micasadirect.com>', recipient still the DB's .invalid address; the superseded real sender (seam) is refused before any claim with ZERO exchange calls and no table change", async () => {
+  test("D6 C55 the exact approved sender on the FAKE wire (real PG26, real worker / executor at 5ba7f793): from === 'MiCasaDirect <bookings@mail.micasadirect.com>', recipient still the DB's .invalid address; the superseded real sender (seam) is refused before any claim with ZERO exchange calls and no table change", async () => {
     const bk = await ready(); const reqs = [];
     const fx = fakeExchange((id, req) => { reqs.push(req); return ok200(id); });
     const r = await run(bk, bk.op.id, "en", fx);

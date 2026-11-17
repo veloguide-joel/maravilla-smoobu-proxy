@@ -26,8 +26,8 @@ after(() => { assert.deepEqual(GUARD, { request: 0, Agent: 0, fetch: 0 }, "no re
 
 const WF = ".github/workflows/e7-hosted-kickoff.yml";
 const yml = readFileSync(join(ROOT, WF), "utf8");
-const PIN = "4e79f26619c26954fe89c1b626e7be0e138ef383";   // e7-test #153 MERGE commit (C112-F1 ghs_ token shape)
-const PIPE_PIN = "f09bcbbdfac88ca8dfd212a386d2af03698f9b710a49189b0ac9262531510999";
+const PIN = "5ba7f793be8ca4e09ec3ce7a7388b34e97dd7cba";   // C116: e7-test #180 draft head (was 4e79f266 #153)
+const PIPE_PIN = "880db5b33024edbf0879fbaf5a3826e3622db12fd1808e8c2047238da507fe1b";   // C116 (was f09bcbbd)
 const PREFIX = "e7-hosted-kickoff-v1\n";
 const FILES = ["scripts/e7-hosted-kickoff.mjs", "test/e7-hosted-kickoff.test.mjs", "test/e7-hosted-kickoff-workflow.test.mjs", WF];
 const code = yml.replace(/^#.*\n/gm, "");                      // counts ignore the header comment block
@@ -66,7 +66,7 @@ test("W2 PERMISSIONS (for ROOT security review): workflow default contents: read
   assert.doesNotMatch(yml.replace(/^#.*$/gm, ""), /secrets\.GITHUB_TOKEN|secrets\.[A-Z_]*PAT|secrets\.[A-Z_]*APP|app-id|private-key|create-github-app-token/i);
 });
 
-test("W3 static: checkouts at the EXACT dispatch SHA + the immutable tooling pin 4e79f266 (persist-credentials false) in all three jobs; the reviewed action pins; Node 22.22.0; preflight / verify have no environment / secret / token / npm / curl", () => {
+test("W3 static: checkouts at the EXACT dispatch SHA + the tooling pin 5ba7f793 (persist-credentials false) in all three jobs; the reviewed action pins; Node 22.22.0; preflight / verify have no environment / secret / token / npm / curl", () => {
   assert.equal(count(/ref: \$\{\{ github\.sha \}\}\n          path: wrapper\n          persist-credentials: false/g), 4);
   assert.equal(count(new RegExp(`repository: veloguide-joel/maravilla-smoobu-proxy\\n          ref: ${PIN}\\n          path: tooling\\n          persist-credentials: false`, "g")), 4);
   assert.equal(count(/persist-credentials: false/g), 8); assert.doesNotMatch(yml, /ref: main|ref: refs\/heads|ref: \$\{\{ github\.ref/);
@@ -127,7 +127,7 @@ const expectedDigest = async () => {
 };
 
 test("W6 preflight bindings block executed locally: passes only with HEAD == dispatch SHA, tooling == pin and a known mode (C113: incl. detect — run 43929404455 refused it); unknown / empty modes refuse", () => {
-  assert.equal(toolSha, PIN, "E7_TOOLING_DIR must be the pinned 4e79f266 checkout");
+  assert.equal(toolSha, PIN, "E7_TOOLING_DIR must be the pinned 5ba7f793 checkout");
   const d = sandbox(); try {
     const bind = runBlock("Verify checkout bindings (wrapper HEAD == dispatch SHA; tooling HEAD == pin; no secrets)");
     for (const mode of ["preflight", "verify", "execute", "detect"]) { const ok = sh(bind, { E7_WORKFLOW_SHA: headSha, E7_TOOLING_PIN: PIN, E7_MODE: mode }, d); assert.equal(ok.status, 0, ok.out); }
@@ -141,7 +141,7 @@ test("W6 preflight bindings block executed locally: passes only with HEAD == dis
 
 test("W7 execute re-check block executed locally (BEFORE any secret): HEAD / tooling / 64-hex / own source digest, then the PIPELINE release binding — today's CLOSED main pipeline is REFUSED with the reviewed pin f09bcbbd; the shell frame equals the runner's pipelineBinding", async () => {
   const d = sandbox(); try {
-    const blk = runBlock("Re-check bindings BEFORE any secret (HEAD == dispatch SHA; tooling pin; kickoff source digest; pipeline release binding f09bcbbd)");
+    const blk = runBlock("Re-check bindings BEFORE any secret (HEAD == dispatch SHA; tooling pin; kickoff source digest; pipeline release binding 880db5b3)");
     assert.doesNotMatch(blk, /E7_DEV_BOOKING_DATABASE_URL|E7_DISPATCH_TOKEN|github\.token|\.mjs execute|secrets\./);
     assert.match(jobs.execute, new RegExp(`E7_PIPELINE_SOURCE_PIN: ${PIPE_PIN}\\n`)); assert.equal(R.CONSTANTS.pipeline.sourceDigest, PIPE_PIN);
     const want = await expectedDigest(); const pipe = await R.pipelineBinding(ROOT);
@@ -159,10 +159,10 @@ test("W7 execute re-check block executed locally (BEFORE any secret): HEAD / too
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
 
-test("W8 untouched: main's eight tracked runners stay CLOSED and byte-unchanged (pipeline, five reviewed runners, C47 inspection, C50 booking-confirmation); the new files are in no other frame", async () => {
+test("W8 untouched: main's seven tracked runners stay CLOSED and byte-unchanged (pipeline, five reviewed runners, C47 inspection; C116: the C50 booking-confirmation exact pin lives in the cross-runner regression); the new files are in no other frame", async () => {
   const P = await import("../scripts/e7-hosted-pipeline.mjs");
   assert.equal(P.CONSTANTS.executeEnabled, false, "pipeline");
-  assert.equal(await R.framedDigest(ROOT, P.CONSTANTS.runnerFiles, "e7-hosted-pipeline-v1\n"), "ce13841b28cbe1677c19b1b21b11b139050e7bdad4c32c47bf1c91240bbf4005", "the CLOSED pipeline source on main a726d8ca");
+  assert.equal(await R.framedDigest(ROOT, P.CONSTANTS.runnerFiles, "e7-hosted-pipeline-v1\n"), "cfe62d4d8b3eaeb739576b8762ee4b3753d47e4f8ed8258696ca40406a66e2d4", "the CLOSED pipeline source on main a726d8ca");
   assert.ok(!P.CONSTANTS.runnerFiles.some((f) => FILES.includes(f)));
   const want = { reservation: "5665544de105e4564a57a4434fa32fd2355b9bbd0e756b250d1248e07feb6b19", capture: "5b547a42200b452055d8a718c84ab70f7f2b5a0cd8343f6174c4a75b0c420ed1",
     "test-cleanup": "33f2ab18984dccd3915a18ff8a55dd4a6e5b6bf89e3d84ba1e578347e6cebd1e", recording: "49b5516cb69543a6bd4a697a407d2f2a97a84e18a63f18715338f099917e4824",
@@ -175,17 +175,18 @@ test("W8 untouched: main's eight tracked runners stay CLOSED and byte-unchanged 
   const I = await import("../scripts/e7-hosted-notify-inspect.mjs");
   assert.equal(I.CONSTANTS.executeEnabled, false);
   assert.equal(await R.framedDigest(ROOT, I.CONSTANTS.runnerFiles, I.SOURCE_DIGEST_PREFIX), "889d6a31af4249cede0bf8b64360b5ca0e7ca2d994c4c882f0348e5f57c2c8e7");
+  // C116: the C50 booking-confirmation runner's exact digest / CLOSED assertions moved to the dedicated C116 cross-runner regression (outside every
+  // runtime frame); only frame disjointness stays here
   const N = await import("../scripts/e7-hosted-booking-confirmation.mjs");
-  assert.equal(N.CONSTANTS.executeEnabled, false);
-  assert.equal(await R.framedDigest(ROOT, N.CONSTANTS.runnerFiles, "e7-hosted-booking-confirmation-v1\n"), "aff728cf8b3867a2580c8159f73081bccf2fd1659b4e07075822e14a7c4c16a0");
+  assert.ok(!N.CONSTANTS.runnerFiles.some((f) => FILES.includes(f)));
 });
 
 // ---- C113: the detect job + the trusted job-output routing --------------------------------------------------------------------------
 test("W9 C113 detect job: checkouts → node → the SAME pre-secret re-check block as execute (byte-identical; executed locally) → npm ci → CA → the ONE detect step LAST; declared outputs outcome + fingerprint only; no token", async () => {
   assert.deepEqual(steps(jobs.detect).map((s) => s.split(" (")[0].split(",")[0]), ["Checkout wrapper", "Checkout E7 kickoff tooling", "Set up Node 22.22.0", "Re-check bindings BEFORE the DB secret",
     "Install the pinned dependency from the verified lockfile", "Fetch the public Supabase CA", "ONE gated read-only detection"]);
-  const det = runBlock("Re-check bindings BEFORE the DB secret, detect (HEAD == dispatch SHA; tooling pin; kickoff source digest; pipeline release binding f09bcbbd)");
-  const exe = runBlock("Re-check bindings BEFORE any secret (HEAD == dispatch SHA; tooling pin; kickoff source digest; pipeline release binding f09bcbbd)");
+  const det = runBlock("Re-check bindings BEFORE the DB secret, detect (HEAD == dispatch SHA; tooling pin; kickoff source digest; pipeline release binding 880db5b3)");
+  const exe = runBlock("Re-check bindings BEFORE any secret (HEAD == dispatch SHA; tooling pin; kickoff source digest; pipeline release binding 880db5b3)");
   assert.equal(det, exe, "identical pre-secret checks in both secret-bearing jobs");
   assert.match(jobs.detect, /\n    outputs:\n      outcome: \$\{\{ steps\.detect\.outputs\.outcome \}\}\n      fingerprint: \$\{\{ steps\.detect\.outputs\.fingerprint \}\}\n    steps:/);
   assert.doesNotMatch(jobs.detect, /E7_INTENT_ID|E7_BOOKING_REF|E7_EXPECTED_VERSION|E7_PAYMENT_INTENT_ID|E7_AMOUNT_MINOR|github\.token|E7_DISPATCH_TOKEN|actions: write/, "no binding input, no token");

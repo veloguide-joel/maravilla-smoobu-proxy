@@ -2,8 +2,9 @@
 // test/e7-hosted-booking-confirmation-workflow.test.mjs. Static assertions on the
 // workflow bytes + LOCAL execution of its gate shell blocks (extracted from the YAML, run with bash against symlinked wrapper / tooling dirs).
 // Zero network, zero secrets: the ONE execute step is never executed here (only asserted); every real network primitive is a throwing guard.
-// Also pins that the five reviewed runners, the C47 inspection runner, the C50 booking-confirmation runner, the charge-list probe and the Resend sink probe
-// are byte-unchanged and that none of their frames contains a C90 file.
+// Also pins that the five reviewed runners, the C47 inspection runner, the charge-list probe and the Resend sink probe are byte-unchanged and that
+// none of their frames (nor the C50 booking-confirmation runner's) contains a C90 file. C116: the C50 runner's exact digest lives in
+// test/e7-cross-runner-regression.test.mjs, outside every runtime frame.
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import https from "node:https";
@@ -134,7 +135,7 @@ test("W6 execute re-check block executed locally (BEFORE any secret): passes onl
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
 
-test("W7 untouched: the five reviewed runners (executeEnabled false, digests unchanged), the C47 inspection runner (889d6a31…), the C50 booking-confirmation runner (C116 2ebeb8f7…), the charge-list probe (43715872…) and the Resend sink probe (aef26da9…) source digests; the new files are in no other frame", async () => {
+test("W7 untouched: the five reviewed runners (executeEnabled false, digests unchanged), the C47 inspection runner (889d6a31…), the C50 booking-confirmation runner frame-disjoint only (exact digest: cross-runner regression), the charge-list probe (43715872…) and the Resend sink probe (aef26da9…) source digests; the new files are in no other frame", async () => {
   const want = { reservation: "5665544de105e4564a57a4434fa32fd2355b9bbd0e756b250d1248e07feb6b19", capture: "5b547a42200b452055d8a718c84ab70f7f2b5a0cd8343f6174c4a75b0c420ed1",
     "test-cleanup": "33f2ab18984dccd3915a18ff8a55dd4a6e5b6bf89e3d84ba1e578347e6cebd1e", recording: "49b5516cb69543a6bd4a697a407d2f2a97a84e18a63f18715338f099917e4824",
     "recorded-cleanup": "9e2021e3ec96bab16869fc194adac672287d559587b2cb7657738ffcd897de1f" };
@@ -147,9 +148,9 @@ test("W7 untouched: the five reviewed runners (executeEnabled false, digests unc
   assert.equal(I.CONSTANTS.executeEnabled, false);
   assert.equal(await R.framedDigest(ROOT, I.CONSTANTS.runnerFiles, I.SOURCE_DIGEST_PREFIX), "889d6a31af4249cede0bf8b64360b5ca0e7ca2d994c4c882f0348e5f57c2c8e7", "C47/C48 inspection runner unchanged");
   assert.ok(!I.CONSTANTS.runnerFiles.some((f) => FILES.includes(f)));
+  // C116: the C50 booking-confirmation runner's exact digest / CLOSED assertions moved to test/e7-cross-runner-regression.test.mjs
+  // (OUTSIDE every runtime frame) — pinning it here made the pipeline ENABLE frame depend on the notification frame (C116 cycle).
   const N = await import("../scripts/e7-hosted-booking-confirmation.mjs");
-  assert.equal(N.CONSTANTS.executeEnabled, false);
-  assert.equal(await R.framedDigest(ROOT, N.CONSTANTS.runnerFiles, "e7-hosted-booking-confirmation-v1\n"), "2ebeb8f7a78ed9c558e058398695e45d28a05613c33f6dd99028e4f4bb4de9d0", "C50 booking-confirmation runner (C116 repin to tooling 9b7a96bf + schema 25; was aff728cf)");
   assert.ok(!N.CONSTANTS.runnerFiles.some((f) => FILES.includes(f)));
   assert.equal(await R.framedDigest(ROOT, ["scripts/e7-hosted-charge-list-probe.mjs", "test/e7-hosted-charge-list-probe.test.mjs", ".github/workflows/e7-hosted-charge-list-probe.yml"], "e7-hosted-charge-list-probe-v1\n"), "43715872ddb450889286880c848acefd8757da6fe33bc5c6a3a547bd27219cf3");
   assert.equal(await R.framedDigest(ROOT, ["scripts/e7-resend-sink-probe.mjs", "scripts/e7-resend/resend-exchange.mjs", "test/e7-resend-sink-probe.test.mjs", ".github/workflows/e7-resend-sink-probe.yml"], "e7-resend-sink-probe-v1\n"), "aef26da954d986dc2d922b607d391be404dd73f1145ece0ae66ea0d80673ade4");

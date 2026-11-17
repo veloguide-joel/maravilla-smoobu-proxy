@@ -9,7 +9,7 @@
 # and ONLY its final step receives the built-in, EPHEMERAL, job-scoped `github.token` (as E7_DISPATCH_TOKEN) — no PAT, no new secret, no App.
 # The existing DB secret NAME E7_DEV_BOOKING_DATABASE_URL + the pinned Supabase CA appear in that SAME final step only.
 # RELEASE BINDING: the transport's expectedMainSha is this run's own github.sha, used only after the SAME checkout's pipeline runnerFiles frame to
-# the reviewed ENABLE source digest f09bcbbd…0999 (closure f7d7cad6…7273) — checked below in shell BEFORE any secret and again by the runner.
+# the reviewed ENABLE source digest 880db5b3…fe1b (C116; was f09bcbbd…0999) (closure f7d7cad6…7273) — checked below in shell BEFORE any secret and again by the runner.
 # C113 DETECT (MANUAL workflow_dispatch only; no schedule): mode `detect` = preflight → verify (CLOSED flags → CLOSED_NOOP exit 0, open=false:
 # the gated jobs are SKIPPED, 0 DB-secret reads, 0 approval prompts) → `detect` (environment e7-readonly-probe = APPROVAL #1; the DB secret
 # in its final step only; ONE rolled-back read-only snapshot; NO token, NO transport; declared outputs outcome + fingerprint only, never an
@@ -92,11 +92,11 @@ jobs:
           ref: ${{ github.sha }}
           path: wrapper
           persist-credentials: false
-      - name: Checkout E7 kickoff tooling (fixed commit 4e79f266)
+      - name: Checkout E7 kickoff tooling (fixed commit 5ba7f793)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: 4e79f26619c26954fe89c1b626e7be0e138ef383
+          ref: 5ba7f793be8ca4e09ec3ce7a7388b34e97dd7cba
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0
@@ -107,7 +107,7 @@ jobs:
       - name: Verify checkout bindings (wrapper HEAD == dispatch SHA; tooling HEAD == pin; no secrets)
         env:
           E7_WORKFLOW_SHA: ${{ github.sha }}
-          E7_TOOLING_PIN: 4e79f26619c26954fe89c1b626e7be0e138ef383
+          E7_TOOLING_PIN: 5ba7f793be8ca4e09ec3ce7a7388b34e97dd7cba
           E7_MODE: ${{ github.event_name == 'schedule' && 'detect' || inputs.mode }}
         run: |
           set -eu
@@ -144,11 +144,11 @@ jobs:
           ref: ${{ github.sha }}
           path: wrapper
           persist-credentials: false
-      - name: Checkout E7 kickoff tooling (fixed commit 4e79f266)
+      - name: Checkout E7 kickoff tooling (fixed commit 5ba7f793)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: 4e79f26619c26954fe89c1b626e7be0e138ef383
+          ref: 5ba7f793be8ca4e09ec3ce7a7388b34e97dd7cba
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0
@@ -189,11 +189,11 @@ jobs:
           ref: ${{ github.sha }}
           path: wrapper
           persist-credentials: false
-      - name: Checkout E7 kickoff tooling (fixed commit 4e79f266)
+      - name: Checkout E7 kickoff tooling (fixed commit 5ba7f793)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: 4e79f26619c26954fe89c1b626e7be0e138ef383
+          ref: 5ba7f793be8ca4e09ec3ce7a7388b34e97dd7cba
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0
@@ -201,12 +201,12 @@ jobs:
         with:
           node-version: "22.22.0"
           package-manager-cache: false
-      - name: Re-check bindings BEFORE the DB secret, detect (HEAD == dispatch SHA; tooling pin; kickoff source digest; pipeline release binding f09bcbbd)
+      - name: Re-check bindings BEFORE the DB secret, detect (HEAD == dispatch SHA; tooling pin; kickoff source digest; pipeline release binding 880db5b3)
         env:
           E7_WORKFLOW_SHA: ${{ github.sha }}
-          E7_TOOLING_PIN: 4e79f26619c26954fe89c1b626e7be0e138ef383
+          E7_TOOLING_PIN: 5ba7f793be8ca4e09ec3ce7a7388b34e97dd7cba
           E7_EXPECTED_SOURCE_DIGEST: ${{ github.event_name == 'schedule' && (vars.E7_KICKOFF_EXPECTED_SOURCE || 'MISSING') || inputs.expected_source_digest }}
-          E7_PIPELINE_SOURCE_PIN: f09bcbbdfac88ca8dfd212a386d2af03698f9b710a49189b0ac9262531510999
+          E7_PIPELINE_SOURCE_PIN: 880db5b33024edbf0879fbaf5a3826e3622db12fd1808e8c2047238da507fe1b
         run: |
           set -eu
           head="$(git -C wrapper rev-parse HEAD)"
@@ -252,11 +252,11 @@ jobs:
           ref: ${{ github.sha }}
           path: wrapper
           persist-credentials: false
-      - name: Checkout E7 kickoff tooling (fixed commit 4e79f266)
+      - name: Checkout E7 kickoff tooling (fixed commit 5ba7f793)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: 4e79f26619c26954fe89c1b626e7be0e138ef383
+          ref: 5ba7f793be8ca4e09ec3ce7a7388b34e97dd7cba
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0
@@ -264,12 +264,12 @@ jobs:
         with:
           node-version: "22.22.0"
           package-manager-cache: false
-      - name: Re-check bindings BEFORE any secret (HEAD == dispatch SHA; tooling pin; kickoff source digest; pipeline release binding f09bcbbd)
+      - name: Re-check bindings BEFORE any secret (HEAD == dispatch SHA; tooling pin; kickoff source digest; pipeline release binding 880db5b3)
         env:
           E7_WORKFLOW_SHA: ${{ github.sha }}
-          E7_TOOLING_PIN: 4e79f26619c26954fe89c1b626e7be0e138ef383
+          E7_TOOLING_PIN: 5ba7f793be8ca4e09ec3ce7a7388b34e97dd7cba
           E7_EXPECTED_SOURCE_DIGEST: ${{ github.event_name == 'schedule' && (vars.E7_KICKOFF_EXPECTED_SOURCE || 'MISSING') || inputs.expected_source_digest }}
-          E7_PIPELINE_SOURCE_PIN: f09bcbbdfac88ca8dfd212a386d2af03698f9b710a49189b0ac9262531510999
+          E7_PIPELINE_SOURCE_PIN: 880db5b33024edbf0879fbaf5a3826e3622db12fd1808e8c2047238da507fe1b
         run: |
           set -eu
           head="$(git -C wrapper rev-parse HEAD)"
