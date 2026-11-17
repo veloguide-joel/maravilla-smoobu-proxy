@@ -148,7 +148,7 @@ function world({ nightly = 250 } = {}) {
 }
 
 let laneN = 0;
-async function authorizedBooking(w, { guestDomain = "mv-test.invalid", listingId: fixedListing = null } = {}) {
+async function authorizedBooking(w, { guestDomain = "mv-test.invalid", listingId: fixedListing = null, guestEmail = null } = {}) {
   laneN += 1;
   const listingId = fixedListing ?? 891000 + laneN;
   const stay = { from: addDays("2026-12-01", 3 * laneN), to: addDays("2026-12-01", 3 * laneN + 2), guests: 2 };
@@ -158,7 +158,7 @@ async function authorizedBooking(w, { guestDomain = "mv-test.invalid", listingId
   assert.ok(priced.ok, priced.error);
   const intent = await createIntentRecord(db.app, { ref: F.nextRef(), accessTokenHash: F.tokenHash(), environment: "test", now: base, listingId, ...stay });
   F.ok(await applyEvent(db.app, intent.id, { type: "PRICE_CONFIRMED", price: priced.price }, { now: base, actor: "guest" }));
-  const guest = { firstName: "Synthia", lastName: "Fixture", email: `guest.n${laneN}@${guestDomain}` };   // SYNTHETIC; never logged
+  const guest = { firstName: "Synthia", lastName: "Fixture", email: guestEmail ?? `guest.n${laneN}@${guestDomain}` };   // SYNTHETIC (C116: or the exact sink); never logged
   F.ok(await collectGuestDetails(db.app, intent.id, guest, { now: base + SEC, termsVersion: "terms-2026-10" }));
   const b = F.ok(await beginPayStep(db.app, intent.id, { now: base + 2 * SEC }));
   const op = await claimNextOperation(db.app, { workerId: "w-pay", now: base + 2 * SEC, intentId: intent.id, opTypes: ["stripe.create_checkout_session"] });
@@ -559,6 +559,53 @@ test("P9 C54 exact approved real sender (SENDER ONLY; recipients stay .invalid):
   assert.equal(getter, 0, "hidden accessor never invoked"); assert.equal(fx0.calls, 0);
   const out = await confirmedBooking({ guestDomain: "mv-test.example" }); const fo = fakeExchange();
   assert.deepEqual([(await runNotificationStep(db.app, realOpts(out, fo, "en"))).outcome, fo.calls], ["idle", 0], "real sender never widens the recipient scope (.example never acquired)");
+  assert.equal(netAttempts, 0);
+});
+
+test("P10 C116 simulation-sink RECIPIENT (0025): a guest stored as exactly delivered@resend.dev is ELIGIBLE and goes through the UNCHANGED gn-v2 chain with the approved sender over the FAKE exchange — wire `to` == stored guest email == the address bound into the render recipientHash; ONE receipt; repeated steps idle (no resend); UNKNOWN never resent; look-alike guests never acquired; the gn-v1 (mock) path never sends to the sink; the sink is never a sender", async () => {
+  assert.ok(TOP >= 25, "0025 applied");
+  const REAL = Object.freeze({ ...APPROVED_REAL_SENDER }); const SINK = "delivered@resend.dev";
+  const realOpts = (bk, fx, locale, over = {}) => provOpts(bk, mkPE(fx, REAL), locale, { sender: { ...REAL }, ...over });
+  { const bk = await confirmedBooking({ guestEmail: SINK }); const fx = fakeExchange();
+    const g = await one("SELECT email, first_name FROM booking.intent_guests WHERE intent_id = $1", [bk.id]);
+    assert.equal(g.email === SINK, true, "stored guest email is exactly the sink");
+    assert.equal(await klass(bk.op.id), "ELIGIBLE");
+    const exp = await expectedV2(bk, "en", REAL); assert.equal(exp.ok, true);
+    const r = CLEAN(await runNotificationStep(db.app, realOpts(bk, fx, "en")));
+    assert.deepEqual([r.ok, r.outcome, r.sends, r.requestVersion, r.provider, fx.calls], [true, "accepted", 1, "gn-v2", "resend", 1]);
+    const wire = JSON.parse(Buffer.from(fx.reqs[0].body).toString("utf8"));
+    assert.equal(JSON.stringify(wire.to) === JSON.stringify([SINK]), true, "wire recipient is exactly the stored sink (no rewrite)");
+    assert.equal(exp.request.to === SINK, true);
+    const rd = await renderOf(bk.op.id);
+    assert.equal(rd.recipient_hash, exp.recipientHash, "render recipientHash is the stored sink + name");
+    assert.equal(rd.content_hash, exp.contentHash);
+    const rc = await receiptOf(bk.op.id); assert.equal(rc.content_hash, exp.contentHash);
+    assert.deepEqual([(await notifyOf(bk.id)).state, (await notifyOf(bk.id)).attempts], ["succeeded", 1]);
+    for (let k = 0; k < 2; k++) { const fk = fakeExchange(); assert.equal((await runNotificationStep(db.app, realOpts(bk, fk, "en", { workerId: `gn2-s${k}` }))).outcome, "idle"); assert.equal(fk.calls, 0, "no resend"); } }
+  { const bk = await confirmedBooking({ guestEmail: SINK }); const fx = fakeExchange(() => ({ status: 500, headers: H200(), body: Buffer.from("x") }));
+    const r = CLEAN(await runNotificationStep(db.app, realOpts(bk, fx, "en")));
+    assert.deepEqual([r.outcome, fx.calls, (await notifyOf(bk.id)).state, await receiptOf(bk.op.id)], ["unknown", 1, "outcome_unknown", undefined]);
+    const fk = fakeExchange(); assert.equal((await runNotificationStep(db.app, realOpts(bk, fk, "en", { workerId: "gn2-su" }))).outcome, "idle"); assert.equal(fk.calls, 0, "UNKNOWN never resent"); }
+  for (const look of ["delivered+x@resend.dev", "x@resend.dev", "delivered@resend.dev.example", "delivered@mail.resend.dev", "delivered@resend.devx"]) {
+    const bk = await confirmedBooking({ guestEmail: look }); const fx = fakeExchange();
+    assert.notEqual(await klass(bk.op.id), "ELIGIBLE", look);
+    assert.deepEqual([(await runNotificationStep(db.app, realOpts(bk, fx, "en"))).outcome, fx.calls], ["idle", 0], `${look}: never acquired`);
+  }
+  { const bk = await confirmedBooking({ guestEmail: SINK }); const s = sink();
+    const r = await step(bk, s, { workerId: "gn1-sink" });
+    assert.equal(r.sends ?? 0, 0, "the gn-v1 (mock) path never sends to the sink (its builder keeps the `.invalid`-only recipient rule)");
+    assert.equal(s.invocations, 0); }
+  const bk0 = { id: "00000000-0000-4000-8000-0000000000ca", listingId: 891998 };
+  const fx0 = fakeExchange(); const peSyn = mkPE(fx0);
+  for (const sender of [{ fromAddress: SINK, fromName: "MiCasaDirect" }, { fromAddress: SINK, fromName: "maraVilla Test" }]) {
+    assert.equal(createResendNotificationExecutor({ exchange: fx0.exchange, credential: () => KEY, sender: { ...sender } }).ok, false, "the sink is never an executor sender");
+    for (const o of [provOpts(bk0, peSyn, "en", { sender: { ...sender } }), gnOpts(bk0, sink(), { sender: { ...sender } }), gnOpts(bk0, sink(), { sender: { ...sender }, ...v2("en") })]) {
+      const p = wrapPool(db.app);
+      assert.deepEqual(await runNotificationStep(p, o), { ok: false, code: "OPTIONS_INVALID" }, "the sink is never a worker sender");
+      assert.deepEqual(p.log, [], "zero queries");
+    }
+  }
+  assert.equal(fx0.calls, 0);
   assert.equal(netAttempts, 0);
 });
 
