@@ -17,6 +17,8 @@ on:
       - "claude/gen-0027-wrapper.py"
       - "claude/derive-0027-pins.mjs"
       - "test/db/e7-0027-*"
+      - "claude/e7-c118-c116-record*"
+      - "claude/gen-c118-c116-record.py"
   workflow_dispatch:
 permissions:
   contents: read
@@ -64,4 +66,4 @@ jobs:
           test/db/e7-c118-external-cancellation.test.mjs test/db/e7-c118-notification-worker.test.mjs
           test/db/e6-intent-api.test.mjs test/db/e7-c98-booking-progress-api.test.mjs
           test/db/e7-checkout-test-page-integration.test.mjs test/db/e7-checkout-test-release.test.mjs
-          test/db/e7-0027-sqleditor-apply-wrapper.test.mjs
+          test/db/e7-0027-sqleditor-apply-wrapper.test.mjs test/db/e7-c118-c116-record.test.mjs
