@@ -17,18 +17,18 @@ const C103 = { approvalRef: "ROOT-C103-PIPELINE-20261115", intentId: "1d6e770f-b
 const bound = (o = {}) => ({ intentId: "2b7c5a10-0f3e-4d1a-9c2b-7e5f4a3b2c1d", ref: "MV-ABCD1234", authorizedVersion: 4, paymentIntentId: "pi_3TestKickoff0001",
   amountMinor: 14000, currency: "USD", listingId: 606998, notBefore: "2026-11-16T00:00:01.234Z", ...o });
 
-test("K1 known answer: the pinned plan copy reproduces ROOT's recorded C103 real plan hash 11c29542… (deployed ENABLE revision 9455bc9e, frame f09bcbbd) AND the C116 rebound frame b8716c54 answer 2ffa60ba… (real 9455bc9e runner bytes)", () => {
+test("K1 known answer: the pinned plan copy reproduces ROOT's recorded C103 real plan hash 11c29542… (deployed ENABLE revision 9455bc9e, frame f09bcbbd) AND the C116 rebound frame 880db5b3 answer 61ef5cef… (real 9455bc9e runner bytes)", () => {
   // the HISTORICAL known answer still binds the copy: the deployed 9455bc9e revision's C103 plan at its own frame f09bcbbd
   assert.equal(K.buildPlan(K.PINNED_PLAN_CONSTANTS, { ...C103, sourceDigest: "f09bcbbdfac88ca8dfd212a386d2af03698f9b710a49189b0ac9262531510999" }).planHash, "11c29542491236af50ce8e89f28983c425944a3d0ee54ce642cccd1af754ca1b");
-  // C116: the same inputs at the rebound ENABLE frame b8716c54 (known answer computed by the REAL 9455bc9e runner bytes a5b9ebca, not by this copy)
+  // C116: the same inputs at the rebound ENABLE frame 880db5b3 (known answer computed by the REAL 9455bc9e runner bytes a5b9ebca, not by this copy)
   const { planHash, plan } = K.buildPlan(K.PINNED_PLAN_CONSTANTS, { ...C103, sourceDigest: K.PINNED_REVISION.sourceDigest });
-  assert.equal(planHash, "2ffa60ba5502d4ab2d9daa558caa2693059748858aeef6b37a40c744b0e1a0c0");
-  assert.equal(plan.executeEnabled, true); assert.equal(plan.sourceDigest, "b8716c54854cca61490f9c35ce1e0aee76a2abb2e2b0ca8c27239ad507247558");
+  assert.equal(planHash, "61ef5cef9aaf5f8aa1f497debc0bb6bd15646a5c06234b9d386afe80aa317c60");
+  assert.equal(plan.executeEnabled, true); assert.equal(plan.sourceDigest, "880db5b33024edbf0879fbaf5a3826e3622db12fd1808e8c2047238da507fe1b");
   assert.deepEqual(K.PINNED_REVISION, { wrapperCommit: "9455bc9ee15370b5321b7a04a96e893e9e80080b", wrapperTree: "f5eac3c1e31d0a9b90f841eac519a025dd6a444b",
     runnerPath: "scripts/e7-hosted-pipeline.mjs", runnerSha256: "a5b9ebca0c4b071f75d318357a8849070d9e2710b4ff652df8fa0ad4dc0cf7e7",
     workflowPath: ".github/workflows/e7-hosted-pipeline.yml", workflowFile: "e7-hosted-pipeline.yml",
     workflowSha256: "3feeed1588c091843c560815840ce98bd6d0fa335dc2acde37b3a42d81d3efbb",
-    sourceDigest: "b8716c54854cca61490f9c35ce1e0aee76a2abb2e2b0ca8c27239ad507247558",
+    sourceDigest: "880db5b33024edbf0879fbaf5a3826e3622db12fd1808e8c2047238da507fe1b",
     closureDigest: "f7d7cad646eaed2fb37a63e031157732ee6e2a44824f9d935d6b9104e08f7273" });
 });
 

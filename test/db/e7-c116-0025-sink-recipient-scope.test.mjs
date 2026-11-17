@@ -35,7 +35,7 @@ const others = () => q1(`SELECT md5(string_agg(x, E'\\n' ORDER BY x)) AS h FROM 
 const sqlScope = async (v) => (await q1("SELECT booking.gn_recipient_in_scope($1) AS r", [v])).r;
 
 test("C116-D1 0025 on base schema 24: in-place replacement (same OID / owner / ACL / volatility / invoker / search_path / signature / return / strict / parallel), no privilege change for any role, every other booking object identical; JS ↔ SQL parity on every shared vector and NULL; exact down restores the 0016 definition; re-up identical", async () => {
-  const M = loadMigrations(); assert.equal(M.at(-1).version, 25); assert.equal(M.at(-1).name, "gn_sink_recipient_scope");
+  const M = loadMigrations(); assert.equal(M.find((m) => m.version === 25).name, "gn_sink_recipient_scope");   // C116: 0026 follows (kickoff literal rebind)
   assert.deepEqual(await migrateUp(c, { env: "test", to: 24 }), Array.from({ length: 24 }, (_, i) => i + 1));
   const a24 = await attrs(); const p24 = await privs(); const o24 = await others();
   assert.deepEqual([a24.vol, a24.secdef, a24.config, a24.lang, a24.args, a24.ret], ["i", false, "{\"search_path=pg_catalog, booking\"}", "sql", "p_email text", "boolean"]);
@@ -43,7 +43,7 @@ test("C116-D1 0025 on base schema 24: in-place replacement (same OID / owner / A
   for (const [v, want] of SQLV) if (v !== "delivered@resend.dev") assert.equal(await sqlScope(v), want, `schema 24 ${JSON.stringify(v)}`);
   assert.equal(await sqlScope("delivered@resend.dev"), false, "schema 24: the sink is out of scope");
 
-  assert.deepEqual(await migrateUp(c, { env: "test" }), [25]);
+  assert.deepEqual(await migrateUp(c, { env: "test", to: 25 }), [25]);
   const a25 = await attrs();
   for (const k of ["oid", "owner", "acl", "vol", "secdef", "config", "lang", "args", "ret", "strict", "parallel"]) assert.equal(a25[k], a24[k], `0025 preserves ${k}`);
   assert.notEqual(a25.def, a24.def, "the body changed");
@@ -64,6 +64,6 @@ test("C116-D1 0025 on base schema 24: in-place replacement (same OID / owner / A
   assert.deepEqual(await privs(), p24); assert.equal((await others()).h, o24.h);
   assert.equal(await sqlScope("delivered@resend.dev"), false, "down: the sink is out of scope again");
 
-  assert.deepEqual(await migrateUp(c, { env: "test" }), [25]);
+  assert.deepEqual(await migrateUp(c, { env: "test", to: 25 }), [25]);
   const r25 = await attrs(); for (const k of Object.keys(a25)) assert.equal(r25[k], a25[k], `re-up identical ${k}`);
 });

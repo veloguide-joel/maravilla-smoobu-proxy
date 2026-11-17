@@ -254,7 +254,7 @@ test("P12 C108-F2 the SQL claim binds the reviewed source / closure digests as l
   }
   const k = await authorizedFresh(); const g = await goodFor(k);
   assert.deepEqual(Object.keys(g.inputs), [...WORKFLOW_INPUT_KEYS]);
-  assert.equal(g.inputs.expected_source_digest, "b8716c54854cca61490f9c35ce1e0aee76a2abb2e2b0ca8c27239ad507247558");
+  assert.equal(g.inputs.expected_source_digest, "880db5b33024edbf0879fbaf5a3826e3622db12fd1808e8c2047238da507fe1b");
   assert.equal(g.inputs.expected_closure_digest, "f7d7cad646eaed2fb37a63e031157732ee6e2a44824f9d935d6b9104e08f7273");
   assert.equal((await q1("SELECT booking.claim_pipeline_kickoff($1, 'root-pins', $2, $3) AS r", [k.id, g.planHash, g.inputs]))[0].r, "CLAIMED");
 });
