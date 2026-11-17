@@ -145,7 +145,7 @@ test("P1 one atomic apply over schema-23 data: notice E7_24_APPLIED, status 24 +
   assert.deepEqual(post.kickoff_catalog, RUNNER_CATALOG_PINS);
   const appc = new pg.Client({ connectionString: db.appUrl() }); await appc.connect();
   try { assert.deepEqual(await kickoffCatalog(appc), RUNNER_CATALOG_PINS, "the runner's own probe, as the runtime app role, admits this database"); } finally { await appc.end(); }
-  const st = await migrationStatus(db.c, { env: "test" }); assert.deepEqual([st.applied.length, st.pending.length], [24, 0]);
+  const st = await migrationStatus(db.c, { env: "test" }); assert.deepEqual([st.applied.length, st.pending], [24, [25]]);   // 0025 (C116 sink recipient scope) mechanical pin: only the later migration is pending
   const r2 = await runWrapper(db.c); assert.deepEqual(r2.notices, ["E7_24_ALREADY_EXACT_NOOP"]); assert.deepEqual(await readback(db.c), post, "second apply wrote nothing");
   const B = await startDbAt(24);
   try { assert.deepEqual(identity(await inventory(B.c)), identity(PINS.post), "migrator-built 24 == the wrapper POST"); assert.deepEqual((await runWrapper(B.c)).notices, ["E7_24_ALREADY_EXACT_NOOP"]); }

@@ -135,7 +135,10 @@ test("X4 refusals BEFORE the exchange (kind 'refused', zero exchange calls, zero
     ["spoofed hash", { request: r, opId: OP, contentHash: "f".repeat(64) }, "CONTENT_HASH_MISMATCH"],
     ["recipient rewrite (stale hash)", { request: mut({ to: "other@mv-test.invalid" }), opId: OP, contentHash: b.contentHash }, "CONTENT_HASH_MISMATCH"],
     ["recipient real domain (hash recomputed)", { request: mut({ to: "guest@gmail.com" }), opId: OP, contentHash: rehash(mut({ to: "guest@gmail.com" })) }, "RECIPIENT_SCOPE"],
-    ["recipient Resend sink (hash recomputed)", { request: mut({ to: "delivered@resend.dev" }), opId: OP, contentHash: rehash(mut({ to: "delivered@resend.dev" })) }, "RECIPIENT_SCOPE"],
+    // C116: the EXACT sink delivered@resend.dev is now IN the recipient scope (isRecipientInScope; see test/e7-c116-sink-recipient-scope.test.mjs);
+    // every look-alike of it stays refused here, even with a recomputed hash
+    ...["delivered+x@resend.dev", "Delivered@resend.dev", "x@resend.dev", "delivered@resend.dev.", "delivered@mail.resend.dev"].map((to) =>
+      [`recipient sink look-alike ${to} (hash recomputed)`, { request: mut({ to }), opId: OP, contentHash: rehash(mut({ to })) }, "RECIPIENT_SCOPE"]),
     ["sender rewrite (hash recomputed)", { request: mut({ from: "x@other.invalid" }), opId: OP, contentHash: rehash(mut({ from: "x@other.invalid" })) }, "SENDER_BINDING"],
     ["sender name rewrite (hash recomputed)", { request: mut({ fromName: "Other" }), opId: OP, contentHash: rehash(mut({ fromName: "Other" })) }, "SENDER_BINDING"],
     ["subject rewrite (stale hash)", { request: mut({ subject: "x" }), opId: OP, contentHash: b.contentHash }, "CONTENT_HASH_MISMATCH"],
