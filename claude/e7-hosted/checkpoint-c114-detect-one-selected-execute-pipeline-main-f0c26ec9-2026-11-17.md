@@ -23,7 +23,11 @@ This closes the main gap left by the C113 NO_REQUEST checkpoint.
 - `[Claude-obs]` = Claude's read-only Hostaway / TEST-page reads.
 - `[ROOT-held]` = facts ROOT holds privately; they are not reproduced here.
 
-Claude ran no workflow, gate approval, merge, DB query, payment or provider write.
+**Roles (rev 2, corrected; ROOT F2):**
+- **Claude** performed the authorized TEST checkout setup. It created ONE Stripe Sandbox Checkout session via the TEST page, which invokes Stripe session creation, and it authored the PRs.
+- **Joel** performed the Pay.
+- **ROOT** performed the merges, gate approvals and the workflow dispatch.
+- Claude performed no reservation, capture, recording, refund, cancellation or notification action, and no gate approval, merge, dispatch or DB query.
 
 ---
 
@@ -33,6 +37,7 @@ Claude ran no workflow, gate approval, merge, DB query, payment or provider writ
 |---|---|
 | F1 fix | #170 → `d42e056d`, tree `150e5c3b`: the detect summary shows `candidateFingerprint=` for outcome ONE only |
 | ENABLE | #171 merged 03:43:55Z → **X `ab974bcb7d69212eac299a4bcaf17c9a19e6e9d0`**. Same 7-path flag delta as #165 (98 identical +/- lines); pipeline files byte-identical to `9455bc9e` |
+| Synthetic preflight at X | kickoff run **44012456752** (03:45:48–03:46:08Z): preflight `PREFLIGHT_OK_PIPELINE_BOUND`; verify / detect / execute skipped |
 | CLOSE | #172 merged 03:50:33Z → **`f0c26ec9dc8ae32bc98abc3e71c89221f2fd7e1a`**, tree **`150e5c3b2156edbd7a2f5325060c4b7b801676ba`** == the pre-ENABLE closed tree `d42e056d` |
 | Digests at X | kickoff source `d4ac34ab…4e24`; kickoff closure `07fedfca…e87b`; pipeline source `f09bcbbd…0999`; pipeline closure `f7d7cad6…7273`; plan hash `5b52b840…e731` |
 
@@ -67,7 +72,12 @@ Claude ran no workflow, gate approval, merge, DB query, payment or provider writ
 
 **Approval by ROOT:** ROOT reviewed the exact-release preflight, its independently recomputed plan hash matched, and fresh TEST admission and calendar checks passed. It approved this one bounded run: at most one create, TEST capture and recording; no refund, cancellation, void or notification; main already CLOSED.
 
-**Runs at X:** exactly one kickoff run and one pipeline run are documented here. ROOT confirmed there were no others; that is ROOT's observation, not re-proven here.
+**Runs at X (rev 2, corrected; ROOT F1):** the public run collection for `ab974bcb` shows **TWO kickoff runs and ONE pipeline run**, all `success`:
+- synthetic preflight **44012456752**;
+- detect / selected kickoff **44012555878**;
+- pipeline **44012956409**.
+
+This was read by Claude from GitHub, and ROOT independently re-read the same collection.
 
 ## 4. Provider end state [Claude-obs, read-only, sanitized]
 
@@ -92,7 +102,7 @@ That matches a 1-night stay, Dec 15 → 16.
 
 ## 5. Request lifecycle (sanitized)
 - Two earlier C114 Checkout sessions expired unpaid. ROOT recorded the first intent as `payment_expired`, with its claim auto-released; both are kept as audit history.
-- The third session was created once by Claude. It was paid **by Joel himself** in Stripe Sandbox with Stripe's public test card at ~03:41Z. Claude never enters cards, Link or OTP, and never clicks Pay.
+- The third session was created once by Claude (the authorized checkout setup). It was paid **by Joel himself** in Stripe Sandbox with Stripe's public test card at ~03:41Z. Claude never enters cards, Link or OTP, and never clicks Pay.
 - `[ROOT-held]`:
   - DB proof of `payment_authorized`, then capture;
   - the single `requested` row and its claim / `dispatch_accepted` transition;
