@@ -87,7 +87,7 @@ test("W4 static: the ONLY secrets (existing NAMES E7_DEV_BOOKING_DATABASE_URL an
   const envKeys = [...yml.matchAll(/^          (E7_[A-Z0-9_]+):/gm)].map((m) => m[1]);
   for (const k of envKeys) if (k !== "E7_TOOLING_PIN" && k !== "E7_MODE") assert.ok(R.ALLOWED_E7_KEYS.includes(k), `${k} is an admitted runner key`);
   assert.equal(count(new RegExp(FILES.map((f) => f.replace(/[.\/]/g, "\\$&")).join(" "), "g")), 2, "digest file list identical in both jobs, documented order");
-  assert.equal(R.CONSTANTS.executeEnabled, false, "SHIPPED CLOSED: the verify step refuses NBC_EXECUTE_CLOSED, so no secret step can run");
+  assert.equal(R.CONSTANTS.executeEnabled, true, "C116 ENABLE B: verify proceeds to the exact bindings (the stacked CLOSE B restores false)");
 });
 
 // ---- LOCAL execution of the gate blocks ----------------------------------------------------------------------------------------------

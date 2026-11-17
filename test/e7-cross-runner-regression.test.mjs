@@ -32,7 +32,7 @@ const NOTIFICATION = Object.freeze({
   prefix: "e7-hosted-booking-confirmation-v1\n",
   runnerFiles: ["scripts/e7-hosted-booking-confirmation.mjs", "test/e7-hosted-booking-confirmation.test.mjs", "test/e7-hosted-booking-confirmation-workflow.test.mjs",
     ".github/workflows/e7-hosted-booking-confirmation.yml"],
-  frame: "0cd953a9964f47dd4cde627e6c153a2f413effe640ba6e9fb292dd98cf599ed9"   // C116: MERGED tooling 66133a22 (#180) + catalog 26 (was aff728cf on main)
+  frame: "71d7fa3d749569c695d90652330cfe1a036ce1ff093f01cef0a7decca0ca17d0"   // C116 ENABLE B (executeEnabled true; CLOSE B restores 0cd953a9…)
 });
 
 /** every runtime source frame on main: each runner's own runnerFiles, plus the fixed frames the workflow tests pin for the two probes */
@@ -51,7 +51,7 @@ async function runtimeFrames() {
 
 test("X1 the C50 notification runner (moved from pipeline W7 / kickoff W8): SHIPPED CLOSED and its exact frame equals the LITERAL reviewed digest", async () => {
   const N = await import("../scripts/e7-hosted-booking-confirmation.mjs");
-  assert.equal(N.CONSTANTS.executeEnabled, false, "SHIPPED CLOSED");
+  assert.equal(N.CONSTANTS.executeEnabled, true, "C116 ENABLE B (the stacked CLOSE B restores false / SHIPPED CLOSED)");
   assert.deepEqual([...N.CONSTANTS.runnerFiles], NOTIFICATION.runnerFiles);
   assert.equal(await N.framedDigest(ROOT, NOTIFICATION.runnerFiles, NOTIFICATION.prefix), NOTIFICATION.frame);
 });
