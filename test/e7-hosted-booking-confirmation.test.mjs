@@ -1,6 +1,6 @@
 // test/e7-hosted-booking-confirmation.test.mjs — C50: the SHIPPED-CLOSED hosted gn-v2 booking-confirmation runner (scripts/e7-hosted-booking-confirmation.mjs).
 // Always-on: the CLOSED proof (zero imports / env value reads / DB / provider), labelled copies, closure, plan binding, hosted gates, and the admission /
-// core flow through FAKE clients / fake tooling. OPT-IN (E7_HBC_DB_TESTS=1; PG_BIN; E7_TOOLING_DIR = the pinned 5ba7f793 checkout with its pinned pg (C116 repin from 46b3eaf8)):
+// core flow through FAKE clients / fake tooling. OPT-IN (E7_HBC_DB_TESTS=1; PG_BIN; E7_TOOLING_DIR = the pinned 66133a22 checkout with its pinned pg (C116 repin from 46b3eaf8)):
 // the execute BODY through the test-local constants / deps seam on DISPOSABLE PostgreSQL at schema 26 with the REAL accepted worker, builder, branded
 // executor and SQL 23 receipts — the exchange is ALWAYS FAKE (no network). Lifecycle helpers are generated at runtime from the pinned tooling file
 // test/db/e7-gn-v2-resend-integration.test.mjs (sha-checked; verbatim; imports rewritten to the tooling checkout). The hosted preflight child never sets
@@ -35,7 +35,7 @@ const IID = "3f1c2b4a-5d6e-4f70-8a91-b2c3d4e5f607"; const OID = "7a8b9c0d-1e2f-4
 const PII = /@|SENTINEL|Synthia|Zanabria|re_[A-Za-z0-9]|Bearer|FAKEPW|maraVilla booking|reservaci|Payment received|Pago recibido|Hello/;
 const KEY = "re_SENTINELkey0123456789";
 const PROC = { versions: { node: "22.22.0" }, platform: "linux", execArgv: [], getuid: () => 1000 };
-const OPEN = Object.freeze({ ...C, executeEnabled: true, toolingStatus: "MERGED" });   // the TEST-LOCAL seam only (shipped: executeEnabled false; toolingStatus DRAFT_HEAD until the #180 merge repin)
+const OPEN = Object.freeze({ ...C, executeEnabled: true });           // the TEST-LOCAL seam only; the shipped constant stays false
 
 // ---------------------------------------------------------------------------------------------------------------------------------
 test("H1 SHIPPED CLOSED: executeEnabled false; verify AND execute refuse NBC_EXECUTE_CLOSED before ANY tooling import, env VALUE read (secrets present), DB, spawn or provider — proven with throwing deps and a recording env proxy", async () => {
@@ -82,8 +82,8 @@ test("H2 labelled copies: hosted-boot helpers == scripts/e7-hosted-reservation.m
   for (const v of ["21", "22", "23"]) assert.notEqual(C.catalogPin26.catalog, I.CONSTANTS.catalogPins[v].catalog, `pin 26 != inspector pin ${v}`); assert.equal(R.bounded.toString(), I.bounded.toString());
 });
 
-test("H3 independent closure at the pinned tooling 5ba7f793 (C116 #180 draft head on the #178 merge 9b7a96bf; was 46b3eaf8) (five runtime roots → 9 modules incl. C54 lib/notify/sender-identity.js + package files; bare imports node:* and pg only); digest; pg 8.18.0; the tooling exchange is byte-identical to main's reviewed scripts/e7-resend/resend-exchange.mjs", async () => {
-  assert.equal(execFileSync("git", ["-C", TOOLING, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), C.toolingCommit, "E7_TOOLING_DIR must be the pinned 5ba7f793 checkout");
+test("H3 independent closure at the pinned MERGED tooling 66133a22 (C116 #180 merge; was 46b3eaf8) (five runtime roots → 9 modules incl. C54 lib/notify/sender-identity.js + package files; bare imports node:* and pg only); digest; pg 8.18.0; the tooling exchange is byte-identical to main's reviewed scripts/e7-resend/resend-exchange.mjs", async () => {
+  assert.equal(execFileSync("git", ["-C", TOOLING, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), C.toolingCommit, "E7_TOOLING_DIR must be the pinned 66133a22 checkout");
   const bare = new Set();
   const scan = (rel, seen = new Set()) => {
     if (seen.has(rel)) return seen; seen.add(rel);
@@ -181,8 +181,8 @@ function fakeDeps(over = {}) {
   return { deps, st };
 }
 
-test("H6b C116 shipped toolingStatus DRAFT_HEAD (#180 draft head 5ba7f793; flips to MERGED only with the repin to #180's merge commit); a non-MERGED pin can never verify / execute even with executeEnabled true in the seam: NBC_CLOSURE_MISMATCH before any tooling import / secret / DB / provider", async () => {
-  assert.equal(C.toolingStatus, "DRAFT_HEAD");
+test("H6b C116 shipped toolingStatus MERGED (the #180 merge 66133a22); a non-MERGED (DRAFT_HEAD) pin can never verify / execute even with executeEnabled true in the seam: NBC_CLOSURE_MISMATCH before any tooling import / secret / DB / provider", async () => {
+  assert.equal(C.toolingStatus, "MERGED");
   for (const mode of ["verify", "execute"]) {
     const c = { ...C, executeEnabled: true, toolingStatus: "DRAFT_HEAD" };
     const { deps, st } = fakeDeps(); const r = await R.runHosted({ mode, env: gated(c, mode === "execute" ? { E7_DEV_BOOKING_DATABASE_URL: DBURL, E7_RESEND_TEST_KEY: KEY } : {}), proc: PROC, wrapperDir: ROOT, deps: { ...deps, constants: c } });
@@ -360,7 +360,7 @@ test("H9 C51 verified completion (fake): an accepted worker outcome with the rea
 // ---------------------------------------------------------------------------------------------------------------------------------
 // OPT-IN REAL DISPOSABLE POSTGRESQL at schema 26 (C116) with the REAL accepted worker / builder / executor / SQL — FAKE exchange only
 if (process.env.E7_HBC_DB_TESTS === "1") {
-  const SRC = "test/db/e7-gn-v2-resend-integration.test.mjs"; const SRC_SHA = "1c847a2d6ade0e3aa3f7e8bbdeb7727a4456cb49ad93ecdbe3b9be56ac5d63a0";   // C116: at 5ba7f793 (authorizedBooking gained the guestEmail option + P10); C55: 22ed2f72… at 46b3eaf8 (was 9533197d… at d322d219; changed ONLY by the reviewed #120 commits 589fd9ae + 75132753: C54 P9 + expectedV2 sender param)
+  const SRC = "test/db/e7-gn-v2-resend-integration.test.mjs"; const SRC_SHA = "1c847a2d6ade0e3aa3f7e8bbdeb7727a4456cb49ad93ecdbe3b9be56ac5d63a0";   // C116: at 66133a22 (authorizedBooking gained the guestEmail option + P10); C55: 22ed2f72… at 46b3eaf8 (was 9533197d… at d322d219; changed ONLY by the reviewed #120 commits 589fd9ae + 75132753: C54 P9 + expectedV2 sender param)
   const text = readFileSync(join(TOOLING, SRC), "utf8"); assert.equal(sha(text), SRC_SHA, "the pinned accepted helper source");
   const tdir = mkdtempSync(join(tmpdir(), "e7-c50-helpers-")); symlinkSync(join(TOOLING, "node_modules"), join(tdir, "node_modules"));
   const turl = (rel) => pathToFileURL(join(TOOLING, "test/db", rel)).href;
@@ -425,7 +425,7 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
     }
   });
 
-  test("D7 C116 the EXACT simulation sink on the FAKE wire (real PG26, real worker / executor at 5ba7f793): a guest stored as delivered@resend.dev is admitted (class ELIGIBLE) → ONE fake 200 → PROVIDER_ACCEPTED + VERIFIED readback; wire `to` === [the stored email] (no rewrite); a rerun is refused OP_NOT_PRISTINE with ZERO calls; a look-alike guest is CLASS_NOT_ELIGIBLE with ZERO calls and no table change", async () => {
+  test("D7 C116 the EXACT simulation sink on the FAKE wire (real PG26, real worker / executor at 66133a22): a guest stored as delivered@resend.dev is admitted (class ELIGIBLE) → ONE fake 200 → PROVIDER_ACCEPTED + VERIFIED readback; wire `to` === [the stored email] (no rewrite); a rerun is refused OP_NOT_PRISTINE with ZERO calls; a look-alike guest is CLASS_NOT_ELIGIBLE with ZERO calls and no table change", async () => {
     const bk = await ready({ guestEmail: "delivered@resend.dev" }); const reqs = [];
     const stored = (await db.owner.query("SELECT email FROM booking.intent_guests WHERE intent_id = $1", [bk.id])).rows[0].email;
     assert.equal(stored === "delivered@resend.dev", true);
@@ -526,7 +526,7 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
     assert.doesNotMatch(JSON.stringify(r), PII);
   });
 
-  test("D6 C55 the exact approved sender on the FAKE wire (real PG26, real worker / executor at 5ba7f793): from === 'MiCasaDirect <bookings@mail.micasadirect.com>', recipient still the DB's .invalid address; the superseded real sender (seam) is refused before any claim with ZERO exchange calls and no table change", async () => {
+  test("D6 C55 the exact approved sender on the FAKE wire (real PG26, real worker / executor at 66133a22): from === 'MiCasaDirect <bookings@mail.micasadirect.com>', recipient still the DB's .invalid address; the superseded real sender (seam) is refused before any claim with ZERO exchange calls and no table change", async () => {
     const bk = await ready(); const reqs = [];
     const fx = fakeExchange((id, req) => { reqs.push(req); return ok200(id); });
     const r = await run(bk, bk.op.id, "en", fx);

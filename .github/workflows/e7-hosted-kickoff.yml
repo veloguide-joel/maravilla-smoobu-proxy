@@ -92,11 +92,11 @@ jobs:
           ref: ${{ github.sha }}
           path: wrapper
           persist-credentials: false
-      - name: Checkout E7 kickoff tooling (fixed commit 5ba7f793)
+      - name: Checkout E7 kickoff tooling (fixed commit 66133a22)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: 5ba7f793be8ca4e09ec3ce7a7388b34e97dd7cba
+          ref: 66133a22edca925e6386c4d178c251fa5f11c82e
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0
@@ -107,7 +107,7 @@ jobs:
       - name: Verify checkout bindings (wrapper HEAD == dispatch SHA; tooling HEAD == pin; no secrets)
         env:
           E7_WORKFLOW_SHA: ${{ github.sha }}
-          E7_TOOLING_PIN: 5ba7f793be8ca4e09ec3ce7a7388b34e97dd7cba
+          E7_TOOLING_PIN: 66133a22edca925e6386c4d178c251fa5f11c82e
           E7_MODE: ${{ github.event_name == 'schedule' && 'detect' || inputs.mode }}
         run: |
           set -eu
@@ -144,11 +144,11 @@ jobs:
           ref: ${{ github.sha }}
           path: wrapper
           persist-credentials: false
-      - name: Checkout E7 kickoff tooling (fixed commit 5ba7f793)
+      - name: Checkout E7 kickoff tooling (fixed commit 66133a22)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: 5ba7f793be8ca4e09ec3ce7a7388b34e97dd7cba
+          ref: 66133a22edca925e6386c4d178c251fa5f11c82e
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0
@@ -189,11 +189,11 @@ jobs:
           ref: ${{ github.sha }}
           path: wrapper
           persist-credentials: false
-      - name: Checkout E7 kickoff tooling (fixed commit 5ba7f793)
+      - name: Checkout E7 kickoff tooling (fixed commit 66133a22)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: 5ba7f793be8ca4e09ec3ce7a7388b34e97dd7cba
+          ref: 66133a22edca925e6386c4d178c251fa5f11c82e
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0
@@ -204,7 +204,7 @@ jobs:
       - name: Re-check bindings BEFORE the DB secret, detect (HEAD == dispatch SHA; tooling pin; kickoff source digest; pipeline release binding 880db5b3)
         env:
           E7_WORKFLOW_SHA: ${{ github.sha }}
-          E7_TOOLING_PIN: 5ba7f793be8ca4e09ec3ce7a7388b34e97dd7cba
+          E7_TOOLING_PIN: 66133a22edca925e6386c4d178c251fa5f11c82e
           E7_EXPECTED_SOURCE_DIGEST: ${{ github.event_name == 'schedule' && (vars.E7_KICKOFF_EXPECTED_SOURCE || 'MISSING') || inputs.expected_source_digest }}
           E7_PIPELINE_SOURCE_PIN: 880db5b33024edbf0879fbaf5a3826e3622db12fd1808e8c2047238da507fe1b
         run: |
@@ -252,11 +252,11 @@ jobs:
           ref: ${{ github.sha }}
           path: wrapper
           persist-credentials: false
-      - name: Checkout E7 kickoff tooling (fixed commit 5ba7f793)
+      - name: Checkout E7 kickoff tooling (fixed commit 66133a22)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: 5ba7f793be8ca4e09ec3ce7a7388b34e97dd7cba
+          ref: 66133a22edca925e6386c4d178c251fa5f11c82e
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0
@@ -267,7 +267,7 @@ jobs:
       - name: Re-check bindings BEFORE any secret (HEAD == dispatch SHA; tooling pin; kickoff source digest; pipeline release binding 880db5b3)
         env:
           E7_WORKFLOW_SHA: ${{ github.sha }}
-          E7_TOOLING_PIN: 5ba7f793be8ca4e09ec3ce7a7388b34e97dd7cba
+          E7_TOOLING_PIN: 66133a22edca925e6386c4d178c251fa5f11c82e
           E7_EXPECTED_SOURCE_DIGEST: ${{ github.event_name == 'schedule' && (vars.E7_KICKOFF_EXPECTED_SOURCE || 'MISSING') || inputs.expected_source_digest }}
           E7_PIPELINE_SOURCE_PIN: 880db5b33024edbf0879fbaf5a3826e3622db12fd1808e8c2047238da507fe1b
         run: |

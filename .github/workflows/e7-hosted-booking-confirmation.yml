@@ -1,5 +1,5 @@
 # E7 C50: HOSTED gn-v2 BOOKING-CONFIRMATION runner for ONE bound TEST guest.notify operation (scripts/e7-hosted-booking-confirmation.mjs) around the
-# ACCEPTED notification worker + gn-v2 builder + branded Resend executor / exchange (tooling 5ba7f793 = C116 #180 draft head on the #178 merge 9b7a96bf; repin to the #180 merge) and the schema-23 receipts on the reviewed schema 26.
+# ACCEPTED notification worker + gn-v2 builder + branded Resend executor / exchange (tooling 66133a22 = C116 #180 merge, tree ade3e084) and the schema-23 receipts on the reviewed schema 26.
 # SHIPPED CLOSED: the runner's executeEnabled is FALSE — `verify` (and therefore the execute job) refuses NBC_EXECUTE_CLOSED before any import,
 # credential, database or provider access; the secret steps below are never reached while it is closed. HONEST LABEL: MANUAL hosted TEST runner
 # (workflow_dispatch + the EXISTING `e7-readonly-probe` reviewer gate); NOT automatic, NOT a queue / cron / API path; ONE bound op, ONE worker
@@ -81,11 +81,11 @@ jobs:
           ref: ${{ github.sha }}
           path: wrapper
           persist-credentials: false
-      - name: Checkout merged E7 tooling (fixed commit 5ba7f793)
+      - name: Checkout merged E7 tooling (fixed commit 66133a22)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: 5ba7f793be8ca4e09ec3ce7a7388b34e97dd7cba
+          ref: 66133a22edca925e6386c4d178c251fa5f11c82e
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0
@@ -96,7 +96,7 @@ jobs:
       - name: Verify checkout bindings (wrapper HEAD == dispatch SHA; tooling HEAD == pin; no secrets)
         env:
           E7_WORKFLOW_SHA: ${{ github.sha }}
-          E7_TOOLING_PIN: 5ba7f793be8ca4e09ec3ce7a7388b34e97dd7cba
+          E7_TOOLING_PIN: 66133a22edca925e6386c4d178c251fa5f11c82e
           E7_MODE: ${{ inputs.mode }}
         run: |
           set -eu
@@ -138,11 +138,11 @@ jobs:
           ref: ${{ github.sha }}
           path: wrapper
           persist-credentials: false
-      - name: Checkout merged E7 tooling (fixed commit 5ba7f793)
+      - name: Checkout merged E7 tooling (fixed commit 66133a22)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: 5ba7f793be8ca4e09ec3ce7a7388b34e97dd7cba
+          ref: 66133a22edca925e6386c4d178c251fa5f11c82e
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0
@@ -153,7 +153,7 @@ jobs:
       - name: Re-check bindings BEFORE any secret (HEAD == dispatch SHA; tooling pin; label; expected digests 64-hex; source digest)
         env:
           E7_WORKFLOW_SHA: ${{ github.sha }}
-          E7_TOOLING_PIN: 5ba7f793be8ca4e09ec3ce7a7388b34e97dd7cba
+          E7_TOOLING_PIN: 66133a22edca925e6386c4d178c251fa5f11c82e
           E7_APPROVAL_REF: ${{ inputs.approval_ref }}
           E7_EXPECTED_PLAN_HASH: ${{ inputs.expected_plan_hash }}
           E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}

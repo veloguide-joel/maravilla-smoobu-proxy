@@ -63,12 +63,12 @@ export const CATALOG_PINS = deepFreeze({                         // derived from
 export const CONSTANTS = deepFreeze({
   executeEnabled: false,                                           // SHIPPED CLOSED: verify / execute refuse HKO_EXECUTE_CLOSED from key names only
   dispatchEnabled: false,                                          // SHIPPED CLOSED: the core refuses HKO_DISPATCH_CLOSED before any DB acquisition
-  toolingCommit: "5ba7f793be8ca4e09ec3ce7a7388b34e97dd7cba",       // C116: e7-test #180 DRAFT HEAD (0026 + PINNED_REVISION 880db5b3); repin to the #180 merge commit. Was 4e79f266 (#153)
-  toolingStatus: "DRAFT_HEAD",                                     // verify / execute refuse HKO_CLOSURE_MISMATCH unless MERGED (C116: flips with the #180 merge repin)
+  toolingCommit: "66133a22edca925e6386c4d178c251fa5f11c82e",       // C116: e7-test #180 merge commit (tree ade3e084 == reviewed head 5ba7f793; 0026 + PINNED_REVISION 880db5b3). Was 4e79f266 (#153)
+  toolingStatus: "MERGED",                                         // verify / execute refuse HKO_CLOSURE_MISMATCH unless MERGED
   closure: ["lib/booking-db/codec.js", "lib/booking-db/config.js", "lib/booking-db/pipeline-dispatch-transport.js", "lib/booking-db/pipeline-kickoff.js",
     "lib/booking-db/pool.js", "lib/booking-db/repo.js", "lib/checkout/intent-state.js", "lib/checkout/pipeline-kickoff-plan.js",
     "package-lock.json", "package.json", "scripts/e7-connected/probe-env-preflight.mjs"],
-  closureDigest: "e180398f5b9b68d708ac3f8ba0fba138a0a6cf7e7fed0f608384de81ee1ed215",   // C116: framed SHA-256 of `closure` at 5ba7f793 (only lib/checkout/pipeline-kickoff-plan.js differs: PINNED_REVISION 880db5b3); was 07fedfca at 4e79f266 (== e11650ec bytes; only the transport differs from 8af49e87) (the test recomputes it from the pinned tree + an independent import scan)
+  closureDigest: "e180398f5b9b68d708ac3f8ba0fba138a0a6cf7e7fed0f608384de81ee1ed215",   // C116: framed SHA-256 of `closure` at 66133a22 (== 5ba7f793 bytes; only lib/checkout/pipeline-kickoff-plan.js differs: PINNED_REVISION 880db5b3); was 07fedfca at 4e79f266 (== e11650ec bytes; only the transport differs from 8af49e87) (the test recomputes it from the pinned tree + an independent import scan)
   pipeline: {                                                       // the reviewed C102 ENABLE revision the dispatch targets (9455bc9e)
     runnerFiles: ["scripts/e7-hosted-pipeline.mjs", "test/e7-hosted-pipeline.test.mjs", "test/e7-hosted-pipeline-workflow.test.mjs", ".github/workflows/e7-hosted-pipeline.yml"],
     sourcePrefix: "e7-hosted-pipeline-v1\n",

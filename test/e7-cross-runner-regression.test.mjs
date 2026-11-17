@@ -32,7 +32,7 @@ const NOTIFICATION = Object.freeze({
   prefix: "e7-hosted-booking-confirmation-v1\n",
   runnerFiles: ["scripts/e7-hosted-booking-confirmation.mjs", "test/e7-hosted-booking-confirmation.test.mjs", "test/e7-hosted-booking-confirmation-workflow.test.mjs",
     ".github/workflows/e7-hosted-booking-confirmation.yml"],
-  frame: "58e9ac0be65b4f32bb9eae6c29afd630d274f97a9403724b9d6ebedaad5b69c4"   // C116: tooling 5ba7f793 (#180 draft head) + catalog 26 (was aff728cf on main)
+  frame: "0cd953a9964f47dd4cde627e6c153a2f413effe640ba6e9fb292dd98cf599ed9"   // C116: MERGED tooling 66133a22 (#180) + catalog 26 (was aff728cf on main)
 });
 
 /** every runtime source frame on main: each runner's own runnerFiles, plus the fixed frames the workflow tests pin for the two probes */
