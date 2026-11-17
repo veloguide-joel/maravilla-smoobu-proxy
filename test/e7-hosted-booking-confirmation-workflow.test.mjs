@@ -25,7 +25,7 @@ after(() => { assert.deepEqual(GUARD, { request: 0, Agent: 0, fetch: 0 }, "no re
 
 const WF = ".github/workflows/e7-hosted-booking-confirmation.yml";
 const yml = readFileSync(join(ROOT, WF), "utf8");
-const PIN = "46b3eaf801fd3c85e268e3bbdc7d20b7078cdd89";   // C55 repin (#120 merged, C54); was d322d219
+const PIN = "d7e39ae327e4740e4c90dd71b3f9b89ab9686db1";   // C116 repin (#178 draft head; repin to its merge SHA); was 46b3eaf8 (C55)
 const OLD_PIN = "d322d2192b377d18b6a9280ae06c17eddfe3e73e";
 const PREFIX = "e7-hosted-booking-confirmation-v1\n";
 const FILES = ["scripts/e7-hosted-booking-confirmation.mjs", "test/e7-hosted-booking-confirmation.test.mjs", "test/e7-hosted-booking-confirmation-workflow.test.mjs", WF];
@@ -51,7 +51,7 @@ test("W1 static: workflow_dispatch ONLY; inputs exactly mode (choice [preflight,
   assert.deepEqual([...R.CONSTANTS.runnerFiles], FILES);
 });
 
-test("W2 static: checkouts at the EXACT dispatch SHA + the immutable tooling pin 46b3eaf8 (persist-credentials false), the same reviewed action pins as e7-hosted-recording.yml, Node 22.22.0; the preflight job has no environment / secret / npm / curl", () => {
+test("W2 static: checkouts at the EXACT dispatch SHA + the tooling pin d7e39ae3 (persist-credentials false), the same reviewed action pins as e7-hosted-recording.yml, Node 22.22.0; the preflight job has no environment / secret / npm / curl", () => {
   assert.equal(count(/ref: \$\{\{ github\.sha \}\}\n          path: wrapper\n          persist-credentials: false/g), 2);
   assert.equal(count(new RegExp(`repository: veloguide-joel/maravilla-smoobu-proxy\\n          ref: ${PIN}\\n          path: tooling\\n          persist-credentials: false`, "g")), 2);
   assert.equal(count(/persist-credentials: false/g), 4); assert.doesNotMatch(yml, /ref: main|ref: refs\/heads|ref: \$\{\{ github\.ref/);
@@ -105,7 +105,7 @@ const expectedDigest = async () => {
 };
 
 test("W5 preflight gate blocks executed locally: bindings pass only with HEAD == dispatch SHA, tooling == pin and a known mode; the digest block prints the documented frame and refuses a mismatching expected digest", async () => {
-  assert.equal(toolSha, PIN, "E7_TOOLING_DIR must be the pinned 46b3eaf8 checkout");
+  assert.equal(toolSha, PIN, "E7_TOOLING_DIR must be the pinned d7e39ae3 checkout");
   const d = sandbox(); try {
     const bind = runBlock("Verify checkout bindings (wrapper HEAD == dispatch SHA; tooling HEAD == pin; no secrets)");
     for (const mode of ["preflight", "execute"]) { const ok = sh(bind, { E7_WORKFLOW_SHA: headSha, E7_TOOLING_PIN: PIN, E7_MODE: mode }, d); assert.equal(ok.status, 0, ok.out); }

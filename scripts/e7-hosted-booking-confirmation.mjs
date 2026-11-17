@@ -1,22 +1,22 @@
 // scripts/e7-hosted-booking-confirmation.mjs — E7 C50: HOSTED gn-v2 BOOKING-CONFIRMATION runner for ONE bound TEST guest.notify operation, around the
-// ALREADY ACCEPTED tooling (immutable e7-test 46b3eaf8 — C55 repin from d322d219; C54 #120 added lib/notify/sender-identity.js): lib/booking-db/notification-worker.js (gn-v2 opt-in + branded Resend provider opt-in, C41 / C45),
+// ALREADY ACCEPTED tooling (e7-test d7e39ae3 = C116 #178 draft head: the recipient-only simulation-sink scope + migration 0025; C55 pin was 46b3eaf8; C54 #120 added lib/notify/sender-identity.js): lib/booking-db/notification-worker.js (gn-v2 opt-in + branded Resend provider opt-in, C41 / C45),
 // lib/checkout/booking-confirmation-request.js (gn-v2 builder), lib/notify/resend-notification-executor.js (branded executor) and
-// scripts/e7-resend/resend-exchange.mjs (the reviewed single-use HTTPS exchange), with the schema-23 typed receipts. Nothing here re-implements the worker.
+// scripts/e7-resend/resend-exchange.mjs (the reviewed single-use HTTPS exchange), with the schema-23 typed receipts (0023) on the reviewed schema 25. Nothing here re-implements the worker.
 //
 // HONEST LABEL: SHIPPED CLOSED. executeEnabled is FALSE: `verify` and `execute` refuse NBC_EXECUTE_CLOSED right after the mode / unexpected-input checks,
 // BEFORE any tooling import, credential read, database or provider access. The execute BODY exists so that it can be reviewed and exercised through the
-// test-local constants / deps seam on disposable PostgreSQL (schema 23) with FAKE exchanges only. Enabling it is a separate reviewed change (no enable diff
+// test-local constants / deps seam on disposable PostgreSQL (schema 25) with FAKE exchanges only. Enabling it is a separate reviewed change (no enable diff
 // here). Even then: the sender is the FIXED approved identity bookings@mail.micasadirect.com / MiCasaDirect (C54/C55; equal to the pinned tooling's
 // APPROVED_REAL_SENDER, which the accepted worker admits ONLY with gn-v2 + the branded Resend executor). Its sending domain is NOT verified and this
-// source claims no sender / auth readiness. The recipient comes ONLY from the database through the accepted `.invalid`-scoped fences (no rewrite, no simulation-sink substitution). This task
-// selects NO real recipient / domain policy. Provider acceptance (HTTP 200 + id) is NOT delivery.
+// source claims no sender / auth readiness. The recipient comes ONLY from the database through the accepted `.invalid`-scoped fences (no rewrite, no simulation-sink substitution). C116: the
+// fences admit `.invalid` OR exactly the 0025 simulation sink delivered@resend.dev (recipient only; never a sender; no real-recipient / domain policy). Provider acceptance (HTTP 200 + id) is NOT delivery.
 //   * Inert on import (`import.meta.main` guard). Self-contained source frame: this file + its two test files + its workflow. Labelled copies of the
 //     hosted-boot helpers (scripts/e7-hosted-reservation.mjs) and of the C47/C48 catalog identity probe (scripts/e7-hosted-notify-inspect.mjs) are
 //     cross-checked by the tests; no existing runner file is imported or edited.
 //   * Exactly ONE bound intent / operation / expected version / locale (en | es) and the fixed sender are in the plan hash. The historical TEST intents
 //     abede8b1… and c83c1842… are refused by id; protected reservation ids are refused; listing 606998, TEST, DEV project ref fixed.
 //   * Admission (ONE REPEATABLE READ READ ONLY transaction as the runtime app role → ROLLBACK): role proof; catalog identity = EXACTLY the reviewed
-//     schema 23 (receipts required; 21 / 22 / drift refused); TEST instance; intent bound (version / listing / USD / confirmed / not protected / not
+//     schema 25 (C116: 0025 sink scope + receipts required; 21 / 22 / 23 / 24 / drift refused); TEST instance; intent bound (version / listing / USD / confirmed / not protected / not
 //     excluded); EXACTLY ONE guest.notify op for the intent and it IS the bound op, pending / attempts 0 / never dispatched / unleased / no result /
 //     payload keys exactly ["template"] / booking_confirmed; the reviewed 0016 class ELIGIBLE; no render / latch / receipt; the intent work unleased.
 //   * Bound-op contract on the accepted worker (no tooling change): the worker is scoped to the bound intent (claim_notification_work p_intent) and
@@ -39,18 +39,20 @@ import { spawn } from "node:child_process";
 const freeze = Object.freeze;
 function deepFreeze(v) { if (v && typeof v === "object") { for (const k of Object.keys(v)) deepFreeze(v[k]); freeze(v); } return v; }
 
-/** the reviewed schema-23 catalog identity — LABELLED COPY of scripts/e7-hosted-notify-inspect.mjs CONSTANTS.catalogPins["23"] (asserted equal) */
-const CATALOG_PIN_23 = {"catalog":"84b3e96fb4b709a933ed738d9f6ee284fc667e9ef937cdaf1b230775cfe549d6","readPath":"b65eddc193d48fe1d03d265084bff9318052226b5f7bc06faa25b881359cea42","readPathCount":6,"sections":{"col":"60cc4581c26ef735546498ed91fdc15cb28e178978276c90f30eb94e3c5d5efa","con":"0551bcedfedd2195dde1b886f226ad3c571a161ac5ad37680491e8b860de7018","fn":"faa842932cde62c14c41897f12a7ce96b0a155c9b9b2a8d9e2aced13191b1db1","pol":"6945243972e402d97b02f622a6f833c664c3602930347f760a8e4eb56208778a","rel":"37ad76f27a9725f7fb80ae5587547cbf987e8d49a28469e1a15d3b966f332bd5","trg":"8824ff6a6d24a88a164dee959594d44f8e8215423eb082aaea49a9db6d69a874"}};
+/** C116: the reviewed schema-25 catalog identity (0001..0025 at the pinned tooling), derived with THIS file's CATALOG_SQL as the runtime app role on
+ *  disposable PostgreSQL 16 AND 17.11 (identical). The same derivation reproduces the accepted schema-23 pin byte-for-byte (asserted by the tests).
+ *  vs schema 24: only the `fn` section and the read path differ (0025 replaces booking.gn_recipient_in_scope in place). Schemas 21 / 22 / 23 / 24 are refused. */
+const CATALOG_PIN_25 = {"catalog":"5406ae74e87ae74d1438052225ae88c280494dda0d9e0bb89a667c6a2eb908f4","readPath":"31f23b641bb57d5cbdec1aa4896447a574190dd057e4b92e6c5fdf8326220baf","readPathCount":6,"sections":{"con":"550534b1daca47fc1df90a557d5dd28a7f6e1f1df11c581cdbd7a671eb95c188","col":"9d645f671980c7a2e0e679aa07d9a3c30a937e488236f132b589a0a162237fbe","fn":"c94fa4c11e95e593ba55c095267f08088d6780dbcff8994a148c3a9c3ef27d4e","pol":"7c69ad5c06cae91f06e96c8ac9d86d97dbc09e94d95a8afb399b141162ee83ee","rel":"359796c40820562166a4f10dce97ae433fe7ae53c5fd2b3385fc41f179437e89","trg":"13e79df7b90097f365a7f3f15337e58c7b7d5277378608fd482c77e2051982f5"}};
 
 export const CONSTANTS = deepFreeze({
-  toolingCommit: "46b3eaf801fd3c85e268e3bbdc7d20b7078cdd89",          // e7-test: #120 merged (C54, exact head 75132753, tree e191c7ab); immutable. C55 repin from d322d219
-  toolingStatus: "MERGED",
+  toolingCommit: "d7e39ae327e4740e4c90dd71b3f9b89ab9686db1",          // C116: e7-test #178 DRAFT HEAD (sink recipient scope + 0025); REPIN to its merge SHA before review. C55 pin was 46b3eaf8
+  toolingStatus: "DRAFT_HEAD",
   executeEnabled: false,                                                // SHIPPED CLOSED: verify / execute refuse NBC_EXECUTE_CLOSED before any import / secret / DB / provider
-  // the INDEPENDENTLY scanned transitive relative imports of the five runtime roots at 46b3eaf8 (+ package files); bare imports: node:* and pg only
+  // the INDEPENDENTLY scanned transitive relative imports of the five runtime roots at d7e39ae3 (+ package files); bare imports: node:* and pg only
   closure: ["lib/booking-db/notification-worker.js", "lib/booking-db/pool.js", "lib/checkout/booking-confirmation-copy.js", "lib/checkout/booking-confirmation-request.js",
     "lib/checkout/guest-notification.js", "lib/notify/resend-notification-executor.js", "lib/notify/sender-identity.js", "package-lock.json", "package.json", "scripts/e7-connected/probe-env-preflight.mjs",
     "scripts/e7-resend/resend-exchange.mjs"],
-  closureDigest: "4203b4517b1059a309a87ec192ce4db5f20bc253ce680a13a993bdaa57176c46",   // framed SHA-256 of `closure` at 46b3eaf8 (the test recomputes it from the pinned tree + an independent import scan)
+  closureDigest: "6f02ce24f92dc0ef4a4d4bbe22adc4203f15f7ec64f36909dd0b1a8d2bd55d06",   // C116: framed SHA-256 of `closure` at d7e39ae3 (was 4203b451… at 46b3eaf8; only the three C116 files changed) (the test recomputes it from the pinned tree + an independent import scan)
   pgVersion: "8.18.0",
   runnerFiles: ["scripts/e7-hosted-booking-confirmation.mjs", "test/e7-hosted-booking-confirmation.test.mjs", "test/e7-hosted-booking-confirmation-workflow.test.mjs",
     ".github/workflows/e7-hosted-booking-confirmation.yml"],
@@ -62,7 +64,7 @@ export const CONSTANTS = deepFreeze({
   // recipient scope stays the accepted `.invalid` fences. NOT a domain-verification / readiness claim.
   sender: { fromAddress: "bookings@mail.micasadirect.com", fromName: "MiCasaDirect" },
   workerEnv: { VERCEL_ENV: "preview", MV_E7_NOTIFICATION_WORKER: "enabled" },   // the accepted worker's own gate marker, passed ONLY inside the (closed) execute body
-  catalogPin23: CATALOG_PIN_23,
+  catalogPin25: CATALOG_PIN_25,
   // timing scope: every connect ≤ connectMs (this wrapper; the frozen pool has no connect timeout), every statement ≤ the pool's statement_timeout
   // (statementMs, server-side), ≤ statements in total, ONE provider exchange ≤ the reviewed exchange's own 10 s deadline, pool.end ≤ endMs. Not a single
   // wall clock: the workflow's job timeout is a separate outer cancellation.
@@ -87,7 +89,7 @@ export const PLAN_SCHEMA = "e7-hosted-booking-confirmation-plan-v1";
 export const RESULT_SCHEMA = "e7-hosted-booking-confirmation-result-v1";
 export const CORE_CODES = freeze(["PROVIDER_ACCEPTED", "PROVIDER_ACCEPTED_REPLAY", "ACCEPTED_UNVERIFIED_STOP", "UNKNOWN_STOP", "NOT_SENT", "NBC_ADMISSION_REFUSED", "NBC_BOUND_OP_MISMATCH",
   "NBC_WORKER_REFUSED", "NBC_WORKER_ERROR", "NBC_EXECUTOR_INVALID", "NBC_DB_FAILED", "NBC_DB_TIMEOUT", "NBC_BUDGET"]);
-export const ADMISSION_CODES = freeze(["NOT_READ_ONLY", "ROLE_REFUSED", "CATALOG_NOT_23", "NOT_TEST", "INTENT_NOT_FOUND", "INTENT_EXCLUDED", "LISTING_MISMATCH",
+export const ADMISSION_CODES = freeze(["NOT_READ_ONLY", "ROLE_REFUSED", "CATALOG_NOT_25", "NOT_TEST", "INTENT_NOT_FOUND", "INTENT_EXCLUDED", "LISTING_MISMATCH",
   "VERSION_MISMATCH", "CURRENCY_NOT_USD", "STATE_NOT_CONFIRMED", "PROTECTED", "OP_COUNT", "OP_NOT_BOUND", "OP_NOT_PRISTINE", "OP_PAYLOAD_SHAPE", "TEMPLATE_NOT_V2",
   "CLASS_NOT_ELIGIBLE", "RENDER_PRESENT", "LATCH_PRESENT", "RECEIPT_PRESENT", "WORK_LEASED", "REPLY_SHAPE"]);
 export const HOSTED_CODES = freeze(["NBC_USAGE", "NBC_INPUT_UNEXPECTED", "NBC_EXECUTE_CLOSED", "NBC_SECRET_SCOPE_VIOLATION", "NBC_INPUT_INVALID", "NBC_INPUT_INCOMPLETE",
@@ -179,7 +181,7 @@ export const PLAN_INPUT_KEYS = freeze(["approvalRef", "intentId", "opId", "expec
 export function buildPlan(c, { approvalRef, intentId, opId, expectedVersion, locale, sourceDigest }) {
   const plan = { schema: PLAN_SCHEMA, kind: "gn-v2-booking-confirmation-one-bound-op", approvalRef, intentId, opId, expectedVersion, locale,
     sender: c.sender, listingId: c.listingId, dbEnvironment: c.dbEnvironment, dbProjectRef: c.dbProjectRef, toolingCommit: c.toolingCommit, closureDigest: c.closureDigest,
-    sourceDigest, catalogPin23: c.catalogPin23, excludedIntentIds: c.excludedIntentIds, protectedReservationIds: c.protectedReservationIds,
+    sourceDigest, catalogPin25: c.catalogPin25, excludedIntentIds: c.excludedIntentIds, protectedReservationIds: c.protectedReservationIds,
     budgets: { workerInvocations: c.budgets.workerInvocations, sends: c.budgets.sends }, executeEnabled: c.executeEnabled };
   return { plan: deepFreeze(plan), planHash: sha(canonical(plan)) };
 }
@@ -255,7 +257,7 @@ export async function admit({ client, plan, c = CONSTANTS }) {
     if (!id || typeof id !== "object" || !id.sections) no("REPLY_SHAPE");
     const sections = {}; for (const k of ["con", "col", "fn", "pol", "rel", "trg"]) sections[k] = id.sections[k] ?? null;
     if (Object.keys(id.sections).some((k) => !Object.hasOwn(sections, k))) no("REPLY_SHAPE");
-    if (sha(canonical(sections)) !== c.catalogPin23.catalog || id.readPath !== c.catalogPin23.readPath || id.readPathCount !== c.catalogPin23.readPathCount) no("CATALOG_NOT_23");
+    if (sha(canonical(sections)) !== c.catalogPin25.catalog || id.readPath !== c.catalogPin25.readPath || id.readPathCount !== c.catalogPin25.readPathCount) no("CATALOG_NOT_25");
     const inst = one(await q("instance")); if (inst.n !== 1 || inst.env !== c.dbEnvironment) no("NOT_TEST");
     if (c.excludedIntentIds.includes(plan.intentId)) no("INTENT_EXCLUDED");
     const ir = await q("intent", [plan.intentId, [...c.protectedReservationIds]]);

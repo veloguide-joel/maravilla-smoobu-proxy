@@ -1,7 +1,7 @@
 // test/e7-hosted-booking-confirmation.test.mjs — C50: the SHIPPED-CLOSED hosted gn-v2 booking-confirmation runner (scripts/e7-hosted-booking-confirmation.mjs).
 // Always-on: the CLOSED proof (zero imports / env value reads / DB / provider), labelled copies, closure, plan binding, hosted gates, and the admission /
-// core flow through FAKE clients / fake tooling. OPT-IN (E7_HBC_DB_TESTS=1; PG_BIN; E7_TOOLING_DIR = the pinned 46b3eaf8 checkout with its pinned pg (C55 repin from d322d219)):
-// the execute BODY through the test-local constants / deps seam on DISPOSABLE PostgreSQL at schema 23 with the REAL accepted worker, builder, branded
+// core flow through FAKE clients / fake tooling. OPT-IN (E7_HBC_DB_TESTS=1; PG_BIN; E7_TOOLING_DIR = the pinned d7e39ae3 checkout with its pinned pg (C116 repin from 46b3eaf8)):
+// the execute BODY through the test-local constants / deps seam on DISPOSABLE PostgreSQL at schema 25 with the REAL accepted worker, builder, branded
 // executor and SQL 23 receipts — the exchange is ALWAYS FAKE (no network). Lifecycle helpers are generated at runtime from the pinned tooling file
 // test/db/e7-gn-v2-resend-integration.test.mjs (sha-checked; verbatim; imports rewritten to the tooling checkout). The hosted preflight child never sets
 // E7_HBC_DB_TESTS. Nothing here touches a shared database, a provider or the network.
@@ -35,7 +35,7 @@ const IID = "3f1c2b4a-5d6e-4f70-8a91-b2c3d4e5f607"; const OID = "7a8b9c0d-1e2f-4
 const PII = /@|SENTINEL|Synthia|Zanabria|re_[A-Za-z0-9]|Bearer|FAKEPW|maraVilla booking|reservaci|Payment received|Pago recibido|Hello/;
 const KEY = "re_SENTINELkey0123456789";
 const PROC = { versions: { node: "22.22.0" }, platform: "linux", execArgv: [], getuid: () => 1000 };
-const OPEN = Object.freeze({ ...C, executeEnabled: true });           // the TEST-LOCAL seam only; the shipped constant stays false
+const OPEN = Object.freeze({ ...C, executeEnabled: true, toolingStatus: "MERGED" });   // the TEST-LOCAL seam only (shipped: executeEnabled false; C116 toolingStatus DRAFT_HEAD until repinned to the #178 merge SHA)
 
 // ---------------------------------------------------------------------------------------------------------------------------------
 test("H1 SHIPPED CLOSED: executeEnabled false; verify AND execute refuse NBC_EXECUTE_CLOSED before ANY tooling import, env VALUE read (secrets present), DB, spawn or provider — proven with throwing deps and a recording env proxy", async () => {
@@ -77,11 +77,13 @@ test("H2 labelled copies: hosted-boot helpers == scripts/e7-hosted-reservation.m
   assert.equal(R.OFFICIAL_CA_SHA256, H.OFFICIAL_CA_SHA256);
   assert.deepEqual([C.listingId, C.dbEnvironment, C.dbProjectRef, C.nodeVersion, [...C.protectedReservationIds]], [H.CONSTANTS.listingId, H.CONSTANTS.dbEnvironment, H.CONSTANTS.dbProjectRef, H.CONSTANTS.nodeVersion, [...H.CONSTANTS.protectedReservationIds]]);
   assert.equal(R.CATALOG_SQL, I.CATALOG_SQL); assert.equal(R.OWNER_ACL_CANON, I.OWNER_ACL_CANON); assert.deepEqual([...R.READ_PATH_FUNCTIONS], [...I.READ_PATH_FUNCTIONS]);
-  assert.deepEqual(C.catalogPin23, I.CONSTANTS.catalogPins["23"]); assert.equal(R.bounded.toString(), I.bounded.toString());
+  // C116: the schema-25 pin is DERIVED on disposable PG (D0 reproduces the accepted schema-23 pin with the same query); it is none of the inspector's 21 / 22 / 23
+  assert.deepEqual(Object.keys(C.catalogPin25).sort(), Object.keys(I.CONSTANTS.catalogPins["23"]).sort());
+  for (const v of ["21", "22", "23"]) assert.notEqual(C.catalogPin25.catalog, I.CONSTANTS.catalogPins[v].catalog, `pin 25 != inspector pin ${v}`); assert.equal(R.bounded.toString(), I.bounded.toString());
 });
 
-test("H3 independent closure at the immutable tooling 46b3eaf8 (five runtime roots → 9 modules incl. C54 lib/notify/sender-identity.js + package files; bare imports node:* and pg only); digest; pg 8.18.0; the tooling exchange is byte-identical to main's reviewed scripts/e7-resend/resend-exchange.mjs", async () => {
-  assert.equal(execFileSync("git", ["-C", TOOLING, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), C.toolingCommit, "E7_TOOLING_DIR must be the pinned 46b3eaf8 checkout");
+test("H3 independent closure at the pinned tooling d7e39ae3 (C116; was 46b3eaf8) (five runtime roots → 9 modules incl. C54 lib/notify/sender-identity.js + package files; bare imports node:* and pg only); digest; pg 8.18.0; the tooling exchange is byte-identical to main's reviewed scripts/e7-resend/resend-exchange.mjs", async () => {
+  assert.equal(execFileSync("git", ["-C", TOOLING, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), C.toolingCommit, "E7_TOOLING_DIR must be the pinned d7e39ae3 checkout");
   const bare = new Set();
   const scan = (rel, seen = new Set()) => {
     if (seen.has(rel)) return seen; seen.add(rel);
@@ -130,7 +132,7 @@ test("H4 plan: deterministic; binds intent / op / version / locale / the fixed a
     assert.notEqual(R.buildPlan(C, { ...base, [k]: v }).planHash, h0, k);
   for (const over of [{ sender: { fromAddress: "other@sender.mv-test.invalid", fromName: "maraVilla Test" } }, { sender: { fromAddress: "bookings@sender.mv-test.invalid", fromName: "maraVilla Test" } },
     { sender: { fromAddress: "bookings@mail.maravillanayarit.com", fromName: "maraVilla" } }, { toolingCommit: "d322d2192b377d18b6a9280ae06c17eddfe3e73e" }, { excludedIntentIds: [] }, { protectedReservationIds: [] }, { closureDigest: "c".repeat(64) },
-    { catalogPin23: {} }, { budgets: { ...C.budgets, sends: 2 } }, { executeEnabled: true }])
+    { catalogPin25: {} }, { budgets: { ...C.budgets, sends: 2 } }, { executeEnabled: true }])
     assert.notEqual(R.buildPlan({ ...C, ...over }, base).planHash, h0, Object.keys(over)[0]);
   assert.deepEqual(C.sender, { fromAddress: "bookings@mail.micasadirect.com", fromName: "MiCasaDirect" }, "C55: the fixed approved sender (sender only; not a domain-verification claim)");
   assert.deepEqual([...C.excludedIntentIds], ["abede8b1-8ef6-44f2-876e-6a02fc056a96", "c83c1842-d342-4e27-9ab7-dc3d50b7a309"]);
@@ -179,6 +181,16 @@ function fakeDeps(over = {}) {
   return { deps, st };
 }
 
+test("H6b C116 a DRAFT_HEAD tooling pin can never verify / execute: even with executeEnabled true in the seam, toolingStatus !== MERGED refuses NBC_CLOSURE_MISMATCH before any tooling import / secret / DB / provider", async () => {
+  assert.equal(C.toolingStatus, "DRAFT_HEAD");
+  for (const mode of ["verify", "execute"]) {
+    const c = { ...C, executeEnabled: true };
+    const { deps, st } = fakeDeps(); const r = await R.runHosted({ mode, env: gated(c, mode === "execute" ? { E7_DEV_BOOKING_DATABASE_URL: DBURL, E7_RESEND_TEST_KEY: KEY } : {}), proc: PROC, wrapperDir: ROOT, deps: { ...deps, constants: c } });
+    assert.deepEqual([r.exitCode, r.result.code], [1, "NBC_CLOSURE_MISMATCH"], mode);
+    assert.deepEqual([st.imports, st.pools], [0, 0], `${mode}: no tooling import / pool`);
+  }
+});
+
 test("H6 through the TEST-LOCAL seam (executeEnabled true in constants only): verify / execute gates — main ref, run id, plan / source / closure exact, closure drift before import; execute: both secret NAMES required, pinned pg, DB target, pinned CA, then ONE pool (max 2) + the core; both secrets removed from env; key never in the result; pool end bounded", async () => {
   const v = await R.runHosted({ mode: "verify", env: gated(OPEN), proc: PROC, wrapperDir: ROOT, deps: { ...fakeDeps().deps, constants: OPEN } });
   assert.deepEqual([v.exitCode, v.result.code], [0, "VERIFY_OK"]);
@@ -223,7 +235,7 @@ test("H6 through the TEST-LOCAL seam (executeEnabled true in constants only): ve
 // ---- admission + core through FAKES ------------------------------------------------------------------------------------------------------
 const PLAN = R.buildPlan(OPEN, { approvalRef: "l", intentId: IID, opId: OID, expectedVersion: VER, locale: "en", sourceDigest: "a".repeat(64) }).plan;
 function world(over = {}) {
-  return { role: { ro: "on", iso: "repeatable read", su: false, app: true, adm: false, rep: false, own: false }, catalog: C.catalogPin23, instance: { n: 1, env: "test" },
+  return { role: { ro: "on", iso: "repeatable read", su: false, app: true, adm: false, rep: false, own: false }, catalog: C.catalogPin25, instance: { n: 1, env: "test" },
     intent: [{ id: IID, state: "confirmed", version: VER, listing_id: 606998, currency: "USD", protected_reservation: false, email: "SENTINEL@example.test" }],
     ops: [{ id: OID, state: "pending", attempts: 0, dispatched: false, leased: false, completed: false, has_result: false, template: "booking_confirmed", payload_keys: ["template"], protected_payload: false }],
     pages: [[{ op_id: OID, intent_id: IID, class: "ELIGIBLE" }]], artefacts: { renders: 0, latches: 0, receipts: 0, work_leased: 0 }, throwAt: null, ...over };
@@ -258,8 +270,8 @@ const core = (w, behaviour, c = OPEN, plan = PLAN) => { const log = []; const t 
 test("H7 admission (fake): every refusal is a code, zero worker invocations, zero executors, ROLLBACK; schema must be EXACTLY 23; excluded / protected / version / listing / currency / state / op count / unbound op / non-pristine / payload / template / class / render / latch / receipt / work lease", async () => {
   const i1 = (o) => [{ ...world().intent[0], ...o }]; const o1 = (o) => [{ ...world().ops[0], ...o }];
   const cases = [[{ role: { ...world().role, ro: "off" } }, "NOT_READ_ONLY"], [{ role: { ...world().role, su: true } }, "ROLE_REFUSED"], [{ role: { ...world().role, adm: true } }, "ROLE_REFUSED"],
-    [{ role: { ...world().role, own: true } }, "ROLE_REFUSED"], [{ catalog: (await import("../scripts/e7-hosted-notify-inspect.mjs")).CONSTANTS.catalogPins["21"] }, "CATALOG_NOT_23"],
-    [{ catalog: { ...C.catalogPin23, sections: { ...C.catalogPin23.sections, rel: "e".repeat(64) } } }, "CATALOG_NOT_23"], [{ instance: { n: 1, env: "live" } }, "NOT_TEST"],
+    [{ role: { ...world().role, own: true } }, "ROLE_REFUSED"], [{ catalog: (await import("../scripts/e7-hosted-notify-inspect.mjs")).CONSTANTS.catalogPins["21"] }, "CATALOG_NOT_25"], [{ catalog: (await import("../scripts/e7-hosted-notify-inspect.mjs")).CONSTANTS.catalogPins["23"] }, "CATALOG_NOT_25"],
+    [{ catalog: { ...C.catalogPin25, sections: { ...C.catalogPin25.sections, rel: "e".repeat(64) } } }, "CATALOG_NOT_25"], [{ instance: { n: 1, env: "live" } }, "NOT_TEST"],
     [{ intent: [] }, "INTENT_NOT_FOUND"], [{ intent: i1({ protected_reservation: true }) }, "PROTECTED"], [{ intent: i1({ listing_id: 603566 }) }, "LISTING_MISMATCH"],
     [{ intent: i1({ version: VER + 1 }) }, "VERSION_MISMATCH"], [{ intent: i1({ currency: "MXN" }) }, "CURRENCY_NOT_USD"], [{ intent: i1({ state: "payment_captured" }) }, "STATE_NOT_CONFIRMED"],
     [{ ops: [] }, "OP_COUNT"], [{ ops: [...o1({}), { ...o1({})[0], id: "7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0e" }] }, "OP_COUNT"], [{ ops: o1({ id: "7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0e" }) }, "OP_NOT_BOUND"],
@@ -346,9 +358,9 @@ test("H9 C51 verified completion (fake): an accepted worker outcome with the rea
 });
 
 // ---------------------------------------------------------------------------------------------------------------------------------
-// OPT-IN REAL DISPOSABLE POSTGRESQL at schema 23 with the REAL accepted worker / builder / executor / SQL — FAKE exchange only
+// OPT-IN REAL DISPOSABLE POSTGRESQL at schema 25 (C116) with the REAL accepted worker / builder / executor / SQL — FAKE exchange only
 if (process.env.E7_HBC_DB_TESTS === "1") {
-  const SRC = "test/db/e7-gn-v2-resend-integration.test.mjs"; const SRC_SHA = "22ed2f725c049e17c61317914ac8826b41a00b05b0cd48679e23107a038b89f0";   // C55: at 46b3eaf8 (was 9533197d… at d322d219; changed ONLY by the reviewed #120 commits 589fd9ae + 75132753: C54 P9 + expectedV2 sender param)
+  const SRC = "test/db/e7-gn-v2-resend-integration.test.mjs"; const SRC_SHA = "1c847a2d6ade0e3aa3f7e8bbdeb7727a4456cb49ad93ecdbe3b9be56ac5d63a0";   // C116: at d7e39ae3 (authorizedBooking gained the guestEmail option + P10); C55: 22ed2f72… at 46b3eaf8 (was 9533197d… at d322d219; changed ONLY by the reviewed #120 commits 589fd9ae + 75132753: C54 P9 + expectedV2 sender param)
   const text = readFileSync(join(TOOLING, SRC), "utf8"); assert.equal(sha(text), SRC_SHA, "the pinned accepted helper source");
   const tdir = mkdtempSync(join(tmpdir(), "e7-c50-helpers-")); symlinkSync(join(TOOLING, "node_modules"), join(tdir, "node_modules"));
   const turl = (rel) => pathToFileURL(join(TOOLING, "test/db", rel)).href;
@@ -385,7 +397,51 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
   };
   const ready = async (opts) => { const bk = await Hm.confirmedBooking(opts); const v = (await db.owner.query("SELECT version FROM booking.intents WHERE id = $1", [bk.id])).rows[0].version; return { ...bk, version: v }; };
 
-  test("D1 execute body (seam) on disposable PG23 — EN: admission → ONE real worker invocation → ONE fake 200 → PROVIDER_ACCEPTED; durable succeeded / resend ref / ONE receipt / gn-v2 en render; a rerun (fresh executor) is refused at admission with ZERO exchange calls (durable no-resend)", async () => {
+  const identityAt = async (to) => {   // the runner's OWN catalog query as the runtime app role on a fresh disposable cluster migrated to `to`
+    const p = await Hm.startPostgres(); const a = new pg.Client({ connectionString: p.adminUrl }); await a.connect();
+    try {
+      await Hm.migrateUp(a, { env: "test", to }); await a.query("CREATE ROLE test_app LOGIN IN ROLE mv_booking_app");
+      const c = new pg.Client({ connectionString: p.appUrl() }); await c.connect();
+      try { await c.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"); const id = (await c.query(R.CATALOG_SQL, [[...R.READ_PATH_FUNCTIONS]])).rows[0].id; await c.query("ROLLBACK");
+        const sections = {}; for (const k of ["con", "col", "fn", "pol", "rel", "trg"]) sections[k] = id.sections[k] ?? null;
+        return { catalog: sha(R.canonical(sections)), readPath: id.readPath, readPathCount: id.readPathCount, sections };
+      } finally { await c.end(); }
+    } finally { await a.end(); p.stop(); }
+  };
+  test("D0 C116 schema-25 pin DERIVED, not copied: the runner's catalog query as the runtime app role on THIS PostgreSQL reproduces the accepted schema-23 pin byte-for-byte at 23, yields EXACTLY CONSTANTS.catalogPin25 at 25, and a schema-24 cluster (shared DEV's current schema) is refused CATALOG_NOT_25 before any worker / exchange", async () => {
+    const I = await import("../scripts/e7-hosted-notify-inspect.mjs");
+    assert.deepEqual(await identityAt(23), I.CONSTANTS.catalogPins["23"], "the derivation reproduces the accepted schema-23 pin");
+    const i24 = await identityAt(24); assert.notEqual(i24.catalog, C.catalogPin25.catalog);
+    assert.deepEqual(Object.keys(i24.sections).filter((k) => i24.sections[k] !== C.catalogPin25.sections[k]), ["fn"], "24 → 25 changes only the function section");
+    assert.deepEqual(await identityAt(25), C.catalogPin25, "the pinned schema-25 identity");
+    const p24 = await Hm.startPostgres(); const a24 = new pg.Client({ connectionString: p24.adminUrl }); await a24.connect();
+    try {
+      await Hm.migrateUp(a24, { env: "test", to: 24 }); await a24.query("CREATE ROLE test_app LOGIN IN ROLE mv_booking_app");
+      const app24 = new pg.Pool({ connectionString: p24.appUrl(), max: 2 }); const bk = await ready(); const fx = fakeExchange(ok200);
+      try { const r = await run(bk, bk.op.id, "en", fx, { pool: app24 }); assert.deepEqual([r.code, r.admission, r.workerInvocations, fx.calls], ["NBC_ADMISSION_REFUSED", "CATALOG_NOT_25", 0, 0]); } finally { await app24.end(); }
+    } finally { await a24.end(); p24.stop(); }
+  });
+
+  test("D7 C116 the EXACT simulation sink on the FAKE wire (real PG25, real worker / executor at d7e39ae3): a guest stored as delivered@resend.dev is admitted (class ELIGIBLE) → ONE fake 200 → PROVIDER_ACCEPTED + VERIFIED readback; wire `to` === [the stored email] (no rewrite); a rerun is refused OP_NOT_PRISTINE with ZERO calls; a look-alike guest is CLASS_NOT_ELIGIBLE with ZERO calls and no table change", async () => {
+    const bk = await ready({ guestEmail: "delivered@resend.dev" }); const reqs = [];
+    const stored = (await db.owner.query("SELECT email FROM booking.intent_guests WHERE intent_id = $1", [bk.id])).rows[0].email;
+    assert.equal(stored === "delivered@resend.dev", true);
+    const fx = fakeExchange((id, req) => { reqs.push(req); return ok200(id); });
+    const r = await run(bk, bk.op.id, "en", fx);
+    assert.deepEqual([r.code, r.admission, r.verifiedCompletion, r.readback, fx.calls, r.deliveryProven], ["PROVIDER_ACCEPTED", "ADMITTED", true, "VERIFIED", 1, false]);
+    const wire = JSON.parse(Buffer.from(reqs[0].body).toString("utf8"));
+    assert.equal(JSON.stringify(wire.to) === JSON.stringify([stored]), true, "wire recipient === the stored guest email (the sink)");
+    assert.equal(wire.from, "MiCasaDirect <bookings@mail.micasadirect.com>");
+    assert.doesNotMatch(JSON.stringify(r), PII);
+    const fx2 = fakeExchange(ok200); const again = await run(bk, bk.op.id, "en", fx2);
+    assert.deepEqual([again.code, again.admission, again.workerInvocations, fx2.calls], ["NBC_ADMISSION_REFUSED", "OP_NOT_PRISTINE", 0, 0]);
+    const look = await ready({ guestEmail: "delivered+x@resend.dev" }); const f0 = await fingerprint(); const fx3 = fakeExchange(ok200);
+    const lr = await run(look, look.op.id, "en", fx3);
+    assert.deepEqual([lr.code, lr.admission, lr.workerInvocations, fx3.calls], ["NBC_ADMISSION_REFUSED", "CLASS_NOT_ELIGIBLE", 0, 0]);
+    assert.deepEqual(await fingerprint(), f0, "no table change for the refused look-alike");
+  });
+
+  test("D1 execute body (seam) on disposable PG25 — EN: admission → ONE real worker invocation → ONE fake 200 → PROVIDER_ACCEPTED; durable succeeded / resend ref / ONE receipt / gn-v2 en render; a rerun (fresh executor) is refused at admission with ZERO exchange calls (durable no-resend)", async () => {
     const bk = await ready(); const fx = fakeExchange(ok200);
     const r = await run(bk, bk.op.id, "en", fx);
     assert.deepEqual([r.code, r.admission, r.workerOutcome, r.workerInvocations, r.sendsAttempted, fx.calls, r.providerAccepted, r.providerReplay, r.deliveryProven], ["PROVIDER_ACCEPTED", "ADMITTED", "accepted", 1, 1, 1, true, false, false], JSON.stringify(r));
@@ -405,7 +461,7 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
     assert.deepEqual([again.code, again.admission, fx2.calls], ["NBC_ADMISSION_REFUSED", "OP_NOT_PRISTINE", 0]); assert.doesNotMatch(JSON.stringify(r) + JSON.stringify(again), PII);
   });
 
-  test("D3 binding refusals on real PG23 leave EVERY booking table unchanged with ZERO exchange calls: wrong version / foreign op / excluded intent id / out-of-scope (.example) recipient / owner role / foreign listing; a schema-21 database → CATALOG_NOT_23", async () => {
+  test("D3 binding refusals on real PG25 leave EVERY booking table unchanged with ZERO exchange calls: wrong version / foreign op / excluded intent id / out-of-scope (.example) recipient / owner role / foreign listing; a schema-21 database → CATALOG_NOT_23", async () => {
     const bk = await ready(); const out = await ready({ guestDomain: "mv-test.example" });
     const f0 = await fingerprint();
     const ownerPool = new pg.Pool({ connectionString: db.adminUrl, max: 2 });
@@ -423,7 +479,7 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
     try {
       await Hm.migrateUp(a21, { env: "test", to: 21 }); await a21.query("CREATE ROLE test_app LOGIN IN ROLE mv_booking_app");
       const app21 = new pg.Pool({ connectionString: p21.appUrl(), max: 2 });
-      try { const r = await run(bk, bk.op.id, "en", fakeExchange(ok200), { pool: app21 }); assert.deepEqual([r.code, r.admission], ["NBC_ADMISSION_REFUSED", "CATALOG_NOT_23"]); } finally { await app21.end(); }
+      try { const r = await run(bk, bk.op.id, "en", fakeExchange(ok200), { pool: app21 }); assert.deepEqual([r.code, r.admission], ["NBC_ADMISSION_REFUSED", "CATALOG_NOT_25"]); } finally { await app21.end(); }
     } finally { await a21.end(); p21.stop(); }
   });
 
@@ -445,7 +501,7 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
     }
   });
 
-  test("D5 C51 the documented class-ELIGIBLE-but-SQL-refused path on real PG23 (source version drift): admission passes (class ELIGIBLE), the accepted worker's v2 claim records its refusal → NOT_SENT with ZERO provider calls — and NOT zero database effects: exactly ONE durable effect, the latch VERSION_DRIFT; the op stays pending / attempts 0, no render / receipt", async () => {
+  test("D5 C51 the documented class-ELIGIBLE-but-SQL-refused path on real PG25 (source version drift): admission passes (class ELIGIBLE), the accepted worker's v2 claim records its refusal → NOT_SENT with ZERO provider calls — and NOT zero database effects: exactly ONE durable effect, the latch VERSION_DRIFT; the op stays pending / attempts 0, no render / receipt", async () => {
     const bk = await ready();
     await Hm.F.ownerManagedHistory(db.owner, "UPDATE booking.intents SET version = version + 1 WHERE id = $1", [bk.id]);   // TEST SETUP: intent version ≠ op source_version
     const v = (await db.owner.query("SELECT version FROM booking.intents WHERE id = $1", [bk.id])).rows[0].version;
@@ -467,7 +523,7 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
     assert.doesNotMatch(JSON.stringify(r), PII);
   });
 
-  test("D6 C55 the exact approved sender on the FAKE wire (real PG23, real worker / executor at 46b3eaf8): from === 'MiCasaDirect <bookings@mail.micasadirect.com>', recipient still the DB's .invalid address; the superseded real sender (seam) is refused before any claim with ZERO exchange calls and no table change", async () => {
+  test("D6 C55 the exact approved sender on the FAKE wire (real PG25, real worker / executor at d7e39ae3): from === 'MiCasaDirect <bookings@mail.micasadirect.com>', recipient still the DB's .invalid address; the superseded real sender (seam) is refused before any claim with ZERO exchange calls and no table change", async () => {
     const bk = await ready(); const reqs = [];
     const fx = fakeExchange((id, req) => { reqs.push(req); return ok200(id); });
     const r = await run(bk, bk.op.id, "en", fx);
