@@ -19,11 +19,15 @@ const STATUS_RE = /^[a-z_]{1,40}$/;
 const CODE_RE = /^[A-Z0-9_]{1,64}$/;
 const BOOKING_REF_RE = /^MV-[A-Z0-9]{6,10}$/;
 /** C98: the server's closed bookingProgress stages (lib/checkout/intent-api-core.js BOOKING_STAGES); anything else is no projection */
-export const PROGRESS_STAGES = Object.freeze(["not_paid", "processing", "payment_received_finalizing", "complete", "needs_review", "ended"]);
+export const PROGRESS_STAGES = Object.freeze(["not_paid", "processing", "payment_received_finalizing", "complete", "needs_review", "ended", "cancelled"]);
+/** C118: the host's refund labels after a cancellation (a label only; the page never claims money arrived) */
+export const REFUND_LABELS = Object.freeze(["pending", "none", "partial", "full"]);
 /** a SAFE copy of the projection or null: a known stage; a booking ref ONLY with "complete" (and then required) */
 export function safeProgress(p) {
   if (!p || typeof p !== "object" || Array.isArray(p) || typeof p.stage !== "string" || !PROGRESS_STAGES.includes(p.stage)) return null;
   if (p.stage === "complete") return typeof p.bookingRef === "string" && BOOKING_REF_RE.test(p.bookingRef) ? { stage: "complete", bookingRef: p.bookingRef } : null;
+  if (p.stage === "cancelled") return REFUND_LABELS.includes(p.refundStatus)
+    ? { stage: "cancelled", bookingRef: typeof p.bookingRef === "string" && BOOKING_REF_RE.test(p.bookingRef) ? p.bookingRef : null, refundStatus: p.refundStatus } : null;
   return { stage: p.stage, bookingRef: null };
 }
 export const UNCERTAIN_ACTIONS = Object.freeze(["create", "details", "pay", "release"]);
@@ -40,7 +44,7 @@ export function validateCheckoutUrl(u) {
 }
 /** the public statuses the accepted API can return (lib/checkout/intent-state.js publicStatus + "release_requested"); anything else is unreadable */
 export const KNOWN_STATUSES = Object.freeze(["awaiting_details", "awaiting_payment", "processing", "release_requested", "unavailable_not_charged", "under_review",
-  "expired", "payment_failed", "unavailable", "not_completed_not_charged", "confirmed"]);
+  "expired", "payment_failed", "unavailable", "not_completed_not_charged", "confirmed", "booking_cancelled"]);
 const safeStatus = (s) => (typeof s === "string" && STATUS_RE.test(s) && KNOWN_STATUSES.includes(s) ? s : null);
 const safeCode = (c) => (typeof c === "string" && CODE_RE.test(c) ? c : "UNEXPECTED_REPLY");
 
@@ -74,6 +78,18 @@ export function describe(status, { releaseRequested = false, progress = null } =
         text: "The server reports the TEST payment received, but the booking is not complete yet. Do not make another TEST payment. The remaining step is run by the test operator, not by this page; use Refresh status to check again." };
       return { kind: "confirming", title: "Not yet confirmed — still processing",
         text: "The server has not reported this TEST booking as complete. Do not make another TEST payment. Use Refresh status later and follow the test operator’s instructions." };
+    }
+    // C118: the host cancelled this booking (manually, in the property system). The refund is a SEPARATE label the host records; the page never
+    // says money was returned unless the host recorded a refund, and never says when money arrives.
+    case "booking_cancelled": {
+      const pg = safeProgress(progress);
+      if (!pg || pg.stage !== "cancelled") return { kind: "review", title: "Cancelled — details unavailable",
+        text: "The server reports this TEST booking cancelled, but the details could not be read. Nothing more is sent from this page." };
+      const refund = { pending: "Refund: not decided yet. The host reviews it under the cancellation policy; no refund has been recorded.",
+        none: "Refund: the host recorded that no refund applies.", partial: "Refund: the host recorded a partial refund.",
+        full: "Refund: the host recorded a full refund." }[pg.refundStatus];
+      return { kind: "terminal", title: "TEST booking cancelled",
+        text: `The host has cancelled this TEST booking${pg.bookingRef ? ` (booking reference ${pg.bookingRef})` : ""}. ${refund} Refunds are made by the host outside this page; this page cannot show when money arrives.` };
     }
     default: return { kind: "unexpected", title: "Unknown status", text: "The server returned a status this page does not know. Nothing more is sent automatically." };
   }

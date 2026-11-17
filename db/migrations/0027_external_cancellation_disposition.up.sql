@@ -7,7 +7,10 @@
 --
 -- Invariants (each has a test in test/db/e7-c118-external-cancellation.test.mjs):
 --   I1  Admin only: the two recording functions are EXECUTE-granted to mv_booking_admin alone (PUBLIC / runtime / report: none).
---       Direct INSERT into the new tables needs this transaction's authority token, which only those functions set.
+--       The app / report / admin roles have NO INSERT / UPDATE / DELETE privilege on the new tables (ACL + RLS); that is the authority.
+--       The transaction-local setting checked by the insert guard is a COORDINATION guard only (it keeps the functions' own inserts
+--       paired with their checks); it is not an unforgeable capability: the schema owner can set it and is trusted. The one runtime-role
+--       grant is EXECUTE on the minimal guest projection booking.external_cancellation_public (F1), which returns no admin / evidence data.
 --   I2  Append-only: the cancellation record and every refund attestation are immutable (no UPDATE / DELETE / TRUNCATE).
 --   I3  Cancellation status and refund disposition are SEPARATE facts. Recording a cancellation never implies a refund; the initial
 --       refund disposition is stated explicitly (pending | none | partial | full) and later changes are new attestation rows.
@@ -20,8 +23,11 @@
 --       for its own reservation, status 'cancelled', NOT superseded by later evidence, and not older than the reservation.
 --   I6  Atomic claim release: the active inventory claim is released in the same transaction (reason EXTERNAL_CANCELLATION_ATTESTED)
 --       through the normal claims guard; booking.claim_release_blockers gains exactly one branch for this case.
---   I7  Afterwards, for that intent: no new inventory claim, no queued confirmation can be claimed (the pristine guest.notify row is
---       fenced, never sent, never resent), no new provider-write or notification operation, and no TEST cleanup entry.
+--   I7  Afterwards, for that intent: no new inventory claim; the queued, never-attempted guest.notify row is LATCHED in the same transaction
+--       with code EXTERNALLY_CANCELLED (the accepted owner-visible "never sent" record, so the worker skips it cleanly: no claim attempt,
+--       no lease, no render, no retry) and additionally fenced by trigger; no new provider-write or notification operation; no TEST cleanup.
+--   I9  The guest's bearer status reports the cancellation honestly (status booking_cancelled, stage cancelled) with the refund
+--       disposition as a SEPARATE label; nothing implies money moved unless the host attested a partial / full refund.
 --   I8  Idempotent replay: the same request key with identical arguments returns the original record; any difference is refused.
 SET LOCAL lock_timeout = '5s';
 
@@ -30,7 +36,7 @@ SET LOCAL lock_timeout = '5s';
 CREATE TABLE booking.external_cancellations (
   id                       uuid PRIMARY KEY,
   intent_id                uuid NOT NULL UNIQUE REFERENCES booking.intents (id),
-  request_key              text NOT NULL UNIQUE CHECK (request_key ~ '^[A-Za-z0-9._:-]{8,120}$'),
+  request_key              text NOT NULL UNIQUE CHECK (request_key ~ '^[A-Za-z0-9._:-]{8,116}$'),   -- 116 + ':r1' fits the 120 child key
   hostaway_reservation_id  text NOT NULL,
   cancellation_evidence_id uuid NOT NULL REFERENCES booking.provider_evidence (id),
   evidence_ids             uuid[] NOT NULL CHECK (cardinality(evidence_ids) BETWEEN 1 AND 20),
@@ -221,9 +227,9 @@ CREATE FUNCTION booking.admin_record_external_cancellation(
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
 DECLARE x booking.external_cancellations%ROWTYPE; f booking.external_refund_attestations%ROWTYPE; i booking.intents%ROWTYPE;
         e booking.provider_evidence%ROWTYPE; r record; nd jsonb := '[]'::jsonb; claim_id bigint; cid uuid := gen_random_uuid();
-        fid uuid := gen_random_uuid(); w booking.intent_work%ROWTYPE;
+        fid uuid := gen_random_uuid(); w booking.intent_work%ROWTYPE; to_latch uuid[] := '{}';
 BEGIN
-  IF p_request_key IS NULL OR p_request_key !~ '^[A-Za-z0-9._:-]{8,120}$' THEN
+  IF p_request_key IS NULL OR p_request_key !~ '^[A-Za-z0-9._:-]{8,116}$' THEN
     RAISE EXCEPTION 'REQUEST_KEY_INVALID' USING ERRCODE = 'invalid_parameter_value';
   END IF;
   -- I8: replay
@@ -264,11 +270,16 @@ BEGIN
     IF r.op_type = 'guest.notify' THEN
       IF r.state = 'pending' THEN
         IF r.attempts <> 0 OR r.dispatched_at IS NOT NULL OR r.completed_at IS NOT NULL OR r.result_ref IS NOT NULL
-           OR EXISTS (SELECT 1 FROM booking.notification_renders n WHERE n.operation_id = r.id)
-           OR EXISTS (SELECT 1 FROM booking.notification_latches l WHERE l.operation_id = r.id) THEN
+           OR EXISTS (SELECT 1 FROM booking.notification_renders n WHERE n.operation_id = r.id) THEN
           RAISE EXCEPTION 'NOTIFY_NOT_PRISTINE' USING ERRCODE = 'check_violation';
         END IF;
-        nd := nd || jsonb_build_object('operationId', r.id, 'template', r.payload ->> 'template', 'state', 'pending', 'disposition', 'fenced_unsent');
+        IF EXISTS (SELECT 1 FROM booking.notification_latches l WHERE l.operation_id = r.id) THEN
+          -- already refused by the worker (e.g. it saw the cancellation evidence first): the existing latch is the record; kept as is
+          nd := nd || jsonb_build_object('operationId', r.id, 'template', r.payload ->> 'template', 'state', 'pending', 'disposition', 'latched_preserved');
+        ELSE
+          to_latch := to_latch || r.id;
+          nd := nd || jsonb_build_object('operationId', r.id, 'template', r.payload ->> 'template', 'state', 'pending', 'disposition', 'latched_unsent');
+        END IF;
       ELSIF r.state = 'succeeded' THEN
         nd := nd || jsonb_build_object('operationId', r.id, 'template', r.payload ->> 'template', 'state', 'succeeded', 'disposition', 'sent_preserved');
       ELSE
@@ -326,6 +337,9 @@ BEGIN
      provider_reference, attested_by, reference, resolver_session_user)
   VALUES (fid, cid, p_intent, 1, p_request_key || ':r1', p_refund_status, p_refunded_minor, i.currency, p_refund_reference, p_attested_by,
      p_reference, session_user);
+  -- I7: the queued, never-attempted confirmation is latched (append-only, owner-visible; the worker never claims a latched row)
+  INSERT INTO booking.notification_latches (operation_id, intent_id, code, intent_version_seen, latched_at, worker)
+  SELECT u, p_intent, 'EXTERNALLY_CANCELLED', i.version, statement_timestamp(), 'admin-external-cancellation' FROM unnest(to_latch) AS u;
   IF claim_id IS NOT NULL THEN
     UPDATE booking.inventory_claims SET released_at = statement_timestamp(), release_reason = 'EXTERNAL_CANCELLATION_ATTESTED'
      WHERE id = claim_id;                                               -- claims_safety_guard re-checks claim_release_blockers
@@ -371,12 +385,23 @@ BEGIN
 END $$;
 
 -- ---------------------------------------------------------------------------------------------
+-- 6b. I9 (F1): the guest projection read by the bearer status handler (runtime role). Only: cancelled + the latest refund label.
+--     No attestation, evidence, reference, amount, time or admin field.
+CREATE FUNCTION booking.external_cancellation_public(p_intent uuid) RETURNS jsonb
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, booking AS $$
+  SELECT jsonb_build_object('cancelled', true, 'refundStatus',
+           (SELECT f.refund_status FROM booking.external_refund_attestations f WHERE f.cancellation_id = x.id ORDER BY f.seq DESC LIMIT 1))
+    FROM booking.external_cancellations x WHERE x.intent_id = p_intent
+$$;
+
+-- ---------------------------------------------------------------------------------------------
 -- 7. Privileges (local draft): admin-only execution; read for admin / report; RLS deny-by-default
 REVOKE ALL ON FUNCTION booking.external_disposition_insert_guard(), booking.externally_cancelled(uuid),
   booking.external_cancellation_claim_fence(), booking.external_cancellation_op_fence(), booking.external_cancellation_intent_fence(),
   booking.external_refund_check(text, bigint, bigint),
   booking.admin_record_external_cancellation(uuid, integer, uuid[], uuid, text, bigint, text, text, text, text, text),
-  booking.admin_attest_external_refund(uuid, text, bigint, text, text, text, text) FROM PUBLIC;
+  booking.admin_attest_external_refund(uuid, text, bigint, text, text, text, text), booking.external_cancellation_public(uuid) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION booking.external_cancellation_public(uuid) TO mv_booking_app;
 GRANT EXECUTE ON FUNCTION
   booking.admin_record_external_cancellation(uuid, integer, uuid[], uuid, text, bigint, text, text, text, text, text),
   booking.admin_attest_external_refund(uuid, text, bigint, text, text, text, text) TO mv_booking_admin;

@@ -10,6 +10,7 @@ END $$;
 DROP TRIGGER external_cancellation_intent_fence ON booking.intents;
 DROP TRIGGER external_cancellation_op_fence ON booking.external_operations;
 DROP TRIGGER external_cancellation_claim_fence ON booking.inventory_claims;
+DROP FUNCTION booking.external_cancellation_public(uuid);
 DROP FUNCTION booking.admin_attest_external_refund(uuid, text, bigint, text, text, text, text);
 DROP FUNCTION booking.admin_record_external_cancellation(uuid, integer, uuid[], uuid, text, bigint, text, text, text, text, text);
 DROP FUNCTION booking.external_refund_check(text, bigint, bigint);

@@ -13,6 +13,7 @@ import { beginPayStep, claimReleaseBlockers, releaseCompletedStayClaims, loadInt
 import { requestRead, claimNextOperation } from "../../lib/booking-db/operations.js";
 import { migrateUp, migrateDown, loadMigrations } from "../../db/lib/migrate.js";
 import { adminRecordEvidence } from "../../db/lib/admin.js";
+import { intentStatus } from "../../lib/checkout/intent-api-core.js";
 
 let netAttempts = 0;
 const realFetch = globalThis.fetch;
@@ -232,7 +233,11 @@ test("I7: after the record — the queued confirmation is fenced, no new notify 
   const c = await manuallyCancelled({ listingId: L(13) });
   const notify = (await db.owner.query("SELECT * FROM booking.external_operations WHERE intent_id = $1 AND op_type = 'guest.notify'", [c.id])).rows;
   const r = await record(c);
-  assert.deepEqual(r.notify.map((x) => x.disposition), notify.map((o) => (o.state === "pending" ? "fenced_unsent" : o.state === "succeeded" ? "sent_preserved" : "terminal_preserved")));
+  assert.deepEqual(r.notify.map((x) => x.disposition), notify.map((o) => (o.state === "pending" ? "latched_unsent" : o.state === "succeeded" ? "sent_preserved" : "terminal_preserved")));
+  for (const o of notify.filter((x) => x.state === "pending")) {
+    const l = (await db.owner.query("SELECT code FROM booking.notification_latches WHERE operation_id = $1", [o.id])).rows[0];
+    assert.equal(l?.code, "EXTERNALLY_CANCELLED", "the queued confirmation is latched in the same transaction");
+  }
   // SIMULATED claim step (the worker's claim function performs exactly this UPDATE): our fence fires first
   for (const o of notify.filter((x) => x.state === "pending")) {
     const e = await errOf(db.owner.query("UPDATE booking.external_operations SET state = 'in_flight', attempts = 1, dispatched_at = now(), lease_worker_id = 'w-n', lease_until = now() + interval '1 minute' WHERE id = $1", [o.id]));
@@ -321,4 +326,81 @@ test("migration: 0027 is the top; down refused once records exist; on a fresh cl
     assert.equal((await cl.query("SELECT to_regclass('booking.external_cancellations') AS t")).rows[0].t, null);
     await migrateUp(cl, { env: "test" });
   } finally { await cl.end(); fresh.stop(); }
+});
+
+test("F1 (I9): the actual bearer status handler reports the cancellation honestly, refund as a separate label; no admin / evidence data; runtime role reads only the projection", async () => {
+  const c = await manuallyCancelled({ listingId: L(20) });
+  const view = async () => (await intentStatus({ pool: db.app }, c.id));
+  const v0 = await view();
+  assert.equal(v0.http, 200); assert.equal(v0.body.status, "confirmed"); assert.equal(v0.body.bookingProgress.stage, "complete");
+  const r = await record(c, { reference: "hostaway-dash-check-secretish", attestedBy: "owner" });
+  const v1 = await view();
+  assert.deepEqual(Object.keys(v1.body).sort(), ["bookingProgress", "price", "quoteExpiresAt", "status"], "same reply shape as before");
+  assert.equal(v1.body.status, "booking_cancelled");
+  assert.deepEqual({ ...v1.body.bookingProgress }, { stage: "cancelled", bookingRef: (await loadIntent(db.app, c.id)).ref, refundStatus: "pending" });
+  assert.ok(Object.isFrozen(v1.body.bookingProgress));
+  assert.doesNotMatch(JSON.stringify(v1.body), /secretish|owner|OWNER_CANCELLED|attest|evidence|[0-9a-f]{8}-[0-9a-f]{4}-|refundedMinor/i, "no admin / evidence / id data");
+  const att = (st, m, k) => db.reconciler.query("SELECT booking.admin_attest_external_refund($1,$2,$3,$4,$5,$6,$7) AS r", [r.cancellationId, st, m, null, "owner", "stripe-dash-1", k]);
+  await att("partial", 100000, key());
+  assert.equal((await view()).body.bookingProgress.refundStatus, "partial");
+  await att("full", 576000, key());
+  assert.equal((await view()).body.bookingProgress.refundStatus, "full");
+  assert.equal((await loadIntent(db.app, c.id)).status, "confirmed", "the intent itself is unchanged; only the projection differs");
+  // the runtime role: EXECUTE on the projection only; the projection returns exactly two keys
+  const pj = (await db.app.query("SELECT booking.external_cancellation_public($1) AS x", [c.id])).rows[0].x;
+  assert.deepEqual(Object.keys(pj).sort(), ["cancelled", "refundStatus"]);
+  assert.equal((await db.app.query("SELECT booking.external_cancellation_public($1) AS x", [(await F.confirmed(db.app, { listingId: L(21) })).id])).rows[0].x, null);
+  assert.equal((await errOf(db.app.query("SELECT * FROM booking.external_refund_attestations")))?.code, "42501");
+});
+
+test("F3: request-key bounds are consistent — 116 accepted (child key fits), 117 refused before any write; replay at the bound; a refused call burns no key; refund keys up to 120", async () => {
+  const c = await manuallyCancelled({ listingId: L(22) });
+  const k116 = "k".repeat(116), k117 = "k".repeat(117);
+  assert.match((await errOf(record(c, { key: k117 })))?.message ?? "", /REQUEST_KEY_INVALID/);
+  assert.match((await errOf(record(c, { key: k116, refundStatus: "full", refundedMinor: 1 })))?.message ?? "", /REFUND_AMOUNT_INVALID/, "rolled back mid-way");
+  assert.equal(await n("SELECT count(*) AS n FROM booking.external_cancellations WHERE intent_id = $1", [c.id]), 0);
+  assert.ok(await activeClaim(c.id), "nothing released by the refused calls");
+  const r1 = await record(c, { key: k116 });
+  assert.equal((await db.owner.query("SELECT request_key FROM booking.external_refund_attestations WHERE id = $1", [r1.refundAttestationId])).rows[0].request_key, `${k116}:r1`);
+  assert.deepEqual(await record(c, { key: k116 }), { ...r1, replayed: true }, "replay at the bound");
+  const att = (k) => db.reconciler.query("SELECT booking.admin_attest_external_refund($1,'none',0,null,'owner','stripe-dash-2',$2) AS r", [r1.cancellationId, k]);
+  assert.equal((await att("a".repeat(120))).rows[0].r.seq, 2);
+  assert.match((await errOf(att("a".repeat(121))))?.message ?? "", /REQUEST_KEY_INVALID/);
+  assert.match((await errOf(att("short")))?.message ?? "", /REQUEST_KEY_INVALID/);
+});
+
+test("I1 (corrected): direct DML is denied to app / report / admin by ACL even with a spoofed coordination setting; the schema owner is trusted (the setting is not a capability)", async () => {
+  const c = await manuallyCancelled({ listingId: L(23) });
+  const r = await record(c);
+  const pools = [["runtime", db.app], ["report", new pg.Pool({ connectionString: db.reportUrl(), max: 1 })], ["admin", db.reconciler]];
+  for (const [label, pool] of pools) {
+    const cl = await pool.connect();
+    try {
+      for (const sql of [
+        `INSERT INTO booking.external_cancellations (id, intent_id, request_key, hostaway_reservation_id, cancellation_evidence_id, evidence_ids, expected_version,
+           intent_state, captured_minor, currency, notify_dispositions, attested_by, reference, justification_code, resolver_session_user)
+         VALUES (gen_random_uuid(), '${c.id}', 'spoofed-key-1', 'x', '${c.evidenceId}', ARRAY['${c.evidenceId}']::uuid[], 0, 'confirmed', 0, 'MXN', '[]', 'owner', 'x', 'X', 'x')`,
+        `INSERT INTO booking.external_refund_attestations (id, cancellation_id, intent_id, seq, request_key, refund_status, refunded_minor, currency, attested_by, reference, resolver_session_user)
+         VALUES (gen_random_uuid(), '${r.cancellationId}', '${c.id}', 9, 'spoofed-key-2', 'full', 576000, 'MXN', 'owner', 'x', 'x')`,
+        `UPDATE booking.external_cancellations SET reference = 'x' WHERE id = '${r.cancellationId}'`,
+        `DELETE FROM booking.external_refund_attestations WHERE cancellation_id = '${r.cancellationId}'`,
+        `UPDATE booking.inventory_claims SET released_at = now(), release_reason = 'SPOOFED' WHERE intent_id = '${c.id}'`]) {
+        await cl.query("BEGIN");
+        await cl.query("SELECT set_config('booking.external_disposition_txn', pg_current_xact_id()::text, true)");   // spoofed coordination setting
+        const e = await errOf(cl.query(sql));
+        await cl.query("ROLLBACK");
+        assert.equal(e?.code, "42501", `${label}: ${sql.slice(0, 40)} → permission denied (${e?.message})`);
+      }
+    } finally { cl.release(); if (label === "report") await pool.end(); }
+  }
+  // TRUSTED schema owner: with the setting it CAN insert — documented, not claimed as prevented (rolled back here)
+  const o = await db.owner.connect();
+  try {
+    await o.query("BEGIN");
+    await o.query("SELECT set_config('booking.external_disposition_txn', pg_current_xact_id()::text, true)");
+    const ok = await errOf(o.query(`INSERT INTO booking.external_refund_attestations (id, cancellation_id, intent_id, seq, request_key, refund_status, refunded_minor, currency, attested_by, reference, resolver_session_user)
+         VALUES (gen_random_uuid(), $1, $2, 9, 'owner-trusted-1', 'none', 0, 'MXN', 'owner', 'x', 'x')`, [r.cancellationId, c.id]));
+    assert.equal(ok, null, "the schema owner is trusted: the coordination setting is not a capability boundary");
+  } finally { await o.query("ROLLBACK"); o.release(); }
+  assert.equal(await n("SELECT count(*) AS n FROM booking.external_refund_attestations WHERE cancellation_id = $1", [r.cancellationId]), 1);
 });

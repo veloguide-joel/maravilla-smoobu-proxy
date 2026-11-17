@@ -439,7 +439,7 @@ test("C98 describe: complete ONLY with status confirmed + a safe complete projec
   assert.match(describe("processing").text, /still processing/i); assert.match(describe("processing").text, /Do not make another TEST payment/); assert.match(describe("under_review").title, /not confirmed/);
   for (const d of [c, f, describe("confirmed"), describe("processing"), describe("under_review")]) assert.doesNotMatch(d.title + d.text, NO_PROMISE, d.title);
   assert.deepEqual(safeProgress({ stage: "payment_received_finalizing", bookingRef: "MV-VBQL2LQY" }), FINALIZING, "a ref is dropped outside complete");
-  assert.deepEqual([...PROGRESS_STAGES], ["not_paid", "processing", "payment_received_finalizing", "complete", "needs_review", "ended"]);
+  assert.deepEqual([...PROGRESS_STAGES], ["not_paid", "processing", "payment_received_finalizing", "complete", "needs_review", "ended", "cancelled"]);   // C118 draft: + cancelled (host-cancelled booking projection)
   // C99-F2 (ROOT review 5913046488): complete is an ACTIVE booking with a HELD claim → the explicit Forget path, never "start new"
   assert.equal(resetFor("complete"), "forget"); assert.equal(resetFor("finalizing"), "forget"); assert.equal(resetFor("confirming"), "forget");
   assert.equal(resetFor("terminal"), "startNew"); assert.equal(resetFor("released"), "startNew");
@@ -490,4 +490,41 @@ test("C99 controller: complete → each failed read (429 / 500 / 503 / 408 / net
     await r.c.refresh(); assert.equal(r.last().screen, "complete", `${label}: a fresh valid read recovers`);
     assert.deepEqual([f.count("pay"), f.count("release"), f.count("details"), f.count("create"), f.count("status")], [0, 0, 0, 0, 3], `${label}: no resend, one read per explicit action`);
   }
+});
+
+// C118 (0027 draft, ROOT review F1): a booking the host cancelled MANUALLY is shown as cancelled, with the refund as a SEPARATE label;
+// never "confirmed", never a claim that money moved unless the host recorded a refund, never a timing promise.
+test("C118 describe/safeProgress: booking_cancelled with each refund label; malformed projection fails closed; no confirmed wording; no money claim for pending / none", () => {
+  const CXL = (refundStatus, bookingRef = "MV-VBQL2LQY") => ({ stage: "cancelled", bookingRef, refundStatus });
+  for (const [label, re, money] of [["pending", /not decided yet/, false], ["none", /no refund applies/, false], ["partial", /partial refund/, true], ["full", /full refund/, true]]) {
+    const d = describe("booking_cancelled", { progress: CXL(label) });
+    assert.deepEqual([d.kind, d.title], ["terminal", "TEST booking cancelled"], label);
+    assert.match(d.text, /host has cancelled this TEST booking/); assert.match(d.text, /MV-VBQL2LQY/); assert.match(d.text, re, label);
+    assert.match(d.text, /cannot show when money arrives/);
+    assert.doesNotMatch(d.title + d.text, /booking (is )?confirmed|e-?mail|inbox|within \d|minutes?|hours?/i, label);
+    if (!money) assert.doesNotMatch(d.text, /recorded a (partial|full) refund|refunded/i, `${label}: no money claim`);
+    assert.equal(resetFor(d.kind), "startNew");
+  }
+  for (const p of [null, {}, { stage: "cancelled" }, CXL("refunded"), CXL(1), { stage: "complete", bookingRef: "MV-VBQL2LQY" }]) {
+    const d = describe("booking_cancelled", { progress: p });
+    assert.equal(d.kind, "review", JSON.stringify(p)); assert.doesNotMatch(d.title + d.text, /refund|confirmed booking|MV-VBQL/i, JSON.stringify(p));
+  }
+  assert.deepEqual(safeProgress(CXL("full", "<b>x</b>")), { stage: "cancelled", bookingRef: null, refundStatus: "full" }, "an unsafe ref is dropped, the label kept");
+  assert.equal(describe("confirmed", { progress: CXL("full") }).kind, "confirming", "a cancelled projection never upgrades / alters confirmed");
+  assert.notEqual(describe("processing", { progress: CXL("full") }).kind, "terminal");
+});
+test("C118 controller: complete → (Refresh) → booking_cancelled replaces the confirmation; no pay / release; refund label follows the server; Forget wording becomes start-new", async () => {
+  const s = memStorage(); createStore(s).save({ token: TOKEN, releaseRequested: false, polls: [] });
+  const f = fakeApi({ status: [reply(200, { status: "confirmed", price: PRICE, bookingProgress: COMPLETE }),
+    reply(200, { status: "booking_cancelled", price: PRICE, bookingProgress: { stage: "cancelled", bookingRef: "MV-VBQL2LQY", refundStatus: "pending" } }),
+    reply(200, { status: "booking_cancelled", price: PRICE, bookingProgress: { stage: "cancelled", bookingRef: "MV-VBQL2LQY", refundStatus: "full" } }),
+    reply(200, { status: "booking_cancelled", price: PRICE })] });
+  const r = rig({ storage: s, api: f }); await r.c.init();
+  assert.equal(r.last().screen, "complete");
+  await r.c.refresh(); let v = r.last();
+  assert.deepEqual([v.title, v.canPay, v.canRequestRelease, v.reset], ["TEST booking cancelled", false, false, "startNew"]);
+  assert.match(v.text, /not decided yet/); assert.doesNotMatch(v.text, /TEST booking confirmed|recorded a (partial|full) refund/);
+  await r.c.refresh(); v = r.last(); assert.match(v.text, /recorded a full refund/);
+  await r.c.refresh(); v = r.last(); assert.equal(v.title, "Cancelled — details unavailable", "status without a readable projection fails closed");
+  await r.c.pay(); assert.deepEqual([f.count("pay"), f.count("release")], [0, 0]);
 });
