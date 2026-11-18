@@ -32,7 +32,7 @@ const NOTIFICATION = Object.freeze({
   prefix: "e7-hosted-booking-confirmation-v1\n",
   runnerFiles: ["scripts/e7-hosted-booking-confirmation.mjs", "test/e7-hosted-booking-confirmation.test.mjs", "test/e7-hosted-booking-confirmation-workflow.test.mjs",
     ".github/workflows/e7-hosted-booking-confirmation.yml"],
-  frame: "f969791b7cb175dc8426a7796db43ab7be70605ac1cd940d0c30a30ffcfca859"   // C119 S4: catalog 28 + e7-test-auto + P3 fresh admission (was ccb52e91… at S2). C119 S2: + the TEST arm re-check (labelled copy) + the arm job / draft schedule (was 9c6cf9f2… at S1 rev 2 / main 30d00191; 0cd953a9… at C116)
+  frame: "a033a893971d1e777e62a368a8c23b20740870be20719525a2482bdd40eab2ba"   // C120: + the passive providerHttpStatus observation (was f969791b… at C119 S4). C119 S4: catalog 28 + e7-test-auto + P3 fresh admission (was ccb52e91… at S2). C119 S2: + the TEST arm re-check (labelled copy) + the arm job / draft schedule (was 9c6cf9f2… at S1 rev 2 / main 30d00191; 0cd953a9… at C116)
 });
 
 /** every runtime source frame on main: each runner's own runnerFiles, plus the fixed frames the workflow tests pin for the two probes */
@@ -95,8 +95,8 @@ test("X4 CI wiring: the regression runs on every pull request / push to main (an
 
 /** C119 S2: the LITERAL reviewed TEST-arm release of this tree (outside every component, so the release never embeds itself). It is NOT an
  *  arm and sets nothing: ROOT sets the repository variable out-of-band at a separately authorized activation, never from this file. */
-// C119 S4: 7a407d45… after the pipeline admission cascade + the MERGED tooling repin (was 12a8f416… at S2 / main ec489f5a)
-const ARM_RELEASE = Object.freeze({ release: "7a407d45741b62b3757209a55e096cf47874a0b155613e88fb7053eb6874546b", components: ["arm-gate", "kickoff", "booking-confirmation", "pipeline"] });
+// C120: 9e87d5f2… after the notification frame change (passive providerHttpStatus; was 7a407d45… at C119 S4 after the pipeline admission cascade + the MERGED tooling repin)
+const ARM_RELEASE = Object.freeze({ release: "9e87d5f2f73e25adeba84ac966a20cf356a7f3ff0c1ddd249ee82f9a37675aa1", components: ["arm-gate", "kickoff", "booking-confirmation", "pipeline"] });
 
 test("X5 C119 S2 the TEST-arm release recomputed from this checkout equals the LITERAL reviewed release; this file is outside every arm component; no component file carries the release", async () => {
   const A = await import("../scripts/e7-test-arm.mjs");

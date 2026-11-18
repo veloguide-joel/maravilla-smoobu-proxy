@@ -290,8 +290,8 @@ function fakeTooling(behaviour) {
     runNotificationStep: async (pool, opts) => { st.invocations += 1; st.opts = opts; return behaviour(opts, st); } };
   return { tooling, st };
 }
-const core = (w, behaviour, c = OPEN, plan = PLAN) => { const log = []; const t = fakeTooling(behaviour);
-  return R.runBookingConfirmationCore({ pool: fakePool(w, log), plan, c, tooling: t.tooling, exchange: async () => ({ status: 200 }), credential: () => KEY, runId: "123456789-1" }).then((res) => ({ res, log, st: t.st })); };
+const core = (w, behaviour, c = OPEN, plan = PLAN, exchange = async () => ({ status: 200 })) => { const log = []; const t = fakeTooling(behaviour);
+  return R.runBookingConfirmationCore({ pool: fakePool(w, log), plan, c, tooling: t.tooling, exchange, credential: () => KEY, runId: "123456789-1" }).then((res) => ({ res, log, st: t.st })); };
 
 test("H7 admission (fake): every refusal is a code, zero worker invocations, zero executors, ROLLBACK; schema must be EXACTLY 27 (C119 S1; 21 / 23 / 26 / drift refused); the 0027 projection: SQL NULL only = not cancelled, cancelled → EXTERNALLY_CANCELLED, error / any other value → CANCELLATION_UNREADABLE; excluded / protected / version / listing / currency / state / op count / unbound op / non-pristine / payload / template / class / render / latch / receipt / work lease", async () => {
   const i1 = (o) => [{ ...world().intent[0], ...o }]; const o1 = (o) => [{ ...world().ops[0], ...o }];
@@ -347,6 +347,31 @@ test("H8 core with FAKE tooling: ONE worker invocation with the bound intent / l
   const thrownAfter = await core(world(), async (opts, st) => { await st.exchange({}); throw new Error("SENTINEL db lost after send FAKEPW"); }); assert.deepEqual([thrownAfter.res.code, thrownAfter.res.sendsAttempted], ["UNKNOWN_STOP", 1]);
   const thrownBefore = await core(world(), async () => { throw new Error("SENTINEL"); }); assert.deepEqual([thrownBefore.res.code, thrownBefore.res.sendsAttempted], ["NBC_WORKER_ERROR", 0]);
   for (const r of [twice, replay, unk, idle, refused, thrownAfter, thrownBefore]) { assert.equal(r.st.invocations <= 1, true); assert.equal(r.res.deliveryProven, false); assert.doesNotMatch(JSON.stringify(r.res), PII); }
+  // C120 passive HTTP-status observation: the executor gets the SAME promise / value / rejection; only an integer 100–599 is recorded
+  assert.equal(a.res.providerHttpStatus, 200, "accepted path records the reply status"); assert.match(R.summaryMarkdown({ mode: "execute", code: "EXECUTE_DONE", core: a.res }), / httpStatus=200 /);
+  for (const r of [idle, refused, thrownBefore]) assert.equal(r.res.providerHttpStatus, null, "no exchange call → null");
+  let unhandled = 0; const onUnhandled = () => { unhandled += 1; }; process.on("unhandledRejection", onUnhandled);
+  try {
+    const SECRET = "re_SYNTHETIC_SECRET_BODY jane.doe@example.com";
+    const statusCase = async (reply, rejectWith = null) => { let made = null; let seen = null; let err = null;
+      const exchange = (req) => { made = rejectWith ? Promise.reject(rejectWith) : Promise.resolve(reply); return made; };
+      const r = await core(world(), async (opts, st) => { const p = st.exchange({}); assert.strictEqual(p, made, "the executor receives the exchange's own promise");
+        try { seen = await p; } catch (e) { err = e; } return { ok: true, outcome: "unknown", opId: OID, code: "HTTP_STATUS" }; }, OPEN, PLAN, exchange);
+      return { r, seen, err }; };
+    const r401 = await statusCase(Object.freeze({ status: 401, headers: { contentType: "application/json" }, body: SECRET }));
+    assert.deepEqual([r401.r.res.code, r401.r.res.workerCode, r401.r.res.providerHttpStatus, r401.r.res.sendsAttempted, r401.r.res.providerAccepted], ["UNKNOWN_STOP", "HTTP_STATUS", 401, 1, false]);
+    assert.equal(r401.seen.body, SECRET, "the reply reaches the executor unchanged");
+    const r503 = await statusCase({ status: 503, body: SECRET }); assert.deepEqual([r503.r.res.code, r503.r.res.providerHttpStatus], ["UNKNOWN_STOP", 503]);
+    const boom = Object.assign(new Error(`EXCHANGE_TIMEOUT ${SECRET}`), { code: "EXCHANGE_TIMEOUT" });
+    const rej = await statusCase(null, boom); assert.strictEqual(rej.err, boom, "the executor sees the SAME rejection"); assert.deepEqual([rej.r.res.code, rej.r.res.providerHttpStatus], ["UNKNOWN_STOP", null]);
+    for (const bad of [{ status: 42 }, { status: 600 }, { status: "200" }, { status: 200.5 }, { status: null }, {}, null, "200", Object.defineProperty({}, "status", { get() { throw new Error(SECRET); } })]) {
+      const m = await statusCase(bad); assert.deepEqual([m.r.res.code, m.r.res.providerHttpStatus, m.r.res.sendsAttempted], ["UNKNOWN_STOP", null, 1], JSON.stringify(bad)); assert.strictEqual(m.seen, bad);
+    }
+    for (const x of [r401, r503, rej]) { assert.doesNotMatch(JSON.stringify(x.r.res) + JSON.stringify(x.r.log) + R.summaryMarkdown({ mode: "execute", code: "EXECUTE_DONE", core: x.r.res }), /SYNTHETIC_SECRET|jane\.doe|re_SYN/);
+      assert.equal(x.r.st.invocations, 1); }
+    await new Promise((res) => setTimeout(res, 10));
+  } finally { process.off("unhandledRejection", onUnhandled); }
+  assert.equal(unhandled, 0, "the side observer never creates an unhandled rejection");
   const badEx = await R.runBookingConfirmationCore({ pool: fakePool(world(), []), plan: PLAN, c: OPEN, tooling: { ...fakeTooling(() => assert.fail("never")).tooling, createResendNotificationExecutor: () => ({ ok: false, code: "EXECUTOR_SENDER_INVALID" }) },
     exchange: async () => {}, credential: () => KEY, runId: "123456789-1" });
   assert.deepEqual([badEx.code, badEx.workerInvocations], ["NBC_EXECUTOR_INVALID", 0]);

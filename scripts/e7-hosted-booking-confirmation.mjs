@@ -558,7 +558,7 @@ export function countedPool(pool, c, counter) {
  */
 export async function runBookingConfirmationCore({ pool, plan: boundPlan, c = CONSTANTS, tooling, exchange, credential, runId, detected = null }) {
   let plan = boundPlan; let boundFacts = null;
-  const out = { schema: RESULT_SCHEMA, flow: detected ? "detect" : "manual", detectCode: null, code: null, admission: null, workerOutcome: null, workerCode: null, sendsAttempted: 0, workerInvocations: 0, statements: 0,
+  const out = { schema: RESULT_SCHEMA, flow: detected ? "detect" : "manual", detectCode: null, code: null, admission: null, workerOutcome: null, workerCode: null, sendsAttempted: 0, providerHttpStatus: null, workerInvocations: 0, statements: 0,
     providerAccepted: false, providerReplay: false, verifiedCompletion: false, readback: null, deliveryProven: false, postcheck: null };
   const counter = { statements: 0 };
   const cp = countedPool(pool, c, counter);
@@ -581,7 +581,13 @@ export async function runBookingConfirmationCore({ pool, plan: boundPlan, c = CO
     out.admission = "ADMITTED";
     // 2. the ONE-call fence in front of the reviewed exchange (the executor calls it synchronously, at most once)
     let calls = 0;
-    const fenced = (req) => { calls += 1; out.sendsAttempted = calls; if (calls > c.budgets.sends) return Promise.reject(Object.assign(new Error("fence"), { code: "EXCHANGE_SPENT" })); return exchange(req); };
+    // C120 passive HTTP-status observation: the SAME exchange promise is returned unchanged to the executor; a detached side observer
+    //   records only an integer status 100–599 from a resolved reply (never body / headers / errors). It cannot throw, reject, consume or
+    //   alter the reply, add a request, or change classification / budgets / no-resend / DB behaviour (rejections are swallowed on the side;
+    //   only a native Promise is observed, so a foreign thenable is never invoked an extra time).
+    const observeStatus = (p) => { try { if (p instanceof Promise) p.then((r) => { try { const st = r !== null && typeof r === "object" ? r.status : undefined;
+      if (Number.isSafeInteger(st) && st >= 100 && st <= 599) out.providerHttpStatus = st; } catch { /* contained */ } }, () => {}); } catch { /* contained */ } return p; };
+    const fenced = (req) => { calls += 1; out.sendsAttempted = calls; if (calls > c.budgets.sends) return Promise.reject(Object.assign(new Error("fence"), { code: "EXCHANGE_SPENT" })); return observeStatus(exchange(req)); };
     const ex = tooling.createResendNotificationExecutor({ exchange: fenced, credential, sender: { ...c.sender } });
     if (!ex || ex.ok !== true) refuse("NBC_EXECUTOR_INVALID");
     // 3. ONE accepted-worker invocation, scoped to the bound intent; the bound-op contract enforced through the accepted hooks
@@ -772,7 +778,7 @@ async function defaultImportTooling(dir) {
       NOTIFICATION_V2_OPTION_KEY: W.NOTIFICATION_V2_OPTION_KEY, NOTIFICATION_PROVIDER_OPTION_KEY: W.NOTIFICATION_PROVIDER_OPTION_KEY }) };
 }
 export function summaryMarkdown(r) {
-  const k = r.core ? ` core=${r.core.code} admission=${r.core.admission ?? "-"} worker=${r.core.workerOutcome ?? "-"}/${r.core.workerCode ?? "-"} sends=${r.core.sendsAttempted} invocations=${r.core.workerInvocations} statements=${r.core.statements} providerAccepted=${r.core.providerAccepted} replay=${r.core.providerReplay} verifiedCompletion=${r.core.verifiedCompletion === true} readback=${r.core.readback ?? "-"} deliveryProven=false` : "";
+  const k = r.core ? ` core=${r.core.code} admission=${r.core.admission ?? "-"} worker=${r.core.workerOutcome ?? "-"}/${r.core.workerCode ?? "-"} sends=${r.core.sendsAttempted} httpStatus=${r.core.providerHttpStatus ?? "-"} invocations=${r.core.workerInvocations} statements=${r.core.statements} providerAccepted=${r.core.providerAccepted} replay=${r.core.providerReplay} verifiedCompletion=${r.core.verifiedCompletion === true} readback=${r.core.readback ?? "-"} deliveryProven=false` : "";
   const d = r.detect ? ` detect=${r.detect.outcome}/${r.detect.code} admission=${r.detect.admission ?? "-"} fingerprint=${r.detect.fingerprint ?? "-"} counts=${r.detect.counts ? canonical(r.detect.counts) : "-"} statements=${r.detect.statements}` : "";
   return `e7-hosted-booking-confirmation ${r.mode} ${r.code} executeEnabled=${r.executeEnabled} plan=${r.planKind ?? "-"}:${r.planHash ?? "-"} runId=${r.runId ?? "-"} closure=${r.closureDigest ?? "-"} source=${r.sourceDigest ?? "-"} cleanup=${r.cleanup ?? "-"}${k}${d}\n`;
 }
