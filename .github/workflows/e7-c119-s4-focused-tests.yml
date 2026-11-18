@@ -20,6 +20,10 @@ on:
       - "test/db/e7-0027-sqleditor-apply-wrapper.test.mjs"
       - "test/db/e7-c107-kickoff-requests.test.mjs"
       - "test/db/e7-c118-*"
+      - "test/db/e7-0028-sqleditor-apply-wrapper.test.mjs"
+      - "claude/e7-0028-*"
+      - "claude/gen-0028-wrapper.py"
+      - "claude/derive-0028-pins.mjs"
       - ".github/workflows/e7-c119-s4-focused-tests.yml"
   workflow_dispatch:
 permissions:
@@ -47,6 +51,18 @@ jobs:
         with:
           ref: 8c8c2d58bf431071ab6fa99c338984380a5b40cc
           path: k2wrapper
+          persist-credentials: false
+      - name: Checkout PRE-S4 main 5b9c0677 (read-only; the 0028 packet's PRE runner-catalog parity)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: 5b9c06774757c9b84036fbc91773c3a098835d8f
+          path: mainpre
+          persist-credentials: false
+      - name: Checkout MERGED S4 main a86437a8 (read-only; the 0028 packet's POST runner-catalog parity)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: a86437a8738b176f132e1661cabffaa82c2515c2
+          path: mainpost
           persist-credentials: false
       - name: Set up Node 22.22.0
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
@@ -79,3 +95,13 @@ jobs:
           test/db/e7-c107-kickoff-requests.test.mjs test/db/e7-c118-external-cancellation.test.mjs test/db/migrations.test.mjs
           test/db/e7-0024-sqleditor-apply-wrapper.test.mjs test/db/e7-0025-0026-sqleditor-apply-wrapper.test.mjs test/db/e7-0027-sqleditor-apply-wrapper.test.mjs
           test/db/e7-c118-c116-record.test.mjs
+      - name: DB — 0028 apply / readback packet (27 → 28 wrapper; PRE / POST runner catalogs vs main 5b9c0677 / a86437a8, REQUIRED) on disposable PostgreSQL ${{ matrix.pg }}
+        env:
+          PG_BIN: /usr/lib/postgresql/${{ matrix.pg }}/bin
+          E7_MAIN_PRE_DIR: ${{ github.workspace }}/mainpre
+          E7_MAIN_DIR: ${{ github.workspace }}/mainpost
+        run: |
+          set -euo pipefail
+          test -f mainpre/scripts/e7-hosted-kickoff.mjs && test -f mainpost/scripts/e7-hosted-status.mjs
+          python3 claude/gen-0028-wrapper.py .
+          node --test test/db/e7-0028-sqleditor-apply-wrapper.test.mjs
