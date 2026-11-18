@@ -8,6 +8,10 @@
 #   * output: ONE line — PASS / FAIL, a fixed code, the HTTP status number, an EXACT allowlisted Resend error name (else `unlisted` /
 #     `unreadable` / `none`) and, ONLY for a strictly valid 200 list, whether mail.micasadirect.com is listed with status `verified`.
 #     Never the key, headers, body, message text or any other domain / field.
+#   * reason (error replies only): API_KEY_INVALID ONLY when the in-memory reply is HTTP 400 or 401 AND JSON name is EXACTLY `validation_error`
+#     AND message is EXACTLY `API key is invalid` (Resend's documented text); every other error reply → UNCLASSIFIED; non-error lines → n/a.
+#     The message is compared in memory only and NEVER emitted (Resend documents 400 validation_error for BOTH request validation and an
+#     invalid key, so the name alone does not tell them apart).
 #   * LIMITS (not proof): a sending-only key is EXPECTED to refuse domain reads, so `restricted_api_key` does not prove the right team / domain,
 #     send permission for our sender or future sending readiness. A 200 match proves only that this read worked at this moment with full access.
 #     Unknown names / shapes / statuses stay unknown. Nothing here says what happened to any earlier send.
@@ -48,8 +52,8 @@ jobs:
           const ERROR_NAMES = new Set(["missing_api_key", "invalid_api_key", "restricted_api_key", "invalid_access", "validation_error", "not_found",
             "method_not_allowed", "rate_limit_exceeded", "daily_quota_exceeded", "security_error", "application_error", "internal_server_error"]);
           let done = false;
-          const out = (ok, code, status, error, match) => { if (done) return; done = true;
-            process.stdout.write(`${NAME} ${ok ? "PASS" : "FAIL"} code=${code} http=${Number.isInteger(status) ? status : "none"} error=${error ?? "none"} domain_match=${match ?? "n/a"}\n`);
+          const out = (ok, code, status, error, match, reason) => { if (done) return; done = true;
+            process.stdout.write(`${NAME} ${ok ? "PASS" : "FAIL"} code=${code} http=${Number.isInteger(status) ? status : "none"} error=${error ?? "none"} reason=${reason ?? "n/a"} domain_match=${match ?? "n/a"}\n`);
             process.exit(ok ? 0 : 3); };
           let key = process.env.E7_RESEND_TEST_KEY ?? ""; delete process.env.E7_RESEND_TEST_KEY;
           if (key.length === 0) out(false, "KEY_MISSING");
@@ -69,7 +73,8 @@ jobs:
               let j = null; try { j = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { j = undefined; }
               if (s !== 200) {
                 const err = j === undefined || !isObj(j) || typeof j.name !== "string" ? "unreadable" : ERROR_NAMES.has(j.name) ? j.name : "unlisted";
-                out(false, s >= 500 ? "HTTP_5XX" : s >= 400 ? "HTTP_4XX" : "HTTP_OTHER", s, err);
+                const reason = (s === 400 || s === 401) && isObj(j) && j.name === "validation_error" && j.message === "API key is invalid" ? "API_KEY_INVALID" : "UNCLASSIFIED";
+                out(false, s >= 500 ? "HTTP_5XX" : s >= 400 ? "HTTP_4XX" : "HTTP_OTHER", s, err, undefined, reason);
               }
               if (j === undefined) out(false, "JSON_INVALID", s);
               const list = isObj(j) && j.object === "list" && Array.isArray(j.data)
@@ -83,4 +88,4 @@ jobs:
           req.on("timeout", () => { req.destroy(); out(false, "TIMEOUT"); });
           req.on("error", (e) => out(false, (e && typeof e.code === "string" && /^E[A-Z_]{2,24}$/.test(e.code)) ? `REQUEST_${e.code}` : "REQUEST_ERROR"));
           req.end();
-          ' 2>/dev/null || { rc=$?; [ "$rc" = 3 ] || echo "e7-test-auto-resend-key-check FAIL code=SCRIPT_ERROR http=none error=none domain_match=n/a"; exit 3; }
+          ' 2>/dev/null || { rc=$?; [ "$rc" = 3 ] || echo "e7-test-auto-resend-key-check FAIL code=SCRIPT_ERROR http=none error=none reason=n/a domain_match=n/a"; exit 3; }
