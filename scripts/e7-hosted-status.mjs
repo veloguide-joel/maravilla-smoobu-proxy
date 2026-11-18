@@ -203,6 +203,25 @@ function metric(source, scope, status, counts, extra = {}) { return { source, sc
 const unknown = (source, scope, code) => metric(source, scope, "UNKNOWN", null, { code });
 const worst = (...s) => (s.includes("UNKNOWN") ? "UNKNOWN" : s.includes("ACTION") ? "ACTION" : s.includes("WAIT") ? "WAIT" : s.includes("INFO") ? "INFO" : "OK");
 /** a one-row aggregate whose every listed key is a non-negative integer (or, for *_min, an integer or NULL) → the row | null */
+export const REFUND_LABELS = Object.freeze(["pending", "none", "partial", "full"]);
+// Pure: classify the refunds projection rows against the closed 0027 shape and the same-snapshot confirmed count.
+export function classifyRefunds(rf, expectedConfirmed, maxIntents, source, scopeLabel) {
+  if (!nni(expectedConfirmed)) return unknown(source, scopeLabel, "PREREQUISITE_UNREADABLE");
+  if (!rf || !Array.isArray(rf.rows) || rf.rows.length > maxIntents) return unknown(source, scopeLabel, "REPLY_SHAPE");
+  if (rf.rows.length !== expectedConfirmed) return unknown(source, scopeLabel, "ROW_COUNT_MISMATCH");
+  const k = { confirmedRead: rf.rows.length, externallyCancelled: 0, refundPending: 0, refundNone: 0, refundPartial: 0, refundFull: 0 };
+  for (const x of rf.rows) {
+    if (!x || typeof x !== "object" || Array.isArray(x) || JSON.stringify(Object.keys(x)) !== '["x"]') return unknown(source, scopeLabel, "REPLY_SHAPE");
+    const v = x.x;
+    if (v === null) continue;
+    if (!v || typeof v !== "object" || Array.isArray(v) || JSON.stringify(Object.keys(v).sort()) !== '["cancelled","refundStatus"]'
+        || v.cancelled !== true || typeof v.refundStatus !== "string" || !REFUND_LABELS.includes(v.refundStatus)) return unknown(source, scopeLabel, "REFUND_SHAPE");
+    k.externallyCancelled += 1;
+    k[`refund${v.refundStatus[0].toUpperCase()}${v.refundStatus.slice(1)}`] += 1;
+  }
+  return metric(source, `${scopeLabel}; the owner-attested refund label only (Stripe dashboard execution unobserved)`, k.refundPending > 0 ? "INFO" : "OK", k,
+    { note: "labels are owner attestations, not provider execution; a pending manual refund is expected owner work (Stripe dashboard): reported, never paged" });
+}
 function aggRow(res, ints, mins = []) {
   if (!res || !Array.isArray(res.rows) || res.rows.length !== 1) return null;
   const r = res.rows[0]; if (!r || typeof r !== "object") return null;
@@ -325,22 +344,13 @@ export async function runStatusCore({ pool, c = CONSTANTS, asOf = null }) {
     if (bad || !miss) M.notifications = unknown(S.notifications, scopeLabel, bad ?? "REPLY_SHAPE");
     else { const k = classifyNotifications(rows, miss.n, T); M.notifications = metric(S.notifications, `${scopeLabel} (notify op created ≥ cutoff)`, k.status, k.counts); }
     rows = null;
-    // refunds: the 0027 projection for every confirmed intent in scope (bounded); a pending refund is EXPECTED manual work → INFO, never ACTION
+    // refunds: the 0027 projection for every confirmed intent in scope (bounded); a pending refund is EXPECTED manual work → INFO, never ACTION.
+    // Closed contract (PR188 / 0027): each row is exactly {x}; x is SQL NULL (not externally cancelled) or EXACTLY
+    // {cancelled:true, refundStatus: pending|none|partial|full}. Anything else (null / unknown / missing label, extra keys, wrong shape) → UNKNOWN.
+    // Completeness: the fixed query returns one row per confirmed intent, so the row count MUST equal the validated pr.confirmed of the
+    // same REPEATABLE READ snapshot; an unreadable prerequisite or any count mismatch (missing / truncated / extra rows) → UNKNOWN, never partial OK.
     const rf = await q(Q.refunds, base.slice(0, 3));
-    if (!rf || !Array.isArray(rf.rows) || rf.rows.length > c.scope.maxIntents) M.refunds = unknown(S.refunds, scopeLabel, "REPLY_SHAPE");
-    else {
-      const k = { confirmedRead: rf.rows.length, externallyCancelled: 0, refundPending: 0, refundOther: 0, refundNone: 0 }; let malformed = false;
-      for (const x of rf.rows) {
-        if (!x || typeof x !== "object" || !Object.hasOwn(x, "x")) { malformed = true; break; }
-        if (x.x === null) continue;
-        const v = x.x; if (!v || typeof v !== "object" || Array.isArray(v) || v.cancelled !== true || !(v.refundStatus === null || (typeof v.refundStatus === "string" && /^[a-z_]{1,40}$/.test(v.refundStatus)))) { malformed = true; break; }
-        k.externallyCancelled += 1;
-        if (v.refundStatus === "pending") k.refundPending += 1; else if (v.refundStatus === null) k.refundNone += 1; else k.refundOther += 1;
-      }
-      M.refunds = malformed ? unknown(S.refunds, scopeLabel, "REPLY_SHAPE")
-        : metric(S.refunds, `${scopeLabel}; the attested label only (Stripe dashboard execution unobserved)`, k.refundPending > 0 || k.refundNone > 0 ? "INFO" : "OK", k,
-          { note: "a pending manual refund is expected owner work (Stripe dashboard): reported, never paged" });
-    }
+    M.refunds = classifyRefunds(rf, pr ? pr.confirmed : null, c.scope.maxIntents, S.refunds, scopeLabel);
     const all = Object.values(M).map((m) => m.status);
     out.overall = all.includes("UNKNOWN") ? "UNKNOWN" : all.includes("ACTION") ? "ATTENTION" : all.includes("WAIT") ? "WAIT" : "OK";
     out.code = `STATUS_${out.overall}`;

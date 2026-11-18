@@ -27,13 +27,18 @@
 | cases | `reconciliation_cases` | — | any open | — |
 | work | `intent_work` | live lease | expired lease; work due > 30 min overdue | — |
 | notifications | `list_guest_notifications` (class + latch code) + missing-op check | ELIGIBLE < 90 min; WAITING / IN_FLIGHT < 30 min | ELIGIBLE ≥ 90 min (confirmed but unsent); other latch codes; WAITING / IN_FLIGHT ≥ 30 min; UNKNOWN / OTHER / OUT_OF_V1_SCOPE; a confirmed intent with no notify op | latched `EXTERNALLY_CANCELLED` |
-| refunds | `external_cancellation_public` (0027 minimal projection) | — | — | pending manual refund (expected owner work; never paged) |
+| refunds | `external_cancellation_public` (0027 minimal projection) | — | — (shape / completeness failures are UNKNOWN, below) | pending manual refund (expected owner work; never paged) |
 
 - `SUCCEEDED` confirmations and closed intents are OK.
 - **Thresholds are technical, TEST-only heuristics**, not a guest SLA.
 - **Overall:** UNKNOWN > ATTENTION (any ACTION) > WAIT > OK. INFO never pages, so the intentionally pending C116 refund does not raise attention.
 - **Exit codes:** 1 on ATTENTION / UNKNOWN; 0 on OK / WAIT.
 - **Missing / unreadable / malformed data → UNKNOWN**, never zero or healthy. A thrown statement voids all metrics.
+
+**Refund metric contract (rev 2, ROOT F1 / F2).**
+- **Closed shape (F1).** Each projection row is exactly `{x}`. `x` is SQL NULL (not externally cancelled) or **exactly** `{cancelled: true, refundStatus}` with `refundStatus` in `pending | none | partial | full` (the PR188 / 0027 contract). A null, unknown or missing label, an extra key or any other shape makes the refund metric UNKNOWN (`REFUND_SHAPE` / `REPLY_SHAPE`), never OK.
+- **Labels.** `pending` is INFO and never pages. `none`, `partial` and `full` are counted separately and reported as OK. They are owner attestations only; nothing here implies that a provider refund was executed.
+- **Completeness (F2).** The fixed query returns one row per confirmed intent in scope, so its row count must equal the validated `pipeline.confirmed` from the same REPEATABLE READ snapshot. Missing, truncated or extra rows give `ROW_COUNT_MISMATCH`; an unreadable pipeline aggregate gives `PREREQUISITE_UNREADABLE`. Both are UNKNOWN, never a partial OK. No new query, privilege or schema.
 
 **Unobserved (explicit, never inferred).**
 - Live Stripe authorization status.

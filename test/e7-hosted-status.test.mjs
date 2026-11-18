@@ -194,6 +194,52 @@ test("T6 core (fake): missing / unreadable / malformed data is UNKNOWN — never
   assert.equal(historic.res.metrics.notifications.status, "OK", "before the cutoff = out of scope");
 });
 
+test("T6b refunds (F1 closed 0027 shape + F2 same-snapshot completeness): SQL NULL and every valid label are reported faithfully (pending INFO, never pages); null / unknown / missing labels, extra keys, too few / too many rows and an unreadable prerequisite are UNKNOWN — never OK", async () => {
+  assert.deepEqual([...S.REFUND_LABELS], ["pending", "none", "partial", "full"]);
+  const agg = (confirmed) => ({ ...AGG, pipeline: { ...AGG.pipeline, total: confirmed, confirmed } });
+  const lab = (refundStatus) => ({ x: { cancelled: true, refundStatus } });
+  // valid: SQL NULL (not externally cancelled) + each label; counts are faithful; only pending → INFO; overall never pages
+  const valid = [
+    [[{ x: null }], "OK", { externallyCancelled: 0, refundPending: 0, refundNone: 0, refundPartial: 0, refundFull: 0 }],
+    [[lab("pending")], "INFO", { externallyCancelled: 1, refundPending: 1, refundNone: 0, refundPartial: 0, refundFull: 0 }],
+    [[lab("none")], "OK", { externallyCancelled: 1, refundPending: 0, refundNone: 1, refundPartial: 0, refundFull: 0 }],
+    [[lab("partial")], "OK", { externallyCancelled: 1, refundPending: 0, refundNone: 0, refundPartial: 1, refundFull: 0 }],
+    [[lab("full")], "OK", { externallyCancelled: 1, refundPending: 0, refundNone: 0, refundPartial: 0, refundFull: 1 }],
+    [[{ x: null }, lab("pending"), lab("none"), lab("partial"), lab("full")], "INFO", { externallyCancelled: 4, refundPending: 1, refundNone: 1, refundPartial: 1, refundFull: 1 }]
+  ];
+  for (const [refunds, status, counts] of valid) {
+    const { res } = await core(world({ refunds, agg: agg(refunds.length), scope: { n: refunds.length } }));
+    assert.equal(res.metrics.refunds.status, status, JSON.stringify(refunds));
+    assert.deepEqual(res.metrics.refunds.counts, { confirmedRead: refunds.length, ...counts });
+    assert.equal(res.overall, "OK", "a valid refund label never pages");
+    assert.match(res.metrics.refunds.scope, /execution unobserved/); assert.match(res.metrics.refunds.note, /not provider execution/);
+  }
+  // F1: the closed projection shape / enum
+  const badShape = [lab(null), lab("unknown"), lab("Pending"), lab("refunded"), lab(""), lab(3), { x: { cancelled: true } }, { x: { refundStatus: "pending" } },
+    { x: { cancelled: true, refundStatus: "pending", amount: 1 } }, { x: { cancelled: false, refundStatus: "pending" } }, { x: { cancelled: "true", refundStatus: "pending" } },
+    { x: [] }, { x: "pending" }, { x: 0 }, { x: null, extra: 1 }, { y: null }, {}, null, []];
+  for (const row of badShape) {
+    const { res } = await core(world({ refunds: [row] }));
+    assert.deepEqual([res.metrics.refunds.status, res.metrics.refunds.counts, res.overall], ["UNKNOWN", null, "UNKNOWN"], JSON.stringify(row));
+    assert.match(res.metrics.refunds.code, /^(REFUND_SHAPE|REPLY_SHAPE)$/);
+  }
+  // F2: cardinality must equal the validated pr.confirmed of the same snapshot
+  for (const [refunds, confirmed] of [[[], 1], [[{ x: null }], 2], [[{ x: null }, { x: null }], 1], [[lab("pending")], 0], [Array.from({ length: 501 }, () => ({ x: null })), 1]]) {
+    const { res } = await core(world({ refunds, agg: agg(confirmed) }));
+    assert.deepEqual([res.metrics.refunds.status, res.overall], ["UNKNOWN", "UNKNOWN"], `${refunds.length} rows vs confirmed ${confirmed}`);
+    assert.match(res.metrics.refunds.code, /^(ROW_COUNT_MISMATCH|REPLY_SHAPE)$/);
+  }
+  const zero = await core(world({ refunds: [], agg: agg(0) })); assert.deepEqual([zero.res.metrics.refunds.status, zero.res.metrics.refunds.counts.confirmedRead], ["OK", 0], "zero confirmed + zero rows is complete");
+  // unreadable prerequisite aggregate (pipeline) → refunds UNKNOWN even with a well-formed projection
+  for (const raw of [{ rows: [] }, { rows: [{ ...AGG.pipeline, confirmed: -1 }] }, { rows: [{ ...AGG.pipeline, confirmed: "1" }] }, { rows: [{ ...AGG.pipeline, extra: 0 }] }]) {
+    const { res } = await core(world({ raw: { pipeline: raw } }));
+    assert.deepEqual([res.metrics.pipeline.status, res.metrics.refunds.status, res.metrics.refunds.code, res.overall], ["UNKNOWN", "UNKNOWN", "PREREQUISITE_UNREADABLE", "UNKNOWN"], JSON.stringify(raw)?.slice(0, 60));
+  }
+  // the pure classifier agrees, and never reads anything
+  assert.equal(S.classifyRefunds({ rows: [lab("pending")] }, null, 500, "s", "sc").code, "PREREQUISITE_UNREADABLE");
+  assert.equal(S.classifyRefunds({ rows: [lab("pending")] }, 1, 500, "s", "sc").status, "INFO");
+});
+
 test("T7 hosted gates (seam): status needs ONLY the DB secret, both 64-hex digests (source exact, closure == pin), main, the run id, the pinned pg / DB target / CA; refused before any pool / core; ONE pool (max 1); the secret is removed from env; ATTENTION / UNKNOWN exit 1, OK / WAIT exit 0; preflight / verify take no secret", async () => {
   const SOURCE = await S.framedDigest(ROOT, C.runnerFiles, S.SOURCE_DIGEST_PREFIX);
   const gated = (over = {}) => ({ E7_TOOLING_DIR: TOOLING, E7_EXPECTED_SOURCE_DIGEST: SOURCE, E7_EXPECTED_CLOSURE_DIGEST: C.closureDigest, E7_WORKFLOW_SHA: "1".repeat(40), E7_RUN_ID: "123456789-1",
