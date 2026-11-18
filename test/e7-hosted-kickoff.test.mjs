@@ -40,10 +40,6 @@ const IID = "11111111-2222-4333-8444-555555555555"; const PI = "pi_3FakeKickoff0
 const okChild = async () => ({ status: 0, signal: null, stdout: "# tests 9\n# pass 9\n# fail 0\n# skipped 0\n", truncated: false, spawnFailed: false });
 const sha = (b) => createHash("sha256").update(b).digest("hex");
 const OPEN = Object.freeze({ ...C, executeEnabled: true, dispatchEnabled: true, toolingStatus: "MERGED" });
-/** C120: the shipped constants are the reviewed ENABLE state; CLOSED = exactly the CLOSE companion's constants (seam) — refusals asserted through it */
-const CLOSED = Object.freeze({ ...C, executeEnabled: false, dispatchEnabled: false });
-/** a STALE pipeline pin (seam): the checkout's pipeline frame does not equal it → not bound */
-const STALE = Object.freeze({ ...OPEN, pipeline: Object.freeze({ ...C.pipeline, sourceDigest: "f".repeat(64) }) });
 /** an env that throws on ANY value read — only key enumeration is allowed (proves "key names only" gates) */
 const namesOnly = (keys) => { const reads = []; const p = new Proxy(Object.fromEntries(keys.map((k) => [k, "x"])), {
   get: (t, k) => { reads.push(k); throw new Error(`value read: ${String(k)}`); }, getOwnPropertyDescriptor: (t, k) => ({ value: "x", enumerable: true, configurable: true, writable: true }) });
@@ -67,11 +63,11 @@ const boundConstants = async (wdir, over = {}) => { const b = await E.pipelineBi
 const realEnv = (over = {}) => ({ E7_TOOLING_DIR: TOOLING, E7_INTENT_ID: IID, E7_BOOKING_REF: REF, E7_EXPECTED_VERSION: "6", E7_PAYMENT_INTENT_ID: PI, E7_AMOUNT_MINOR: "56000",
   E7_WORKFLOW_SHA: SHA_A, GITHUB_SHA: SHA_A, GITHUB_REF: "refs/heads/main", E7_RUN_ID: "123456-1", E7_TEST_ARM: ARM, ...over });
 
-test("H1 C120 ACTIVATION ENABLE: executeEnabled / dispatchEnabled TRUE (one supervised run); the CLOSED constants (= the CLOSE companion) still refuse verify and execute HKO_EXECUTE_CLOSED from KEY NAMES only — 0 env value reads, 0 import / spawn / head / pg / CA / core", async () => {
-  assert.equal(C.executeEnabled, true); assert.equal(C.dispatchEnabled, true); assert.equal(C.toolingStatus, "MERGED"); assert.equal(C.toolingCommit, TOOL_PIN);
+test("H1 SHIPPED CLOSED: executeEnabled / dispatchEnabled FALSE; verify and execute refuse HKO_EXECUTE_CLOSED from KEY NAMES only — 0 env value reads, 0 import / spawn / head / pg / CA / core", async () => {
+  assert.equal(C.executeEnabled, false); assert.equal(C.dispatchEnabled, false); assert.equal(C.toolingStatus, "MERGED"); assert.equal(C.toolingCommit, TOOL_PIN);
   for (const mode of ["verify", "execute"]) {
     const { env, reads } = namesOnly(["E7_TOOLING_DIR", "E7_INTENT_ID", "E7_DEV_BOOKING_DATABASE_URL", "E7_DISPATCH_TOKEN", "GITHUB_SHA"]);
-    const r = await E.runHosted({ mode, env, proc: PROC, wrapperDir: ROOT, deps: { ...TRAPS, constants: CLOSED } });
+    const r = await E.runHosted({ mode, env, proc: PROC, wrapperDir: ROOT, deps: TRAPS });
     assert.deepEqual([r.exitCode, r.result.code], [1, "HKO_EXECUTE_CLOSED"], mode); assert.deepEqual(reads, [], `${mode}: no env value was read`);
   }
   // an unexpected E7_ key name is refused first, also from names only
@@ -92,8 +88,8 @@ test("H3 preflight (default, no env / secret / DB / install): closure digest of 
   const seen = {};
   const r = await E.runHosted({ mode: "preflight", env: { E7_TOOLING_DIR: TOOLING, PATH: "/usr/bin" }, proc: PROC, wrapperDir: ROOT,
     deps: { ...TRAPS, importEnv: (d) => tool("scripts/e7-connected/probe-env-preflight.mjs"), spawnChild: async (args, o) => { seen.args = args; seen.env = o.env; return okChild(); } } }).catch((e) => e);
-  assert.equal(r.exitCode, 0, JSON.stringify(r.result)); assert.equal(r.result.code, "PREFLIGHT_OK_PIPELINE_BOUND", "C120: this main carries the reviewed ENABLE pipeline source");
-  assert.equal(r.result.closureDigest, C.closureDigest); assert.equal(r.result.pipeline.bound, true); assert.equal(r.result.pipeline.sourceDigest, C.pipeline.sourceDigest); assert.equal(r.result.pipeline.closureDigest, C.pipeline.closureDigest);
+  assert.equal(r.exitCode, 0, JSON.stringify(r.result)); assert.equal(r.result.code, "PREFLIGHT_OK_PIPELINE_NOT_BOUND");
+  assert.equal(r.result.closureDigest, C.closureDigest); assert.equal(r.result.pipeline.bound, false); assert.equal(r.result.pipeline.closureDigest, C.pipeline.closureDigest);
   assert.deepEqual(seen.args, ["--test", "--test-reporter=tap", ...E.TEST_FILES]); assert.deepEqual(Object.keys(seen.env).sort(), ["E7_TOOLING_DIR", "PATH"]);
   const bad = await E.runHosted({ mode: "preflight", env: { E7_TOOLING_DIR: TOOLING }, proc: PROC, wrapperDir: ROOT,
     deps: { ...TRAPS, importEnv: () => C1, spawnChild: async () => ({ status: 1, signal: null, stdout: "# tests 3\n# pass 2\n# fail 1\n", truncated: false, spawnFailed: false }) } });
@@ -177,7 +173,7 @@ test("H6 verify / execute ORDER (open seam constants): not MERGED / no inputs / 
       ["not main (C119 S2: the arm refuses a non-main ref first)", "verify", base({ GITHUB_REF: "refs/heads/feature" }), bc, "HKO_ARM_CLOSED"],
       ["GITHUB_SHA != E7_WORKFLOW_SHA", "verify", base({ GITHUB_SHA: SHA_B }), bc, "HKO_BINDING_MISMATCH"],
       ["own source", "verify", base({ E7_EXPECTED_SOURCE_DIGEST: "c".repeat(64) }), bc, "HKO_SOURCE_MISMATCH"],
-      ["pipeline not bound (stale pin seam)", "verify", base(), STALE, "HKO_PIPELINE_NOT_BOUND"]];
+      ["pipeline not bound (stale / closed)", "verify", base(), OPEN, "HKO_PIPELINE_NOT_BOUND"]];
     for (const [label, mode, env, constants, k] of cases) {
       const r = await E.runHosted({ mode, env, proc: PROC, wrapperDir: w, deps: { ...TRAPS, readHead: head, constants } });
       assert.equal(r.result.code, k, label);
@@ -191,7 +187,7 @@ test("H6 verify / execute ORDER (open seam constants): not MERGED / no inputs / 
     let secretReads = 0;
     const counted = (o) => new Proxy(o, { get: (t2, k) => { if (E.SECRET_KEYS.includes(k)) secretReads += 1; return t2[k]; } });
     const nb = await E.runHosted({ mode: "execute", env: counted(base({ E7_DEV_BOOKING_DATABASE_URL: "postgresql://x", E7_DISPATCH_TOKEN: "t".repeat(40) })), proc: PROC, wrapperDir: w,
-      deps: { ...TRAPS, readHead: head, constants: STALE } });
+      deps: { ...TRAPS, readHead: head, constants: OPEN } });
     assert.deepEqual([nb.result.code, secretReads], ["HKO_PIPELINE_NOT_BOUND", 0]);
   } finally { rmSync(w, { recursive: true, force: true }); }
 });
@@ -331,10 +327,9 @@ const OPEN_CORE = Object.freeze({ ...C, dispatchEnabled: true, tls: TLS_POL });
 const core = (st, over = {}) => E.runKickoffCore({ mods: MODS, pool: st.pool, binding: BIND, credential: () => { throw new Error("credential must not be read"); }, workerId: "hko:test-0001",
   constants: OPEN_CORE, ...over });
 
-test("K1 the core is CLOSED with the CLOSED constants (= the CLOSE companion; C120 ships dispatchEnabled TRUE): HKO_DISPATCH_CLOSED before ANY pool acquisition; invalid inputs / scope drift / historical binding also refuse with 0 connect", async () => {
+test("K1 the core is CLOSED with the shipped constants: HKO_DISPATCH_CLOSED before ANY pool acquisition; invalid inputs / scope drift / historical binding also refuse with 0 connect", async () => {
   const st = fakePool();
-  assert.equal(C.dispatchEnabled, true);
-  assert.deepEqual([(await core(st, { constants: CLOSED })).code, st.connects], ["HKO_DISPATCH_CLOSED", 0]);
+  assert.deepEqual([(await core(st, { constants: C })).code, st.connects], ["HKO_DISPATCH_CLOSED", 0]);
   assert.equal((await core(st, { binding: { ...BIND, releaseSha: "main" } })).code, "CORE_INVALID");
   assert.equal((await core(st, { binding: { ...BIND, intentId: "1d6e770f-ba3d-40f7-92c1-ee01be7da532" } })).code, "HISTORICAL_TARGET");
   assert.equal((await core(st, { mods: { ...MODS, KICKOFF_SCOPE: { ...PL.KICKOFF_SCOPE, cutoff: "2026-11-01T00:00:00.000Z" } } })).code, "SCOPE_DRIFT");
@@ -498,7 +493,7 @@ const DMODS = Object.freeze({ readKickoffFacts: factsVia(FACTS_OK), kickoffAdmis
 const detCore = (st, over = {}) => E.runKickoffCore({ mods: DMODS, pool: st.pool, binding: { source: "detect" }, constants: OPEN_CORE, ...over });
 const SEL = Object.freeze({ source: "selected", expectedFingerprint: FP, releaseSha: SHA_A });
 
-test("K11 C113 binding seam: source-less == manual (compat); source manual / selected / detect take EXACT keys; unknown tags, extra / missing keys, a bad fingerprint / SHA, or a credential / worker on detect → CORE_INVALID with 0 connect; the CLOSED constants (= the CLOSE companion) stop detect too", async () => {
+test("K11 C113 binding seam: source-less == manual (compat); source manual / selected / detect take EXACT keys; unknown tags, extra / missing keys, a bad fingerprint / SHA, or a credential / worker on detect → CORE_INVALID with 0 connect; the shipped CLOSED constants stop detect too", async () => {
   assert.equal(E.CANDIDATE_PREFIX, "e7-kickoff-candidate-v1");
   assert.equal(E.candidateFingerprint({ intentId: "00000000-0000-4000-8000-000000000001", ref: "MV-TEST0001", version: 4, paymentIntentId: "pi_SYNTHETIC0001", amountMinor: 14000 }),
     "13e93ba6950bf74d5b1931cb4d95ad69ad4f90faf6c649878052d3347db905ea", "the contract test vector");
@@ -517,7 +512,7 @@ test("K11 C113 binding seam: source-less == manual (compat); source manual / sel
     assert.equal((await core(st, o)).code, "CORE_INVALID", label);
   assert.equal((await detCore(st, { credential: () => "x" })).code, "CORE_INVALID", "detect never takes a credential");
   assert.equal((await detCore(st, { workerId: "hko:x" })).code, "CORE_INVALID", "detect never takes a worker");
-  assert.equal((await detCore(st, { constants: CLOSED })).code, "HKO_DISPATCH_CLOSED");
+  assert.equal((await detCore(st, { constants: C })).code, "HKO_DISPATCH_CLOSED");
   assert.equal(st.connects, 0);
 });
 
@@ -650,8 +645,8 @@ const secretCounted = (o) => { const n = { reads: 0, byKey: {} }; return { n, en
 const detEnv = (over = {}) => ({ E7_TOOLING_DIR: TOOLING, E7_INPUT_MODE: "detect", E7_INTENT_ID: "", E7_BOOKING_REF: "", E7_EXPECTED_VERSION: "", E7_PAYMENT_INTENT_ID: "", E7_AMOUNT_MINOR: "",
   E7_WORKFLOW_SHA: SHA_A, GITHUB_SHA: SHA_A, GITHUB_REF: "refs/heads/main", E7_RUN_ID: "123456-1", E7_TEST_ARM: ARM, ...over });
 
-test("H9 C113 CLOSED detect flow (the CLOSED constants = the CLOSE companion): verify → CLOSED_NOOP exit 0 with output open=false (the gated jobs are skipped: 0 prompts, 0 DB secret); a secret / fingerprint NAME or any binding input refuses; a CLOSED detect / detect-flow execute → HKO_EXECUTE_CLOSED; unknown / inconsistent modes refuse — 0 secret reads, 0 import / head / core", async () => {
-  { const { n, env } = secretCounted(detEnv()); const r = await E.runHosted({ mode: "verify", env, proc: PROC, wrapperDir: ROOT, deps: { ...TRAPS, constants: CLOSED } });
+test("H9 C113 SHIPPED CLOSED detect flow: verify → CLOSED_NOOP exit 0 with output open=false (the gated jobs are skipped: 0 prompts, 0 DB secret); a secret / fingerprint NAME or any binding input refuses; a CLOSED detect / detect-flow execute → HKO_EXECUTE_CLOSED; unknown / inconsistent modes refuse — 0 secret reads, 0 import / head / core", async () => {
+  { const { n, env } = secretCounted(detEnv()); const r = await E.runHosted({ mode: "verify", env, proc: PROC, wrapperDir: ROOT, deps: TRAPS });
     assert.deepEqual([r.exitCode, r.result.code, r.result.flow, r.result.outputs, n.reads], [0, "CLOSED_NOOP", "detect", { open: "false" }, 0]);
     assert.equal(E.outputLines(r.result), "open=false\n"); }
   for (const [label, mode, over, k] of [
@@ -663,11 +658,11 @@ test("H9 C113 CLOSED detect flow (the CLOSED constants = the CLOSE companion): v
     ["detect-flow execute (closed)", "execute", { E7_EXPECTED_CANDIDATE_FINGERPRINT: FP, E7_DEV_BOOKING_DATABASE_URL: "x", E7_DISPATCH_TOKEN: "x" }, "HKO_EXECUTE_CLOSED"],
     ["unknown input mode", "verify", { E7_INPUT_MODE: "auto" }, "HKO_INPUT_INVALID"],
     ["detect command, manual input mode", "detect", { E7_INPUT_MODE: "execute" }, "HKO_INPUT_INVALID"]]) {
-    const { n, env } = secretCounted(detEnv(over)); const r = await E.runHosted({ mode, env, proc: PROC, wrapperDir: ROOT, deps: { ...TRAPS, constants: CLOSED } });
+    const { n, env } = secretCounted(detEnv(over)); const r = await E.runHosted({ mode, env, proc: PROC, wrapperDir: ROOT, deps: TRAPS });
     assert.deepEqual([r.exitCode, r.result.code, n.reads, r.result.outputs], [1, k, 0, null], label); assert.equal(E.outputLines(r.result), "", label);
   }
   // the manual flow is unchanged when CLOSED (verify / execute → HKO_EXECUTE_CLOSED, no outputs)
-  for (const mode of ["verify", "execute"]) { const r = await E.runHosted({ mode, env: realEnv({ E7_INPUT_MODE: mode }), proc: PROC, wrapperDir: ROOT, deps: { ...TRAPS, constants: CLOSED } });
+  for (const mode of ["verify", "execute"]) { const r = await E.runHosted({ mode, env: realEnv({ E7_INPUT_MODE: mode }), proc: PROC, wrapperDir: ROOT, deps: TRAPS });
     assert.deepEqual([r.result.code, r.result.flow, E.outputLines(r.result)], ["HKO_EXECUTE_CLOSED", "manual", ""], mode); }
 });
 
@@ -732,19 +727,9 @@ test("H10 C113 OPEN seam: verify(detect) → open=true; detect holds ONLY the DB
 });
 
 test("H11 C115 scheduled source pin (the value the workflow passes for a schedule: vars.E7_KICKOFF_EXPECTED_SOURCE or the literal 'MISSING'): CLOSED → CLOSED_NOOP whatever the pin (0 secret reads); OPEN verify / detect / execute with a missing / malformed / stale pin refuse BEFORE any secret read, import, pool or core; only the exact reviewed pin passes — never a fallback to the computed digest", async () => {
-  { const CLOSED = Object.freeze({ ...C, executeEnabled: false, dispatchEnabled: false });   // C120 ACTIVATION ENABLE: the CLOSED behaviour is proven through a closed-constants seam
-    for (const pin of ["MISSING", "f".repeat(64), ""]) { const { n, env } = secretCounted(detEnv({ E7_EXPECTED_SOURCE_DIGEST: pin }));
-    const r = await E.runHosted({ mode: "verify", env, proc: PROC, wrapperDir: ROOT, deps: { ...TRAPS, constants: CLOSED } });
+  { for (const pin of ["MISSING", "f".repeat(64), ""]) { const { n, env } = secretCounted(detEnv({ E7_EXPECTED_SOURCE_DIGEST: pin }));
+    const r = await E.runHosted({ mode: "verify", env, proc: PROC, wrapperDir: ROOT, deps: TRAPS });
     assert.deepEqual([r.exitCode, r.result.code, r.result.outputs, n.reads], [0, "CLOSED_NOOP", { open: "false" }, 0], pin); } }
-  // C120 ACTIVATION ENABLE: with the SHIPPED OPEN constants a scheduled tick whose pin is MISSING / empty / not lowercase hex / foreign is refused at verify
-  // and at detect BEFORE any secret read — a schedule can never act outside the reviewed binding while this window is open
-  for (const [pin, want] of [["MISSING", "HKO_INPUT_INCOMPLETE"], ["", "HKO_INPUT_INCOMPLETE"], ["F".repeat(64), "HKO_INPUT_INCOMPLETE"], ["f".repeat(64), "HKO_SOURCE_MISMATCH"]]) {
-    for (const mode of ["verify", "detect"]) {
-      const { n, env } = secretCounted(detEnv({ E7_EXPECTED_SOURCE_DIGEST: pin }));
-      const r = await E.runHosted({ mode, env, proc: PROC, wrapperDir: ROOT, deps: TRAPS });
-      assert.deepEqual([r.exitCode, r.result.code, n.reads], [1, want, 0], `shipped OPEN ${mode} pin=${pin.slice(0, 8)}`);
-    }
-  }
   const w = wrapperFixture();
   try {
     const bc = await boundConstants(w); const src = await E.framedDigest(w, E.RUNNER_FILES, E.SOURCE_PREFIX);

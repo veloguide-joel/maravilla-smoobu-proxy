@@ -32,7 +32,7 @@ const NOTIFICATION = Object.freeze({
   prefix: "e7-hosted-booking-confirmation-v1\n",
   runnerFiles: ["scripts/e7-hosted-booking-confirmation.mjs", "test/e7-hosted-booking-confirmation.test.mjs", "test/e7-hosted-booking-confirmation-workflow.test.mjs",
     ".github/workflows/e7-hosted-booking-confirmation.yml"],
-  frame: "629037bcf2b57da721705b572e2c148e258b2dae36b2f8ab698294ae5a141972"   // C120 ACTIVATION ENABLE (executeEnabled true; the CLOSE companion restores f969791b…). C119 S4: catalog 28 + e7-test-auto + P3 fresh admission (was ccb52e91… at S2). C119 S2: + the TEST arm re-check (labelled copy) + the arm job / draft schedule (was 9c6cf9f2… at S1 rev 2 / main 30d00191; 0cd953a9… at C116)
+  frame: "f969791b7cb175dc8426a7796db43ab7be70605ac1cd940d0c30a30ffcfca859"   // C119 S4: catalog 28 + e7-test-auto + P3 fresh admission (was ccb52e91… at S2). C119 S2: + the TEST arm re-check (labelled copy) + the arm job / draft schedule (was 9c6cf9f2… at S1 rev 2 / main 30d00191; 0cd953a9… at C116)
 });
 
 /** every runtime source frame on main: each runner's own runnerFiles, plus the fixed frames the workflow tests pin for the two probes */
@@ -51,7 +51,7 @@ async function runtimeFrames() {
 
 test("X1 the C50 notification runner (moved from pipeline W7 / kickoff W8): SHIPPED CLOSED and its exact frame equals the LITERAL reviewed digest", async () => {
   const N = await import("../scripts/e7-hosted-booking-confirmation.mjs");
-  assert.equal(N.CONSTANTS.executeEnabled, true, "C120 ACTIVATION ENABLE (the CLOSE companion restores false / SHIPPED CLOSED)");
+  assert.equal(N.CONSTANTS.executeEnabled, false, "SHIPPED CLOSED");
   assert.deepEqual([...N.CONSTANTS.runnerFiles], NOTIFICATION.runnerFiles);
   assert.equal(await N.framedDigest(ROOT, NOTIFICATION.runnerFiles, NOTIFICATION.prefix), NOTIFICATION.frame);
 });
@@ -95,8 +95,8 @@ test("X4 CI wiring: the regression runs on every pull request / push to main (an
 
 /** C119 S2: the LITERAL reviewed TEST-arm release of this tree (outside every component, so the release never embeds itself). It is NOT an
  *  arm and sets nothing: ROOT sets the repository variable out-of-band at a separately authorized activation, never from this file. */
-// C120 ACTIVATION ENABLE: 29ff560e… (the CLOSE companion restores 7a407d45…). C119 S4: 7a407d45… after the pipeline admission cascade + the MERGED tooling repin (was 12a8f416… at S2 / main ec489f5a)
-const ARM_RELEASE = Object.freeze({ release: "29ff560e3a2fe636aef7cfdb28f85bffebb7d30d1bf5463ec42861f0a5b465c8", components: ["arm-gate", "kickoff", "booking-confirmation", "pipeline"] });
+// C119 S4: 7a407d45… after the pipeline admission cascade + the MERGED tooling repin (was 12a8f416… at S2 / main ec489f5a)
+const ARM_RELEASE = Object.freeze({ release: "7a407d45741b62b3757209a55e096cf47874a0b155613e88fb7053eb6874546b", components: ["arm-gate", "kickoff", "booking-confirmation", "pipeline"] });
 
 test("X5 C119 S2 the TEST-arm release recomputed from this checkout equals the LITERAL reviewed release; this file is outside every arm component; no component file carries the release", async () => {
   const A = await import("../scripts/e7-test-arm.mjs");
