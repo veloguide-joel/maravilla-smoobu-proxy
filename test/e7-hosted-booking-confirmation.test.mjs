@@ -5,13 +5,15 @@
 // executor and SQL 23 receipts — the exchange is ALWAYS FAKE (no network). Lifecycle helpers are generated at runtime from the pinned tooling file
 // test/db/e7-gn-v2-resend-integration.test.mjs (sha-checked; verbatim; imports rewritten to the tooling checkout). The hosted preflight child never sets
 // E7_HBC_DB_TESTS. Nothing here touches a shared database, a provider or the network.
+// C119 S1: the DB tests run at schema 27 = the pinned tooling's 0001..0026 + the MERGED e7-test 0027 bytes, read from E7_SCHEMA27_DIR (a checkout of
+// e7-test a314681b; both 0027 files sha-checked below). Detect / detect-flow execute / external-cancellation / catalog-27 cases added (H10–H12, D8–D14).
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import https from "node:https";
 import http from "node:http";
 import { syncBuiltinESMExports, createRequire } from "node:module";
 import { createHash } from "node:crypto";
-import { readFileSync, realpathSync, mkdtempSync, writeFileSync, rmSync, symlinkSync, mkdirSync } from "node:fs";
+import { readFileSync, realpathSync, mkdtempSync, writeFileSync, rmSync, symlinkSync, mkdirSync, readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
@@ -36,11 +38,14 @@ const PII = /@|SENTINEL|Synthia|Zanabria|re_[A-Za-z0-9]|Bearer|FAKEPW|maraVilla 
 const KEY = "re_SENTINELkey0123456789";
 const PROC = { versions: { node: "22.22.0" }, platform: "linux", execArgv: [], getuid: () => 1000 };
 const OPEN = Object.freeze({ ...C, executeEnabled: true });           // the TEST-LOCAL seam only; the shipped constant stays false
+/** the C116 schema-26 identity (literal; the CLOSED main runner's previous pin) and the #189 packet's POST-27 notification catalog (literal) */
+const PIN26 = Object.freeze({"catalog":"47b1d904a25cde0f4f9f85b8554b93cd914364d70ef1091cb273ce68043379da","readPath":"31f23b641bb57d5cbdec1aa4896447a574190dd057e4b92e6c5fdf8326220baf","readPathCount":6,"sections":{"con":"550534b1daca47fc1df90a557d5dd28a7f6e1f1df11c581cdbd7a671eb95c188","col":"9d645f671980c7a2e0e679aa07d9a3c30a937e488236f132b589a0a162237fbe","fn":"501f34f7f4db9a5a5fb98c00046013a7904745faea78cd731bbafa23ddf8fb7c","pol":"7c69ad5c06cae91f06e96c8ac9d86d97dbc09e94d95a8afb399b141162ee83ee","rel":"359796c40820562166a4f10dce97ae433fe7ae53c5fd2b3385fc41f179437e89","trg":"13e79df7b90097f365a7f3f15337e58c7b7d5277378608fd482c77e2051982f5"}});
+const POST27_CATALOG = "bcc116319adfa7c2e0c2f42d32d48b67fdc53ab35cd4058e777e5de5376c6d16";
 
 // ---------------------------------------------------------------------------------------------------------------------------------
 test("H1 SHIPPED CLOSED: executeEnabled false; verify AND execute refuse NBC_EXECUTE_CLOSED before ANY tooling import, env VALUE read (secrets present), DB, spawn or provider — proven with throwing deps and a recording env proxy", async () => {
   assert.equal(C.executeEnabled, false); assert.ok(Object.isFrozen(C) && Object.isFrozen(C.sender) && Object.isFrozen(C.budgets));
-  for (const mode of ["verify", "execute"]) {
+  for (const mode of ["verify", "detect", "execute"]) {
     const reads = []; const base = { E7_DEV_BOOKING_DATABASE_URL: "postgresql://x", E7_RESEND_TEST_KEY: KEY, E7_APPROVAL_REF: "label", E7_INTENT_ID: IID, E7_OP_ID: OID,
       E7_EXPECTED_VERSION: "9", E7_LOCALE: "en", E7_TOOLING_DIR: TOOLING, GITHUB_REF: "refs/heads/main" };
     const env = new Proxy(base, { get(t, k) { reads.push(String(k)); return t[k]; } });
@@ -51,18 +56,25 @@ test("H1 SHIPPED CLOSED: executeEnabled false; verify AND execute refuse NBC_EXE
     assert.equal(base.E7_RESEND_TEST_KEY, KEY, "nothing deleted / touched");
   }
   const src = readFileSync(join(ROOT, "scripts/e7-hosted-booking-confirmation.mjs"), "utf8"); const code = src.replace(/^\s*\/\/.*$/gm, "").replace(/\/\*\*[\s\S]*?\*\//g, "");
-  assert.deepEqual([...code.matchAll(/^import .* from "([^"]+)";$/gm)].map((m) => m[1]).sort(), ["node:child_process", "node:crypto", "node:fs/promises", "node:process", "node:url"]);
+  assert.deepEqual([...code.matchAll(/^import .* from "([^"]+)";$/gm)].map((m) => m[1]).sort(), ["node:child_process", "node:crypto", "node:fs", "node:fs/promises", "node:process", "node:url"]);
   assert.deepEqual([...code.matchAll(/u\("([^"]+)"\)/g)].map((m) => m[1]).sort(), ["lib/booking-db/notification-worker.js", "lib/booking-db/pool.js", "lib/notify/resend-notification-executor.js", "scripts/e7-resend/resend-exchange.mjs"]);
   const iClosed = code.indexOf('refuse("NBC_EXECUTE_CLOSED")'); assert.ok(iClosed > 0);
-  for (const later of ["importEnv(tooling)", "importTooling(tooling)", "readCa(", "readPgVersion(", "framedDigest(tooling", "env.E7_DEV_BOOKING_DATABASE_URL", "env.E7_RESEND_TEST_KEY", "env[INPUT_ENV"])
+  for (const later of ["importEnv(tooling)", "importTooling(tooling)", "readCa(", "readPgVersion(", "framedDigest(tooling", "env.E7_DEV_BOOKING_DATABASE_URL", "env.E7_RESEND_TEST_KEY", "env[INPUT_ENV",
+    "env.E7_INPUT_MODE", "env.E7_EXPECTED_CANDIDATE_FINGERPRINT", "runDetect({"])
     assert.ok(code.indexOf(later) > iClosed, `${later} only after the CLOSED gate`);
-  assert.doesNotMatch(code, /claim_guest_notification|complete_guest_notification|latch_guest_notification|recover_expired|release_notification_work|claim_notification_work|guest_notification_snapshot|guest_notification_presend|suppress_guest|purge_guest|stripe|hostaway\.com/i);
+  assert.doesNotMatch(code, /claim_guest_notification|complete_guest_notification|latch_guest_notification|recover_expired|release_notification_work|claim_notification_work|guest_notification_presend|suppress_guest|purge_guest|stripe|hostaway\.com/i);
   assert.doesNotMatch(code, /\b(INSERT|UPDATE|DELETE|TRUNCATE|MERGE)\b/, "no SQL write keyword anywhere in the runner (the ONLY write path is the accepted worker)");
   assert.match(src, /^if \(import\.meta\.main === true\) \{$/m);
   for (const [k, v] of Object.entries(Q)) {
     if (k === "begin") assert.equal(v, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"); else if (k === "rollback") assert.equal(v, "ROLLBACK"); else assert.match(v, /^SELECT /, k);
-    for (const fn of v.matchAll(/booking\.([a-z_0-9]+)\s*\(/g)) assert.equal(fn[1], "list_guest_notifications", k);
+    for (const fn of v.matchAll(/booking\.([a-z_0-9]+)\s*\(/g)) assert.ok(["list_guest_notifications", "external_cancellation_public"].includes(fn[1]), k);
   }
+  assert.equal(Q.cancellation, "SELECT booking.external_cancellation_public($1::uuid) AS x", "C119 S1: ONLY the minimal granted 0027 projection");
+  assert.doesNotMatch(code, /externally_cancelled\s*\(|external_cancellations\b|external_refund_attestations\b/, "no ungranted 0027 read path");
+  assert.deepEqual(Object.keys(R.DETECT_QUERIES), ["page", "snapshot"]);
+  for (const [k, v] of Object.entries(R.DETECT_QUERIES)) { assert.match(v, /^SELECT /, k); assert.deepEqual([...v.matchAll(/booking\.([a-z_0-9]+)\s*\(/g)].map((m) => m[1]), [k === "page" ? "list_guest_notifications" : "guest_notification_snapshot"], k); }
+  assert.equal(R.DETECT_QUERIES.snapshot, "SELECT booking.guest_notification_snapshot($1::uuid) AS r", "rev 2: the accepted worker's own read-only observation function (runtime grant since 0016), nothing else");
+  assert.equal((code.match(/guest_notification_snapshot/g) || []).length, 1, "the snapshot read path appears exactly once (the reviewed query constant)");
   assert.match(R.POSTCHECK_QUERY, /^SELECT /); assert.doesNotMatch(R.POSTCHECK_QUERY, /booking\.[a-z_]+\s*\(/);
 });
 
@@ -76,10 +88,13 @@ test("H2 labelled copies: hosted-boot helpers == scripts/e7-hosted-reservation.m
     assert.equal(R.dbTargetOk(u), H.dbTargetOk(u));
   assert.equal(R.OFFICIAL_CA_SHA256, H.OFFICIAL_CA_SHA256);
   assert.deepEqual([C.listingId, C.dbEnvironment, C.dbProjectRef, C.nodeVersion, [...C.protectedReservationIds]], [H.CONSTANTS.listingId, H.CONSTANTS.dbEnvironment, H.CONSTANTS.dbProjectRef, H.CONSTANTS.nodeVersion, [...H.CONSTANTS.protectedReservationIds]]);
-  assert.equal(R.CATALOG_SQL, I.CATALOG_SQL); assert.equal(R.OWNER_ACL_CANON, I.OWNER_ACL_CANON); assert.deepEqual([...R.READ_PATH_FUNCTIONS], [...I.READ_PATH_FUNCTIONS]);
-  // C116: the schema-26 pin is DERIVED on disposable PG (D0 reproduces the accepted schema-23 pin with the same query); it is none of the inspector's 21 / 22 / 23
-  assert.deepEqual(Object.keys(C.catalogPin26).sort(), Object.keys(I.CONSTANTS.catalogPins["23"]).sort());
-  for (const v of ["21", "22", "23"]) assert.notEqual(C.catalogPin26.catalog, I.CONSTANTS.catalogPins[v].catalog, `pin 26 != inspector pin ${v}`); assert.equal(R.bounded.toString(), I.bounded.toString());
+  assert.equal(R.CATALOG_SQL, I.CATALOG_SQL); assert.equal(R.OWNER_ACL_CANON, I.OWNER_ACL_CANON); assert.deepEqual([...R.INSPECT_READ_PATH_FUNCTIONS], [...I.READ_PATH_FUNCTIONS]);
+  assert.deepEqual([...R.READ_PATH_FUNCTIONS], [...I.READ_PATH_FUNCTIONS, "external_cancellation_public"], "C119 S1: the inspector's read path + the ONE granted 0027 projection");
+  // C119 S1: the schema-27 pin is DERIVED on disposable PG (D0 reproduces the accepted schema-23 and C116 schema-26 pins with the same query); none of 21 / 22 / 23 / 26
+  assert.deepEqual(Object.keys(C.catalogPin27).sort(), Object.keys(I.CONSTANTS.catalogPins["23"]).sort());
+  for (const v of ["21", "22", "23"]) assert.notEqual(C.catalogPin27.catalog, I.CONSTANTS.catalogPins[v].catalog, `pin 27 != inspector pin ${v}`);
+  assert.notEqual(C.catalogPin27.catalog, PIN26.catalog); assert.equal(C.catalogPin27.catalog, POST27_CATALOG, "== the #189 apply packet's POST-27 notification catalog (independent derivation)");
+  assert.equal(C.catalogPin27.readPathCount, 7); assert.equal(R.bounded.toString(), I.bounded.toString());
 });
 
 test("H3 independent closure at the pinned MERGED tooling 66133a22 (C116 #180 merge; was 46b3eaf8) (five runtime roots → 9 modules incl. C54 lib/notify/sender-identity.js + package files; bare imports node:* and pg only); digest; pg 8.18.0; the tooling exchange is byte-identical to main's reviewed scripts/e7-resend/resend-exchange.mjs", async () => {
@@ -132,7 +147,7 @@ test("H4 plan: deterministic; binds intent / op / version / locale / the fixed a
     assert.notEqual(R.buildPlan(C, { ...base, [k]: v }).planHash, h0, k);
   for (const over of [{ sender: { fromAddress: "other@sender.mv-test.invalid", fromName: "maraVilla Test" } }, { sender: { fromAddress: "bookings@sender.mv-test.invalid", fromName: "maraVilla Test" } },
     { sender: { fromAddress: "bookings@mail.maravillanayarit.com", fromName: "maraVilla" } }, { toolingCommit: "d322d2192b377d18b6a9280ae06c17eddfe3e73e" }, { excludedIntentIds: [] }, { protectedReservationIds: [] }, { closureDigest: "c".repeat(64) },
-    { catalogPin26: {} }, { budgets: { ...C.budgets, sends: 2 } }, { executeEnabled: true }])
+    { catalogPin27: {} }, { budgets: { ...C.budgets, sends: 2 } }, { executeEnabled: true }])
     assert.notEqual(R.buildPlan({ ...C, ...over }, base).planHash, h0, Object.keys(over)[0]);
   assert.deepEqual(C.sender, { fromAddress: "bookings@mail.micasadirect.com", fromName: "MiCasaDirect" }, "C55: the fixed approved sender (sender only; not a domain-verification claim)");
   assert.deepEqual([...C.excludedIntentIds], ["abede8b1-8ef6-44f2-876e-6a02fc056a96", "c83c1842-d342-4e27-9ab7-dc3d50b7a309"]);
@@ -235,7 +250,7 @@ test("H6 through the TEST-LOCAL seam (executeEnabled true in constants only): ve
 // ---- admission + core through FAKES ------------------------------------------------------------------------------------------------------
 const PLAN = R.buildPlan(OPEN, { approvalRef: "l", intentId: IID, opId: OID, expectedVersion: VER, locale: "en", sourceDigest: "a".repeat(64) }).plan;
 function world(over = {}) {
-  return { role: { ro: "on", iso: "repeatable read", su: false, app: true, adm: false, rep: false, own: false }, catalog: C.catalogPin26, instance: { n: 1, env: "test" },
+  return { role: { ro: "on", iso: "repeatable read", su: false, app: true, adm: false, rep: false, own: false }, catalog: C.catalogPin27, instance: { n: 1, env: "test" },
     intent: [{ id: IID, state: "confirmed", version: VER, listing_id: 606998, currency: "USD", protected_reservation: false, email: "SENTINEL@example.test" }],
     ops: [{ id: OID, state: "pending", attempts: 0, dispatched: false, leased: false, completed: false, has_result: false, template: "booking_confirmed", payload_keys: ["template"], protected_payload: false }],
     pages: [[{ op_id: OID, intent_id: IID, class: "ELIGIBLE" }]], artefacts: { renders: 0, latches: 0, receipts: 0, work_leased: 0 }, throwAt: null, ...over };
@@ -243,19 +258,24 @@ function world(over = {}) {
 function fakeClient(w, log) {
   let page = 0;
   return { query: async (t, p) => {
-    const k = Object.keys(Q).find((x) => Q[x] === t) ?? (t === R.POSTCHECK_QUERY ? "postcheck" : (t.startsWith("BEGIN") || t === "ROLLBACK") ? "tx" : null);
+    const k = Object.keys(Q).find((x) => Q[x] === t) ?? (t === R.POSTCHECK_QUERY ? "postcheck" : t === R.DETECT_QUERIES.page ? "dpage" : t === R.DETECT_QUERIES.snapshot ? "dsnap" : (t.startsWith("BEGIN") || t === "ROLLBACK") ? "tx" : null);
     log.push(k ?? "UNLISTED"); if (!k) throw new Error("unlisted");
     if (w.throwAt === k) throw new Error("SENTINEL db FAKEPW");
     switch (k) {
       case "role": return { rows: [w.role] };
       case "catalog": return { rows: [{ id: { sections: w.catalog.sections, readPath: w.catalog.readPath, readPathCount: w.catalog.readPathCount } }] };
       case "instance": return { rows: [w.instance] }; case "intent": return { rows: w.intent }; case "ops": return { rows: w.ops };
+      case "cancellation": return { rows: w.cancellation ?? [{ x: null }] };
+      case "dsnap": { const sn = w.snaps ? (w.snaps[w._sn = (w._sn ?? -1) + 1] ?? w.snaps.at(-1)) : (Object.hasOwn(w, "snapshot") ? w.snapshot : SNAP_OK); return sn === "NO_ROW" ? { rows: [] } : { rows: [{ r: sn }] }; }
+      case "dpage": { log.push(`dpage:${JSON.stringify(p.slice(1))}`); return { rows: (w.dpages ?? [[{ op_id: OID, intent_id: IID, template: "booking_confirmed", class: "ELIGIBLE", in_scope: true }]])[w._dp = (w._dp ?? -1) + 1] ?? [] }; }
       case "page": return { rows: w.pages[page++] ?? [] }; case "artefacts": return { rows: [w.artefacts] };
       case "postcheck": return w.postRows !== undefined ? { rows: w.postRows } : { rows: [w.post ?? POST_OK] };
       default: return { rows: [] };
     } }, release: () => {} };
 }
 const fakePool = (w, log) => ({ connect: async () => fakeClient(w, log) });
+const SNAP_OK = Object.freeze({ class: "ELIGIBLE", code: null, template: "booking_confirmed", factsHash: "1".repeat(64), recipientHash: "2".repeat(64), email: "SENTINEL@example.test", firstName: "Synthia",
+  facts: { ref: "MV-SENTINEL", totalMinor: 14000 } });
 const POST_OK = Object.freeze({ state: "succeeded", attempts: 1, resend_ref: true, error_code: null, receipts: 1, replayed: false, template_version: "gn-v2", locale: "en" });
 function fakeTooling(behaviour) {
   const st = { invocations: 0, executors: 0, opts: null };
@@ -267,11 +287,16 @@ function fakeTooling(behaviour) {
 const core = (w, behaviour, c = OPEN, plan = PLAN) => { const log = []; const t = fakeTooling(behaviour);
   return R.runBookingConfirmationCore({ pool: fakePool(w, log), plan, c, tooling: t.tooling, exchange: async () => ({ status: 200 }), credential: () => KEY, runId: "123456789-1" }).then((res) => ({ res, log, st: t.st })); };
 
-test("H7 admission (fake): every refusal is a code, zero worker invocations, zero executors, ROLLBACK; schema must be EXACTLY 23; excluded / protected / version / listing / currency / state / op count / unbound op / non-pristine / payload / template / class / render / latch / receipt / work lease", async () => {
+test("H7 admission (fake): every refusal is a code, zero worker invocations, zero executors, ROLLBACK; schema must be EXACTLY 27 (C119 S1; 21 / 23 / 26 / drift refused); the 0027 projection: SQL NULL only = not cancelled, cancelled → EXTERNALLY_CANCELLED, error / any other value → CANCELLATION_UNREADABLE; excluded / protected / version / listing / currency / state / op count / unbound op / non-pristine / payload / template / class / render / latch / receipt / work lease", async () => {
   const i1 = (o) => [{ ...world().intent[0], ...o }]; const o1 = (o) => [{ ...world().ops[0], ...o }];
   const cases = [[{ role: { ...world().role, ro: "off" } }, "NOT_READ_ONLY"], [{ role: { ...world().role, su: true } }, "ROLE_REFUSED"], [{ role: { ...world().role, adm: true } }, "ROLE_REFUSED"],
-    [{ role: { ...world().role, own: true } }, "ROLE_REFUSED"], [{ catalog: (await import("../scripts/e7-hosted-notify-inspect.mjs")).CONSTANTS.catalogPins["21"] }, "CATALOG_NOT_26"], [{ catalog: (await import("../scripts/e7-hosted-notify-inspect.mjs")).CONSTANTS.catalogPins["23"] }, "CATALOG_NOT_26"],
-    [{ catalog: { ...C.catalogPin26, sections: { ...C.catalogPin26.sections, rel: "e".repeat(64) } } }, "CATALOG_NOT_26"], [{ instance: { n: 1, env: "live" } }, "NOT_TEST"],
+    [{ role: { ...world().role, own: true } }, "ROLE_REFUSED"], [{ catalog: (await import("../scripts/e7-hosted-notify-inspect.mjs")).CONSTANTS.catalogPins["21"] }, "CATALOG_NOT_27"], [{ catalog: (await import("../scripts/e7-hosted-notify-inspect.mjs")).CONSTANTS.catalogPins["23"] }, "CATALOG_NOT_27"],
+    [{ catalog: PIN26 }, "CATALOG_NOT_27"], [{ catalog: { ...C.catalogPin27, readPath: PIN26.readPath, readPathCount: 6 } }, "CATALOG_NOT_27"],
+    [{ catalog: { ...C.catalogPin27, sections: { ...C.catalogPin27.sections, rel: "e".repeat(64) } } }, "CATALOG_NOT_27"],
+    [{ cancellation: [{ x: { cancelled: true, refundStatus: "pending" } }] }, "EXTERNALLY_CANCELLED"], [{ cancellation: [{ x: { cancelled: true, refundStatus: null } }] }, "EXTERNALLY_CANCELLED"],
+    [{ cancellation: [] }, "CANCELLATION_UNREADABLE"], [{ cancellation: [{ x: null }, { x: null }] }, "CANCELLATION_UNREADABLE"], [{ cancellation: [{ y: null }] }, "CANCELLATION_UNREADABLE"],
+    [{ cancellation: [{ x: false }] }, "CANCELLATION_UNREADABLE"], [{ cancellation: [{ x: {} }] }, "CANCELLATION_UNREADABLE"], [{ cancellation: [{ x: { cancelled: "true" } }] }, "CANCELLATION_UNREADABLE"],
+    [{ cancellation: [{ x: [] }] }, "CANCELLATION_UNREADABLE"], [{ cancellation: [{ x: "null" }] }, "CANCELLATION_UNREADABLE"], [{ throwAt: "cancellation" }, "CANCELLATION_UNREADABLE"], [{ instance: { n: 1, env: "live" } }, "NOT_TEST"],
     [{ intent: [] }, "INTENT_NOT_FOUND"], [{ intent: i1({ protected_reservation: true }) }, "PROTECTED"], [{ intent: i1({ listing_id: 603566 }) }, "LISTING_MISMATCH"],
     [{ intent: i1({ version: VER + 1 }) }, "VERSION_MISMATCH"], [{ intent: i1({ currency: "MXN" }) }, "CURRENCY_NOT_USD"], [{ intent: i1({ state: "payment_captured" }) }, "STATE_NOT_CONFIRMED"],
     [{ ops: [] }, "OP_COUNT"], [{ ops: [...o1({}), { ...o1({})[0], id: "7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0e" }] }, "OP_COUNT"], [{ ops: o1({ id: "7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0e" }) }, "OP_NOT_BOUND"],
@@ -357,6 +382,159 @@ test("H9 C51 verified completion (fake): an accepted worker outcome with the rea
   assert.match(R.POSTCHECK_QUERY, /coalesce\(o\.result_ref LIKE 'resend:%', false\) AS resend_ref/, "the SQL itself yields a strict boolean (no NULL coerced in JS)");
 });
 
+// ---- C119 S1: DETECT + detect-flow execute through FAKES ---------------------------------------------------------------------------------
+const OID2 = "7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0e"; const IID2 = "3f1c2b4a-5d6e-4f70-8a91-b2c3d4e5f608";
+const row = (o = {}) => ({ op_id: OID, intent_id: IID, template: "booking_confirmed", class: "ELIGIBLE", in_scope: true, ...o });
+const detectWith = (over, c = OPEN) => { const log = []; return R.runDetectCore({ pool: fakePool(world(over), log), c, sourceDigest: "a".repeat(64) }).then((res) => ({ res, log })); };
+const FB = R.factsBindingOf(SNAP_OK).binding;
+const FP = R.detectPlan(OPEN, { intentId: IID, opId: OID, version: VER, factsBinding: FB }, "a".repeat(64)).fingerprint;
+
+test("H10 C119 detect (fake): NONE / ONE / conservative STOP; the fingerprint is the planHash of the server-derived plan; every in-scope unknown / in-flight / other / waiting / out-of-scope / unrecognised class STOPs (never skipped); >1 eligible → STOP DETECT_MORE_THAN_ONE (capacity limitation); bounded pages; historic / excluded / other-template rows never selected; the candidate must pass the UNCHANGED admission (incl. the 0027 projection); outputs carry no identifier", async () => {
+  const one = await detectWith({});
+  assert.deepEqual([one.res.outcome, one.res.code, one.res.admission, one.res.fingerprint], ["ONE", "DETECT_ONE", "ADMITTED", FP]);
+  const PH = R.buildPlan(OPEN, { approvalRef: "E7-HBC-DETECT-v1", intentId: IID, opId: OID, expectedVersion: VER, locale: "en", sourceDigest: "a".repeat(64) }).planHash;
+  assert.equal(FP, R.detectFingerprint(PH, FB)); assert.notEqual(FP, PH, "rev 2: the fingerprint is NOT the bare plan hash");
+  assert.equal(FB, sha(R.canonical({ schema: "e7-hbc-detect-facts-v1", factsHash: SNAP_OK.factsHash, recipientHash: SNAP_OK.recipientHash })), "ONLY the two SQL hashes are bound");
+  assert.notEqual(FP, R.detectPlan(OPEN, { intentId: IID, opId: OID, version: VER + 1, factsBinding: FB }, "a".repeat(64)).fingerprint, "the version is bound");
+  assert.notEqual(FP, R.detectPlan(OPEN, { intentId: IID, opId: OID, version: VER, factsBinding: FB }, "b".repeat(64)).fingerprint, "the source is bound");
+  for (const k of ["factsHash", "recipientHash"]) {
+    const other = R.factsBindingOf({ ...SNAP_OK, [k]: "3".repeat(64) }).binding;
+    assert.notEqual(R.detectPlan(OPEN, { intentId: IID, opId: OID, version: VER, factsBinding: other }, "a".repeat(64)).fingerprint, FP, `${k} is bound`);
+  }
+  assert.equal(R.factsBindingOf({ ...SNAP_OK, email: "other@x.invalid", firstName: "Other", facts: {} }).binding, FB, "raw values never enter the binding (only the SQL hashes do)");
+  assert.equal(R.detectPlan(OPEN, { intentId: IID, opId: OID, version: VER }, "a".repeat(64)).fingerprint, null, "no facts binding → no fingerprint");
+  // rev 2: the facts snapshot — refused / unreadable / malformed → STOP, never a guess
+  for (const [snapshot, code] of [[{ ...SNAP_OK, class: "WAITING" }, "DETECT_FACTS_REFUSED"], [{ class: "PROTECTED" }, "DETECT_FACTS_REFUSED"], [{ ...SNAP_OK, code: "VERSION_DRIFT" }, "DETECT_FACTS_REFUSED"],
+    [(({ code, ...x }) => x)(SNAP_OK), "DETECT_FACTS_UNREADABLE"], [{ ...SNAP_OK, code: 3 }, "DETECT_FACTS_UNREADABLE"], [{ ...SNAP_OK, template: "not_completed_not_charged" }, "DETECT_FACTS_UNREADABLE"],
+    [{ ...SNAP_OK, factsHash: null }, "DETECT_FACTS_UNREADABLE"], [{ ...SNAP_OK, recipientHash: "X".repeat(64) }, "DETECT_FACTS_UNREADABLE"], [{ ...SNAP_OK, factsHash: "1".repeat(63) }, "DETECT_FACTS_UNREADABLE"],
+    [null, "DETECT_FACTS_UNREADABLE"], [[], "DETECT_FACTS_UNREADABLE"], ["ELIGIBLE", "DETECT_FACTS_UNREADABLE"], ["NO_ROW", "DETECT_FACTS_UNREADABLE"]]) {
+    const r = await detectWith({ snapshot }); assert.deepEqual([r.res.outcome, r.res.code, r.res.fingerprint], ["STOP", code, null], JSON.stringify(snapshot));
+  }
+  const thrown = await detectWith({ throwAt: "dsnap" }); assert.deepEqual([thrown.res.outcome, thrown.res.code], ["STOP", "DETECT_DB_FAILED"]);
+  assert.ok(one.log.includes("dpage:[null,100,\"2026-11-15T22:58:01.000Z\"]"), "listing page, no cursor, the reviewed page limit + cutoff");
+  assert.deepEqual([one.log.filter((k) => k === "begin").length, one.log.filter((k) => k === "rollback").length], [2, 2], "two read-only snapshots (selection + admission), each BEGIN … ROLLBACK");
+  assert.ok(!one.log.includes("UNLISTED"));
+  for (const r of [one]) { const t = JSON.stringify(r.res); assert.ok(!t.includes(IID) && !t.includes(OID) && !t.includes("1".repeat(64)) && !t.includes("2".repeat(64)) && !t.includes(FB), "no intent / op id / facts hash in the detect result"); assert.doesNotMatch(t, PII); }
+  const none = [[[]], [[row({ class: "SUCCEEDED" }), row({ op_id: OID2, intent_id: IID2, class: "LATCHED" })]], [[row({ in_scope: false })]], [[row({ in_scope: false, class: "UNKNOWN" })]],
+    [[row({ intent_id: "1d6e770f-ba3d-40f7-92c1-ee01be7da532" })]], [[row({ intent_id: "abede8b1-8ef6-44f2-876e-6a02fc056a96" })]], [[row({ template: "not_completed_not_charged" })]],
+    [[row({ template: "not_charged_authorization_may_show", class: "OTHER" })]]];
+  for (const dpages of none) { const r = await detectWith({ dpages }); assert.deepEqual([r.res.outcome, r.res.code, r.res.fingerprint, r.res.admission], ["NONE", "DETECT_NONE", null, null], JSON.stringify(dpages)); }
+  const h = await detectWith({ dpages: [[row({ in_scope: false, class: "UNKNOWN" }), row({ class: "SUCCEEDED", op_id: OID2 })]] });
+  assert.deepEqual([h.res.counts.historic, h.res.counts.historicUnresolved, h.res.counts.terminal], [1, 1, 1], "historic unresolved rows are COUNTED (visible), never selected");
+  for (const cls of ["IN_FLIGHT", "UNKNOWN", "OTHER", "WAITING", "OUT_OF_V1_SCOPE", "PROTECTED", "NOT_NOTIFY", "eligible", "SOMETHING_NEW"]) {
+    const r = await detectWith({ dpages: [[row(), row({ op_id: OID2, intent_id: IID2, class: cls })]] });
+    assert.deepEqual([r.res.outcome, r.res.code, r.res.fingerprint], ["STOP", "DETECT_ATTENTION", null], cls);
+  }
+  for (const cls of ["IN_FLIGHT", "UNKNOWN"]) { const r = await detectWith({ dpages: [[row({ template: "not_completed_not_charged", class: cls })]] }); assert.deepEqual([r.res.outcome, r.res.code], ["STOP", "DETECT_ATTENTION"], `other template ${cls}`); }
+  const two = await detectWith({ dpages: [[row(), row({ op_id: OID2, intent_id: IID2 })]] });
+  assert.deepEqual([two.res.outcome, two.res.code, two.res.fingerprint, two.res.admission], ["STOP", "DETECT_MORE_THAN_ONE", null, null], "CAPACITY LIMITATION: never picks one of several");
+  const full = Array.from({ length: 100 }, (_, n) => row({ op_id: `7a8b9c0d-1e2f-4a3b-8c4d-${String(n).padStart(12, "0")}`, class: "SUCCEEDED" }));
+  const paged = await detectWith({ dpages: [full, [row()]] });
+  assert.deepEqual([paged.res.outcome, paged.res.counts.pages], ["ONE", 2]); assert.ok(paged.log.includes(`dpage:["${full[99].op_id}",100,"2026-11-15T22:58:01.000Z"]`), "cursor = the last op id of the previous page");
+  const budget = await detectWith({ dpages: Array.from({ length: 21 }, () => full) });
+  assert.deepEqual([budget.res.outcome, budget.res.code, budget.res.counts.pages], ["STOP", "DETECT_BUDGET", 20], "bounded: never an unbounded scan, never a partial NONE");
+  for (const bad of [[[{ ...row(), op_id: "x" }]], [[{ ...row(), in_scope: "t" }]], [[{ ...row(), class: null }]], [[{ ...row(), template: 3 }]], [[{ ...row(), intent_id: null }]], [Array.from({ length: 101 }, () => row())]]) {
+    const r = await detectWith({ dpages: bad }); assert.deepEqual([r.res.outcome, r.res.code], ["STOP", "DETECT_REPLY_SHAPE"], JSON.stringify(bad).slice(0, 60));
+  }
+  for (const [over, code] of [[{ role: { ...world().role, ro: "off" } }, "DETECT_SESSION_REFUSED"], [{ role: { ...world().role, own: true } }, "DETECT_SESSION_REFUSED"], [{ catalog: PIN26 }, "DETECT_SESSION_REFUSED"],
+    [{ instance: { n: 1, env: "live" } }, "DETECT_SESSION_REFUSED"], [{ throwAt: "dpage" }, "DETECT_DB_FAILED"], [{ throwAt: "role" }, "DETECT_DB_FAILED"], [{ intent: [] }, "DETECT_REPLY_SHAPE"]]) {
+    const r = await detectWith(over); assert.deepEqual([r.res.outcome, r.res.code, r.res.fingerprint], ["STOP", code, null], code);
+  }
+  // the ONE candidate must pass the UNCHANGED admission: cancellation / unreadable projection / version / state / pristine / artefacts / lease
+  for (const [over, adm] of [[{ cancellation: [{ x: { cancelled: true, refundStatus: "pending" } }] }, "EXTERNALLY_CANCELLED"], [{ throwAt: "cancellation" }, "CANCELLATION_UNREADABLE"],
+    [{ cancellation: [{ x: 1 }] }, "CANCELLATION_UNREADABLE"], [{ intent: [{ ...world().intent[0], state: "payment_captured" }] }, "STATE_NOT_CONFIRMED"],
+    [{ ops: [{ ...world().ops[0], attempts: 1 }] }, "OP_NOT_PRISTINE"], [{ pages: [[{ op_id: OID, intent_id: IID, class: "WAITING" }]] }, "CLASS_NOT_ELIGIBLE"],
+    [{ artefacts: { renders: 0, latches: 0, receipts: 0, work_leased: 1 } }, "WORK_LEASED"], [{ intent: [{ ...world().intent[0], listing_id: 603566 }] }, "LISTING_MISMATCH"]]) {
+    const r = await detectWith(over); assert.deepEqual([r.res.outcome, r.res.code, r.res.admission, r.res.fingerprint], ["STOP", "DETECT_NOT_ADMISSIBLE", adm, null], adm);
+  }
+  const conn = await R.runDetectCore({ pool: { connect: async () => { throw new Error("SENTINEL FAKEPW"); } }, c: OPEN, sourceDigest: "a".repeat(64) });
+  assert.deepEqual([conn.outcome, conn.code], ["STOP", "DETECT_DB_FAILED"]); assert.doesNotMatch(JSON.stringify(conn), PII);
+});
+
+test("H11 C119 detect-flow core (fake): re-selects server-side and requires the SAME fingerprint before admission; a changed / vanished / multiplied candidate or a different version / source → NBC_CANDIDATE_CHANGED with ZERO worker invocations and ZERO sends; a match runs the unchanged admission + ONE worker invocation bound to the server-derived op", async () => {
+  const accepted = async (opts, st) => { await opts.hooks.afterInitialObservation(OID); await opts.hooks.afterClaim(OID); await st.exchange({}); return { ok: true, outcome: "accepted", opId: OID, providerReplay: false }; };
+  const dcore = (w, fp, behaviour = accepted, src = "a".repeat(64)) => { const log = []; const t = fakeTooling(behaviour);
+    return R.runBookingConfirmationCore({ pool: fakePool(w, log), plan: null, c: OPEN, tooling: t.tooling, exchange: async () => ({ status: 200 }), credential: () => KEY, runId: "123456789-1",
+      detected: { expectedFingerprint: fp, sourceDigest: src } }).then((res) => ({ res, log, st: t.st })); };
+  const ok = await dcore(world(), FP);
+  assert.deepEqual([ok.res.flow, ok.res.detectCode, ok.res.code, ok.res.admission, ok.res.workerInvocations, ok.res.sendsAttempted, ok.res.verifiedCompletion], ["detect", "DETECT_ONE", "PROVIDER_ACCEPTED", "ADMITTED", 1, 1, true]);
+  assert.deepEqual([ok.st.opts.intentId, ok.st.opts.confirmationLocale], [IID, "en"], "the worker is scoped to the server-derived intent, locale en");
+  assert.doesNotMatch(JSON.stringify(ok.res), PII);
+  for (const [w, fp, src, why] of [[world(), "f".repeat(64), undefined, "other fingerprint"], [world({ intent: [{ ...world().intent[0], version: VER + 1 }] }), FP, undefined, "same op, version moved"],
+    [world({ dpages: [[]] }), FP, undefined, "candidate vanished (sent / latched / cancelled)"], [world({ dpages: [[row(), row({ op_id: OID2, intent_id: IID2 })]] }), FP, undefined, "a second candidate appeared"],
+    [world({ dpages: [[row({ class: "IN_FLIGHT" })]] }), FP, undefined, "another runner claimed it"], [world(), FP, "b".repeat(64), "a different source"], [world(), "", undefined, "no fingerprint"],
+    [world({ throwAt: "dpage" }), FP, undefined, "selection unreadable"]]) {
+    const r = await dcore(w, fp, () => assert.fail("worker must not run"), src);
+    assert.deepEqual([r.res.workerInvocations, r.res.sendsAttempted, r.st.executors], [0, 0, 0], why);
+    assert.ok(["NBC_CANDIDATE_CHANGED", "NBC_DB_FAILED"].includes(r.res.code), `${why}: ${r.res.code}`);
+  }
+  // rev 2: the facts binding is recomputed BEFORE the invocation and AGAIN in the accepted worker's afterInitialObservation seam
+  const CHG = { ...SNAP_OK, recipientHash: "4".repeat(64) };
+  const pre = await dcore(world({ snaps: [SNAP_OK, CHG] }), FP, () => assert.fail("worker must not run"));
+  assert.deepEqual([pre.res.code, pre.res.workerInvocations, pre.res.sendsAttempted, pre.st.executors], ["NBC_BOUND_FACTS_MISMATCH", 0, 0, 1], "changed after the re-selection, before the invocation");
+  const inHook = await dcore(world({ snaps: [SNAP_OK, SNAP_OK, { ...SNAP_OK, factsHash: "5".repeat(64) }] }), FP);
+  assert.deepEqual([inHook.res.code, inHook.res.workerInvocations, inHook.res.sendsAttempted], ["NBC_BOUND_FACTS_MISMATCH", 1, 0], "changed inside the worker's observation window: refused by the existing hook before any claim / send");
+  for (const bad of [{ ...SNAP_OK, class: "LATCHED" }, "NO_ROW", { ...SNAP_OK, factsHash: null }]) {
+    const r = await dcore(world({ snaps: [SNAP_OK, SNAP_OK, bad] }), FP); assert.deepEqual([r.res.code, r.res.sendsAttempted], ["NBC_BOUND_FACTS_MISMATCH", 0], JSON.stringify(bad));
+  }
+  const thr = await dcore(world({ snaps: [SNAP_OK, SNAP_OK], throwAt: null }), FP, async (opts, st) => { await opts.hooks.afterInitialObservation(OID); await st.exchange({}); return { ok: true, outcome: "accepted", opId: OID }; });
+  assert.equal(thr.res.code, "PROVIDER_ACCEPTED", "unchanged facts (the default snapshot repeated) still verify");
+  const sameFacts = await dcore(world({ snaps: [{ ...SNAP_OK, email: "other@mv-test.invalid", firstName: "Zed" }] }), FP);
+  assert.equal(sameFacts.res.code, "PROVIDER_ACCEPTED", "raw fields that the SQL hashes do not cover cannot change the binding (the hashes ARE the recipient / facts identity)");
+  assert.doesNotMatch(JSON.stringify(inHook.res) + JSON.stringify(pre.res), /4{64}|5{64}|1{64}|2{64}/, "no facts hash in any result");
+  const plus = await R.runBookingConfirmationCore({ pool: fakePool(world(), []), plan: PLAN, c: OPEN, tooling: fakeTooling(() => assert.fail("never")).tooling, exchange: async () => {}, credential: () => KEY, runId: "123456789-1",
+    detected: { expectedFingerprint: FP, sourceDigest: "a".repeat(64) } });
+  assert.deepEqual([plus.code, plus.workerInvocations], ["NBC_CANDIDATE_CHANGED", 0], "a hand-bound plan is never mixed into a detect flow");
+  // detect passes but admission (same snapshot facts) fails → the unchanged admission refusal, zero sends
+  const canc = await dcore(world({ cancellation: [{ x: { cancelled: true, refundStatus: "pending" } }] }), FP, () => assert.fail("never"));
+  assert.deepEqual([canc.res.code, canc.res.admission, canc.res.workerInvocations], ["NBC_ADMISSION_REFUSED", "EXTERNALLY_CANCELLED", 0]);
+});
+
+test("H12 C119 hosted detect / detect-flow gates (seam): detect needs ONLY the DB secret (a Resend key → NBC_SECRET_SCOPE_VIOLATION), no binding input / plan hash / fingerprint, both digests; it never imports an exchange; STOP exits 1; outputs = outcome + fingerprint only; verify / execute of a detect flow refuse bindings, require the fingerprint (execute) and hand the core NO plan; a manual flow refuses a fingerprint", async () => {
+  const dg = (over = {}) => ({ E7_TOOLING_DIR: TOOLING, E7_EXPECTED_SOURCE_DIGEST: SOURCE, E7_EXPECTED_CLOSURE_DIGEST: OPEN.closureDigest, E7_WORKFLOW_SHA: "1".repeat(40), E7_RUN_ID: "123456789-1",
+    GITHUB_REF: "refs/heads/main", PATH: process.env.PATH, ...over });
+  const mk = (detectRes) => { const st = { detect: null, exchanges: 0, pools: 0, maxes: [] }; const deps = { ...fakeDeps().deps, constants: OPEN,
+    importTooling: async () => ({ createBookingPool: (cfg) => { st.pools += 1; st.maxes.push(cfg.max); return { end: async () => {} }; }, createResendExchange: () => { st.exchanges += 1; return { ok: true, exchange: async () => {} }; }, tooling: {} }),
+    runDetect: async (a) => { st.detect = { sourceDigest: a.sourceDigest, hasPool: !!a.pool }; return Object.freeze(detectRes); }, runCore: async (a) => { st.core = { plan: a.plan, detected: a.detected }; return Object.freeze({ code: "PROVIDER_ACCEPTED", verifiedCompletion: true }); } };
+    return { st, deps }; };
+  const ONE = { outcome: "ONE", code: "DETECT_ONE", fingerprint: FP, admission: "ADMITTED", counts: { pages: 1 }, statements: 9 };
+  let m = mk(ONE); let r = await R.runHosted({ mode: "detect", env: dg({ E7_DEV_BOOKING_DATABASE_URL: DBURL }), proc: PROC, wrapperDir: ROOT, deps: m.deps });
+  assert.deepEqual([r.exitCode, r.result.code, r.result.planKind, r.result.planHash, r.result.outputs, m.st.detect.sourceDigest, m.st.exchanges, m.st.maxes], [0, "DETECT_DONE", "DETECT", null, { outcome: "ONE", fingerprint: FP }, SOURCE, 0, [1]]);
+  assert.doesNotMatch(JSON.stringify(r) + R.summaryMarkdown(r.result), PII); assert.match(R.summaryMarkdown(r.result), / detect=ONE\/DETECT_ONE /);
+  for (const res of [{ outcome: "STOP", code: "DETECT_MORE_THAN_ONE", fingerprint: null }, { outcome: "STOP", code: "DETECT_ATTENTION", fingerprint: null }]) {
+    m = mk(res); r = await R.runHosted({ mode: "detect", env: dg({ E7_DEV_BOOKING_DATABASE_URL: DBURL }), proc: PROC, wrapperDir: ROOT, deps: m.deps });
+    assert.deepEqual([r.exitCode, r.result.outputs], [1, { outcome: "STOP", fingerprint: "" }], res.code);
+  }
+  m = mk({ outcome: "NONE", code: "DETECT_NONE", fingerprint: "f".repeat(64) }); r = await R.runHosted({ mode: "detect", env: dg({ E7_DEV_BOOKING_DATABASE_URL: DBURL }), proc: PROC, wrapperDir: ROOT, deps: m.deps });
+  assert.deepEqual([r.exitCode, r.result.outputs], [0, { outcome: "NONE", fingerprint: "" }], "a fingerprint is only ever output for ONE");
+  for (const [over, code] of [[{ E7_DEV_BOOKING_DATABASE_URL: DBURL, E7_RESEND_TEST_KEY: KEY }, "NBC_SECRET_SCOPE_VIOLATION"], [{}, "NBC_CREDENTIALS_MISSING"],
+    [{ E7_DEV_BOOKING_DATABASE_URL: DBURL, E7_INTENT_ID: IID }, "NBC_INPUT_INCOMPLETE"], [{ E7_DEV_BOOKING_DATABASE_URL: DBURL, ...inputs }, "NBC_INPUT_UNEXPECTED"],
+    [{ E7_DEV_BOOKING_DATABASE_URL: DBURL, E7_EXPECTED_PLAN_HASH: "a".repeat(64) }, "NBC_INPUT_UNEXPECTED"], [{ E7_DEV_BOOKING_DATABASE_URL: DBURL, E7_EXPECTED_CANDIDATE_FINGERPRINT: FP }, "NBC_INPUT_UNEXPECTED"],
+    [{ E7_DEV_BOOKING_DATABASE_URL: DBURL, E7_INPUT_MODE: "manual" }, "NBC_INPUT_INVALID"], [{ E7_DEV_BOOKING_DATABASE_URL: DBURL, E7_EXPECTED_SOURCE_DIGEST: "" }, "NBC_INPUT_INCOMPLETE"],
+    [{ E7_DEV_BOOKING_DATABASE_URL: DBURL, E7_EXPECTED_SOURCE_DIGEST: "f".repeat(64) }, "NBC_SOURCE_MISMATCH"], [{ E7_DEV_BOOKING_DATABASE_URL: DBURL, GITHUB_REF: "refs/heads/x" }, "NBC_REF_NOT_MAIN"],
+    [{ E7_DEV_BOOKING_DATABASE_URL: DBURL.replace(":6543", ":5432") }, "NBC_DB_TARGET_INVALID"]]) {
+    m = mk(ONE); r = await R.runHosted({ mode: "detect", env: dg(over), proc: PROC, wrapperDir: ROOT, deps: m.deps });
+    assert.deepEqual([r.exitCode, r.result.code, m.st.detect, m.st.pools], [1, code, null, 0], `${code} ${Object.keys(over)}`); assert.doesNotMatch(JSON.stringify(r), PII);
+  }
+  // verify / execute of a detect flow
+  m = mk(ONE); r = await R.runHosted({ mode: "verify", env: dg({ E7_INPUT_MODE: "detect" }), proc: PROC, wrapperDir: ROOT, deps: m.deps });
+  assert.deepEqual([r.exitCode, r.result.code, r.result.planKind], [0, "VERIFY_OK", "DETECT"]);
+  m = mk(ONE); r = await R.runHosted({ mode: "execute", env: dg({ E7_INPUT_MODE: "detect", E7_EXPECTED_CANDIDATE_FINGERPRINT: FP, E7_DEV_BOOKING_DATABASE_URL: DBURL, E7_RESEND_TEST_KEY: KEY }), proc: PROC, wrapperDir: ROOT, deps: m.deps });
+  assert.deepEqual([r.exitCode, r.result.code, m.st.core.plan, m.st.core.detected], [0, "EXECUTE_DONE", null, { expectedFingerprint: FP, sourceDigest: SOURCE }]);
+  for (const [mode, over, code] of [["execute", { E7_INPUT_MODE: "detect", E7_DEV_BOOKING_DATABASE_URL: DBURL, E7_RESEND_TEST_KEY: KEY }, "NBC_INPUT_INCOMPLETE"],
+    ["execute", { E7_INPUT_MODE: "detect", E7_EXPECTED_CANDIDATE_FINGERPRINT: "xyz", E7_DEV_BOOKING_DATABASE_URL: DBURL, E7_RESEND_TEST_KEY: KEY }, "NBC_INPUT_INCOMPLETE"],
+    ["execute", { E7_INPUT_MODE: "detect", E7_EXPECTED_CANDIDATE_FINGERPRINT: FP, ...inputs, E7_DEV_BOOKING_DATABASE_URL: DBURL, E7_RESEND_TEST_KEY: KEY }, "NBC_INPUT_UNEXPECTED"],
+    ["verify", { E7_INPUT_MODE: "detect", E7_EXPECTED_PLAN_HASH: "a".repeat(64) }, "NBC_INPUT_UNEXPECTED"], ["verify", { E7_INPUT_MODE: "other" }, "NBC_INPUT_INVALID"],
+    ["verify", { ...inputs, E7_EXPECTED_PLAN_HASH: planOf(OPEN), E7_INPUT_MODE: "manual", E7_EXPECTED_CANDIDATE_FINGERPRINT: FP }, "NBC_INPUT_UNEXPECTED"],
+    ["preflight", { E7_INPUT_MODE: "detect" }, "NBC_INPUT_INVALID"]]) {
+    m = mk(ONE); r = await R.runHosted({ mode, env: dg(over), proc: PROC, wrapperDir: ROOT, deps: m.deps });
+    assert.deepEqual([r.exitCode, r.result.code, m.st.core ?? null], [1, code, null], `${mode} ${code}`);
+  }
+  // the manual flow is unchanged (E7_INPUT_MODE manual and an EMPTY fingerprint, as the workflow passes them)
+  m = mk(ONE); r = await R.runHosted({ mode: "verify", env: { ...gated(OPEN), E7_INPUT_MODE: "manual", E7_EXPECTED_CANDIDATE_FINGERPRINT: "" }, proc: PROC, wrapperDir: ROOT, deps: m.deps });
+  assert.deepEqual([r.exitCode, r.result.code, r.result.planKind], [0, "VERIFY_OK", "REAL"]);
+});
+
 // ---------------------------------------------------------------------------------------------------------------------------------
 // OPT-IN REAL DISPOSABLE POSTGRESQL at schema 26 (C116) with the REAL accepted worker / builder / executor / SQL — FAKE exchange only
 if (process.env.E7_HBC_DB_TESTS === "1") {
@@ -378,8 +556,17 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
   const T = { runNotificationStep: (await import(pathToFileURL(join(TOOLING, "lib/booking-db/notification-worker.js")).href)).runNotificationStep,
     createResendNotificationExecutor: (await import(pathToFileURL(join(TOOLING, "lib/notify/resend-notification-executor.js")).href)).createResendNotificationExecutor,
     NOTIFICATION_V2_OPTION_KEY: "confirmationLocale", NOTIFICATION_PROVIDER_OPTION_KEY: "providerExecutor" };
+  // C119 S1: schema 27 = the pinned tooling's migrations + the MERGED e7-test 0027 bytes (sha-checked), in ONE disposable migrations dir
+  const S27 = realpathSync(process.env.E7_SCHEMA27_DIR || join(ROOT, "..", "schema27"));
+  const M27 = { "0027_external_cancellation_disposition.up.sql": "ae949bf42450cf1af2632212f2cc2c2704b66ca314f4fc4f2744e6130f9c8ecf",
+    "0027_external_cancellation_disposition.down.sql": "8e3810678bc788df6915a4be9c728296a89f0b040ae0df245ceef7583fc6ba6c" };
+  const MDIR = mkdtempSync(join(tmpdir(), "e7-c119-m27-"));
+  for (const f of readdirSync(join(TOOLING, "db/migrations"))) writeFileSync(join(MDIR, f), readFileSync(join(TOOLING, "db/migrations", f)));
+  assert.ok(!readdirSync(MDIR).some((f) => f.startsWith("0027_")), "the pinned tooling has no 0027");
+  for (const [f, h] of Object.entries(M27)) { const b = readFileSync(join(S27, "db/migrations", f)); assert.equal(sha(b), h, `${f}: the merged e7-test 0027 bytes`); writeFileSync(join(MDIR, f), b); }
   const db = await Hm.startMigratedDatabase(); Hm.__setDb(db);
-  after(async () => { await db.close(); rmSync(tdir, { recursive: true, force: true }); });
+  assert.deepEqual(await Hm.migrateUp(db.owner, { env: "test", dir: MDIR }), [27], "0027 applied on top of the pinned 0001..0026");
+  after(async () => { await db.close(); rmSync(tdir, { recursive: true, force: true }); rmSync(MDIR, { recursive: true, force: true }); });
   assert.deepEqual(Hm.SENDER, { fromAddress: "bookings@sender.mv-test.invalid", fromName: "maraVilla Test" }, "the accepted suites' synthetic sender is unchanged");
   const SI = await import(pathToFileURL(join(TOOLING, "lib/notify/sender-identity.js")).href);
   assert.deepEqual({ ...C.sender }, { ...SI.APPROVED_REAL_SENDER }, "C55: the runner's fixed sender == the pinned approved identity");
@@ -400,7 +587,7 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
   const identityAt = async (to) => {   // the runner's OWN catalog query as the runtime app role on a fresh disposable cluster migrated to `to`
     const p = await Hm.startPostgres(); const a = new pg.Client({ connectionString: p.adminUrl }); await a.connect();
     try {
-      await Hm.migrateUp(a, { env: "test", to }); await a.query("CREATE ROLE test_app LOGIN IN ROLE mv_booking_app");
+      await Hm.migrateUp(a, { env: "test", to, dir: MDIR }); await a.query("CREATE ROLE test_app LOGIN IN ROLE mv_booking_app");
       const c = new pg.Client({ connectionString: p.appUrl() }); await c.connect();
       try { await c.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"); const id = (await c.query(R.CATALOG_SQL, [[...R.READ_PATH_FUNCTIONS]])).rows[0].id; await c.query("ROLLBACK");
         const sections = {}; for (const k of ["con", "col", "fn", "pol", "rel", "trg"]) sections[k] = id.sections[k] ?? null;
@@ -408,24 +595,28 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
       } finally { await c.end(); }
     } finally { await a.end(); p.stop(); }
   };
-  test("D0 C116 schema-26 pin DERIVED, not copied: the runner's catalog query as the runtime app role on THIS PostgreSQL reproduces the accepted schema-23 pin byte-for-byte at 23, yields EXACTLY CONSTANTS.catalogPin26 at 26 (25 → 26 changes only the function section), and a schema-25 cluster (the pre-0026 state) and a schema-24 cluster (shared DEV's current schema) are each refused CATALOG_NOT_26 before any worker / exchange", async () => {
+  test("D0 C119 schema-27 pin DERIVED, not copied: the runner's catalog query (7-function read path) as the runtime app role on THIS PostgreSQL reproduces the accepted schema-23 inspector pin and the C116 schema-26 pin byte-for-byte, yields EXACTLY CONSTANTS.catalogPin27 at 27 (== the #189 POST-27 catalog; the read path now covers the 0027 projection), and schema-26 / schema-25 clusters are each refused CATALOG_NOT_27 before any worker / exchange", async () => {
     const I = await import("../scripts/e7-hosted-notify-inspect.mjs");
     assert.deepEqual(await identityAt(23), I.CONSTANTS.catalogPins["23"], "the derivation reproduces the accepted schema-23 pin");
-    const i25 = await identityAt(25); assert.notEqual(i25.catalog, C.catalogPin26.catalog);
-    assert.deepEqual(Object.keys(i25.sections).filter((k) => i25.sections[k] !== C.catalogPin26.sections[k]), ["fn"], "25 → 26 changes only the function section");
-    assert.equal(i25.readPath, C.catalogPin26.readPath, "the read path is unchanged by 0026");
-    assert.deepEqual(await identityAt(26), C.catalogPin26, "the pinned schema-26 identity");
-    for (const to of [25, 24]) {
+    assert.deepEqual(await identityAt(26), PIN26, "the derivation reproduces the C116 schema-26 pin (the projection does not exist at 26)");
+    const i27 = await identityAt(27);
+    assert.deepEqual(i27, C.catalogPin27, "the pinned schema-27 identity"); assert.equal(i27.catalog, POST27_CATALOG);
+    assert.deepEqual([i27.readPathCount, i27.readPath !== PIN26.readPath], [7, true], "the read path covers booking.external_cancellation_public");
+    for (const to of [26, 25]) {
       const p = await Hm.startPostgres(); const a = new pg.Client({ connectionString: p.adminUrl }); await a.connect();
       try {
-        await Hm.migrateUp(a, { env: "test", to }); await a.query("CREATE ROLE test_app LOGIN IN ROLE mv_booking_app");
+        await Hm.migrateUp(a, { env: "test", to, dir: MDIR }); await a.query("CREATE ROLE test_app LOGIN IN ROLE mv_booking_app");
         const app = new pg.Pool({ connectionString: p.appUrl(), max: 2 }); const bk = await ready(); const fx = fakeExchange(ok200);
-        try { const r = await run(bk, bk.op.id, "en", fx, { pool: app }); assert.deepEqual([r.code, r.admission, r.workerInvocations, fx.calls], ["NBC_ADMISSION_REFUSED", "CATALOG_NOT_26", 0, 0], `schema ${to}`); } finally { await app.end(); }
+        try {
+          const r = await run(bk, bk.op.id, "en", fx, { pool: app }); assert.deepEqual([r.code, r.admission, r.workerInvocations, fx.calls], ["NBC_ADMISSION_REFUSED", "CATALOG_NOT_27", 0, 0], `schema ${to}`);
+          const d = await R.runDetectCore({ pool: app, c: { ...OPEN, listingId: bk.listingId }, sourceDigest: "a".repeat(64) });
+          assert.deepEqual([d.outcome, d.code, d.fingerprint], ["STOP", "DETECT_SESSION_REFUSED", null], `detect at schema ${to}`);
+        } finally { await app.end(); }
       } finally { await a.end(); p.stop(); }
     }
   });
 
-  test("D7 C116 the EXACT simulation sink on the FAKE wire (real PG26, real worker / executor at 66133a22): a guest stored as delivered@resend.dev is admitted (class ELIGIBLE) → ONE fake 200 → PROVIDER_ACCEPTED + VERIFIED readback; wire `to` === [the stored email] (no rewrite); a rerun is refused OP_NOT_PRISTINE with ZERO calls; a look-alike guest is CLASS_NOT_ELIGIBLE with ZERO calls and no table change", async () => {
+  test("D7 C116 the EXACT simulation sink on the FAKE wire (real PG27, real worker / executor at 66133a22): a guest stored as delivered@resend.dev is admitted (class ELIGIBLE) → ONE fake 200 → PROVIDER_ACCEPTED + VERIFIED readback; wire `to` === [the stored email] (no rewrite); a rerun is refused OP_NOT_PRISTINE with ZERO calls; a look-alike guest is CLASS_NOT_ELIGIBLE with ZERO calls and no table change", async () => {
     const bk = await ready({ guestEmail: "delivered@resend.dev" }); const reqs = [];
     const stored = (await db.owner.query("SELECT email FROM booking.intent_guests WHERE intent_id = $1", [bk.id])).rows[0].email;
     assert.equal(stored === "delivered@resend.dev", true);
@@ -444,7 +635,7 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
     assert.deepEqual(await fingerprint(), f0, "no table change for the refused look-alike");
   });
 
-  test("D1 execute body (seam) on disposable PG26 — EN: admission → ONE real worker invocation → ONE fake 200 → PROVIDER_ACCEPTED; durable succeeded / resend ref / ONE receipt / gn-v2 en render; a rerun (fresh executor) is refused at admission with ZERO exchange calls (durable no-resend)", async () => {
+  test("D1 execute body (seam) on disposable PG27 — EN: admission → ONE real worker invocation → ONE fake 200 → PROVIDER_ACCEPTED; durable succeeded / resend ref / ONE receipt / gn-v2 en render; a rerun (fresh executor) is refused at admission with ZERO exchange calls (durable no-resend)", async () => {
     const bk = await ready(); const fx = fakeExchange(ok200);
     const r = await run(bk, bk.op.id, "en", fx);
     assert.deepEqual([r.code, r.admission, r.workerOutcome, r.workerInvocations, r.sendsAttempted, fx.calls, r.providerAccepted, r.providerReplay, r.deliveryProven], ["PROVIDER_ACCEPTED", "ADMITTED", "accepted", 1, 1, 1, true, false, false], JSON.stringify(r));
@@ -464,7 +655,7 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
     assert.deepEqual([again.code, again.admission, fx2.calls], ["NBC_ADMISSION_REFUSED", "OP_NOT_PRISTINE", 0]); assert.doesNotMatch(JSON.stringify(r) + JSON.stringify(again), PII);
   });
 
-  test("D3 binding refusals on real PG26 leave EVERY booking table unchanged with ZERO exchange calls: wrong version / foreign op / excluded intent id / out-of-scope (.example) recipient / owner role / foreign listing; a schema-21 database → CATALOG_NOT_23", async () => {
+  test("D3 binding refusals on real PG27 leave EVERY booking table unchanged with ZERO exchange calls: wrong version / foreign op / excluded intent id / out-of-scope (.example) recipient / owner role / foreign listing; a schema-21 database → CATALOG_NOT_27", async () => {
     const bk = await ready(); const out = await ready({ guestDomain: "mv-test.example" });
     const f0 = await fingerprint();
     const ownerPool = new pg.Pool({ connectionString: db.adminUrl, max: 2 });
@@ -480,9 +671,9 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
     assert.deepEqual(await fingerprint(), f0, "no booking / notification / lease / claim / render / latch / receipt / inbox change on any refusal");
     const p21 = await Hm.startPostgres(); const a21 = new pg.Client({ connectionString: p21.adminUrl }); await a21.connect();
     try {
-      await Hm.migrateUp(a21, { env: "test", to: 21 }); await a21.query("CREATE ROLE test_app LOGIN IN ROLE mv_booking_app");
+      await Hm.migrateUp(a21, { env: "test", to: 21, dir: MDIR }); await a21.query("CREATE ROLE test_app LOGIN IN ROLE mv_booking_app");
       const app21 = new pg.Pool({ connectionString: p21.appUrl(), max: 2 });
-      try { const r = await run(bk, bk.op.id, "en", fakeExchange(ok200), { pool: app21 }); assert.deepEqual([r.code, r.admission], ["NBC_ADMISSION_REFUSED", "CATALOG_NOT_26"]); } finally { await app21.end(); }
+      try { const r = await run(bk, bk.op.id, "en", fakeExchange(ok200), { pool: app21 }); assert.deepEqual([r.code, r.admission], ["NBC_ADMISSION_REFUSED", "CATALOG_NOT_27"]); } finally { await app21.end(); }
     } finally { await a21.end(); p21.stop(); }
   });
 
@@ -504,7 +695,7 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
     }
   });
 
-  test("D5 C51 the documented class-ELIGIBLE-but-SQL-refused path on real PG26 (source version drift): admission passes (class ELIGIBLE), the accepted worker's v2 claim records its refusal → NOT_SENT with ZERO provider calls — and NOT zero database effects: exactly ONE durable effect, the latch VERSION_DRIFT; the op stays pending / attempts 0, no render / receipt", async () => {
+  test("D5 C51 the documented class-ELIGIBLE-but-SQL-refused path on real PG27 (source version drift): admission passes (class ELIGIBLE), the accepted worker's v2 claim records its refusal → NOT_SENT with ZERO provider calls — and NOT zero database effects: exactly ONE durable effect, the latch VERSION_DRIFT; the op stays pending / attempts 0, no render / receipt", async () => {
     const bk = await ready();
     await Hm.F.ownerManagedHistory(db.owner, "UPDATE booking.intents SET version = version + 1 WHERE id = $1", [bk.id]);   // TEST SETUP: intent version ≠ op source_version
     const v = (await db.owner.query("SELECT version FROM booking.intents WHERE id = $1", [bk.id])).rows[0].version;
@@ -526,7 +717,7 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
     assert.doesNotMatch(JSON.stringify(r), PII);
   });
 
-  test("D6 C55 the exact approved sender on the FAKE wire (real PG26, real worker / executor at 66133a22): from === 'MiCasaDirect <bookings@mail.micasadirect.com>', recipient still the DB's .invalid address; the superseded real sender (seam) is refused before any claim with ZERO exchange calls and no table change", async () => {
+  test("D6 C55 the exact approved sender on the FAKE wire (real PG27, real worker / executor at 66133a22): from === 'MiCasaDirect <bookings@mail.micasadirect.com>', recipient still the DB's .invalid address; the superseded real sender (seam) is refused before any claim with ZERO exchange calls and no table change", async () => {
     const bk = await ready(); const reqs = [];
     const fx = fakeExchange((id, req) => { reqs.push(req); return ok200(id); });
     const r = await run(bk, bk.op.id, "en", fx);
@@ -542,5 +733,155 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
       assert.deepEqual([bad.code, bad.admission, bad.workerInvocations, bad.sendsAttempted, fx2.calls], ["NBC_EXECUTOR_INVALID", "ADMITTED", 0, 0, 0], JSON.stringify(sender));
     }
     assert.deepEqual(await fingerprint(), f0, "no table change for a refused sender");
+  });
+  // ---- C119 S1 on REAL PG27: detect + detect-flow execute (real worker / builder / executor at 66133a22; FAKE exchange only) --------------------
+  const SRC_A = "a".repeat(64);
+  const cOf = (listingId, over = {}) => ({ ...OPEN, listingId, ...over });
+  const detect = (listingId, { pool = db.app, c = {} } = {}) => R.runDetectCore({ pool, c: cOf(listingId, c), sourceDigest: SRC_A });
+  const dexec = (listingId, fp, fx, { pool = db.app } = {}) => R.runBookingConfirmationCore({ pool, plan: null, c: cOf(listingId), tooling: T, exchange: fx.exchange, credential: () => KEY,
+    runId: "123456789-1", detected: { expectedFingerprint: fp, sourceDigest: SRC_A } });
+  /** the owner's REAL 0027 path (admin login): one owner-attested dashboard observation + the record (refund pending) */
+  const cancelExternally = async (bk) => {
+    const res = (await db.owner.query("SELECT hostaway_reservation_id AS r, version AS v FROM booking.intents WHERE id = $1", [bk.id])).rows[0];
+    const ev = (await db.reconciler.query("SELECT booking.admin_record_evidence($1,$2,$3,$4,$5,$6,$7,$8) AS id",
+      [bk.id, "hostaway_reservation", String(res.r), "cancelled", {}, new Date(), "owner", "hostaway-dashboard-cancelled"])).rows[0].id;
+    return (await db.reconciler.query("SELECT booking.admin_record_external_cancellation($1,$2,$3::uuid[],$4,$5,$6,$7,$8,$9,$10,$11) AS r",
+      [bk.id, res.v, [ev], ev, "pending", null, null, "owner", "hostaway-dash-check-c119", "OWNER_CANCELLED_IN_HOSTAWAY", `c119-${bk.id.slice(0, 8)}`])).rows[0].r;
+  };
+  /** rev 2: an INDEPENDENT recompute of the facts binding as the OWNER (the same SQL hash functions, not the runtime snapshot path) */
+  const ownerBinding = async (bk) => { const h = (await db.owner.query(`SELECT booking.gn_hash_facts(booking.guest_notification_facts($1)) AS f,
+      (SELECT booking.gn_recipient_hash_of(g.email, g.first_name) FROM booking.intent_guests g WHERE g.intent_id = $2) AS r`, [bk.op.id, bk.id])).rows[0];
+    return sha(R.canonical({ schema: "e7-hbc-detect-facts-v1", factsHash: h.f, recipientHash: h.r })); };
+  const fpOf = async (bk, version = bk.version) => R.detectPlan(cOf(bk.listingId), { intentId: bk.id, opId: bk.op.id, version, factsBinding: await ownerBinding(bk) }, SRC_A).fingerprint;
+  const noIds = (r, ...bks) => { const t = JSON.stringify(r); for (const b of bks) { assert.ok(!t.includes(b.id) && !t.includes(b.op.id), "no intent / op id in the result"); } assert.doesNotMatch(t, PII); };
+
+  test("D8 C119 detect → ONE → detect-flow execute on REAL PG27: detect writes NOTHING (every booking table identical) and outputs no identifier; the execute re-selects, matches the fingerprint and makes ONE real worker invocation → ONE fake 200 → PROVIDER_ACCEPTED + VERIFIED; afterwards detect → NONE (SUCCEEDED is terminal), the SAME fingerprint replayed → NBC_CANDIDATE_CHANGED with ZERO calls, and the manual path is refused OP_NOT_PRISTINE (already sent)", async () => {
+    const bk = await ready(); const f0 = await fingerprint();
+    const d = await detect(bk.listingId);
+    assert.deepEqual([d.outcome, d.code, d.admission, d.counts.eligible, d.counts.attention], ["ONE", "DETECT_ONE", "ADMITTED", 1, 0], JSON.stringify(d));
+    assert.equal(d.fingerprint, await fpOf(bk), "fingerprint == H(server-derived plan hash, owner-recomputed facts / recipient hashes)");
+    assert.deepEqual(await fingerprint(), f0, "detect is read-only"); noIds(d, bk);
+    const fx = fakeExchange(ok200); const r = await dexec(bk.listingId, d.fingerprint, fx);
+    assert.deepEqual([r.flow, r.detectCode, r.code, r.admission, r.workerInvocations, fx.calls, r.verifiedCompletion, r.readback], ["detect", "DETECT_ONE", "PROVIDER_ACCEPTED", "ADMITTED", 1, 1, true, "VERIFIED"]);
+    assert.deepEqual([r.postcheck.state, r.postcheck.receipts, r.postcheck.templateVersion, r.postcheck.locale], ["succeeded", 1, "gn-v2", "en"]); noIds(r, bk);
+    const again = await detect(bk.listingId); assert.deepEqual([again.outcome, again.code, again.counts.terminal], ["NONE", "DETECT_NONE", 1]);
+    const fx2 = fakeExchange(ok200); const replay = await dexec(bk.listingId, d.fingerprint, fx2);
+    assert.deepEqual([replay.code, replay.detectCode, replay.workerInvocations, fx2.calls], ["NBC_CANDIDATE_CHANGED", "DETECT_NONE", 0, 0], "never a resend");
+    const fx3 = fakeExchange(ok200); const manual = await run(bk, bk.op.id, "en", fx3);
+    assert.deepEqual([manual.admission, fx3.calls], ["OP_NOT_PRISTINE", 0]);
+  });
+
+  test("D9 C119 more than ONE eligible on the listing → STOP DETECT_MORE_THAN_ONE (explicit capacity limitation of this TEST slice, never a pick), ZERO table changes; a detect-flow execute with any fingerprint → NBC_CANDIDATE_CHANGED with ZERO calls; a historic cutoff makes every row historic → NONE", async () => {
+    const a = await ready(); const b = await ready({ listingId: a.listingId }); const f0 = await fingerprint();
+    const d = await detect(a.listingId);
+    assert.deepEqual([d.outcome, d.code, d.fingerprint, d.counts.eligible], ["STOP", "DETECT_MORE_THAN_ONE", null, 2]); noIds(d, a, b);
+    for (const fp of [await fpOf(a), await fpOf(b)]) {
+      const fx = fakeExchange(ok200); const r = await dexec(a.listingId, fp, fx); assert.deepEqual([r.code, r.detectCode, r.workerInvocations, fx.calls], ["NBC_CANDIDATE_CHANGED", "DETECT_MORE_THAN_ONE", 0, 0]);
+    }
+    const future = await detect(a.listingId, { c: { detect: { ...OPEN.detect, cutoff: "2099-01-01T00:00:00.000Z" } } });
+    assert.deepEqual([future.outcome, future.counts.historic, future.counts.historicUnresolved], ["NONE", 2, 2], "historic rows are counted (visible) and never selected");
+    assert.deepEqual(await fingerprint(), f0, "nothing written");
+  });
+
+  test("D10 C119 external cancellation BEFORE detect (the REAL 0027 admin path; the pristine notify is latched EXTERNALLY_CANCELLED): the runtime role reads the granted projection as cancelled; detect → NONE (LATCHED is terminal); the manual path is refused EXTERNALLY_CANCELLED at admission; ZERO exchange calls; no table changed by any of them", async () => {
+    const bk = await ready(); const rec = await cancelExternally(bk);
+    assert.ok(rec, "recorded");
+    assert.deepEqual((await db.app.query("SELECT booking.external_cancellation_public($1::uuid) AS x", [bk.id])).rows[0].x, { cancelled: true, refundStatus: "pending" });
+    const f0 = await fingerprint();
+    const d = await detect(bk.listingId); assert.deepEqual([d.outcome, d.code, d.counts.terminal, d.counts.eligible], ["NONE", "DETECT_NONE", 1, 0], JSON.stringify(d));
+    const fx = fakeExchange(ok200); const m = await run(bk, bk.op.id, "en", fx);
+    assert.deepEqual([m.code, m.admission, m.workerInvocations, fx.calls], ["NBC_ADMISSION_REFUSED", "EXTERNALLY_CANCELLED", 0, 0]);
+    assert.deepEqual(await fingerprint(), f0);
+  });
+
+  test("D11 C119 external cancellation BETWEEN detect and execute: the detect-flow execute re-selects (the op is now latched) → NBC_CANDIDATE_CHANGED with ZERO worker invocations / calls; a manual plan for the same op → EXTERNALLY_CANCELLED at admission; the notification stays unsent", async () => {
+    const bk = await ready(); const d = await detect(bk.listingId); assert.equal(d.outcome, "ONE");
+    await cancelExternally(bk);
+    const fx = fakeExchange(ok200); const r = await dexec(bk.listingId, d.fingerprint, fx);
+    assert.deepEqual([r.code, r.detectCode, r.workerInvocations, fx.calls], ["NBC_CANDIDATE_CHANGED", "DETECT_NONE", 0, 0]);
+    const fx2 = fakeExchange(ok200); const m = await run(bk, bk.op.id, "en", fx2);
+    assert.deepEqual([m.admission, fx2.calls], ["EXTERNALLY_CANCELLED", 0]);
+    const op = (await db.owner.query("SELECT state, attempts FROM booking.external_operations WHERE id = $1", [bk.op.id])).rows[0];
+    assert.deepEqual([op.state, op.attempts], ["pending", 0], "never sent");
+  });
+
+  test("D12 C119 fact drift after detect: (a) SAME intent version, guest recipient moved out of the sink / .invalid scope → the class is OUT_OF_V1_SCOPE: execute → NBC_CANDIDATE_CHANGED (re-select STOPs on attention), ZERO calls; (b) version drift (the D5 setup) → the fingerprint no longer matches → NBC_CANDIDATE_CHANGED, ZERO calls", async () => {
+    const a = await ready(); const d = await detect(a.listingId); assert.equal(d.outcome, "ONE");
+    const v0 = (await db.owner.query("SELECT version FROM booking.intents WHERE id = $1", [a.id])).rows[0].version;
+    await Hm.F.ownerManagedHistory(db.owner, "UPDATE booking.intent_guests SET email = $2 WHERE intent_id = $1", [a.id, "guest.drift@mv-test.example"]);   // TEST SETUP
+    assert.equal((await db.owner.query("SELECT version FROM booking.intents WHERE id = $1", [a.id])).rows[0].version, v0, "same version");
+    const fx = fakeExchange(ok200); const r = await dexec(a.listingId, d.fingerprint, fx);
+    assert.deepEqual([r.code, r.detectCode, r.workerInvocations, fx.calls], ["NBC_CANDIDATE_CHANGED", "DETECT_ATTENTION", 0, 0]);
+    const b = await ready(); const db0 = await detect(b.listingId); assert.equal(db0.outcome, "ONE");
+    await Hm.F.ownerManagedHistory(db.owner, "UPDATE booking.intents SET version = version + 1 WHERE id = $1", [b.id]);   // TEST SETUP (as D5)
+    const fx2 = fakeExchange(ok200); const r2 = await dexec(b.listingId, db0.fingerprint, fx2);
+    assert.deepEqual([r2.code, r2.detectCode, r2.workerInvocations, fx2.calls], ["NBC_CANDIDATE_CHANGED", "DETECT_FACTS_REFUSED", 0, 0], "rev 2: the version moved past the op's source version → the snapshot's pending SQL refusal (VERSION_DRIFT) STOPs the re-selection");
+  });
+
+  test("D13 C119 two COMPETING detect / execute runs for the SAME candidate (both detect ONE, both execute concurrently with the same fingerprint): exactly ONE provider acceptance in total and the loser never reaches the exchange (the accepted worker's claim / lease fences are the authority, not detect)", async () => {
+    const bk = await ready(); const d1 = await detect(bk.listingId); const d2 = await detect(bk.listingId);
+    assert.deepEqual([d1.outcome, d2.outcome, d1.fingerprint === d2.fingerprint], ["ONE", "ONE", true]);
+    const fa = fakeExchange(ok200); const fb = fakeExchange(ok200);
+    const [ra, rb] = await Promise.all([dexec(bk.listingId, d1.fingerprint, fa), dexec(bk.listingId, d2.fingerprint, fb)]);
+    assert.equal(fa.calls + fb.calls, 1, `exactly ONE exchange call in total: ${ra.code}/${ra.admission}/${ra.workerOutcome} vs ${rb.code}/${rb.admission}/${rb.workerOutcome}`);
+    assert.deepEqual([ra, rb].filter((x) => x.code === "PROVIDER_ACCEPTED").length, 1);
+    const loser = [ra, rb].find((x) => x.code !== "PROVIDER_ACCEPTED"); assert.equal(loser.sendsAttempted, 0);
+    const rc = Number((await db.owner.query("SELECT count(*) AS n FROM booking.notification_provider_receipts WHERE operation_id = $1", [bk.op.id])).rows[0].n); assert.equal(rc, 1);
+  });
+
+  test("D14 C119 unreadable cancellation projection: (a) runtime EXECUTE revoked (test-local) → the fn ACL is part of the catalog → detect STOP DETECT_SESSION_REFUSED and execute CATALOG_NOT_27; (b) a thrown / malformed / non-NULL-non-cancelled projection reply on the REAL path → CANCELLATION_UNREADABLE (detect DETECT_NOT_ADMISSIBLE; execute refused) — never read as 'not cancelled'; ZERO calls throughout", async () => {
+    const bk = await ready();
+    await db.owner.query("REVOKE EXECUTE ON FUNCTION booking.external_cancellation_public(uuid) FROM mv_booking_app");
+    try {
+      const d = await detect(bk.listingId); assert.deepEqual([d.outcome, d.code], ["STOP", "DETECT_SESSION_REFUSED"]);
+      const fx = fakeExchange(ok200); const m = await run(bk, bk.op.id, "en", fx); assert.deepEqual([m.admission, fx.calls], ["CATALOG_NOT_27", 0]);
+    } finally { await db.owner.query("GRANT EXECUTE ON FUNCTION booking.external_cancellation_public(uuid) TO mv_booking_app"); }
+    assert.equal((await detect(bk.listingId)).outcome, "ONE", "restored");
+    const QX = R.ADMISSION_QUERIES.cancellation;
+    const faulty = (reply) => ({ query: (t, p) => db.app.query(t, p), connect: async () => { const cl = await db.app.connect();
+      return { query: (t, p) => (t === QX ? reply(cl, p) : cl.query(t, p)), release: (x) => cl.release(x) }; } });
+    for (const [why, reply] of [["thrown", () => Promise.reject(new Error("permission denied for function external_cancellation_public"))], ["no row", () => Promise.resolve({ rows: [] })],
+      ["string", () => Promise.resolve({ rows: [{ x: "null" }] })], ["not cancelled object", () => Promise.resolve({ rows: [{ x: { cancelled: false } }] })], ["two rows", (cl, p) => cl.query(`${QX} UNION ALL ${QX}`, [...p, ...p].slice(0, 1))]]) {
+      const d = await R.runDetectCore({ pool: faulty(reply), c: cOf(bk.listingId), sourceDigest: SRC_A });
+      assert.deepEqual([d.outcome, d.code, d.admission, d.fingerprint], ["STOP", "DETECT_NOT_ADMISSIBLE", "CANCELLATION_UNREADABLE", null], why);
+      const fx = fakeExchange(ok200); const m = await run(bk, bk.op.id, "en", fx, { pool: faulty(reply) });
+      assert.deepEqual([m.code, m.admission, m.workerInvocations, fx.calls], ["NBC_ADMISSION_REFUSED", "CANCELLATION_UNREADABLE", 0, 0], why);
+    }
+  });
+
+
+  test("D15 C119 rev 2 (ROOT F1) SAME-VERSION fact changes that stay ELIGIBLE: (1) the synthetic recipient moved to ANOTHER allowed synthetic .invalid recipient, (2) the guest first name changed — each keeps the intent version and the class ELIGIBLE, yet the old fingerprint is refused NBC_CANDIDATE_CHANGED with ZERO worker invocations / sends; a fresh detect yields a NEW fingerprint (== the owner recompute) that executes ONE send; an unchanged booking keeps its fingerprint across detects", async () => {
+    for (const [why, sql, val] of [["recipient", "UPDATE booking.intent_guests SET email = $2 WHERE intent_id = $1", "guest.moved.c119@mv-test.invalid"],
+      ["first name", "UPDATE booking.intent_guests SET first_name = $2 WHERE intent_id = $1", "Renamed"]]) {
+      const bk = await ready(); const d0 = await detect(bk.listingId); assert.equal(d0.outcome, "ONE", why);
+      assert.equal((await detect(bk.listingId)).fingerprint, d0.fingerprint, `${why}: unchanged facts → the same fingerprint`);
+      const v0 = (await db.owner.query("SELECT version FROM booking.intents WHERE id = $1", [bk.id])).rows[0].version;
+      await Hm.F.ownerManagedHistory(db.owner, sql, [bk.id, val]);   // TEST SETUP: the same intent version, still in scope
+      assert.equal((await db.owner.query("SELECT version FROM booking.intents WHERE id = $1", [bk.id])).rows[0].version, v0, `${why}: same version`);
+      const cls = (await db.app.query("SELECT l.class FROM booking.list_guest_notifications($1::int[], NULL, 100) l WHERE l.op_id = $2", [[bk.listingId], bk.op.id])).rows[0].class;
+      assert.equal(cls, "ELIGIBLE", `${why}: still eligible (this is fact binding, not an eligibility refusal)`);
+      const f0 = await fingerprint(); const fx = fakeExchange(ok200); const old = await dexec(bk.listingId, d0.fingerprint, fx);
+      assert.deepEqual([old.code, old.detectCode, old.workerInvocations, old.sendsAttempted, fx.calls], ["NBC_CANDIDATE_CHANGED", "DETECT_ONE", 0, 0, 0], why);
+      assert.deepEqual(await fingerprint(), f0, `${why}: nothing written by the refused execute`); noIds(old, bk);
+      const d1 = await detect(bk.listingId);
+      assert.deepEqual([d1.outcome, d1.fingerprint !== d0.fingerprint, d1.fingerprint === await fpOf(bk)], ["ONE", true, true], why);
+      const fx2 = fakeExchange(ok200); const ok = await dexec(bk.listingId, d1.fingerprint, fx2);
+      assert.deepEqual([ok.code, ok.verifiedCompletion, fx2.calls], ["PROVIDER_ACCEPTED", true, 1], `${why}: the re-detected binding sends ONCE`);
+    }
+  });
+
+  test("D16 C119 rev 2 a same-version recipient-name change committed INSIDE the accepted worker's observation window (after its own snapshot, before its claim): the existing afterInitialObservation seam recomputes the binding in a fresh read-only snapshot → NBC_BOUND_FACTS_MISMATCH with ONE invocation, ZERO sends, nothing claimed / rendered / sent (op pending, attempts 0); RESIDUAL (documented): the hook throw leaves the work lease to expire; later changes are governed only by the worker's claim + pre-send FACTS_CHANGED / RECIPIENT_CHANGED fences", async () => {
+    const bk = await ready(); const d = await detect(bk.listingId); assert.equal(d.outcome, "ONE");
+    const WORKER_SNAPSHOT = "SELECT booking.guest_notification_snapshot($1) AS r"; let mutated = 0;
+    const racing = { query: (t, p) => db.app.query(t, p), connect: async () => { const cl = await db.app.connect();
+      return { query: async (t, p) => { const r = await cl.query(t, p); if (t === WORKER_SNAPSHOT && mutated === 0) { mutated += 1;
+        await Hm.F.ownerManagedHistory(db.owner, "UPDATE booking.intent_guests SET first_name = $2 WHERE intent_id = $1", [bk.id, "Racer"]); } return r; }, release: (x) => cl.release(x) }; } };
+    const fx = fakeExchange(ok200); const r = await dexec(bk.listingId, d.fingerprint, fx, { pool: racing });
+    assert.equal(mutated, 1, "the change landed inside the worker's own observation window");
+    assert.deepEqual([r.code, r.workerInvocations, r.sendsAttempted, fx.calls], ["NBC_BOUND_FACTS_MISMATCH", 1, 0, 0], JSON.stringify(r));
+    const op = (await db.owner.query("SELECT state, attempts, dispatched_at IS NULL AS nd FROM booking.external_operations WHERE id = $1", [bk.op.id])).rows[0];
+    const art = (await db.owner.query("SELECT (SELECT count(*)::int FROM booking.notification_renders WHERE operation_id = $1) AS r, (SELECT count(*)::int FROM booking.notification_provider_receipts WHERE operation_id = $1) AS p", [bk.op.id])).rows[0];
+    assert.deepEqual([op.state, op.attempts, op.nd, art.r, art.p], ["pending", 0, true, 0, 0], "never claimed / rendered / sent");
+    noIds(r, bk);
   });
 }

@@ -32,7 +32,7 @@ const NOTIFICATION = Object.freeze({
   prefix: "e7-hosted-booking-confirmation-v1\n",
   runnerFiles: ["scripts/e7-hosted-booking-confirmation.mjs", "test/e7-hosted-booking-confirmation.test.mjs", "test/e7-hosted-booking-confirmation-workflow.test.mjs",
     ".github/workflows/e7-hosted-booking-confirmation.yml"],
-  frame: "0cd953a9964f47dd4cde627e6c153a2f413effe640ba6e9fb292dd98cf599ed9"   // C116: MERGED tooling 66133a22 (#180) + catalog 26 (was aff728cf on main)
+  frame: "9c6cf9f2a1dbd5f63371e952c82c6e2b6c43add6f0f308b5031f497f1363116b"   // C119 S1 rev 2: catalog 27 + read-only detect (facts-bound fingerprint) + detect-flow execute, tooling 66133a22 unchanged (was 0cd953a9… at C116: catalog 26; aff728cf before)
 });
 
 /** every runtime source frame on main: each runner's own runnerFiles, plus the fixed frames the workflow tests pin for the two probes */

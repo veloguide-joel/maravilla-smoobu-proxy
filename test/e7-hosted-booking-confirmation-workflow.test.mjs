@@ -1,6 +1,7 @@
 // test/e7-hosted-booking-confirmation-workflow.test.mjs — C50: regression test for .github/workflows/e7-hosted-booking-confirmation.yml (SHIPPED CLOSED). Static assertions on the
 // workflow bytes + LOCAL execution of its gate shell blocks (extracted from the YAML, run with bash against symlinked wrapper / tooling dirs).
 // Zero network, zero secrets: the ONE execute step is never executed here (only asserted); every real network primitive is a throwing guard.
+// C119 S1: + the manual `detect` job (approval #1, the DB secret only, declared outputs outcome + fingerprint) and the detect-flow execute routing.
 // Also pins that the five reviewed runners, the C47 inspection runner, the charge-list probe and the Resend sink probe are byte-unchanged.
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
@@ -35,58 +36,64 @@ function runBlock(stepName) {
   const rest = yml.slice(i); const m = rest.match(/\n        run: \|\n((?:          .*\n)+)/); assert.ok(m, `run block of ${stepName}`);
   return m[1].split("\n").map((l) => l.replace(/^ {10}/, "")).join("\n");
 }
-const jobs = { preflight: yml.slice(yml.indexOf("\n  preflight:\n"), yml.indexOf("\n  execute:\n")), execute: yml.slice(yml.indexOf("\n  execute:\n")) };
+const jobs = { preflight: yml.slice(yml.indexOf("\n  preflight:\n"), yml.indexOf("\n  detect:\n")), detect: yml.slice(yml.indexOf("\n  detect:\n"), yml.indexOf("\n  execute:\n")),
+  execute: yml.slice(yml.indexOf("\n  execute:\n")) };
 const steps = (job) => [...job.matchAll(/\n      - name: ([^\n]+)/g)].map((m) => m[1]);
 
-test("W1 static: workflow_dispatch ONLY; inputs exactly mode (choice [preflight, execute], default preflight) / approval_ref / intent_id / op_id / expected_version / locale / three expected digests — NO contact / sender / recipient / subject / body input; permissions contents: read; concurrency cancel-in-progress false; runner FILES = the documented frame", () => {
+test("W1 static: workflow_dispatch ONLY (C119 S1: still no schedule); inputs exactly mode (choice [preflight, detect, execute], default preflight) / approval_ref / intent_id / op_id / expected_version / locale / three expected digests — NO contact / sender / recipient / subject / body input; permissions contents: read; concurrency cancel-in-progress false; runner FILES = the documented frame", () => {
   assert.match(yml, /^on:\n  workflow_dispatch:\n    inputs:\n      mode:\n/m); assert.doesNotMatch(yml, /\n  (push|pull_request|pull_request_target|schedule|workflow_call|repository_dispatch):/);
-  assert.match(yml, /      mode:\n(?:        .*\n)*?        type: choice\n        options: \[preflight, execute\]\n        default: preflight\n/);
+  assert.match(yml, /      mode:\n(?:        .*\n)*?        type: choice\n        options: \[preflight, detect, execute\]\n        default: preflight\n/);
   assert.deepEqual([...yml.matchAll(/^      ([a-z_]+):\n        description/gm)].map((m) => m[1]),
     ["mode", "approval_ref", "intent_id", "op_id", "expected_version", "locale", "expected_plan_hash", "expected_source_digest", "expected_closure_digest"]);
   assert.doesNotMatch(yml.slice(0, yml.indexOf("\npermissions:")).replace(/^#.*$/gm, ""), /recipient|sender|email|subject|body|to_address|from_address/i);
   assert.match(yml, /\npermissions:\n  contents: read\n\n/); assert.equal(count(/permissions:/g), 1); assert.doesNotMatch(yml, /: write|id-token:|pull-requests:|packages:|deployments:|issues:|checks:|statuses:/);
   assert.match(yml, /\nconcurrency:\n  group: e7-hosted-booking-confirmation\n  cancel-in-progress: false\n/);
-  assert.deepEqual([...yml.matchAll(/^  ([a-z-]+):\n    (?:needs|runs-on|if)/gm)].map((m) => m[1]), ["preflight", "execute"]);
-  assert.equal(count(/runs-on: ubuntu-24\.04/g), 2); assert.equal(count(/timeout-minutes: 10\n/g), 2);
+  assert.deepEqual([...yml.matchAll(/^  ([a-z-]+):\n    (?:needs|runs-on|if)/gm)].map((m) => m[1]), ["preflight", "detect", "execute"]);
+  assert.equal(count(/runs-on: ubuntu-24\.04/g), 3); assert.equal(count(/timeout-minutes: 10\n/g), 3);
   assert.deepEqual([...R.CONSTANTS.runnerFiles], FILES);
 });
 
 test("W2 static: checkouts at the EXACT dispatch SHA + the tooling pin 66133a22 (persist-credentials false), the same reviewed action pins as e7-hosted-recording.yml, Node 22.22.0; the preflight job has no environment / secret / npm / curl", () => {
-  assert.equal(count(/ref: \$\{\{ github\.sha \}\}\n          path: wrapper\n          persist-credentials: false/g), 2);
-  assert.equal(count(new RegExp(`repository: veloguide-joel/maravilla-smoobu-proxy\\n          ref: ${PIN}\\n          path: tooling\\n          persist-credentials: false`, "g")), 2);
-  assert.equal(count(/persist-credentials: false/g), 4); assert.doesNotMatch(yml, /ref: main|ref: refs\/heads|ref: \$\{\{ github\.ref/);
+  assert.equal(count(/ref: \$\{\{ github\.sha \}\}\n          path: wrapper\n          persist-credentials: false/g), 3);
+  assert.equal(count(new RegExp(`repository: veloguide-joel/maravilla-smoobu-proxy\\n          ref: ${PIN}\\n          path: tooling\\n          persist-credentials: false`, "g")), 3);
+  assert.equal(count(/persist-credentials: false/g), 6); assert.doesNotMatch(yml, /ref: main|ref: refs\/heads|ref: \$\{\{ github\.ref/);
   const rec = readFileSync(join(ROOT, ".github/workflows/e7-hosted-recording.yml"), "utf8");
   const pins = (s) => [...new Set([...s.matchAll(/uses: (actions\/[a-z-]+@[0-9a-f]{40})/g)].map((m) => m[1]))].sort();
-  assert.deepEqual(pins(yml), pins(rec)); assert.equal(count(/uses: /g), 6);
-  assert.equal(count(/node-version: "22\.22\.0"\n          package-manager-cache: false/g), 2);
+  assert.deepEqual(pins(yml), pins(rec)); assert.equal(count(/uses: /g), 9);
+  assert.equal(count(/node-version: "22\.22\.0"\n          package-manager-cache: false/g), 3);
   assert.doesNotMatch(jobs.preflight, /environment:|secrets\.|needs:|npm |curl |E7_CA_FILE/);
   assert.equal(R.CONSTANTS.toolingCommit, PIN);
   assert.ok(!yml.includes(OLD_PIN) && !yml.includes("d322d219"), "C55: the old tooling pin appears nowhere in the workflow");
-  assert.equal(yml.split(`ref: ${PIN}`).length - 1, 2, "both workflow checkouts use the exact new immutable ref");
-  assert.equal(yml.split(`E7_TOOLING_PIN: ${PIN}`).length - 1, 2, "both tooling-pin bindings are the exact new ref");
+  assert.equal(yml.split(`ref: ${PIN}`).length - 1, 3, "every tooling checkout uses the exact immutable ref");
+  assert.equal(yml.split(`E7_TOOLING_PIN: ${PIN}`).length - 1, 3, "every tooling-pin binding is the exact ref");
 });
 
-test("W3 static: execute job needs preflight AND mode == 'execute' && main AND environment e7-readonly-probe (the only environment); step order: checkouts → node → bindings re-check → runner verify (SHIPPED CLOSED refuses HERE, before any secret step) → npm ci → CA fetch → the ONE execute step LAST", () => {
-  assert.match(jobs.execute, /^\n  execute:\n    needs: preflight\n    if: inputs\.mode == 'execute' && github\.ref == 'refs\/heads\/main'\n    runs-on: ubuntu-24\.04\n    environment: e7-readonly-probe\n    timeout-minutes: 10\n/);
-  assert.equal(count(/environment: /g), 1);
+test("W3 static: execute job needs preflight (+ detect) AND (manual execute with detect SKIPPED | detect flow with detect outcome ONE) && main AND environment e7-readonly-probe (the only environment); step order: checkouts → node → bindings re-check → runner verify (SHIPPED CLOSED refuses HERE, before any secret step) → npm ci → CA fetch → the ONE execute step LAST", () => {
+  assert.ok(jobs.execute.startsWith("\n  execute:\n    needs: [preflight, detect]\n    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.preflight.result == 'success' && ((inputs.mode == 'execute' && needs.detect.result == 'skipped') || (inputs.mode == 'detect' && needs.detect.result == 'success' && needs.detect.outputs.outcome == 'ONE')) }}\n    runs-on: ubuntu-24.04\n    environment: e7-readonly-probe\n    timeout-minutes: 10\n"), "execute routing");
+  assert.equal(count(/environment: /g), 2); assert.equal(count(/environment: e7-readonly-probe\n/g), 2, "the EXISTING reviewer-gated environment only (detect = approval #1, execute = approval #2)");
   assert.deepEqual(steps(jobs.execute).map((s) => s.split(" (")[0]), ["Checkout wrapper", "Checkout merged E7 tooling", "Set up Node 22.22.0", "Re-check bindings BEFORE any secret",
     "Verify", "Install the pinned dependency from the verified lockfile", "Fetch the public Supabase CA", "ONE bound gn-v2 booking confirmation"]);
   assert.match(jobs.execute, /working-directory: tooling\n        run: npm ci --ignore-scripts --omit=dev --no-audit --no-fund\n/);
-  assert.equal(count(/curl --fail --silent --show-error --proto '=https' --max-time 20 -o "\$RUNNER_TEMP\/prod-ca-2021\.crt" https:\/\/supabase-downloads\.s3-ap-southeast-1\.amazonaws\.com\/prod\/ssl\/prod-ca-2021\.crt\n/g), 1);
+  assert.equal(count(/curl --fail --silent --show-error --proto '=https' --max-time 20 -o "\$RUNNER_TEMP\/prod-ca-2021\.crt" https:\/\/supabase-downloads\.s3-ap-southeast-1\.amazonaws\.com\/prod\/ssl\/prod-ca-2021\.crt\n/g), 2, "detect + execute");
   assert.deepEqual(steps(jobs.preflight).map((s) => s.split(" (")[0]), ["Checkout wrapper", "Checkout merged E7 tooling", "Set up Node 22.22.0", "Verify checkout bindings", "Preflight", "Source digest"]);
 });
 
 test("W4 static: the ONLY secrets (existing NAMES E7_DEV_BOOKING_DATABASE_URL and E7_RESEND_TEST_KEY) appear exactly once each, in the env of the LAST execute step, whose run is exactly the one `execute` command; no Hostaway / Stripe secret; no expression interpolation inside any run; every E7_* env name is an admitted runner key", () => {
-  assert.equal(count(/secrets\./g), 2); assert.equal(count(/\$\{\{ secrets\.E7_DEV_BOOKING_DATABASE_URL \}\}/g), 1); assert.equal(count(/\$\{\{ secrets\.E7_RESEND_TEST_KEY \}\}/g), 1);
+  assert.equal(count(/secrets\./g), 3); assert.equal(count(/\$\{\{ secrets\.E7_DEV_BOOKING_DATABASE_URL \}\}/g), 2); assert.equal(count(/\$\{\{ secrets\.E7_RESEND_TEST_KEY \}\}/g), 1);
+  assert.doesNotMatch(jobs.detect, /E7_RESEND_TEST_KEY|createResendExchange/, "C119 S1: the detect job never sees the Resend key");
+  const dlast = jobs.detect.slice(jobs.detect.lastIndexOf("      - name: "));
+  assert.match(dlast, /^      - name: ONE read-only detection[^\n]*\n        id: detect\n        env:\n(?:          [A-Z0-9_]+: [^\n]+\n)+        run: node wrapper\/scripts\/e7-hosted-booking-confirmation\.mjs detect\n$/);
+  assert.match(dlast, /          E7_DEV_BOOKING_DATABASE_URL: \$\{\{ secrets\.E7_DEV_BOOKING_DATABASE_URL \}\}\n        run:/);
   const last = yml.slice(yml.lastIndexOf("      - name: "));
   assert.match(last, /^      - name: ONE bound gn-v2 booking confirmation[^\n]*\n        env:\n(?:          [A-Z0-9_]+: [^\n]+\n)+        run: node wrapper\/scripts\/e7-hosted-booking-confirmation\.mjs execute\n$/);
   assert.match(last, /          E7_DEV_BOOKING_DATABASE_URL: \$\{\{ secrets\.E7_DEV_BOOKING_DATABASE_URL \}\}\n          E7_RESEND_TEST_KEY: \$\{\{ secrets\.E7_RESEND_TEST_KEY \}\}\n        run:/);
-  assert.equal(count(/e7-hosted-booking-confirmation\.mjs execute\n/g), 1); assert.equal(count(/e7-hosted-booking-confirmation\.mjs verify\n/g), 1); assert.equal(count(/e7-hosted-booking-confirmation\.mjs preflight\n/g), 1);
+  assert.equal(count(/e7-hosted-booking-confirmation\.mjs execute\n/g), 1); assert.equal(count(/e7-hosted-booking-confirmation\.mjs verify\n/g), 2); assert.equal(count(/e7-hosted-booking-confirmation\.mjs preflight\n/g), 1);
+  assert.equal(count(/e7-hosted-booking-confirmation\.mjs detect\n/g), 1);
   assert.doesNotMatch(yml, /E7_HOSTAWAY_TOKEN|E7_STRIPE|api\.stripe\.com|api\.hostaway\.com|delivered@resend\.dev|E7_RECIPIENT|E7_SENDER/);
   for (const blk of yml.split(/\n      - name: /).slice(1)) { const r = blk.match(/\n        run: \|\n((?:          .*\n)+)|\n        run: (.*)\n/); if (r) assert.doesNotMatch(r[1] ?? r[2], /\$\{\{/, "no expression interpolation inside run"); }
   const envKeys = [...yml.matchAll(/^          (E7_[A-Z0-9_]+):/gm)].map((m) => m[1]);
-  for (const k of envKeys) if (k !== "E7_TOOLING_PIN" && k !== "E7_MODE") assert.ok(R.ALLOWED_E7_KEYS.includes(k), `${k} is an admitted runner key`);
-  assert.equal(count(new RegExp(FILES.map((f) => f.replace(/[.\/]/g, "\\$&")).join(" "), "g")), 2, "digest file list identical in both jobs, documented order");
+  for (const k of envKeys) if (k !== "E7_TOOLING_PIN" && k !== "E7_MODE" && k !== "E7_BINDINGS") assert.ok(R.ALLOWED_E7_KEYS.includes(k), `${k} is an admitted runner key`);
+  assert.equal(count(new RegExp(FILES.map((f) => f.replace(/[.\/]/g, "\\$&")).join(" "), "g")), 3, "digest file list identical in all three jobs, documented order");
   assert.equal(R.CONSTANTS.executeEnabled, false, "SHIPPED CLOSED: the verify step refuses NBC_EXECUTE_CLOSED, so no secret step can run");
 });
 
@@ -108,7 +115,7 @@ test("W5 preflight gate blocks executed locally: bindings pass only with HEAD ==
   assert.equal(toolSha, PIN, "E7_TOOLING_DIR must be the pinned 66133a22 checkout");
   const d = sandbox(); try {
     const bind = runBlock("Verify checkout bindings (wrapper HEAD == dispatch SHA; tooling HEAD == pin; no secrets)");
-    for (const mode of ["preflight", "execute"]) { const ok = sh(bind, { E7_WORKFLOW_SHA: headSha, E7_TOOLING_PIN: PIN, E7_MODE: mode }, d); assert.equal(ok.status, 0, ok.out); }
+    for (const mode of ["preflight", "detect", "execute"]) { const ok = sh(bind, { E7_WORKFLOW_SHA: headSha, E7_TOOLING_PIN: PIN, E7_MODE: mode }, d); assert.equal(ok.status, 0, ok.out); }
     for (const [env, why] of [[{ E7_WORKFLOW_SHA: "0".repeat(40), E7_TOOLING_PIN: PIN, E7_MODE: "preflight" }, /wrapper HEAD != dispatch SHA/],
       [{ E7_WORKFLOW_SHA: headSha, E7_TOOLING_PIN: "1".repeat(40), E7_MODE: "preflight" }, /tooling HEAD != pin/], [{ E7_WORKFLOW_SHA: headSha, E7_TOOLING_PIN: PIN, E7_MODE: "inspect" }, /REFUSED: mode/]]) {
       const r = sh(bind, env, d); assert.deepEqual([r.status, why.test(r.out)], [3, true], r.out);
@@ -122,13 +129,22 @@ test("W5 preflight gate blocks executed locally: bindings pass only with HEAD ==
 
 test("W6 execute re-check block executed locally (BEFORE any secret): passes only with HEAD == dispatch SHA, tooling == pin, a non-empty approval label, three 64-hex expected digests and the expected source digest EQUAL to the actual one", async () => {
   const d = sandbox(); try {
-    const blk = runBlock("Re-check bindings BEFORE any secret (HEAD == dispatch SHA; tooling pin; label; expected digests 64-hex; source digest)");
+    const blk = runBlock("Re-check bindings BEFORE any secret (HEAD == dispatch SHA; tooling pin; flow bindings; expected digests 64-hex; source digest)");
     assert.doesNotMatch(blk, /E7_DEV_BOOKING_DATABASE_URL|E7_RESEND_TEST_KEY|\.mjs execute|secrets\./); const want = await expectedDigest();
-    const base = { E7_WORKFLOW_SHA: headSha, E7_TOOLING_PIN: PIN, E7_APPROVAL_REF: "ROOT-C50-label", E7_EXPECTED_PLAN_HASH: "a".repeat(64), E7_EXPECTED_SOURCE_DIGEST: want, E7_EXPECTED_CLOSURE_DIGEST: R.CONSTANTS.closureDigest };
+    const base = { E7_WORKFLOW_SHA: headSha, E7_TOOLING_PIN: PIN, E7_INPUT_MODE: "manual", E7_APPROVAL_REF: "ROOT-C50-label", E7_EXPECTED_PLAN_HASH: "a".repeat(64), E7_EXPECTED_CANDIDATE_FINGERPRINT: "",
+      E7_EXPECTED_SOURCE_DIGEST: want, E7_EXPECTED_CLOSURE_DIGEST: R.CONSTANTS.closureDigest };
     const ok = sh(blk, base, d); assert.equal(ok.status, 0, ok.out); assert.match(ok.out, new RegExp(`bindings ok: wrapper=${headSha} tooling=${PIN} source=${want}`));
     for (const [over, why] of [[{ E7_WORKFLOW_SHA: "0".repeat(40) }, /wrapper HEAD != dispatch SHA/], [{ E7_TOOLING_PIN: "1".repeat(40) }, /tooling HEAD != pin/], [{ E7_APPROVAL_REF: "" }, /approval_ref empty/],
-      [{ E7_EXPECTED_PLAN_HASH: "" }, /not 64-hex/], [{ E7_EXPECTED_CLOSURE_DIGEST: "XYZ" }, /not 64-hex/], [{ E7_EXPECTED_SOURCE_DIGEST: "f".repeat(64) }, /expected_source_digest mismatch/]]) {
+      [{ E7_EXPECTED_PLAN_HASH: "" }, /not 64-hex/], [{ E7_EXPECTED_CLOSURE_DIGEST: "XYZ" }, /not 64-hex/], [{ E7_EXPECTED_SOURCE_DIGEST: "f".repeat(64) }, /expected_source_digest mismatch/],
+      [{ E7_EXPECTED_CANDIDATE_FINGERPRINT: "a".repeat(64) }, /fingerprint in a manual flow/], [{ E7_INPUT_MODE: "auto" }, /REFUSED: flow/]]) {
       const r = sh(blk, { ...base, ...over }, d); assert.deepEqual([r.status, why.test(r.out)], [3, true], JSON.stringify(over) + r.out);
+    }
+    // C119 S1 detect flow: no label / plan hash; the detect job's fingerprint must be 64-hex
+    const dflow = { ...base, E7_INPUT_MODE: "detect", E7_APPROVAL_REF: "", E7_EXPECTED_PLAN_HASH: "", E7_EXPECTED_CANDIDATE_FINGERPRINT: "b".repeat(64) };
+    const okd = sh(blk, dflow, d); assert.equal(okd.status, 0, okd.out);
+    for (const [over, why] of [[{ E7_APPROVAL_REF: "x" }, /takes no label/], [{ E7_EXPECTED_PLAN_HASH: "a".repeat(64) }, /takes no label/], [{ E7_EXPECTED_CANDIDATE_FINGERPRINT: "" }, /not 64-hex/],
+      [{ E7_EXPECTED_CANDIDATE_FINGERPRINT: "B".repeat(64) }, /not 64-hex/]]) {
+      const r = sh(blk, { ...dflow, ...over }, d); assert.deepEqual([r.status, why.test(r.out)], [3, true], JSON.stringify(over) + r.out);
     }
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
@@ -147,4 +163,27 @@ test("W7 untouched: the five reviewed runners (executeEnabled false, digests unc
   assert.ok(!I.CONSTANTS.runnerFiles.some((f) => FILES.includes(f)));
   assert.equal(await R.framedDigest(ROOT, ["scripts/e7-hosted-charge-list-probe.mjs", "test/e7-hosted-charge-list-probe.test.mjs", ".github/workflows/e7-hosted-charge-list-probe.yml"], "e7-hosted-charge-list-probe-v1\n"), "43715872ddb450889286880c848acefd8757da6fe33bc5c6a3a547bd27219cf3");
   assert.equal(await R.framedDigest(ROOT, ["scripts/e7-resend-sink-probe.mjs", "scripts/e7-resend/resend-exchange.mjs", "test/e7-resend-sink-probe.test.mjs", ".github/workflows/e7-resend-sink-probe.yml"], "e7-resend-sink-probe-v1\n"), "aef26da954d986dc2d922b607d391be404dd73f1145ece0ae66ea0d80673ade4");
+});
+
+test("W8 C119 S1 detect job: needs preflight, mode == 'detect' && main, environment e7-readonly-probe (APPROVAL #1); steps checkouts → node → the pre-secret re-check (executed locally: no binding input, 64-hex digests, exact source) → runner verify of the detect flow (SHIPPED CLOSED refuses HERE) → npm ci → CA → the ONE read-only detection LAST (DB secret only); declared outputs outcome + fingerprint ONLY; the execute steps receive the flow + fingerprint", async () => {
+  assert.match(jobs.detect, /^\n  detect:\n    needs: preflight\n    if: inputs\.mode == 'detect' && github\.ref == 'refs\/heads\/main'\n    runs-on: ubuntu-24\.04\n    environment: e7-readonly-probe\n    timeout-minutes: 10\n    outputs:\n      outcome: \$\{\{ steps\.detect\.outputs\.outcome \}\}\n      fingerprint: \$\{\{ steps\.detect\.outputs\.fingerprint \}\}\n    steps:\n/);
+  assert.deepEqual(steps(jobs.detect).map((s) => s.split(" (")[0].split(",")[0]), ["Checkout wrapper", "Checkout merged E7 tooling", "Set up Node 22.22.0", "Re-check bindings BEFORE the DB secret",
+    "Verify", "Install the pinned dependency from the verified lockfile", "Fetch the public Supabase CA", "ONE read-only detection"]);
+  assert.doesNotMatch(jobs.detect, /E7_INTENT_ID|E7_OP_ID|E7_EXPECTED_VERSION|E7_LOCALE|E7_APPROVAL_REF|E7_EXPECTED_PLAN_HASH|github\.token|: write/, "no binding input reaches the runner, no token");
+  const vstep = jobs.detect.slice(jobs.detect.indexOf("      - name: Verify, detect flow"), jobs.detect.indexOf("      - name: Install"));
+  assert.match(vstep, /          E7_INPUT_MODE: detect\n/); assert.doesNotMatch(vstep, /secrets\./);
+  assert.ok(jobs.detect.indexOf("mjs verify") < jobs.detect.indexOf("secrets."), "the runner's CLOSED verify runs before the only secret step");
+  for (const step of ["      - name: Verify (runner;", "      - name: ONE bound gn-v2 booking confirmation"]) {
+    const blk = jobs.execute.slice(jobs.execute.indexOf(step)); assert.match(blk, /\n          E7_INPUT_MODE: \$\{\{ inputs\.mode == 'detect' && 'detect' \|\| 'manual' \}\}\n          E7_EXPECTED_CANDIDATE_FINGERPRINT: \$\{\{ needs\.detect\.outputs\.fingerprint \}\}\n/, step);
+  }
+  const d = sandbox(); try {
+    const blk = runBlock("Re-check bindings BEFORE the DB secret, detect (HEAD == dispatch SHA; tooling pin; no binding input; expected digests 64-hex; source digest)");
+    assert.doesNotMatch(blk, /E7_DEV_BOOKING_DATABASE_URL|E7_RESEND_TEST_KEY|\.mjs detect|secrets\./); const want = await expectedDigest();
+    const base = { E7_WORKFLOW_SHA: headSha, E7_TOOLING_PIN: PIN, E7_BINDINGS: "", E7_EXPECTED_SOURCE_DIGEST: want, E7_EXPECTED_CLOSURE_DIGEST: R.CONSTANTS.closureDigest };
+    const ok = sh(blk, base, d); assert.equal(ok.status, 0, ok.out); assert.match(ok.out, new RegExp(`bindings ok: wrapper=${headSha} tooling=${PIN} source=${want}`));
+    for (const [over, why] of [[{ E7_WORKFLOW_SHA: "0".repeat(40) }, /wrapper HEAD != dispatch SHA/], [{ E7_TOOLING_PIN: "1".repeat(40) }, /tooling HEAD != pin/], [{ E7_BINDINGS: "x" }, /takes no binding input/],
+      [{ E7_EXPECTED_CLOSURE_DIGEST: "" }, /not 64-hex/], [{ E7_EXPECTED_SOURCE_DIGEST: "f".repeat(64) }, /expected_source_digest mismatch/]]) {
+      const r = sh(blk, { ...base, ...over }, d); assert.deepEqual([r.status, why.test(r.out)], [3, true], JSON.stringify(over) + r.out);
+    }
+  } finally { rmSync(d, { recursive: true, force: true }); }
 });
