@@ -37,7 +37,8 @@ const others = () => q1(`SELECT md5(string_agg(x, E'\\n' ORDER BY x)) AS h FROM 
   ) s`, [FN]);
 
 test("C116-D2 0026 on base schema 25: claim_pipeline_kickoff replaced IN PLACE with ONLY the expected_source_digest literal changed (f09bcbbd → 880db5b3 == PINNED_REVISION.sourceDigest); OID / owner / ACL / volatility / definer / search_path / signature / return / strict / parallel kept; no privilege change; every other booking object identical; exact down; re-up identical", async () => {
-  assert.equal(PINNED_REVISION.sourceDigest, NEW, "SQL literal == tooling PINNED_REVISION.sourceDigest");
+  // C119 S4: 0026's literal is the HISTORIC C116 ENABLE frame (PINNED_REVISION now pins the S4 frame, bound by 0028 — see the 0028 suite)
+  assert.equal(NEW, "880db5b33024edbf0879fbaf5a3826e3622db12fd1808e8c2047238da507fe1b"); assert.notEqual(PINNED_REVISION.sourceDigest, NEW);
   const M = loadMigrations(); const m26 = M.find((m) => m.version === 26); assert.equal(m26.name, "pipeline_kickoff_source_rebind");   // C118 draft: 0027 may follow
   assert.deepEqual(await migrateUp(c, { env: "test", to: 25 }), Array.from({ length: 25 }, (_, i) => i + 1));
   const a25 = await attrs(); const p25 = await privs(); const o25 = await others();
