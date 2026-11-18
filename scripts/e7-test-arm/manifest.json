@@ -1,0 +1,9 @@
+{
+  "schema": "e7-test-arm-manifest-v1",
+  "components": [
+    { "name": "arm-gate", "prefix": "e7-test-arm-v1\n", "files": ["scripts/e7-test-arm.mjs", "test/e7-test-arm.test.mjs"] },
+    { "name": "kickoff", "prefix": "e7-hosted-kickoff-v1\n", "files": ["scripts/e7-hosted-kickoff.mjs", "test/e7-hosted-kickoff.test.mjs", "test/e7-hosted-kickoff-workflow.test.mjs", ".github/workflows/e7-hosted-kickoff.yml"] },
+    { "name": "booking-confirmation", "prefix": "e7-hosted-booking-confirmation-v1\n", "files": ["scripts/e7-hosted-booking-confirmation.mjs", "test/e7-hosted-booking-confirmation.test.mjs", "test/e7-hosted-booking-confirmation-workflow.test.mjs", ".github/workflows/e7-hosted-booking-confirmation.yml"] },
+    { "name": "pipeline", "prefix": "e7-hosted-pipeline-v1\n", "files": ["scripts/e7-hosted-pipeline.mjs", "test/e7-hosted-pipeline.test.mjs", "test/e7-hosted-pipeline-workflow.test.mjs", ".github/workflows/e7-hosted-pipeline.yml"] }
+  ]
+}

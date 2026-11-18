@@ -36,31 +36,33 @@ function runBlock(stepName) {
   const rest = yml.slice(i); const m = rest.match(/\n        run: \|\n((?:          .*\n)+)/); assert.ok(m, `run block of ${stepName}`);
   return m[1].split("\n").map((l) => l.replace(/^ {10}/, "")).join("\n");
 }
-const jobs = { preflight: yml.slice(yml.indexOf("\n  preflight:\n"), yml.indexOf("\n  detect:\n")), detect: yml.slice(yml.indexOf("\n  detect:\n"), yml.indexOf("\n  execute:\n")),
+const jobs = { preflight: yml.slice(yml.indexOf("\n  preflight:\n"), yml.indexOf("\n  arm:\n")), arm: yml.slice(yml.indexOf("\n  arm:\n"), yml.indexOf("\n  detect:\n")), detect: yml.slice(yml.indexOf("\n  detect:\n"), yml.indexOf("\n  execute:\n")),
   execute: yml.slice(yml.indexOf("\n  execute:\n")) };
 const steps = (job) => [...job.matchAll(/\n      - name: ([^\n]+)/g)].map((m) => m[1]);
 
 test("W1 static: workflow_dispatch ONLY (C119 S1: still no schedule); inputs exactly mode (choice [preflight, detect, execute], default preflight) / approval_ref / intent_id / op_id / expected_version / locale / three expected digests — NO contact / sender / recipient / subject / body input; permissions contents: read; concurrency cancel-in-progress false; runner FILES = the documented frame", () => {
-  assert.match(yml, /^on:\n  workflow_dispatch:\n    inputs:\n      mode:\n/m); assert.doesNotMatch(yml, /\n  (push|pull_request|pull_request_target|schedule|workflow_call|repository_dispatch):/);
+  assert.match(yml, /^on:\n  schedule:\n    - cron: '28,58 \* \* \* \*'\n  workflow_dispatch:\n    inputs:\n      mode:\n/m, "C119 S2: ONE draft TEST-only schedule + manual dispatch");
+  assert.doesNotMatch(yml, /\n  (push|pull_request|pull_request_target|workflow_call|repository_dispatch|workflow_run):/); assert.equal((yml.replace(/^#.*$/gm, "").match(/cron:/g) || []).length, 1);
   assert.match(yml, /      mode:\n(?:        .*\n)*?        type: choice\n        options: \[preflight, detect, execute\]\n        default: preflight\n/);
   assert.deepEqual([...yml.matchAll(/^      ([a-z_]+):\n        description/gm)].map((m) => m[1]),
     ["mode", "approval_ref", "intent_id", "op_id", "expected_version", "locale", "expected_plan_hash", "expected_source_digest", "expected_closure_digest"]);
   assert.doesNotMatch(yml.slice(0, yml.indexOf("\npermissions:")).replace(/^#.*$/gm, ""), /recipient|sender|email|subject|body|to_address|from_address/i);
   assert.match(yml, /\npermissions:\n  contents: read\n\n/); assert.equal(count(/permissions:/g), 1); assert.doesNotMatch(yml, /: write|id-token:|pull-requests:|packages:|deployments:|issues:|checks:|statuses:/);
   assert.match(yml, /\nconcurrency:\n  group: e7-hosted-booking-confirmation\n  cancel-in-progress: false\n/);
-  assert.deepEqual([...yml.matchAll(/^  ([a-z-]+):\n    (?:needs|runs-on|if)/gm)].map((m) => m[1]), ["preflight", "detect", "execute"]);
-  assert.equal(count(/runs-on: ubuntu-24\.04/g), 3); assert.equal(count(/timeout-minutes: 10\n/g), 3);
+  assert.deepEqual([...yml.matchAll(/^  ([a-z-]+):\n    (?:needs|runs-on|if)/gm)].map((m) => m[1]), ["preflight", "arm", "detect", "execute"]);
+  assert.equal(count(/runs-on: ubuntu-24\.04/g), 4); assert.equal(count(/timeout-minutes: 10\n/g), 3); assert.equal(count(/timeout-minutes: 5\n/g), 1);
   assert.deepEqual([...R.CONSTANTS.runnerFiles], FILES);
 });
 
 test("W2 static: checkouts at the EXACT dispatch SHA + the tooling pin 66133a22 (persist-credentials false), the same reviewed action pins as e7-hosted-recording.yml, Node 22.22.0; the preflight job has no environment / secret / npm / curl", () => {
-  assert.equal(count(/ref: \$\{\{ github\.sha \}\}\n          path: wrapper\n          persist-credentials: false/g), 3);
+  assert.equal(count(/ref: \$\{\{ github\.sha \}\}\n          path: wrapper\n          persist-credentials: false/g), 4);
   assert.equal(count(new RegExp(`repository: veloguide-joel/maravilla-smoobu-proxy\\n          ref: ${PIN}\\n          path: tooling\\n          persist-credentials: false`, "g")), 3);
-  assert.equal(count(/persist-credentials: false/g), 6); assert.doesNotMatch(yml, /ref: main|ref: refs\/heads|ref: \$\{\{ github\.ref/);
+  assert.equal(count(/persist-credentials: false/g), 7); assert.doesNotMatch(yml, /ref: main|ref: refs\/heads|ref: \$\{\{ github\.ref/);
   const rec = readFileSync(join(ROOT, ".github/workflows/e7-hosted-recording.yml"), "utf8");
   const pins = (s) => [...new Set([...s.matchAll(/uses: (actions\/[a-z-]+@[0-9a-f]{40})/g)].map((m) => m[1]))].sort();
-  assert.deepEqual(pins(yml), pins(rec)); assert.equal(count(/uses: /g), 9);
-  assert.equal(count(/node-version: "22\.22\.0"\n          package-manager-cache: false/g), 3);
+  assert.deepEqual(pins(yml), pins(rec)); assert.equal(count(/uses: /g), 11);
+  assert.equal(count(/node-version: "22\.22\.0"\n          package-manager-cache: false/g), 4);
+  assert.doesNotMatch(jobs.arm, /environment:|secrets\.|tooling|npm |curl |: write/, "the arm job: no environment, no secret, no tooling");
   assert.doesNotMatch(jobs.preflight, /environment:|secrets\.|needs:|npm |curl |E7_CA_FILE/);
   assert.equal(R.CONSTANTS.toolingCommit, PIN);
   assert.ok(!yml.includes(OLD_PIN) && !yml.includes("d322d219"), "C55: the old tooling pin appears nowhere in the workflow");
@@ -69,7 +71,7 @@ test("W2 static: checkouts at the EXACT dispatch SHA + the tooling pin 66133a22 
 });
 
 test("W3 static: execute job needs preflight (+ detect) AND (manual execute with detect SKIPPED | detect flow with detect outcome ONE) && main AND environment e7-readonly-probe (the only environment); step order: checkouts → node → bindings re-check → runner verify (SHIPPED CLOSED refuses HERE, before any secret step) → npm ci → CA fetch → the ONE execute step LAST", () => {
-  assert.ok(jobs.execute.startsWith("\n  execute:\n    needs: [preflight, detect]\n    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.preflight.result == 'success' && ((inputs.mode == 'execute' && needs.detect.result == 'skipped') || (inputs.mode == 'detect' && needs.detect.result == 'success' && needs.detect.outputs.outcome == 'ONE')) }}\n    runs-on: ubuntu-24.04\n    environment: e7-readonly-probe\n    timeout-minutes: 10\n"), "execute routing");
+  assert.ok(jobs.execute.startsWith("\n  execute:\n    needs: [preflight, arm, detect]\n    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.preflight.result == 'success' && needs.arm.result == 'success' && needs.arm.outputs.armed == 'true' && ((github.event_name == 'workflow_dispatch' && inputs.mode == 'execute' && needs.detect.result == 'skipped') || ((inputs.mode == 'detect' || github.event_name == 'schedule') && needs.detect.result == 'success' && needs.detect.outputs.outcome == 'ONE')) }}\n    runs-on: ubuntu-24.04\n    environment: e7-readonly-probe\n    timeout-minutes: 10\n"), "execute routing");
   assert.equal(count(/environment: /g), 2); assert.equal(count(/environment: e7-readonly-probe\n/g), 2, "the EXISTING reviewer-gated environment only (detect = approval #1, execute = approval #2)");
   assert.deepEqual(steps(jobs.execute).map((s) => s.split(" (")[0]), ["Checkout wrapper", "Checkout merged E7 tooling", "Set up Node 22.22.0", "Re-check bindings BEFORE any secret",
     "Verify", "Install the pinned dependency from the verified lockfile", "Fetch the public Supabase CA", "ONE bound gn-v2 booking confirmation"]);
@@ -166,7 +168,7 @@ test("W7 untouched: the five reviewed runners (executeEnabled false, digests unc
 });
 
 test("W8 C119 S1 detect job: needs preflight, mode == 'detect' && main, environment e7-readonly-probe (APPROVAL #1); steps checkouts → node → the pre-secret re-check (executed locally: no binding input, 64-hex digests, exact source) → runner verify of the detect flow (SHIPPED CLOSED refuses HERE) → npm ci → CA → the ONE read-only detection LAST (DB secret only); declared outputs outcome + fingerprint ONLY; the execute steps receive the flow + fingerprint", async () => {
-  assert.match(jobs.detect, /^\n  detect:\n    needs: preflight\n    if: inputs\.mode == 'detect' && github\.ref == 'refs\/heads\/main'\n    runs-on: ubuntu-24\.04\n    environment: e7-readonly-probe\n    timeout-minutes: 10\n    outputs:\n      outcome: \$\{\{ steps\.detect\.outputs\.outcome \}\}\n      fingerprint: \$\{\{ steps\.detect\.outputs\.fingerprint \}\}\n    steps:\n/);
+  assert.match(jobs.detect, /^\n  detect:\n    needs: \[preflight, arm\]\n    if: \(inputs\.mode == 'detect' \|\| github\.event_name == 'schedule'\) && github\.ref == 'refs\/heads\/main' && needs\.arm\.outputs\.armed == 'true'\n    runs-on: ubuntu-24\.04\n    environment: e7-readonly-probe\n    timeout-minutes: 10\n    outputs:\n      outcome: \$\{\{ steps\.detect\.outputs\.outcome \}\}\n      fingerprint: \$\{\{ steps\.detect\.outputs\.fingerprint \}\}\n    steps:\n/);
   assert.deepEqual(steps(jobs.detect).map((s) => s.split(" (")[0].split(",")[0]), ["Checkout wrapper", "Checkout merged E7 tooling", "Set up Node 22.22.0", "Re-check bindings BEFORE the DB secret",
     "Verify", "Install the pinned dependency from the verified lockfile", "Fetch the public Supabase CA", "ONE read-only detection"]);
   assert.doesNotMatch(jobs.detect, /E7_INTENT_ID|E7_OP_ID|E7_EXPECTED_VERSION|E7_LOCALE|E7_APPROVAL_REF|E7_EXPECTED_PLAN_HASH|github\.token|: write/, "no binding input reaches the runner, no token");
@@ -174,7 +176,7 @@ test("W8 C119 S1 detect job: needs preflight, mode == 'detect' && main, environm
   assert.match(vstep, /          E7_INPUT_MODE: detect\n/); assert.doesNotMatch(vstep, /secrets\./);
   assert.ok(jobs.detect.indexOf("mjs verify") < jobs.detect.indexOf("secrets."), "the runner's CLOSED verify runs before the only secret step");
   for (const step of ["      - name: Verify (runner;", "      - name: ONE bound gn-v2 booking confirmation"]) {
-    const blk = jobs.execute.slice(jobs.execute.indexOf(step)); assert.match(blk, /\n          E7_INPUT_MODE: \$\{\{ inputs\.mode == 'detect' && 'detect' \|\| 'manual' \}\}\n          E7_EXPECTED_CANDIDATE_FINGERPRINT: \$\{\{ needs\.detect\.outputs\.fingerprint \}\}\n/, step);
+    const blk = jobs.execute.slice(jobs.execute.indexOf(step)); assert.match(blk, /\n          E7_INPUT_MODE: \$\{\{ \(inputs\.mode == 'detect' \|\| github\.event_name == 'schedule'\) && 'detect' \|\| 'manual' \}\}\n          E7_EXPECTED_CANDIDATE_FINGERPRINT: \$\{\{ needs\.detect\.outputs\.fingerprint \}\}\n/, step);
   }
   const d = sandbox(); try {
     const blk = runBlock("Re-check bindings BEFORE the DB secret, detect (HEAD == dispatch SHA; tooling pin; no binding input; expected digests 64-hex; source digest)");
@@ -186,4 +188,77 @@ test("W8 C119 S1 detect job: needs preflight, mode == 'detect' && main, environm
       const r = sh(blk, { ...base, ...over }, d); assert.deepEqual([r.status, why.test(r.out)], [3, true], JSON.stringify(over) + r.out);
     }
   } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+// ---- C119 S2: the TEST arm + the draft schedule (REAL expressions) ---------------------------------------------------------------------------
+function jobIf(job) {
+  const m = job.match(/\n    if: (.*)\n/); assert.ok(m, "job has if"); let e = m[1].trim();
+  if (e.startsWith("${{")) e = e.replace(/^\$\{\{\s*/, "").replace(/\s*\}\}$/, "");
+  assert.match(e, /^[a-zA-Z0-9_.'()!&|= \/-]+$/, "only the reviewed operators / literals");
+  const js = e.replace(/==/g, "===").replace(/!===/g, "!==").replace(/\bcancelled\(\)/g, "ctx.cancelled()").replace(/\b(inputs|github|needs)\./g, "ctx.$1.");
+  const explicit = /\b(cancelled|always|success|failure)\(\)/.test(e);
+  const fn = new Function("ctx", `return (${js});`);
+  return (ctx, needs) => (explicit ? true : needs.every((n) => ctx.needs[n].result === "success")) && fn(ctx) === true;
+}
+function evalExpr(raw, ctx) {
+  const e = raw.replace(/^\$\{\{\s*/, "").replace(/\s*\}\}$/, "");
+  assert.match(e, /^[a-zA-Z0-9_.'()|&= -]+$/, "only the reviewed operators / literals");
+  return new Function("ctx", `return (${e.replace(/==/g, "===").replace(/\b(github|inputs|vars|needs)\./g, "ctx.$1.")});`)(ctx);
+}
+const stepEnv = (key, text = yml) => [...new Set([...text.matchAll(new RegExp(`^          ${key}: (.*)$`, "gm"))].map((m) => m[1]))];
+
+test("W9 C119 S2 arm job + routing truth table (REAL expressions): every non-preflight route (schedule, manual detect, manual execute) needs the arm job's armed == 'true'; NOT armed / arm failed / skipped / cancelled reaches NO environment job (CLOSED_NOOP, no manual bypass); manual preflight needs no arm; a schedule is ALWAYS the detect flow and never the manual execute path", () => {
+  assert.match(jobs.arm, /^\n  arm:\n    needs: preflight\n    if: github\.event_name == 'schedule' \|\| inputs\.mode == 'detect' \|\| inputs\.mode == 'execute'\n    runs-on: ubuntu-24\.04\n    timeout-minutes: 5\n    outputs:\n      armed: \$\{\{ steps\.arm\.outputs\.armed \}\}\n      confirmation: \$\{\{ steps\.arm\.outputs\.confirmation \}\}\n    steps:\n/);
+  assert.deepEqual(steps(jobs.arm).map((s) => s.split(" (")[0]), ["Checkout wrapper", "Set up Node 22.22.0", "TEST arm gate"]);
+  assert.match(jobs.arm, /        id: arm\n        env:\n          E7_TEST_ARM: \$\{\{ vars\.E7_TEST_AUTO_ARMED \}\}\n        run: node wrapper\/scripts\/e7-test-arm\.mjs check\n/);
+  const ifArm = jobIf(jobs.arm); const ifDetect = jobIf(jobs.detect); const ifExec = jobIf(jobs.execute);
+  const ctx = ({ mode, ev = "workflow_dispatch", ref = "refs/heads/main", pre = "success", arm = "success", armed = "true", det = "skipped", outcome = "", cancelled = false }) =>
+    ({ inputs: ev === "schedule" ? {} : { mode }, github: { ref, event_name: ev }, cancelled: () => cancelled,
+      needs: { preflight: { result: pre }, arm: { result: arm, outputs: { armed } }, detect: { result: det, outputs: { outcome } } } });
+  const run = (o) => { const c = ctx(o); return { arm: ifArm(c, ["preflight"]), detect: ifDetect(c, ["preflight", "arm"]), execute: ifExec(c, ["preflight", "arm", "detect"]) }; };
+  const cases = [
+    [{ mode: "preflight", arm: "skipped", armed: "" }, { arm: false, detect: false, execute: false }],
+    [{ mode: "execute" }, { arm: true, detect: false, execute: true }],
+    [{ mode: "execute", armed: "false" }, { arm: true, detect: false, execute: false }],                         // no manual bypass
+    [{ mode: "execute", arm: "failure", armed: "" }, { arm: true, detect: false, execute: false }],
+    [{ mode: "execute", ref: "refs/heads/x" }, { arm: true, detect: false, execute: false }],
+    [{ mode: "detect" }, { arm: true, detect: true, execute: false }],
+    [{ mode: "detect", det: "success", outcome: "ONE" }, { arm: true, detect: true, execute: true }],
+    [{ mode: "detect", det: "success", outcome: "NONE" }, { arm: true, detect: true, execute: false }],
+    [{ mode: "detect", det: "failure", outcome: "STOP" }, { arm: true, detect: true, execute: false }],
+    [{ mode: "detect", armed: "false" }, { arm: true, detect: false, execute: false }],
+    [{ mode: "detect", det: "skipped" }, { arm: true, detect: true, execute: false }],
+    [{ ev: "schedule" }, { arm: true, detect: true, execute: false }],
+    [{ ev: "schedule", det: "success", outcome: "ONE" }, { arm: true, detect: true, execute: true }],
+    [{ ev: "schedule", det: "success", outcome: "ONE", cancelled: true }, { arm: true, detect: true, execute: false }],
+    [{ ev: "schedule", armed: "false" }, { arm: true, detect: false, execute: false }],                          // CLOSED_NOOP tick: 0 approvals
+    [{ ev: "schedule", armed: "", arm: "failure" }, { arm: true, detect: false, execute: false }],
+    [{ ev: "schedule", armed: "true", arm: "cancelled", det: "success", outcome: "ONE" }, { arm: true, detect: false, execute: false }],
+    [{ ev: "schedule", det: "skipped" }, { arm: true, detect: true, execute: false }],                            // never the manual path
+    [{ ev: "schedule", ref: "refs/heads/x", det: "success", outcome: "ONE" }, { arm: true, detect: false, execute: false }],
+    [{ ev: "schedule", pre: "failure" }, { arm: false, detect: false, execute: false }]];
+  for (const [o, want] of cases) assert.deepEqual(run(o), want, JSON.stringify(o));
+});
+
+test("W10 C119 S2 schedule routing (REAL expressions): schedule → mode / flow 'detect', source = the arm job's RECOMPUTED confirmation frame, closure = the pinned literal; manual inputs unchanged; the ONLY variable is vars.E7_TEST_AUTO_ARMED (arm job + every runner step in the environment jobs); E7_TEST_ARM is an admitted runner key (the runners check the SUPPLIED value; GitHub's refresh timing for queued jobs is not asserted)", () => {
+  assert.deepEqual(stepEnv("E7_MODE"), ["${{ github.event_name == 'schedule' && 'detect' || inputs.mode }}"]);
+  assert.deepEqual(stepEnv("E7_INPUT_MODE"), ["detect", "${{ (inputs.mode == 'detect' || github.event_name == 'schedule') && 'detect' || 'manual' }}"]);
+  assert.deepEqual(stepEnv("E7_EXPECTED_SOURCE_DIGEST", jobs.preflight), ["${{ inputs.expected_source_digest }}"], "the manual preflight digest check is unchanged (a schedule passes none: printed only)");
+  const gated = jobs.detect + jobs.execute; const src = stepEnv("E7_EXPECTED_SOURCE_DIGEST", gated); const clo = stepEnv("E7_EXPECTED_CLOSURE_DIGEST", gated);
+  assert.deepEqual(src, ["${{ github.event_name == 'schedule' && needs.arm.outputs.confirmation || inputs.expected_source_digest }}"]);
+  assert.deepEqual(clo, [`\${{ github.event_name == 'schedule' && '${R.CONSTANTS.closureDigest}' || inputs.expected_closure_digest }}`]);
+  assert.deepEqual(stepEnv("E7_TEST_ARM"), ["${{ vars.E7_TEST_AUTO_ARMED }}"]);
+  const nc = yml.replace(/^#.*$/gm, ""); assert.equal((nc.match(/vars\./g) || []).length, 5, "arm job + detect verify / detect + execute verify / execute");
+  assert.doesNotMatch(nc, /vars\.(?!E7_TEST_AUTO_ARMED\b)|secrets\.E7_TEST/);
+  assert.ok(R.ALLOWED_E7_KEYS.includes("E7_TEST_ARM"));
+  const frame = "c".repeat(64); const man = "d".repeat(64);
+  const sched = { github: { event_name: "schedule" }, inputs: {}, needs: { arm: { outputs: { confirmation: frame } } } };
+  const manual = (mode) => ({ github: { event_name: "workflow_dispatch" }, inputs: { mode, expected_source_digest: man, expected_closure_digest: "e".repeat(64) }, needs: { arm: { outputs: { confirmation: frame } } } });
+  assert.equal(evalExpr(stepEnv("E7_MODE")[0], sched), "detect"); assert.equal(evalExpr(stepEnv("E7_INPUT_MODE")[1], sched), "detect");
+  assert.equal(evalExpr(src[0], sched), frame); assert.equal(evalExpr(clo[0], sched), R.CONSTANTS.closureDigest);
+  assert.equal(evalExpr(src[0], { ...sched, needs: { arm: { outputs: { confirmation: "" } } } }), undefined, "not armed → no frame (and the environment jobs are skipped anyway)");
+  for (const m of ["detect", "execute"]) { assert.equal(evalExpr(src[0], manual(m)), man); assert.equal(evalExpr(clo[0], manual(m)), "e".repeat(64)); }
+  assert.equal(evalExpr(stepEnv("E7_INPUT_MODE")[1], manual("execute")), "manual"); assert.equal(evalExpr(stepEnv("E7_INPUT_MODE")[1], manual("detect")), "detect");
+  for (const job of [jobs.detect, jobs.execute]) for (const step of job.split("\n      - name: ").slice(1)) if (/e7-hosted-booking-confirmation\.mjs (verify|detect|execute)\n/.test(step))
+    assert.match(step, /\n          E7_TEST_ARM: \$\{\{ vars\.E7_TEST_AUTO_ARMED \}\}\n/, "every runner step re-checks the arm value it is SUPPLIED (the vars refresh timing for queued jobs is UNVERIFIED, not relied on)");
 });

@@ -18,7 +18,7 @@
 # C115 SCHEDULED DETECT (drafted CLOSED; activation is a separate ROOT decision): `schedule` cron '13,43 * * * *' = a NOMINAL 30-minute polling
 # cadence, NOT a bounded worst-case delay (GitHub may delay or drop scheduled runs; they run only on the default branch). A scheduled run is ALWAYS
 # the detect flow with EMPTY binding inputs (it cannot route to the manual execute path) and the SAME two approvals / concurrency group.
-# Its expected source digest comes ONLY from the repository variable vars.E7_KICKOFF_EXPECTED_SOURCE (an exact reviewed 64-hex pin set by ROOT
+# C115 (superseded by C119 S2): its expected source digest came from the repository variable vars.E7_KICKOFF_EXPECTED_SOURCE; now it is the arm job's recomputed kickoff frame
 # per ENABLE window); missing → the literal 'MISSING' → verify refuses (HKO_INPUT_INCOMPLETE / HKO_SOURCE_MISMATCH) BEFORE any approval,
 # secret, SQL or HTTP — never a fallback to the computed digest. Manual workflow_dispatch and its expected_source_digest input are unchanged.
 # On a CLOSED main a scheduled run is CLOSED_NOOP: detect + execute SKIPPED, 0 approvals, 0 DB secret, 0 SQL, 0 HTTP.
@@ -26,6 +26,14 @@
 # GET main == releaseSha after the claim (with its documented notSent / TOCTOU limits). No mid-write cancellation, no reliance on run ordering;
 # the durable single-winner claim stays the authority. Public-repo standard runners are currently free; ~96 job-minutes/day is a
 # private-repo billing scenario only.
+# C119 S2 TEST ARM (DRAFT, SHIPPED CLOSED; NO variable / environment / secret / setting is created or changed here): EVERY non-preflight route (schedule,
+# manual verify / detect / execute — no manual bypass) first runs the `arm` job (no environment, no secret, no database): scripts/e7-test-arm.mjs recomputes
+# the release digest from THIS checkout and compares it with vars.E7_TEST_AUTO_ARMED. Not armed (absent / malformed / stale / mismatched / not main) →
+# armed=false → detect + execute are SKIPPED (0 approvals, 0 secrets, 0 SQL, 0 HTTP); verify (no environment) re-checks it with the runner's labelled copy
+# (detect flow → CLOSED_NOOP). The scheduled source pin is the arm job's RECOMPUTED kickoff frame (replaces vars.E7_KICKOFF_EXPECTED_SOURCE). The arm
+# does NOT gate e7-hosted-pipeline.yml (untouched): a directly dispatched or already queued pipeline run is not refused by it. Cadence is TEST-only.
+# WHEN GitHub refreshes the vars context for an already queued / approval-held job is UNVERIFIED: clearing the variable must NOT be relied on to revoke
+# queued, pending-approval or running work (a pre-activation blocker).
 # Source digest = SHA-256 over: prefix "e7-hosted-kickoff-v1\n", then for each file IN THIS ORDER
 #   1. scripts/e7-hosted-kickoff.mjs  2. test/e7-hosted-kickoff.test.mjs  3. test/e7-hosted-kickoff-workflow.test.mjs  4. .github/workflows/e7-hosted-kickoff.yml
 # the frame  <relative path> NUL <decimal byte length> NUL <file bytes> NUL  (the framedDigest convention of the reviewed runners).
@@ -128,8 +136,36 @@ jobs:
           E7_WORKFLOW_SHA: ${{ github.sha }}
         run: node wrapper/scripts/e7-hosted-kickoff.mjs preflight
 
-  verify:
+  arm:
     needs: preflight
+    if: github.event_name == 'schedule' || inputs.mode == 'verify' || inputs.mode == 'execute' || inputs.mode == 'detect'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      armed: ${{ steps.arm.outputs.armed }}
+      kickoff: ${{ steps.arm.outputs.kickoff }}
+    steps:
+      - name: Checkout wrapper (this repository, exact dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          path: wrapper
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: TEST arm gate (release digest recomputed from this checkout; no environment, no secret, no database; not armed → CLOSED_NOOP)
+        id: arm
+        env:
+          E7_TEST_ARM: ${{ vars.E7_TEST_AUTO_ARMED }}
+        run: node wrapper/scripts/e7-test-arm.mjs check
+
+  verify:
+    needs: [preflight, arm]
     if: inputs.mode == 'verify' || inputs.mode == 'execute' || inputs.mode == 'detect' || github.event_name == 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -159,6 +195,7 @@ jobs:
       - name: Verify (runner; SHIPPED CLOSED → HKO_EXECUTE_CLOSED here, or CLOSED_NOOP for detect; no secret, no database, no environment)
         id: verify
         env:
+          E7_TEST_ARM: ${{ vars.E7_TEST_AUTO_ARMED }}
           E7_INPUT_MODE: ${{ github.event_name == 'schedule' && 'detect' || inputs.mode }}
           E7_TOOLING_DIR: ${{ github.workspace }}/tooling
           E7_INTENT_ID: ${{ inputs.intent_id }}
@@ -166,14 +203,14 @@ jobs:
           E7_EXPECTED_VERSION: ${{ inputs.expected_version }}
           E7_PAYMENT_INTENT_ID: ${{ inputs.payment_intent_id }}
           E7_AMOUNT_MINOR: ${{ inputs.amount_minor }}
-          E7_EXPECTED_SOURCE_DIGEST: ${{ github.event_name == 'schedule' && (vars.E7_KICKOFF_EXPECTED_SOURCE || 'MISSING') || inputs.expected_source_digest }}
+          E7_EXPECTED_SOURCE_DIGEST: ${{ github.event_name == 'schedule' && (needs.arm.outputs.kickoff || 'MISSING') || inputs.expected_source_digest }}
           E7_WORKFLOW_SHA: ${{ github.sha }}
           E7_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
         run: node wrapper/scripts/e7-hosted-kickoff.mjs verify
 
   detect:
-    needs: [preflight, verify]
-    if: (inputs.mode == 'detect' || github.event_name == 'schedule') && needs.verify.outputs.open == 'true' && github.ref == 'refs/heads/main'
+    needs: [preflight, arm, verify]
+    if: (inputs.mode == 'detect' || github.event_name == 'schedule') && needs.arm.outputs.armed == 'true' && needs.verify.outputs.open == 'true' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     environment: e7-readonly-probe
     timeout-minutes: 10
@@ -205,7 +242,7 @@ jobs:
         env:
           E7_WORKFLOW_SHA: ${{ github.sha }}
           E7_TOOLING_PIN: 66133a22edca925e6386c4d178c251fa5f11c82e
-          E7_EXPECTED_SOURCE_DIGEST: ${{ github.event_name == 'schedule' && (vars.E7_KICKOFF_EXPECTED_SOURCE || 'MISSING') || inputs.expected_source_digest }}
+          E7_EXPECTED_SOURCE_DIGEST: ${{ github.event_name == 'schedule' && (needs.arm.outputs.kickoff || 'MISSING') || inputs.expected_source_digest }}
           E7_PIPELINE_SOURCE_PIN: 880db5b33024edbf0879fbaf5a3826e3622db12fd1808e8c2047238da507fe1b
         run: |
           set -eu
@@ -227,9 +264,10 @@ jobs:
       - name: ONE gated read-only detection (the DB secret only, this step only; one rolled-back snapshot; no token, no dispatch)
         id: detect
         env:
+          E7_TEST_ARM: ${{ vars.E7_TEST_AUTO_ARMED }}
           E7_TOOLING_DIR: ${{ github.workspace }}/tooling
           E7_INPUT_MODE: ${{ github.event_name == 'schedule' && 'detect' || inputs.mode }}
-          E7_EXPECTED_SOURCE_DIGEST: ${{ github.event_name == 'schedule' && (vars.E7_KICKOFF_EXPECTED_SOURCE || 'MISSING') || inputs.expected_source_digest }}
+          E7_EXPECTED_SOURCE_DIGEST: ${{ github.event_name == 'schedule' && (needs.arm.outputs.kickoff || 'MISSING') || inputs.expected_source_digest }}
           E7_WORKFLOW_SHA: ${{ github.sha }}
           E7_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
           E7_CA_FILE: ${{ runner.temp }}/prod-ca-2021.crt
@@ -237,8 +275,8 @@ jobs:
         run: node wrapper/scripts/e7-hosted-kickoff.mjs detect
 
   execute:
-    needs: [preflight, verify, detect]
-    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.preflight.result == 'success' && needs.verify.result == 'success' && ((github.event_name == 'workflow_dispatch' && inputs.mode == 'execute' && needs.detect.result == 'skipped') || ((inputs.mode == 'detect' || github.event_name == 'schedule') && needs.detect.result == 'success' && needs.detect.outputs.outcome == 'ONE')) }}
+    needs: [preflight, arm, verify, detect]
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.preflight.result == 'success' && needs.arm.result == 'success' && needs.arm.outputs.armed == 'true' && needs.verify.result == 'success' && ((github.event_name == 'workflow_dispatch' && inputs.mode == 'execute' && needs.detect.result == 'skipped') || ((inputs.mode == 'detect' || github.event_name == 'schedule') && needs.detect.result == 'success' && needs.detect.outputs.outcome == 'ONE')) }}
     runs-on: ubuntu-24.04
     environment: e7-readonly-probe
     timeout-minutes: 10
@@ -268,7 +306,7 @@ jobs:
         env:
           E7_WORKFLOW_SHA: ${{ github.sha }}
           E7_TOOLING_PIN: 66133a22edca925e6386c4d178c251fa5f11c82e
-          E7_EXPECTED_SOURCE_DIGEST: ${{ github.event_name == 'schedule' && (vars.E7_KICKOFF_EXPECTED_SOURCE || 'MISSING') || inputs.expected_source_digest }}
+          E7_EXPECTED_SOURCE_DIGEST: ${{ github.event_name == 'schedule' && (needs.arm.outputs.kickoff || 'MISSING') || inputs.expected_source_digest }}
           E7_PIPELINE_SOURCE_PIN: 880db5b33024edbf0879fbaf5a3826e3622db12fd1808e8c2047238da507fe1b
         run: |
           set -eu
@@ -289,13 +327,14 @@ jobs:
         run: curl --fail --silent --show-error --proto '=https' --max-time 20 -o "$RUNNER_TEMP/prod-ca-2021.crt" https://supabase-downloads.s3-ap-southeast-1.amazonaws.com/prod/ssl/prod-ca-2021.crt
       - name: ONE gated kickoff handoff (the only secrets + the job-scoped token, this step only; <= 1 GET + 1 POST; no retry)
         env:
+          E7_TEST_ARM: ${{ vars.E7_TEST_AUTO_ARMED }}
           E7_TOOLING_DIR: ${{ github.workspace }}/tooling
           E7_INTENT_ID: ${{ inputs.intent_id }}
           E7_BOOKING_REF: ${{ inputs.booking_ref }}
           E7_EXPECTED_VERSION: ${{ inputs.expected_version }}
           E7_PAYMENT_INTENT_ID: ${{ inputs.payment_intent_id }}
           E7_AMOUNT_MINOR: ${{ inputs.amount_minor }}
-          E7_EXPECTED_SOURCE_DIGEST: ${{ github.event_name == 'schedule' && (vars.E7_KICKOFF_EXPECTED_SOURCE || 'MISSING') || inputs.expected_source_digest }}
+          E7_EXPECTED_SOURCE_DIGEST: ${{ github.event_name == 'schedule' && (needs.arm.outputs.kickoff || 'MISSING') || inputs.expected_source_digest }}
           E7_WORKFLOW_SHA: ${{ github.sha }}
           E7_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
           E7_CA_FILE: ${{ runner.temp }}/prod-ca-2021.crt

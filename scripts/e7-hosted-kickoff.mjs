@@ -37,6 +37,15 @@
 // exactly-once (single-winner claim + revalidation), not global cardinality. Live-main movement is detected only by the transport's GET.
 //
 // The ONLY top-level effect is the guarded main() at the bottom. No schedule / cron / webhook / route triggers this file (dispatch only).
+// C119 S2 (DRAFT, SHIPPED CLOSED): the TEST ARM gate. verify / detect / execute (manual OR scheduled — no manual bypass) additionally require the
+//   repository variable E7_TEST_AUTO_ARMED (passed as E7_TEST_ARM) to EQUAL the release digest RECOMPUTED here from this checkout (labelled copy of
+//   scripts/e7-test-arm.mjs; the caller-supplied value is never the authority). Detect-flow verify not armed → CLOSED_NOOP (open=false: the gated
+//   jobs are skipped); any other mode not armed → HKO_ARM_CLOSED — before any tooling import, secret value, DB, token or HTTP. The scheduled source
+//   pin now comes from the arm job's recomputed kickoff frame (vars.E7_KICKOFF_EXPECTED_SOURCE is retired). Manual preflight is unchanged.
+//   The arm does NOT gate the pipeline runner (its bytes are untouched): a directly dispatched / already queued pipeline run is not refused by it.
+//   PROVEN: refusal whenever the value it RECEIVES (from the GitHub vars context) differs; UNVERIFIED: when GitHub refreshes that context for an already
+//   queued / approval-held job (no live configuration fetch here). Clearing the variable must NOT be relied on to revoke queued / pending-approval /
+//   already-running work (a pre-activation blocker).
 import process from "node:process";
 import { readFile, realpath, lstat } from "node:fs/promises";
 import { appendFileSync } from "node:fs";
@@ -96,13 +105,13 @@ export const TEST_FILES = freeze(["test/e7-hosted-kickoff.test.mjs", "test/e7-ho
 export const SECRET_KEYS = freeze(["E7_DEV_BOOKING_DATABASE_URL", "E7_DISPATCH_TOKEN"]);
 export const INPUT_ENV = freeze({ intentId: "E7_INTENT_ID", ref: "E7_BOOKING_REF", expectedVersion: "E7_EXPECTED_VERSION", paymentIntentId: "E7_PAYMENT_INTENT_ID", amountMinor: "E7_AMOUNT_MINOR" });
 export const ALLOWED_E7_KEYS = freeze([...Object.values(INPUT_ENV), "E7_TOOLING_DIR", "E7_EXPECTED_SOURCE_DIGEST", "E7_WORKFLOW_SHA", "E7_RUN_ID", "E7_CA_FILE", ...SECRET_KEYS,
-  "E7_INPUT_MODE", "E7_EXPECTED_CANDIDATE_FINGERPRINT"]);                                    // C113: the workflow mode + the detect job's declared output
+  "E7_INPUT_MODE", "E7_EXPECTED_CANDIDATE_FINGERPRINT", "E7_TEST_ARM"]);                     // C113: the workflow mode + the detect job's declared output; C119 S2: the arm
 /** C113: the workflow input `mode` values the runner admits in E7_INPUT_MODE (public, never a binding) */
 export const INPUT_MODES = freeze(["preflight", "verify", "execute", "detect"]);
 export const HOSTED_CODES = freeze(["HKO_USAGE", "HKO_INPUT_UNEXPECTED", "HKO_EXECUTE_CLOSED", "HKO_SECRET_SCOPE_VIOLATION", "HKO_INPUT_INCOMPLETE", "HKO_INPUT_INVALID",
   "HKO_INTENT_EXCLUDED", "HKO_REF_NOT_MAIN", "HKO_BINDING_MISMATCH", "HKO_CLOSURE_MISMATCH", "HKO_LAYOUT_INVALID", "HKO_SOURCE_UNREADABLE", "HKO_SOURCE_MISMATCH",
   "HKO_PIPELINE_NOT_BOUND", "HKO_DEPENDENCY_MISMATCH", "HKO_IMPORT_FAILED", "HKO_ENV_REFUSED", "HKO_CHILD_FAILED", "HKO_TESTS_FAILED", "HKO_CREDENTIALS_MISSING", "HKO_CREDENTIAL_FORMAT_UNSUPPORTED",
-  "HKO_DB_TARGET_INVALID", "HKO_CA_INVALID", "HKO_TOOLING_PIN_MISMATCH"]);
+  "HKO_DB_TARGET_INVALID", "HKO_CA_INVALID", "HKO_TOOLING_PIN_MISMATCH", "HKO_ARM_CLOSED"]);
 /** C113: the ONLY detect job outputs (allowlisted enums) — an identifier is never an output */
 export const DETECT_OUTCOME_RE = /^(NO_REQUEST|ONE|AMBIGUOUS|INELIGIBLE:[A-Z0-9_:]{1,80}|STOP)$/;
 
@@ -177,6 +186,65 @@ export function spawnNode(args, { cwd, env }) {
     child.on("error", () => resolve({ status: null, signal: null, stdout: "", truncated, spawnFailed: true }));
     child.on("close", (status, signal) => resolve({ status, signal, stdout: out, truncated, spawnFailed: false }));
   });
+}
+
+// ---- C119 S2: LABELLED COPY of scripts/e7-test-arm.mjs (the release computation + arm decision; asserted byte-equal by test/e7-test-arm.test.mjs) ----
+const ARM_HEX64 = /^[0-9a-f]{64}$/;
+const ARM_PATH_RE = /^(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+$/;
+const ARM_PREFIX_RE = /^[a-z0-9-]{1,60}-v1\n$/;
+function armCanonical(v) {
+  if (v === null || typeof v !== "object") return JSON.stringify(v);
+  if (Array.isArray(v)) return `[${v.map(armCanonical).join(",")}]`;
+  return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${armCanonical(v[k])}`).join(",")}}`;
+}
+const armSha = (b) => createHash("sha256").update(b).digest("hex");
+async function armFrame(dir, files, prefix) {
+  const h = createHash("sha256"); h.update(prefix); let total = 0;
+  for (const rel of files) {
+    const st = await lstat(`${dir}/${rel}`);
+    if (!st.isFile() || st.size < 1 || st.size > 1048576) throw new Error("ARM_FILE");
+    const b = await readFile(`${dir}/${rel}`); if (b.length !== st.size) throw new Error("ARM_FILE");
+    total += b.length; if (total > 8388608) throw new Error("ARM_FILE");
+    h.update(rel); h.update(Buffer.from([0])); h.update(String(b.length)); h.update(Buffer.from([0])); h.update(b); h.update(Buffer.from([0]));
+  }
+  return h.digest("hex");
+}
+/** armRelease(dir) → { ok: true, release, manifest, frames } | { ok: false } — the manifest is parsed STRICTLY; never throws */
+export async function armRelease(dir) {
+  try {
+    const p = `${dir}/scripts/e7-test-arm/manifest.json`; const st = await lstat(p);
+    if (!st.isFile() || st.size < 2 || st.size > 65536) return { ok: false };
+    const bytes = await readFile(p); const m = JSON.parse(bytes.toString("utf8"));
+    if (!m || typeof m !== "object" || Array.isArray(m) || JSON.stringify(Object.keys(m)) !== JSON.stringify(["schema", "components"]) || m.schema !== "e7-test-arm-manifest-v1") return { ok: false };
+    const want = ["arm-gate", "kickoff", "booking-confirmation", "pipeline"];
+    if (!Array.isArray(m.components) || m.components.length !== want.length) return { ok: false };
+    const seen = new Set(); const comps = []; const frames = {};
+    for (let i = 0; i < want.length; i += 1) {
+      const x = m.components[i];
+      if (!x || typeof x !== "object" || Array.isArray(x) || JSON.stringify(Object.keys(x)) !== JSON.stringify(["name", "prefix", "files"]) || x.name !== want[i]) return { ok: false };
+      if (typeof x.prefix !== "string" || !ARM_PREFIX_RE.test(x.prefix) || !Array.isArray(x.files) || x.files.length < 1 || x.files.length > 8) return { ok: false };
+      for (const f of x.files) {
+        if (typeof f !== "string" || !ARM_PATH_RE.test(f) || f.split("/").some((s) => s === "." || s === "..") || seen.has(f)
+            || ["scripts/e7-test-arm/manifest.json", "test/e7-cross-runner-regression.test.mjs", ".github/workflows/e7-cross-runner-regression.yml"].includes(f)) return { ok: false };
+        seen.add(f);
+      }
+      const frame = await armFrame(dir, x.files, x.prefix);
+      comps.push({ name: x.name, frame }); frames[x.name] = frame;
+    }
+    const manifest = armSha(bytes);
+    return { ok: true, release: armSha(armCanonical({ schema: "e7-test-arm-release-v1", manifest, components: comps })), manifest, frames };
+  } catch { return { ok: false }; }
+}
+/** armDecision({ dir, value, ref }) → frozen { armed, code, release, frames } — absent / malformed / ref / unreadable / mismatch → NOT armed */
+export async function armDecision({ dir, value, ref }) {
+  const no = (code, rel = null) => Object.freeze({ armed: false, code, release: rel, frames: null });
+  if (value === undefined || value === null || value === "") return no("ARM_ABSENT");
+  if (typeof value !== "string" || !ARM_HEX64.test(value)) return no("ARM_MALFORMED");
+  if (ref !== "refs/heads/main") return no("ARM_REF_NOT_MAIN");
+  const r = await armRelease(dir);
+  if (!r.ok) return no("ARM_RELEASE_UNREADABLE");
+  if (r.release !== value) return no("ARM_MISMATCH", r.release);
+  return Object.freeze({ armed: true, code: "ARMED", release: r.release, frames: Object.freeze({ ...r.frames }) });
 }
 
 // ---- admission SQL (read-only; every statement is one supervised, counted query) ---------------------------------------------------------
@@ -540,7 +608,7 @@ export async function runHosted({ mode = "preflight", env, proc, wrapperDir, dep
   const c = deps.constants ?? CONSTANTS;
   const r = { schema: "e7-hosted-kickoff-hosted-v1", mode: null, code: null, workflowSha: null, toolingCommit: c.toolingCommit, executeEnabled: c.executeEnabled,
     dispatchEnabled: c.dispatchEnabled, closureDigest: null, sourceDigest: null, pipeline: null, envCode: null, tests: null, runId: null, core: null, cleanup: null,
-    flow: null, outputs: null };
+    flow: null, outputs: null, arm: null };
   let pool = null;
   try {
     if (!["preflight", "verify", "execute", "detect"].includes(mode)) refuse("HKO_USAGE");
@@ -566,6 +634,18 @@ export async function runHosted({ mode = "preflight", env, proc, wrapperDir, dep
     if (mode !== "execute" && mode !== "detect" && SECRET_KEYS.some(hasKey)) refuse("HKO_SECRET_SCOPE_VIOLATION");
     if (mode === "detect" && hasKey("E7_DISPATCH_TOKEN")) refuse("HKO_SECRET_SCOPE_VIOLATION");   // detect never holds the dispatch token
     if (hasKey("E7_EXPECTED_CANDIDATE_FINGERPRINT") && mode !== "execute") refuse("HKO_INPUT_UNEXPECTED");
+    // C119 S2: the TEST arm, recomputed from THIS checkout — before any input value / tooling import / secret value / DB / token / HTTP
+    let armedFrame = null;
+    if (mode !== "preflight") {
+      const armDir = await realpath(wrapperDir).catch(() => refuse("HKO_LAYOUT_INVALID"));
+      const arm = await armDecision({ dir: armDir, value: hasKey("E7_TEST_ARM") ? env.E7_TEST_ARM : "", ref: env.GITHUB_REF });
+      r.arm = arm.code;
+      if (!arm.armed) {
+        if (mode === "verify" && detectFlow) { r.code = "CLOSED_NOOP"; r.outputs = freeze({ open: "false" }); return { exitCode: 0, result: r }; }
+        refuse("HKO_ARM_CLOSED");
+      }
+      armedFrame = arm.frames.kickoff;
+    }
     const spawnChild = deps.spawnChild ?? spawnNode;
     const importEnv = deps.importEnv ?? ((dir) => import(pathToFileURL(`${dir}/scripts/e7-connected/probe-env-preflight.mjs`).href));
     const importTooling = deps.importTooling ?? defaultImportTooling;
@@ -603,6 +683,7 @@ export async function runHosted({ mode = "preflight", env, proc, wrapperDir, dep
     // ---- own source + the PIPELINE release binding, from bytes only, BEFORE any secret ----
     r.sourceDigest = await framedDigest(wdir, RUNNER_FILES, SOURCE_PREFIX).catch((e) => refuse(e instanceof Refusal ? e.code : "HKO_SOURCE_UNREADABLE"));
     if (mode !== "preflight" && r.sourceDigest !== expSrc) refuse("HKO_SOURCE_MISMATCH");
+    if (mode !== "preflight" && r.sourceDigest !== armedFrame) refuse("HKO_ARM_CLOSED");            // the armed release frames THIS runner's exact bytes
     r.pipeline = await pipelineBinding(wdir, c).catch((e) => refuse(e instanceof Refusal ? e.code : "HKO_SOURCE_UNREADABLE"));
     if (mode !== "preflight") {
       if (r.pipeline.bound !== true) refuse("HKO_PIPELINE_NOT_BOUND");                                 // wrong / closed / stale pipeline → 0 credential, 0 POST

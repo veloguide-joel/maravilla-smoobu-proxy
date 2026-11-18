@@ -155,12 +155,13 @@ test("H4 plan: deterministic; binds intent / op / version / locale / the fixed a
 });
 
 const SOURCE = await R.framedDigest(ROOT, C.runnerFiles, R.SOURCE_DIGEST_PREFIX);
+const ARM = (await R.armRelease(ROOT)).release;   // C119 S2: the recomputed release of THIS checkout (the arm value a test-local seam passes)
 const inputs = { E7_APPROVAL_REF: "label-c50", E7_INTENT_ID: IID, E7_OP_ID: OID, E7_EXPECTED_VERSION: String(VER), E7_LOCALE: "es" };
 const planOf = (c = C, o = {}) => R.buildPlan(c, { approvalRef: "label-c50", intentId: IID, opId: OID, expectedVersion: VER, locale: "es", sourceDigest: SOURCE, ...o }).planHash;
 const okChild = async () => ({ status: 0, signal: null, stdout: "# tests 4\n# pass 4\n# fail 0\n# skipped 0\n", truncated: false, spawnFailed: false });
 const DBURL = "postgresql://mv_booking_app_dev.mxotevtiscernhqilyiu:FAKEPW@aws-0-us-east-1.pooler.supabase.com:6543/postgres";
 const gated = (c, over = {}) => ({ E7_TOOLING_DIR: TOOLING, ...inputs, E7_EXPECTED_PLAN_HASH: planOf(c), E7_EXPECTED_SOURCE_DIGEST: SOURCE, E7_EXPECTED_CLOSURE_DIGEST: c.closureDigest,
-  E7_WORKFLOW_SHA: "1".repeat(40), E7_RUN_ID: "123456789-1", GITHUB_REF: "refs/heads/main", PATH: process.env.PATH, ...over });
+  E7_WORKFLOW_SHA: "1".repeat(40), E7_RUN_ID: "123456789-1", GITHUB_REF: "refs/heads/main", PATH: process.env.PATH, E7_TEST_ARM: ARM, ...over });
 
 test("H5 preflight (no environment / secret / DB): spawns ONLY the two focused test files; synthetic or REAL plan; refuses any unexpected E7_* (recipient / sender / subject / body / foreign key), a secret NAME, bad / missing locale, and BOTH historical intents by id", async () => {
   let spawned = null;
@@ -492,7 +493,7 @@ test("H11 C119 detect-flow core (fake): re-selects server-side and requires the 
 
 test("H12 C119 hosted detect / detect-flow gates (seam): detect needs ONLY the DB secret (a Resend key → NBC_SECRET_SCOPE_VIOLATION), no binding input / plan hash / fingerprint, both digests; it never imports an exchange; STOP exits 1; outputs = outcome + fingerprint only; verify / execute of a detect flow refuse bindings, require the fingerprint (execute) and hand the core NO plan; a manual flow refuses a fingerprint", async () => {
   const dg = (over = {}) => ({ E7_TOOLING_DIR: TOOLING, E7_EXPECTED_SOURCE_DIGEST: SOURCE, E7_EXPECTED_CLOSURE_DIGEST: OPEN.closureDigest, E7_WORKFLOW_SHA: "1".repeat(40), E7_RUN_ID: "123456789-1",
-    GITHUB_REF: "refs/heads/main", PATH: process.env.PATH, ...over });
+    GITHUB_REF: "refs/heads/main", PATH: process.env.PATH, E7_TEST_ARM: ARM, ...over });
   const mk = (detectRes) => { const st = { detect: null, exchanges: 0, pools: 0, maxes: [] }; const deps = { ...fakeDeps().deps, constants: OPEN,
     importTooling: async () => ({ createBookingPool: (cfg) => { st.pools += 1; st.maxes.push(cfg.max); return { end: async () => {} }; }, createResendExchange: () => { st.exchanges += 1; return { ok: true, exchange: async () => {} }; }, tooling: {} }),
     runDetect: async (a) => { st.detect = { sourceDigest: a.sourceDigest, hasPool: !!a.pool }; return Object.freeze(detectRes); }, runCore: async (a) => { st.core = { plan: a.plan, detected: a.detected }; return Object.freeze({ code: "PROVIDER_ACCEPTED", verifiedCompletion: true }); } };

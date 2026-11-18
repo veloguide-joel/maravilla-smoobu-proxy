@@ -58,6 +58,14 @@
 //     RESIDUAL WINDOW (not closed here): a change committed AFTER (c) is governed only by the accepted worker's own fences — its claim binds the hashes
 //     of ITS snapshot (claim_guest_notification_v2) and its pre-send observation refuses FACTS_CHANGED / RECIPIENT_CHANGED; the final synchronous
 //     section between that pre-send observation and the provider call is the worker's documented minimal window.
+// C119 S2 (DRAFT, SHIPPED CLOSED): the TEST ARM gate. verify / detect / execute (manual OR scheduled — no manual bypass) additionally require the
+//   repository variable E7_TEST_AUTO_ARMED (passed as E7_TEST_ARM) to EQUAL the release digest RECOMPUTED here from this checkout (labelled copy of
+//   scripts/e7-test-arm.mjs; manifest scripts/e7-test-arm/manifest.json; the caller-supplied value is never the authority). Not armed → NBC_ARM_CLOSED
+//   before any tooling import, secret value, DB or provider (the workflow's own `arm` job already skips every environment job: CLOSED_NOOP).
+//   Manual preflight is unchanged (no arm). A DRAFT `schedule` (TEST-only cadence, not a launch SLA) always takes the detect flow.
+//   PROVEN: the runner refuses whenever the value it RECEIVES (E7_TEST_ARM, supplied by the workflow from the GitHub vars context) is not the recomputed
+//   release. UNVERIFIED: WHEN GitHub refreshes that context for an already queued / approval-held job; the runner fetches NO live repository
+//   configuration. Clearing the variable must NOT be relied on to revoke queued / pending-approval / already-running work (a pre-activation blocker).
 import process from "node:process";
 import { readFile, realpath, lstat } from "node:fs/promises";
 import { appendFileSync } from "node:fs";
@@ -129,10 +137,69 @@ export const ADMISSION_CODES = freeze(["NOT_READ_ONLY", "ROLE_REFUSED", "CATALOG
 export const HOSTED_CODES = freeze(["NBC_USAGE", "NBC_INPUT_UNEXPECTED", "NBC_EXECUTE_CLOSED", "NBC_SECRET_SCOPE_VIOLATION", "NBC_INPUT_INVALID", "NBC_INPUT_INCOMPLETE",
   "NBC_INTENT_EXCLUDED", "NBC_REF_NOT_MAIN", "NBC_LAYOUT_INVALID", "NBC_SOURCE_UNREADABLE", "NBC_SOURCE_MISMATCH", "NBC_CLOSURE_MISMATCH", "NBC_PLAN_HASH_MISMATCH",
   "NBC_IMPORT_FAILED", "NBC_ENV_REFUSED", "NBC_CHILD_FAILED", "NBC_TESTS_FAILED", "NBC_CREDENTIALS_MISSING", "NBC_DEPENDENCY_MISMATCH", "NBC_DB_TARGET_INVALID",
-  "NBC_CA_INVALID", "NBC_INTERNAL"]);
+  "NBC_CA_INVALID", "NBC_INTERNAL", "NBC_ARM_CLOSED"]);
 export const DETECT_OUTCOMES = freeze(["NONE", "ONE", "STOP"]);
 export const DETECT_CODES = freeze(["DETECT_NONE", "DETECT_ONE", "DETECT_ATTENTION", "DETECT_MORE_THAN_ONE", "DETECT_BUDGET", "DETECT_REPLY_SHAPE", "DETECT_SESSION_REFUSED",
   "DETECT_FACTS_REFUSED", "DETECT_FACTS_UNREADABLE", "DETECT_NOT_ADMISSIBLE", "DETECT_DB_FAILED", "DETECT_DB_TIMEOUT"]);
+
+// ---- C119 S2: LABELLED COPY of scripts/e7-test-arm.mjs (the release computation + arm decision; asserted byte-equal by test/e7-test-arm.test.mjs) ----
+const ARM_HEX64 = /^[0-9a-f]{64}$/;
+const ARM_PATH_RE = /^(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+$/;
+const ARM_PREFIX_RE = /^[a-z0-9-]{1,60}-v1\n$/;
+function armCanonical(v) {
+  if (v === null || typeof v !== "object") return JSON.stringify(v);
+  if (Array.isArray(v)) return `[${v.map(armCanonical).join(",")}]`;
+  return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${armCanonical(v[k])}`).join(",")}}`;
+}
+const armSha = (b) => createHash("sha256").update(b).digest("hex");
+async function armFrame(dir, files, prefix) {
+  const h = createHash("sha256"); h.update(prefix); let total = 0;
+  for (const rel of files) {
+    const st = await lstat(`${dir}/${rel}`);
+    if (!st.isFile() || st.size < 1 || st.size > 1048576) throw new Error("ARM_FILE");
+    const b = await readFile(`${dir}/${rel}`); if (b.length !== st.size) throw new Error("ARM_FILE");
+    total += b.length; if (total > 8388608) throw new Error("ARM_FILE");
+    h.update(rel); h.update(Buffer.from([0])); h.update(String(b.length)); h.update(Buffer.from([0])); h.update(b); h.update(Buffer.from([0]));
+  }
+  return h.digest("hex");
+}
+/** armRelease(dir) → { ok: true, release, manifest, frames } | { ok: false } — the manifest is parsed STRICTLY; never throws */
+export async function armRelease(dir) {
+  try {
+    const p = `${dir}/scripts/e7-test-arm/manifest.json`; const st = await lstat(p);
+    if (!st.isFile() || st.size < 2 || st.size > 65536) return { ok: false };
+    const bytes = await readFile(p); const m = JSON.parse(bytes.toString("utf8"));
+    if (!m || typeof m !== "object" || Array.isArray(m) || JSON.stringify(Object.keys(m)) !== JSON.stringify(["schema", "components"]) || m.schema !== "e7-test-arm-manifest-v1") return { ok: false };
+    const want = ["arm-gate", "kickoff", "booking-confirmation", "pipeline"];
+    if (!Array.isArray(m.components) || m.components.length !== want.length) return { ok: false };
+    const seen = new Set(); const comps = []; const frames = {};
+    for (let i = 0; i < want.length; i += 1) {
+      const x = m.components[i];
+      if (!x || typeof x !== "object" || Array.isArray(x) || JSON.stringify(Object.keys(x)) !== JSON.stringify(["name", "prefix", "files"]) || x.name !== want[i]) return { ok: false };
+      if (typeof x.prefix !== "string" || !ARM_PREFIX_RE.test(x.prefix) || !Array.isArray(x.files) || x.files.length < 1 || x.files.length > 8) return { ok: false };
+      for (const f of x.files) {
+        if (typeof f !== "string" || !ARM_PATH_RE.test(f) || f.split("/").some((s) => s === "." || s === "..") || seen.has(f)
+            || ["scripts/e7-test-arm/manifest.json", "test/e7-cross-runner-regression.test.mjs", ".github/workflows/e7-cross-runner-regression.yml"].includes(f)) return { ok: false };
+        seen.add(f);
+      }
+      const frame = await armFrame(dir, x.files, x.prefix);
+      comps.push({ name: x.name, frame }); frames[x.name] = frame;
+    }
+    const manifest = armSha(bytes);
+    return { ok: true, release: armSha(armCanonical({ schema: "e7-test-arm-release-v1", manifest, components: comps })), manifest, frames };
+  } catch { return { ok: false }; }
+}
+/** armDecision({ dir, value, ref }) → frozen { armed, code, release, frames } — absent / malformed / ref / unreadable / mismatch → NOT armed */
+export async function armDecision({ dir, value, ref }) {
+  const no = (code, rel = null) => Object.freeze({ armed: false, code, release: rel, frames: null });
+  if (value === undefined || value === null || value === "") return no("ARM_ABSENT");
+  if (typeof value !== "string" || !ARM_HEX64.test(value)) return no("ARM_MALFORMED");
+  if (ref !== "refs/heads/main") return no("ARM_REF_NOT_MAIN");
+  const r = await armRelease(dir);
+  if (!r.ok) return no("ARM_RELEASE_UNREADABLE");
+  if (r.release !== value) return no("ARM_MISMATCH", r.release);
+  return Object.freeze({ armed: true, code: "ARMED", release: r.release, frames: Object.freeze({ ...r.frames }) });
+}
 
 // ---- LABELLED COPIES of scripts/e7-hosted-reservation.mjs pure helpers (asserted equal by the tests) -------------------------------------
 export function canonical(v) {
@@ -568,14 +635,14 @@ const TEST_FILES = freeze(["test/e7-hosted-booking-confirmation.test.mjs", "test
 const SECRET_KEYS = freeze(["E7_DEV_BOOKING_DATABASE_URL", "E7_RESEND_TEST_KEY"]);
 export const INPUT_ENV = freeze({ approvalRef: "E7_APPROVAL_REF", intentId: "E7_INTENT_ID", opId: "E7_OP_ID", expectedVersion: "E7_EXPECTED_VERSION", locale: "E7_LOCALE" });
 export const ALLOWED_E7_KEYS = freeze([...Object.values(INPUT_ENV), "E7_TOOLING_DIR", "E7_EXPECTED_PLAN_HASH", "E7_EXPECTED_SOURCE_DIGEST", "E7_EXPECTED_CLOSURE_DIGEST",
-  "E7_WORKFLOW_SHA", "E7_RUN_ID", "E7_CA_FILE", ...SECRET_KEYS, "E7_INPUT_MODE", "E7_EXPECTED_CANDIDATE_FINGERPRINT"]);   // C119 S1: the flow + the detect job's declared output
+  "E7_WORKFLOW_SHA", "E7_RUN_ID", "E7_CA_FILE", ...SECRET_KEYS, "E7_INPUT_MODE", "E7_EXPECTED_CANDIDATE_FINGERPRINT", "E7_TEST_ARM"]);   // C119 S1: the flow + the detect job's declared output
 const SECRETS_BY_MODE = freeze({ preflight: freeze([]), verify: freeze([]), detect: freeze(["E7_DEV_BOOKING_DATABASE_URL"]), execute: SECRET_KEYS });
 
 /** runHosted({ mode, env, proc, wrapperDir, deps }) → { exitCode, result }. Never throws. deps = TEST SEAMS (constants included). */
 export async function runHosted({ mode = "preflight", env, proc, wrapperDir, deps = {} }) {
   const c = deps.constants ?? CONSTANTS;
   const r = { schema: "e7-hosted-booking-confirmation-hosted-v1", mode: null, code: null, workflowSha: null, toolingCommit: c.toolingCommit, executeEnabled: c.executeEnabled,
-    closureDigest: null, sourceDigest: null, planKind: null, planHash: null, runId: null, envCode: null, tests: null, core: null, detect: null, outputs: null, cleanup: null };
+    closureDigest: null, sourceDigest: null, planKind: null, planHash: null, runId: null, envCode: null, tests: null, core: null, detect: null, outputs: null, arm: null, cleanup: null };
   let pool = null;
   try {
     if (!["preflight", "verify", "detect", "execute"].includes(mode)) refuse("NBC_USAGE");
@@ -607,6 +674,7 @@ export async function runHosted({ mode = "preflight", env, proc, wrapperDir, dep
     const expPlan = env.E7_EXPECTED_PLAN_HASH ?? ""; const expSrc = env.E7_EXPECTED_SOURCE_DIGEST ?? ""; const expClo = env.E7_EXPECTED_CLOSURE_DIGEST ?? "";
     const runId = env.E7_RUN_ID ?? "";
     if (detectFlow && (anyReal || expPlan !== "")) refuse("NBC_INPUT_UNEXPECTED");
+    let armedFrame = null;
     if (mode !== "preflight") {
       if (c.toolingStatus !== "MERGED" || !HEX64.test(String(c.closureDigest))) refuse("NBC_CLOSURE_MISMATCH");
       if (detectFlow) { if (!HEX64.test(expSrc) || !HEX64.test(expClo) || (mode === "execute" && !HEX64.test(expFp)) || (expFp !== "" && !HEX64.test(expFp))) refuse("NBC_INPUT_INCOMPLETE"); }
@@ -614,6 +682,11 @@ export async function runHosted({ mode = "preflight", env, proc, wrapperDir, dep
       if (!RUN_ID_RE.test(runId)) refuse("NBC_INPUT_INVALID");
       if (env.GITHUB_REF !== "refs/heads/main") refuse("NBC_REF_NOT_MAIN");
       if (expClo !== c.closureDigest) refuse("NBC_CLOSURE_MISMATCH");
+      // C119 S2: the TEST arm — recomputed from THIS checkout; before any tooling import / secret value / DB / provider
+      const armDir = await realpath(wrapperDir).catch(() => refuse("NBC_LAYOUT_INVALID"));
+      const arm = await armDecision({ dir: armDir, value: env.E7_TEST_ARM ?? "", ref: env.GITHUB_REF });
+      r.arm = arm.code; if (!arm.armed) refuse("NBC_ARM_CLOSED");
+      armedFrame = arm.frames["booking-confirmation"];
     }
     const tooling = await realpath(env.E7_TOOLING_DIR ?? "").catch(() => refuse("NBC_LAYOUT_INVALID"));
     const wdir = await realpath(wrapperDir).catch(() => refuse("NBC_LAYOUT_INVALID"));
@@ -622,6 +695,7 @@ export async function runHosted({ mode = "preflight", env, proc, wrapperDir, dep
     if (r.closureDigest !== c.closureDigest) refuse("NBC_CLOSURE_MISMATCH");           // the pinned bytes are verified BEFORE any tooling import
     r.sourceDigest = await framedDigest(wdir, c.runnerFiles, SOURCE_DIGEST_PREFIX).catch((e) => refuse(e instanceof Refusal ? e.code : "NBC_SOURCE_UNREADABLE"));
     if (mode !== "preflight" && r.sourceDigest !== expSrc) refuse("NBC_SOURCE_MISMATCH");
+    if (mode !== "preflight" && r.sourceDigest !== armedFrame) refuse("NBC_ARM_CLOSED");          // the armed release frames THIS runner's exact bytes
     let built = null;
     if (detectFlow) r.planKind = "DETECT";                                // the plan is derived server-side from the ONE detected candidate (core)
     else {
