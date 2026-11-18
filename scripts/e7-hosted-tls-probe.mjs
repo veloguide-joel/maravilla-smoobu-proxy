@@ -35,7 +35,7 @@ const KC = K.CONSTANTS;
 export const CONSTANTS = deepFreeze({
   probeEnabled: true,                                                // read-only probe; reviewer gate + main + exact source digest control it
   samples: 5,                                                        // EXACTLY five fresh connections; all five must prove both hops
-  toolingCommit: KC.toolingCommit, toolingStatus: KC.toolingStatus,  // C119 S4: 71750f58 DRAFT_HEAD (inherited from the kickoff → this probe refuses until the repin; C116 66133a22 MERGED)
+  toolingCommit: KC.toolingCommit, toolingStatus: KC.toolingStatus,  // C119 S4: bbf12aa2 MERGED (#194 merge; inherited from the kickoff; C116 66133a22 MERGED)
   closure: KC.closure, closureDigest: KC.closureDigest,              // C119 S4: 573dae82… (inherited; C116 e180398f…) (createBookingPool + the pinned pg lockfile are inside it)
   tls: KC.tls,                                                       // { host: aws-0-us-east-1.pooler.supabase.com, caSha256: OFFICIAL_CA_SHA256 }
   dbProjectRef: KC.dbProjectRef, environment: KC.environment, nodeVersion: KC.nodeVersion, pgVersion: KC.pgVersion,

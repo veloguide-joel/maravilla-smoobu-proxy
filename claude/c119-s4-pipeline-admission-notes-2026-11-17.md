@@ -69,29 +69,38 @@
 | ENABLE runner / workflow sha256 | `a5b9ebca…` / `3feeed15…` | `d4a593e9…f673` / `17208b78…5db4` |
 | C102 delta fixture sha256 (ops unchanged) | — | `6c5fbd10…6f0b` |
 | C103 known-answer plan hash at the ENABLE frame | `61ef5cef…` | `f4572091…6b59` (real ENABLE runner == tooling copy) |
-| tooling (kickoff / TLS probe pin) | `66133a22` (MERGED) | `71750f58…33` (**DRAFT_HEAD**, tree `3057af31`) |
+| tooling (kickoff / TLS probe pin) | `66133a22` (MERGED) | `bbf12aa22446807df7b63a55e38a464f4be88763` (**MERGED** e7-test #194; tree `3057af31` == reviewed head `71750f58`) |
 | kickoff closure | `e180398f…` | `573dae82…dc17` (only the plan + transport files differ) |
 | 0028 up / down sha256 | — | `a72d2ce9…3642` / `c247b178…806f` |
 | claim prosrc md5 (kickoff `CATALOG_PINS`) | `fb103173…` | `98ffe6c8…d284` (PG16 == PG17) |
 | notification / status catalog pin | 27 `bcc11631…` | 28 `96d74ab10cdf7bdd99e125eb6825284e9b57cacec33478fb1a666746e8f91b1b` (only the `fn` section differs; read path unchanged) |
 | arm manifest | `bae2c308…` | **unchanged** |
 | arm-gate frame | `f15d66a7…` | `b0ddf2b7…9b18` (test literal removed, pipeline in the labelled-copy check) |
-| kickoff frame | `3e8deca3…` | `ae77e133…7cac` |
+| kickoff frame | `3e8deca3…` | `dbb0d647…9d4e` |
 | booking-confirmation frame | `ccb52e91…` | `f969791b…a859` |
 | status frame (outside the release) | `06032c9b…` | `365018eb…54e0` |
-| TLS probe frame (outside the release) | — | `533d658b…caeb` |
-| **TEST arm release** | `12a8f416…` | `23a3ddf46bbd96863af934eca8f2443b84cb31a665d91513c912838b374ae323` (literal only in cross-runner X5) |
+| TLS probe frame (outside the release) | — | `7eec86f6…7f87` |
+| **TEST arm release** | `12a8f416…` | `7a407d45741b62b3757209a55e096cf47874a0b155613e88fb7053eb6874546b` (literal only in cross-runner X5) |
 
 **Hygiene**
 - The pipeline workflow test W7 keeps its structural checks. The **foreign** digest literals moved to cross-runner **X6**, with the checks unchanged, so foreign runner edits can no longer rewrite the SQL-bound pipeline frame.
 - The status workflow test no longer pins the release literal.
 
-## 6. Finalization before merge (mechanical, separately reviewed)
-1. ROOT merges the tooling PR into e7-test (merge commit, same tree `3057af31`).
-2. Repin the main PR: the kickoff `toolingCommit` becomes that merge commit with status `MERGED`. The TLS probe inherits it, and the workflow refs follow. The closure, `PINNED_REVISION` and 0028 bytes are unchanged; the kickoff / TLS frames, the release and X5 are recomputed.
-3. Merge the main PR with a merge commit.
+## 6. Finalization
+1. **Done:** ROOT merged the tooling PR #194 into e7-test as `bbf12aa2` (tree `3057af31` == reviewed head `71750f58`; acceptance comment 6967739270).
+2. **Done:** this PR was repinned mechanically:
+   - the kickoff `toolingCommit` is `bbf12aa2` with status `MERGED`;
+   - the TLS probe inherits it;
+   - the workflow / CI tooling refs follow.
 
-Until then the kickoff and the TLS probe refuse `*_CLOSURE_MISMATCH` (DRAFT_HEAD, fail-closed). Shared-TEST 0028 apply + readback is a later, separately authorized packet. Until it happens, kickoff / confirmation / status refuse on shared schema 27; this is fail-closed and intended.
+   Unchanged by the repin: the closure `573dae82`, `PINNED_REVISION`, the 0028 bytes, the pipeline source commit `8c8c2d58` and all four pipeline frame files, the delta and the manifest. Recomputed: the kickoff / TLS frames, the release and X5.
+3. **Pending:** ROOT's final review, then merge with a merge commit (keeps `8c8c2d58` reachable).
+
+**Later, separately authorized packets**
+- the shared-TEST 0028 apply + readback (until then, kickoff / confirmation / status refuse on shared schema 27; this is fail-closed and intended);
+- owner setup of `e7-test-auto`;
+- the activation runbook (including the old-run drain);
+- hosted acceptance.
 
 ## 7. Tests (disposable PG16 + PG17, fake providers)
 **Pipeline**

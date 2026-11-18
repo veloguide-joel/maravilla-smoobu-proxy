@@ -43,11 +43,11 @@ jobs:
           ref: 66133a22edca925e6386c4d178c251fa5f11c82e
           path: tooling
           persist-credentials: false
-      - name: Checkout the C119 S4 tooling 71750f58 (the 0027 + 0028 migration bytes only; sha-checked by the tests)
+      - name: Checkout the C119 S4 tooling bbf12aa2 (the 0027 + 0028 migration bytes only; sha-checked by the tests)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: 71750f58a2d6df8143098431edbd86a393897933
+          ref: bbf12aa22446807df7b63a55e38a464f4be88763
           path: schema28
           persist-credentials: false
       - name: Set up Node 22.22.0

@@ -95,8 +95,8 @@ test("X4 CI wiring: the regression runs on every pull request / push to main (an
 
 /** C119 S2: the LITERAL reviewed TEST-arm release of this tree (outside every component, so the release never embeds itself). It is NOT an
  *  arm and sets nothing: ROOT sets the repository variable out-of-band at a separately authorized activation, never from this file. */
-// C119 S4: 23a3ddf4… after the pipeline admission cascade (was 12a8f416… at S2 / main ec489f5a)
-const ARM_RELEASE = Object.freeze({ release: "23a3ddf46bbd96863af934eca8f2443b84cb31a665d91513c912838b374ae323", components: ["arm-gate", "kickoff", "booking-confirmation", "pipeline"] });
+// C119 S4: 7a407d45… after the pipeline admission cascade + the MERGED tooling repin (was 12a8f416… at S2 / main ec489f5a)
+const ARM_RELEASE = Object.freeze({ release: "7a407d45741b62b3757209a55e096cf47874a0b155613e88fb7053eb6874546b", components: ["arm-gate", "kickoff", "booking-confirmation", "pipeline"] });
 
 test("X5 C119 S2 the TEST-arm release recomputed from this checkout equals the LITERAL reviewed release; this file is outside every arm component; no component file carries the release", async () => {
   const A = await import("../scripts/e7-test-arm.mjs");
