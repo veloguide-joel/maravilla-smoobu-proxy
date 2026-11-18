@@ -32,7 +32,7 @@ const NOTIFICATION = Object.freeze({
   prefix: "e7-hosted-booking-confirmation-v1\n",
   runnerFiles: ["scripts/e7-hosted-booking-confirmation.mjs", "test/e7-hosted-booking-confirmation.test.mjs", "test/e7-hosted-booking-confirmation-workflow.test.mjs",
     ".github/workflows/e7-hosted-booking-confirmation.yml"],
-  frame: "9c6cf9f2a1dbd5f63371e952c82c6e2b6c43add6f0f308b5031f497f1363116b"   // C119 S1 rev 2: catalog 27 + read-only detect (facts-bound fingerprint) + detect-flow execute, tooling 66133a22 unchanged (was 0cd953a9… at C116: catalog 26; aff728cf before)
+  frame: "3394c8c756a640567d8b493ff53ae1a630bed824d809ccde5e9c28db5b627165"   // C119 S2: + the TEST arm re-check (labelled copy) + the arm job / draft schedule (was 9c6cf9f2… at S1 rev 2 / main 30d00191; 0cd953a9… at C116)
 });
 
 /** every runtime source frame on main: each runner's own runnerFiles, plus the fixed frames the workflow tests pin for the two probes */
@@ -91,4 +91,18 @@ test("X4 CI wiring: the regression runs on every pull request / push to main (an
   assert.ok(y.includes("actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803") && y.includes("actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38"));
   assert.ok(y.includes("persist-credentials: false") && y.includes('node-version: "22.22.0"'));
   assert.ok(y.includes(`node --test ${SELF}`));
+});
+
+/** C119 S2: the LITERAL reviewed TEST-arm release of this tree (outside every component, so the release never embeds itself). It is NOT an
+ *  arm and sets nothing: ROOT sets the repository variable out-of-band at a separately authorized activation, never from this file. */
+const ARM_RELEASE = Object.freeze({ release: "dd055a2ba5b5d96fe57cbf353f975e8626af689776ed860272a92cf4d215c595", components: ["arm-gate", "kickoff", "booking-confirmation", "pipeline"] });
+
+test("X5 C119 S2 the TEST-arm release recomputed from this checkout equals the LITERAL reviewed release; this file is outside every arm component; no component file carries the release", async () => {
+  const A = await import("../scripts/e7-test-arm.mjs");
+  const r = await A.armRelease(ROOT); assert.equal(r.ok, true);
+  assert.equal(r.release, ARM_RELEASE.release);
+  const m = JSON.parse(readFileSync(join(ROOT, A.ARM_MANIFEST_PATH), "utf8"));
+  assert.deepEqual(m.components.map((x) => x.name), ARM_RELEASE.components);
+  for (const x of m.components) { assert.ok(!x.files.includes(SELF) && !x.files.includes(WF), x.name); for (const f of x.files) assert.ok(!readFileSync(join(ROOT, f), "utf8").includes(ARM_RELEASE.release), f); }
+  assert.equal(r.frames["booking-confirmation"], NOTIFICATION.frame, "the release frames the reviewed notification runner bytes");
 });

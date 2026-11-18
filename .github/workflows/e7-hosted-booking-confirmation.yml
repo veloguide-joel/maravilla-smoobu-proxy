@@ -14,6 +14,13 @@
 # fingerprint only, never an identifier; no Resend key) → `execute` (APPROVAL #2, ONLY when detect outcome == ONE; no hand-bound identifier: the
 # runner re-selects server-side and requires the SAME fingerprint, then the unchanged admission + ONE accepted worker invocation). The manual
 # bound-op execute path is unchanged and reachable only when detect is SKIPPED. >1 eligible → STOP (a capacity limitation of this TEST slice).
+# C119 S2 TEST ARM + DRAFT SCHEDULE (SHIPPED CLOSED; executeEnabled stays FALSE; NO variable / environment / secret / setting is created or changed here):
+# `schedule` cron '28,58 * * * *' = a NOMINAL 30-minute TEST-only polling cadence (NOT a launch SLA; GitHub may delay / drop scheduled runs). A scheduled
+# run is ALWAYS the detect flow with EMPTY bindings. EVERY non-preflight route (schedule, manual detect, manual execute — no manual bypass) first runs
+# the `arm` job (no environment, no secret, no database): scripts/e7-test-arm.mjs recomputes the release digest from THIS checkout and compares it with
+# vars.E7_TEST_AUTO_ARMED; absent / malformed / stale / mismatched / not main → armed=false → CLOSED_NOOP: every environment job is SKIPPED (0 approval
+# prompts, 0 secrets, 0 SQL, 0 HTTP). The runner re-checks the arm itself (labelled copy) inside each gated job BEFORE any secret step (a queued job
+# started after the variable changed refuses NBC_ARM_CLOSED). Clearing the variable does NOT stop a job already past its gates.
 # Source digest = SHA-256 over: prefix "e7-hosted-booking-confirmation-v1\n", then for each file IN THIS ORDER
 #   1. scripts/e7-hosted-booking-confirmation.mjs  2. test/e7-hosted-booking-confirmation.test.mjs  3. test/e7-hosted-booking-confirmation-workflow.test.mjs
 #   4. .github/workflows/e7-hosted-booking-confirmation.yml
@@ -21,6 +28,8 @@
 name: e7-hosted-booking-confirmation
 
 on:
+  schedule:
+    - cron: '28,58 * * * *'
   workflow_dispatch:
     inputs:
       mode:
@@ -103,7 +112,7 @@ jobs:
         env:
           E7_WORKFLOW_SHA: ${{ github.sha }}
           E7_TOOLING_PIN: 66133a22edca925e6386c4d178c251fa5f11c82e
-          E7_MODE: ${{ inputs.mode }}
+          E7_MODE: ${{ github.event_name == 'schedule' && 'detect' || inputs.mode }}
         run: |
           set -eu
           head="$(git -C wrapper rev-parse HEAD)"
@@ -131,9 +140,35 @@ jobs:
           echo "sourceDigest=$d"
           if [ -n "$E7_EXPECTED_SOURCE_DIGEST" ] && [ "$E7_EXPECTED_SOURCE_DIGEST" != "$d" ]; then echo "REFUSED: expected_source_digest mismatch"; exit 3; fi
 
-  detect:
+  arm:
     needs: preflight
-    if: inputs.mode == 'detect' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'schedule' || inputs.mode == 'detect' || inputs.mode == 'execute'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      armed: ${{ steps.arm.outputs.armed }}
+      confirmation: ${{ steps.arm.outputs.confirmation }}
+    steps:
+      - name: Checkout wrapper (this repository, exact dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          path: wrapper
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: TEST arm gate (release digest recomputed from this checkout; no environment, no secret, no database; not armed → CLOSED_NOOP)
+        id: arm
+        env:
+          E7_TEST_ARM: ${{ vars.E7_TEST_AUTO_ARMED }}
+        run: node wrapper/scripts/e7-test-arm.mjs check
+
+  detect:
+    needs: [preflight, arm]
+    if: (inputs.mode == 'detect' || github.event_name == 'schedule') && github.ref == 'refs/heads/main' && needs.arm.outputs.armed == 'true'
     runs-on: ubuntu-24.04
     environment: e7-readonly-probe
     timeout-minutes: 10
@@ -164,8 +199,8 @@ jobs:
           E7_WORKFLOW_SHA: ${{ github.sha }}
           E7_TOOLING_PIN: 66133a22edca925e6386c4d178c251fa5f11c82e
           E7_BINDINGS: ${{ inputs.approval_ref }}${{ inputs.intent_id }}${{ inputs.op_id }}${{ inputs.expected_version }}${{ inputs.locale }}${{ inputs.expected_plan_hash }}
-          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
-          E7_EXPECTED_CLOSURE_DIGEST: ${{ inputs.expected_closure_digest }}
+          E7_EXPECTED_SOURCE_DIGEST: ${{ github.event_name == 'schedule' && needs.arm.outputs.confirmation || inputs.expected_source_digest }}
+          E7_EXPECTED_CLOSURE_DIGEST: ${{ github.event_name == 'schedule' && '6f02ce24f92dc0ef4a4d4bbe22adc4203f15f7ec64f36909dd0b1a8d2bd55d06' || inputs.expected_closure_digest }}
         run: |
           set -eu
           head="$(git -C wrapper rev-parse HEAD)"
@@ -179,10 +214,11 @@ jobs:
           echo "bindings ok: wrapper=$head tooling=$tool source=$d"
       - name: Verify, detect flow (runner; SHIPPED CLOSED → NBC_EXECUTE_CLOSED here; no secret, no database)
         env:
+          E7_TEST_ARM: ${{ vars.E7_TEST_AUTO_ARMED }}
           E7_TOOLING_DIR: ${{ github.workspace }}/tooling
           E7_INPUT_MODE: detect
-          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
-          E7_EXPECTED_CLOSURE_DIGEST: ${{ inputs.expected_closure_digest }}
+          E7_EXPECTED_SOURCE_DIGEST: ${{ github.event_name == 'schedule' && needs.arm.outputs.confirmation || inputs.expected_source_digest }}
+          E7_EXPECTED_CLOSURE_DIGEST: ${{ github.event_name == 'schedule' && '6f02ce24f92dc0ef4a4d4bbe22adc4203f15f7ec64f36909dd0b1a8d2bd55d06' || inputs.expected_closure_digest }}
           E7_WORKFLOW_SHA: ${{ github.sha }}
           E7_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
         run: node wrapper/scripts/e7-hosted-booking-confirmation.mjs verify
@@ -194,9 +230,10 @@ jobs:
       - name: ONE read-only detection (the DB secret only, this step only; writes nothing; outputs outcome + fingerprint only)
         id: detect
         env:
+          E7_TEST_ARM: ${{ vars.E7_TEST_AUTO_ARMED }}
           E7_TOOLING_DIR: ${{ github.workspace }}/tooling
-          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
-          E7_EXPECTED_CLOSURE_DIGEST: ${{ inputs.expected_closure_digest }}
+          E7_EXPECTED_SOURCE_DIGEST: ${{ github.event_name == 'schedule' && needs.arm.outputs.confirmation || inputs.expected_source_digest }}
+          E7_EXPECTED_CLOSURE_DIGEST: ${{ github.event_name == 'schedule' && '6f02ce24f92dc0ef4a4d4bbe22adc4203f15f7ec64f36909dd0b1a8d2bd55d06' || inputs.expected_closure_digest }}
           E7_WORKFLOW_SHA: ${{ github.sha }}
           E7_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
           E7_CA_FILE: ${{ runner.temp }}/prod-ca-2021.crt
@@ -204,8 +241,8 @@ jobs:
         run: node wrapper/scripts/e7-hosted-booking-confirmation.mjs detect
 
   execute:
-    needs: [preflight, detect]
-    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.preflight.result == 'success' && ((inputs.mode == 'execute' && needs.detect.result == 'skipped') || (inputs.mode == 'detect' && needs.detect.result == 'success' && needs.detect.outputs.outcome == 'ONE')) }}
+    needs: [preflight, arm, detect]
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.preflight.result == 'success' && needs.arm.result == 'success' && needs.arm.outputs.armed == 'true' && ((github.event_name == 'workflow_dispatch' && inputs.mode == 'execute' && needs.detect.result == 'skipped') || ((inputs.mode == 'detect' || github.event_name == 'schedule') && needs.detect.result == 'success' && needs.detect.outputs.outcome == 'ONE')) }}
     runs-on: ubuntu-24.04
     environment: e7-readonly-probe
     timeout-minutes: 10
@@ -232,12 +269,12 @@ jobs:
         env:
           E7_WORKFLOW_SHA: ${{ github.sha }}
           E7_TOOLING_PIN: 66133a22edca925e6386c4d178c251fa5f11c82e
-          E7_INPUT_MODE: ${{ inputs.mode == 'detect' && 'detect' || 'manual' }}
+          E7_INPUT_MODE: ${{ (inputs.mode == 'detect' || github.event_name == 'schedule') && 'detect' || 'manual' }}
           E7_APPROVAL_REF: ${{ inputs.approval_ref }}
           E7_EXPECTED_PLAN_HASH: ${{ inputs.expected_plan_hash }}
           E7_EXPECTED_CANDIDATE_FINGERPRINT: ${{ needs.detect.outputs.fingerprint }}
-          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
-          E7_EXPECTED_CLOSURE_DIGEST: ${{ inputs.expected_closure_digest }}
+          E7_EXPECTED_SOURCE_DIGEST: ${{ github.event_name == 'schedule' && needs.arm.outputs.confirmation || inputs.expected_source_digest }}
+          E7_EXPECTED_CLOSURE_DIGEST: ${{ github.event_name == 'schedule' && '6f02ce24f92dc0ef4a4d4bbe22adc4203f15f7ec64f36909dd0b1a8d2bd55d06' || inputs.expected_closure_digest }}
         run: |
           set -eu
           head="$(git -C wrapper rev-parse HEAD)"
@@ -255,7 +292,8 @@ jobs:
           echo "bindings ok: wrapper=$head tooling=$tool source=$d"
       - name: Verify (runner; SHIPPED CLOSED → NBC_EXECUTE_CLOSED here; else closure / source / plan / approval bindings; no secret, no database)
         env:
-          E7_INPUT_MODE: ${{ inputs.mode == 'detect' && 'detect' || 'manual' }}
+          E7_TEST_ARM: ${{ vars.E7_TEST_AUTO_ARMED }}
+          E7_INPUT_MODE: ${{ (inputs.mode == 'detect' || github.event_name == 'schedule') && 'detect' || 'manual' }}
           E7_EXPECTED_CANDIDATE_FINGERPRINT: ${{ needs.detect.outputs.fingerprint }}
           E7_TOOLING_DIR: ${{ github.workspace }}/tooling
           E7_APPROVAL_REF: ${{ inputs.approval_ref }}
@@ -264,8 +302,8 @@ jobs:
           E7_EXPECTED_VERSION: ${{ inputs.expected_version }}
           E7_LOCALE: ${{ inputs.locale }}
           E7_EXPECTED_PLAN_HASH: ${{ inputs.expected_plan_hash }}
-          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
-          E7_EXPECTED_CLOSURE_DIGEST: ${{ inputs.expected_closure_digest }}
+          E7_EXPECTED_SOURCE_DIGEST: ${{ github.event_name == 'schedule' && needs.arm.outputs.confirmation || inputs.expected_source_digest }}
+          E7_EXPECTED_CLOSURE_DIGEST: ${{ github.event_name == 'schedule' && '6f02ce24f92dc0ef4a4d4bbe22adc4203f15f7ec64f36909dd0b1a8d2bd55d06' || inputs.expected_closure_digest }}
           E7_WORKFLOW_SHA: ${{ github.sha }}
           E7_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
         run: node wrapper/scripts/e7-hosted-booking-confirmation.mjs verify
@@ -276,7 +314,8 @@ jobs:
         run: curl --fail --silent --show-error --proto '=https' --max-time 20 -o "$RUNNER_TEMP/prod-ca-2021.crt" https://supabase-downloads.s3-ap-southeast-1.amazonaws.com/prod/ssl/prod-ca-2021.crt
       - name: ONE bound gn-v2 booking confirmation (the only secrets, this step only; ONE worker invocation, at most ONE send, no retry)
         env:
-          E7_INPUT_MODE: ${{ inputs.mode == 'detect' && 'detect' || 'manual' }}
+          E7_TEST_ARM: ${{ vars.E7_TEST_AUTO_ARMED }}
+          E7_INPUT_MODE: ${{ (inputs.mode == 'detect' || github.event_name == 'schedule') && 'detect' || 'manual' }}
           E7_EXPECTED_CANDIDATE_FINGERPRINT: ${{ needs.detect.outputs.fingerprint }}
           E7_TOOLING_DIR: ${{ github.workspace }}/tooling
           E7_APPROVAL_REF: ${{ inputs.approval_ref }}
@@ -285,8 +324,8 @@ jobs:
           E7_EXPECTED_VERSION: ${{ inputs.expected_version }}
           E7_LOCALE: ${{ inputs.locale }}
           E7_EXPECTED_PLAN_HASH: ${{ inputs.expected_plan_hash }}
-          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
-          E7_EXPECTED_CLOSURE_DIGEST: ${{ inputs.expected_closure_digest }}
+          E7_EXPECTED_SOURCE_DIGEST: ${{ github.event_name == 'schedule' && needs.arm.outputs.confirmation || inputs.expected_source_digest }}
+          E7_EXPECTED_CLOSURE_DIGEST: ${{ github.event_name == 'schedule' && '6f02ce24f92dc0ef4a4d4bbe22adc4203f15f7ec64f36909dd0b1a8d2bd55d06' || inputs.expected_closure_digest }}
           E7_WORKFLOW_SHA: ${{ github.sha }}
           E7_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
           E7_CA_FILE: ${{ runner.temp }}/prod-ca-2021.crt

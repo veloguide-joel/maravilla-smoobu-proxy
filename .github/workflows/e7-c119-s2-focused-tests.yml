@@ -1,0 +1,57 @@
+# C119 S2 — FOCUSED TEST EVIDENCE ONLY for the TEST arm gate (scripts/e7-test-arm.mjs + manifest) and its use in the kickoff / booking-confirmation
+# runners and workflows (DRAFT, SHIPPED CLOSED). Fake-only suites against the pinned tooling 66133a22: the arm gate, both runners + workflows, the TLS
+# probe (it frames the kickoff runner) and the cross-runner regression. No secrets, no environment, no variable, no database, no network beyond the
+# checkouts. Outside every runtime source frame and every arm component. contents: read only.
+name: e7-c119-s2-focused-tests
+on:
+  pull_request:
+    paths:
+      - "scripts/e7-test-arm.mjs"
+      - "scripts/e7-test-arm/**"
+      - "test/e7-test-arm.test.mjs"
+      - "scripts/e7-hosted-kickoff.mjs"
+      - "test/e7-hosted-kickoff*.test.mjs"
+      - ".github/workflows/e7-hosted-kickoff.yml"
+      - "scripts/e7-hosted-booking-confirmation.mjs"
+      - "test/e7-hosted-booking-confirmation*.test.mjs"
+      - ".github/workflows/e7-hosted-booking-confirmation.yml"
+      - "test/e7-cross-runner-regression.test.mjs"
+      - ".github/workflows/e7-c119-s2-focused-tests.yml"
+      - "claude/c119-s2-*"
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: e7-c119-s2-focused-tests-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  focused:
+    name: c119-s2-focused
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout wrapper (exact event SHA)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout merged E7 tooling (fixed commit 66133a22)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: 66133a22edca925e6386c4d178c251fa5f11c82e
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Fake suites — arm gate, kickoff, booking confirmation, TLS probe, cross-runner regression
+        working-directory: wrapper
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+        run: >-
+          node --test test/e7-test-arm.test.mjs test/e7-hosted-kickoff.test.mjs test/e7-hosted-kickoff-workflow.test.mjs
+          test/e7-hosted-booking-confirmation.test.mjs test/e7-hosted-booking-confirmation-workflow.test.mjs
+          test/e7-hosted-tls-probe.test.mjs test/e7-hosted-tls-probe-workflow.test.mjs test/e7-cross-runner-regression.test.mjs

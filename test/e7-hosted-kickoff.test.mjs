@@ -48,15 +48,20 @@ const trap = (name) => async () => { throw new Error(`must not be called: ${name
 const TRAPS = { spawnChild: trap("spawn"), importEnv: trap("importEnv"), importTooling: trap("importTooling"), runCore: trap("runCore"), readHead: trap("readHead"),
   readPgVersion: trap("readPg"), readCa: trap("readCa") };
 
+// ---- C119 S2: the TEST arm (recomputed release of an exact copy == this checkout's release; a mutated copy has its OWN release) ------------
+const ARM_MANIFEST = JSON.parse(readFileSync(join(ROOT, "scripts/e7-test-arm/manifest.json"), "utf8"));
+const ARM_FILES = ["scripts/e7-test-arm/manifest.json", ...ARM_MANIFEST.components.flatMap((x) => x.files)];
+const ARM = (await E.armRelease(ROOT)).release;
+const armOf = async (dir) => (await E.armRelease(dir)).release;
 // ---- a wrapper fixture whose pipeline files are bound by a SEAM constant (the real ENABLE binding is G-tested separately) -------------
 function wrapperFixture() {
   const d = mkdtempSync(join(tmpdir(), "hko-w-"));
-  for (const f of [...E.RUNNER_FILES, ...C.pipeline.runnerFiles]) { mkdirSync(dirname(join(d, f)), { recursive: true }); cpSync(join(ROOT, f), join(d, f)); }
+  for (const f of [...new Set([...E.RUNNER_FILES, ...C.pipeline.runnerFiles, ...ARM_FILES])]) { mkdirSync(dirname(join(d, f)), { recursive: true }); cpSync(join(ROOT, f), join(d, f)); }
   return d;
 }
 const boundConstants = async (wdir, over = {}) => { const b = await E.pipelineBinding(wdir); return Object.freeze({ ...OPEN, pipeline: Object.freeze({ ...C.pipeline, sourceDigest: b.sourceDigest }), ...over }); };
 const realEnv = (over = {}) => ({ E7_TOOLING_DIR: TOOLING, E7_INTENT_ID: IID, E7_BOOKING_REF: REF, E7_EXPECTED_VERSION: "6", E7_PAYMENT_INTENT_ID: PI, E7_AMOUNT_MINOR: "56000",
-  E7_WORKFLOW_SHA: SHA_A, GITHUB_SHA: SHA_A, GITHUB_REF: "refs/heads/main", E7_RUN_ID: "123456-1", ...over });
+  E7_WORKFLOW_SHA: SHA_A, GITHUB_SHA: SHA_A, GITHUB_REF: "refs/heads/main", E7_RUN_ID: "123456-1", E7_TEST_ARM: ARM, ...over });
 
 test("H1 SHIPPED CLOSED: executeEnabled / dispatchEnabled FALSE; verify and execute refuse HKO_EXECUTE_CLOSED from KEY NAMES only — 0 env value reads, 0 import / spawn / head / pg / CA / core", async () => {
   assert.equal(C.executeEnabled, false); assert.equal(C.dispatchEnabled, false); assert.equal(C.toolingStatus, "MERGED"); assert.equal(C.toolingCommit, TOOL_PIN);
@@ -160,12 +165,12 @@ test("H6 verify / execute ORDER (open seam constants): not MERGED / no inputs / 
     const head = async () => SHA_A;
     const cases = [
       ["not merged (seam)", "verify", base(), { ...C, executeEnabled: true, toolingStatus: "DRAFT_UNMERGED" }, "HKO_CLOSURE_MISMATCH"],
-      ["no inputs", "verify", { E7_TOOLING_DIR: TOOLING, E7_EXPECTED_SOURCE_DIGEST: src, E7_RUN_ID: "123456-1", GITHUB_REF: "refs/heads/main" }, bc, "HKO_INPUT_INCOMPLETE"],
+      ["no inputs", "verify", { E7_TOOLING_DIR: TOOLING, E7_EXPECTED_SOURCE_DIGEST: src, E7_RUN_ID: "123456-1", GITHUB_REF: "refs/heads/main", E7_TEST_ARM: ARM }, bc, "HKO_INPUT_INCOMPLETE"],
       ["partial", "verify", base({ E7_AMOUNT_MINOR: "" }), bc, "HKO_INPUT_INCOMPLETE"],
       ["bad PI", "verify", base({ E7_PAYMENT_INTENT_ID: "ch_x" }), bc, "HKO_INPUT_INVALID"],
       ["C103 target", "verify", base({ E7_INTENT_ID: "1d6e770f-ba3d-40f7-92c1-ee01be7da532" }), bc, "HKO_INTENT_EXCLUDED"],
       ["historic", "verify", base({ E7_INTENT_ID: "669da884-02e8-4105-8825-f908e5d22ae9" }), bc, "HKO_INTENT_EXCLUDED"],
-      ["not main", "verify", base({ GITHUB_REF: "refs/heads/feature" }), bc, "HKO_REF_NOT_MAIN"],
+      ["not main (C119 S2: the arm refuses a non-main ref first)", "verify", base({ GITHUB_REF: "refs/heads/feature" }), bc, "HKO_ARM_CLOSED"],
       ["GITHUB_SHA != E7_WORKFLOW_SHA", "verify", base({ GITHUB_SHA: SHA_B }), bc, "HKO_BINDING_MISMATCH"],
       ["own source", "verify", base({ E7_EXPECTED_SOURCE_DIGEST: "c".repeat(64) }), bc, "HKO_SOURCE_MISMATCH"],
       ["pipeline not bound (stale / closed)", "verify", base(), OPEN, "HKO_PIPELINE_NOT_BOUND"]];
@@ -638,7 +643,7 @@ test("K16 C113 / C114-F1 summary: flow + detect outcome + candidate count; the c
 /** an env whose SECRET values are counted (non-secret public inputs may be read) */
 const secretCounted = (o) => { const n = { reads: 0, byKey: {} }; return { n, env: new Proxy(o, { get: (t, k) => { if (E.SECRET_KEYS.includes(k)) { n.reads += 1; n.byKey[k] = (n.byKey[k] ?? 0) + 1; } return t[k]; } }) }; };
 const detEnv = (over = {}) => ({ E7_TOOLING_DIR: TOOLING, E7_INPUT_MODE: "detect", E7_INTENT_ID: "", E7_BOOKING_REF: "", E7_EXPECTED_VERSION: "", E7_PAYMENT_INTENT_ID: "", E7_AMOUNT_MINOR: "",
-  E7_WORKFLOW_SHA: SHA_A, GITHUB_SHA: SHA_A, GITHUB_REF: "refs/heads/main", E7_RUN_ID: "123456-1", ...over });
+  E7_WORKFLOW_SHA: SHA_A, GITHUB_SHA: SHA_A, GITHUB_REF: "refs/heads/main", E7_RUN_ID: "123456-1", E7_TEST_ARM: ARM, ...over });
 
 test("H9 C113 SHIPPED CLOSED detect flow: verify → CLOSED_NOOP exit 0 with output open=false (the gated jobs are skipped: 0 prompts, 0 DB secret); a secret / fingerprint NAME or any binding input refuses; a CLOSED detect / detect-flow execute → HKO_EXECUTE_CLOSED; unknown / inconsistent modes refuse — 0 secret reads, 0 import / head / core", async () => {
   { const { n, env } = secretCounted(detEnv()); const r = await E.runHosted({ mode: "verify", env, proc: PROC, wrapperDir: ROOT, deps: TRAPS });
