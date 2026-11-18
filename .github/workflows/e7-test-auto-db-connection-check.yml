@@ -1,0 +1,95 @@
+# e7-test-auto-db-connection-check — DIAGNOSTIC ONLY (C120). Proves that ONE secret, the e7-test-auto environment's E7_DEV_BOOKING_DATABASE_URL,
+# authenticates as the approved TEST runtime role over a TLS-verified connection to the pinned Supabase pooler. Nothing else.
+#   * manual dispatch only, main only, NO inputs, NO schedule; environment e7-test-auto (its existing required reviewer gates the job)
+#   * permissions contents: read; no token use; no provider secret; no other secret; no repository runtime module is imported
+#   * the pinned tooling checkout (bbf12aa2) supplies ONLY the `pg` client from its verified lockfile (npm ci, no lifecycle scripts)
+#   * the official Supabase CA is fetched and its SHA-256 checked against the pinned value before use; TLS rejectUnauthorized, servername pinned
+#   * the URL is validated against the runners' dbTargetOk shape (host / port / user / path / no query) BEFORE any connection
+#   * ONE connection, ONE attempt, no retry: BEGIN READ ONLY; SELECT 1 + current role / read-only / role membership / TEST instance marker /
+#     server-side SSL of this backend; ROLLBACK; end. No application table other than the one-row booking.instance marker; no intent / booking read.
+#   * output: PASS or FAIL plus a sanitized code (an SQLSTATE, or a fixed local code) ONLY — never the URL, user, password, host or error text
+# OUTSIDE every runner frame and the TEST arm release (no component lists this file); it enables nothing and changes no flag.
+name: e7-test-auto-db-connection-check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e7-test-auto-db-connection-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: e7-test-auto
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout the pinned tooling (bbf12aa2) for its verified pg lockfile only
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: bbf12aa22446807df7b63a55e38a464f4be88763
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Verify the tooling pin, then install the pinned dependency from the verified lockfile (no lifecycle scripts)
+        env:
+          E7_TOOLING_PIN: bbf12aa22446807df7b63a55e38a464f4be88763
+        run: |
+          set -eu
+          [ "$(git -C tooling rev-parse HEAD)" = "$E7_TOOLING_PIN" ] || { echo "FAIL code=TOOLING_PIN"; exit 3; }
+          cd tooling && npm ci --ignore-scripts --omit=dev --no-audit --no-fund >/dev/null 2>&1 || { echo "FAIL code=NPM_CI"; exit 3; }
+      - name: Fetch the public Supabase CA and check its pinned SHA-256
+        env:
+          E7_CA_SHA256: 700723581420dd1ac98fd7e9ac529f0ef210eadcaf87fc868a3ad7d114c2f3b7
+        run: |
+          set -eu
+          curl --fail --silent --show-error --proto '=https' --max-time 20 -o "$RUNNER_TEMP/prod-ca-2021.crt" https://supabase-downloads.s3-ap-southeast-1.amazonaws.com/prod/ssl/prod-ca-2021.crt || { echo "FAIL code=CA_FETCH"; exit 3; }
+          [ "$(sha256sum "$RUNNER_TEMP/prod-ca-2021.crt" | cut -d' ' -f1)" = "$E7_CA_SHA256" ] || { echo "FAIL code=CA_PIN"; exit 3; }
+      - name: ONE TLS-verified read-only connection check (this step only receives the DB secret; output PASS / FAIL + sanitized code only)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_CA_FILE: ${{ runner.temp }}/prod-ca-2021.crt
+          E7_DEV_BOOKING_DATABASE_URL: ${{ secrets.E7_DEV_BOOKING_DATABASE_URL }}
+        run: |
+          node --input-type=module -e '
+          import { createRequire } from "node:module";
+          import { readFileSync } from "node:fs";
+          const out = (ok, code) => { process.stdout.write(`e7-test-auto-db-connection-check ${ok ? "PASS" : "FAIL"} code=${code}\n`); process.exit(ok ? 0 : 3); };
+          const HOST = "aws-0-us-east-1.pooler.supabase.com"; const REF = "mxotevtiscernhqilyiu"; const ROLE = "mv_booking_app_dev";
+          let u; try { u = new URL(process.env.E7_DEV_BOOKING_DATABASE_URL ?? ""); } catch { out(false, "URL_UNPARSEABLE"); }
+          let user = ""; let password = ""; try { user = decodeURIComponent(u.username); password = decodeURIComponent(u.password); } catch { out(false, "URL_ENCODING"); }
+          if (!(u.protocol === "postgresql:" || u.protocol === "postgres:") || u.hostname !== HOST || u.port !== "6543" || user !== `${ROLE}.${REF}`
+              || u.pathname !== "/postgres" || u.search !== "" || u.hash !== "") out(false, "TARGET_SHAPE");
+          if (password.length === 0) out(false, "PASSWORD_EMPTY");
+          const pg = createRequire(`${process.env.E7_TOOLING_DIR}/package.json`)("pg");
+          const client = new pg.Client({ host: HOST, port: 6543, user, password, database: "postgres",
+            ssl: { ca: readFileSync(process.env.E7_CA_FILE, "utf8"), rejectUnauthorized: true, servername: HOST },
+            connectionTimeoutMillis: 10000, statement_timeout: 5000, query_timeout: 8000, application_name: "e7-test-auto-db-connection-check" });
+          client.on("error", () => {});
+          const code = (e) => (e && typeof e.code === "string" && /^[0-9A-Z]{5}$/.test(e.code)) ? e.code : "NO_SQLSTATE";
+          try { await client.connect(); } catch (e) { out(false, `CONNECT_${code(e)}`); }
+          let verdict = null;
+          try {
+            await client.query("BEGIN READ ONLY");
+            const r = (await client.query(`SELECT 1 AS one, current_user::text AS cu, session_user::text AS su, current_setting($$transaction_read_only$$) AS ro,
+              pg_has_role(current_user, $$mv_booking_app$$, $$MEMBER$$) AS app, (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) AS su_flag,
+              (SELECT count(*)::int FROM booking.instance) AS n, (SELECT min(environment)::text FROM booking.instance) AS env,
+              (SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()) AS ssl`)).rows[0];
+            verdict = (r && r.one === 1 && r.cu === ROLE && r.su === ROLE && r.ro === "on" && r.app === true && r.su_flag === false && r.n === 1 && r.env === "test" && r.ssl === true)
+              ? "OK" : (r && r.cu !== ROLE ? "ROLE_MISMATCH" : r && r.ro !== "on" ? "NOT_READ_ONLY" : r && r.env !== "test" ? "NOT_TEST_INSTANCE" : r && r.ssl !== true ? "BACKEND_SSL_OFF" : "IDENTITY_MISMATCH");
+            await client.query("ROLLBACK");
+          } catch (e) { verdict = verdict ?? `QUERY_${code(e)}`; }
+          try { await client.end(); } catch { /* ignore */ }
+          out(verdict === "OK", verdict === "OK" ? "CONNECTED_READ_ONLY_TEST" : verdict);
+          ' 2>/dev/null || { rc=$?; [ "$rc" = 3 ] || echo "e7-test-auto-db-connection-check FAIL code=SCRIPT_ERROR"; exit 3; }
