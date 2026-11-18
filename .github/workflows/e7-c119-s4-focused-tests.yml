@@ -14,6 +14,12 @@ on:
       - "test/e7-c109-dispatch-transport.test.mjs"
       - "test/db/e7-c116-0026-*"
       - "test/db/e7-c119-s4-*"
+      - "test/db/migrations.test.mjs"
+      - "test/db/e7-0024-sqleditor-apply-wrapper.test.mjs"
+      - "test/db/e7-0025-0026-sqleditor-apply-wrapper.test.mjs"
+      - "test/db/e7-0027-sqleditor-apply-wrapper.test.mjs"
+      - "test/db/e7-c107-kickoff-requests.test.mjs"
+      - "test/db/e7-c118-*"
       - ".github/workflows/e7-c119-s4-focused-tests.yml"
   workflow_dispatch:
 permissions:
@@ -69,4 +75,6 @@ jobs:
         run: >-
           node --test --test-concurrency=2
           test/db/e7-c119-s4-0028-pipeline-kickoff-source-rebind.test.mjs test/db/e7-c116-0026-pipeline-kickoff-source-rebind.test.mjs
-          test/db/e7-c107-kickoff-requests.test.mjs test/db/e7-c118-external-cancellation.test.mjs
+          test/db/e7-c107-kickoff-requests.test.mjs test/db/e7-c118-external-cancellation.test.mjs test/db/migrations.test.mjs
+          test/db/e7-0024-sqleditor-apply-wrapper.test.mjs test/db/e7-0025-0026-sqleditor-apply-wrapper.test.mjs test/db/e7-0027-sqleditor-apply-wrapper.test.mjs
+          test/db/e7-c118-c116-record.test.mjs
