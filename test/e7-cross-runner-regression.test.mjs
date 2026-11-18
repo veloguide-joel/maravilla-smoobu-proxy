@@ -32,7 +32,7 @@ const NOTIFICATION = Object.freeze({
   prefix: "e7-hosted-booking-confirmation-v1\n",
   runnerFiles: ["scripts/e7-hosted-booking-confirmation.mjs", "test/e7-hosted-booking-confirmation.test.mjs", "test/e7-hosted-booking-confirmation-workflow.test.mjs",
     ".github/workflows/e7-hosted-booking-confirmation.yml"],
-  frame: "a033a893971d1e777e62a368a8c23b20740870be20719525a2482bdd40eab2ba"   // C120: + the passive providerHttpStatus observation (was f969791b… at C119 S4). C119 S4: catalog 28 + e7-test-auto + P3 fresh admission (was ccb52e91… at S2). C119 S2: + the TEST arm re-check (labelled copy) + the arm job / draft schedule (was 9c6cf9f2… at S1 rev 2 / main 30d00191; 0cd953a9… at C116)
+  frame: "5d0cf13495c22db4aa9008e9653cad956f4ef45aff90a419bdd74437f6d8dbec"   // C120 sink-probe env move: its workflow-test pins (sink 3e16037c / inspector 2950152a) (was a033a893…). C120: + the passive providerHttpStatus observation (was f969791b… at C119 S4). C119 S4: catalog 28 + e7-test-auto + P3 fresh admission (was ccb52e91… at S2). C119 S2: + the TEST arm re-check (labelled copy) + the arm job / draft schedule (was 9c6cf9f2… at S1 rev 2 / main 30d00191; 0cd953a9… at C116)
 });
 
 /** every runtime source frame on main: each runner's own runnerFiles, plus the fixed frames the workflow tests pin for the two probes */
@@ -95,8 +95,8 @@ test("X4 CI wiring: the regression runs on every pull request / push to main (an
 
 /** C119 S2: the LITERAL reviewed TEST-arm release of this tree (outside every component, so the release never embeds itself). It is NOT an
  *  arm and sets nothing: ROOT sets the repository variable out-of-band at a separately authorized activation, never from this file. */
-// C120: 9e87d5f2… after the notification frame change (passive providerHttpStatus; was 7a407d45… at C119 S4 after the pipeline admission cascade + the MERGED tooling repin)
-const ARM_RELEASE = Object.freeze({ release: "9e87d5f2f73e25adeba84ac966a20cf356a7f3ff0c1ddd249ee82f9a37675aa1", components: ["arm-gate", "kickoff", "booking-confirmation", "pipeline"] });
+// C120: 9e14224d… after the sink-probe env move pin cascade (kickoff + notification frames; was 9e87d5f2… after the passive providerHttpStatus; was 7a407d45… at C119 S4 after the pipeline admission cascade + the MERGED tooling repin)
+const ARM_RELEASE = Object.freeze({ release: "9e14224dc22f3922b56f6da110aeb4d3fc1cc555083bca45a9cea71c1a92fb37", components: ["arm-gate", "kickoff", "booking-confirmation", "pipeline"] });
 
 test("X5 C119 S2 the TEST-arm release recomputed from this checkout equals the LITERAL reviewed release; this file is outside every arm component; no component file carries the release", async () => {
   const A = await import("../scripts/e7-test-arm.mjs");
@@ -113,9 +113,9 @@ const FOREIGN = Object.freeze({
   runners: { reservation: "5665544de105e4564a57a4434fa32fd2355b9bbd0e756b250d1248e07feb6b19", capture: "5b547a42200b452055d8a718c84ab70f7f2b5a0cd8343f6174c4a75b0c420ed1",
     "test-cleanup": "33f2ab18984dccd3915a18ff8a55dd4a6e5b6bf89e3d84ba1e578347e6cebd1e", recording: "49b5516cb69543a6bd4a697a407d2f2a97a84e18a63f18715338f099917e4824",
     "recorded-cleanup": "9e2021e3ec96bab16869fc194adac672287d559587b2cb7657738ffcd897de1f" },
-  inspector: "889d6a31af4249cede0bf8b64360b5ca0e7ca2d994c4c882f0348e5f57c2c8e7",
+  inspector: "2950152aac0c8d06a4bc48b32539d0ea0d7140c7a6c1dc3f949314f748452715",
   chargeList: "43715872ddb450889286880c848acefd8757da6fe33bc5c6a3a547bd27219cf3",
-  resendSink: "aef26da954d986dc2d922b607d391be404dd73f1145ece0ae66ea0d80673ade4"
+  resendSink: "3e16037c3b1a68f60dc32fcb4a2654abebd3a39f2dce55c9e860d91eb642ad42"
 });
 
 test("X6 C119 S4 (moved from pipeline W7, checks unchanged): the five reviewed runners SHIPPED CLOSED with their exact reviewed digests; the C47 inspection runner (889d6a31…) CLOSED + exact; the charge-list probe (43715872…) and the Resend sink probe (aef26da9…) exact; none of these literals appears in the (SQL-bound) pipeline frame", async () => {

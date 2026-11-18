@@ -183,7 +183,7 @@ test("W8 untouched: main's seven tracked runners stay CLOSED and byte-unchanged 
   }
   const I = await import("../scripts/e7-hosted-notify-inspect.mjs");
   assert.equal(I.CONSTANTS.executeEnabled, false);
-  assert.equal(await R.framedDigest(ROOT, I.CONSTANTS.runnerFiles, I.SOURCE_DIGEST_PREFIX), "889d6a31af4249cede0bf8b64360b5ca0e7ca2d994c4c882f0348e5f57c2c8e7");
+  assert.equal(await R.framedDigest(ROOT, I.CONSTANTS.runnerFiles, I.SOURCE_DIGEST_PREFIX), "2950152aac0c8d06a4bc48b32539d0ea0d7140c7a6c1dc3f949314f748452715");
   // C116: the C50 booking-confirmation runner's exact digest / CLOSED assertions moved to the dedicated C116 cross-runner regression (outside every
   // runtime frame); only frame disjointness stays here
   const N = await import("../scripts/e7-hosted-booking-confirmation.mjs");

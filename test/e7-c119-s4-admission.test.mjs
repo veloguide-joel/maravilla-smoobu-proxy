@@ -44,7 +44,7 @@ const runOf = (step) => { const m = step.match(/\n        run: \|\n((?:         
 const MOVED = [["pipeline", "execute"], ["kickoff", "detect"], ["kickoff", "execute"], ["confirmation", "detect"], ["confirmation", "execute"]];
 const P3 = "Fresh admission (C119 S4 P3;";
 
-test("F1 static: the P3 fresh-admission step is BYTE-IDENTICAL in the five moved jobs, placed right after the pre-secret re-check and before verify / npm / any secret; only the built-in token + this run's commit; every e7-test-auto job is arm-gated; e7-readonly-probe keeps exactly the other 17 job references; this file is in no runtime frame", async () => {
+test("F1 static: the P3 fresh-admission step is BYTE-IDENTICAL in the five moved jobs, placed right after the pre-secret re-check and before verify / npm / any secret; only the built-in token + this run's commit; every e7-test-auto job is arm-gated; e7-readonly-probe keeps exactly the other 16 job references (C120: + the sink-probe send job moved, checked explicitly); this file is in no runtime frame", async () => {
   const blocks = MOVED.map(([w, j]) => { const job = jobOf(Y[w], j); return { w, j, job, step: stepOf(job, P3) }; });
   for (const b of blocks) assert.equal(b.step, blocks[0].step, `${b.w}.${b.j}: P3 byte-identical`);
   const st = blocks[0].step;
@@ -76,9 +76,19 @@ test("F1 static: the P3 fresh-admission step is BYTE-IDENTICAL in the five moved
       assert.doesNotMatch(t, /schedule:|vars\.|github\.token|actions: write|wrapper\/scripts|import\(/, "diagnostic: no schedule / arm / token / runtime module");
       continue;
     }
+    // C120: the existing WRITE-capable SYNTHETIC Resend sink probe (NOT a read-only diagnostic): its ONE send job moved to e7-test-auto;
+    // manual-only, main-only, needs its own preflight, ONE secret, no schedule / arm / token / variable; every other byte keeps its own W1–W7 tests
+    if (f === "e7-resend-sink-probe.yml") {
+      assert.match(t, /\non:\n  workflow_dispatch:\n    inputs:\n/, "sink probe: manual dispatch only"); assert.match(t, /\npermissions:\n  contents: read\n/);
+      assert.deepEqual(t.match(/environment: [a-z0-9-]+/g), ["environment: e7-test-auto"], "sink probe: ONE environment, the isolated TEST one");
+      assert.match(t, /\n  send:\n    needs: preflight\n    if: inputs\.mode == 'send' && github\.ref == 'refs\/heads\/main'\n    runs-on: ubuntu-24\.04\n    environment: e7-test-auto\n/);
+      assert.deepEqual(t.match(/secrets\.[A-Z0-9_]+/g), ["secrets.E7_RESEND_TEST_KEY"], "sink probe: its one secret only");
+      assert.doesNotMatch(t, /schedule:|vars\.|github\.token|actions: write|import\(/, "sink probe: no schedule / arm / token / variable");
+      continue;
+    }
     probe += (t.match(/\n    environment: e7-readonly-probe\n/g) || []).length; auto += (t.match(/environment: e7-test-auto/g) || []).length;
   }
-  assert.deepEqual([probe, auto], [17, 5], "the 5 moved jobs only; every other e7-readonly-probe reference untouched");
+  assert.deepEqual([probe, auto], [16, 5], "the 5 moved jobs only (+ the C120 sink-probe send job, checked above); every other e7-readonly-probe reference untouched");
   // outside every runtime frame: no runner frame / arm component lists or names this file
   const A = await import("../scripts/e7-test-arm.mjs"); const M = JSON.parse(readFileSync(join(ROOT, A.ARM_MANIFEST_PATH), "utf8"));
   const S = await import("../scripts/e7-hosted-status.mjs");

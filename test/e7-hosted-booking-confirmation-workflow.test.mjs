@@ -166,10 +166,10 @@ test("W7 untouched: the five reviewed runners (executeEnabled false, digests unc
     assert.equal(await R.framedDigest(ROOT, m.CONSTANTS.runnerFiles, m.RUNNER_DIGEST_PREFIX), want[n], n);
   }
   const I = await import("../scripts/e7-hosted-notify-inspect.mjs");
-  assert.equal(await R.framedDigest(ROOT, I.CONSTANTS.runnerFiles, I.SOURCE_DIGEST_PREFIX), "889d6a31af4249cede0bf8b64360b5ca0e7ca2d994c4c882f0348e5f57c2c8e7", "C47/C48 inspection runner unchanged (889d6a31… since C65 cross-pin maintenance; was e822a4d6…)");
+  assert.equal(await R.framedDigest(ROOT, I.CONSTANTS.runnerFiles, I.SOURCE_DIGEST_PREFIX), "2950152aac0c8d06a4bc48b32539d0ea0d7140c7a6c1dc3f949314f748452715", "C47/C48 inspection runner unchanged (889d6a31… since C65 cross-pin maintenance; was e822a4d6…)");
   assert.ok(!I.CONSTANTS.runnerFiles.some((f) => FILES.includes(f)));
   assert.equal(await R.framedDigest(ROOT, ["scripts/e7-hosted-charge-list-probe.mjs", "test/e7-hosted-charge-list-probe.test.mjs", ".github/workflows/e7-hosted-charge-list-probe.yml"], "e7-hosted-charge-list-probe-v1\n"), "43715872ddb450889286880c848acefd8757da6fe33bc5c6a3a547bd27219cf3");
-  assert.equal(await R.framedDigest(ROOT, ["scripts/e7-resend-sink-probe.mjs", "scripts/e7-resend/resend-exchange.mjs", "test/e7-resend-sink-probe.test.mjs", ".github/workflows/e7-resend-sink-probe.yml"], "e7-resend-sink-probe-v1\n"), "aef26da954d986dc2d922b607d391be404dd73f1145ece0ae66ea0d80673ade4");
+  assert.equal(await R.framedDigest(ROOT, ["scripts/e7-resend-sink-probe.mjs", "scripts/e7-resend/resend-exchange.mjs", "test/e7-resend-sink-probe.test.mjs", ".github/workflows/e7-resend-sink-probe.yml"], "e7-resend-sink-probe-v1\n"), "3e16037c3b1a68f60dc32fcb4a2654abebd3a39f2dce55c9e860d91eb642ad42");
 });
 
 test("W8 C119 S1 detect job: needs preflight, mode == 'detect' && main, environment e7-test-auto + fresh admission (C119 S4); steps checkouts → node → the pre-secret re-check (executed locally: no binding input, 64-hex digests, exact source) → runner verify of the detect flow (SHIPPED CLOSED refuses HERE) → npm ci → CA → the ONE read-only detection LAST (DB secret only); declared outputs outcome + fingerprint ONLY; the execute steps receive the flow + fingerprint", async () => {
