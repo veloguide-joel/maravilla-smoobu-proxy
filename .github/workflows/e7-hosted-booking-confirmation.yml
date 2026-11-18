@@ -19,8 +19,9 @@
 # run is ALWAYS the detect flow with EMPTY bindings. EVERY non-preflight route (schedule, manual detect, manual execute — no manual bypass) first runs
 # the `arm` job (no environment, no secret, no database): scripts/e7-test-arm.mjs recomputes the release digest from THIS checkout and compares it with
 # vars.E7_TEST_AUTO_ARMED; absent / malformed / stale / mismatched / not main → armed=false → CLOSED_NOOP: every environment job is SKIPPED (0 approval
-# prompts, 0 secrets, 0 SQL, 0 HTTP). The runner re-checks the arm itself (labelled copy) inside each gated job BEFORE any secret step (a queued job
-# started after the variable changed refuses NBC_ARM_CLOSED). Clearing the variable does NOT stop a job already past its gates.
+# prompts, 0 secrets, 0 SQL, 0 HTTP). The runner re-checks the value it RECEIVES (labelled copy) inside each gated job BEFORE any secret step. WHEN GitHub
+# refreshes the vars context for an already queued / approval-held job is UNVERIFIED: clearing the variable must NOT be relied on to revoke queued,
+# pending-approval or running work (a pre-activation blocker).
 # Source digest = SHA-256 over: prefix "e7-hosted-booking-confirmation-v1\n", then for each file IN THIS ORDER
 #   1. scripts/e7-hosted-booking-confirmation.mjs  2. test/e7-hosted-booking-confirmation.test.mjs  3. test/e7-hosted-booking-confirmation-workflow.test.mjs
 #   4. .github/workflows/e7-hosted-booking-confirmation.yml

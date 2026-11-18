@@ -14,8 +14,9 @@
 // the release digest recomputed here from the exact checked-out bytes. Absent / malformed / another ref / an unreadable release / any other value
 // (a stale release, a moved main, a tampered file) → NOT armed (CLOSED_NOOP).
 //
-// HONEST LIMITS: clearing or changing the variable does NOT stop work that is already running (a job that already passed its gates continues under
-// its own fences); it stops only gates evaluated afterwards. The pipeline runner is a component of the release but is NOT gated by this module
+// HONEST LIMITS: this module decides from the value it is GIVEN (E7_TEST_ARM, supplied by the workflow from the GitHub vars context); it fetches NO live
+// repository configuration. WHEN GitHub refreshes that context for an already queued / approval-held job is UNVERIFIED, so clearing or changing the
+// variable must NOT be relied on to revoke queued, pending-approval or already-running work (a pre-activation blocker; see the C119 S2 design §6). The pipeline runner is a component of the release but is NOT gated by this module
 // (its bytes are untouched in S2): an already queued or directly dispatched pipeline run is not refused by the arm (see the C119 S2 design).
 import process from "node:process";
 import { readFile, lstat } from "node:fs/promises";

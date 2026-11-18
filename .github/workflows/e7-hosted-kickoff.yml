@@ -32,7 +32,8 @@
 # armed=false → detect + execute are SKIPPED (0 approvals, 0 secrets, 0 SQL, 0 HTTP); verify (no environment) re-checks it with the runner's labelled copy
 # (detect flow → CLOSED_NOOP). The scheduled source pin is the arm job's RECOMPUTED kickoff frame (replaces vars.E7_KICKOFF_EXPECTED_SOURCE). The arm
 # does NOT gate e7-hosted-pipeline.yml (untouched): a directly dispatched or already queued pipeline run is not refused by it. Cadence is TEST-only.
-# Clearing the variable does NOT stop a job already past its gates.
+# WHEN GitHub refreshes the vars context for an already queued / approval-held job is UNVERIFIED: clearing the variable must NOT be relied on to revoke
+# queued, pending-approval or running work (a pre-activation blocker).
 # Source digest = SHA-256 over: prefix "e7-hosted-kickoff-v1\n", then for each file IN THIS ORDER
 #   1. scripts/e7-hosted-kickoff.mjs  2. test/e7-hosted-kickoff.test.mjs  3. test/e7-hosted-kickoff-workflow.test.mjs  4. .github/workflows/e7-hosted-kickoff.yml
 # the frame  <relative path> NUL <decimal byte length> NUL <file bytes> NUL  (the framedDigest convention of the reviewed runners).

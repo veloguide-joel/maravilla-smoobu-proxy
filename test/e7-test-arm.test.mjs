@@ -120,7 +120,7 @@ const never = (n) => async () => { throw new Error(`must not be called: ${n}`); 
 const PROC = { versions: { node: "22.22.0" }, platform: "linux", execArgv: [], getuid: () => 1000 };
 const TOOLING = "/nonexistent-tooling";   // never reached: the arm refuses first
 
-test("A6 confirmation runner: verify / detect / execute (manual bound op AND detect flow — no manual bypass) refuse NBC_ARM_CLOSED for an absent / cleared / malformed / mismatched / stale arm BEFORE any tooling import, credential read, DB or provider; manual preflight never needs the arm; SHIPPED CLOSED still refuses first", async () => {
+test("A6 confirmation runner: verify / detect / execute (manual bound op AND detect flow — no manual bypass) refuse NBC_ARM_CLOSED for an absent / empty / malformed / mismatched / stale SUPPLIED arm value BEFORE any tooling import, credential read, DB or provider; manual preflight never needs the arm; SHIPPED CLOSED still refuses first", async () => {
   const OPEN = Object.freeze({ ...N.CONSTANTS, executeEnabled: true });
   const SRC = await N.framedDigest(ROOT, N.CONSTANTS.runnerFiles, N.SOURCE_DIGEST_PREFIX);
   const deps = { constants: OPEN, importEnv: never("importEnv"), importTooling: never("importTooling"), runCore: never("runCore"), runDetect: never("runDetect"), spawnChild: never("spawn"), readPgVersion: never("pg"), readCa: never("ca") };
@@ -129,7 +129,7 @@ test("A6 confirmation runner: verify / detect / execute (manual bound op AND det
   const stale = await withTree((d) => writeFileSync(join(d, "test/e7-test-arm.test.mjs"), `${readFileSync(join(d, "test/e7-test-arm.test.mjs"), "utf8")}\n// a later main\n`), async (d) => (await A.armRelease(d)).release);
   const routes = [["verify", { ...bound }], ["execute", { ...bound, E7_DEV_BOOKING_DATABASE_URL: "postgresql://x", E7_RESEND_TEST_KEY: "re_x" }], ["verify", { E7_INPUT_MODE: "detect" }],
     ["detect", { E7_DEV_BOOKING_DATABASE_URL: "postgresql://x" }], ["execute", { E7_INPUT_MODE: "detect", E7_EXPECTED_CANDIDATE_FINGERPRINT: "b".repeat(64), E7_DEV_BOOKING_DATABASE_URL: "postgresql://x", E7_RESEND_TEST_KEY: "re_x" }]];
-  for (const [mode, extra] of routes) for (const [arm, why] of [[undefined, "absent"], ["", "cleared (a queued job started after the variable was cleared)"], ["x", "malformed"], ["f".repeat(64), "mismatched"], [stale, "stale (another release)"]]) {
+  for (const [mode, extra] of routes) for (const [arm, why] of [[undefined, "absent"], ["", "cleared — the SUPPLIED value is empty (proves refusal of a received value only; GitHub vars refresh timing for queued jobs is UNVERIFIED)"], ["x", "malformed"], ["f".repeat(64), "mismatched"], [stale, "stale (another release)"]]) {
     let secretReads = 0; const env = new Proxy({ ...base, ...extra, ...(arm === undefined ? {} : { E7_TEST_ARM: arm }) }, { get: (t, k) => { if (k === "E7_DEV_BOOKING_DATABASE_URL" || k === "E7_RESEND_TEST_KEY") secretReads += 1; return t[k]; } });
     const r = await N.runHosted({ mode, env, proc: PROC, wrapperDir: ROOT, deps });
     assert.deepEqual([r.exitCode, r.result.code, secretReads, r.result.core, r.result.detect, r.result.closureDigest], [1, "NBC_ARM_CLOSED", 0, null, null, null], `${mode} ${JSON.stringify(Object.keys(extra))} ${why}`);

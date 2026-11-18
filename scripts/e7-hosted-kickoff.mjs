@@ -43,7 +43,9 @@
 //   jobs are skipped); any other mode not armed → HKO_ARM_CLOSED — before any tooling import, secret value, DB, token or HTTP. The scheduled source
 //   pin now comes from the arm job's recomputed kickoff frame (vars.E7_KICKOFF_EXPECTED_SOURCE is retired). Manual preflight is unchanged.
 //   The arm does NOT gate the pipeline runner (its bytes are untouched): a directly dispatched / already queued pipeline run is not refused by it.
-//   Clearing the variable does NOT stop already-running work.
+//   PROVEN: refusal whenever the value it RECEIVES (from the GitHub vars context) differs; UNVERIFIED: when GitHub refreshes that context for an already
+//   queued / approval-held job (no live configuration fetch here). Clearing the variable must NOT be relied on to revoke queued / pending-approval /
+//   already-running work (a pre-activation blocker).
 import process from "node:process";
 import { readFile, realpath, lstat } from "node:fs/promises";
 import { appendFileSync } from "node:fs";

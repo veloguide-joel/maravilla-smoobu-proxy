@@ -240,7 +240,7 @@ test("W9 C119 S2 arm job + routing truth table (REAL expressions): every non-pre
   for (const [o, want] of cases) assert.deepEqual(run(o), want, JSON.stringify(o));
 });
 
-test("W10 C119 S2 schedule routing (REAL expressions): schedule → mode / flow 'detect', source = the arm job's RECOMPUTED confirmation frame, closure = the pinned literal; manual inputs unchanged; the ONLY variable is vars.E7_TEST_AUTO_ARMED (arm job + every runner step in the environment jobs); E7_TEST_ARM is an admitted runner key", () => {
+test("W10 C119 S2 schedule routing (REAL expressions): schedule → mode / flow 'detect', source = the arm job's RECOMPUTED confirmation frame, closure = the pinned literal; manual inputs unchanged; the ONLY variable is vars.E7_TEST_AUTO_ARMED (arm job + every runner step in the environment jobs); E7_TEST_ARM is an admitted runner key (the runners check the SUPPLIED value; GitHub's refresh timing for queued jobs is not asserted)", () => {
   assert.deepEqual(stepEnv("E7_MODE"), ["${{ github.event_name == 'schedule' && 'detect' || inputs.mode }}"]);
   assert.deepEqual(stepEnv("E7_INPUT_MODE"), ["detect", "${{ (inputs.mode == 'detect' || github.event_name == 'schedule') && 'detect' || 'manual' }}"]);
   assert.deepEqual(stepEnv("E7_EXPECTED_SOURCE_DIGEST", jobs.preflight), ["${{ inputs.expected_source_digest }}"], "the manual preflight digest check is unchanged (a schedule passes none: printed only)");
@@ -260,5 +260,5 @@ test("W10 C119 S2 schedule routing (REAL expressions): schedule → mode / flow 
   for (const m of ["detect", "execute"]) { assert.equal(evalExpr(src[0], manual(m)), man); assert.equal(evalExpr(clo[0], manual(m)), "e".repeat(64)); }
   assert.equal(evalExpr(stepEnv("E7_INPUT_MODE")[1], manual("execute")), "manual"); assert.equal(evalExpr(stepEnv("E7_INPUT_MODE")[1], manual("detect")), "detect");
   for (const job of [jobs.detect, jobs.execute]) for (const step of job.split("\n      - name: ").slice(1)) if (/e7-hosted-booking-confirmation\.mjs (verify|detect|execute)\n/.test(step))
-    assert.match(step, /\n          E7_TEST_ARM: \$\{\{ vars\.E7_TEST_AUTO_ARMED \}\}\n/, "every runner step re-checks the arm (a queued job started after the variable changed refuses)");
+    assert.match(step, /\n          E7_TEST_ARM: \$\{\{ vars\.E7_TEST_AUTO_ARMED \}\}\n/, "every runner step re-checks the arm value it is SUPPLIED (the vars refresh timing for queued jobs is UNVERIFIED, not relied on)");
 });

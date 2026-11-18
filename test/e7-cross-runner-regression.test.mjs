@@ -32,7 +32,7 @@ const NOTIFICATION = Object.freeze({
   prefix: "e7-hosted-booking-confirmation-v1\n",
   runnerFiles: ["scripts/e7-hosted-booking-confirmation.mjs", "test/e7-hosted-booking-confirmation.test.mjs", "test/e7-hosted-booking-confirmation-workflow.test.mjs",
     ".github/workflows/e7-hosted-booking-confirmation.yml"],
-  frame: "3394c8c756a640567d8b493ff53ae1a630bed824d809ccde5e9c28db5b627165"   // C119 S2: + the TEST arm re-check (labelled copy) + the arm job / draft schedule (was 9c6cf9f2… at S1 rev 2 / main 30d00191; 0cd953a9… at C116)
+  frame: "ccb52e914543d6bf5dbce8ab7279e68c051778bfede1742a2750936f11e4ebfe"   // C119 S2: + the TEST arm re-check (labelled copy) + the arm job / draft schedule (was 9c6cf9f2… at S1 rev 2 / main 30d00191; 0cd953a9… at C116)
 });
 
 /** every runtime source frame on main: each runner's own runnerFiles, plus the fixed frames the workflow tests pin for the two probes */
@@ -95,7 +95,7 @@ test("X4 CI wiring: the regression runs on every pull request / push to main (an
 
 /** C119 S2: the LITERAL reviewed TEST-arm release of this tree (outside every component, so the release never embeds itself). It is NOT an
  *  arm and sets nothing: ROOT sets the repository variable out-of-band at a separately authorized activation, never from this file. */
-const ARM_RELEASE = Object.freeze({ release: "dd055a2ba5b5d96fe57cbf353f975e8626af689776ed860272a92cf4d215c595", components: ["arm-gate", "kickoff", "booking-confirmation", "pipeline"] });
+const ARM_RELEASE = Object.freeze({ release: "12a8f416b542bc2d6afc93d8925906df68d6b5efb6e47ac7ea32491e8ae7f3ed", components: ["arm-gate", "kickoff", "booking-confirmation", "pipeline"] });
 
 test("X5 C119 S2 the TEST-arm release recomputed from this checkout equals the LITERAL reviewed release; this file is outside every arm component; no component file carries the release", async () => {
   const A = await import("../scripts/e7-test-arm.mjs");

@@ -63,7 +63,9 @@
 //   scripts/e7-test-arm.mjs; manifest scripts/e7-test-arm/manifest.json; the caller-supplied value is never the authority). Not armed → NBC_ARM_CLOSED
 //   before any tooling import, secret value, DB or provider (the workflow's own `arm` job already skips every environment job: CLOSED_NOOP).
 //   Manual preflight is unchanged (no arm). A DRAFT `schedule` (TEST-only cadence, not a launch SLA) always takes the detect flow.
-//   Clearing the variable does NOT stop already-running work; it refuses every gate evaluated afterwards (e.g. a queued job started later).
+//   PROVEN: the runner refuses whenever the value it RECEIVES (E7_TEST_ARM, supplied by the workflow from the GitHub vars context) is not the recomputed
+//   release. UNVERIFIED: WHEN GitHub refreshes that context for an already queued / approval-held job; the runner fetches NO live repository
+//   configuration. Clearing the variable must NOT be relied on to revoke queued / pending-approval / already-running work (a pre-activation blocker).
 import process from "node:process";
 import { readFile, realpath, lstat } from "node:fs/promises";
 import { appendFileSync } from "node:fs";
