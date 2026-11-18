@@ -1,0 +1,86 @@
+# e7-test-auto-resend-key-check — DIAGNOSTIC ONLY (C120). Observes what ONE secret, the e7-test-auto environment's E7_RESEND_TEST_KEY, gets back
+# from ONE read-only Resend request: GET https://api.resend.com/domains. It NEVER calls a send endpoint and cannot create a notification.
+#   * manual dispatch only, main only, NO inputs, NO schedule; environment e7-test-auto (its existing required reviewer gates the job)
+#   * permissions contents: read; no checkout, no dependency install, no repository module; no other secret
+#   * ONE request, fixed: GET /domains, headers Authorization Bearer / Accept / User-Agent only. No body, no query, no other path or method.
+#     One fresh non-keep-alive socket, 10 s timeout, NO retry, NO redirect follow (a 3xx is a FAIL, the Location is never read), NO key creation.
+#   * the reply body is read up to 64 KiB in memory only; it is never printed
+#   * output: ONE line — PASS / FAIL, a fixed code, the HTTP status number, an EXACT allowlisted Resend error name (else `unlisted` /
+#     `unreadable` / `none`) and, ONLY for a strictly valid 200 list, whether mail.micasadirect.com is listed with status `verified`.
+#     Never the key, headers, body, message text or any other domain / field.
+#   * LIMITS (not proof): a sending-only key is EXPECTED to refuse domain reads, so `restricted_api_key` does not prove the right team / domain,
+#     send permission for our sender or future sending readiness. A 200 match proves only that this read worked at this moment with full access.
+#     Unknown names / shapes / statuses stay unknown. Nothing here says what happened to any earlier send.
+# OUTSIDE every runner frame and the TEST arm release (no component lists this file); it enables nothing and changes no flag.
+name: e7-test-auto-resend-key-check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e7-test-auto-resend-key-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: e7-test-auto
+    timeout-minutes: 3
+    permissions:
+      contents: read
+    steps:
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: ONE read-only Resend domains read (this step only receives the Resend secret; output one sanitized line only)
+        env:
+          E7_RESEND_TEST_KEY: ${{ secrets.E7_RESEND_TEST_KEY }}
+        run: |
+          node -e '
+          const https = require("node:https");
+          const NAME = "e7-test-auto-resend-key-check"; const DOMAIN = "mail.micasadirect.com"; const MAX = 64 * 1024;
+          const ERROR_NAMES = new Set(["missing_api_key", "invalid_api_key", "restricted_api_key", "invalid_access", "validation_error", "not_found",
+            "method_not_allowed", "rate_limit_exceeded", "daily_quota_exceeded", "security_error", "application_error", "internal_server_error"]);
+          let done = false;
+          const out = (ok, code, status, error, match) => { if (done) return; done = true;
+            process.stdout.write(`${NAME} ${ok ? "PASS" : "FAIL"} code=${code} http=${Number.isInteger(status) ? status : "none"} error=${error ?? "none"} domain_match=${match ?? "n/a"}\n`);
+            process.exit(ok ? 0 : 3); };
+          let key = process.env.E7_RESEND_TEST_KEY ?? ""; delete process.env.E7_RESEND_TEST_KEY;
+          if (key.length === 0) out(false, "KEY_MISSING");
+          if (!/^[\x21-\x7e]+$/.test(key)) out(false, "KEY_SHAPE");
+          const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+          const agent = new https.Agent({ keepAlive: false, maxSockets: 1 });
+          const req = https.request({ method: "GET", host: "api.resend.com", port: 443, path: "/domains", agent,
+            headers: { Authorization: `Bearer ${key}`, Accept: "application/json", "User-Agent": "maravilla-e7-resend-key-check/1" }, timeout: 10000 }, (res) => {
+            const s = res.statusCode;
+            if (s >= 300 && s <= 399) { res.destroy(); out(false, "REDIRECT_REFUSED", s); }
+            const cl = res.headers["content-length"];
+            if (cl !== undefined && (!/^\d{1,12}$/.test(cl) || Number(cl) > MAX)) { res.destroy(); out(false, "BODY_TOO_LARGE", s); }
+            const chunks = []; let n = 0;
+            res.on("data", (c) => { n += c.length; if (n > MAX) { res.destroy(); out(false, "BODY_TOO_LARGE", s); } else chunks.push(c); });
+            res.on("error", () => out(false, "READ_ERROR", s));
+            res.on("end", () => {
+              let j = null; try { j = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { j = undefined; }
+              if (s !== 200) {
+                const err = j === undefined || !isObj(j) || typeof j.name !== "string" ? "unreadable" : ERROR_NAMES.has(j.name) ? j.name : "unlisted";
+                out(false, s >= 500 ? "HTTP_5XX" : s >= 400 ? "HTTP_4XX" : "HTTP_OTHER", s, err);
+              }
+              if (j === undefined) out(false, "JSON_INVALID", s);
+              const list = isObj(j) && j.object === "list" && Array.isArray(j.data)
+                && j.data.every((d) => isObj(d) && typeof d.name === "string" && typeof d.status === "string") ? j.data : null;
+              if (list === null) out(false, "REPLY_SHAPE", s);
+              const match = list.filter((d) => d.name === DOMAIN && d.status === "verified").length === 1;
+              out(match, match ? "DOMAIN_VERIFIED_LISTED" : "DOMAIN_NOT_LISTED_VERIFIED", s, "none", match);
+            });
+          });
+          key = null;
+          req.on("timeout", () => { req.destroy(); out(false, "TIMEOUT"); });
+          req.on("error", (e) => out(false, (e && typeof e.code === "string" && /^E[A-Z_]{2,24}$/.test(e.code)) ? `REQUEST_${e.code}` : "REQUEST_ERROR"));
+          req.end();
+          ' 2>/dev/null || { rc=$?; [ "$rc" = 3 ] || echo "e7-test-auto-resend-key-check FAIL code=SCRIPT_ERROR http=none error=none domain_match=n/a"; exit 3; }

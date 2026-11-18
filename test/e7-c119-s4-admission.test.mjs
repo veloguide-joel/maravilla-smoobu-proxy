@@ -65,7 +65,8 @@ test("F1 static: the P3 fresh-admission step is BYTE-IDENTICAL in the five moved
   }
   let probe = 0; let auto = 0;
   // C120 diagnostics: manual-only, main-only, reviewer-gated, ONE secret each, no arm, no runtime module
-  const DIAG = { "e7-test-auto-db-connection-check.yml": "secrets.E7_DEV_BOOKING_DATABASE_URL", "e7-test-auto-hostaway-listing-check.yml": "secrets.E7_HOSTAWAY_TOKEN" };
+  const DIAG = { "e7-test-auto-db-connection-check.yml": "secrets.E7_DEV_BOOKING_DATABASE_URL", "e7-test-auto-hostaway-listing-check.yml": "secrets.E7_HOSTAWAY_TOKEN",
+    "e7-test-auto-resend-key-check.yml": "secrets.E7_RESEND_TEST_KEY" };
   for (const f of readdirSync(join(ROOT, ".github/workflows"))) {
     const t = readFileSync(join(ROOT, ".github/workflows", f), "utf8");
     if (Object.hasOwn(DIAG, f)) {
