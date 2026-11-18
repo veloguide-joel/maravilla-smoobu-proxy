@@ -134,9 +134,9 @@ test("W7 probe re-check block executed locally (BEFORE any secret): HEAD / tooli
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
 
-test("W8 C120 ACTIVATION ENABLE: the booking runners are in the reviewed ACTIVATION ENABLE state (kickoff executeEnabled / dispatchEnabled true, pipeline executeEnabled true; the CLOSE companion restores false); the probe adds no booking / dispatch capability", async () => {
-  assert.deepEqual([K.CONSTANTS.executeEnabled, K.CONSTANTS.dispatchEnabled], [true, true]);
-  const PL = await import("../scripts/e7-hosted-pipeline.mjs"); assert.equal(PL.CONSTANTS.executeEnabled, true);
+test("W8 booking runners untouched and CLOSED: kickoff executeEnabled / dispatchEnabled false, pipeline executeEnabled false; the probe adds no booking / dispatch capability", async () => {
+  assert.deepEqual([K.CONSTANTS.executeEnabled, K.CONSTANTS.dispatchEnabled], [false, false]);
+  const PL = await import("../scripts/e7-hosted-pipeline.mjs"); assert.equal(PL.CONSTANTS.executeEnabled, false);
   const src = readFileSync(join(ROOT, "scripts/e7-hosted-tls-probe.mjs"), "utf8");
   assert.doesNotMatch(src, /runKickoffCore|runPipelineKickoffOnce|createGithub|workflow_dispatch\b.*POST|stripe|hostaway|resend/i);
 });
