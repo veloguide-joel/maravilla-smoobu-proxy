@@ -1,0 +1,130 @@
+# E7 C119 S3: HOSTED READ-ONLY TEST STATUS / RECONCILIATION runner (scripts/e7-hosted-status.mjs) — it REPORTS counts / codes, it never repairs.
+# SHIPPED CLOSED: the runner's readEnabled is FALSE — `verify` (and therefore the status job) refuses STS_READ_CLOSED before any import, credential,
+# database or network; the secret step below is never reached while it is closed. HONEST LABEL: MANUAL workflow_dispatch ONLY (no schedule, no arm,
+# no activation wiring — that is future, separately reviewed work); OUTSIDE the C119 S2 arm release. Default mode `preflight` = no environment, no
+# secret, no database (digests only). The ONLY secret (existing NAME E7_DEV_BOOKING_DATABASE_URL = the runtime role, environment `e7-readonly-probe`)
+# appears in the ONE last status step only; ONE read-only snapshot; no provider credential; no write. No new secret, environment, permission or setting.
+# Source digest = SHA-256 over: prefix "e7-hosted-status-v1\n", then for each file IN THIS ORDER
+#   1. scripts/e7-hosted-status.mjs  2. test/e7-hosted-status.test.mjs  3. test/e7-hosted-status-workflow.test.mjs  4. .github/workflows/e7-hosted-status.yml
+# the frame  <relative path> NUL <decimal byte length> NUL <file bytes> NUL  (the framedDigest convention of the reviewed runners).
+name: e7-hosted-status
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "preflight (default: no environment, no secret, no database) or status (SHIPPED CLOSED: refuses at verify; main only; ONE read-only snapshot)"
+        type: choice
+        options: [preflight, status]
+        default: preflight
+      expected_source_digest:
+        description: "status only: exact 64-hex source digest printed by a preflight of this SAME commit (no default)"
+        type: string
+        required: false
+        default: ""
+      expected_closure_digest:
+        description: "status only: exact 64-hex closure digest of the pinned tooling (no default)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e7-hosted-status
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout wrapper (this repository, exact dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout merged E7 tooling (fixed commit 66133a22)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: 66133a22edca925e6386c4d178c251fa5f11c82e
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Preflight (runner; digests + layout; no environment, no secret, no database, no dependency install)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+        run: node wrapper/scripts/e7-hosted-status.mjs preflight
+
+  status:
+    needs: preflight
+    if: inputs.mode == 'status' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: e7-readonly-probe
+    timeout-minutes: 10
+    steps:
+      - name: Checkout wrapper (this repository, exact dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout merged E7 tooling (fixed commit 66133a22)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: 66133a22edca925e6386c4d178c251fa5f11c82e
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Re-check bindings BEFORE the secret (HEAD == dispatch SHA; tooling pin; expected digests 64-hex; source digest)
+        env:
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_TOOLING_PIN: 66133a22edca925e6386c4d178c251fa5f11c82e
+          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
+          E7_EXPECTED_CLOSURE_DIGEST: ${{ inputs.expected_closure_digest }}
+        run: |
+          set -eu
+          head="$(git -C wrapper rev-parse HEAD)"
+          [ "$head" = "$E7_WORKFLOW_SHA" ] || { echo "REFUSED: wrapper HEAD != dispatch SHA"; exit 3; }
+          tool="$(git -C tooling rev-parse HEAD)"
+          [ "$tool" = "$E7_TOOLING_PIN" ] || { echo "REFUSED: tooling HEAD != pin"; exit 3; }
+          for v in "$E7_EXPECTED_SOURCE_DIGEST" "$E7_EXPECTED_CLOSURE_DIGEST"; do printf '%s' "$v" | grep -Eq '^[0-9a-f]{64}$' || { echo "REFUSED: expected digest not 64-hex"; exit 3; }; done
+          d="$({ printf 'e7-hosted-status-v1\n'; for f in scripts/e7-hosted-status.mjs test/e7-hosted-status.test.mjs test/e7-hosted-status-workflow.test.mjs .github/workflows/e7-hosted-status.yml; do printf '%s\0%s\0' "$f" "$(stat -c%s "wrapper/$f")"; cat "wrapper/$f"; printf '\0'; done; } | sha256sum | cut -d' ' -f1)"
+          [ "$d" = "$E7_EXPECTED_SOURCE_DIGEST" ] || { echo "REFUSED: expected_source_digest mismatch (actual $d)"; exit 3; }
+          echo "bindings ok: wrapper=$head tooling=$tool source=$d"
+      - name: Verify (runner; SHIPPED CLOSED → STS_READ_CLOSED here; no secret, no database)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
+          E7_EXPECTED_CLOSURE_DIGEST: ${{ inputs.expected_closure_digest }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: node wrapper/scripts/e7-hosted-status.mjs verify
+      - name: Install the pinned dependency from the verified lockfile (no lifecycle scripts)
+        working-directory: tooling
+        run: npm ci --ignore-scripts --omit=dev --no-audit --no-fund
+      - name: Fetch the public Supabase CA (the runner checks its pinned SHA-256)
+        run: curl --fail --silent --show-error --proto '=https' --max-time 20 -o "$RUNNER_TEMP/prod-ca-2021.crt" https://supabase-downloads.s3-ap-southeast-1.amazonaws.com/prod/ssl/prod-ca-2021.crt
+      - name: ONE read-only status snapshot (the DB secret only, this step only; counts / codes only; no write, no provider)
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
+          E7_EXPECTED_CLOSURE_DIGEST: ${{ inputs.expected_closure_digest }}
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          E7_CA_FILE: ${{ runner.temp }}/prod-ca-2021.crt
+          E7_DEV_BOOKING_DATABASE_URL: ${{ secrets.E7_DEV_BOOKING_DATABASE_URL }}
+        run: node wrapper/scripts/e7-hosted-status.mjs status
