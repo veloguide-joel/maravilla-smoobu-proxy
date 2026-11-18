@@ -47,6 +47,17 @@
 //     queue-draining behaviour.
 //   * DETECT-FLOW EXECUTE: no hand-bound identifier. The core re-selects server-side, requires the SAME fingerprint (else NBC_CANDIDATE_CHANGED), then
 //     runs the unchanged admission + the ONE accepted worker invocation under its existing claim / lease / latch / receipt / sink-scope fences.
+//   * rev 2 (ROOT F1, review 6964982942) FACT BINDING: the fingerprint ALSO binds the candidate's recipient + render facts, read through the EXISTING
+//     reviewed runtime read path booking.guest_notification_snapshot(op) (granted to the runtime role in 0016; the accepted worker's own initial
+//     observation; READ ONLY REPEATABLE READ only) — ONLY its two SQL hashes are kept (factsHash = gn_hash_facts(facts), recipientHash =
+//     gn_recipient_hash_of(email, first name)); the raw recipient / name / facts are discarded at once and never reach a result, log or output.
+//     Not ELIGIBLE / a pending SQL refusal code → DETECT_FACTS_REFUSED; missing / malformed → DETECT_FACTS_UNREADABLE (STOP, never a guess).
+//     Execute recomputes it (a) in the re-selection, (b) again right before the ONE worker invocation, and (c) through the accepted worker's existing
+//     hooks.afterInitialObservation seam — AFTER the worker's own snapshot and BEFORE any claim / render / send — in a fresh read-only snapshot:
+//     any difference → NBC_BOUND_FACTS_MISMATCH with ZERO sends (the documented hook-throw residual: the work lease is left to expire).
+//     RESIDUAL WINDOW (not closed here): a change committed AFTER (c) is governed only by the accepted worker's own fences — its claim binds the hashes
+//     of ITS snapshot (claim_guest_notification_v2) and its pre-send observation refuses FACTS_CHANGED / RECIPIENT_CHANGED; the final synchronous
+//     section between that pre-send observation and the provider call is the worker's documented minimal window.
 import process from "node:process";
 import { readFile, realpath, lstat } from "node:fs/promises";
 import { appendFileSync } from "node:fs";
@@ -111,7 +122,7 @@ const WORKER_ID_RE = /^[A-Za-z0-9._:-]{1,64}$/;
 export const PLAN_SCHEMA = "e7-hosted-booking-confirmation-plan-v1";
 export const RESULT_SCHEMA = "e7-hosted-booking-confirmation-result-v1";
 export const CORE_CODES = freeze(["PROVIDER_ACCEPTED", "PROVIDER_ACCEPTED_REPLAY", "ACCEPTED_UNVERIFIED_STOP", "UNKNOWN_STOP", "NOT_SENT", "NBC_ADMISSION_REFUSED", "NBC_BOUND_OP_MISMATCH",
-  "NBC_WORKER_REFUSED", "NBC_WORKER_ERROR", "NBC_EXECUTOR_INVALID", "NBC_DB_FAILED", "NBC_DB_TIMEOUT", "NBC_BUDGET", "NBC_CANDIDATE_CHANGED"]);
+  "NBC_WORKER_REFUSED", "NBC_WORKER_ERROR", "NBC_EXECUTOR_INVALID", "NBC_DB_FAILED", "NBC_DB_TIMEOUT", "NBC_BUDGET", "NBC_CANDIDATE_CHANGED", "NBC_BOUND_FACTS_MISMATCH"]);
 export const ADMISSION_CODES = freeze(["NOT_READ_ONLY", "ROLE_REFUSED", "CATALOG_NOT_27", "NOT_TEST", "INTENT_NOT_FOUND", "INTENT_EXCLUDED", "LISTING_MISMATCH",
   "VERSION_MISMATCH", "CURRENCY_NOT_USD", "STATE_NOT_CONFIRMED", "PROTECTED", "EXTERNALLY_CANCELLED", "CANCELLATION_UNREADABLE", "OP_COUNT", "OP_NOT_BOUND", "OP_NOT_PRISTINE", "OP_PAYLOAD_SHAPE", "TEMPLATE_NOT_V2",
   "CLASS_NOT_ELIGIBLE", "RENDER_PRESENT", "LATCH_PRESENT", "RECEIPT_PRESENT", "WORK_LEASED", "REPLY_SHAPE"]);
@@ -121,7 +132,7 @@ export const HOSTED_CODES = freeze(["NBC_USAGE", "NBC_INPUT_UNEXPECTED", "NBC_EX
   "NBC_CA_INVALID", "NBC_INTERNAL"]);
 export const DETECT_OUTCOMES = freeze(["NONE", "ONE", "STOP"]);
 export const DETECT_CODES = freeze(["DETECT_NONE", "DETECT_ONE", "DETECT_ATTENTION", "DETECT_MORE_THAN_ONE", "DETECT_BUDGET", "DETECT_REPLY_SHAPE", "DETECT_SESSION_REFUSED",
-  "DETECT_NOT_ADMISSIBLE", "DETECT_DB_FAILED", "DETECT_DB_TIMEOUT"]);
+  "DETECT_FACTS_REFUSED", "DETECT_FACTS_UNREADABLE", "DETECT_NOT_ADMISSIBLE", "DETECT_DB_FAILED", "DETECT_DB_TIMEOUT"]);
 
 // ---- LABELLED COPIES of scripts/e7-hosted-reservation.mjs pure helpers (asserted equal by the tests) -------------------------------------
 export function canonical(v) {
@@ -335,8 +346,23 @@ export async function admit({ client, plan, c = CONSTANTS }) {
 // ---- C119 S1: server-side read-only DETECT of ONE eligible booking_confirmed op -----------------------------------------------------------
 export const DETECT_QUERIES = deepFreeze({
   page: `SELECT l.op_id::text AS op_id, l.intent_id::text AS intent_id, l.template AS template, l.class AS class, (l.created_at >= $4::timestamptz) AS in_scope
-    FROM booking.list_guest_notifications($1::int[], $2::uuid, $3::int) l`
+    FROM booking.list_guest_notifications($1::int[], $2::uuid, $3::int) l`,
+  snapshot: "SELECT booking.guest_notification_snapshot($1::uuid) AS r"    // rev 2: the accepted worker's own reviewed read path (READ ONLY RR only)
 });
+/** rev 2: the candidate's recipient + render-facts binding from ONE guest_notification_snapshot reply — ONLY its two SQL hashes are used (pure) */
+export const FACTS_BINDING_SCHEMA = "e7-hbc-detect-facts-v1";
+export const FINGERPRINT_SCHEMA = "e7-hbc-detect-fingerprint-v1";
+export function factsBindingOf(r) {
+  if (!r || typeof r !== "object" || Array.isArray(r) || typeof r.class !== "string") return freeze({ ok: false, code: "DETECT_FACTS_UNREADABLE" });
+  if (r.class !== "ELIGIBLE") return freeze({ ok: false, code: "DETECT_FACTS_REFUSED" });                  // no longer eligible at this snapshot
+  if (!Object.hasOwn(r, "code") || !(r.code === null || typeof r.code === "string")) return freeze({ ok: false, code: "DETECT_FACTS_UNREADABLE" });
+  if (r.code !== null) return freeze({ ok: false, code: "DETECT_FACTS_REFUSED" });                          // a pending SQL refusal (the claim would latch / wait)
+  if (r.template !== "booking_confirmed" || typeof r.factsHash !== "string" || !HEX64.test(r.factsHash) || typeof r.recipientHash !== "string" || !HEX64.test(r.recipientHash))
+    return freeze({ ok: false, code: "DETECT_FACTS_UNREADABLE" });
+  return freeze({ ok: true, binding: sha(canonical({ schema: FACTS_BINDING_SCHEMA, factsHash: r.factsHash, recipientHash: r.recipientHash })) });
+}
+/** the detection fingerprint = H(the server-derived planHash, the facts binding) */
+export const detectFingerprint = (planHash, factsBinding) => sha(canonical({ schema: FINGERPRINT_SCHEMA, planHash, factsBinding }));
 const TERMINAL_CLASSES = freeze(["SUCCEEDED", "LATCHED"]);
 const UNRESOLVED_OTHER_TEMPLATE = freeze(["IN_FLIGHT", "UNKNOWN"]);
 /**
@@ -388,14 +414,31 @@ export async function selectCandidate({ client, c = CONSTANTS }) {
     if (!INTENT_RE.test(cand.intentId) || cand.intentId === cand.opId) return done("STOP", "DETECT_REPLY_SHAPE");
     const ir = await q(Q.intent, [cand.intentId, [...c.protectedReservationIds]]);
     const i = one(ir); if (!i || i.id !== cand.intentId || !Number.isSafeInteger(i.version) || i.version < 1 || i.version > 9999999) return done("STOP", "DETECT_REPLY_SHAPE");
-    return done("ONE", "DETECT_ONE", { intentId: cand.intentId, opId: cand.opId, version: i.version });
+    // rev 2: the recipient / render facts of THE SAME snapshot, as two SQL hashes only (the raw reply is discarded here)
+    const snap = one(await q(DETECT_QUERIES.snapshot, [cand.opId]));
+    const fb = factsBindingOf(snap?.r);
+    if (!fb.ok) return done("STOP", fb.code);
+    return done("ONE", "DETECT_ONE", { intentId: cand.intentId, opId: cand.opId, version: i.version, factsBinding: fb.binding });
   } finally {
     if (began) { let rt; try { await Promise.race([client.query(Q.rollback), new Promise((_, rej) => { rt = setTimeout(() => rej(new Error("rollback")), c.budgets.rollbackMs); })]); } catch { /* the connection is discarded */ } finally { clearTimeout(rt); } }
   }
 }
-/** the server-derived plan for a detected candidate: fixed label + locale; its planHash IS the fingerprint the execute run must reproduce */
+/** the server-derived plan for a detected candidate (fixed label + locale) + rev 2: the fingerprint binds its planHash AND the facts binding */
 export function detectPlan(c, cand, sourceDigest) {
-  return buildPlan(c, { approvalRef: c.detect.approvalRef, intentId: cand.intentId, opId: cand.opId, expectedVersion: cand.version, locale: c.detect.locale, sourceDigest });
+  const b = buildPlan(c, { approvalRef: c.detect.approvalRef, intentId: cand.intentId, opId: cand.opId, expectedVersion: cand.version, locale: c.detect.locale, sourceDigest });
+  const fp = typeof cand.factsBinding === "string" && HEX64.test(cand.factsBinding) ? detectFingerprint(b.planHash, cand.factsBinding) : null;
+  return freeze({ plan: b.plan, planHash: b.planHash, fingerprint: fp });
+}
+/** rev 2: ONE fresh read-only snapshot of the bound op's facts binding → { ok, binding } | { ok: false, code } (never throws; any error → UNREADABLE) */
+export async function readFactsBinding(cp, opId, c = CONSTANTS) {
+  let cl; try { cl = await cp.connect(); } catch { return freeze({ ok: false, code: "DETECT_FACTS_UNREADABLE" }); }
+  try {
+    await cl.query(ADMISSION_QUERIES.begin);
+    await cl.query(ADMISSION_QUERIES.bounds, [String(c.budgets.statementMs), String(c.budgets.lockMs), String(c.budgets.idleMs)]);
+    const r = await cl.query(DETECT_QUERIES.snapshot, [opId]);
+    return r && Array.isArray(r.rows) && r.rows.length === 1 ? factsBindingOf(r.rows[0]?.r) : freeze({ ok: false, code: "DETECT_FACTS_UNREADABLE" });
+  } catch { return freeze({ ok: false, code: "DETECT_FACTS_UNREADABLE" }); }
+  finally { try { await cl.query(ADMISSION_QUERIES.rollback); } catch { /* discarded */ } cl.release(true); }
 }
 export const DETECT_RESULT_SCHEMA = "e7-hosted-booking-confirmation-detect-v1";
 /** runDetectCore({ pool, c, sourceDigest }) → frozen { outcome, code, fingerprint, admission, counts, statements }. Never throws. Writes nothing. */
@@ -412,7 +455,8 @@ export async function runDetectCore({ pool, c = CONSTANTS, sourceDigest }) {
       let ac; try { ac = await cp.connect(); } catch (e) { refuse(e instanceof Refusal ? e.code : "NBC_DB_FAILED"); }
       let adm; try { adm = await admit({ client: ac, plan: built.plan, c }); } finally { ac.release(true); }
       if (!adm.ok) { out.outcome = "STOP"; out.code = "DETECT_NOT_ADMISSIBLE"; out.admission = adm.code; }
-      else { out.outcome = "ONE"; out.admission = "ADMITTED"; out.fingerprint = built.planHash; }
+      else if (!built.fingerprint) { out.outcome = "STOP"; out.code = "DETECT_FACTS_UNREADABLE"; }
+      else { out.outcome = "ONE"; out.admission = "ADMITTED"; out.fingerprint = built.fingerprint; }
     }
   } catch (e) {
     out.outcome = "STOP"; out.fingerprint = null;
@@ -441,7 +485,7 @@ export function countedPool(pool, c, counter) {
  * exchange = the reviewed single-use Resend exchange function (FAKE in every test); credential = () => key (never logged, never in the result).
  */
 export async function runBookingConfirmationCore({ pool, plan: boundPlan, c = CONSTANTS, tooling, exchange, credential, runId, detected = null }) {
-  let plan = boundPlan;
+  let plan = boundPlan; let boundFacts = null;
   const out = { schema: RESULT_SCHEMA, flow: detected ? "detect" : "manual", detectCode: null, code: null, admission: null, workerOutcome: null, workerCode: null, sendsAttempted: 0, workerInvocations: 0, statements: 0,
     providerAccepted: false, providerReplay: false, verifiedCompletion: false, readback: null, deliveryProven: false, postcheck: null };
   const counter = { statements: 0 };
@@ -455,8 +499,8 @@ export async function runBookingConfirmationCore({ pool, plan: boundPlan, c = CO
       out.detectCode = sel.code;
       if (sel.kind !== "ONE") refuse("NBC_CANDIDATE_CHANGED");
       const built = detectPlan(c, sel.candidate, detected.sourceDigest);
-      if (built.planHash !== detected.expectedFingerprint) refuse("NBC_CANDIDATE_CHANGED");
-      plan = built.plan;
+      if (!built.fingerprint || built.fingerprint !== detected.expectedFingerprint) refuse("NBC_CANDIDATE_CHANGED");
+      plan = built.plan; boundFacts = sel.candidate.factsBinding;
     }
     // 1. admission (read-only)
     let ac; try { ac = await cp.connect(); } catch (e) { refuse(e instanceof Refusal ? e.code : "NBC_DB_FAILED"); }
@@ -470,14 +514,18 @@ export async function runBookingConfirmationCore({ pool, plan: boundPlan, c = CO
     if (!ex || ex.ok !== true) refuse("NBC_EXECUTOR_INVALID");
     // 3. ONE accepted-worker invocation, scoped to the bound intent; the bound-op contract enforced through the accepted hooks
     const bind = async (opId) => { if (opId !== plan.opId) throw new Refusal("NBC_BOUND_OP_MISMATCH"); };
+    // rev 2 (detect flow): the facts binding recomputed right before the invocation AND through the existing afterInitialObservation seam
+    const factsOk = async () => { const fb = await readFactsBinding(cp, plan.opId, c); if (!fb.ok || fb.binding !== boundFacts) throw new Refusal("NBC_BOUND_FACTS_MISMATCH"); };
+    if (boundFacts !== null) { try { await factsOk(); } catch (e) { out.code = "NBC_BOUND_FACTS_MISMATCH"; throw e; } }
+    const observed = boundFacts === null ? bind : async (opId) => { await bind(opId); await factsOk(); };
     const opts = { env: { ...c.workerEnv }, workerId: `hbc-${runId}`, listingIds: [c.listingId], intentId: plan.intentId, sender: { ...c.sender }, clock: Date.now,
-      hooks: { afterInitialObservation: bind, afterClaim: bind }, [tooling.NOTIFICATION_V2_OPTION_KEY]: plan.locale, [tooling.NOTIFICATION_PROVIDER_OPTION_KEY]: ex.executor };
+      hooks: { afterInitialObservation: observed, afterClaim: bind }, [tooling.NOTIFICATION_V2_OPTION_KEY]: plan.locale, [tooling.NOTIFICATION_PROVIDER_OPTION_KEY]: ex.executor };
     if (!WORKER_ID_RE.test(opts.workerId)) refuse("NBC_WORKER_REFUSED");
     out.workerInvocations += 1; if (out.workerInvocations > c.budgets.workerInvocations) refuse("NBC_BUDGET");
     let w;
     try { w = await tooling.runNotificationStep(cp, opts); }
-    catch (e) { out.code = e instanceof Refusal && ["NBC_BOUND_OP_MISMATCH", "NBC_BUDGET", "NBC_DB_TIMEOUT", "NBC_DB_FAILED"].includes(e.code) ? e.code : "NBC_WORKER_ERROR";
-      if (calls > 0 && out.code !== "NBC_BOUND_OP_MISMATCH") out.code = "UNKNOWN_STOP"; throw new Refusal(out.code); }
+    catch (e) { out.code = e instanceof Refusal && ["NBC_BOUND_OP_MISMATCH", "NBC_BOUND_FACTS_MISMATCH", "NBC_BUDGET", "NBC_DB_TIMEOUT", "NBC_DB_FAILED"].includes(e.code) ? e.code : "NBC_WORKER_ERROR";
+      if (calls > 0 && out.code !== "NBC_BOUND_OP_MISMATCH" && out.code !== "NBC_BOUND_FACTS_MISMATCH") out.code = "UNKNOWN_STOP"; throw new Refusal(out.code); }
     if (!w || w.ok !== true) { out.workerCode = w && typeof w.code === "string" && CODE_RE.test(w.code) ? w.code : "REDACTED"; refuse("NBC_WORKER_REFUSED"); }
     out.workerOutcome = typeof w.outcome === "string" && TOKEN_RE.test(w.outcome) ? w.outcome : "redacted";
     out.workerCode = typeof w.code === "string" && CODE_RE.test(w.code) ? w.code : null;

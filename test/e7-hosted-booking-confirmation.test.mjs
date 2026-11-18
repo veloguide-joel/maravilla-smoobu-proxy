@@ -62,7 +62,7 @@ test("H1 SHIPPED CLOSED: executeEnabled false; verify AND execute refuse NBC_EXE
   for (const later of ["importEnv(tooling)", "importTooling(tooling)", "readCa(", "readPgVersion(", "framedDigest(tooling", "env.E7_DEV_BOOKING_DATABASE_URL", "env.E7_RESEND_TEST_KEY", "env[INPUT_ENV",
     "env.E7_INPUT_MODE", "env.E7_EXPECTED_CANDIDATE_FINGERPRINT", "runDetect({"])
     assert.ok(code.indexOf(later) > iClosed, `${later} only after the CLOSED gate`);
-  assert.doesNotMatch(code, /claim_guest_notification|complete_guest_notification|latch_guest_notification|recover_expired|release_notification_work|claim_notification_work|guest_notification_snapshot|guest_notification_presend|suppress_guest|purge_guest|stripe|hostaway\.com/i);
+  assert.doesNotMatch(code, /claim_guest_notification|complete_guest_notification|latch_guest_notification|recover_expired|release_notification_work|claim_notification_work|guest_notification_presend|suppress_guest|purge_guest|stripe|hostaway\.com/i);
   assert.doesNotMatch(code, /\b(INSERT|UPDATE|DELETE|TRUNCATE|MERGE)\b/, "no SQL write keyword anywhere in the runner (the ONLY write path is the accepted worker)");
   assert.match(src, /^if \(import\.meta\.main === true\) \{$/m);
   for (const [k, v] of Object.entries(Q)) {
@@ -71,7 +71,10 @@ test("H1 SHIPPED CLOSED: executeEnabled false; verify AND execute refuse NBC_EXE
   }
   assert.equal(Q.cancellation, "SELECT booking.external_cancellation_public($1::uuid) AS x", "C119 S1: ONLY the minimal granted 0027 projection");
   assert.doesNotMatch(code, /externally_cancelled\s*\(|external_cancellations\b|external_refund_attestations\b/, "no ungranted 0027 read path");
-  for (const [k, v] of Object.entries(R.DETECT_QUERIES)) { assert.match(v, /^SELECT /, k); assert.deepEqual([...v.matchAll(/booking\.([a-z_0-9]+)\s*\(/g)].map((m) => m[1]), ["list_guest_notifications"], k); }
+  assert.deepEqual(Object.keys(R.DETECT_QUERIES), ["page", "snapshot"]);
+  for (const [k, v] of Object.entries(R.DETECT_QUERIES)) { assert.match(v, /^SELECT /, k); assert.deepEqual([...v.matchAll(/booking\.([a-z_0-9]+)\s*\(/g)].map((m) => m[1]), [k === "page" ? "list_guest_notifications" : "guest_notification_snapshot"], k); }
+  assert.equal(R.DETECT_QUERIES.snapshot, "SELECT booking.guest_notification_snapshot($1::uuid) AS r", "rev 2: the accepted worker's own read-only observation function (runtime grant since 0016), nothing else");
+  assert.equal((code.match(/guest_notification_snapshot/g) || []).length, 1, "the snapshot read path appears exactly once (the reviewed query constant)");
   assert.match(R.POSTCHECK_QUERY, /^SELECT /); assert.doesNotMatch(R.POSTCHECK_QUERY, /booking\.[a-z_]+\s*\(/);
 });
 
@@ -255,7 +258,7 @@ function world(over = {}) {
 function fakeClient(w, log) {
   let page = 0;
   return { query: async (t, p) => {
-    const k = Object.keys(Q).find((x) => Q[x] === t) ?? (t === R.POSTCHECK_QUERY ? "postcheck" : t === R.DETECT_QUERIES.page ? "dpage" : (t.startsWith("BEGIN") || t === "ROLLBACK") ? "tx" : null);
+    const k = Object.keys(Q).find((x) => Q[x] === t) ?? (t === R.POSTCHECK_QUERY ? "postcheck" : t === R.DETECT_QUERIES.page ? "dpage" : t === R.DETECT_QUERIES.snapshot ? "dsnap" : (t.startsWith("BEGIN") || t === "ROLLBACK") ? "tx" : null);
     log.push(k ?? "UNLISTED"); if (!k) throw new Error("unlisted");
     if (w.throwAt === k) throw new Error("SENTINEL db FAKEPW");
     switch (k) {
@@ -263,6 +266,7 @@ function fakeClient(w, log) {
       case "catalog": return { rows: [{ id: { sections: w.catalog.sections, readPath: w.catalog.readPath, readPathCount: w.catalog.readPathCount } }] };
       case "instance": return { rows: [w.instance] }; case "intent": return { rows: w.intent }; case "ops": return { rows: w.ops };
       case "cancellation": return { rows: w.cancellation ?? [{ x: null }] };
+      case "dsnap": { const sn = w.snaps ? (w.snaps[w._sn = (w._sn ?? -1) + 1] ?? w.snaps.at(-1)) : (Object.hasOwn(w, "snapshot") ? w.snapshot : SNAP_OK); return sn === "NO_ROW" ? { rows: [] } : { rows: [{ r: sn }] }; }
       case "dpage": { log.push(`dpage:${JSON.stringify(p.slice(1))}`); return { rows: (w.dpages ?? [[{ op_id: OID, intent_id: IID, template: "booking_confirmed", class: "ELIGIBLE", in_scope: true }]])[w._dp = (w._dp ?? -1) + 1] ?? [] }; }
       case "page": return { rows: w.pages[page++] ?? [] }; case "artefacts": return { rows: [w.artefacts] };
       case "postcheck": return w.postRows !== undefined ? { rows: w.postRows } : { rows: [w.post ?? POST_OK] };
@@ -270,6 +274,8 @@ function fakeClient(w, log) {
     } }, release: () => {} };
 }
 const fakePool = (w, log) => ({ connect: async () => fakeClient(w, log) });
+const SNAP_OK = Object.freeze({ class: "ELIGIBLE", code: null, template: "booking_confirmed", factsHash: "1".repeat(64), recipientHash: "2".repeat(64), email: "SENTINEL@example.test", firstName: "Synthia",
+  facts: { ref: "MV-SENTINEL", totalMinor: 14000 } });
 const POST_OK = Object.freeze({ state: "succeeded", attempts: 1, resend_ref: true, error_code: null, receipts: 1, replayed: false, template_version: "gn-v2", locale: "en" });
 function fakeTooling(behaviour) {
   const st = { invocations: 0, executors: 0, opts: null };
@@ -380,18 +386,35 @@ test("H9 C51 verified completion (fake): an accepted worker outcome with the rea
 const OID2 = "7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0e"; const IID2 = "3f1c2b4a-5d6e-4f70-8a91-b2c3d4e5f608";
 const row = (o = {}) => ({ op_id: OID, intent_id: IID, template: "booking_confirmed", class: "ELIGIBLE", in_scope: true, ...o });
 const detectWith = (over, c = OPEN) => { const log = []; return R.runDetectCore({ pool: fakePool(world(over), log), c, sourceDigest: "a".repeat(64) }).then((res) => ({ res, log })); };
-const FP = R.detectPlan(OPEN, { intentId: IID, opId: OID, version: VER }, "a".repeat(64)).planHash;
+const FB = R.factsBindingOf(SNAP_OK).binding;
+const FP = R.detectPlan(OPEN, { intentId: IID, opId: OID, version: VER, factsBinding: FB }, "a".repeat(64)).fingerprint;
 
 test("H10 C119 detect (fake): NONE / ONE / conservative STOP; the fingerprint is the planHash of the server-derived plan; every in-scope unknown / in-flight / other / waiting / out-of-scope / unrecognised class STOPs (never skipped); >1 eligible → STOP DETECT_MORE_THAN_ONE (capacity limitation); bounded pages; historic / excluded / other-template rows never selected; the candidate must pass the UNCHANGED admission (incl. the 0027 projection); outputs carry no identifier", async () => {
   const one = await detectWith({});
   assert.deepEqual([one.res.outcome, one.res.code, one.res.admission, one.res.fingerprint], ["ONE", "DETECT_ONE", "ADMITTED", FP]);
-  assert.equal(FP, R.buildPlan(OPEN, { approvalRef: "E7-HBC-DETECT-v1", intentId: IID, opId: OID, expectedVersion: VER, locale: "en", sourceDigest: "a".repeat(64) }).planHash);
-  assert.notEqual(FP, R.detectPlan(OPEN, { intentId: IID, opId: OID, version: VER + 1 }, "a".repeat(64)).planHash, "the version is bound");
-  assert.notEqual(FP, R.detectPlan(OPEN, { intentId: IID, opId: OID, version: VER }, "b".repeat(64)).planHash, "the source is bound");
+  const PH = R.buildPlan(OPEN, { approvalRef: "E7-HBC-DETECT-v1", intentId: IID, opId: OID, expectedVersion: VER, locale: "en", sourceDigest: "a".repeat(64) }).planHash;
+  assert.equal(FP, R.detectFingerprint(PH, FB)); assert.notEqual(FP, PH, "rev 2: the fingerprint is NOT the bare plan hash");
+  assert.equal(FB, sha(R.canonical({ schema: "e7-hbc-detect-facts-v1", factsHash: SNAP_OK.factsHash, recipientHash: SNAP_OK.recipientHash })), "ONLY the two SQL hashes are bound");
+  assert.notEqual(FP, R.detectPlan(OPEN, { intentId: IID, opId: OID, version: VER + 1, factsBinding: FB }, "a".repeat(64)).fingerprint, "the version is bound");
+  assert.notEqual(FP, R.detectPlan(OPEN, { intentId: IID, opId: OID, version: VER, factsBinding: FB }, "b".repeat(64)).fingerprint, "the source is bound");
+  for (const k of ["factsHash", "recipientHash"]) {
+    const other = R.factsBindingOf({ ...SNAP_OK, [k]: "3".repeat(64) }).binding;
+    assert.notEqual(R.detectPlan(OPEN, { intentId: IID, opId: OID, version: VER, factsBinding: other }, "a".repeat(64)).fingerprint, FP, `${k} is bound`);
+  }
+  assert.equal(R.factsBindingOf({ ...SNAP_OK, email: "other@x.invalid", firstName: "Other", facts: {} }).binding, FB, "raw values never enter the binding (only the SQL hashes do)");
+  assert.equal(R.detectPlan(OPEN, { intentId: IID, opId: OID, version: VER }, "a".repeat(64)).fingerprint, null, "no facts binding → no fingerprint");
+  // rev 2: the facts snapshot — refused / unreadable / malformed → STOP, never a guess
+  for (const [snapshot, code] of [[{ ...SNAP_OK, class: "WAITING" }, "DETECT_FACTS_REFUSED"], [{ class: "PROTECTED" }, "DETECT_FACTS_REFUSED"], [{ ...SNAP_OK, code: "VERSION_DRIFT" }, "DETECT_FACTS_REFUSED"],
+    [(({ code, ...x }) => x)(SNAP_OK), "DETECT_FACTS_UNREADABLE"], [{ ...SNAP_OK, code: 3 }, "DETECT_FACTS_UNREADABLE"], [{ ...SNAP_OK, template: "not_completed_not_charged" }, "DETECT_FACTS_UNREADABLE"],
+    [{ ...SNAP_OK, factsHash: null }, "DETECT_FACTS_UNREADABLE"], [{ ...SNAP_OK, recipientHash: "X".repeat(64) }, "DETECT_FACTS_UNREADABLE"], [{ ...SNAP_OK, factsHash: "1".repeat(63) }, "DETECT_FACTS_UNREADABLE"],
+    [null, "DETECT_FACTS_UNREADABLE"], [[], "DETECT_FACTS_UNREADABLE"], ["ELIGIBLE", "DETECT_FACTS_UNREADABLE"], ["NO_ROW", "DETECT_FACTS_UNREADABLE"]]) {
+    const r = await detectWith({ snapshot }); assert.deepEqual([r.res.outcome, r.res.code, r.res.fingerprint], ["STOP", code, null], JSON.stringify(snapshot));
+  }
+  const thrown = await detectWith({ throwAt: "dsnap" }); assert.deepEqual([thrown.res.outcome, thrown.res.code], ["STOP", "DETECT_DB_FAILED"]);
   assert.ok(one.log.includes("dpage:[null,100,\"2026-11-15T22:58:01.000Z\"]"), "listing page, no cursor, the reviewed page limit + cutoff");
   assert.deepEqual([one.log.filter((k) => k === "begin").length, one.log.filter((k) => k === "rollback").length], [2, 2], "two read-only snapshots (selection + admission), each BEGIN … ROLLBACK");
   assert.ok(!one.log.includes("UNLISTED"));
-  for (const r of [one]) { const t = JSON.stringify(r.res); assert.ok(!t.includes(IID) && !t.includes(OID), "no intent / op id in the detect result"); assert.doesNotMatch(t, PII); }
+  for (const r of [one]) { const t = JSON.stringify(r.res); assert.ok(!t.includes(IID) && !t.includes(OID) && !t.includes("1".repeat(64)) && !t.includes("2".repeat(64)) && !t.includes(FB), "no intent / op id / facts hash in the detect result"); assert.doesNotMatch(t, PII); }
   const none = [[[]], [[row({ class: "SUCCEEDED" }), row({ op_id: OID2, intent_id: IID2, class: "LATCHED" })]], [[row({ in_scope: false })]], [[row({ in_scope: false, class: "UNKNOWN" })]],
     [[row({ intent_id: "1d6e770f-ba3d-40f7-92c1-ee01be7da532" })]], [[row({ intent_id: "abede8b1-8ef6-44f2-876e-6a02fc056a96" })]], [[row({ template: "not_completed_not_charged" })]],
     [[row({ template: "not_charged_authorization_may_show", class: "OTHER" })]]];
@@ -445,6 +468,20 @@ test("H11 C119 detect-flow core (fake): re-selects server-side and requires the 
     assert.deepEqual([r.res.workerInvocations, r.res.sendsAttempted, r.st.executors], [0, 0, 0], why);
     assert.ok(["NBC_CANDIDATE_CHANGED", "NBC_DB_FAILED"].includes(r.res.code), `${why}: ${r.res.code}`);
   }
+  // rev 2: the facts binding is recomputed BEFORE the invocation and AGAIN in the accepted worker's afterInitialObservation seam
+  const CHG = { ...SNAP_OK, recipientHash: "4".repeat(64) };
+  const pre = await dcore(world({ snaps: [SNAP_OK, CHG] }), FP, () => assert.fail("worker must not run"));
+  assert.deepEqual([pre.res.code, pre.res.workerInvocations, pre.res.sendsAttempted, pre.st.executors], ["NBC_BOUND_FACTS_MISMATCH", 0, 0, 1], "changed after the re-selection, before the invocation");
+  const inHook = await dcore(world({ snaps: [SNAP_OK, SNAP_OK, { ...SNAP_OK, factsHash: "5".repeat(64) }] }), FP);
+  assert.deepEqual([inHook.res.code, inHook.res.workerInvocations, inHook.res.sendsAttempted], ["NBC_BOUND_FACTS_MISMATCH", 1, 0], "changed inside the worker's observation window: refused by the existing hook before any claim / send");
+  for (const bad of [{ ...SNAP_OK, class: "LATCHED" }, "NO_ROW", { ...SNAP_OK, factsHash: null }]) {
+    const r = await dcore(world({ snaps: [SNAP_OK, SNAP_OK, bad] }), FP); assert.deepEqual([r.res.code, r.res.sendsAttempted], ["NBC_BOUND_FACTS_MISMATCH", 0], JSON.stringify(bad));
+  }
+  const thr = await dcore(world({ snaps: [SNAP_OK, SNAP_OK], throwAt: null }), FP, async (opts, st) => { await opts.hooks.afterInitialObservation(OID); await st.exchange({}); return { ok: true, outcome: "accepted", opId: OID }; });
+  assert.equal(thr.res.code, "PROVIDER_ACCEPTED", "unchanged facts (the default snapshot repeated) still verify");
+  const sameFacts = await dcore(world({ snaps: [{ ...SNAP_OK, email: "other@mv-test.invalid", firstName: "Zed" }] }), FP);
+  assert.equal(sameFacts.res.code, "PROVIDER_ACCEPTED", "raw fields that the SQL hashes do not cover cannot change the binding (the hashes ARE the recipient / facts identity)");
+  assert.doesNotMatch(JSON.stringify(inHook.res) + JSON.stringify(pre.res), /4{64}|5{64}|1{64}|2{64}/, "no facts hash in any result");
   const plus = await R.runBookingConfirmationCore({ pool: fakePool(world(), []), plan: PLAN, c: OPEN, tooling: fakeTooling(() => assert.fail("never")).tooling, exchange: async () => {}, credential: () => KEY, runId: "123456789-1",
     detected: { expectedFingerprint: FP, sourceDigest: "a".repeat(64) } });
   assert.deepEqual([plus.code, plus.workerInvocations], ["NBC_CANDIDATE_CHANGED", 0], "a hand-bound plan is never mixed into a detect flow");
@@ -711,13 +748,18 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
     return (await db.reconciler.query("SELECT booking.admin_record_external_cancellation($1,$2,$3::uuid[],$4,$5,$6,$7,$8,$9,$10,$11) AS r",
       [bk.id, res.v, [ev], ev, "pending", null, null, "owner", "hostaway-dash-check-c119", "OWNER_CANCELLED_IN_HOSTAWAY", `c119-${bk.id.slice(0, 8)}`])).rows[0].r;
   };
+  /** rev 2: an INDEPENDENT recompute of the facts binding as the OWNER (the same SQL hash functions, not the runtime snapshot path) */
+  const ownerBinding = async (bk) => { const h = (await db.owner.query(`SELECT booking.gn_hash_facts(booking.guest_notification_facts($1)) AS f,
+      (SELECT booking.gn_recipient_hash_of(g.email, g.first_name) FROM booking.intent_guests g WHERE g.intent_id = $2) AS r`, [bk.op.id, bk.id])).rows[0];
+    return sha(R.canonical({ schema: "e7-hbc-detect-facts-v1", factsHash: h.f, recipientHash: h.r })); };
+  const fpOf = async (bk, version = bk.version) => R.detectPlan(cOf(bk.listingId), { intentId: bk.id, opId: bk.op.id, version, factsBinding: await ownerBinding(bk) }, SRC_A).fingerprint;
   const noIds = (r, ...bks) => { const t = JSON.stringify(r); for (const b of bks) { assert.ok(!t.includes(b.id) && !t.includes(b.op.id), "no intent / op id in the result"); } assert.doesNotMatch(t, PII); };
 
   test("D8 C119 detect → ONE → detect-flow execute on REAL PG27: detect writes NOTHING (every booking table identical) and outputs no identifier; the execute re-selects, matches the fingerprint and makes ONE real worker invocation → ONE fake 200 → PROVIDER_ACCEPTED + VERIFIED; afterwards detect → NONE (SUCCEEDED is terminal), the SAME fingerprint replayed → NBC_CANDIDATE_CHANGED with ZERO calls, and the manual path is refused OP_NOT_PRISTINE (already sent)", async () => {
     const bk = await ready(); const f0 = await fingerprint();
     const d = await detect(bk.listingId);
     assert.deepEqual([d.outcome, d.code, d.admission, d.counts.eligible, d.counts.attention], ["ONE", "DETECT_ONE", "ADMITTED", 1, 0], JSON.stringify(d));
-    assert.equal(d.fingerprint, R.detectPlan(cOf(bk.listingId), { intentId: bk.id, opId: bk.op.id, version: bk.version }, SRC_A).planHash, "fingerprint == the server-derived plan hash");
+    assert.equal(d.fingerprint, await fpOf(bk), "fingerprint == H(server-derived plan hash, owner-recomputed facts / recipient hashes)");
     assert.deepEqual(await fingerprint(), f0, "detect is read-only"); noIds(d, bk);
     const fx = fakeExchange(ok200); const r = await dexec(bk.listingId, d.fingerprint, fx);
     assert.deepEqual([r.flow, r.detectCode, r.code, r.admission, r.workerInvocations, fx.calls, r.verifiedCompletion, r.readback], ["detect", "DETECT_ONE", "PROVIDER_ACCEPTED", "ADMITTED", 1, 1, true, "VERIFIED"]);
@@ -733,7 +775,7 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
     const a = await ready(); const b = await ready({ listingId: a.listingId }); const f0 = await fingerprint();
     const d = await detect(a.listingId);
     assert.deepEqual([d.outcome, d.code, d.fingerprint, d.counts.eligible], ["STOP", "DETECT_MORE_THAN_ONE", null, 2]); noIds(d, a, b);
-    for (const fp of [R.detectPlan(cOf(a.listingId), { intentId: a.id, opId: a.op.id, version: a.version }, SRC_A).planHash, R.detectPlan(cOf(a.listingId), { intentId: b.id, opId: b.op.id, version: b.version }, SRC_A).planHash]) {
+    for (const fp of [await fpOf(a), await fpOf(b)]) {
       const fx = fakeExchange(ok200); const r = await dexec(a.listingId, fp, fx); assert.deepEqual([r.code, r.detectCode, r.workerInvocations, fx.calls], ["NBC_CANDIDATE_CHANGED", "DETECT_MORE_THAN_ONE", 0, 0]);
     }
     const future = await detect(a.listingId, { c: { detect: { ...OPEN.detect, cutoff: "2099-01-01T00:00:00.000Z" } } });
@@ -773,7 +815,7 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
     const b = await ready(); const db0 = await detect(b.listingId); assert.equal(db0.outcome, "ONE");
     await Hm.F.ownerManagedHistory(db.owner, "UPDATE booking.intents SET version = version + 1 WHERE id = $1", [b.id]);   // TEST SETUP (as D5)
     const fx2 = fakeExchange(ok200); const r2 = await dexec(b.listingId, db0.fingerprint, fx2);
-    assert.deepEqual([r2.code, r2.detectCode, r2.workerInvocations, fx2.calls], ["NBC_CANDIDATE_CHANGED", "DETECT_ONE", 0, 0], "re-selected, but the version moved: a different fingerprint");
+    assert.deepEqual([r2.code, r2.detectCode, r2.workerInvocations, fx2.calls], ["NBC_CANDIDATE_CHANGED", "DETECT_FACTS_REFUSED", 0, 0], "rev 2: the version moved past the op's source version → the snapshot's pending SQL refusal (VERSION_DRIFT) STOPs the re-selection");
   });
 
   test("D13 C119 two COMPETING detect / execute runs for the SAME candidate (both detect ONE, both execute concurrently with the same fingerprint): exactly ONE provider acceptance in total and the loser never reaches the exchange (the accepted worker's claim / lease fences are the authority, not detect)", async () => {
@@ -807,4 +849,39 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
     }
   });
 
+
+  test("D15 C119 rev 2 (ROOT F1) SAME-VERSION fact changes that stay ELIGIBLE: (1) the synthetic recipient moved to ANOTHER allowed synthetic .invalid recipient, (2) the guest first name changed — each keeps the intent version and the class ELIGIBLE, yet the old fingerprint is refused NBC_CANDIDATE_CHANGED with ZERO worker invocations / sends; a fresh detect yields a NEW fingerprint (== the owner recompute) that executes ONE send; an unchanged booking keeps its fingerprint across detects", async () => {
+    for (const [why, sql, val] of [["recipient", "UPDATE booking.intent_guests SET email = $2 WHERE intent_id = $1", "guest.moved.c119@mv-test.invalid"],
+      ["first name", "UPDATE booking.intent_guests SET first_name = $2 WHERE intent_id = $1", "Renamed"]]) {
+      const bk = await ready(); const d0 = await detect(bk.listingId); assert.equal(d0.outcome, "ONE", why);
+      assert.equal((await detect(bk.listingId)).fingerprint, d0.fingerprint, `${why}: unchanged facts → the same fingerprint`);
+      const v0 = (await db.owner.query("SELECT version FROM booking.intents WHERE id = $1", [bk.id])).rows[0].version;
+      await Hm.F.ownerManagedHistory(db.owner, sql, [bk.id, val]);   // TEST SETUP: the same intent version, still in scope
+      assert.equal((await db.owner.query("SELECT version FROM booking.intents WHERE id = $1", [bk.id])).rows[0].version, v0, `${why}: same version`);
+      const cls = (await db.app.query("SELECT l.class FROM booking.list_guest_notifications($1::int[], NULL, 100) l WHERE l.op_id = $2", [[bk.listingId], bk.op.id])).rows[0].class;
+      assert.equal(cls, "ELIGIBLE", `${why}: still eligible (this is fact binding, not an eligibility refusal)`);
+      const f0 = await fingerprint(); const fx = fakeExchange(ok200); const old = await dexec(bk.listingId, d0.fingerprint, fx);
+      assert.deepEqual([old.code, old.detectCode, old.workerInvocations, old.sendsAttempted, fx.calls], ["NBC_CANDIDATE_CHANGED", "DETECT_ONE", 0, 0, 0], why);
+      assert.deepEqual(await fingerprint(), f0, `${why}: nothing written by the refused execute`); noIds(old, bk);
+      const d1 = await detect(bk.listingId);
+      assert.deepEqual([d1.outcome, d1.fingerprint !== d0.fingerprint, d1.fingerprint === await fpOf(bk)], ["ONE", true, true], why);
+      const fx2 = fakeExchange(ok200); const ok = await dexec(bk.listingId, d1.fingerprint, fx2);
+      assert.deepEqual([ok.code, ok.verifiedCompletion, fx2.calls], ["PROVIDER_ACCEPTED", true, 1], `${why}: the re-detected binding sends ONCE`);
+    }
+  });
+
+  test("D16 C119 rev 2 a same-version recipient-name change committed INSIDE the accepted worker's observation window (after its own snapshot, before its claim): the existing afterInitialObservation seam recomputes the binding in a fresh read-only snapshot → NBC_BOUND_FACTS_MISMATCH with ONE invocation, ZERO sends, nothing claimed / rendered / sent (op pending, attempts 0); RESIDUAL (documented): the hook throw leaves the work lease to expire; later changes are governed only by the worker's claim + pre-send FACTS_CHANGED / RECIPIENT_CHANGED fences", async () => {
+    const bk = await ready(); const d = await detect(bk.listingId); assert.equal(d.outcome, "ONE");
+    const WORKER_SNAPSHOT = "SELECT booking.guest_notification_snapshot($1) AS r"; let mutated = 0;
+    const racing = { query: (t, p) => db.app.query(t, p), connect: async () => { const cl = await db.app.connect();
+      return { query: async (t, p) => { const r = await cl.query(t, p); if (t === WORKER_SNAPSHOT && mutated === 0) { mutated += 1;
+        await Hm.F.ownerManagedHistory(db.owner, "UPDATE booking.intent_guests SET first_name = $2 WHERE intent_id = $1", [bk.id, "Racer"]); } return r; }, release: (x) => cl.release(x) }; } };
+    const fx = fakeExchange(ok200); const r = await dexec(bk.listingId, d.fingerprint, fx, { pool: racing });
+    assert.equal(mutated, 1, "the change landed inside the worker's own observation window");
+    assert.deepEqual([r.code, r.workerInvocations, r.sendsAttempted, fx.calls], ["NBC_BOUND_FACTS_MISMATCH", 1, 0, 0], JSON.stringify(r));
+    const op = (await db.owner.query("SELECT state, attempts, dispatched_at IS NULL AS nd FROM booking.external_operations WHERE id = $1", [bk.op.id])).rows[0];
+    const art = (await db.owner.query("SELECT (SELECT count(*)::int FROM booking.notification_renders WHERE operation_id = $1) AS r, (SELECT count(*)::int FROM booking.notification_provider_receipts WHERE operation_id = $1) AS p", [bk.op.id])).rows[0];
+    assert.deepEqual([op.state, op.attempts, op.nd, art.r, art.p], ["pending", 0, true, 0, 0], "never claimed / rendered / sent");
+    noIds(r, bk);
+  });
 }

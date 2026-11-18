@@ -188,3 +188,14 @@ None of these blocks TEST orchestration, because TEST email goes only to the sin
   - It re-selects and requires the same fingerprint; otherwise `NBC_CANDIDATE_CHANGED`.
   - Then the unchanged admission and ONE accepted worker invocation run under the existing claim / lease / latch / receipt / sink-scope fences. Detect is not authority to send.
 - **Not in S1:** schedule, arm variable, environment change, pipeline / kickoff / SQL change, activation.
+- **Rev 2 (ROOT F1, review comment 6964982942): fact binding.**
+  - The fingerprint now also binds the candidate's recipient and render facts. It equals H(planHash, H(factsHash, recipientHash)).
+  - Both hashes come from the existing runtime read path `booking.guest_notification_snapshot(op)`: the accepted worker's own observation, granted to the runtime role since 0016, read-only. Its definition is pinned by the catalog-27 `fn` section.
+  - Raw recipient, name and facts are discarded immediately and never output or logged.
+  - Not ELIGIBLE or a pending SQL refusal → `DETECT_FACTS_REFUSED`; missing or malformed → `DETECT_FACTS_UNREADABLE`.
+  - Execute recomputes the binding three times: (a) in the re-selection, (b) right before the ONE worker invocation, and (c) in the worker's existing `afterInitialObservation` hook, after its own snapshot and before any claim.
+  - A difference → `NBC_BOUND_FACTS_MISMATCH` with zero sends. When it trips in the hook, the work lease is left to expire (the documented hook-throw residual).
+- **Residual window (not closed by S1).** A change committed after (c) is governed only by the accepted worker's existing fences:
+  - its claim binds the hashes of its own snapshot;
+  - its pre-send observation refuses `FACTS_CHANGED` / `RECIPIENT_CHANGED`;
+  - the remaining window is the worker's minimal synchronous section between that pre-send observation and the provider call.
