@@ -69,25 +69,25 @@
 | ENABLE runner / workflow sha256 | `a5b9ebca…` / `3feeed15…` | `d4a593e9…f673` / `17208b78…5db4` |
 | C102 delta fixture sha256 (ops unchanged) | — | `6c5fbd10…6f0b` |
 | C103 known-answer plan hash at the ENABLE frame | `61ef5cef…` | `f4572091…6b59` (real ENABLE runner == tooling copy) |
-| tooling (kickoff / TLS probe pin) | `66133a22` (MERGED) | `3a3cc449…d9` (**DRAFT_HEAD**, tree `e2ac4cdd`) |
+| tooling (kickoff / TLS probe pin) | `66133a22` (MERGED) | `71750f58…33` (**DRAFT_HEAD**, tree `3057af31`) |
 | kickoff closure | `e180398f…` | `573dae82…dc17` (only the plan + transport files differ) |
 | 0028 up / down sha256 | — | `a72d2ce9…3642` / `c247b178…806f` |
 | claim prosrc md5 (kickoff `CATALOG_PINS`) | `fb103173…` | `98ffe6c8…d284` (PG16 == PG17) |
 | notification / status catalog pin | 27 `bcc11631…` | 28 `96d74ab10cdf7bdd99e125eb6825284e9b57cacec33478fb1a666746e8f91b1b` (only the `fn` section differs; read path unchanged) |
 | arm manifest | `bae2c308…` | **unchanged** |
 | arm-gate frame | `f15d66a7…` | `b0ddf2b7…9b18` (test literal removed, pipeline in the labelled-copy check) |
-| kickoff frame | `3e8deca3…` | `47b82853…82a8` |
+| kickoff frame | `3e8deca3…` | `ae77e133…7cac` |
 | booking-confirmation frame | `ccb52e91…` | `f969791b…a859` |
 | status frame (outside the release) | `06032c9b…` | `365018eb…54e0` |
-| TLS probe frame (outside the release) | — | `66c1e18c…fe55` |
-| **TEST arm release** | `12a8f416…` | `e42f169127fc69056b42e1d4a62b33a52261758dd9364135fb55d23addf50fa7` (literal only in cross-runner X5) |
+| TLS probe frame (outside the release) | — | `533d658b…caeb` |
+| **TEST arm release** | `12a8f416…` | `23a3ddf46bbd96863af934eca8f2443b84cb31a665d91513c912838b374ae323` (literal only in cross-runner X5) |
 
 **Hygiene**
 - The pipeline workflow test W7 keeps its structural checks. The **foreign** digest literals moved to cross-runner **X6**, with the checks unchanged, so foreign runner edits can no longer rewrite the SQL-bound pipeline frame.
 - The status workflow test no longer pins the release literal.
 
 ## 6. Finalization before merge (mechanical, separately reviewed)
-1. ROOT merges the tooling PR into e7-test (merge commit, same tree `e2ac4cdd`).
+1. ROOT merges the tooling PR into e7-test (merge commit, same tree `3057af31`).
 2. Repin the main PR: the kickoff `toolingCommit` becomes that merge commit with status `MERGED`. The TLS probe inherits it, and the workflow refs follow. The closure, `PINNED_REVISION` and 0028 bytes are unchanged; the kickoff / TLS frames, the release and X5 are recomputed.
 3. Merge the main PR with a merge commit.
 

@@ -73,12 +73,12 @@ export const CATALOG_PINS = deepFreeze({                         // derived from
 export const CONSTANTS = deepFreeze({
   executeEnabled: false,                                           // SHIPPED CLOSED: verify / execute refuse HKO_EXECUTE_CLOSED from key names only
   dispatchEnabled: false,                                          // SHIPPED CLOSED: the core refuses HKO_DISPATCH_CLOSED before any DB acquisition
-  toolingCommit: "3a3cc44942bc149c037acaa5d9afa14bf3ed57d9",       // C119 S4: the DRAFT tooling head (0028 + PINNED_REVISION 5294b6b4; tree e2ac4cdd). C116: 66133a22 (#180 merge)
+  toolingCommit: "71750f58a2d6df8143098431edbd86a393897933",       // C119 S4: the DRAFT tooling head (0028 + PINNED_REVISION 5294b6b4; tree 3057af31). C116: 66133a22 (#180 merge)
   toolingStatus: "DRAFT_HEAD",                                     // C119 S4: NOT merged yet → verify / execute refuse HKO_CLOSURE_MISMATCH (fail-closed); repinned to the e7-test MERGE commit (same tree) + MERGED before this PR merges
   closure: ["lib/booking-db/codec.js", "lib/booking-db/config.js", "lib/booking-db/pipeline-dispatch-transport.js", "lib/booking-db/pipeline-kickoff.js",
     "lib/booking-db/pool.js", "lib/booking-db/repo.js", "lib/checkout/intent-state.js", "lib/checkout/pipeline-kickoff-plan.js",
     "package-lock.json", "package.json", "scripts/e7-connected/probe-env-preflight.mjs"],
-  closureDigest: "573dae82aad8b7e9fc208fbc1b0887b5a582348cacdd24cdded73f0ac5badc17",   // C119 S4: framed SHA-256 of `closure` at 3a3cc449 (only lib/checkout/pipeline-kickoff-plan.js + lib/booking-db/pipeline-dispatch-transport.js differ from 66133a22 e180398f); the test recomputes it
+  closureDigest: "573dae82aad8b7e9fc208fbc1b0887b5a582348cacdd24cdded73f0ac5badc17",   // C119 S4: framed SHA-256 of `closure` at 71750f58 (only lib/checkout/pipeline-kickoff-plan.js + lib/booking-db/pipeline-dispatch-transport.js differ from 66133a22 e180398f); the test recomputes it
   pipeline: {                                                       // the reviewed C102 ENABLE revision the dispatch targets (9455bc9e)
     runnerFiles: ["scripts/e7-hosted-pipeline.mjs", "test/e7-hosted-pipeline.test.mjs", "test/e7-hosted-pipeline-workflow.test.mjs", ".github/workflows/e7-hosted-pipeline.yml"],
     sourcePrefix: "e7-hosted-pipeline-v1\n",

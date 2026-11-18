@@ -1,5 +1,5 @@
 # C119 S4 — FOCUSED TEST EVIDENCE ONLY for the pipeline admission cascade (DRAFT, SHIPPED CLOSED): the pipeline (P0 arm job, P3 live-main, P4 arm gate,
-# P5 request binding), the kickoff / TLS probe repin to the C119 S4 tooling 3a3cc449 (0028 + PINNED_REVISION 5294b6b4), the confirmation / status
+# P5 request binding), the kickoff / TLS probe repin to the C119 S4 tooling 71750f58 (0028 + PINNED_REVISION 5294b6b4), the confirmation / status
 # catalog-28 repin, the arm-gate test, the cross-runner regression and the out-of-frame S4 admission suite (P3 executed for all five jobs + the full
 # kickoff → pipeline chain on schema 28). Disposable localhost PostgreSQL 16 and 17, FAKE providers only: no secrets, no environment, no variable, no
 # shared database, no provider, no dispatch. Outside every runtime frame and the arm release. contents: read only.
@@ -60,11 +60,11 @@ jobs:
           ref: 66133a22edca925e6386c4d178c251fa5f11c82e
           path: tooling
           persist-credentials: false
-      - name: Checkout the C119 S4 tooling (draft head 3a3cc449; kickoff / TLS probe pin, schema 28)
+      - name: Checkout the C119 S4 tooling (draft head 71750f58; kickoff / TLS probe pin, schema 28)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: 3a3cc44942bc149c037acaa5d9afa14bf3ed57d9
+          ref: 71750f58a2d6df8143098431edbd86a393897933
           path: ktooling
           persist-credentials: false
       - name: Set up Node 22.22.0

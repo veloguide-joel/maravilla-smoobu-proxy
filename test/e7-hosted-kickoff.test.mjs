@@ -33,7 +33,7 @@ const [K, T, PL, C1] = await Promise.all([tool("lib/booking-db/pipeline-kickoff.
 after(() => { assert.deepEqual(GUARD, { request: 0, Agent: 0, fetch: 0 }, "no real network primitive was touched"); });
 
 const C = E.CONSTANTS;
-const TOOL_PIN = "3a3cc44942bc149c037acaa5d9afa14bf3ed57d9";   // C119 S4 DRAFT tooling head (tree e2ac4cdd); C116 66133a22 #180 merge
+const TOOL_PIN = "71750f58a2d6df8143098431edbd86a393897933";   // C119 S4 DRAFT tooling head (tree 3057af31); C116 66133a22 #180 merge
 const PROC = { versions: { node: "22.22.0" }, platform: "linux", execArgv: [], getuid: () => 1000 };
 const SHA_A = "a".repeat(40); const SHA_B = "b".repeat(40);
 const IID = "11111111-2222-4333-8444-555555555555"; const PI = "pi_3FakeKickoff0001"; const REF = "MV-FAKE0001";

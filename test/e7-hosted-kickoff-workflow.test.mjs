@@ -26,7 +26,7 @@ after(() => { assert.deepEqual(GUARD, { request: 0, Agent: 0, fetch: 0 }, "no re
 
 const WF = ".github/workflows/e7-hosted-kickoff.yml";
 const yml = readFileSync(join(ROOT, WF), "utf8");
-const PIN = "3a3cc44942bc149c037acaa5d9afa14bf3ed57d9";   // C116: e7-test #180 merge (was 4e79f266 #153)
+const PIN = "71750f58a2d6df8143098431edbd86a393897933";   // C116: e7-test #180 merge (was 4e79f266 #153)
 const PIPE_PIN = "5294b6b467839e1dd825e56063abc1ad1267eafdfb2973f2c2129e9b1f29c3f5";   // C116 (was f09bcbbd)
 const PREFIX = "e7-hosted-kickoff-v1\n";
 const FILES = ["scripts/e7-hosted-kickoff.mjs", "test/e7-hosted-kickoff.test.mjs", "test/e7-hosted-kickoff-workflow.test.mjs", WF];
@@ -69,7 +69,7 @@ test("W2 PERMISSIONS (for ROOT security review): workflow default contents: read
   assert.doesNotMatch(yml.replace(/^#.*$/gm, ""), /secrets\.GITHUB_TOKEN|secrets\.[A-Z_]*PAT|secrets\.[A-Z_]*APP|app-id|private-key|create-github-app-token/i);
 });
 
-test("W3 static: checkouts at the EXACT dispatch SHA + the tooling pin 3a3cc449 (C119 S4; persist-credentials false) in all three jobs; the reviewed action pins; Node 22.22.0; preflight / verify have no environment / secret / token / npm / curl", () => {
+test("W3 static: checkouts at the EXACT dispatch SHA + the tooling pin 71750f58 (C119 S4; persist-credentials false) in all three jobs; the reviewed action pins; Node 22.22.0; preflight / verify have no environment / secret / token / npm / curl", () => {
   assert.equal(count(/ref: \$\{\{ github\.sha \}\}\n          path: wrapper\n          persist-credentials: false/g), 5, "C119 S2: + the arm job");
   assert.equal(count(new RegExp(`repository: veloguide-joel/maravilla-smoobu-proxy\\n          ref: ${PIN}\\n          path: tooling\\n          persist-credentials: false`, "g")), 4);
   assert.equal(count(/persist-credentials: false/g), 9); assert.doesNotMatch(yml, /ref: main|ref: refs\/heads|ref: \$\{\{ github\.ref/);
@@ -136,7 +136,7 @@ const expectedDigest = async () => {
 };
 
 test("W6 preflight bindings block executed locally: passes only with HEAD == dispatch SHA, tooling == pin and a known mode (C113: incl. detect — run 43929404455 refused it); unknown / empty modes refuse", () => {
-  assert.equal(toolSha, PIN, "E7_TOOLING_DIR must be the pinned 3a3cc449 checkout");
+  assert.equal(toolSha, PIN, "E7_TOOLING_DIR must be the pinned 71750f58 checkout");
   const d = sandbox(); try {
     const bind = runBlock("Verify checkout bindings (wrapper HEAD == dispatch SHA; tooling HEAD == pin; no secrets)");
     for (const mode of ["preflight", "verify", "execute", "detect"]) { const ok = sh(bind, { E7_WORKFLOW_SHA: headSha, E7_TOOLING_PIN: PIN, E7_MODE: mode }, d); assert.equal(ok.status, 0, ok.out); }
