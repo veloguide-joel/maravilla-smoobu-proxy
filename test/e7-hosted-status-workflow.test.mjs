@@ -92,12 +92,11 @@ test("W4 the pre-secret re-check block executed locally: passes only with HEAD =
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
 
-test("W5 S3 leaves the C119 S2 arm release EXACTLY as merged: release 12a8f416… (which binds the manifest + all four component frames); the status runner frame is in NO arm component and in no other runner's frame", async () => {
+test("W5 the status runner is OUTSIDE the TEST arm release: the release recomputes (four components; its exact literal lives ONLY in the cross-runner regression X5 — C119 S4 moved the S3-era 12a8f416 pin out, so no status byte depends on the release); the status runner frame is in NO arm component and in no other runner's frame", async () => {
   const A = await import("../scripts/e7-test-arm.mjs");
   const r = await A.armRelease(ROOT);
-  assert.deepEqual([r.ok, r.release], [true, "12a8f416b542bc2d6afc93d8925906df68d6b5efb6e47ac7ea32491e8ae7f3ed"]);
-  // the release binds the manifest bytes + every component frame, so an unchanged release proves all of them unchanged (no frame literal pinned here:
-  // the notification frame literal lives ONLY in the cross-runner regression, outside every runtime frame)
+  assert.equal(r.ok, true); assert.match(r.release, /^[0-9a-f]{64}$/);
+  for (const f of FILES) assert.ok(!readFileSync(join(ROOT, f), "utf8").includes(r.release), `${f} carries no release literal`);
   assert.equal(Object.keys(r.frames).length, 4);
   const m = JSON.parse(readFileSync(join(ROOT, A.ARM_MANIFEST_PATH), "utf8"));
   for (const x of m.components) assert.ok(!x.files.some((f) => FILES.includes(f)), x.name);

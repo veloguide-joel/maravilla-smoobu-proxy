@@ -33,7 +33,7 @@ const [K, T, PL, C1] = await Promise.all([tool("lib/booking-db/pipeline-kickoff.
 after(() => { assert.deepEqual(GUARD, { request: 0, Agent: 0, fetch: 0 }, "no real network primitive was touched"); });
 
 const C = E.CONSTANTS;
-const TOOL_PIN = "66133a22edca925e6386c4d178c251fa5f11c82e";   // C116 #180 merge (tree ade3e084; was 4e79f266)
+const TOOL_PIN = "3a3cc44942bc149c037acaa5d9afa14bf3ed57d9";   // C119 S4 DRAFT tooling head (tree e2ac4cdd); C116 66133a22 #180 merge
 const PROC = { versions: { node: "22.22.0" }, platform: "linux", execArgv: [], getuid: () => 1000 };
 const SHA_A = "a".repeat(40); const SHA_B = "b".repeat(40);
 const IID = "11111111-2222-4333-8444-555555555555"; const PI = "pi_3FakeKickoff0001"; const REF = "MV-FAKE0001";
@@ -64,7 +64,7 @@ const realEnv = (over = {}) => ({ E7_TOOLING_DIR: TOOLING, E7_INTENT_ID: IID, E7
   E7_WORKFLOW_SHA: SHA_A, GITHUB_SHA: SHA_A, GITHUB_REF: "refs/heads/main", E7_RUN_ID: "123456-1", E7_TEST_ARM: ARM, ...over });
 
 test("H1 SHIPPED CLOSED: executeEnabled / dispatchEnabled FALSE; verify and execute refuse HKO_EXECUTE_CLOSED from KEY NAMES only — 0 env value reads, 0 import / spawn / head / pg / CA / core", async () => {
-  assert.equal(C.executeEnabled, false); assert.equal(C.dispatchEnabled, false); assert.equal(C.toolingStatus, "MERGED"); assert.equal(C.toolingCommit, TOOL_PIN);
+  assert.equal(C.executeEnabled, false); assert.equal(C.dispatchEnabled, false); assert.equal(C.toolingStatus, "DRAFT_HEAD", "C119 S4: an unmerged tooling head is never claimed MERGED (verify refuses until the repin)"); assert.equal(C.toolingCommit, TOOL_PIN);
   for (const mode of ["verify", "execute"]) {
     const { env, reads } = namesOnly(["E7_TOOLING_DIR", "E7_INTENT_ID", "E7_DEV_BOOKING_DATABASE_URL", "E7_DISPATCH_TOKEN", "GITHUB_SHA"]);
     const r = await E.runHosted({ mode, env, proc: PROC, wrapperDir: ROOT, deps: TRAPS });

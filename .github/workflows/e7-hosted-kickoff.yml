@@ -5,13 +5,13 @@
 # from key names only, before any value, import, credential, database or network; the secret step below is never reached while it is closed.
 # HONEST LABEL: MANUAL workflow_dispatch only (no schedule / cron / webhook / repository_dispatch / route). The automatic consumer trigger is an
 # explicit REMAINING GAP. Default mode `preflight` = no environment, no secret, no database, no dependency install (focused FAKE tests + digests).
-# PERMISSIONS: workflow default `contents: read`. ONLY the gated execute job (main only, environment `e7-readonly-probe`) adds `actions: write`,
+# PERMISSIONS: workflow default `contents: read`. ONLY the gated execute job (main only, C119 S4 environment `e7-test-auto`) adds `actions: write`,
 # and ONLY its final step receives the built-in, EPHEMERAL, job-scoped `github.token` (as E7_DISPATCH_TOKEN) — no PAT, no new secret, no App.
 # The existing DB secret NAME E7_DEV_BOOKING_DATABASE_URL + the pinned Supabase CA appear in that SAME final step only.
 # RELEASE BINDING: the transport's expectedMainSha is this run's own github.sha, used only after the SAME checkout's pipeline runnerFiles frame to
-# the reviewed ENABLE source digest 880db5b3…fe1b (C116; was f09bcbbd…0999) (closure f7d7cad6…7273) — checked below in shell BEFORE any secret and again by the runner.
+# the reviewed ENABLE source digest 5294b6b4…c3f5 (C119 S4; C116 880db5b3; was f09bcbbd…0999) (closure f7d7cad6…7273) — checked below in shell BEFORE any secret and again by the runner.
 # C113 DETECT (MANUAL workflow_dispatch only; no schedule): mode `detect` = preflight → verify (CLOSED flags → CLOSED_NOOP exit 0, open=false:
-# the gated jobs are SKIPPED, 0 DB-secret reads, 0 approval prompts) → `detect` (environment e7-readonly-probe = APPROVAL #1; the DB secret
+# the gated jobs are SKIPPED, 0 DB-secret reads, 0 approval prompts) → `detect` (environment e7-test-auto (C119 S4) + fresh admission; the DB secret
 # in its final step only; ONE rolled-back read-only snapshot; NO token, NO transport; declared outputs outcome + fingerprint only, never an
 # identifier) → `execute` (APPROVAL #2, ONLY when detect output outcome == ONE; re-selects server-side and requires the same fingerprint).
 # Manual `execute` stays reachable when `detect` is SKIPPED; a failed / cancelled preflight / verify / detect never reaches a secret job.
@@ -31,7 +31,8 @@
 # the release digest from THIS checkout and compares it with vars.E7_TEST_AUTO_ARMED. Not armed (absent / malformed / stale / mismatched / not main) →
 # armed=false → detect + execute are SKIPPED (0 approvals, 0 secrets, 0 SQL, 0 HTTP); verify (no environment) re-checks it with the runner's labelled copy
 # (detect flow → CLOSED_NOOP). The scheduled source pin is the arm job's RECOMPUTED kickoff frame (replaces vars.E7_KICKOFF_EXPECTED_SOURCE). The arm
-# does NOT gate e7-hosted-pipeline.yml (untouched): a directly dispatched or already queued pipeline run is not refused by it. Cadence is TEST-only.
+# now also gates e7-hosted-pipeline.yml (C119 S4: arm job + labelled gate + durable request binding). Cadence is TEST-only. C119 S4 P3: detect / execute
+# re-check the LIVE main ref (built-in token) after any queue / approval delay, before any secret — revocation = a CLOSE commit moving main.
 # WHEN GitHub refreshes the vars context for an already queued / approval-held job is UNVERIFIED: clearing the variable must NOT be relied on to revoke
 # queued, pending-approval or running work (a pre-activation blocker).
 # Source digest = SHA-256 over: prefix "e7-hosted-kickoff-v1\n", then for each file IN THIS ORDER
@@ -100,11 +101,11 @@ jobs:
           ref: ${{ github.sha }}
           path: wrapper
           persist-credentials: false
-      - name: Checkout E7 kickoff tooling (fixed commit 66133a22)
+      - name: Checkout E7 kickoff tooling (fixed commit 3a3cc449)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: 66133a22edca925e6386c4d178c251fa5f11c82e
+          ref: 3a3cc44942bc149c037acaa5d9afa14bf3ed57d9
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0
@@ -115,7 +116,7 @@ jobs:
       - name: Verify checkout bindings (wrapper HEAD == dispatch SHA; tooling HEAD == pin; no secrets)
         env:
           E7_WORKFLOW_SHA: ${{ github.sha }}
-          E7_TOOLING_PIN: 66133a22edca925e6386c4d178c251fa5f11c82e
+          E7_TOOLING_PIN: 3a3cc44942bc149c037acaa5d9afa14bf3ed57d9
           E7_MODE: ${{ github.event_name == 'schedule' && 'detect' || inputs.mode }}
         run: |
           set -eu
@@ -180,11 +181,11 @@ jobs:
           ref: ${{ github.sha }}
           path: wrapper
           persist-credentials: false
-      - name: Checkout E7 kickoff tooling (fixed commit 66133a22)
+      - name: Checkout E7 kickoff tooling (fixed commit 3a3cc449)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: 66133a22edca925e6386c4d178c251fa5f11c82e
+          ref: 3a3cc44942bc149c037acaa5d9afa14bf3ed57d9
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0
@@ -212,7 +213,7 @@ jobs:
     needs: [preflight, arm, verify]
     if: (inputs.mode == 'detect' || github.event_name == 'schedule') && needs.arm.outputs.armed == 'true' && needs.verify.outputs.open == 'true' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    environment: e7-readonly-probe
+    environment: e7-test-auto
     timeout-minutes: 10
     permissions:
       contents: read
@@ -226,11 +227,11 @@ jobs:
           ref: ${{ github.sha }}
           path: wrapper
           persist-credentials: false
-      - name: Checkout E7 kickoff tooling (fixed commit 66133a22)
+      - name: Checkout E7 kickoff tooling (fixed commit 3a3cc449)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: 66133a22edca925e6386c4d178c251fa5f11c82e
+          ref: 3a3cc44942bc149c037acaa5d9afa14bf3ed57d9
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0
@@ -238,12 +239,12 @@ jobs:
         with:
           node-version: "22.22.0"
           package-manager-cache: false
-      - name: Re-check bindings BEFORE the DB secret, detect (HEAD == dispatch SHA; tooling pin; kickoff source digest; pipeline release binding 880db5b3)
+      - name: Re-check bindings BEFORE the DB secret, detect (HEAD == dispatch SHA; tooling pin; kickoff source digest; pipeline release binding 5294b6b4)
         env:
           E7_WORKFLOW_SHA: ${{ github.sha }}
-          E7_TOOLING_PIN: 66133a22edca925e6386c4d178c251fa5f11c82e
+          E7_TOOLING_PIN: 3a3cc44942bc149c037acaa5d9afa14bf3ed57d9
           E7_EXPECTED_SOURCE_DIGEST: ${{ github.event_name == 'schedule' && (needs.arm.outputs.kickoff || 'MISSING') || inputs.expected_source_digest }}
-          E7_PIPELINE_SOURCE_PIN: 880db5b33024edbf0879fbaf5a3826e3622db12fd1808e8c2047238da507fe1b
+          E7_PIPELINE_SOURCE_PIN: 5294b6b467839e1dd825e56063abc1ad1267eafdfb2973f2c2129e9b1f29c3f5
         run: |
           set -eu
           head="$(git -C wrapper rev-parse HEAD)"
@@ -256,6 +257,18 @@ jobs:
           p="$({ printf 'e7-hosted-pipeline-v1\n'; for f in scripts/e7-hosted-pipeline.mjs test/e7-hosted-pipeline.test.mjs test/e7-hosted-pipeline-workflow.test.mjs .github/workflows/e7-hosted-pipeline.yml; do printf '%s\0%s\0' "$f" "$(stat -c%s "wrapper/$f")"; cat "wrapper/$f"; printf '\0'; done; } | sha256sum | cut -d' ' -f1)"
           [ "$p" = "$E7_PIPELINE_SOURCE_PIN" ] || { echo "REFUSED: pipeline at this commit is not the reviewed ENABLE source (actual $p)"; exit 3; }
           echo "bindings ok: wrapper=$head tooling=$tool source=$d pipeline=$p"
+      - name: Fresh admission (C119 S4 P3; live main ref == this run's commit, checked AFTER any queue / approval delay; built-in token only; BEFORE verify / any secret)
+        env:
+          FRESH_SHA: ${{ github.sha }}
+          FRESH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$FRESH_SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "REFUSED: MAIN_UNREADABLE (sha)"; exit 3; }
+          [ -n "$FRESH_TOKEN" ] || { echo "REFUSED: MAIN_UNREADABLE (token)"; exit 3; }
+          body="$(printf 'Authorization: Bearer %s\n' "$FRESH_TOKEN" | curl --silent --show-error --fail --proto '=https' --max-redirs 0 --max-time 15 --max-filesize 8192 -H @- -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' https://api.github.com/repos/veloguide-joel/maravilla-smoobu-proxy/git/ref/heads/main)" || { echo "REFUSED: MAIN_UNREADABLE (http)"; exit 3; }
+          live="$(printf '%s' "$body" | node -e 'let s="";process.stdin.on("data",(d)=>{s+=d;if(s.length>8192)process.exit(3);}).on("end",()=>{let j;try{j=JSON.parse(s);}catch{process.exit(3);}const o=j&&j.object;if(!j||j.ref!=="refs/heads/main"||!o||o.type!=="commit"||typeof o.sha!=="string"||!/^[0-9a-f]{40}$/.test(o.sha))process.exit(3);process.stdout.write(o.sha);});')" || { echo "REFUSED: MAIN_UNREADABLE (shape)"; exit 3; }
+          [ "$live" = "$FRESH_SHA" ] || { echo "REFUSED: MAIN_MOVED (live main != this run's commit; a CLOSE commit revokes not-yet-admitted work)"; exit 3; }
+          echo "fresh admission ok: live main == this run's commit (point-in-time; a later move of main is not seen by this run)"
       - name: Install the pinned dependency from the verified lockfile (no lifecycle scripts)
         working-directory: tooling
         run: npm ci --ignore-scripts --omit=dev --no-audit --no-fund
@@ -278,7 +291,7 @@ jobs:
     needs: [preflight, arm, verify, detect]
     if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.preflight.result == 'success' && needs.arm.result == 'success' && needs.arm.outputs.armed == 'true' && needs.verify.result == 'success' && ((github.event_name == 'workflow_dispatch' && inputs.mode == 'execute' && needs.detect.result == 'skipped') || ((inputs.mode == 'detect' || github.event_name == 'schedule') && needs.detect.result == 'success' && needs.detect.outputs.outcome == 'ONE')) }}
     runs-on: ubuntu-24.04
-    environment: e7-readonly-probe
+    environment: e7-test-auto
     timeout-minutes: 10
     permissions:
       contents: read
@@ -290,11 +303,11 @@ jobs:
           ref: ${{ github.sha }}
           path: wrapper
           persist-credentials: false
-      - name: Checkout E7 kickoff tooling (fixed commit 66133a22)
+      - name: Checkout E7 kickoff tooling (fixed commit 3a3cc449)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: 66133a22edca925e6386c4d178c251fa5f11c82e
+          ref: 3a3cc44942bc149c037acaa5d9afa14bf3ed57d9
           path: tooling
           persist-credentials: false
       - name: Set up Node 22.22.0
@@ -302,12 +315,12 @@ jobs:
         with:
           node-version: "22.22.0"
           package-manager-cache: false
-      - name: Re-check bindings BEFORE any secret (HEAD == dispatch SHA; tooling pin; kickoff source digest; pipeline release binding 880db5b3)
+      - name: Re-check bindings BEFORE any secret (HEAD == dispatch SHA; tooling pin; kickoff source digest; pipeline release binding 5294b6b4)
         env:
           E7_WORKFLOW_SHA: ${{ github.sha }}
-          E7_TOOLING_PIN: 66133a22edca925e6386c4d178c251fa5f11c82e
+          E7_TOOLING_PIN: 3a3cc44942bc149c037acaa5d9afa14bf3ed57d9
           E7_EXPECTED_SOURCE_DIGEST: ${{ github.event_name == 'schedule' && (needs.arm.outputs.kickoff || 'MISSING') || inputs.expected_source_digest }}
-          E7_PIPELINE_SOURCE_PIN: 880db5b33024edbf0879fbaf5a3826e3622db12fd1808e8c2047238da507fe1b
+          E7_PIPELINE_SOURCE_PIN: 5294b6b467839e1dd825e56063abc1ad1267eafdfb2973f2c2129e9b1f29c3f5
         run: |
           set -eu
           head="$(git -C wrapper rev-parse HEAD)"
@@ -320,6 +333,18 @@ jobs:
           p="$({ printf 'e7-hosted-pipeline-v1\n'; for f in scripts/e7-hosted-pipeline.mjs test/e7-hosted-pipeline.test.mjs test/e7-hosted-pipeline-workflow.test.mjs .github/workflows/e7-hosted-pipeline.yml; do printf '%s\0%s\0' "$f" "$(stat -c%s "wrapper/$f")"; cat "wrapper/$f"; printf '\0'; done; } | sha256sum | cut -d' ' -f1)"
           [ "$p" = "$E7_PIPELINE_SOURCE_PIN" ] || { echo "REFUSED: pipeline at this commit is not the reviewed ENABLE source (actual $p)"; exit 3; }
           echo "bindings ok: wrapper=$head tooling=$tool source=$d pipeline=$p"
+      - name: Fresh admission (C119 S4 P3; live main ref == this run's commit, checked AFTER any queue / approval delay; built-in token only; BEFORE verify / any secret)
+        env:
+          FRESH_SHA: ${{ github.sha }}
+          FRESH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$FRESH_SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "REFUSED: MAIN_UNREADABLE (sha)"; exit 3; }
+          [ -n "$FRESH_TOKEN" ] || { echo "REFUSED: MAIN_UNREADABLE (token)"; exit 3; }
+          body="$(printf 'Authorization: Bearer %s\n' "$FRESH_TOKEN" | curl --silent --show-error --fail --proto '=https' --max-redirs 0 --max-time 15 --max-filesize 8192 -H @- -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' https://api.github.com/repos/veloguide-joel/maravilla-smoobu-proxy/git/ref/heads/main)" || { echo "REFUSED: MAIN_UNREADABLE (http)"; exit 3; }
+          live="$(printf '%s' "$body" | node -e 'let s="";process.stdin.on("data",(d)=>{s+=d;if(s.length>8192)process.exit(3);}).on("end",()=>{let j;try{j=JSON.parse(s);}catch{process.exit(3);}const o=j&&j.object;if(!j||j.ref!=="refs/heads/main"||!o||o.type!=="commit"||typeof o.sha!=="string"||!/^[0-9a-f]{40}$/.test(o.sha))process.exit(3);process.stdout.write(o.sha);});')" || { echo "REFUSED: MAIN_UNREADABLE (shape)"; exit 3; }
+          [ "$live" = "$FRESH_SHA" ] || { echo "REFUSED: MAIN_MOVED (live main != this run's commit; a CLOSE commit revokes not-yet-admitted work)"; exit 3; }
+          echo "fresh admission ok: live main == this run's commit (point-in-time; a later move of main is not seen by this run)"
       - name: Install the pinned dependency from the verified lockfile (no lifecycle scripts)
         working-directory: tooling
         run: npm ci --ignore-scripts --omit=dev --no-audit --no-fund

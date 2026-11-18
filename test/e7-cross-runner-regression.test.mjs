@@ -32,7 +32,7 @@ const NOTIFICATION = Object.freeze({
   prefix: "e7-hosted-booking-confirmation-v1\n",
   runnerFiles: ["scripts/e7-hosted-booking-confirmation.mjs", "test/e7-hosted-booking-confirmation.test.mjs", "test/e7-hosted-booking-confirmation-workflow.test.mjs",
     ".github/workflows/e7-hosted-booking-confirmation.yml"],
-  frame: "ccb52e914543d6bf5dbce8ab7279e68c051778bfede1742a2750936f11e4ebfe"   // C119 S2: + the TEST arm re-check (labelled copy) + the arm job / draft schedule (was 9c6cf9f2… at S1 rev 2 / main 30d00191; 0cd953a9… at C116)
+  frame: "f969791b7cb175dc8426a7796db43ab7be70605ac1cd940d0c30a30ffcfca859"   // C119 S4: catalog 28 + e7-test-auto + P3 fresh admission (was ccb52e91… at S2). C119 S2: + the TEST arm re-check (labelled copy) + the arm job / draft schedule (was 9c6cf9f2… at S1 rev 2 / main 30d00191; 0cd953a9… at C116)
 });
 
 /** every runtime source frame on main: each runner's own runnerFiles, plus the fixed frames the workflow tests pin for the two probes */
@@ -95,7 +95,8 @@ test("X4 CI wiring: the regression runs on every pull request / push to main (an
 
 /** C119 S2: the LITERAL reviewed TEST-arm release of this tree (outside every component, so the release never embeds itself). It is NOT an
  *  arm and sets nothing: ROOT sets the repository variable out-of-band at a separately authorized activation, never from this file. */
-const ARM_RELEASE = Object.freeze({ release: "12a8f416b542bc2d6afc93d8925906df68d6b5efb6e47ac7ea32491e8ae7f3ed", components: ["arm-gate", "kickoff", "booking-confirmation", "pipeline"] });
+// C119 S4: e42f1691… after the pipeline admission cascade (was 12a8f416… at S2 / main ec489f5a)
+const ARM_RELEASE = Object.freeze({ release: "e42f169127fc69056b42e1d4a62b33a52261758dd9364135fb55d23addf50fa7", components: ["arm-gate", "kickoff", "booking-confirmation", "pipeline"] });
 
 test("X5 C119 S2 the TEST-arm release recomputed from this checkout equals the LITERAL reviewed release; this file is outside every arm component; no component file carries the release", async () => {
   const A = await import("../scripts/e7-test-arm.mjs");
@@ -105,4 +106,30 @@ test("X5 C119 S2 the TEST-arm release recomputed from this checkout equals the L
   assert.deepEqual(m.components.map((x) => x.name), ARM_RELEASE.components);
   for (const x of m.components) { assert.ok(!x.files.includes(SELF) && !x.files.includes(WF), x.name); for (const f of x.files) assert.ok(!readFileSync(join(ROOT, f), "utf8").includes(ARM_RELEASE.release), f); }
   assert.equal(r.frames["booking-confirmation"], NOTIFICATION.frame, "the release frames the reviewed notification runner bytes");
+});
+
+/** C119 S4: the FOREIGN runner digest literals MOVED here from the pipeline workflow test W7 (outside every runtime frame), checks unchanged */
+const FOREIGN = Object.freeze({
+  runners: { reservation: "5665544de105e4564a57a4434fa32fd2355b9bbd0e756b250d1248e07feb6b19", capture: "5b547a42200b452055d8a718c84ab70f7f2b5a0cd8343f6174c4a75b0c420ed1",
+    "test-cleanup": "33f2ab18984dccd3915a18ff8a55dd4a6e5b6bf89e3d84ba1e578347e6cebd1e", recording: "49b5516cb69543a6bd4a697a407d2f2a97a84e18a63f18715338f099917e4824",
+    "recorded-cleanup": "9e2021e3ec96bab16869fc194adac672287d559587b2cb7657738ffcd897de1f" },
+  inspector: "889d6a31af4249cede0bf8b64360b5ca0e7ca2d994c4c882f0348e5f57c2c8e7",
+  chargeList: "43715872ddb450889286880c848acefd8757da6fe33bc5c6a3a547bd27219cf3",
+  resendSink: "aef26da954d986dc2d922b607d391be404dd73f1145ece0ae66ea0d80673ade4"
+});
+
+test("X6 C119 S4 (moved from pipeline W7, checks unchanged): the five reviewed runners SHIPPED CLOSED with their exact reviewed digests; the C47 inspection runner (889d6a31…) CLOSED + exact; the charge-list probe (43715872…) and the Resend sink probe (aef26da9…) exact; none of these literals appears in the (SQL-bound) pipeline frame", async () => {
+  const P = await import("../scripts/e7-hosted-pipeline.mjs");
+  for (const n of Object.keys(FOREIGN.runners)) {
+    const m = await import(`../scripts/e7-hosted-${n}.mjs`);
+    assert.equal(m.CONSTANTS.executeEnabled, false, n); assert.ok(!m.CONSTANTS.runnerFiles.some((f) => P.CONSTANTS.runnerFiles.includes(f)), n);
+    assert.equal(await P.framedDigest(ROOT, m.CONSTANTS.runnerFiles, m.RUNNER_DIGEST_PREFIX), FOREIGN.runners[n], n);
+  }
+  const I = await import("../scripts/e7-hosted-notify-inspect.mjs");
+  assert.equal(I.CONSTANTS.executeEnabled, false);
+  assert.equal(await P.framedDigest(ROOT, I.CONSTANTS.runnerFiles, I.SOURCE_DIGEST_PREFIX), FOREIGN.inspector, "C47/C48 inspection runner unchanged");
+  assert.equal(await P.framedDigest(ROOT, ["scripts/e7-hosted-charge-list-probe.mjs", "test/e7-hosted-charge-list-probe.test.mjs", ".github/workflows/e7-hosted-charge-list-probe.yml"], "e7-hosted-charge-list-probe-v1\n"), FOREIGN.chargeList);
+  assert.equal(await P.framedDigest(ROOT, ["scripts/e7-resend-sink-probe.mjs", "scripts/e7-resend/resend-exchange.mjs", "test/e7-resend-sink-probe.test.mjs", ".github/workflows/e7-resend-sink-probe.yml"], "e7-resend-sink-probe-v1\n"), FOREIGN.resendSink);
+  const lits = [...Object.values(FOREIGN.runners), FOREIGN.inspector, FOREIGN.chargeList, FOREIGN.resendSink];
+  for (const f of P.CONSTANTS.runnerFiles) { const t = readFileSync(join(ROOT, f), "utf8"); for (const l of lits) assert.ok(!t.includes(l), `${f} carries ${l.slice(0, 8)}…`); }
 });

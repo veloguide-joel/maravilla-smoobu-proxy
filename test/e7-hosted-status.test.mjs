@@ -1,7 +1,7 @@
 // test/e7-hosted-status.test.mjs — C119 S3: the SHIPPED-CLOSED read-only TEST status / reconciliation runner (scripts/e7-hosted-status.mjs).
 // Always-on (FAKE): the CLOSED proof, labelled copies, closure, query hygiene, classifiers / thresholds, core shapes / errors / privacy, hosted gates.
 // OPT-IN (E7_HST_DB_TESTS=1; PG_BIN; E7_TOOLING_DIR = the pinned 66133a22 checkout with its pinned pg; E7_SCHEMA27_DIR = a checkout of e7-test a314681b
-// for the merged 0027 bytes, sha-checked): the REAL core on DISPOSABLE PostgreSQL at schema 27 with synthetic fixtures and a synthetic clock (asOf seam).
+// for the merged 0027 bytes, sha-checked): the REAL core on DISPOSABLE PostgreSQL at schema 28 (C119 S4; was 27) with synthetic fixtures and a synthetic clock (asOf seam).
 // Nothing here touches a shared database, a provider or the network.
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
@@ -52,11 +52,11 @@ test("T1 SHIPPED CLOSED: readEnabled false; verify AND status refuse STS_READ_CL
   assert.match(src, /^if \(import\.meta\.main === true\) \{$/m);
 });
 
-test("T2 labelled copies == the merged C50 booking-confirmation runner (catalog probe SQL, owner-ACL canonicaliser, both read paths, the schema-27 pin, DB target rule, CA pin, framedDigest output); closure = pool.js (imports only pg) + package files at 66133a22; pg 8.18.0", async () => {
+test("T2 labelled copies == the merged C50 booking-confirmation runner (catalog probe SQL, owner-ACL canonicaliser, both read paths, the schema-28 pin (C119 S4), DB target rule, CA pin, framedDigest output); closure = pool.js (imports only pg) + package files at 66133a22; pg 8.18.0", async () => {
   const N = await import("../scripts/e7-hosted-booking-confirmation.mjs");
   assert.equal(S.CATALOG_SQL, N.CATALOG_SQL); assert.equal(S.OWNER_ACL_CANON, N.OWNER_ACL_CANON);
   assert.deepEqual([...S.READ_PATH_FUNCTIONS], [...N.READ_PATH_FUNCTIONS]); assert.deepEqual([...S.INSPECT_READ_PATH_FUNCTIONS], [...N.INSPECT_READ_PATH_FUNCTIONS]);
-  assert.deepEqual(C.catalogPin27, N.CONSTANTS.catalogPin27);
+  assert.deepEqual(C.catalogPin28, N.CONSTANTS.catalogPin28);
   const U = "aws-0-us-east-1.pooler.supabase.com";
   for (const u of [DBURL, DBURL.replace(":6543", ":5432"), `postgresql://postgres.mxotevtiscernhqilyiu:pw@${U}:6543/postgres`, `postgresql://mv_booking_admin_dev.mxotevtiscernhqilyiu:pw@${U}:6543/postgres`, "nope"])
     assert.equal(S.dbTargetOk(u), N.dbTargetOk(u), u.slice(0, 40));
@@ -123,7 +123,7 @@ const AGG = {
   cases: { open: 0, oldest_open_min: null }, work: { lease_expired: 0, lease_live: 0, due_overdue: 0 }, notifyMissing: { n: 0 }
 };
 function world(over = {}) {
-  return { role: { ro: "on", iso: "repeatable read", su: false, app: true, adm: false, rep: false, own: false }, catalog: C.catalogPin27, instance: { n: 1, env: "test" }, clock: { ok: true, synthetic: false },
+  return { role: { ro: "on", iso: "repeatable read", su: false, app: true, adm: false, rep: false, own: false }, catalog: C.catalogPin28, instance: { n: 1, env: "test" }, clock: { ok: true, synthetic: false },
     scope: { n: 1 }, agg: AGG, notifyPages: [[{ op_id: OID, intent_id: IID, template: "booking_confirmed", class: "SUCCEEDED", code: null, in_scope: true, age_min: 30 }]],
     refunds: [{ x: { cancelled: true, refundStatus: "pending" } }], throwAt: null, ...over };
 }
@@ -166,7 +166,7 @@ test("T6 core (fake): missing / unreadable / malformed data is UNKNOWN — never
   }
   for (const [over, code] of [[{ role: { ...world().role, ro: "off" } }, "STS_NOT_READ_ONLY"], [{ role: { ...world().role, adm: true } }, "STS_ROLE_REFUSED"], [{ role: { ...world().role, rep: true } }, "STS_ROLE_REFUSED"],
     [{ role: { ...world().role, own: true } }, "STS_ROLE_REFUSED"], [{ role: { ...world().role, su: true } }, "STS_ROLE_REFUSED"], [{ role: { ...world().role, app: false } }, "STS_ROLE_REFUSED"],
-    [{ catalog: { ...C.catalogPin27, readPathCount: 6 } }, "STS_CATALOG_NOT_27"], [{ catalog: { ...C.catalogPin27, sections: { ...C.catalogPin27.sections, fn: "0".repeat(64) } } }, "STS_CATALOG_NOT_27"],
+    [{ catalog: { ...C.catalogPin28, readPathCount: 6 } }, "STS_CATALOG_NOT_28"], [{ catalog: { ...C.catalogPin28, sections: { ...C.catalogPin28.sections, fn: "0".repeat(64) } } }, "STS_CATALOG_NOT_28"],
     [{ instance: { n: 1, env: "live" } }, "STS_NOT_TEST"], [{ instance: { n: 2, env: "test" } }, "STS_NOT_TEST"], [{ clock: { ok: true, synthetic: true } }, "STS_REPLY_SHAPE"], [{ scope: { n: 501 } }, "STS_SCOPE_TOO_LARGE"],
     [{ scope: { n: -1 } }, "STS_REPLY_SHAPE"]]) {
     const { res } = await core(world(over)); assert.deepEqual([res.overall, res.code, res.metrics], ["UNKNOWN", code, {}], code);
@@ -272,17 +272,20 @@ test("T7 hosted gates (seam): status needs ONLY the DB secret, both 64-hex diges
 });
 
 // ---------------------------------------------------------------------------------------------------------------------------------
-// OPT-IN REAL DISPOSABLE POSTGRESQL at schema 27 — the REAL core, synthetic fixtures (pinned tooling) and a synthetic clock
+// OPT-IN REAL DISPOSABLE POSTGRESQL at schema 28 (C119 S4) — the REAL core, synthetic fixtures (pinned tooling) and a synthetic clock
 if (process.env.E7_HST_DB_TESTS === "1") {
   const tool = (p) => import(pathToFileURL(join(TOOLING, p)).href);
   const H = await tool("test/db/harness.mjs"); const F = await tool("test/db/fixtures.mjs"); const MG = await tool("db/lib/migrate.js");
   const pg = createRequire(join(TOOLING, "package.json"))("pg");
-  const S27 = realpathSync(process.env.E7_SCHEMA27_DIR || join(ROOT, "..", "schema27"));
-  const M27 = { "0027_external_cancellation_disposition.up.sql": "ae949bf42450cf1af2632212f2cc2c2704b66ca314f4fc4f2744e6130f9c8ecf",
-    "0027_external_cancellation_disposition.down.sql": "8e3810678bc788df6915a4be9c728296a89f0b040ae0df245ceef7583fc6ba6c" };
-  const MDIR = mkdtempSync(join(tmpdir(), "e7-s3-m27-"));
+  // C119 S4: schema 28 = the pinned tooling's 0001..0026 + the 0027 + C119 S4 0028 bytes (sha-checked) from E7_SCHEMA28_DIR (a C119 S4 tooling checkout)
+  const S28 = realpathSync(process.env.E7_SCHEMA28_DIR || join(ROOT, "..", "schema28"));
+  const M28 = { "0027_external_cancellation_disposition.up.sql": "ae949bf42450cf1af2632212f2cc2c2704b66ca314f4fc4f2744e6130f9c8ecf",
+    "0027_external_cancellation_disposition.down.sql": "8e3810678bc788df6915a4be9c728296a89f0b040ae0df245ceef7583fc6ba6c",
+    "0028_pipeline_kickoff_source_rebind_s4.up.sql": "a72d2ce911cac924b728525f1af43b547c7e908a96bdecbf84f41ca3ebfa3642",
+    "0028_pipeline_kickoff_source_rebind_s4.down.sql": "c247b17883b23ecdba1eb0ec2a94e5e0e9caa558724ee29c4b0500fb7b77806f" };
+  const MDIR = mkdtempSync(join(tmpdir(), "e7-s4-m28-"));
   for (const f of readdirSync(join(TOOLING, "db/migrations"))) writeFileSync(join(MDIR, f), readFileSync(join(TOOLING, "db/migrations", f)));
-  for (const [f, h] of Object.entries(M27)) { const b = readFileSync(join(S27, "db/migrations", f)); assert.equal(sha(b), h, f); writeFileSync(join(MDIR, f), b); }
+  for (const [f, h] of Object.entries(M28)) { const b = readFileSync(join(S28, "db/migrations", f)); assert.equal(sha(b), h, f); writeFileSync(join(MDIR, f), b); }
   // the accepted gn-v2 lifecycle helpers (USD bookings with an .invalid synthetic guest, the REAL accepted workers), generated from the pinned tooling's
   // test/db/e7-gn-v2-resend-integration.test.mjs exactly as the C50 runner's DB tests do (sha-checked; imports rewritten to the tooling checkout)
   const SRC = "test/db/e7-gn-v2-resend-integration.test.mjs"; const SRC_SHA = "1c847a2d6ade0e3aa3f7e8bbdeb7727a4456cb49ad93ecdbe3b9be56ac5d63a0";
@@ -300,7 +303,7 @@ if (process.env.E7_HST_DB_TESTS === "1") {
   symlinkSync(join(TOOLING, "node_modules"), join(tdir, "node_modules"));
   const Hm = await import(pathToFileURL(join(tdir, "helpers.mjs")).href);
   const db = await H.startMigratedDatabase(); Hm.__setDb(db);
-  assert.deepEqual(await MG.migrateUp(db.owner, { env: "test", dir: MDIR }), [27]);
+  assert.deepEqual(await MG.migrateUp(db.owner, { env: "test", dir: MDIR }), [27, 28]);
   const reportPool = new pg.Pool({ connectionString: db.reportUrl(), max: 2 });
   after(async () => { await reportPool.end(); await db.close(); rmSync(MDIR, { recursive: true, force: true }); rmSync(tdir, { recursive: true, force: true }); });
   const L = 606998;
@@ -316,7 +319,7 @@ if (process.env.E7_HST_DB_TESTS === "1") {
       WHERE s.nspname = 'booking' AND t.relkind = 'r'`)).rows[0].f;
   const notifyOf = async (id) => one("SELECT id, created_at FROM booking.external_operations WHERE intent_id = $1 AND op_type = 'guest.notify'", [id]);
 
-  test("D0 empty TEST scope on schema 27 (the real runtime role): overall OK, every metric OK with zero counts — and ONE read-only snapshot writes NOTHING", async () => {
+  test("D0 empty TEST scope on schema 28 (the real runtime role): overall OK, every metric OK with zero counts — and ONE read-only snapshot writes NOTHING", async () => {
     const f0 = await tableFingerprint(); const r = await run(null);
     assert.deepEqual([r.overall, r.code, r.clock, r.scope.intents], ["OK", "STATUS_OK", "database", 0], JSON.stringify(r));
     for (const m of Object.values(r.metrics)) assert.equal(m.status, "OK");
@@ -395,11 +398,11 @@ if (process.env.E7_HST_DB_TESTS === "1") {
     m = await k(t0); assert.deepEqual([m.status, m.counts.refused, m.counts.refused_still_authorized], ["INFO", 1, 0], "a refusal of a closed intent is informational");
   });
 
-  test("D5 permissions / identity / bounds on the REAL database: the owner, the admin login and the report login are each refused STS_ROLE_REFUSED (only the runtime role reads); a revoked runtime grant changes the catalog → STS_CATALOG_NOT_27; a faulted statement → UNKNOWN with no metrics; maxIntents below the scope → STS_SCOPE_TOO_LARGE (never a partial OK); a non-TEST instance marker → STS_NOT_TEST; zero writes throughout", async () => {
+  test("D5 permissions / identity / bounds on the REAL database: the owner, the admin login and the report login are each refused STS_ROLE_REFUSED (only the runtime role reads); a revoked runtime grant changes the catalog → STS_CATALOG_NOT_28; a faulted statement → UNKNOWN with no metrics; maxIntents below the scope → STS_SCOPE_TOO_LARGE (never a partial OK); a non-TEST instance marker → STS_NOT_TEST; zero writes throughout", async () => {
     const f0 = await tableFingerprint();
     for (const pool of [db.owner, db.reconciler, reportPool]) { const r = await run(null, C0, pool); assert.deepEqual([r.overall, r.code, r.metrics], ["UNKNOWN", "STS_ROLE_REFUSED", {}]); }
     await db.owner.query("REVOKE EXECUTE ON FUNCTION booking.external_cancellation_public(uuid) FROM mv_booking_app");
-    try { const r = await run(null); assert.deepEqual([r.overall, r.code], ["UNKNOWN", "STS_CATALOG_NOT_27"]); }
+    try { const r = await run(null); assert.deepEqual([r.overall, r.code], ["UNKNOWN", "STS_CATALOG_NOT_28"]); }
     finally { await db.owner.query("GRANT EXECUTE ON FUNCTION booking.external_cancellation_public(uuid) TO mv_booking_app"); }
     for (const victim of [Q.kickoff, Q.notifyPage, Q.refunds]) {
       const faulty = { connect: async () => { const cl = await db.app.connect(); return { query: (t, p) => (t === victim ? Promise.reject(new Error("permission denied SENTINEL")) : cl.query(t, p)), release: (x) => cl.release(x) }; } };

@@ -30,8 +30,11 @@
 //     otherwise ACCEPTED_UNVERIFIED_STOP (acceptance retained, exit 1). Provider acceptance is still NOT delivery (deliveryProven false).
 //   * Never: a second send, a retry, a generic sweep, notification / inbox processing beyond the ONE bound op, refund / cancel / void / claim release,
 //     or a recipient / name / subject / text / header / key / raw exception in a result or log (codes / hashes / sanitized operation metadata only).
+// C119 S4 (DRAFT, SHIPPED CLOSED): CATALOG 28 — admission accepts EXACTLY schema 28 (0028 rebinds only the claim_pipeline_kickoff source literal, so only
+//   the fn section moves); 27 / 26 / 21–25 / drift refused (CATALOG_NOT_28). Tooling 66133a22 + closure unchanged. Both gated jobs run in the isolated
+//   environment e7-test-auto and re-check the LIVE main ref (P3) after any queue / approval delay, before any secret.
 // C119 S1 (DRAFT, SHIPPED CLOSED; no schedule / variable / environment / setting change):
-//   * CATALOG 27: admission accepts EXACTLY the reviewed schema 27 (0027 external cancellation); 26 / 21–25 / drift refused (CATALOG_NOT_27). The read
+//   * (history) CATALOG 27: admission accepted EXACTLY the reviewed schema 27 (0027 external cancellation); 26 / 21–25 / drift refused. The read
 //     path additionally covers booking.external_cancellation_public (the ONLY 0027 function the runtime role may execute). Tooling 66133a22 and the
 //     closure are unchanged (0027 adds no runtime module; the only lib change since 66133a22 is intent-api-core.js, in no closure).
 //   * EXTERNAL CANCELLATION: admission reads booking.external_cancellation_public(intent) (the minimal granted projection; the runtime role has no
@@ -76,11 +79,13 @@ import { spawn } from "node:child_process";
 const freeze = Object.freeze;
 function deepFreeze(v) { if (v && typeof v === "object") { for (const k of Object.keys(v)) deepFreeze(v[k]); freeze(v); } return v; }
 
-/** C119 S1: the reviewed schema-27 catalog identity (0001..0027; tooling 66133a22 migrations 0001..0026 + the merged e7-test a314681b 0027 bytes), derived with
+/** C119 S4: the reviewed schema-28 catalog identity (0001..0028 = the C119 S4 tooling migrations; 0028 rebinds ONLY the claim_pipeline_kickoff
+ *  source literal, so only the fn section differs from 27), derived the same way (PG16 == PG17); schema 27 (bcc11631…) is now REFUSED with 21–26.
+ *  History — C119 S1: the reviewed schema-27 catalog identity (0001..0027; tooling 66133a22 migrations 0001..0026 + the merged e7-test a314681b 0027 bytes), derived with
  *  THIS file's CATALOG_SQL and the 7-function READ_PATH_FUNCTIONS (incl. booking.external_cancellation_public) as the runtime app role on disposable
  *  PostgreSQL 16 AND 17 (identical). The same derivation reproduces the accepted schema-23 inspector pin byte-for-byte and the C116 schema-26 pin
  *  (asserted by the DB tests). Schemas 21–26 and any drift are refused. */
-const CATALOG_PIN_27 = {"catalog":"bcc116319adfa7c2e0c2f42d32d48b67fdc53ab35cd4058e777e5de5376c6d16","readPath":"b881c9e076b2d113508399dfc0d16322ea5e759fe9fcc6c6ec1eed25324a930a","readPathCount":7,"sections":{"con":"4c9a9148388a8b3846c9ffdb563454b129ea033bf8ee10ec8578db673671b589","col":"4707a34d900203ce83b3a201876fb64897c45c9c10a587f49bb32e753732435f","fn":"6003d12e6fe64492e52bd6e60727cbedaaa047001853b0185413298a5e1d0b49","pol":"f33e232460e9c4d9e4e29945f6e38526fef3551b122efa7a9f8793b182d40b64","rel":"845368cfa6b65e98bbe47af3e8140057be46bcefd1f6ded3034bd1dd06a66d54","trg":"6887ee0464f01e23a8987b963944e856a2065c8e3f0c2e7d6d0d82808018dd42"}};
+const CATALOG_PIN_28 = {"catalog":"96d74ab10cdf7bdd99e125eb6825284e9b57cacec33478fb1a666746e8f91b1b","readPath":"b881c9e076b2d113508399dfc0d16322ea5e759fe9fcc6c6ec1eed25324a930a","readPathCount":7,"sections":{"con":"4c9a9148388a8b3846c9ffdb563454b129ea033bf8ee10ec8578db673671b589","col":"4707a34d900203ce83b3a201876fb64897c45c9c10a587f49bb32e753732435f","fn":"ab8143ea24d02b5ff512388473ccfee3465a9eaddaa3a99bdcc03c4a66207cef","pol":"f33e232460e9c4d9e4e29945f6e38526fef3551b122efa7a9f8793b182d40b64","rel":"845368cfa6b65e98bbe47af3e8140057be46bcefd1f6ded3034bd1dd06a66d54","trg":"6887ee0464f01e23a8987b963944e856a2065c8e3f0c2e7d6d0d82808018dd42"}};
 
 export const CONSTANTS = deepFreeze({
   toolingCommit: "66133a22edca925e6386c4d178c251fa5f11c82e",          // C116: e7-test #180 merge commit (tree ade3e084 == reviewed head 5ba7f793; 0026). #178 merge 9b7a96bf: tree 40dbe13f == reviewed head d7e39ae3; sink recipient scope + 0025). C55 pin was 46b3eaf8
@@ -102,7 +107,7 @@ export const CONSTANTS = deepFreeze({
   // recipient scope stays the accepted `.invalid` fences. NOT a domain-verification / readiness claim.
   sender: { fromAddress: "bookings@mail.micasadirect.com", fromName: "MiCasaDirect" },
   workerEnv: { VERCEL_ENV: "preview", MV_E7_NOTIFICATION_WORKER: "enabled" },   // the accepted worker's own gate marker, passed ONLY inside the (closed) execute body
-  catalogPin27: CATALOG_PIN_27,
+  catalogPin28: CATALOG_PIN_28,
   // C119 S1 detect scope: the reviewed kickoff cutoff (2026-11-15T22:58:01Z; older rows are historic: counted, never selected, never a STOP) and the
   // runner's exclusions + the C103 continuation intent (== the reviewed kickoff scope's exclusions). Fixed label + locale for the server-derived plan.
   detect: { cutoff: "2026-11-15T22:58:01.000Z", template: "booking_confirmed", locale: "en", approvalRef: "E7-HBC-DETECT-v1", pages: 20, pageLimit: 100,
@@ -131,7 +136,7 @@ export const PLAN_SCHEMA = "e7-hosted-booking-confirmation-plan-v1";
 export const RESULT_SCHEMA = "e7-hosted-booking-confirmation-result-v1";
 export const CORE_CODES = freeze(["PROVIDER_ACCEPTED", "PROVIDER_ACCEPTED_REPLAY", "ACCEPTED_UNVERIFIED_STOP", "UNKNOWN_STOP", "NOT_SENT", "NBC_ADMISSION_REFUSED", "NBC_BOUND_OP_MISMATCH",
   "NBC_WORKER_REFUSED", "NBC_WORKER_ERROR", "NBC_EXECUTOR_INVALID", "NBC_DB_FAILED", "NBC_DB_TIMEOUT", "NBC_BUDGET", "NBC_CANDIDATE_CHANGED", "NBC_BOUND_FACTS_MISMATCH"]);
-export const ADMISSION_CODES = freeze(["NOT_READ_ONLY", "ROLE_REFUSED", "CATALOG_NOT_27", "NOT_TEST", "INTENT_NOT_FOUND", "INTENT_EXCLUDED", "LISTING_MISMATCH",
+export const ADMISSION_CODES = freeze(["NOT_READ_ONLY", "ROLE_REFUSED", "CATALOG_NOT_28", "NOT_TEST", "INTENT_NOT_FOUND", "INTENT_EXCLUDED", "LISTING_MISMATCH",
   "VERSION_MISMATCH", "CURRENCY_NOT_USD", "STATE_NOT_CONFIRMED", "PROTECTED", "EXTERNALLY_CANCELLED", "CANCELLATION_UNREADABLE", "OP_COUNT", "OP_NOT_BOUND", "OP_NOT_PRISTINE", "OP_PAYLOAD_SHAPE", "TEMPLATE_NOT_V2",
   "CLASS_NOT_ELIGIBLE", "RENDER_PRESENT", "LATCH_PRESENT", "RECEIPT_PRESENT", "WORK_LEASED", "REPLY_SHAPE"]);
 export const HOSTED_CODES = freeze(["NBC_USAGE", "NBC_INPUT_UNEXPECTED", "NBC_EXECUTE_CLOSED", "NBC_SECRET_SCOPE_VIOLATION", "NBC_INPUT_INVALID", "NBC_INPUT_INCOMPLETE",
@@ -287,7 +292,7 @@ export const PLAN_INPUT_KEYS = freeze(["approvalRef", "intentId", "opId", "expec
 export function buildPlan(c, { approvalRef, intentId, opId, expectedVersion, locale, sourceDigest }) {
   const plan = { schema: PLAN_SCHEMA, kind: "gn-v2-booking-confirmation-one-bound-op", approvalRef, intentId, opId, expectedVersion, locale,
     sender: c.sender, listingId: c.listingId, dbEnvironment: c.dbEnvironment, dbProjectRef: c.dbProjectRef, toolingCommit: c.toolingCommit, closureDigest: c.closureDigest,
-    sourceDigest, catalogPin27: c.catalogPin27, excludedIntentIds: c.excludedIntentIds, protectedReservationIds: c.protectedReservationIds,
+    sourceDigest, catalogPin28: c.catalogPin28, excludedIntentIds: c.excludedIntentIds, protectedReservationIds: c.protectedReservationIds,
     budgets: { workerInvocations: c.budgets.workerInvocations, sends: c.budgets.sends }, executeEnabled: c.executeEnabled };
   return { plan: deepFreeze(plan), planHash: sha(canonical(plan)) };
 }
@@ -364,7 +369,7 @@ export async function admit({ client, plan, c = CONSTANTS }) {
     if (!id || typeof id !== "object" || !id.sections) no("REPLY_SHAPE");
     const sections = {}; for (const k of ["con", "col", "fn", "pol", "rel", "trg"]) sections[k] = id.sections[k] ?? null;
     if (Object.keys(id.sections).some((k) => !Object.hasOwn(sections, k))) no("REPLY_SHAPE");
-    if (sha(canonical(sections)) !== c.catalogPin27.catalog || id.readPath !== c.catalogPin27.readPath || id.readPathCount !== c.catalogPin27.readPathCount) no("CATALOG_NOT_27");
+    if (sha(canonical(sections)) !== c.catalogPin28.catalog || id.readPath !== c.catalogPin28.readPath || id.readPathCount !== c.catalogPin28.readPathCount) no("CATALOG_NOT_28");
     const inst = one(await q("instance")); if (inst.n !== 1 || inst.env !== c.dbEnvironment) no("NOT_TEST");
     if (c.excludedIntentIds.includes(plan.intentId)) no("INTENT_EXCLUDED");
     const ir = await q("intent", [plan.intentId, [...c.protectedReservationIds]]);
@@ -452,7 +457,7 @@ export async function selectCandidate({ client, c = CONSTANTS }) {
     if (!id || typeof id !== "object" || !id.sections || typeof id.sections !== "object") return done("STOP", "DETECT_REPLY_SHAPE");
     const sections = {}; for (const k of ["con", "col", "fn", "pol", "rel", "trg"]) sections[k] = id.sections[k] ?? null;
     if (Object.keys(id.sections).some((k) => !Object.hasOwn(sections, k))) return done("STOP", "DETECT_REPLY_SHAPE");
-    if (sha(canonical(sections)) !== c.catalogPin27.catalog || id.readPath !== c.catalogPin27.readPath || id.readPathCount !== c.catalogPin27.readPathCount) return done("STOP", "DETECT_SESSION_REFUSED");
+    if (sha(canonical(sections)) !== c.catalogPin28.catalog || id.readPath !== c.catalogPin28.readPath || id.readPathCount !== c.catalogPin28.readPathCount) return done("STOP", "DETECT_SESSION_REFUSED");
     const inst = one(await q(Q.instance)); if (!inst || inst.n !== 1 || inst.env !== c.dbEnvironment) return done("STOP", "DETECT_SESSION_REFUSED");
     const candidates = []; let cursor = null;
     for (;;) {

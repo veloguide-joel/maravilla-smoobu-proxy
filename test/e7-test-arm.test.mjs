@@ -22,6 +22,7 @@ const ROOT = realpathSync(join(dirname(fileURLToPath(import.meta.url)), ".."));
 const A = await import("../scripts/e7-test-arm.mjs");
 const K = await import("../scripts/e7-hosted-kickoff.mjs");
 const N = await import("../scripts/e7-hosted-booking-confirmation.mjs");
+const P = await import("../scripts/e7-hosted-pipeline.mjs");                                  // C119 S4: the pipeline carries the labelled arm copy too
 const sha = (b) => createHash("sha256").update(b).digest("hex");
 const MANIFEST = readFileSync(join(ROOT, A.ARM_MANIFEST_PATH), "utf8");
 const M = JSON.parse(MANIFEST);
@@ -43,13 +44,17 @@ test("A1 release digest: deterministic, recomputed from the bytes (an exact copy
   assert.deepEqual(M.components[2].files, [...N.CONSTANTS.runnerFiles]); assert.equal(M.components[2].prefix, N.SOURCE_DIGEST_PREFIX);
   assert.equal(R0.frames["booking-confirmation"], await N.framedDigest(ROOT, N.CONSTANTS.runnerFiles, N.SOURCE_DIGEST_PREFIX));
   assert.deepEqual(M.components[3].files, [...K.CONSTANTS.pipeline.runnerFiles], "the pipeline frame the kickoff binds");
-  assert.equal(R0.frames.pipeline, "cfe62d4d8b3eaeb739576b8762ee4b3753d47e4f8ed8258696ca40406a66e2d4", "S2 leaves the pipeline bytes untouched (the CLOSED main frame)");
+  // C119 S4: no pipeline-frame LITERAL here any more (the pipeline is now an arm-gated component; its exact frames live in the kickoff pins / the
+  // tooling PINNED_REVISION / the C102 delta fixture, and the release literal only in the cross-runner regression X5)
+  assert.equal(R0.frames.pipeline, await K.framedDigest(ROOT, K.CONSTANTS.pipeline.runnerFiles, K.CONSTANTS.pipeline.sourcePrefix), "the CLOSED pipeline frame on this tree");
   assert.deepEqual(M.components[0].files, ["scripts/e7-test-arm.mjs", "test/e7-test-arm.test.mjs"]);
   assert.doesNotMatch(MANIFEST, /[0-9a-f]{40,}/, "the manifest lists names / prefixes / files only — never a digest");
-  // a component may pin the UNTOUCHED pipeline's frame (kickoff already does; the pipeline embeds nothing of ours), but NO file in the release embeds the
-  // release itself or the frame of any component that changes with S2 (arm gate / kickoff / confirmation) — so nothing depends on its own result
+  // ACYCLIC: the kickoff component may pin the pipeline's frames (kickoff → pipeline only); NO file in the release embeds the release itself or the frame
+  // of the arm gate / kickoff / confirmation; the PIPELINE embeds no frame / release literal at all (C119 S4: it now RECOMPUTES the release from its
+  // own checkout via a labelled copy — code, never a literal — so it still depends on nothing downstream)
   for (const f of FILES) { const t = readFileSync(join(ROOT, f), "utf8"); for (const v of [R0.release, R0.frames["arm-gate"], R0.frames.kickoff, R0.frames["booking-confirmation"]]) assert.ok(!t.includes(v), `${f} must not embed ${v.slice(0, 8)}…`); }
-  for (const f of M.components[3].files) { const t = readFileSync(join(ROOT, f), "utf8"); assert.doesNotMatch(t, /e7-test-arm|E7_TEST_AUTO_ARMED/, `the pipeline component ${f} knows nothing of the arm (acyclic)`); }
+  for (const f of M.components[3].files) { const t = readFileSync(join(ROOT, f), "utf8"); assert.ok(!t.includes(R0.frames.pipeline), `${f} must not embed its own frame`);
+    const D = JSON.parse(readFileSync(join(ROOT, "test/fixtures/e7-c102-pipeline-enable-delta.json"), "utf8")); assert.ok(!t.includes(D.enableFrame) && !t.includes(D.closedFrame), `${f}: no own-frame literal`); }
   for (const f of A.OUTSIDE_EVERY_COMPONENT) assert.ok(!M.components.some((x) => x.files.includes(f)), `${f} is outside every component`);
 });
 
@@ -92,8 +97,8 @@ test("A3 release changes: ONE byte in ANY component file (arm gate, kickoff, con
 test("A4 the runners' arm blocks are LABELLED COPIES (byte-equal) of scripts/e7-test-arm.mjs and compute the same release / decision", async () => {
   const block = (t) => { const i = t.indexOf("const ARM_HEX64 = "); const j = t.indexOf("\n// ----", i + 1); assert.ok(i > 0 && j > i); return t.slice(i, j).trimEnd(); };
   const a = block(readFileSync(join(ROOT, "scripts/e7-test-arm.mjs"), "utf8"));
-  for (const f of ["scripts/e7-hosted-kickoff.mjs", "scripts/e7-hosted-booking-confirmation.mjs"]) assert.equal(block(readFileSync(join(ROOT, f), "utf8")), a, f);
-  for (const X of [K, N]) {
+  for (const f of ["scripts/e7-hosted-kickoff.mjs", "scripts/e7-hosted-booking-confirmation.mjs", "scripts/e7-hosted-pipeline.mjs"]) assert.equal(block(readFileSync(join(ROOT, f), "utf8")), a, f);
+  for (const X of [K, N, P]) {
     assert.equal(X.armRelease.toString(), A.armRelease.toString()); assert.equal(X.armDecision.toString(), A.armDecision.toString());
     assert.deepEqual(await X.armRelease(ROOT), R0);
     assert.deepEqual(await X.armDecision({ dir: ROOT, value: R0.release, ref: "refs/heads/main" }), await A.armDecision({ dir: ROOT, value: R0.release, ref: "refs/heads/main" }));

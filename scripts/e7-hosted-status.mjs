@@ -19,8 +19,8 @@ import { createHash } from "node:crypto";
 const freeze = Object.freeze;
 function deepFreeze(v) { if (v && typeof v === "object") { for (const k of Object.keys(v)) deepFreeze(v[k]); freeze(v); } return v; }
 
-// ---- LABELLED COPIES of scripts/e7-hosted-booking-confirmation.mjs (the schema-27 identity probe + pin; asserted equal by the tests) -----------
-const CATALOG_PIN_27 = {"catalog":"bcc116319adfa7c2e0c2f42d32d48b67fdc53ab35cd4058e777e5de5376c6d16","readPath":"b881c9e076b2d113508399dfc0d16322ea5e759fe9fcc6c6ec1eed25324a930a","readPathCount":7,"sections":{"con":"4c9a9148388a8b3846c9ffdb563454b129ea033bf8ee10ec8578db673671b589","col":"4707a34d900203ce83b3a201876fb64897c45c9c10a587f49bb32e753732435f","fn":"6003d12e6fe64492e52bd6e60727cbedaaa047001853b0185413298a5e1d0b49","pol":"f33e232460e9c4d9e4e29945f6e38526fef3551b122efa7a9f8793b182d40b64","rel":"845368cfa6b65e98bbe47af3e8140057be46bcefd1f6ded3034bd1dd06a66d54","trg":"6887ee0464f01e23a8987b963944e856a2065c8e3f0c2e7d6d0d82808018dd42"}};
+// ---- LABELLED COPIES of scripts/e7-hosted-booking-confirmation.mjs (C119 S4: the schema-28 identity probe + pin; asserted equal by the tests) -----------
+const CATALOG_PIN_28 = {"catalog":"96d74ab10cdf7bdd99e125eb6825284e9b57cacec33478fb1a666746e8f91b1b","readPath":"b881c9e076b2d113508399dfc0d16322ea5e759fe9fcc6c6ec1eed25324a930a","readPathCount":7,"sections":{"con":"4c9a9148388a8b3846c9ffdb563454b129ea033bf8ee10ec8578db673671b589","col":"4707a34d900203ce83b3a201876fb64897c45c9c10a587f49bb32e753732435f","fn":"ab8143ea24d02b5ff512388473ccfee3465a9eaddaa3a99bdcc03c4a66207cef","pol":"f33e232460e9c4d9e4e29945f6e38526fef3551b122efa7a9f8793b182d40b64","rel":"845368cfa6b65e98bbe47af3e8140057be46bcefd1f6ded3034bd1dd06a66d54","trg":"6887ee0464f01e23a8987b963944e856a2065c8e3f0c2e7d6d0d82808018dd42"}};
 export const INSPECT_READ_PATH_FUNCTIONS = freeze(["gn_check_scope", "gn_recipient_in_scope", "guest_notification_class", "guest_notification_protected", "list_guest_notifications",
   "recording_protected_reservation_ids"]);
 export const READ_PATH_FUNCTIONS = freeze([...INSPECT_READ_PATH_FUNCTIONS, "external_cancellation_public"]);
@@ -57,7 +57,7 @@ export const CONSTANTS = deepFreeze({
   pgVersion: "8.18.0", nodeVersion: "22.22.0",
   runnerFiles: ["scripts/e7-hosted-status.mjs", "test/e7-hosted-status.test.mjs", "test/e7-hosted-status-workflow.test.mjs", ".github/workflows/e7-hosted-status.yml"],
   listingId: 606998, dbEnvironment: "test", dbProjectRef: "mxotevtiscernhqilyiu",
-  catalogPin27: CATALOG_PIN_27,
+  catalogPin28: CATALOG_PIN_28,
   // scope: the reviewed kickoff scope (cutoff + exclusions); intents by created_at, kickoff requests by intent_created_at, notifications by op created_at
   scope: { cutoff: "2026-11-15T22:58:01.000Z", excludedIntentIds: ["abede8b1-8ef6-44f2-876e-6a02fc056a96", "c83c1842-d342-4e27-9ab7-dc3d50b7a309", "1d6e770f-ba3d-40f7-92c1-ee01be7da532"],
     maxIntents: 500, notifyPages: 20, notifyPageLimit: 100 },
@@ -295,7 +295,7 @@ export async function runStatusCore({ pool, c = CONSTANTS, asOf = null }) {
     if (!id || typeof id !== "object" || !id.sections) refuse("STS_REPLY_SHAPE");
     const sections = {}; for (const k of ["con", "col", "fn", "pol", "rel", "trg"]) sections[k] = id.sections[k] ?? null;
     if (Object.keys(id.sections).some((k) => !Object.hasOwn(sections, k))) refuse("STS_REPLY_SHAPE");
-    if (sha(canonical(sections)) !== c.catalogPin27.catalog || id.readPath !== c.catalogPin27.readPath || id.readPathCount !== c.catalogPin27.readPathCount) refuse("STS_CATALOG_NOT_27");
+    if (sha(canonical(sections)) !== c.catalogPin28.catalog || id.readPath !== c.catalogPin28.readPath || id.readPathCount !== c.catalogPin28.readPathCount) refuse("STS_CATALOG_NOT_28");
     const inst = one(await q(Q.instance)); if (!inst || inst.n !== 1 || inst.env !== c.dbEnvironment) refuse("STS_NOT_TEST");
     const ck = one(await q(Q.clock, base)); if (!ck || ck.ok !== true || ck.synthetic !== (asOf !== null)) refuse("STS_REPLY_SHAPE");
     const sc = one(await q(Q.scope, base.slice(0, 3)));
