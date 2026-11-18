@@ -32,7 +32,7 @@ const NOTIFICATION = Object.freeze({
   prefix: "e7-hosted-booking-confirmation-v1\n",
   runnerFiles: ["scripts/e7-hosted-booking-confirmation.mjs", "test/e7-hosted-booking-confirmation.test.mjs", "test/e7-hosted-booking-confirmation-workflow.test.mjs",
     ".github/workflows/e7-hosted-booking-confirmation.yml"],
-  frame: "60a668f084d54c742d230d3a18b0d7aa019f5a599f10568463f07be338d8ab01"   // C120d ACTIVATION ENABLE (executeEnabled true; the CLOSE companion restores 5d0cf134…). C120 sink-probe env move: its workflow-test pins (sink 3e16037c / inspector 2950152a) (was a033a893…). C120: + the passive providerHttpStatus observation (was f969791b… at C119 S4). C119 S4: catalog 28 + e7-test-auto + P3 fresh admission (was ccb52e91… at S2). C119 S2: + the TEST arm re-check (labelled copy) + the arm job / draft schedule (was 9c6cf9f2… at S1 rev 2 / main 30d00191; 0cd953a9… at C116)
+  frame: "5d0cf13495c22db4aa9008e9653cad956f4ef45aff90a419bdd74437f6d8dbec"   // C120 sink-probe env move: its workflow-test pins (sink 3e16037c / inspector 2950152a) (was a033a893…). C120: + the passive providerHttpStatus observation (was f969791b… at C119 S4). C119 S4: catalog 28 + e7-test-auto + P3 fresh admission (was ccb52e91… at S2). C119 S2: + the TEST arm re-check (labelled copy) + the arm job / draft schedule (was 9c6cf9f2… at S1 rev 2 / main 30d00191; 0cd953a9… at C116)
 });
 
 /** every runtime source frame on main: each runner's own runnerFiles, plus the fixed frames the workflow tests pin for the two probes */
@@ -51,7 +51,7 @@ async function runtimeFrames() {
 
 test("X1 the C50 notification runner (moved from pipeline W7 / kickoff W8): SHIPPED CLOSED and its exact frame equals the LITERAL reviewed digest", async () => {
   const N = await import("../scripts/e7-hosted-booking-confirmation.mjs");
-  assert.equal(N.CONSTANTS.executeEnabled, true, "C120 ACTIVATION ENABLE (the CLOSE companion restores false / SHIPPED CLOSED)");
+  assert.equal(N.CONSTANTS.executeEnabled, false, "SHIPPED CLOSED");
   assert.deepEqual([...N.CONSTANTS.runnerFiles], NOTIFICATION.runnerFiles);
   assert.equal(await N.framedDigest(ROOT, NOTIFICATION.runnerFiles, NOTIFICATION.prefix), NOTIFICATION.frame);
 });
@@ -95,8 +95,8 @@ test("X4 CI wiring: the regression runs on every pull request / push to main (an
 
 /** C119 S2: the LITERAL reviewed TEST-arm release of this tree (outside every component, so the release never embeds itself). It is NOT an
  *  arm and sets nothing: ROOT sets the repository variable out-of-band at a separately authorized activation, never from this file. */
-// C120d ACTIVATION ENABLE: 2dfceb27… (the CLOSE companion restores 9e14224d…). C120: 9e14224d… after the sink-probe env move pin cascade (kickoff + notification frames; was 9e87d5f2… after the passive providerHttpStatus; was 7a407d45… at C119 S4 after the pipeline admission cascade + the MERGED tooling repin)
-const ARM_RELEASE = Object.freeze({ release: "2dfceb27bce7992e615884855b103ac51a870d7f1417f073eb2a734aaddea604", components: ["arm-gate", "kickoff", "booking-confirmation", "pipeline"] });
+// C120: 9e14224d… after the sink-probe env move pin cascade (kickoff + notification frames; was 9e87d5f2… after the passive providerHttpStatus; was 7a407d45… at C119 S4 after the pipeline admission cascade + the MERGED tooling repin)
+const ARM_RELEASE = Object.freeze({ release: "9e14224dc22f3922b56f6da110aeb4d3fc1cc555083bca45a9cea71c1a92fb37", components: ["arm-gate", "kickoff", "booking-confirmation", "pipeline"] });
 
 test("X5 C119 S2 the TEST-arm release recomputed from this checkout equals the LITERAL reviewed release; this file is outside every arm component; no component file carries the release", async () => {
   const A = await import("../scripts/e7-test-arm.mjs");
