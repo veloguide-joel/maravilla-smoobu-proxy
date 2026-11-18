@@ -7,7 +7,7 @@
 // HONEST LABEL: SHIPPED CLOSED. CONSTANTS.executeEnabled is FALSE: `verify` and `execute` refuse HPL_EXECUTE_CLOSED right after the key-name /
 // mode checks — BEFORE any input value, tooling import, credential, database or provider access. The execute body exists so it can be reviewed
 // and exercised through test seams on disposable PostgreSQL with FAKE provider exchanges only. Opening it is a separate reviewed change.
-// MANUAL hosted TEST runner (workflow_dispatch + the EXISTING `e7-readonly-probe` reviewer gate). NOT automatic checkout, NOT a cron / webhook /
+// MANUAL hosted TEST runner (workflow_dispatch; C119 S4: arm + live-main + request-bound, env `e7-test-auto`). NOT automatic checkout, NOT a cron / webhook /
 // API / UI path. ≤ 2 coordinator invocations per dispatch (the second only after the ONE bounded wait of the proven healthy PENDING NOT_DUE
 // branch, C100); no poll or re-dispatch loop; never self-retries an uncertain write.
 //
@@ -55,6 +55,13 @@
 // PENDING carries a sanitized nextActionAt and needs a FUTURE, separately dispatched attempt with fresh proof (exit 0, NOT completion).
 // Anything else is STOP (exit 1): writes attempted are reported (possiblyEffected); never a repeat write, a repair, or reconcile-by-inference.
 // Refunds stay MANUAL; no cancel / refund / void / cleanup / mirror / claim release / email automation here.
+// C119 S4 (DRAFT; this revision ships CLOSED — opening is the separate reviewed C102 ENABLE delta): pipeline ADMISSION. P4 verify / execute require the TEST arm (E7_TEST_ARM) to EQUAL the
+//   release RECOMPUTED from this checkout (labelled copy of scripts/e7-test-arm.mjs) → HPL_ARM_CLOSED before any value / import / secret / DB /
+//   provider; no manual bypass. P5 the core admits ONLY a run whose 0024 kickoff request (claimed | dispatch_accepted) carries EXACTLY this run's
+//   frozen plan hash + dispatch inputs — read FRESH under the run lock, at admission (before any provider exchange) and again before EACH coordinator
+//   invocation; anything else (no row, several, another state, any shape / value difference, a read error) → STOP, zero coordinator invocations.
+//   The workflow's P3 live main-ref check (after any queue / approval delay, before verify) is the revocation point: a CLOSE commit moving main.
+//   Neither interrupts an admitted run (≤ 2 invocations, ≤ 150 s wait); leases / idempotency / unknown / cancellation fences are unchanged.
 import process from "node:process";
 import { readFile, realpath, lstat } from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -134,7 +141,7 @@ export const OUTCOMES = freeze(["CONFIRMED_VERIFIED", "PENDING", "STOP"]);
 export const HOSTED_CODES = freeze(["HPL_USAGE", "HPL_INPUT_UNEXPECTED", "HPL_EXECUTE_CLOSED", "HPL_SECRET_SCOPE_VIOLATION", "HPL_INPUT_INVALID", "HPL_INPUT_INCOMPLETE",
   "HPL_INTENT_EXCLUDED", "HPL_REF_NOT_MAIN", "HPL_LAYOUT_INVALID", "HPL_SOURCE_UNREADABLE", "HPL_SOURCE_MISMATCH", "HPL_CLOSURE_MISMATCH", "HPL_PLAN_HASH_MISMATCH",
   "HPL_IMPORT_FAILED", "HPL_ENV_REFUSED", "HPL_CHILD_FAILED", "HPL_TESTS_FAILED", "HPL_CREDENTIALS_MISSING", "HPL_DEPENDENCY_MISMATCH", "HPL_DB_TARGET_INVALID",
-  "HPL_CA_INVALID", "HPL_INTERNAL"]);
+  "HPL_CA_INVALID", "HPL_INTERNAL", "HPL_ARM_CLOSED"]);
 
 // ---- LABELLED COPIES of scripts/e7-hosted-reservation.mjs pure helpers (asserted equal by the tests; no runner file is imported) ---------------
 export function canonical(v) {
@@ -229,9 +236,49 @@ export const QUERIES = deepFreeze({
   // C101 F2: continuation-only gates (pure counts; never process / release / resolve). Zero OPEN cases is NOT equivalent: a hold may name a resolved case
   holds: "/*e7hpl:holds*/ SELECT count(*)::int AS n FROM booking.recording_holds WHERE intent_id = $1 AND released_at IS NULL",
   inbox: "/*e7hpl:inbox*/ SELECT count(*)::int AS n FROM booking.recording_conflict_inbox WHERE intent_id = $1 AND processed_at IS NULL",
-  guest: `/*e7hpl:guest*/ SELECT g.first_name, g.last_name, g.email FROM (SELECT 1) one LEFT JOIN booking.intent_guests g ON g.intent_id = $1`
+  guest: `/*e7hpl:guest*/ SELECT g.first_name, g.last_name, g.email FROM (SELECT 1) one LEFT JOIN booking.intent_guests g ON g.intent_id = $1`,
+  // C119 S4 (P5): the ONE durable kickoff claim this run must be bound to (0024 SELECT grant + app_admin_read RLS policy; no new privilege)
+  request: "/*e7hpl:request*/ SELECT intent_id::text AS intent_id, state, plan_hash, dispatch_inputs FROM booking.pipeline_kickoff_requests WHERE intent_id = $1"
 });
 const Q = QUERIES;
+
+// ---- C119 S4 (P5): the durable request binding --------------------------------------------------------------------------------------------
+// A run is admitted ONLY for an intent whose 0024 kickoff request is `claimed` / `dispatch_accepted` and whose FROZEN plan_hash + dispatch_inputs
+// (written once by booking.claim_pipeline_kickoff, immutable by the 0024 guard) EXACTLY equal this run's own inputs. Read FRESH under the run
+// lock before EACH coordinator invocation. No row / several rows / another state / any shape or value difference / a query error → STOP, zero
+// coordinator invocations, zero provider calls, the lock released by the normal teardown. This closes direct / hand-built / stale dispatches;
+// it is NOT a revocation mechanism (revocation = a CLOSE commit moving main, checked live before verify by the workflow).
+export const REQUEST_INPUT_KEYS = freeze(["mode", "approval_ref", "intent_id", "booking_ref", "expected_version", "not_before", "payment_intent_id", "amount_minor",
+  "currency", "expected_plan_hash", "expected_source_digest", "expected_closure_digest"]);
+const REQUEST_ROW_KEYS = freeze(["dispatch_inputs", "intent_id", "plan_hash", "state"]);
+const REQUEST_STATES = freeze(["requested", "claimed", "dispatch_accepted", "dispatch_unknown", "dispatch_refused", "refused"]);
+const ADMITTED_REQUEST_STATES = freeze(["claimed", "dispatch_accepted"]);
+const plainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v) && Object.getPrototypeOf(v) === Object.prototype;
+const exactKeys = (v, keys) => plainObject(v) && JSON.stringify(Object.keys(v).sort()) === JSON.stringify([...keys].sort());
+/** the run's OWN binding (built by runHosted from the dispatched input strings) must be closed, typed and coherent with the plan → null | code */
+export function requestBindingInvalid(b, plan, planHash) {
+  if (!exactKeys(b, ["planHash", "inputs"]) || typeof b.planHash !== "string" || !HEX64.test(b.planHash) || b.planHash !== planHash) return "BINDING_PLAN_HASH";
+  const x = b.inputs;
+  if (!exactKeys(x, REQUEST_INPUT_KEYS) || !REQUEST_INPUT_KEYS.every((k) => typeof x[k] === "string")) return "BINDING_SHAPE";
+  if (x.mode !== "execute" || x.approval_ref !== plan.approvalRef || x.intent_id !== plan.intentId || x.booking_ref !== plan.ref || x.expected_version !== String(plan.expectedVersion)
+      || x.not_before !== plan.notBefore || x.payment_intent_id !== plan.paymentIntentId || x.amount_minor !== String(plan.amountMinor) || x.currency !== plan.currency
+      || x.expected_plan_hash !== planHash || x.expected_source_digest !== plan.sourceDigest || x.expected_closure_digest !== plan.closureDigest) return "BINDING_INCOHERENT";
+  return null;
+}
+/** pure: the fresh durable read against the run's binding → null (bound) | refusal code */
+export function requestBindingRefusal(rows, b) {
+  if (!Array.isArray(rows)) return "REQUEST_READ_INVALID";
+  if (rows.length === 0) return "NO_KICKOFF_REQUEST";
+  if (rows.length !== 1) return "REQUEST_MULTIPLE";
+  const row = rows[0];
+  if (!exactKeys(row, REQUEST_ROW_KEYS) || row.intent_id !== b.inputs.intent_id || typeof row.state !== "string" || !REQUEST_STATES.includes(row.state)) return "REQUEST_SHAPE_INVALID";
+  if (!ADMITTED_REQUEST_STATES.includes(row.state)) return `REQUEST_NOT_DISPATCHED:${row.state.toUpperCase()}`;
+  if (typeof row.plan_hash !== "string" || !HEX64.test(row.plan_hash) || row.plan_hash !== b.planHash) return "REQUEST_PLAN_HASH_MISMATCH";
+  const di = row.dispatch_inputs;
+  if (!exactKeys(di, REQUEST_INPUT_KEYS) || !REQUEST_INPUT_KEYS.every((k) => typeof di[k] === "string")) return "REQUEST_INPUTS_SHAPE_INVALID";
+  if (canonical(di) !== canonical(b.inputs)) return "REQUEST_INPUTS_MISMATCH";
+  return null;
+}
 const CREATE = "hostaway.create_reservation"; const CAPTURE = "stripe.capture_payment_intent"; const RECORD = "hostaway.record_offline_charge";
 const NOTIFY = "guest.notify";
 const FORBIDDEN_OPS = freeze(["stripe.void_payment_intent", "hostaway.cancel_reservation", "alert.owner", "stripe.refund_payment_intent", "stripe.retrieve_refund",
@@ -437,7 +484,7 @@ export async function runPipelineCore(input) {
     proofs: [], possiblyEffected: false, verifiedCompletion: false,
     sends: { create: 0, capture: 0, record: 0 }, replies: { create: "NONE", capture: "NONE", record: "NONE" }, exchanges: 0, accountReads: 0, piReads: 0, pricingCalls: 0,
     hostawayReads: 0, lookupPages: 0, chargeLists: 0, refusedAtTransport: 0, refusedByStop: 0, dbQueries: 0, dbBudgetRefused: 0, lock: "not_acquired", lockSession: null,
-    stopReason: null, factsObserved: false, postcheck: null };
+    stopReason: null, factsObserved: false, postcheck: null, requestBinding: null };
   const DONE = Symbol("done");
   const done = (outcome, k = null) => { if (!finalized) { r.outcome = outcome; r.code = k === null ? null : code(String(k), "CODE"); } return DONE; };
   const stop = (k) => done("STOP", k);
@@ -508,6 +555,8 @@ export async function runPipelineCore(input) {
         || typeof runId !== "string" || !RUN_ID_RE.test(runId)
         || !pool || typeof pool.query !== "function" || !tooling || !exchanges || typeof exchanges.stripe !== "function" || typeof exchanges.hostaway !== "function"
         || !credentials || typeof credentials.stripe !== "function" || typeof credentials.hostaway !== "function") return stop("CORE_INVALID");
+    if (requestBindingInvalid(input.requestBinding, plan, sha(canonical(plan))) !== null) return stop("CORE_INVALID:REQUEST_BINDING");   // C119 S4 (P5)
+    const requestBinding = input.requestBinding;
     for (const k of TOOLING_KEYS) if (typeof tooling[k] !== "function") return stop("CORE_INVALID:TOOLING");
     if (typeof tooling.LOCK_KEY !== "string" || typeof tooling.LOCK_PRECHECK_SQL !== "string") return stop("CORE_INVALID:TOOLING");
     const clock = input.clock ?? (() => Date.now());
@@ -593,6 +642,15 @@ export async function runPipelineCore(input) {
       const role = await q(Q.role, []);
       if (role.length !== 1 || role[0].privileged !== false || role[0].is_app !== true) return stop("SCOPE_REFUSED:ROLE_NOT_APP");
     } catch (e) { return e instanceof Stopped || e instanceof DbTimeout ? stop(`STOP_${stopReason ?? e.code}`) : stop("DB_ERROR:LOCK_QUERY_FAILED"); }
+    // C119 S4 (P5, ADMISSION): the durable request binding, first read right after the lock / role proofs — BEFORE any provider exchange
+    {
+      let rq = null; let rqErr = false;
+      try { rq = await q(Q.request, [IID]); } catch (e) { if (e instanceof Stopped || e instanceof DbTimeout) return stop(`STOP_${stopReason ?? e.code}`); rqErr = true; }
+      const rb = rqErr ? "REQUEST_READ_FAILED" : requestBindingRefusal(rq, requestBinding);
+      r.requestBinding = [`ADMISSION:${rb ?? "BOUND"}`];
+      if (rb !== null) return stop(`ADMISSION_REFUSED:${rb}`);
+    }
+    if (stopped()) return stop(`STOP_${stopReason}`);
 
     // ---- (4) the target-only transport fence (Stripe + Hostaway), counters BEFORE the transport ---------------------------------------------------
     const bound = { resId: null, rid: null, res: null, cap: null, rec: null };
@@ -865,6 +923,13 @@ export async function runPipelineCore(input) {
       try {
         if (!(await ownLock())) { r.lock = "lost"; return { stop: `LOCK_LOST:BEFORE_${label}` }; }
         if (stopped()) return { stop: `STOP_${stopReason}` };
+        // C119 S4 (P5): the FRESH durable request binding, under the held run lock, before EVERY coordinator invocation
+        let rq = null; let rqErr = false;
+        try { rq = await q(Q.request, [IID]); } catch (e) { if (r.sealed) return { stop: `STOP_${stopReason}` }; if (e instanceof Refusal && e.code === "DB_BUDGET") return { stop: "BUDGET_EXHAUSTED:DB_QUERY_CEILING" }; rqErr = true; }
+        const rb = rqErr ? "REQUEST_READ_FAILED" : requestBindingRefusal(rq, requestBinding);
+        r.requestBinding = [...(r.requestBinding ?? []), `${label}:${rb ?? "BOUND"}`];
+        if (rb !== null) return { stop: `ADMISSION_REFUSED:${rb}` };
+        if (stopped()) return { stop: `STOP_${stopReason}` };
         r.coordinatorInvocations += 1;
         coordinatorAdmitted = true;
         coP = Promise.resolve().then(() => tooling.runTestPipelineCoordinator(countedPool, { workerId: `e7-hpl:${plan.approvalRef.slice(0, 40)}`, env: workerEnv, binding: { intentId: IID, ref: plan.ref },
@@ -1071,13 +1136,74 @@ const SECRET_KEYS = freeze(["E7_STRIPE_TEST_KEY", "E7_HOSTAWAY_TOKEN", "E7_DEV_B
 export const INPUT_ENV = freeze({ approvalRef: "E7_APPROVAL_REF", intentId: "E7_INTENT_ID", ref: "E7_BOOKING_REF", expectedVersion: "E7_EXPECTED_VERSION",
   notBefore: "E7_NOT_BEFORE", paymentIntentId: "E7_PAYMENT_INTENT_ID", amountMinor: "E7_AMOUNT_MINOR", currency: "E7_CURRENCY" });
 export const ALLOWED_E7_KEYS = freeze([...Object.values(INPUT_ENV), "E7_TOOLING_DIR", "E7_EXPECTED_PLAN_HASH", "E7_EXPECTED_SOURCE_DIGEST", "E7_EXPECTED_CLOSURE_DIGEST",
-  "E7_WORKFLOW_SHA", "E7_RUN_ID", "E7_CA_FILE", ...SECRET_KEYS]);
+  "E7_WORKFLOW_SHA", "E7_RUN_ID", "E7_CA_FILE", ...SECRET_KEYS, "E7_TEST_ARM"]);                    // C119 S4: + the TEST arm (a claim; recomputed here)
 
 /** runHosted({ mode, env, proc, wrapperDir, deps }) → { exitCode, result }. Never throws. deps = TEST SEAMS (constants included). */
+// ---- C119 S4: LABELLED COPY of scripts/e7-test-arm.mjs (the release computation + arm decision; asserted byte-equal by test/e7-test-arm.test.mjs) ----
+const ARM_HEX64 = /^[0-9a-f]{64}$/;
+const ARM_PATH_RE = /^(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+$/;
+const ARM_PREFIX_RE = /^[a-z0-9-]{1,60}-v1\n$/;
+function armCanonical(v) {
+  if (v === null || typeof v !== "object") return JSON.stringify(v);
+  if (Array.isArray(v)) return `[${v.map(armCanonical).join(",")}]`;
+  return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${armCanonical(v[k])}`).join(",")}}`;
+}
+const armSha = (b) => createHash("sha256").update(b).digest("hex");
+async function armFrame(dir, files, prefix) {
+  const h = createHash("sha256"); h.update(prefix); let total = 0;
+  for (const rel of files) {
+    const st = await lstat(`${dir}/${rel}`);
+    if (!st.isFile() || st.size < 1 || st.size > 1048576) throw new Error("ARM_FILE");
+    const b = await readFile(`${dir}/${rel}`); if (b.length !== st.size) throw new Error("ARM_FILE");
+    total += b.length; if (total > 8388608) throw new Error("ARM_FILE");
+    h.update(rel); h.update(Buffer.from([0])); h.update(String(b.length)); h.update(Buffer.from([0])); h.update(b); h.update(Buffer.from([0]));
+  }
+  return h.digest("hex");
+}
+/** armRelease(dir) → { ok: true, release, manifest, frames } | { ok: false } — the manifest is parsed STRICTLY; never throws */
+export async function armRelease(dir) {
+  try {
+    const p = `${dir}/scripts/e7-test-arm/manifest.json`; const st = await lstat(p);
+    if (!st.isFile() || st.size < 2 || st.size > 65536) return { ok: false };
+    const bytes = await readFile(p); const m = JSON.parse(bytes.toString("utf8"));
+    if (!m || typeof m !== "object" || Array.isArray(m) || JSON.stringify(Object.keys(m)) !== JSON.stringify(["schema", "components"]) || m.schema !== "e7-test-arm-manifest-v1") return { ok: false };
+    const want = ["arm-gate", "kickoff", "booking-confirmation", "pipeline"];
+    if (!Array.isArray(m.components) || m.components.length !== want.length) return { ok: false };
+    const seen = new Set(); const comps = []; const frames = {};
+    for (let i = 0; i < want.length; i += 1) {
+      const x = m.components[i];
+      if (!x || typeof x !== "object" || Array.isArray(x) || JSON.stringify(Object.keys(x)) !== JSON.stringify(["name", "prefix", "files"]) || x.name !== want[i]) return { ok: false };
+      if (typeof x.prefix !== "string" || !ARM_PREFIX_RE.test(x.prefix) || !Array.isArray(x.files) || x.files.length < 1 || x.files.length > 8) return { ok: false };
+      for (const f of x.files) {
+        if (typeof f !== "string" || !ARM_PATH_RE.test(f) || f.split("/").some((s) => s === "." || s === "..") || seen.has(f)
+            || ["scripts/e7-test-arm/manifest.json", "test/e7-cross-runner-regression.test.mjs", ".github/workflows/e7-cross-runner-regression.yml"].includes(f)) return { ok: false };
+        seen.add(f);
+      }
+      const frame = await armFrame(dir, x.files, x.prefix);
+      comps.push({ name: x.name, frame }); frames[x.name] = frame;
+    }
+    const manifest = armSha(bytes);
+    return { ok: true, release: armSha(armCanonical({ schema: "e7-test-arm-release-v1", manifest, components: comps })), manifest, frames };
+  } catch { return { ok: false }; }
+}
+/** armDecision({ dir, value, ref }) → frozen { armed, code, release, frames } — absent / malformed / ref / unreadable / mismatch → NOT armed */
+export async function armDecision({ dir, value, ref }) {
+  const no = (code, rel = null) => Object.freeze({ armed: false, code, release: rel, frames: null });
+  if (value === undefined || value === null || value === "") return no("ARM_ABSENT");
+  if (typeof value !== "string" || !ARM_HEX64.test(value)) return no("ARM_MALFORMED");
+  if (ref !== "refs/heads/main") return no("ARM_REF_NOT_MAIN");
+  const r = await armRelease(dir);
+  if (!r.ok) return no("ARM_RELEASE_UNREADABLE");
+  if (r.release !== value) return no("ARM_MISMATCH", r.release);
+  return Object.freeze({ armed: true, code: "ARMED", release: r.release, frames: Object.freeze({ ...r.frames }) });
+}
+
+
+// ---- hosted entry (C119 S4: P4 arm gate above) --------------------------------------------------------------------------------------
 export async function runHosted({ mode = "preflight", env, proc, wrapperDir, deps = {} }) {
   const c = deps.constants ?? CONSTANTS;
   const r = { schema: "e7-hosted-pipeline-hosted-v1", mode: null, code: null, workflowSha: null, toolingCommit: c.toolingCommit, executeEnabled: c.executeEnabled,
-    closureDigest: null, sourceDigest: null, planKind: null, planHash: null, runId: null, envCode: null, tests: null, lockEndpoint: null, core: null, cleanup: null };
+    closureDigest: null, sourceDigest: null, planKind: null, planHash: null, runId: null, envCode: null, tests: null, lockEndpoint: null, core: null, cleanup: null, arm: null };
   let pool = null; let lockPool = null;
   try {
     if (!["preflight", "verify", "execute"].includes(mode)) refuse("HPL_USAGE");
@@ -1085,6 +1211,14 @@ export async function runHosted({ mode = "preflight", env, proc, wrapperDir, dep
     const keys = Object.keys(env);                                         // key NAMES only — no value is read before the next two gates
     if (keys.some((k) => k.startsWith("E7_") && !ALLOWED_E7_KEYS.includes(k))) refuse("HPL_INPUT_UNEXPECTED");
     if (mode !== "preflight" && c.executeEnabled !== true) refuse("HPL_EXECUTE_CLOSED");   // SHIPPED: refuses HERE — before any value / import / credential / DB / provider
+    // C119 S4 (P4): the TEST arm, RECOMPUTED from THIS checkout (the supplied value is a claim, never the authority) — after the key-name / CLOSED
+    // gates, BEFORE any input value / tooling import / credential / DB / provider. No manual bypass: verify and execute both require it.
+    if (mode !== "preflight") {
+      const armDir = await realpath(wrapperDir).catch(() => refuse("HPL_LAYOUT_INVALID"));
+      const arm = await armDecision({ dir: armDir, value: keys.includes("E7_TEST_ARM") ? env.E7_TEST_ARM : "", ref: env.GITHUB_REF });
+      r.arm = arm.code;
+      if (!arm.armed) refuse("HPL_ARM_CLOSED");
+    }
     const spawnChild = deps.spawnChild ?? spawnNode;
     const importEnv = deps.importEnv ?? ((dir) => import(pathToFileURL(`${dir}/scripts/e7-connected/probe-env-preflight.mjs`).href));
     const importTooling = deps.importTooling ?? defaultImportTooling;
@@ -1168,7 +1302,10 @@ export async function runHosted({ mode = "preflight", env, proc, wrapperDir, dep
       const sk = skey; const ht = htok;
       try {
         r.core = await runCore({ plan: built.plan, pool, lockClientFactory: () => lockPool.connect(), tooling: mods.tooling, exchanges: { stripe: xs.exchange, hostaway: xh.exchange },
-          credentials: { stripe: () => sk, hostaway: () => ht }, runId, runSignal: ac.signal });
+          credentials: { stripe: () => sk, hostaway: () => ht }, runId, runSignal: ac.signal,
+          requestBinding: freeze({ planHash: built.planHash, inputs: freeze({ mode: "execute", approval_ref: inp.approvalRef, intent_id: inp.intentId, booking_ref: inp.ref,
+            expected_version: inp.expectedVersion, not_before: inp.notBefore, payment_intent_id: inp.paymentIntentId, amount_minor: inp.amountMinor, currency: inp.currency,
+            expected_plan_hash: expPlan, expected_source_digest: expSrc, expected_closure_digest: expClo }) }) });
       } finally { proc.off?.("SIGINT", onSig); proc.off?.("SIGTERM", onSig); }
     } finally { wipe(); }
     r.code = "EXECUTE_DONE";

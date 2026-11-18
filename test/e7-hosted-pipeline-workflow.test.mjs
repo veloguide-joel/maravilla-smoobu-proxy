@@ -37,7 +37,8 @@ function runBlock(stepName) {
   const rest = yml.slice(i); const m = rest.match(/\n        run: \|\n((?:          .*\n)+)/); assert.ok(m, `run block of ${stepName}`);
   return m[1].split("\n").map((l) => l.replace(/^ {10}/, "")).join("\n");
 }
-const jobs = { preflight: yml.slice(yml.indexOf("\n  preflight:\n"), yml.indexOf("\n  execute:\n")), execute: yml.slice(yml.indexOf("\n  execute:\n")) };
+const jobs = { preflight: yml.slice(yml.indexOf("\n  preflight:\n"), yml.indexOf("\n  arm:\n")), arm: yml.slice(yml.indexOf("\n  arm:\n"), yml.indexOf("\n  execute:\n")),
+  execute: yml.slice(yml.indexOf("\n  execute:\n")) };
 const steps = (job) => [...job.matchAll(/\n      - name: ([^\n]+)/g)].map((m) => m[1]);
 
 test("W1 static: workflow_dispatch ONLY; inputs exactly mode (choice [preflight, execute], default preflight) / approval_ref / the seven bound plan inputs / three expected digests — NO contact / guest / recipient input; permissions contents: read; concurrency cancel-in-progress false; runner FILES = the documented frame", () => {
@@ -46,32 +47,44 @@ test("W1 static: workflow_dispatch ONLY; inputs exactly mode (choice [preflight,
   assert.deepEqual([...yml.matchAll(/^      ([a-z_]+):\n        description/gm)].map((m) => m[1]),
     ["mode", "approval_ref", "intent_id", "booking_ref", "expected_version", "not_before", "payment_intent_id", "amount_minor", "currency", "expected_plan_hash", "expected_source_digest", "expected_closure_digest"]);
   assert.doesNotMatch(yml.slice(0, yml.indexOf("\npermissions:")).replace(/^#.*$/gm, ""), /recipient|sender|email|subject|guest_name|to_address|from_address|reservation_id|listing_id/i);
-  assert.match(yml, /\npermissions:\n  contents: read\n\n/); assert.equal(count(/permissions:/g), 1); assert.doesNotMatch(yml, /: write|id-token:|pull-requests:|packages:|deployments:|issues:|checks:|statuses:/);
+  assert.match(yml, /\npermissions:\n  contents: read\n\n/); assert.equal(count(/permissions:/g), 2); assert.doesNotMatch(yml, /: write|id-token:|pull-requests:|packages:|deployments:|issues:|checks:|statuses:/);
+  assert.match(jobs.arm, /\n    permissions:\n      contents: read\n    outputs:\n/, "C119 S4: the arm job has contents: read only");
   assert.match(yml, /\nconcurrency:\n  group: e7-hosted-pipeline\n  cancel-in-progress: false\n/);
-  assert.deepEqual([...yml.matchAll(/^  ([a-z-]+):\n    (?:needs|runs-on|if)/gm)].map((m) => m[1]), ["preflight", "execute"]);
-  assert.equal(count(/runs-on: ubuntu-24\.04/g), 2); assert.equal(count(/timeout-minutes: 10\n/g), 1); assert.equal(count(/timeout-minutes: 20\n/g), 1);
+  assert.deepEqual([...yml.matchAll(/^  ([a-z-]+):\n    (?:needs|runs-on|if)/gm)].map((m) => m[1]), ["preflight", "arm", "execute"]);
+  assert.equal(count(/runs-on: ubuntu-24\.04/g), 3); assert.equal(count(/timeout-minutes: 10\n/g), 1); assert.equal(count(/timeout-minutes: 20\n/g), 1); assert.equal(count(/timeout-minutes: 5\n/g), 1);
   assert.deepEqual([...R.CONSTANTS.runnerFiles], FILES);
 });
 
 test("W2 static: checkouts at the EXACT dispatch SHA + the immutable tooling pin 71c3dcf8 (persist-credentials false), the same reviewed action pins as e7-hosted-recording.yml, Node 22.22.0; the preflight job has no environment / secret / npm / curl", () => {
-  assert.equal(count(/ref: \$\{\{ github\.sha \}\}\n          path: wrapper\n          persist-credentials: false/g), 2);
+  assert.equal(count(/ref: \$\{\{ github\.sha \}\}\n          path: wrapper\n          persist-credentials: false/g), 3);
   assert.equal(count(new RegExp(`repository: veloguide-joel/maravilla-smoobu-proxy\\n          ref: ${PIN}\\n          path: tooling\\n          persist-credentials: false`, "g")), 2);
-  assert.equal(count(/persist-credentials: false/g), 4); assert.doesNotMatch(yml, /ref: main|ref: refs\/heads|ref: \$\{\{ github\.ref/);
+  assert.equal(count(/persist-credentials: false/g), 5); assert.doesNotMatch(yml, /ref: main|ref: refs\/heads|ref: \$\{\{ github\.ref/);
   const rec = readFileSync(join(ROOT, ".github/workflows/e7-hosted-recording.yml"), "utf8");
   const pins = (s) => [...new Set([...s.matchAll(/uses: (actions\/[a-z-]+@[0-9a-f]{40})/g)].map((m) => m[1]))].sort();
-  assert.deepEqual(pins(yml), pins(rec)); assert.equal(count(/uses: /g), 6);
-  assert.equal(count(/node-version: "22\.22\.0"\n          package-manager-cache: false/g), 2);
+  assert.deepEqual(pins(yml), pins(rec)); assert.equal(count(/uses: /g), 8);
+  assert.equal(count(/node-version: "22\.22\.0"\n          package-manager-cache: false/g), 3);
   assert.doesNotMatch(jobs.preflight, /environment:|secrets\.|needs:|npm |curl |E7_CA_FILE/);
   assert.equal(R.CONSTANTS.toolingCommit, PIN);
   assert.equal(yml.split(`ref: ${PIN}`).length - 1, 2, "both workflow checkouts use the exact immutable ref");
   assert.equal(yml.split(`E7_TOOLING_PIN: ${PIN}`).length - 1, 2, "both tooling-pin bindings are the exact ref");
 });
 
-test("W3 static: execute job needs preflight AND mode == 'execute' && main AND environment e7-readonly-probe (the only environment); step order: checkouts → node → bindings re-check → runner verify (SHIPPED CLOSED refuses HERE, before any secret step) → npm ci → CA fetch → the ONE execute step LAST", () => {
-  assert.match(jobs.execute, /^\n  execute:\n    needs: preflight\n    if: inputs\.mode == 'execute' && github\.ref == 'refs\/heads\/main'\n    runs-on: ubuntu-24\.04\n    environment: e7-readonly-probe\n    timeout-minutes: 20\n/);
-  assert.equal(count(/environment: /g), 1);
+test("W3 static: execute job needs preflight AND mode == 'execute' && main AND (C119 S4) the arm AND the isolated environment e7-test-auto (the only environment) + fresh admission; step order: checkouts → node → bindings re-check → runner verify (SHIPPED CLOSED refuses HERE, before any secret step) → npm ci → CA fetch → the ONE execute step LAST", () => {
+  // C119 S4: P0 arm job (no environment / secret) routes execute; P1 execute needs the arm; the ISOLATED TEST environment e7-test-auto (owner-created
+  // before any armed run; while unarmed this job is skipped, so no environment is auto-created); P3 fresh admission right after the re-check, before verify
+  assert.match(jobs.execute, /^\n  execute:\n    needs: \[preflight, arm\]\n    if: inputs\.mode == 'execute' && github\.ref == 'refs\/heads\/main' && needs\.arm\.outputs\.armed == 'true'\n    runs-on: ubuntu-24\.04\n    environment: e7-test-auto\n    timeout-minutes: 20\n/);
+  assert.equal(count(/environment: /g), 1); assert.doesNotMatch(yml, /e7-readonly-probe/);
+  assert.match(jobs.arm, /^\n  arm:\n    needs: preflight\n    if: inputs\.mode == 'execute'\n    runs-on: ubuntu-24\.04\n    timeout-minutes: 5\n    permissions:\n      contents: read\n    outputs:\n      armed: \$\{\{ steps\.arm\.outputs\.armed \}\}\n    steps:\n/);
+  assert.deepEqual(steps(jobs.arm).map((s) => s.split(" (")[0]), ["Checkout wrapper", "Set up Node 22.22.0", "TEST arm gate"]);
+  assert.match(jobs.arm, /        id: arm\n        env:\n          E7_TEST_ARM: \$\{\{ vars\.E7_TEST_AUTO_ARMED \}\}\n        run: node wrapper\/scripts\/e7-test-arm\.mjs check\n/);
+  assert.doesNotMatch(jobs.arm, /environment:|secrets\.|github\.token|tooling|npm |curl /);
   assert.deepEqual(steps(jobs.execute).map((s) => s.split(" (")[0]), ["Checkout wrapper", "Checkout merged E7 tooling", "Set up Node 22.22.0", "Re-check bindings BEFORE any secret",
-    "Verify", "Install the pinned dependency from the verified lockfile", "Fetch the public Supabase CA", "ONE gated TEST pipeline run"]);
+    "Fresh admission", "Verify", "Install the pinned dependency from the verified lockfile", "Fetch the public Supabase CA", "ONE gated TEST pipeline run"]);
+  const p3 = jobs.execute.slice(jobs.execute.indexOf("- name: Fresh admission"), jobs.execute.indexOf("- name: Verify"));
+  assert.match(p3, /\n        env:\n          FRESH_SHA: \$\{\{ github\.sha \}\}\n          FRESH_TOKEN: \$\{\{ github\.token \}\}\n        run: \|\n/);
+  assert.equal(count(/github\.token/g), 1, "the built-in token appears ONLY in the fresh-admission step"); assert.doesNotMatch(p3, /secrets\.|E7_/);
+  assert.match(p3, /https:\/\/api\.github\.com\/repos\/veloguide-joel\/maravilla-smoobu-proxy\/git\/ref\/heads\/main\)/);
+  for (const k of ["E7_TEST_ARM: ${{ vars.E7_TEST_AUTO_ARMED }}"]) assert.equal(jobs.execute.split(k).length - 1, 2, "verify AND the run step carry the arm claim");
   assert.match(jobs.execute, /working-directory: tooling\n        run: npm ci --ignore-scripts --omit=dev --no-audit --no-fund\n/);
   assert.equal(count(/curl --fail --silent --show-error --proto '=https' --max-time 20 -o "\$RUNNER_TEMP\/prod-ca-2021\.crt" https:\/\/supabase-downloads\.s3-ap-southeast-1\.amazonaws\.com\/prod\/ssl\/prod-ca-2021\.crt\n/g), 1);
   assert.deepEqual(steps(jobs.preflight).map((s) => s.split(" (")[0]), ["Checkout wrapper", "Checkout merged E7 tooling", "Set up Node 22.22.0", "Verify checkout bindings", "Preflight", "Source digest"]);
@@ -135,23 +148,19 @@ test("W6 execute re-check block executed locally (BEFORE any secret): passes onl
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
 
-test("W7 untouched: the five reviewed runners (executeEnabled false, digests unchanged), the C47 inspection runner (889d6a31…), the C50 booking-confirmation runner frame-disjoint only (exact digest: cross-runner regression), the charge-list probe (43715872…) and the Resend sink probe (aef26da9…) source digests; the new files are in no other frame", async () => {
-  const want = { reservation: "5665544de105e4564a57a4434fa32fd2355b9bbd0e756b250d1248e07feb6b19", capture: "5b547a42200b452055d8a718c84ab70f7f2b5a0cd8343f6174c4a75b0c420ed1",
-    "test-cleanup": "33f2ab18984dccd3915a18ff8a55dd4a6e5b6bf89e3d84ba1e578347e6cebd1e", recording: "49b5516cb69543a6bd4a697a407d2f2a97a84e18a63f18715338f099917e4824",
-    "recorded-cleanup": "9e2021e3ec96bab16869fc194adac672287d559587b2cb7657738ffcd897de1f" };
-  for (const n of Object.keys(want)) {
+test("W7 untouched (C119 S4: structural checks only — the FOREIGN runners' exact digest literals moved to test/e7-cross-runner-regression.test.mjs X6, outside every runtime frame, so a foreign runner edit can never rewrite the pipeline frame → the SQL literal): the five reviewed runners + the C47 inspection runner stay SHIPPED CLOSED; no other runner frame (incl. the C50 booking-confirmation runner) contains a pipeline file; the frame contains no foreign digest literal", async () => {
+  for (const n of ["reservation", "capture", "test-cleanup", "recording", "recorded-cleanup"]) {
     const m = await import(`../scripts/e7-hosted-${n}.mjs`);
     assert.equal(m.CONSTANTS.executeEnabled, false, n); assert.ok(!m.CONSTANTS.runnerFiles.some((f) => FILES.includes(f)), n);
-    assert.equal(await R.framedDigest(ROOT, m.CONSTANTS.runnerFiles, m.RUNNER_DIGEST_PREFIX), want[n], n);
   }
   const I = await import("../scripts/e7-hosted-notify-inspect.mjs");
-  assert.equal(I.CONSTANTS.executeEnabled, false);
-  assert.equal(await R.framedDigest(ROOT, I.CONSTANTS.runnerFiles, I.SOURCE_DIGEST_PREFIX), "889d6a31af4249cede0bf8b64360b5ca0e7ca2d994c4c882f0348e5f57c2c8e7", "C47/C48 inspection runner unchanged");
-  assert.ok(!I.CONSTANTS.runnerFiles.some((f) => FILES.includes(f)));
-  // C116: the C50 booking-confirmation runner's exact digest / CLOSED assertions moved to test/e7-cross-runner-regression.test.mjs
-  // (OUTSIDE every runtime frame) — pinning it here made the pipeline ENABLE frame depend on the notification frame (C116 cycle).
+  assert.equal(I.CONSTANTS.executeEnabled, false); assert.ok(!I.CONSTANTS.runnerFiles.some((f) => FILES.includes(f)));
   const N = await import("../scripts/e7-hosted-booking-confirmation.mjs");
   assert.ok(!N.CONSTANTS.runnerFiles.some((f) => FILES.includes(f)));
-  assert.equal(await R.framedDigest(ROOT, ["scripts/e7-hosted-charge-list-probe.mjs", "test/e7-hosted-charge-list-probe.test.mjs", ".github/workflows/e7-hosted-charge-list-probe.yml"], "e7-hosted-charge-list-probe-v1\n"), "43715872ddb450889286880c848acefd8757da6fe33bc5c6a3a547bd27219cf3");
-  assert.equal(await R.framedDigest(ROOT, ["scripts/e7-resend-sink-probe.mjs", "scripts/e7-resend/resend-exchange.mjs", "test/e7-resend-sink-probe.test.mjs", ".github/workflows/e7-resend-sink-probe.yml"], "e7-resend-sink-probe-v1\n"), "aef26da954d986dc2d922b607d391be404dd73f1145ece0ae66ea0d80673ade4");
+  for (const f of ["scripts/e7-hosted-charge-list-probe.mjs", "test/e7-hosted-charge-list-probe.test.mjs", ".github/workflows/e7-hosted-charge-list-probe.yml", "scripts/e7-resend-sink-probe.mjs",
+    "scripts/e7-resend/resend-exchange.mjs", "test/e7-resend-sink-probe.test.mjs", ".github/workflows/e7-resend-sink-probe.yml"]) assert.ok(!FILES.includes(f), f);
+  // the pipeline frame embeds no 64-hex literal except its OWN reviewed pins (tooling closure, CA) — never another runner's / the release's / a catalog digest
+  // + the two IMMUTABLE historic 0024 migration byte pins the DB suite applies (reviewed C107 bytes; never derived from any current runner / SQL rebind)
+  const allowed = new Set([R.CONSTANTS.closureDigest, R.OFFICIAL_CA_SHA256, "f5c97d010eae9c83d0b798064b6491cffe73e01a03f130e8281b38e763f287fc", "3bfe7d8952b7fc9a3178418dc1842d054e845fb8cedc3225920f9b1b72bc6aa9"]);
+  for (const f of FILES) for (const m of readFileSync(join(ROOT, f), "utf8").matchAll(/\b[0-9a-f]{64}\b/g)) assert.ok(allowed.has(m[0]) || /^(.)\1{63}$/.test(m[0]), `${f}: foreign literal ${m[0].slice(0, 8)}…`);
 });

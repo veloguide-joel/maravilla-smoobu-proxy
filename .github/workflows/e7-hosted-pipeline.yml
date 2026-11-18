@@ -3,16 +3,24 @@
 # capture → recording through the ACCEPTED workers / executor adapters / transports, replacing the manual S1 / S2 / S4 dispatch sequence.
 # SHIPPED CLOSED: the runner's executeEnabled is FALSE — `verify` (and therefore the execute job) refuses HPL_EXECUTE_CLOSED before any value,
 # import, credential, database or provider access; the secret step below is never reached while it is closed. HONEST LABEL: MANUAL hosted TEST
-# runner (workflow_dispatch + the EXISTING `e7-readonly-probe` reviewer gate); NOT automatic checkout, NOT a cron / webhook / API / UI path.
+# runner (workflow_dispatch; C119 S4: arm + live-main + request-bound, environment `e7-test-auto`); NOT a cron / webhook / API / UI path.
 # <= 2 coordinator invocations per dispatch (C100: the second ONLY after ONE bounded wait <= 150 s of the proven healthy PENDING NOT_DUE branch,
 # with a fresh re-admission), cumulative <= 1 create / 1 capture / 1 offline-charge record; no poll / re-dispatch. Any other PENDING (or a second
 # PENDING) reports a sanitized nextActionAt and needs a FUTURE, separately dispatched attempt with fresh proof. Refunds stay MANUAL; no
 # cancel / void / refund / cleanup / notification send. Default mode `preflight` = no environment, no secret, no database: focused FAKE tests
 # (spawned by the runner) + the plan hash + the digests. The ONLY secrets (existing NAMES E7_STRIPE_TEST_KEY, E7_HOSTAWAY_TOKEN,
-# E7_DEV_BOOKING_DATABASE_URL, environment `e7-readonly-probe`) appear in the ONE last execute step only. No new secret, environment, permission or setting.
+# E7_DEV_BOOKING_DATABASE_URL; C119 S4 environment `e7-test-auto`) appear in the ONE last execute step only. No new secret NAME or permission.
 # Source digest = SHA-256 over: prefix "e7-hosted-pipeline-v1\n", then for each file IN THIS ORDER
 #   1. scripts/e7-hosted-pipeline.mjs  2. test/e7-hosted-pipeline.test.mjs  3. test/e7-hosted-pipeline-workflow.test.mjs  4. .github/workflows/e7-hosted-pipeline.yml
 # the frame  <relative path> NUL <decimal byte length> NUL <file bytes> NUL  (the framedDigest convention of the reviewed runners).
+# C119 S4 (DRAFT, SHIPPED CLOSED; NO variable / environment / secret / reviewer / setting is created or changed here): pipeline ADMISSION.
+#   P0 `arm` job (no environment, no secret, contents: read): the S2 TEST arm recomputed from this checkout (vars.E7_TEST_AUTO_ARMED is a claim).
+#   P1 execute runs only when armed, mode execute, on main. P2 the existing pre-secret re-check. P3 FRESH ADMISSION after any queue / approval delay:
+#   live GET refs/heads/main with the built-in token must equal this run's commit, else REFUSED before verify / any secret (revocation = a CLOSE
+#   commit moving main; clearing the variable is NOT relied on). P4 the runner's labelled arm gate (HPL_ARM_CLOSED). P5 the runner's durable
+#   request binding (the 0024 kickoff claim, read fresh under the run lock before each coordinator invocation). Execution environment
+#   `e7-test-auto` (isolated TEST; must be created / configured by the owner BEFORE any armed run — while unarmed this job is always skipped, so no
+#   environment is auto-created). Point-in-time windows: P3 → the last step (seconds) is not re-checked; an admitted run is NOT interrupted.
 name: e7-hosted-pipeline
 
 on:
@@ -144,11 +152,38 @@ jobs:
           echo "sourceDigest=$d"
           if [ -n "$E7_EXPECTED_SOURCE_DIGEST" ] && [ "$E7_EXPECTED_SOURCE_DIGEST" != "$d" ]; then echo "REFUSED: expected_source_digest mismatch"; exit 3; fi
 
-  execute:
+  arm:
     needs: preflight
-    if: inputs.mode == 'execute' && github.ref == 'refs/heads/main'
+    if: inputs.mode == 'execute'
     runs-on: ubuntu-24.04
-    environment: e7-readonly-probe
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      armed: ${{ steps.arm.outputs.armed }}
+    steps:
+      - name: Checkout wrapper (this repository, exact dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          path: wrapper
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: TEST arm gate (release digest recomputed from this checkout; no environment, no secret, no database; not armed → CLOSED_NOOP)
+        id: arm
+        env:
+          E7_TEST_ARM: ${{ vars.E7_TEST_AUTO_ARMED }}
+        run: node wrapper/scripts/e7-test-arm.mjs check
+
+  execute:
+    needs: [preflight, arm]
+    if: inputs.mode == 'execute' && github.ref == 'refs/heads/main' && needs.arm.outputs.armed == 'true'
+    runs-on: ubuntu-24.04
+    environment: e7-test-auto
     timeout-minutes: 20
     steps:
       - name: Checkout wrapper (this repository, exact dispatched commit)
@@ -188,9 +223,22 @@ jobs:
           d="$({ printf 'e7-hosted-pipeline-v1\n'; for f in scripts/e7-hosted-pipeline.mjs test/e7-hosted-pipeline.test.mjs test/e7-hosted-pipeline-workflow.test.mjs .github/workflows/e7-hosted-pipeline.yml; do printf '%s\0%s\0' "$f" "$(stat -c%s "wrapper/$f")"; cat "wrapper/$f"; printf '\0'; done; } | sha256sum | cut -d' ' -f1)"
           [ "$d" = "$E7_EXPECTED_SOURCE_DIGEST" ] || { echo "REFUSED: expected_source_digest mismatch (actual $d)"; exit 3; }
           echo "bindings ok: wrapper=$head tooling=$tool source=$d"
+      - name: Fresh admission (C119 S4 P3; live main ref == this run's commit, checked AFTER any queue / approval delay; built-in token only; BEFORE verify / any secret)
+        env:
+          FRESH_SHA: ${{ github.sha }}
+          FRESH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$FRESH_SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "REFUSED: MAIN_UNREADABLE (sha)"; exit 3; }
+          [ -n "$FRESH_TOKEN" ] || { echo "REFUSED: MAIN_UNREADABLE (token)"; exit 3; }
+          body="$(printf 'Authorization: Bearer %s\n' "$FRESH_TOKEN" | curl --silent --show-error --fail --proto '=https' --max-redirs 0 --max-time 15 --max-filesize 8192 -H @- -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' https://api.github.com/repos/veloguide-joel/maravilla-smoobu-proxy/git/ref/heads/main)" || { echo "REFUSED: MAIN_UNREADABLE (http)"; exit 3; }
+          live="$(printf '%s' "$body" | node -e 'let s="";process.stdin.on("data",(d)=>{s+=d;if(s.length>8192)process.exit(3);}).on("end",()=>{let j;try{j=JSON.parse(s);}catch{process.exit(3);}const o=j&&j.object;if(!j||j.ref!=="refs/heads/main"||!o||o.type!=="commit"||typeof o.sha!=="string"||!/^[0-9a-f]{40}$/.test(o.sha))process.exit(3);process.stdout.write(o.sha);});')" || { echo "REFUSED: MAIN_UNREADABLE (shape)"; exit 3; }
+          [ "$live" = "$FRESH_SHA" ] || { echo "REFUSED: MAIN_MOVED (live main != this run's commit; a CLOSE commit revokes not-yet-admitted work)"; exit 3; }
+          echo "fresh admission ok: live main == this run's commit (point-in-time; a later move of main is not seen by this run)"
       - name: Verify (runner; SHIPPED CLOSED → HPL_EXECUTE_CLOSED here; else closure / source / plan / approval bindings; no secret, no database)
         env:
           E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_TEST_ARM: ${{ vars.E7_TEST_AUTO_ARMED }}
           E7_APPROVAL_REF: ${{ inputs.approval_ref }}
           E7_INTENT_ID: ${{ inputs.intent_id }}
           E7_BOOKING_REF: ${{ inputs.booking_ref }}
@@ -213,6 +261,7 @@ jobs:
       - name: ONE gated TEST pipeline run (the only secrets, this step only; <= 2 coordinator invocations, <= 1 bounded wait; cumulative <= 1 create / capture / record, no retry)
         env:
           E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_TEST_ARM: ${{ vars.E7_TEST_AUTO_ARMED }}
           E7_APPROVAL_REF: ${{ inputs.approval_ref }}
           E7_INTENT_ID: ${{ inputs.intent_id }}
           E7_BOOKING_REF: ${{ inputs.booking_ref }}
