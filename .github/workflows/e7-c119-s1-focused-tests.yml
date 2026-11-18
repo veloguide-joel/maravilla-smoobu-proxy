@@ -1,0 +1,84 @@
+# C119 S1 — FOCUSED TEST EVIDENCE ONLY for the C50 booking-confirmation runner's catalog-27 repin + read-only detect (DRAFT, SHIPPED CLOSED).
+# Runs the runner's two frame test files + the cross-runner regression, then the runner's opt-in DB cases against a DISPOSABLE localhost
+# PostgreSQL (16 and 17) that the tests create and delete themselves: the pinned tooling 66133a22 (accepted worker / builder / executor / harness)
+# + the MERGED e7-test a314681b 0027 bytes (sha-checked by the test). Synthetic fixtures and in-memory FAKE exchanges only: no secrets, no
+# environment, no provider credential, no shared database, no network beyond the checkouts / package and PostgreSQL installs.
+# Outside every runtime source frame (no runner lists, imports or reads it). contents: read only.
+name: e7-c119-s1-focused-tests
+on:
+  pull_request:
+    paths:
+      - "scripts/e7-hosted-booking-confirmation.mjs"
+      - "test/e7-hosted-booking-confirmation.test.mjs"
+      - "test/e7-hosted-booking-confirmation-workflow.test.mjs"
+      - ".github/workflows/e7-hosted-booking-confirmation.yml"
+      - "test/e7-cross-runner-regression.test.mjs"
+      - ".github/workflows/e7-c119-s1-focused-tests.yml"
+      - "claude/c119-*"
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: e7-c119-s1-focused-tests-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  focused:
+    name: c119-s1-focused (PG ${{ matrix.pg }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["16", "17"]
+    steps:
+      - name: Checkout wrapper (exact event SHA)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout merged E7 tooling (fixed commit 66133a22)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: 66133a22edca925e6386c4d178c251fa5f11c82e
+          path: tooling
+          persist-credentials: false
+      - name: Checkout merged e7-test a314681b (the 0027 migration bytes only)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: a314681b08f402c2f2b140dfe334ac1729c2dabb
+          path: schema27
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Install PostgreSQL ${{ matrix.pg }} binaries (no service is started; tests run their own throwaway cluster)
+        run: |
+          set -euo pipefail
+          if [ ! -x "/usr/lib/postgresql/${{ matrix.pg }}/bin/initdb" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq postgresql-common
+            sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+            sudo apt-get install -y -qq "postgresql-${{ matrix.pg }}"
+          fi
+          sudo systemctl stop postgresql || true
+          "/usr/lib/postgresql/${{ matrix.pg }}/bin/postgres" --version
+      - name: Install the pinned tooling dependencies (lockfile, no scripts)
+        working-directory: tooling
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Unit — runner + workflow + cross-runner regression (fake only)
+        working-directory: wrapper
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+        run: node --test test/e7-hosted-booking-confirmation.test.mjs test/e7-hosted-booking-confirmation-workflow.test.mjs test/e7-cross-runner-regression.test.mjs
+      - name: DB — catalog 27 / detect / detect-flow execute / cancellation cases (disposable localhost PostgreSQL ${{ matrix.pg }})
+        working-directory: wrapper
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_SCHEMA27_DIR: ${{ github.workspace }}/schema27
+          E7_HBC_DB_TESTS: "1"
+          PG_BIN: /usr/lib/postgresql/${{ matrix.pg }}/bin
+        run: node --test test/e7-hosted-booking-confirmation.test.mjs

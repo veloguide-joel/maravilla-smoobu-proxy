@@ -1,7 +1,7 @@
 // scripts/e7-hosted-booking-confirmation.mjs — E7 C50: HOSTED gn-v2 BOOKING-CONFIRMATION runner for ONE bound TEST guest.notify operation, around the
 // ALREADY ACCEPTED tooling (e7-test 66133a22 = C116 #180 merged (reviewed head 5ba7f793, tree ade3e084) on top of the #178 merge 9b7a96bf: the recipient-only simulation-sink scope + migration 0025; C55 pin was 46b3eaf8; C54 #120 added lib/notify/sender-identity.js): lib/booking-db/notification-worker.js (gn-v2 opt-in + branded Resend provider opt-in, C41 / C45),
 // lib/checkout/booking-confirmation-request.js (gn-v2 builder), lib/notify/resend-notification-executor.js (branded executor) and
-// scripts/e7-resend/resend-exchange.mjs (the reviewed single-use HTTPS exchange), with the schema-23 typed receipts (0023) on the reviewed schema 26. Nothing here re-implements the worker.
+// scripts/e7-resend/resend-exchange.mjs (the reviewed single-use HTTPS exchange), with the schema-23 typed receipts (0023) on the reviewed schema 27 (C119 S1; was 26). Nothing here re-implements the worker.
 //
 // HONEST LABEL: SHIPPED CLOSED. executeEnabled is FALSE: `verify` and `execute` refuse NBC_EXECUTE_CLOSED right after the mode / unexpected-input checks,
 // BEFORE any tooling import, credential read, database or provider access. The execute BODY exists so that it can be reviewed and exercised through the
@@ -16,7 +16,7 @@
 //   * Exactly ONE bound intent / operation / expected version / locale (en | es) and the fixed sender are in the plan hash. The historical TEST intents
 //     abede8b1… and c83c1842… are refused by id; protected reservation ids are refused; listing 606998, TEST, DEV project ref fixed.
 //   * Admission (ONE REPEATABLE READ READ ONLY transaction as the runtime app role → ROLLBACK): role proof; catalog identity = EXACTLY the reviewed
-//     schema 26 (C116: 0025 sink scope + 0026 claim literal + receipts required; 21 / 22 / 23 / 24 / 25 / drift refused); TEST instance; intent bound (version / listing / USD / confirmed / not protected / not
+//     schema 27 (C119 S1; was 26 at C116: 0025 sink scope + 0026 claim literal + receipts required; 21 … 26 / drift refused); the 0027 projection (below); TEST instance; intent bound (version / listing / USD / confirmed / not protected / not
 //     excluded); EXACTLY ONE guest.notify op for the intent and it IS the bound op, pending / attempts 0 / never dispatched / unleased / no result /
 //     payload keys exactly ["template"] / booking_confirmed; the reviewed 0016 class ELIGIBLE; no render / latch / receipt; the intent work unleased.
 //   * Bound-op contract on the accepted worker (no tooling change): the worker is scoped to the bound intent (claim_notification_work p_intent) and
@@ -30,8 +30,26 @@
 //     otherwise ACCEPTED_UNVERIFIED_STOP (acceptance retained, exit 1). Provider acceptance is still NOT delivery (deliveryProven false).
 //   * Never: a second send, a retry, a generic sweep, notification / inbox processing beyond the ONE bound op, refund / cancel / void / claim release,
 //     or a recipient / name / subject / text / header / key / raw exception in a result or log (codes / hashes / sanitized operation metadata only).
+// C119 S1 (DRAFT, SHIPPED CLOSED; no schedule / variable / environment / setting change):
+//   * CATALOG 27: admission accepts EXACTLY the reviewed schema 27 (0027 external cancellation); 26 / 21–25 / drift refused (CATALOG_NOT_27). The read
+//     path additionally covers booking.external_cancellation_public (the ONLY 0027 function the runtime role may execute). Tooling 66133a22 and the
+//     closure are unchanged (0027 adds no runtime module; the only lib change since 66133a22 is intent-api-core.js, in no closure).
+//   * EXTERNAL CANCELLATION: admission reads booking.external_cancellation_public(intent) (the minimal granted projection; the runtime role has no
+//     EXECUTE on externally_cancelled() and no SELECT on external_cancellations). Exactly SQL NULL = no recorded cancellation; a cancelled object →
+//     EXTERNALLY_CANCELLED; an error / permission failure / any other value → CANCELLATION_UNREADABLE (never read as "not cancelled").
+//   * DETECT (mode `detect`, manual workflow_dispatch only): ONE read-only REPEATABLE READ snapshot as the runtime role pages the reviewed
+//     booking.list_guest_notifications for the TEST listing (bounded: pages × pageLimit) and selects ONE eligible booking_confirmed op created at or
+//     after the reviewed cutoff, outside the exclusions; then the UNCHANGED admission re-proves that ONE candidate in a second read-only snapshot.
+//     Output = outcome NONE | ONE | STOP + (ONE only) a fingerprint = the planHash of the server-derived plan (fixed label, locale en). Codes and
+//     counts only: never an intent / op / guest / recipient / provider identifier. Detect WRITES NOTHING and is NOT authority to send.
+//     Any in-scope IN_FLIGHT / UNKNOWN / OTHER / WAITING / OUT_OF_V1_SCOPE / unrecognised class → STOP (unknown outcomes are never skipped).
+//     MORE THAN ONE eligible candidate → STOP DETECT_MORE_THAN_ONE: a deliberate CAPACITY LIMITATION of this bounded TEST slice, NOT production
+//     queue-draining behaviour.
+//   * DETECT-FLOW EXECUTE: no hand-bound identifier. The core re-selects server-side, requires the SAME fingerprint (else NBC_CANDIDATE_CHANGED), then
+//     runs the unchanged admission + the ONE accepted worker invocation under its existing claim / lease / latch / receipt / sink-scope fences.
 import process from "node:process";
 import { readFile, realpath, lstat } from "node:fs/promises";
+import { appendFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
@@ -39,10 +57,11 @@ import { spawn } from "node:child_process";
 const freeze = Object.freeze;
 function deepFreeze(v) { if (v && typeof v === "object") { for (const k of Object.keys(v)) deepFreeze(v[k]); freeze(v); } return v; }
 
-/** C116: the reviewed schema-26 catalog identity (0001..0026 at the pinned tooling; 25 → 26 changes only the fn section: 0026 rebinds the claim literal), derived with THIS file's CATALOG_SQL as the runtime app role on
- *  disposable PostgreSQL 16 AND 17.11 (identical). The same derivation reproduces the accepted schema-23 pin byte-for-byte (asserted by the tests).
- *  vs schema 24: only the `fn` section and the read path differ (0025 replaces booking.gn_recipient_in_scope in place). Schemas 21 / 22 / 23 / 24 are refused. */
-const CATALOG_PIN_26 = {"catalog":"47b1d904a25cde0f4f9f85b8554b93cd914364d70ef1091cb273ce68043379da","readPath":"31f23b641bb57d5cbdec1aa4896447a574190dd057e4b92e6c5fdf8326220baf","readPathCount":6,"sections":{"con":"550534b1daca47fc1df90a557d5dd28a7f6e1f1df11c581cdbd7a671eb95c188","col":"9d645f671980c7a2e0e679aa07d9a3c30a937e488236f132b589a0a162237fbe","fn":"501f34f7f4db9a5a5fb98c00046013a7904745faea78cd731bbafa23ddf8fb7c","pol":"7c69ad5c06cae91f06e96c8ac9d86d97dbc09e94d95a8afb399b141162ee83ee","rel":"359796c40820562166a4f10dce97ae433fe7ae53c5fd2b3385fc41f179437e89","trg":"13e79df7b90097f365a7f3f15337e58c7b7d5277378608fd482c77e2051982f5"}};
+/** C119 S1: the reviewed schema-27 catalog identity (0001..0027; tooling 66133a22 migrations 0001..0026 + the merged e7-test a314681b 0027 bytes), derived with
+ *  THIS file's CATALOG_SQL and the 7-function READ_PATH_FUNCTIONS (incl. booking.external_cancellation_public) as the runtime app role on disposable
+ *  PostgreSQL 16 AND 17 (identical). The same derivation reproduces the accepted schema-23 inspector pin byte-for-byte and the C116 schema-26 pin
+ *  (asserted by the DB tests). Schemas 21–26 and any drift are refused. */
+const CATALOG_PIN_27 = {"catalog":"bcc116319adfa7c2e0c2f42d32d48b67fdc53ab35cd4058e777e5de5376c6d16","readPath":"b881c9e076b2d113508399dfc0d16322ea5e759fe9fcc6c6ec1eed25324a930a","readPathCount":7,"sections":{"con":"4c9a9148388a8b3846c9ffdb563454b129ea033bf8ee10ec8578db673671b589","col":"4707a34d900203ce83b3a201876fb64897c45c9c10a587f49bb32e753732435f","fn":"6003d12e6fe64492e52bd6e60727cbedaaa047001853b0185413298a5e1d0b49","pol":"f33e232460e9c4d9e4e29945f6e38526fef3551b122efa7a9f8793b182d40b64","rel":"845368cfa6b65e98bbe47af3e8140057be46bcefd1f6ded3034bd1dd06a66d54","trg":"6887ee0464f01e23a8987b963944e856a2065c8e3f0c2e7d6d0d82808018dd42"}};
 
 export const CONSTANTS = deepFreeze({
   toolingCommit: "66133a22edca925e6386c4d178c251fa5f11c82e",          // C116: e7-test #180 merge commit (tree ade3e084 == reviewed head 5ba7f793; 0026). #178 merge 9b7a96bf: tree 40dbe13f == reviewed head d7e39ae3; sink recipient scope + 0025). C55 pin was 46b3eaf8
@@ -64,7 +83,11 @@ export const CONSTANTS = deepFreeze({
   // recipient scope stays the accepted `.invalid` fences. NOT a domain-verification / readiness claim.
   sender: { fromAddress: "bookings@mail.micasadirect.com", fromName: "MiCasaDirect" },
   workerEnv: { VERCEL_ENV: "preview", MV_E7_NOTIFICATION_WORKER: "enabled" },   // the accepted worker's own gate marker, passed ONLY inside the (closed) execute body
-  catalogPin26: CATALOG_PIN_26,
+  catalogPin27: CATALOG_PIN_27,
+  // C119 S1 detect scope: the reviewed kickoff cutoff (2026-11-15T22:58:01Z; older rows are historic: counted, never selected, never a STOP) and the
+  // runner's exclusions + the C103 continuation intent (== the reviewed kickoff scope's exclusions). Fixed label + locale for the server-derived plan.
+  detect: { cutoff: "2026-11-15T22:58:01.000Z", template: "booking_confirmed", locale: "en", approvalRef: "E7-HBC-DETECT-v1", pages: 20, pageLimit: 100,
+    excludedIntentIds: ["abede8b1-8ef6-44f2-876e-6a02fc056a96", "c83c1842-d342-4e27-9ab7-dc3d50b7a309", "1d6e770f-ba3d-40f7-92c1-ee01be7da532"] },
   // timing scope: every connect ≤ connectMs (this wrapper; the frozen pool has no connect timeout), every statement ≤ the pool's statement_timeout
   // (statementMs, server-side), ≤ statements in total, ONE provider exchange ≤ the reviewed exchange's own 10 s deadline, pool.end ≤ endMs. Not a single
   // wall clock: the workflow's job timeout is a separate outer cancellation.
@@ -88,14 +111,17 @@ const WORKER_ID_RE = /^[A-Za-z0-9._:-]{1,64}$/;
 export const PLAN_SCHEMA = "e7-hosted-booking-confirmation-plan-v1";
 export const RESULT_SCHEMA = "e7-hosted-booking-confirmation-result-v1";
 export const CORE_CODES = freeze(["PROVIDER_ACCEPTED", "PROVIDER_ACCEPTED_REPLAY", "ACCEPTED_UNVERIFIED_STOP", "UNKNOWN_STOP", "NOT_SENT", "NBC_ADMISSION_REFUSED", "NBC_BOUND_OP_MISMATCH",
-  "NBC_WORKER_REFUSED", "NBC_WORKER_ERROR", "NBC_EXECUTOR_INVALID", "NBC_DB_FAILED", "NBC_DB_TIMEOUT", "NBC_BUDGET"]);
-export const ADMISSION_CODES = freeze(["NOT_READ_ONLY", "ROLE_REFUSED", "CATALOG_NOT_26", "NOT_TEST", "INTENT_NOT_FOUND", "INTENT_EXCLUDED", "LISTING_MISMATCH",
-  "VERSION_MISMATCH", "CURRENCY_NOT_USD", "STATE_NOT_CONFIRMED", "PROTECTED", "OP_COUNT", "OP_NOT_BOUND", "OP_NOT_PRISTINE", "OP_PAYLOAD_SHAPE", "TEMPLATE_NOT_V2",
+  "NBC_WORKER_REFUSED", "NBC_WORKER_ERROR", "NBC_EXECUTOR_INVALID", "NBC_DB_FAILED", "NBC_DB_TIMEOUT", "NBC_BUDGET", "NBC_CANDIDATE_CHANGED"]);
+export const ADMISSION_CODES = freeze(["NOT_READ_ONLY", "ROLE_REFUSED", "CATALOG_NOT_27", "NOT_TEST", "INTENT_NOT_FOUND", "INTENT_EXCLUDED", "LISTING_MISMATCH",
+  "VERSION_MISMATCH", "CURRENCY_NOT_USD", "STATE_NOT_CONFIRMED", "PROTECTED", "EXTERNALLY_CANCELLED", "CANCELLATION_UNREADABLE", "OP_COUNT", "OP_NOT_BOUND", "OP_NOT_PRISTINE", "OP_PAYLOAD_SHAPE", "TEMPLATE_NOT_V2",
   "CLASS_NOT_ELIGIBLE", "RENDER_PRESENT", "LATCH_PRESENT", "RECEIPT_PRESENT", "WORK_LEASED", "REPLY_SHAPE"]);
 export const HOSTED_CODES = freeze(["NBC_USAGE", "NBC_INPUT_UNEXPECTED", "NBC_EXECUTE_CLOSED", "NBC_SECRET_SCOPE_VIOLATION", "NBC_INPUT_INVALID", "NBC_INPUT_INCOMPLETE",
   "NBC_INTENT_EXCLUDED", "NBC_REF_NOT_MAIN", "NBC_LAYOUT_INVALID", "NBC_SOURCE_UNREADABLE", "NBC_SOURCE_MISMATCH", "NBC_CLOSURE_MISMATCH", "NBC_PLAN_HASH_MISMATCH",
   "NBC_IMPORT_FAILED", "NBC_ENV_REFUSED", "NBC_CHILD_FAILED", "NBC_TESTS_FAILED", "NBC_CREDENTIALS_MISSING", "NBC_DEPENDENCY_MISMATCH", "NBC_DB_TARGET_INVALID",
   "NBC_CA_INVALID", "NBC_INTERNAL"]);
+export const DETECT_OUTCOMES = freeze(["NONE", "ONE", "STOP"]);
+export const DETECT_CODES = freeze(["DETECT_NONE", "DETECT_ONE", "DETECT_ATTENTION", "DETECT_MORE_THAN_ONE", "DETECT_BUDGET", "DETECT_REPLY_SHAPE", "DETECT_SESSION_REFUSED",
+  "DETECT_NOT_ADMISSIBLE", "DETECT_DB_FAILED", "DETECT_DB_TIMEOUT"]);
 
 // ---- LABELLED COPIES of scripts/e7-hosted-reservation.mjs pure helpers (asserted equal by the tests) -------------------------------------
 export function canonical(v) {
@@ -149,8 +175,10 @@ export function bounded(promise, ms, onLate = () => {}) {
 const dispose = (cl) => { try { cl?.release?.(true); } catch { /* ignore */ } };
 
 // ---- the catalog identity probe: LABELLED COPIES of scripts/e7-hosted-notify-inspect.mjs (asserted byte-equal) --------------------------------
-export const READ_PATH_FUNCTIONS = freeze(["gn_check_scope", "gn_recipient_in_scope", "guest_notification_class", "guest_notification_protected", "list_guest_notifications",
+/** the C47 inspector's six read-path functions (labelled copy, asserted equal) + C119 S1: the 0027 projection the admission now reads */
+export const INSPECT_READ_PATH_FUNCTIONS = freeze(["gn_check_scope", "gn_recipient_in_scope", "guest_notification_class", "guest_notification_protected", "list_guest_notifications",
   "recording_protected_reservation_ids"]);
+export const READ_PATH_FUNCTIONS = freeze([...INSPECT_READ_PATH_FUNCTIONS, "external_cancellation_public"]);
 export const OWNER_ACL_CANON = "CASE WHEN split_part(a.item, '=', 1) = a.owner AND split_part(a.item, '/', 2) = a.owner THEN a.owner || '=' || replace(split_part(split_part(a.item, '=', 2), '/', 1), 'm', '') || '/' || a.owner ELSE a.item END";
 export const CATALOG_SQL = `SELECT jsonb_build_object(
   'sections', (SELECT jsonb_object_agg(s.k, s.h) FROM (SELECT q.k, encode(sha256(convert_to(string_agg(q.x, E'\\n' ORDER BY q.x), 'UTF8')), 'hex') AS h FROM (
@@ -181,7 +209,7 @@ export const PLAN_INPUT_KEYS = freeze(["approvalRef", "intentId", "opId", "expec
 export function buildPlan(c, { approvalRef, intentId, opId, expectedVersion, locale, sourceDigest }) {
   const plan = { schema: PLAN_SCHEMA, kind: "gn-v2-booking-confirmation-one-bound-op", approvalRef, intentId, opId, expectedVersion, locale,
     sender: c.sender, listingId: c.listingId, dbEnvironment: c.dbEnvironment, dbProjectRef: c.dbProjectRef, toolingCommit: c.toolingCommit, closureDigest: c.closureDigest,
-    sourceDigest, catalogPin26: c.catalogPin26, excludedIntentIds: c.excludedIntentIds, protectedReservationIds: c.protectedReservationIds,
+    sourceDigest, catalogPin27: c.catalogPin27, excludedIntentIds: c.excludedIntentIds, protectedReservationIds: c.protectedReservationIds,
     budgets: { workerInvocations: c.budgets.workerInvocations, sends: c.budgets.sends }, executeEnabled: c.executeEnabled };
   return { plan: deepFreeze(plan), planHash: sha(canonical(plan)) };
 }
@@ -199,6 +227,7 @@ export const ADMISSION_QUERIES = deepFreeze({
   instance: "SELECT count(*)::int AS n, min(environment) AS env FROM booking.instance",
   intent: `SELECT i.id::text AS id, i.state AS state, i.version AS version, i.listing_id AS listing_id, i.currency AS currency,
     coalesce(i.hostaway_reservation_id = ANY ($2::text[]), false) AS protected_reservation FROM booking.intents i WHERE i.id = $1::uuid`,
+  cancellation: "SELECT booking.external_cancellation_public($1::uuid) AS x",
   ops: `SELECT o.id::text AS id, o.state AS state, o.attempts AS attempts, (o.dispatched_at IS NOT NULL) AS dispatched,
     (o.lease_worker_id IS NOT NULL OR o.lease_until IS NOT NULL) AS leased, (o.completed_at IS NOT NULL) AS completed, (o.result_ref IS NOT NULL) AS has_result,
     o.payload ->> 'template' AS template, (SELECT coalesce(array_agg(k ORDER BY k), '{}'::text[]) FROM jsonb_object_keys(o.payload) k) AS payload_keys,
@@ -257,7 +286,7 @@ export async function admit({ client, plan, c = CONSTANTS }) {
     if (!id || typeof id !== "object" || !id.sections) no("REPLY_SHAPE");
     const sections = {}; for (const k of ["con", "col", "fn", "pol", "rel", "trg"]) sections[k] = id.sections[k] ?? null;
     if (Object.keys(id.sections).some((k) => !Object.hasOwn(sections, k))) no("REPLY_SHAPE");
-    if (sha(canonical(sections)) !== c.catalogPin26.catalog || id.readPath !== c.catalogPin26.readPath || id.readPathCount !== c.catalogPin26.readPathCount) no("CATALOG_NOT_26");
+    if (sha(canonical(sections)) !== c.catalogPin27.catalog || id.readPath !== c.catalogPin27.readPath || id.readPathCount !== c.catalogPin27.readPathCount) no("CATALOG_NOT_27");
     const inst = one(await q("instance")); if (inst.n !== 1 || inst.env !== c.dbEnvironment) no("NOT_TEST");
     if (c.excludedIntentIds.includes(plan.intentId)) no("INTENT_EXCLUDED");
     const ir = await q("intent", [plan.intentId, [...c.protectedReservationIds]]);
@@ -269,6 +298,11 @@ export async function admit({ client, plan, c = CONSTANTS }) {
     if (i.version !== plan.expectedVersion) no("VERSION_MISMATCH");
     if (i.currency !== "USD") no("CURRENCY_NOT_USD");
     if (i.state !== "confirmed") no("STATE_NOT_CONFIRMED");
+    // C119 S1: the minimal granted 0027 projection; ONLY exactly SQL NULL means "no recorded external cancellation"
+    let cx; try { cx = await client.query(Q.cancellation, [plan.intentId]); } catch { no("CANCELLATION_UNREADABLE"); }
+    if (!cx || !Array.isArray(cx.rows) || cx.rows.length !== 1 || !cx.rows[0] || typeof cx.rows[0] !== "object" || !Object.hasOwn(cx.rows[0], "x")) no("CANCELLATION_UNREADABLE");
+    const xv = cx.rows[0].x;
+    if (xv !== null) { if (xv && typeof xv === "object" && !Array.isArray(xv) && xv.cancelled === true) no("EXTERNALLY_CANCELLED"); no("CANCELLATION_UNREADABLE"); }
     const ops = await q("ops", [plan.intentId, [...c.protectedReservationIds]]);
     if (!ops || !Array.isArray(ops.rows)) no("REPLY_SHAPE"); if (ops.rows.length !== 1) no("OP_COUNT");
     const o = ops.rows[0];
@@ -298,6 +332,97 @@ export async function admit({ client, plan, c = CONSTANTS }) {
   }
 }
 
+// ---- C119 S1: server-side read-only DETECT of ONE eligible booking_confirmed op -----------------------------------------------------------
+export const DETECT_QUERIES = deepFreeze({
+  page: `SELECT l.op_id::text AS op_id, l.intent_id::text AS intent_id, l.template AS template, l.class AS class, (l.created_at >= $4::timestamptz) AS in_scope
+    FROM booking.list_guest_notifications($1::int[], $2::uuid, $3::int) l`
+});
+const TERMINAL_CLASSES = freeze(["SUCCEEDED", "LATCHED"]);
+const UNRESOLVED_OTHER_TEMPLATE = freeze(["IN_FLIGHT", "UNKNOWN"]);
+/**
+ * selectCandidate({ client, c }) → { kind: "NONE" | "ONE" | "STOP", code, counts, candidate? } — ONE REPEATABLE READ READ ONLY transaction as the runtime
+ * role, always ROLLBACK. The same session / catalog-27 / TEST proofs as admit(); then the bounded page walk. Pure classification over the reviewed
+ * class function (no new SQL function, no table read beyond the admission's own intent query for the ONE candidate's version). Throws Refusal(NBC_DB_*).
+ */
+export async function selectCandidate({ client, c = CONSTANTS }) {
+  const Q = ADMISSION_QUERIES; const D = c.detect; let began = false;
+  const counts = { pages: 0, rows: 0, historic: 0, historicUnresolved: 0, excluded: 0, otherTemplates: 0, terminal: 0, eligible: 0, attention: 0 };
+  const done = (kind, code, candidate) => freeze({ kind, code, counts: freeze({ ...counts }), ...(candidate ? { candidate: freeze(candidate) } : {}) });
+  const q = async (t, p) => { try { return await client.query(t, p); } catch (e) { if (e instanceof Refusal) throw e; refuse("NBC_DB_FAILED"); } };
+  const one = (r) => (r && Array.isArray(r.rows) && r.rows.length === 1 ? r.rows[0] : null);
+  try {
+    await q(Q.begin); began = true;
+    await q(Q.bounds, [String(c.budgets.statementMs), String(c.budgets.lockMs), String(c.budgets.idleMs)]);
+    const r = one(await q(Q.role)); if (!r) return done("STOP", "DETECT_REPLY_SHAPE");
+    if (r.ro !== "on" || r.iso !== "repeatable read" || r.su !== false || r.app !== true || r.adm !== false || r.rep !== false || r.own !== false) return done("STOP", "DETECT_SESSION_REFUSED");
+    const idr = one(await q(Q.catalog, [[...READ_PATH_FUNCTIONS]])); const id = idr?.id;
+    if (!id || typeof id !== "object" || !id.sections || typeof id.sections !== "object") return done("STOP", "DETECT_REPLY_SHAPE");
+    const sections = {}; for (const k of ["con", "col", "fn", "pol", "rel", "trg"]) sections[k] = id.sections[k] ?? null;
+    if (Object.keys(id.sections).some((k) => !Object.hasOwn(sections, k))) return done("STOP", "DETECT_REPLY_SHAPE");
+    if (sha(canonical(sections)) !== c.catalogPin27.catalog || id.readPath !== c.catalogPin27.readPath || id.readPathCount !== c.catalogPin27.readPathCount) return done("STOP", "DETECT_SESSION_REFUSED");
+    const inst = one(await q(Q.instance)); if (!inst || inst.n !== 1 || inst.env !== c.dbEnvironment) return done("STOP", "DETECT_SESSION_REFUSED");
+    const candidates = []; let cursor = null;
+    for (;;) {
+      if (counts.pages >= D.pages) return done("STOP", "DETECT_BUDGET");   // bounded: never an unbounded scan, never a partial NONE
+      counts.pages += 1;
+      const pg = await q(DETECT_QUERIES.page, [[c.listingId], cursor, D.pageLimit, D.cutoff]);
+      if (!pg || !Array.isArray(pg.rows) || pg.rows.length > D.pageLimit) return done("STOP", "DETECT_REPLY_SHAPE");
+      for (const x of pg.rows) {
+        if (!x || typeof x.op_id !== "string" || !UUID_RE.test(x.op_id) || typeof x.intent_id !== "string" || !UUID_RE.test(x.intent_id) || typeof x.in_scope !== "boolean"
+            || typeof x.class !== "string" || !(x.template === null || typeof x.template === "string")) return done("STOP", "DETECT_REPLY_SHAPE");
+        counts.rows += 1;
+        if (D.excludedIntentIds.includes(x.intent_id) || c.excludedIntentIds.includes(x.intent_id)) { counts.excluded += 1; continue; }
+        if (!x.in_scope) { counts.historic += 1; if (!TERMINAL_CLASSES.includes(x.class)) counts.historicUnresolved += 1; continue; }
+        if (x.template !== D.template) { counts.otherTemplates += 1; if (UNRESOLVED_OTHER_TEMPLATE.includes(x.class)) counts.attention += 1; continue; }
+        if (x.class === "ELIGIBLE") { counts.eligible += 1; candidates.push({ intentId: x.intent_id, opId: x.op_id }); continue; }
+        if (TERMINAL_CLASSES.includes(x.class)) { counts.terminal += 1; continue; }
+        counts.attention += 1;                                              // IN_FLIGHT / UNKNOWN / OTHER / WAITING / OUT_OF_V1_SCOPE / unrecognised
+      }
+      if (pg.rows.length < D.pageLimit) break;
+      cursor = pg.rows[pg.rows.length - 1].op_id;
+    }
+    if (counts.attention > 0) return done("STOP", "DETECT_ATTENTION");
+    if (candidates.length === 0) return done("NONE", "DETECT_NONE");
+    if (candidates.length > 1) return done("STOP", "DETECT_MORE_THAN_ONE");   // CAPACITY LIMITATION of this bounded TEST slice (never drains a queue)
+    const cand = candidates[0];
+    if (!INTENT_RE.test(cand.intentId) || cand.intentId === cand.opId) return done("STOP", "DETECT_REPLY_SHAPE");
+    const ir = await q(Q.intent, [cand.intentId, [...c.protectedReservationIds]]);
+    const i = one(ir); if (!i || i.id !== cand.intentId || !Number.isSafeInteger(i.version) || i.version < 1 || i.version > 9999999) return done("STOP", "DETECT_REPLY_SHAPE");
+    return done("ONE", "DETECT_ONE", { intentId: cand.intentId, opId: cand.opId, version: i.version });
+  } finally {
+    if (began) { let rt; try { await Promise.race([client.query(Q.rollback), new Promise((_, rej) => { rt = setTimeout(() => rej(new Error("rollback")), c.budgets.rollbackMs); })]); } catch { /* the connection is discarded */ } finally { clearTimeout(rt); } }
+  }
+}
+/** the server-derived plan for a detected candidate: fixed label + locale; its planHash IS the fingerprint the execute run must reproduce */
+export function detectPlan(c, cand, sourceDigest) {
+  return buildPlan(c, { approvalRef: c.detect.approvalRef, intentId: cand.intentId, opId: cand.opId, expectedVersion: cand.version, locale: c.detect.locale, sourceDigest });
+}
+export const DETECT_RESULT_SCHEMA = "e7-hosted-booking-confirmation-detect-v1";
+/** runDetectCore({ pool, c, sourceDigest }) → frozen { outcome, code, fingerprint, admission, counts, statements }. Never throws. Writes nothing. */
+export async function runDetectCore({ pool, c = CONSTANTS, sourceDigest }) {
+  const out = { schema: DETECT_RESULT_SCHEMA, outcome: "STOP", code: null, fingerprint: null, admission: null, counts: null, statements: 0 };
+  const counter = { statements: 0 }; const cp = countedPool(pool, c, counter);
+  try {
+    let cl; try { cl = await cp.connect(); } catch (e) { refuse(e instanceof Refusal ? e.code : "NBC_DB_FAILED"); }
+    let sel; try { sel = await selectCandidate({ client: cl, c }); } finally { cl.release(true); }
+    out.counts = sel.counts; out.code = sel.code;
+    if (sel.kind !== "ONE") { out.outcome = sel.kind; }
+    else {
+      const built = detectPlan(c, sel.candidate, sourceDigest);
+      let ac; try { ac = await cp.connect(); } catch (e) { refuse(e instanceof Refusal ? e.code : "NBC_DB_FAILED"); }
+      let adm; try { adm = await admit({ client: ac, plan: built.plan, c }); } finally { ac.release(true); }
+      if (!adm.ok) { out.outcome = "STOP"; out.code = "DETECT_NOT_ADMISSIBLE"; out.admission = adm.code; }
+      else { out.outcome = "ONE"; out.admission = "ADMITTED"; out.fingerprint = built.planHash; }
+    }
+  } catch (e) {
+    out.outcome = "STOP"; out.fingerprint = null;
+    out.code = e instanceof Refusal && e.code === "NBC_DB_TIMEOUT" ? "DETECT_DB_TIMEOUT" : "DETECT_DB_FAILED";
+  }
+  if (!DETECT_CODES.includes(out.code)) { out.outcome = "STOP"; out.code = "DETECT_DB_FAILED"; out.fingerprint = null; }
+  out.statements = counter.statements;
+  return deepFreeze(out);
+}
+
 /** a counted, connect-bounded view of a pg Pool: exactly the surface the accepted worker uses (query / connect → { query, release }) */
 export function countedPool(pool, c, counter) {
   const wrap = (cl) => ({ query: (t, p) => { counter.statements += 1; if (counter.statements > c.budgets.statements) return Promise.reject(new Refusal("NBC_BUDGET")); return cl.query(t, p); },
@@ -315,12 +440,24 @@ export function countedPool(pool, c, counter) {
  * tooling = { runNotificationStep, createResendNotificationExecutor, NOTIFICATION_V2_OPTION_KEY, NOTIFICATION_PROVIDER_OPTION_KEY } (the ACCEPTED modules).
  * exchange = the reviewed single-use Resend exchange function (FAKE in every test); credential = () => key (never logged, never in the result).
  */
-export async function runBookingConfirmationCore({ pool, plan, c = CONSTANTS, tooling, exchange, credential, runId }) {
-  const out = { schema: RESULT_SCHEMA, code: null, admission: null, workerOutcome: null, workerCode: null, sendsAttempted: 0, workerInvocations: 0, statements: 0,
+export async function runBookingConfirmationCore({ pool, plan: boundPlan, c = CONSTANTS, tooling, exchange, credential, runId, detected = null }) {
+  let plan = boundPlan;
+  const out = { schema: RESULT_SCHEMA, flow: detected ? "detect" : "manual", detectCode: null, code: null, admission: null, workerOutcome: null, workerCode: null, sendsAttempted: 0, workerInvocations: 0, statements: 0,
     providerAccepted: false, providerReplay: false, verifiedCompletion: false, readback: null, deliveryProven: false, postcheck: null };
   const counter = { statements: 0 };
   const cp = countedPool(pool, c, counter);
   try {
+    // 0. C119 S1 detect flow: re-select server-side (read-only) and require the SAME fingerprint; detect is never authority to send
+    if (detected) {
+      if (plan !== null || !detected || !HEX64.test(String(detected.expectedFingerprint)) || !HEX64.test(String(detected.sourceDigest))) refuse("NBC_CANDIDATE_CHANGED");
+      let sc; try { sc = await cp.connect(); } catch (e) { refuse(e instanceof Refusal ? e.code : "NBC_DB_FAILED"); }
+      let sel; try { sel = await selectCandidate({ client: sc, c }); } finally { sc.release(true); }
+      out.detectCode = sel.code;
+      if (sel.kind !== "ONE") refuse("NBC_CANDIDATE_CHANGED");
+      const built = detectPlan(c, sel.candidate, detected.sourceDigest);
+      if (built.planHash !== detected.expectedFingerprint) refuse("NBC_CANDIDATE_CHANGED");
+      plan = built.plan;
+    }
     // 1. admission (read-only)
     let ac; try { ac = await cp.connect(); } catch (e) { refuse(e instanceof Refusal ? e.code : "NBC_DB_FAILED"); }
     let adm; try { adm = await admit({ client: ac, plan, c }); } finally { ac.release(true); }
@@ -355,7 +492,7 @@ export async function runBookingConfirmationCore({ pool, plan, c = CONSTANTS, to
   //    valid readback matching the durable accepted shape is a verified completion; unavailable / missing / malformed / contradictory → the explicit
   //    STOP ACCEPTED_UNVERIFIED_STOP with providerAccepted / providerReplay RETAINED (the acceptance already happened: never "nothing happened",
   //    never a permission to resend — the lifecycle fences + admission still refuse a rerun). Other outcomes: informational only, never upgraded.
-  if (out.admission === "ADMITTED") {
+  if (out.admission === "ADMITTED" && plan) {
     let parsed;
     try {
       const pc = await cp.connect();
@@ -383,16 +520,17 @@ const TEST_FILES = freeze(["test/e7-hosted-booking-confirmation.test.mjs", "test
 const SECRET_KEYS = freeze(["E7_DEV_BOOKING_DATABASE_URL", "E7_RESEND_TEST_KEY"]);
 export const INPUT_ENV = freeze({ approvalRef: "E7_APPROVAL_REF", intentId: "E7_INTENT_ID", opId: "E7_OP_ID", expectedVersion: "E7_EXPECTED_VERSION", locale: "E7_LOCALE" });
 export const ALLOWED_E7_KEYS = freeze([...Object.values(INPUT_ENV), "E7_TOOLING_DIR", "E7_EXPECTED_PLAN_HASH", "E7_EXPECTED_SOURCE_DIGEST", "E7_EXPECTED_CLOSURE_DIGEST",
-  "E7_WORKFLOW_SHA", "E7_RUN_ID", "E7_CA_FILE", ...SECRET_KEYS]);
+  "E7_WORKFLOW_SHA", "E7_RUN_ID", "E7_CA_FILE", ...SECRET_KEYS, "E7_INPUT_MODE", "E7_EXPECTED_CANDIDATE_FINGERPRINT"]);   // C119 S1: the flow + the detect job's declared output
+const SECRETS_BY_MODE = freeze({ preflight: freeze([]), verify: freeze([]), detect: freeze(["E7_DEV_BOOKING_DATABASE_URL"]), execute: SECRET_KEYS });
 
 /** runHosted({ mode, env, proc, wrapperDir, deps }) → { exitCode, result }. Never throws. deps = TEST SEAMS (constants included). */
 export async function runHosted({ mode = "preflight", env, proc, wrapperDir, deps = {} }) {
   const c = deps.constants ?? CONSTANTS;
   const r = { schema: "e7-hosted-booking-confirmation-hosted-v1", mode: null, code: null, workflowSha: null, toolingCommit: c.toolingCommit, executeEnabled: c.executeEnabled,
-    closureDigest: null, sourceDigest: null, planKind: null, planHash: null, runId: null, envCode: null, tests: null, core: null, cleanup: null };
+    closureDigest: null, sourceDigest: null, planKind: null, planHash: null, runId: null, envCode: null, tests: null, core: null, detect: null, outputs: null, cleanup: null };
   let pool = null;
   try {
-    if (!["preflight", "verify", "execute"].includes(mode)) refuse("NBC_USAGE");
+    if (!["preflight", "verify", "detect", "execute"].includes(mode)) refuse("NBC_USAGE");
     r.mode = mode;
     const keys = Object.keys(env);                                       // key NAMES only — no value of any variable is read before the next two gates
     if (keys.some((k) => k.startsWith("E7_") && !ALLOWED_E7_KEYS.includes(k))) refuse("NBC_INPUT_UNEXPECTED");
@@ -401,10 +539,16 @@ export async function runHosted({ mode = "preflight", env, proc, wrapperDir, dep
     const importEnv = deps.importEnv ?? ((dir) => import(pathToFileURL(`${dir}/scripts/e7-connected/probe-env-preflight.mjs`).href));
     const importTooling = deps.importTooling ?? defaultImportTooling;
     const runCore = deps.runCore ?? runBookingConfirmationCore;
+    const runDetect = deps.runDetect ?? runDetectCore;
     const readPgVersion = deps.readPgVersion ?? (async (dir) => JSON.parse(await readFile(`${dir}/node_modules/pg/package.json`, "utf8")).version);
     const readCa = deps.readCa ?? ((p) => readFile(p));
     r.workflowSha = HEX40.test(env.E7_WORKFLOW_SHA ?? "") ? env.E7_WORKFLOW_SHA : null;
-    if (mode !== "execute" && SECRET_KEYS.some((k) => keys.includes(k))) refuse("NBC_SECRET_SCOPE_VIOLATION");
+    if (SECRET_KEYS.some((k) => keys.includes(k) && !SECRETS_BY_MODE[mode].includes(k))) refuse("NBC_SECRET_SCOPE_VIOLATION");
+    // C119 S1 flow: `detect` mode, or verify / execute of a detect flow (E7_INPUT_MODE=detect): NO hand-bound identifier, no plan hash
+    const inMode = env.E7_INPUT_MODE ?? ""; const expFp = env.E7_EXPECTED_CANDIDATE_FINGERPRINT ?? "";
+    if (!["", "manual", "detect"].includes(inMode) || (mode === "preflight" && inMode !== "") || (mode === "detect" && inMode !== "" && inMode !== "detect")) refuse("NBC_INPUT_INVALID");
+    const detectFlow = mode === "detect" || ((mode === "verify" || mode === "execute") && inMode === "detect");
+    if (!(detectFlow && mode !== "detect") && expFp !== "") refuse("NBC_INPUT_UNEXPECTED");
     const inp = {}; for (const k of PLAN_INPUT_KEYS) inp[k] = env[INPUT_ENV[k]] ?? "";
     const vals = PLAN_INPUT_KEYS.map((k) => inp[k]); const anyReal = vals.some((v) => v !== "");
     if (anyReal && vals.some((v) => v === "")) refuse("NBC_INPUT_INCOMPLETE");
@@ -414,9 +558,11 @@ export async function runHosted({ mode = "preflight", env, proc, wrapperDir, dep
     if (anyReal && (c.excludedIntentIds.includes(inp.intentId))) refuse("NBC_INTENT_EXCLUDED");
     const expPlan = env.E7_EXPECTED_PLAN_HASH ?? ""; const expSrc = env.E7_EXPECTED_SOURCE_DIGEST ?? ""; const expClo = env.E7_EXPECTED_CLOSURE_DIGEST ?? "";
     const runId = env.E7_RUN_ID ?? "";
+    if (detectFlow && (anyReal || expPlan !== "")) refuse("NBC_INPUT_UNEXPECTED");
     if (mode !== "preflight") {
       if (c.toolingStatus !== "MERGED" || !HEX64.test(String(c.closureDigest))) refuse("NBC_CLOSURE_MISMATCH");
-      if (!anyReal || !HEX64.test(expPlan) || !HEX64.test(expSrc) || !HEX64.test(expClo)) refuse("NBC_INPUT_INCOMPLETE");
+      if (detectFlow) { if (!HEX64.test(expSrc) || !HEX64.test(expClo) || (mode === "execute" && !HEX64.test(expFp)) || (expFp !== "" && !HEX64.test(expFp))) refuse("NBC_INPUT_INCOMPLETE"); }
+      else if (!anyReal || !HEX64.test(expPlan) || !HEX64.test(expSrc) || !HEX64.test(expClo)) refuse("NBC_INPUT_INCOMPLETE");
       if (!RUN_ID_RE.test(runId)) refuse("NBC_INPUT_INVALID");
       if (env.GITHUB_REF !== "refs/heads/main") refuse("NBC_REF_NOT_MAIN");
       if (expClo !== c.closureDigest) refuse("NBC_CLOSURE_MISMATCH");
@@ -428,10 +574,14 @@ export async function runHosted({ mode = "preflight", env, proc, wrapperDir, dep
     if (r.closureDigest !== c.closureDigest) refuse("NBC_CLOSURE_MISMATCH");           // the pinned bytes are verified BEFORE any tooling import
     r.sourceDigest = await framedDigest(wdir, c.runnerFiles, SOURCE_DIGEST_PREFIX).catch((e) => refuse(e instanceof Refusal ? e.code : "NBC_SOURCE_UNREADABLE"));
     if (mode !== "preflight" && r.sourceDigest !== expSrc) refuse("NBC_SOURCE_MISMATCH");
-    r.planKind = anyReal ? "REAL" : "SYNTHETIC";
-    const built = buildPlan(c, anyReal ? { ...inp, expectedVersion: Number(inp.expectedVersion), sourceDigest: r.sourceDigest } : { ...c.synthetic, sourceDigest: r.sourceDigest });
-    r.planHash = built.planHash;
-    if (mode !== "preflight" && built.planHash !== expPlan) refuse("NBC_PLAN_HASH_MISMATCH");
+    let built = null;
+    if (detectFlow) r.planKind = "DETECT";                                // the plan is derived server-side from the ONE detected candidate (core)
+    else {
+      r.planKind = anyReal ? "REAL" : "SYNTHETIC";
+      built = buildPlan(c, anyReal ? { ...inp, expectedVersion: Number(inp.expectedVersion), sourceDigest: r.sourceDigest } : { ...c.synthetic, sourceDigest: r.sourceDigest });
+      r.planHash = built.planHash;
+      if (mode !== "preflight" && built.planHash !== expPlan) refuse("NBC_PLAN_HASH_MISMATCH");
+    }
     let C1; try { C1 = await importEnv(tooling); } catch { refuse("NBC_IMPORT_FAILED"); }
     const present = Object.fromEntries(C1.PRESENT_KEYS.map((k) => [k, Object.hasOwn(env, k)]));
     let uid = null; try { if (typeof proc.getuid === "function") { const u = proc.getuid(); if (Number.isSafeInteger(u) && u >= 0) uid = u; } } catch { uid = null; }
@@ -449,9 +599,9 @@ export async function runHosted({ mode = "preflight", env, proc, wrapperDir, dep
     }
     if (mode === "verify") { r.code = "VERIFY_OK"; return { exitCode: 0, result: r }; }
     r.runId = runId;
-    if (!SECRET_KEYS.every((k) => typeof env[k] === "string" && env[k].length > 0)) refuse("NBC_CREDENTIALS_MISSING");
+    if (!SECRETS_BY_MODE[mode].every((k) => typeof env[k] === "string" && env[k].length > 0)) refuse("NBC_CREDENTIALS_MISSING");
     let dbUrl = env.E7_DEV_BOOKING_DATABASE_URL; delete env.E7_DEV_BOOKING_DATABASE_URL;
-    let key = env.E7_RESEND_TEST_KEY; delete env.E7_RESEND_TEST_KEY;
+    let key = mode === "execute" ? env.E7_RESEND_TEST_KEY : null; if (mode === "execute") delete env.E7_RESEND_TEST_KEY;
     const credential = () => key;
     try {
       let pgv; try { pgv = await readPgVersion(tooling); } catch { pgv = null; }
@@ -461,11 +611,21 @@ export async function runHosted({ mode = "preflight", env, proc, wrapperDir, dep
       try { const b = await readCa(env.E7_CA_FILE ?? ""); if (b.length < 16384 && sha(b) === (deps.caSha256 ?? OFFICIAL_CA_SHA256)) caPem = b.toString("utf8"); } catch { caPem = null; }
       if (caPem === null) refuse("NBC_CA_INVALID");
       let mods; try { mods = await importTooling(tooling); } catch { refuse("NBC_IMPORT_FAILED"); }
+      if (mode === "detect") {                                             // C119 S1: read-only; no exchange, no executor, no worker, no Resend key
+        try { pool = mods.createBookingPool({ connectionString: dbUrl, caPem, max: 1, statementTimeoutMs: c.budgets.statementMs }); } catch { refuse("NBC_DB_TARGET_INVALID"); }
+        dbUrl = null;
+        r.detect = await runDetect({ pool, c, sourceDigest: r.sourceDigest });
+        r.outputs = freeze({ outcome: DETECT_OUTCOMES.includes(r.detect?.outcome) ? r.detect.outcome : "STOP",
+          fingerprint: r.detect?.outcome === "ONE" && HEX64.test(String(r.detect.fingerprint)) ? r.detect.fingerprint : "" });
+        r.code = "DETECT_DONE";
+        return { exitCode: r.outputs.outcome === "STOP" ? 1 : 0, result: r };
+      }
       const xr = mods.createResendExchange();
       if (!xr || xr.ok !== true || typeof xr.exchange !== "function") refuse("NBC_IMPORT_FAILED");
       try { pool = mods.createBookingPool({ connectionString: dbUrl, caPem, max: 2, statementTimeoutMs: c.budgets.statementMs }); } catch { refuse("NBC_DB_TARGET_INVALID"); }
       dbUrl = null;
-      r.core = await runCore({ pool, plan: built.plan, c, tooling: mods.tooling, exchange: xr.exchange, credential, runId });
+      r.core = await runCore({ pool, plan: detectFlow ? null : built.plan, c, tooling: mods.tooling, exchange: xr.exchange, credential, runId,
+        detected: detectFlow ? freeze({ expectedFingerprint: expFp, sourceDigest: r.sourceDigest }) : null });
     } finally { dbUrl = null; key = null; }
     r.code = "EXECUTE_DONE";
     return { exitCode: r.core && (r.core.code === "PROVIDER_ACCEPTED" || r.core.code === "PROVIDER_ACCEPTED_REPLAY") && r.core.verifiedCompletion === true ? 0 : 1, result: r };
@@ -486,7 +646,8 @@ async function defaultImportTooling(dir) {
 }
 export function summaryMarkdown(r) {
   const k = r.core ? ` core=${r.core.code} admission=${r.core.admission ?? "-"} worker=${r.core.workerOutcome ?? "-"}/${r.core.workerCode ?? "-"} sends=${r.core.sendsAttempted} invocations=${r.core.workerInvocations} statements=${r.core.statements} providerAccepted=${r.core.providerAccepted} replay=${r.core.providerReplay} verifiedCompletion=${r.core.verifiedCompletion === true} readback=${r.core.readback ?? "-"} deliveryProven=false` : "";
-  return `e7-hosted-booking-confirmation ${r.mode} ${r.code} executeEnabled=${r.executeEnabled} plan=${r.planKind ?? "-"}:${r.planHash ?? "-"} runId=${r.runId ?? "-"} closure=${r.closureDigest ?? "-"} source=${r.sourceDigest ?? "-"} cleanup=${r.cleanup ?? "-"}${k}\n`;
+  const d = r.detect ? ` detect=${r.detect.outcome}/${r.detect.code} admission=${r.detect.admission ?? "-"} fingerprint=${r.detect.fingerprint ?? "-"} counts=${r.detect.counts ? canonical(r.detect.counts) : "-"} statements=${r.detect.statements}` : "";
+  return `e7-hosted-booking-confirmation ${r.mode} ${r.code} executeEnabled=${r.executeEnabled} plan=${r.planKind ?? "-"}:${r.planHash ?? "-"} runId=${r.runId ?? "-"} closure=${r.closureDigest ?? "-"} source=${r.sourceDigest ?? "-"} cleanup=${r.cleanup ?? "-"}${k}${d}\n`;
 }
 
 // ---- the ONLY top-level effect -----------------------------------------------------------------------------------------------------
@@ -495,6 +656,11 @@ if (import.meta.main === true) {
   const wrapperDir = fileURLToPath(new URL("../", import.meta.url));
   runHosted({ mode, env: process.env, proc: process, wrapperDir }).then(({ exitCode, result }) => {
     process.stdout.write(`${JSON.stringify(result)}\n`);
+    // C119 S1: the detect job's ONLY declared outputs (validated tokens; never an identifier)
+    if (result.mode === "detect" && result.outputs && typeof process.env.GITHUB_OUTPUT === "string" && process.env.GITHUB_OUTPUT.length > 0) {
+      const o = result.outputs; const ok = DETECT_OUTCOMES.includes(o.outcome) && (o.fingerprint === "" || HEX64.test(o.fingerprint));
+      try { appendFileSync(process.env.GITHUB_OUTPUT, ok ? `outcome=${o.outcome}\nfingerprint=${o.fingerprint}\n` : "outcome=STOP\nfingerprint=\n"); } catch { /* the job's outputs stay empty → execute is skipped */ }
+    }
     if (typeof process.env.GITHUB_STEP_SUMMARY === "string" && process.env.GITHUB_STEP_SUMMARY.length > 0) {
       import("node:fs/promises").then((fs) => fs.appendFile(process.env.GITHUB_STEP_SUMMARY, summaryMarkdown(result))).catch(() => {}).finally(() => process.exit(exitCode));
     } else process.exit(exitCode);
