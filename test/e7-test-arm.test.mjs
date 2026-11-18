@@ -141,9 +141,9 @@ test("A6 confirmation runner: verify / detect / execute (manual bound op AND det
   }
   const pre = await N.runHosted({ mode: "preflight", env: { E7_TOOLING_DIR: TOOLING }, proc: PROC, wrapperDir: ROOT, deps: { ...deps, constants: N.CONSTANTS } });
   assert.notEqual(pre.result.code, "NBC_ARM_CLOSED", "manual preflight takes no arm");
-  const shipped = await N.runHosted({ mode: "detect", env: { ...base, E7_TEST_ARM: R0.release, E7_DEV_BOOKING_DATABASE_URL: "postgresql://x" }, proc: PROC, wrapperDir: ROOT, deps: { ...deps, constants: Object.freeze({ ...N.CONSTANTS, executeEnabled: false }) } });
-  assert.equal(shipped.result.code, "NBC_EXECUTE_CLOSED", "CLOSED constants (= the CLOSE companion): a valid arm never opens the closed runner");
-  assert.equal(N.CONSTANTS.executeEnabled, true, "C120 ACTIVATION ENABLE ships true; the CLOSE companion restores false");
+  const shipped = await N.runHosted({ mode: "detect", env: { ...base, E7_TEST_ARM: R0.release, E7_DEV_BOOKING_DATABASE_URL: "postgresql://x" }, proc: PROC, wrapperDir: ROOT, deps: { ...deps, constants: N.CONSTANTS } });
+  assert.equal(shipped.result.code, "NBC_EXECUTE_CLOSED", "SHIPPED CLOSED: a valid arm never opens the closed runner");
+  assert.equal(N.CONSTANTS.executeEnabled, false);
 });
 
 test("A7 kickoff runner: detect-flow verify NOT armed → CLOSED_NOOP (open=false: the gated jobs are skipped); manual verify / execute and the detect / detect-flow execute → HKO_ARM_CLOSED — all BEFORE any tooling import, secret / token read, DB or HTTP; manual preflight never needs the arm; SHIPPED CLOSED refuses first", async () => {
@@ -164,7 +164,7 @@ test("A7 kickoff runner: detect-flow verify NOT armed → CLOSED_NOOP (open=fals
   }
   const pre = await K.runHosted({ mode: "preflight", env: { E7_TOOLING_DIR: TOOLING }, proc: PROC, wrapperDir: ROOT, deps: { ...deps, constants: K.CONSTANTS } });
   assert.notEqual(pre.result.code, "HKO_ARM_CLOSED", "manual preflight takes no arm");
-  const shipped = await K.runHosted({ mode: "verify", env: { ...base, ...bound, E7_TEST_ARM: R0.release }, proc: PROC, wrapperDir: ROOT, deps: { ...deps, constants: Object.freeze({ ...K.CONSTANTS, executeEnabled: false, dispatchEnabled: false }) } });
-  assert.equal(shipped.result.code, "HKO_EXECUTE_CLOSED", "CLOSED constants (= the CLOSE companion): a valid arm never opens the closed runner");
-  assert.deepEqual([K.CONSTANTS.executeEnabled, K.CONSTANTS.dispatchEnabled], [true, true], "C120 ACTIVATION ENABLE ships true; the CLOSE companion restores false");
+  const shipped = await K.runHosted({ mode: "verify", env: { ...base, ...bound, E7_TEST_ARM: R0.release }, proc: PROC, wrapperDir: ROOT, deps: { ...deps, constants: K.CONSTANTS } });
+  assert.equal(shipped.result.code, "HKO_EXECUTE_CLOSED", "SHIPPED CLOSED: a valid arm never opens the closed runner");
+  assert.deepEqual([K.CONSTANTS.executeEnabled, K.CONSTANTS.dispatchEnabled], [false, false]);
 });
