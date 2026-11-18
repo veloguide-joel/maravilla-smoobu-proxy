@@ -3,7 +3,8 @@
 // lib/checkout/booking-confirmation-request.js (gn-v2 builder), lib/notify/resend-notification-executor.js (branded executor) and
 // scripts/e7-resend/resend-exchange.mjs (the reviewed single-use HTTPS exchange), with the schema-23 typed receipts (0023) on the reviewed schema 27 (C119 S1; was 26). Nothing here re-implements the worker.
 //
-// HONEST LABEL: SHIPPED CLOSED. executeEnabled is FALSE: `verify` and `execute` refuse NBC_EXECUTE_CLOSED right after the mode / unexpected-input checks,
+// HONEST LABEL: C120 ACTIVATION ENABLE — OPENED for ONE bounded TEST sink notification (the CLOSE companion restores FALSE). With closed constants (the shipped
+// state outside this window) `verify` and `execute` refuse NBC_EXECUTE_CLOSED right after the mode / unexpected-input checks,
 // BEFORE any tooling import, credential read, database or provider access. The execute BODY exists so that it can be reviewed and exercised through the
 // test-local constants / deps seam on disposable PostgreSQL (schema 26) with FAKE exchanges only. Enabling it is a separate reviewed change (no enable diff
 // here). Even then: the sender is the FIXED approved identity bookings@mail.micasadirect.com / MiCasaDirect (C54/C55; equal to the pinned tooling's
@@ -90,7 +91,7 @@ const CATALOG_PIN_28 = {"catalog":"96d74ab10cdf7bdd99e125eb6825284e9b57cacec3347
 export const CONSTANTS = deepFreeze({
   toolingCommit: "66133a22edca925e6386c4d178c251fa5f11c82e",          // C116: e7-test #180 merge commit (tree ade3e084 == reviewed head 5ba7f793; 0026). #178 merge 9b7a96bf: tree 40dbe13f == reviewed head d7e39ae3; sink recipient scope + 0025). C55 pin was 46b3eaf8
   toolingStatus: "MERGED",
-  executeEnabled: false,                                                // SHIPPED CLOSED: verify / execute refuse NBC_EXECUTE_CLOSED before any import / secret / DB / provider
+  executeEnabled: true,                                                 // C120 ACTIVATION ENABLE (ONE bounded TEST sink run; the CLOSE companion restores false); closed constants refuse NBC_EXECUTE_CLOSED
   // the INDEPENDENTLY scanned transitive relative imports of the five runtime roots at 66133a22 (+ package files); bare imports: node:* and pg only
   closure: ["lib/booking-db/notification-worker.js", "lib/booking-db/pool.js", "lib/checkout/booking-confirmation-copy.js", "lib/checkout/booking-confirmation-request.js",
     "lib/checkout/guest-notification.js", "lib/notify/resend-notification-executor.js", "lib/notify/sender-identity.js", "package-lock.json", "package.json", "scripts/e7-connected/probe-env-preflight.mjs",
