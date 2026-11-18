@@ -60,8 +60,8 @@ test("W2 static: both jobs check out the wrapper at the EXACT dispatch SHA and t
   assert.doesNotMatch(yml, /npm (ci|install|i )|npx|yarn|pnpm|curl|wget|resend-node|from 'resend'|supabase|DATABASE|STRIPE|HOSTAWAY|E7_CA_FILE|prod-ca/);
 });
 
-test("W3 static: send job needs preflight AND if mode == 'send' && github.ref == 'refs/heads/main' AND the EXISTING environment e7-readonly-probe (the only environment); preflight has no environment / secret / needs", () => {
-  assert.match(jobs.send, /^\n  send:\n    needs: preflight\n    if: inputs\.mode == 'send' && github\.ref == 'refs\/heads\/main'\n    runs-on: ubuntu-24\.04\n    environment: e7-readonly-probe\n    timeout-minutes: 5\n/);
+test("W3 static: send job needs preflight AND if mode == 'send' && github.ref == 'refs/heads/main' AND the EXISTING isolated TEST environment e7-test-auto (C120; was e7-readonly-probe; the only environment); preflight has no environment / secret / needs", () => {
+  assert.match(jobs.send, /^\n  send:\n    needs: preflight\n    if: inputs\.mode == 'send' && github\.ref == 'refs\/heads\/main'\n    runs-on: ubuntu-24\.04\n    environment: e7-test-auto\n    timeout-minutes: 5\n/);
   assert.equal(count(/environment: /g), 1); assert.doesNotMatch(jobs.preflight, /environment:|secrets\.|needs:/);
   assert.match(jobs.preflight, /^\n  preflight:\n    runs-on: ubuntu-24\.04\n    timeout-minutes: 5\n    steps:/);
 });

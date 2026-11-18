@@ -9,7 +9,8 @@
 # run attempt 1 only (a rerun is refused before the key is read). No DB, no Hostaway, no Stripe, no CA, no worker. Inputs / labels / hashes are
 # NOT consent. MANUAL dispatch only; default mode `preflight` = no environment, no secret, no network: focused FAKE tests + `--dry` + the
 # deterministic source digest + the plan hash for the chosen locale. `send` = ONE `--send` call, main only, after a SUCCESSFUL preflight job
-# of the SAME dispatch, behind the EXISTING `e7-readonly-probe` environment (reviewers / settings unchanged), only after HEAD / tooling pin /
+# of the SAME dispatch, behind the EXISTING isolated TEST environment `e7-test-auto` (C120; was `e7-readonly-probe`; reviewers / settings
+# unchanged), only after HEAD / tooling pin /
 # copy closure / expected source digest / expected plan hash / label / run attempt re-checks pass. The ONLY secret (E7_RESEND_TEST_KEY) is
 # injected into the LAST send step only; it is merely referenced here (this file creates, reads or requests no credential).
 # Source digest = SHA-256 over: prefix "e7-resend-sink-probe-v1\n", then for each file IN THIS ORDER
@@ -112,7 +113,7 @@ jobs:
     needs: preflight
     if: inputs.mode == 'send' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    environment: e7-readonly-probe
+    environment: e7-test-auto
     timeout-minutes: 5
     steps:
       - name: Checkout wrapper (this repository, exact dispatched commit)
