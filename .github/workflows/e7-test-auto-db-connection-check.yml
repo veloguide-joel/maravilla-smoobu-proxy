@@ -89,7 +89,7 @@ jobs:
             verdict = (r && r.one === 1 && r.cu === ROLE && r.su === ROLE && r.ro === "on" && r.app === true && r.su_flag === false && r.n === 1 && r.env === "test" && r.ssl === true)
               ? "OK" : (r && r.cu !== ROLE ? "ROLE_MISMATCH" : r && r.ro !== "on" ? "NOT_READ_ONLY" : r && r.env !== "test" ? "NOT_TEST_INSTANCE" : r && r.ssl !== true ? "BACKEND_SSL_OFF" : "IDENTITY_MISMATCH");
             await client.query("ROLLBACK");
-          } catch (e) { verdict = verdict ?? `QUERY_${code(e)}`; }
+          } catch (e) { verdict = `QUERY_${code(e)}`; }
           try { await client.end(); } catch { /* ignore */ }
           out(verdict === "OK", verdict === "OK" ? "CONNECTED_READ_ONLY_TEST" : verdict);
           ' 2>/dev/null || { rc=$?; [ "$rc" = 3 ] || echo "e7-test-auto-db-connection-check FAIL code=SCRIPT_ERROR"; exit 3; }
