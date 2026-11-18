@@ -16,8 +16,9 @@
 //
 // HONEST LIMITS: this module decides from the value it is GIVEN (E7_TEST_ARM, supplied by the workflow from the GitHub vars context); it fetches NO live
 // repository configuration. WHEN GitHub refreshes that context for an already queued / approval-held job is UNVERIFIED, so clearing or changing the
-// variable must NOT be relied on to revoke queued, pending-approval or already-running work (a pre-activation blocker; see the C119 S2 design §6). The pipeline runner is a component of the release but is NOT gated by this module
-// (its bytes are untouched in S2): an already queued or directly dispatched pipeline run is not refused by the arm (see the C119 S2 design).
+// variable must NOT be relied on to revoke queued, pending-approval or already-running work (a pre-activation blocker; see the C119 S2 design §6). C119 S4: the pipeline runner now
+// carries a labelled copy of this module (P4) plus a durable request binding (P5), and every gated job re-checks the LIVE main ref (P3); the
+// revocation for not-yet-admitted work is a CLOSE commit moving main, never the variable alone. An admitted run is not interrupted.
 import process from "node:process";
 import { readFile, lstat } from "node:fs/promises";
 import { appendFileSync } from "node:fs";

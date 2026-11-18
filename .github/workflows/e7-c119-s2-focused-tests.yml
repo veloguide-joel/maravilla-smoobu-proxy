@@ -42,16 +42,28 @@ jobs:
           ref: 66133a22edca925e6386c4d178c251fa5f11c82e
           path: tooling
           persist-credentials: false
+      - name: Checkout the C119 S4 kickoff tooling bbf12aa2 (the kickoff / TLS probe pin)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: bbf12aa22446807df7b63a55e38a464f4be88763
+          path: ktooling
+          persist-credentials: false
       - name: Set up Node 22.22.0
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: "22.22.0"
           package-manager-cache: false
-      - name: Fake suites — arm gate, kickoff, booking confirmation, TLS probe, cross-runner regression
+      - name: Fake suites — arm gate, booking confirmation, cross-runner regression (tooling 66133a22)
         working-directory: wrapper
         env:
           E7_TOOLING_DIR: ${{ github.workspace }}/tooling
         run: >-
-          node --test test/e7-test-arm.test.mjs test/e7-hosted-kickoff.test.mjs test/e7-hosted-kickoff-workflow.test.mjs
-          test/e7-hosted-booking-confirmation.test.mjs test/e7-hosted-booking-confirmation-workflow.test.mjs
-          test/e7-hosted-tls-probe.test.mjs test/e7-hosted-tls-probe-workflow.test.mjs test/e7-cross-runner-regression.test.mjs
+          node --test test/e7-test-arm.test.mjs test/e7-hosted-booking-confirmation.test.mjs test/e7-hosted-booking-confirmation-workflow.test.mjs
+          test/e7-cross-runner-regression.test.mjs
+      - name: Fake suites — kickoff, TLS probe (C119 S4 kickoff tooling)
+        working-directory: wrapper
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/ktooling
+        run: >-
+          node --test test/e7-hosted-kickoff.test.mjs test/e7-hosted-kickoff-workflow.test.mjs test/e7-hosted-tls-probe.test.mjs test/e7-hosted-tls-probe-workflow.test.mjs

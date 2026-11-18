@@ -1,0 +1,141 @@
+# C119 S4 — FOCUSED TEST EVIDENCE ONLY for the pipeline admission cascade (DRAFT, SHIPPED CLOSED): the pipeline (P0 arm job, P3 live-main, P4 arm gate,
+# P5 request binding), the kickoff / TLS probe repin to the C119 S4 tooling bbf12aa2 (0028 + PINNED_REVISION 5294b6b4), the confirmation / status
+# catalog-28 repin, the arm-gate test, the cross-runner regression and the out-of-frame S4 admission suite (P3 executed for all five jobs + the full
+# kickoff → pipeline chain on schema 28). Disposable localhost PostgreSQL 16 and 17, FAKE providers only: no secrets, no environment, no variable, no
+# shared database, no provider, no dispatch. Outside every runtime frame and the arm release. contents: read only.
+name: e7-c119-s4-focused-tests
+on:
+  pull_request:
+    paths:
+      - "scripts/e7-hosted-pipeline.mjs"
+      - "scripts/e7-hosted-kickoff.mjs"
+      - "scripts/e7-hosted-booking-confirmation.mjs"
+      - "scripts/e7-hosted-status.mjs"
+      - "scripts/e7-hosted-tls-probe.mjs"
+      - "scripts/e7-test-arm.mjs"
+      - "test/e7-hosted-pipeline*.test.mjs"
+      - "test/e7-hosted-kickoff*.test.mjs"
+      - "test/e7-hosted-booking-confirmation*.test.mjs"
+      - "test/e7-hosted-status*.test.mjs"
+      - "test/e7-hosted-tls-probe*.test.mjs"
+      - "test/e7-hosted-kickoff-shallow.test.mjs"
+      - "test/e7-test-arm.test.mjs"
+      - "test/e7-cross-runner-regression.test.mjs"
+      - "test/e7-c119-s4-admission.test.mjs"
+      - "test/fixtures/e7-c102-pipeline-enable-delta.json"
+      - ".github/workflows/e7-hosted-*.yml"
+      - ".github/workflows/e7-c119-s4-focused-tests.yml"
+      - "claude/c119-s4-*"
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: e7-c119-s4-focused-tests-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  focused:
+    name: c119-s4-focused (PG ${{ matrix.pg }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["16", "17"]
+    steps:
+      - name: Checkout wrapper (exact event SHA)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout the pipeline coordinator tooling (fixed commit 71c3dcf8)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: 71c3dcf83c6b78a2cb0c6a7e829b5ecb23d37af5
+          path: ptooling
+          persist-credentials: false
+      - name: Checkout merged E7 tooling (fixed commit 66133a22; confirmation / status runtime + the immutable 0024 bytes)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: 66133a22edca925e6386c4d178c251fa5f11c82e
+          path: tooling
+          persist-credentials: false
+      - name: Checkout the C119 S4 tooling (e7-test #194 merge bbf12aa2; kickoff / TLS probe pin, schema 28)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: bbf12aa22446807df7b63a55e38a464f4be88763
+          path: ktooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Install PostgreSQL ${{ matrix.pg }} binaries (no service is started; tests run their own throwaway cluster)
+        run: |
+          set -euo pipefail
+          if [ ! -x "/usr/lib/postgresql/${{ matrix.pg }}/bin/initdb" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq postgresql-common
+            sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+            sudo apt-get install -y -qq "postgresql-${{ matrix.pg }}"
+          fi
+          sudo systemctl stop postgresql || true
+          "/usr/lib/postgresql/${{ matrix.pg }}/bin/postgres" --version
+      - name: Install the pinned tooling dependencies (lockfiles, no scripts)
+        run: |
+          set -euo pipefail
+          for d in ptooling tooling ktooling; do (cd "$d" && npm ci --ignore-scripts --no-audit --no-fund); done
+      - name: Unit — pipeline (P4 / P5 fake) + workflow, arm gate, cross-runner, S4 admission (P3 executed ×5, main-side parity)
+        working-directory: wrapper
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/ptooling
+          E7_KICKOFF_TOOLING_DIR: ${{ github.workspace }}/ktooling
+        run: >-
+          node --test test/e7-hosted-pipeline.test.mjs test/e7-hosted-pipeline-workflow.test.mjs test/e7-test-arm.test.mjs test/e7-cross-runner-regression.test.mjs
+          test/e7-c119-s4-admission.test.mjs
+      - name: Unit — kickoff + TLS probe (C119 S4 tooling)
+        working-directory: wrapper
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/ktooling
+        run: node --test test/e7-hosted-kickoff.test.mjs test/e7-hosted-kickoff-workflow.test.mjs test/e7-hosted-kickoff-shallow.test.mjs test/e7-hosted-tls-probe.test.mjs test/e7-hosted-tls-probe-workflow.test.mjs test/e7-hosted-tls-probe-shallow.test.mjs
+      - name: Unit — booking confirmation + status (tooling 66133a22)
+        working-directory: wrapper
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+        run: node --test test/e7-hosted-booking-confirmation.test.mjs test/e7-hosted-booking-confirmation-workflow.test.mjs test/e7-hosted-status.test.mjs test/e7-hosted-status-workflow.test.mjs
+      - name: DB — pipeline P-suite incl. P19 (real coordinator + workers on schema 23 + the immutable 0024; fake providers)
+        working-directory: wrapper
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/ptooling
+          E7_HPL_SCHEMA24_DIR: ${{ github.workspace }}/tooling
+          E7_HPL_DB_TESTS: "1"
+          PG_BIN: /usr/lib/postgresql/${{ matrix.pg }}/bin
+        run: node --test test/e7-hosted-pipeline.test.mjs
+      - name: DB — S4 full chain on schema 28 (real authorization → real kickoff claim (0028) → pipeline P5 + real coordinator; fake providers)
+        working-directory: wrapper
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/ptooling
+          E7_KICKOFF_TOOLING_DIR: ${{ github.workspace }}/ktooling
+          E7_S4_DB_TESTS: "1"
+          PG_BIN: /usr/lib/postgresql/${{ matrix.pg }}/bin
+        run: node --test test/e7-c119-s4-admission.test.mjs
+      - name: DB — kickoff + TLS probe (schema 28 native in the C119 S4 tooling)
+        working-directory: wrapper
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/ktooling
+          E7_HKO_DB_TESTS: "1"
+          E7_TLSP_DB_TESTS: "1"
+          PG_BIN: /usr/lib/postgresql/${{ matrix.pg }}/bin
+        run: node --test test/e7-hosted-kickoff.test.mjs test/e7-hosted-tls-probe.test.mjs
+      - name: DB — booking confirmation + status (66133a22 + the sha-checked 0027 / 0028 bytes = schema 28)
+        working-directory: wrapper
+        env:
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_SCHEMA28_DIR: ${{ github.workspace }}/ktooling
+          E7_HBC_DB_TESTS: "1"
+          E7_HST_DB_TESTS: "1"
+          PG_BIN: /usr/lib/postgresql/${{ matrix.pg }}/bin
+        run: node --test --test-concurrency=1 test/e7-hosted-booking-confirmation.test.mjs test/e7-hosted-status.test.mjs

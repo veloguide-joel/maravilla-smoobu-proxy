@@ -129,7 +129,8 @@ test("H5 runHosted OPEN-CONSTANTS seam (test-local; the shipped constants stay c
   const open = { ...C, executeEnabled: true };
   const pre = await E.runHosted({ mode: "preflight", env: realEnv(), proc: PROC, wrapperDir: ROOT, deps: { spawnChild: okChild, constants: open } });
   const DBU = "postgresql://mv_booking_app_dev.mxotevtiscernhqilyiu:pw@aws-0-us-east-1.pooler.supabase.com:6543/postgres";
-  const exec = (over = {}, deps = {}) => ({ GITHUB_REF: "refs/heads/main", ...realEnv({ E7_EXPECTED_PLAN_HASH: pre.result.planHash, E7_EXPECTED_SOURCE_DIGEST: pre.result.sourceDigest,
+  const ARM = (await E.armRelease(ROOT)).release;                                                       // C119 S4: the release recomputed from this checkout
+  const exec = (over = {}, deps = {}) => ({ GITHUB_REF: "refs/heads/main", ...realEnv({ E7_TEST_ARM: ARM, E7_EXPECTED_PLAN_HASH: pre.result.planHash, E7_EXPECTED_SOURCE_DIGEST: pre.result.sourceDigest,
     E7_EXPECTED_CLOSURE_DIGEST: C.closureDigest, E7_RUN_ID: "43746039485-1", E7_CA_FILE: "/ca", E7_STRIPE_TEST_KEY: "sk_test_x", E7_HOSTAWAY_TOKEN: "h", E7_DEV_BOOKING_DATABASE_URL: DBU, ...over }) });
   const seen = {};
   const fakeMods = { X: { createE7RealExchange: () => ({ ok: true, exchange: () => Promise.reject(new Error("no")) }) }, createBookingPool: () => ({ end: async () => {}, connect: async () => ({}) }), tooling: {} };
@@ -140,6 +141,26 @@ test("H5 runHosted OPEN-CONSTANTS seam (test-local; the shipped constants stay c
   assert.deepEqual([ok.exitCode, ok.result.code, ok.result.cleanup, ok.result.lockEndpoint], [0, "EXECUTE_DONE", "POOLS_ENDED", "session:5432"], JSON.stringify(ok.result));
   for (const k of ["E7_STRIPE_TEST_KEY", "E7_HOSTAWAY_TOKEN", "E7_DEV_BOOKING_DATABASE_URL"]) assert.ok(!(k in env1), `${k} removed from env`);
   assert.equal(seen.inp.credentials.stripe(), "sk_test_x"); assert.equal(seen.inp.runId, "43746039485-1"); assert.equal(seen.inp.plan.intentId, "11111111-2222-4333-8444-555555555555");
+  // C119 S4 (P5): the core receives the run's OWN binding = exactly the dispatched input strings (what a kickoff claim stores), closed + coherent
+  assert.deepEqual(Object.keys(seen.inp.requestBinding.inputs), [...E.REQUEST_INPUT_KEYS]);
+  assert.deepEqual(seen.inp.requestBinding, { planHash: pre.result.planHash, inputs: { mode: "execute", approval_ref: env1.E7_APPROVAL_REF ?? exec().E7_APPROVAL_REF, intent_id: exec().E7_INTENT_ID,
+    booking_ref: exec().E7_BOOKING_REF, expected_version: exec().E7_EXPECTED_VERSION, not_before: exec().E7_NOT_BEFORE, payment_intent_id: exec().E7_PAYMENT_INTENT_ID,
+    amount_minor: exec().E7_AMOUNT_MINOR, currency: "USD", expected_plan_hash: pre.result.planHash, expected_source_digest: pre.result.sourceDigest, expected_closure_digest: C.closureDigest } });
+  assert.equal(E.requestBindingInvalid(seen.inp.requestBinding, seen.inp.plan, pre.result.planHash), null);
+  assert.equal(ok.result.arm, "ARMED");
+  // C119 S4 (P4): no manual bypass — verify AND execute refuse HPL_ARM_CLOSED (absent / malformed / mismatch / not main) BEFORE any value / import / secret / DB / provider
+  for (const [armOver, code] of [[{ E7_TEST_ARM: undefined }, "ARM_ABSENT"], [{ E7_TEST_ARM: "" }, "ARM_ABSENT"], [{ E7_TEST_ARM: ARM.toUpperCase() }, "ARM_MALFORMED"],
+    [{ E7_TEST_ARM: "f".repeat(64) }, "ARM_MISMATCH"], [{ GITHUB_REF: "refs/heads/feature" }, "ARM_REF_NOT_MAIN"]]) {
+    for (const mode of ["verify", "execute"]) {
+      const spy = { imp: 0, core: 0, ca: 0, pg: 0 };
+      const ex = Object.fromEntries(Object.entries({ ...exec(), ...armOver }).filter(([, x]) => x !== undefined));
+      const x = await E.runHosted({ mode, env: ex, proc: PROC, wrapperDir: ROOT, deps: { ...deps(null), importTooling: async () => { spy.imp += 1; return fakeMods; },
+        runCore: async () => { spy.core += 1; return null; }, readCa: async () => { spy.ca += 1; return Buffer.from("CA"); }, readPgVersion: async () => { spy.pg += 1; return "8.18.0"; },
+        spawnChild: async () => { spy.child = 1; return { status: 1 }; }, importEnv: async () => { spy.env = 1; return {}; } } });
+      assert.deepEqual([x.exitCode, x.result.code, x.result.arm, x.result.planHash, x.result.sourceDigest, spy], [1, "HPL_ARM_CLOSED", code, null, null, { imp: 0, core: 0, ca: 0, pg: 0 }], `${mode} ${code}`);
+      assert.equal(ex.E7_STRIPE_TEST_KEY, "sk_test_x", "the secret VALUES were never touched (still present, unread)");
+    }
+  }
   assert.ok(!JSON.stringify(ok.result).includes("sk_test_x") && !JSON.stringify(ok.result).includes("pw@"));
   assert.equal((await E.runHosted({ mode: "execute", env: exec(), proc: PROC, wrapperDir: ROOT, deps: deps({ outcome: "PENDING", nextActionAt: "2026-11-16T00:02:00.000Z" }) })).exitCode, 0);
   assert.equal((await E.runHosted({ mode: "execute", env: exec(), proc: PROC, wrapperDir: ROOT, deps: deps({ outcome: "PENDING", nextActionAt: null }) })).exitCode, 1);
@@ -150,7 +171,7 @@ test("H5 runHosted OPEN-CONSTANTS seam (test-local; the shipped constants stay c
   const strip = (o) => Object.fromEntries(Object.entries(o).filter(([, x]) => x !== undefined));
   const vv = await E.runHosted({ mode: "verify", env: strip(exec({ E7_STRIPE_TEST_KEY: undefined, E7_HOSTAWAY_TOKEN: undefined, E7_DEV_BOOKING_DATABASE_URL: undefined, E7_CA_FILE: undefined })), proc: PROC, wrapperDir: ROOT, deps: deps(null) });
   assert.equal(vv.result.code, "VERIFY_OK", JSON.stringify(vv.result));
-  for (const [over, k, dx] of [[{ GITHUB_REF: "refs/heads/feature" }, "HPL_REF_NOT_MAIN"], [{ E7_EXPECTED_CLOSURE_DIGEST: "a".repeat(64) }, "HPL_CLOSURE_MISMATCH"],
+  for (const [over, k, dx] of [[{ GITHUB_REF: "refs/heads/feature" }, "HPL_ARM_CLOSED"],                  // C119 S4: the arm (ref rule) refuses first; HPL_REF_NOT_MAIN stays behind it [{ E7_EXPECTED_CLOSURE_DIGEST: "a".repeat(64) }, "HPL_CLOSURE_MISMATCH"],
     [{ E7_EXPECTED_SOURCE_DIGEST: "b".repeat(64) }, "HPL_SOURCE_MISMATCH"], [{ E7_EXPECTED_PLAN_HASH: "c".repeat(64) }, "HPL_PLAN_HASH_MISMATCH"], [{ E7_EXPECTED_VERSION: "5" }, "HPL_PLAN_HASH_MISMATCH"],
     [{ E7_RUN_ID: "x" }, "HPL_INPUT_INVALID"], [{ E7_EXPECTED_PLAN_HASH: "" }, "HPL_INPUT_INCOMPLETE"], [{ E7_HOSTAWAY_TOKEN: "" }, "HPL_CREDENTIALS_MISSING"],
     [{ E7_DEV_BOOKING_DATABASE_URL: "postgresql://postgres:pw@db.example.com:5432/postgres" }, "HPL_DB_TARGET_INVALID"], [{}, "HPL_CA_INVALID", { caSha256: "0".repeat(64) }],
@@ -229,6 +250,7 @@ function fpool(w, o = {}) {
       case "guest": return { rows: [{ first_name: "Fake", last_name: "Guest", email: "fake.guest@example.test" }] };
       case "role": return { rows: [{ is_app: true, privileged: false }] };
       case "identity": return { rows: [{ db: "fake", environment: "test" }] };
+      case "request": if (w.requestQuery) return w.requestQuery(); return { rows: [w.request ?? { intent_id: IID, state: "dispatch_accepted", plan_hash: w.binding.planHash, dispatch_inputs: { ...w.binding.inputs } }] };
       default: throw new Error(`unexpected SQL ${String(sql).slice(0, 50)}`);
     }
   }, async connect() { return { query: (sql, params) => p.query(sql, params), release() {}, on() {} }; } };
@@ -247,10 +269,15 @@ const fexchanges = (w) => ({
   hostaway: (req) => { w.calls.push(`H ${req.method} ${req.url.replace("https://api.hostaway.com", "")}`); return Promise.resolve({ status: 404, contentType: "application/json", bytes: enc({ status: "fail" }) }); }
 });
 const CAPTURED = {};
-const fcore = (w, co, o = {}) => E.runPipelineCore({ plan: plan(o.plan), pool: o.pool ?? fpool(w, o), lockClientFactory: o.lockClientFactory ?? (async () => fpool(w, o).lock()), runId: "unit-run-0001",
+/** C119 S4 (P5): the run's binding = exactly the strings a kickoff claim stores for this plan (fake suites: the request row echoes it unless overridden) */
+const bindingFor = (p) => { const h = createHash("sha256").update(E.canonical(p)).digest("hex");
+  return Object.freeze({ planHash: h, inputs: Object.freeze({ mode: "execute", approval_ref: p.approvalRef, intent_id: p.intentId, booking_ref: p.ref, expected_version: String(p.expectedVersion),
+    not_before: p.notBefore, payment_intent_id: p.paymentIntentId, amount_minor: String(p.amountMinor), currency: p.currency, expected_plan_hash: h,
+    expected_source_digest: p.sourceDigest, expected_closure_digest: p.closureDigest }) }); };
+const fcore = (w, co, o = {}) => { const pl = plan(o.plan); w.binding = w.binding ?? bindingFor(pl); return E.runPipelineCore({ requestBinding: w.binding, plan: pl, pool: o.pool ?? fpool(w, o), lockClientFactory: o.lockClientFactory ?? (async () => fpool(w, o).lock()), runId: "unit-run-0001",
   tooling: { ...pureTooling, loadIntent: async () => intentAuth({ status: w.status, version: w.version, lease: w.lease ?? null, payment: { ...intentAuth().payment, capturedMinor: w.status === "confirmed" ? AMT : 0 } }),
     runTestPipelineCoordinator: async (pool, opts) => { w.coOpts = opts; if (o.coordinatorExtra) await o.coordinatorExtra(opts); if (typeof co === "function") return co(w, opts, pool); return co; } },
-  exchanges: fexchanges(w), credentials: { stripe: () => "sk_test_fake", hostaway: () => "tok" }, clock: () => Date.UTC(2026, 10, 16, 2), ...(o.extra ?? {}) });
+  exchanges: fexchanges(w), credentials: { stripe: () => "sk_test_fake", hostaway: () => "tok" }, clock: () => Date.UTC(2026, 10, 16, 2), ...(o.extra ?? {}) }); };
 test("H7 FAKE core: admission refusals BEFORE the lock (stored refund veto / invalid refund evidence / wrong version / open case / released claim / dispatched notify / excluded id) and start-proof refusal — zero provider calls, no coordinator", async () => {
   for (const [mk, k] of [[() => fworld({ evidence: [{ kind: "payment_intent", external_ref: PI, observed: { amountRefundedMinor: 500 } }] }), "ADMISSION_REFUSED:PAYMENT_REFUND_OBSERVED"],
     [() => fworld({ evidence: [{ kind: "payment_intent", external_ref: PI, observed: { refunded: "yes" } }] }), "ADMISSION_REFUSED:PAYMENT_REFUND_EVIDENCE_INVALID"],
@@ -575,6 +602,62 @@ test("H17 C101-F2 an active recording hold / any unprocessed conflict-inbox row 
 });
 
 // ---------------------------------------------------------------------------------------------------------------------------------
+test("H18 C119 S4 (P5) request binding: the PURE refusal over the fresh read (no row / several / every non-admitted state / closed row + input shape / typed plan hash / exact canonical inputs) and the run's own binding (closed, typed, coherent with the plan)", () => {
+  const pl = plan(); const b = bindingFor(pl); const row = (o = {}) => ({ intent_id: IID, state: "dispatch_accepted", plan_hash: b.planHash, dispatch_inputs: { ...b.inputs }, ...o });
+  assert.equal(E.requestBindingInvalid(b, pl, b.planHash), null);
+  for (const st of ["claimed", "dispatch_accepted"]) assert.equal(E.requestBindingRefusal([row({ state: st })], b), null, st);
+  // jsonb key order is not semantic: a reordered stored object is still EXACTLY equal (canonical)
+  assert.equal(E.requestBindingRefusal([row({ dispatch_inputs: Object.fromEntries(Object.entries(b.inputs).reverse()) })], b), null);
+  const no = (rows, code) => assert.equal(E.requestBindingRefusal(rows, b), code, JSON.stringify(rows).slice(0, 120));
+  no(null, "REQUEST_READ_INVALID"); no({ rows: [] }, "REQUEST_READ_INVALID"); no([], "NO_KICKOFF_REQUEST"); no([row(), row()], "REQUEST_MULTIPLE");
+  for (const st of ["requested", "dispatch_unknown", "dispatch_refused", "refused"]) no([row({ state: st })], `REQUEST_NOT_DISPATCHED:${st.toUpperCase()}`);
+  for (const r of [row({ state: "CLAIMED" }), row({ state: "new_state" }), row({ state: null }), row({ intent_id: "22222222-2222-4333-8444-555555555555" }), { ...row(), extra: 1 },
+    (() => { const x = row(); delete x.plan_hash; return x; })(), null, [], "row"]) no([r], "REQUEST_SHAPE_INVALID");
+  for (const h of [null, 1, b.planHash.toUpperCase(), "0".repeat(64), b.planHash.slice(1)]) no([row({ plan_hash: h })], "REQUEST_PLAN_HASH_MISMATCH");
+  for (const di of [null, [], "x", { ...b.inputs, extra: "1" }, (() => { const x = { ...b.inputs }; delete x.currency; return x; })(), { ...b.inputs, amount_minor: Number(b.inputs.amount_minor) },
+    { ...b.inputs, expected_version: null }]) no([row({ dispatch_inputs: di })], "REQUEST_INPUTS_SHAPE_INVALID");
+  for (const k of E.REQUEST_INPUT_KEYS) no([row({ dispatch_inputs: { ...b.inputs, [k]: `${b.inputs[k]}0` } })], "REQUEST_INPUTS_MISMATCH");
+  no([row({ dispatch_inputs: { ...b.inputs, not_before: "2026-11-16T00:00:00Z" } })], "REQUEST_INPUTS_MISMATCH");   // same instant, different STRING → refused (exact)
+  // the run's OWN binding
+  for (const x of [undefined, null, {}, { planHash: b.planHash }, { ...b, extra: 1 }, { ...b, planHash: b.planHash.toUpperCase() }, { ...b, planHash: "0".repeat(64) }])
+    assert.equal(E.requestBindingInvalid(x, pl, b.planHash), "BINDING_PLAN_HASH", JSON.stringify(x)?.slice(0, 80));
+  for (const inputs of [{ ...b.inputs, extra: "x" }, (() => { const x = { ...b.inputs }; delete x.mode; return x; })(), { ...b.inputs, amount_minor: AMT }])
+    assert.equal(E.requestBindingInvalid({ planHash: b.planHash, inputs }, pl, b.planHash), "BINDING_SHAPE");
+  for (const k of E.REQUEST_INPUT_KEYS) assert.equal(E.requestBindingInvalid({ planHash: b.planHash, inputs: { ...b.inputs, [k]: `${b.inputs[k]}0` } }, pl, b.planHash), "BINDING_INCOHERENT", k);
+  assert.match(E.QUERIES.request, /^\/\*e7hpl:request\*\/ SELECT intent_id::text AS intent_id, state, plan_hash, dispatch_inputs FROM booking\.pipeline_kickoff_requests WHERE intent_id = \$1$/);
+});
+
+test("H19 C119 S4 (P5) FAKE core: the binding is read AFTER the lock and BEFORE any provider exchange, and FRESH again before EACH coordinator invocation; any refusal / read error / malformed / several rows → STOP with zero coordinator invocations and zero provider calls, the lock released; a missing / incoherent binding → CORE_INVALID before any read", async () => {
+  const CO = { outcome: "STOP", code: "X", steps: [], writes: { create: 0, capture: 0, record: 0 } };
+  for (const [mk, code] of [[(w) => { w.request = { ...w.req0, state: "dispatch_unknown" }; }, "ADMISSION_REFUSED:REQUEST_NOT_DISPATCHED:DISPATCH_UNKNOWN"],
+    [(w) => { w.requestQuery = () => ({ rows: [] }); }, "ADMISSION_REFUSED:NO_KICKOFF_REQUEST"], [(w) => { w.requestQuery = () => ({ rows: [w.req0, w.req0] }); }, "ADMISSION_REFUSED:REQUEST_MULTIPLE"],
+    [(w) => { w.requestQuery = () => { throw new Error("relation does not exist"); }; }, "ADMISSION_REFUSED:REQUEST_READ_FAILED"],
+    [(w) => { w.request = { ...w.req0, dispatch_inputs: { ...w.req0.dispatch_inputs, expected_version: "8" } }; }, "ADMISSION_REFUSED:REQUEST_INPUTS_MISMATCH"],
+    [(w) => { w.request = { ...w.req0, plan_hash: "f".repeat(64) }; }, "ADMISSION_REFUSED:REQUEST_PLAN_HASH_MISMATCH"],
+    [(w) => { w.requestQuery = () => ({ rows: [{ ...w.req0, extra: true }] }); }, "ADMISSION_REFUSED:REQUEST_SHAPE_INVALID"]]) {
+    const w = fworld(); w.binding = bindingFor(plan()); w.req0 = { intent_id: IID, state: "dispatch_accepted", plan_hash: w.binding.planHash, dispatch_inputs: { ...w.binding.inputs } }; mk(w);
+    let coCalls = 0; const r = await fcore(w, () => { coCalls += 1; return CO; });
+    assert.deepEqual([r.outcome, r.code, r.coordinatorInvocations, coCalls, w.calls.length, r.possiblyEffected], ["STOP", code, 0, 0, 0, false], code);
+    assert.deepEqual([w.unlock, w.released], [1, "pooled"], `${code}: the advisory lock released (normal teardown)`);
+    assert.deepEqual(r.requestBinding, [`ADMISSION:${code.replace("ADMISSION_REFUSED:", "")}`]);
+  }
+  { // bound: read at admission AND fresh before the invocation (two reads; the second sees a state change made after the first)
+    const w = fworld(); w.binding = bindingFor(plan()); let n = 0; const good = { intent_id: IID, state: "dispatch_accepted", plan_hash: w.binding.planHash, dispatch_inputs: { ...w.binding.inputs } };
+    w.requestQuery = () => { n += 1; return { rows: [n === 1 ? good : { ...good, state: "dispatch_refused" }] }; };
+    let coCalls = 0; const r = await fcore(w, () => { coCalls += 1; return CO; });
+    assert.deepEqual([r.outcome, r.code, r.coordinatorInvocations, coCalls, n], ["STOP", "ADMISSION_REFUSED:REQUEST_NOT_DISPATCHED:DISPATCH_REFUSED", 0, 0, 2]);
+    assert.deepEqual(r.requestBinding, ["ADMISSION:BOUND", "FIRST:REQUEST_NOT_DISPATCHED:DISPATCH_REFUSED"]);
+  }
+  { const w = fworld(); let reads = 0; w.requestQuery = () => { reads += 1; return { rows: [] }; };
+    for (const bad of [undefined, null, { planHash: "0".repeat(64), inputs: {} }]) {
+      const r = await E.runPipelineCore({ ...(bad === undefined ? {} : { requestBinding: bad }), plan: plan(), pool: fpool(w), lockClientFactory: async () => fpool(w).lock(), runId: "unit-run-0001",
+        tooling: { ...pureTooling, loadIntent: async () => intentAuth(), runTestPipelineCoordinator: async () => CO }, exchanges: fexchanges(w), credentials: { stripe: () => "s", hostaway: () => "h" } });
+      assert.deepEqual([r.outcome, r.code], ["STOP", "CORE_INVALID:REQUEST_BINDING"]);
+    }
+    assert.equal(reads, 0); assert.equal(w.calls.length, 0);
+  }
+});
+
 // OPT-IN INTEGRATION (E7_HPL_DB_TESTS=1; tooling with its pinned pg; PG_BIN): the REAL merged coordinator + workers + repo + operations + transports +
 // executor adapters on a disposable PostgreSQL. FAKE exchanges ONLY; fixtures through the accepted APIs. The hosted preflight child never sets it.
 if (process.env.E7_HPL_DB_TESTS === "1") {
@@ -584,6 +667,38 @@ if (process.env.E7_HPL_DB_TESTS === "1") {
   const pg = pgMod.default ?? pgMod;
   const db = await startMigratedDatabase();
   after(async () => { await db.close(); });
+  // C119 S4 (P5): the runner reads booking.pipeline_kickoff_requests (0024). The pinned coordinator tooling (71c3dcf8) is schema 23, so the EXACT
+  // reviewed 0024 bytes (immutable; sha-pinned here; from E7_HPL_SCHEMA24_DIR, e.g. tooling 66133a22) are applied on top. TEST SETUP binds each run
+  // to a request row as the owner (session_replication_role = replica bypasses only the 0024 guard trigger; every CHECK constraint still applies).
+  // The REAL claim function + kickoff-generated inputs + RLS are exercised in test/e7-c119-s4-admission.test.mjs (outside every frame).
+  const S24 = realpathSync(process.env.E7_HPL_SCHEMA24_DIR || join(ROOT, "..", "schema24"));
+  const M24 = { "0024_pipeline_kickoff_requests.up.sql": "f5c97d010eae9c83d0b798064b6491cffe73e01a03f130e8281b38e763f287fc",
+    "0024_pipeline_kickoff_requests.down.sql": "3bfe7d8952b7fc9a3178418dc1842d054e845fb8cedc3225920f9b1b72bc6aa9" };
+  {
+    const { mkdtempSync, writeFileSync: wf, readdirSync, rmSync } = await import("node:fs"); const { tmpdir } = await import("node:os");
+    const MDIR = mkdtempSync(join(tmpdir(), "e7-hpl-m24-"));
+    for (const f of readdirSync(join(TOOLING, "db/migrations"))) wf(join(MDIR, f), readFileSync(join(TOOLING, "db/migrations", f)));
+    for (const [f, h] of Object.entries(M24)) { const b = readFileSync(join(S24, "db/migrations", f)); assert.equal(createHash("sha256").update(b).digest("hex"), h, f); wf(join(MDIR, f), b); }
+    const MG = await tool("db/lib/migrate.js");
+    assert.deepEqual(await MG.migrateUp(db.owner, { env: "test", dir: MDIR }), [24]);
+    rmSync(MDIR, { recursive: true, force: true });
+  }
+  /** TEST SETUP: bind the intent's 0024 request to EXACTLY this run's binding (state claimed | dispatch_accepted | any other for refusal tests) */
+  const bindRequest = async (b, state = "dispatch_accepted") => {
+    const cl = await db.owner.connect();
+    try {
+      await cl.query("BEGIN"); await cl.query("SET LOCAL session_replication_role = replica");
+      const settled = !["requested", "claimed"].includes(state); const claimedish = state !== "requested" && state !== "refused";
+      await cl.query(`INSERT INTO booking.pipeline_kickoff_requests (intent_id, ref, authorized_version, payment_intent_id, amount_minor, currency, listing_id, intent_created_at, requested_at,
+          state, claim_worker, claimed_at, plan_hash, dispatch_inputs, settled_at, outcome_code)
+        SELECT i.id, i.ref, $2::int, $3, $4::bigint, 'USD', i.listing_id, i.created_at, clock_timestamp(), $5, $6, $7, $8, $9::jsonb, $10, $11 FROM booking.intents i WHERE i.id = $1
+        ON CONFLICT (intent_id) DO UPDATE SET state = EXCLUDED.state, claim_worker = EXCLUDED.claim_worker, claimed_at = EXCLUDED.claimed_at, plan_hash = EXCLUDED.plan_hash,
+          dispatch_inputs = EXCLUDED.dispatch_inputs, settled_at = EXCLUDED.settled_at, outcome_code = EXCLUDED.outcome_code`,
+        [b.inputs.intent_id, Number(b.inputs.expected_version), b.inputs.payment_intent_id, b.inputs.amount_minor, state, claimedish ? "hpl-test-setup" : null, claimedish ? new Date() : null,
+          claimedish ? b.planHash : null, claimedish ? JSON.stringify(b.inputs) : null, settled ? new Date() : null, settled ? "TEST_SETUP" : null]);
+      await cl.query("COMMIT");
+    } catch (e) { await cl.query("ROLLBACK").catch(() => {}); throw e; } finally { cl.release(); }
+  };
   const LIST = 606998; const SEC = 1000; const MIN = 60 * SEC; const DAY = 24 * 60 * MIN;
   const CO = await tool("lib/booking-db/test-pipeline-coordinator.js");
   const realTooling = { ...pureTooling, refundObservationRefusal: CO.refundObservationRefusal, runTestPipelineCoordinator: CO.runTestPipelineCoordinator, loadIntent: R.loadIntent };
@@ -704,8 +819,10 @@ if (process.env.E7_HPL_DB_TESTS === "1") {
     const clk = extra.clk ?? { t: bk.base + 10 * SEC };
     const p = E.buildPlan(C, { approvalRef: "SYNTHETIC-hpl-pg", intentId: bk.id, ref: bk.ref, expectedVersion: await version(bk.id), notBefore: new Date(bk.base - MIN).toISOString(),
       paymentIntentId: bk.piId, amountMinor: bk.total, currency: "USD", sourceDigest: "0".repeat(64), ...over }).plan;
-    const { clk: _c, ...rest } = extra;
-    return E.runPipelineCore({ plan: p, pool: db.app, tooling: realTooling, exchanges: { stripe: w.stripe, hostaway: w.hostaway },
+    const { clk: _c, bindState, binding: bOver, ...rest } = extra;
+    const binding = bOver ?? bindingFor(p);
+    if (bindState !== null) await bindRequest(binding, bindState ?? "dispatch_accepted");                    // C119 S4: TEST SETUP (null = leave the row as is)
+    return E.runPipelineCore({ requestBinding: binding, plan: p, pool: db.app, tooling: realTooling, exchanges: { stripe: w.stripe, hostaway: w.hostaway },
       credentials: { stripe: () => "sk_test_Fake1", hostaway: () => "synthetic-hostaway-token" }, runId: "pg-run-00000001", clock: () => clk.t, recordingClock: Date.now, ...rest });
   };
   const snap = async (id) => ({ st: (await db.owner.query("SELECT state, version, hostaway_reservation_id::text AS rid, offline_charge_id::text AS och FROM booking.intents WHERE id = $1", [id])).rows[0],
@@ -715,6 +832,32 @@ if (process.env.E7_HPL_DB_TESTS === "1") {
     locks: Number((await db.owner.query("SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory'")).rows[0].n) });
   const writesOf = (w) => w.calls.filter((x) => /^(S POST|H POST(?! \/v1\/listings)|H PUT|H DELETE)/.test(x));
   const opsOf = (s, t) => s.ops.filter((x) => x.op_type === t).map((x) => [x.state, x.attempts, x.d]);
+
+  test("P19 C119 S4 (P5) PG: the REAL runtime role reads the 0024 row under RLS; no row / every non-admitted state / a frozen-input or plan-hash difference → STOP ADMISSION_REFUSED BEFORE any provider exchange (zero calls), intent / version / ops unchanged, no advisory lock left; claimed and dispatch_accepted both admit (run completes)", async () => {
+    const vis = await db.app.query("SELECT count(*)::int AS n FROM booking.pipeline_kickoff_requests"); assert.ok(vis.rows[0].n >= 0, "the runtime role can SELECT (grant + RLS policy)");
+    for (const [label, setup, code] of [
+      ["no row", async (b) => { const cl = await db.owner.connect(); try { await cl.query("BEGIN"); await cl.query("SET LOCAL session_replication_role = replica");
+        await cl.query("DELETE FROM booking.pipeline_kickoff_requests WHERE intent_id = $1", [b.inputs.intent_id]); await cl.query("COMMIT"); } finally { cl.release(); } return null; }, "ADMISSION_REFUSED:NO_KICKOFF_REQUEST"],
+      ["requested", async () => "requested", "ADMISSION_REFUSED:REQUEST_NOT_DISPATCHED:REQUESTED"], ["refused", async () => "refused", "ADMISSION_REFUSED:REQUEST_NOT_DISPATCHED:REFUSED"],
+      ["dispatch_unknown", async () => "dispatch_unknown", "ADMISSION_REFUSED:REQUEST_NOT_DISPATCHED:DISPATCH_UNKNOWN"],
+      ["dispatch_refused", async () => "dispatch_refused", "ADMISSION_REFUSED:REQUEST_NOT_DISPATCHED:DISPATCH_REFUSED"],
+      ["inputs differ", async (b) => { await bindRequest({ planHash: b.planHash, inputs: { ...b.inputs, amount_minor: String(Number(b.inputs.amount_minor) + 1) } }); return null; }, "ADMISSION_REFUSED:REQUEST_INPUTS_MISMATCH"],
+      ["plan hash differs", async (b) => { await bindRequest({ planHash: "e".repeat(64), inputs: b.inputs }); return null; }, "ADMISSION_REFUSED:REQUEST_PLAN_HASH_MISMATCH"]]) {
+      const bk = await authorizedBooking(); const w = pgWorld(bk);
+      const p = E.buildPlan(C, { approvalRef: "SYNTHETIC-hpl-pg", intentId: bk.id, ref: bk.ref, expectedVersion: await version(bk.id), notBefore: new Date(bk.base - MIN).toISOString(),
+        paymentIntentId: bk.piId, amountMinor: bk.total, currency: "USD", sourceDigest: "0".repeat(64) }).plan;
+      const b = bindingFor(p); await bindRequest(b, "dispatch_accepted"); const st = await setup(b); if (typeof st === "string") await bindRequest(b, st);
+      const before = await snap(bk.id);
+      const r = await pgRun(bk, w, { bindState: null, binding: b });
+      assert.deepEqual([r.outcome, r.code, r.coordinatorInvocations, w.calls.length, r.possiblyEffected], ["STOP", code, 0, 0, false], `${label}: ${JSON.stringify(r).slice(0, 300)}`);
+      assert.deepEqual(await snap(bk.id), before, `${label}: nothing changed; no advisory lock left`);
+    }
+    for (const state of ["claimed", "dispatch_accepted"]) {
+      const bk = await authorizedBooking(); const w = pgWorld(bk);
+      const r = await pgRun(bk, w, { bindState: state });
+      assert.deepEqual([r.outcome, r.verifiedCompletion, r.requestBinding], ["CONFIRMED_VERIFIED", true, ["ADMISSION:BOUND", "FIRST:BOUND"]], state);
+    }
+  });
 
   test("P1 PG (REAL coordinator + workers + adapters + transports; FAKE exchanges): echoed success — ONE invocation drives authorized → confirmed; EXACTLY 1 create / 1 capture / 1 offline-charge POST; fresh Stripe proofs at start, before capture and before recording + the echo proof; durable postcheck verified; notify queued undispatched; claim held; lock released; a SECOND dispatch refuses read-only with zero sends", async () => {
     const bk = await authorizedBooking(); const w = pgWorld(bk);

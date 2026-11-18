@@ -39,12 +39,12 @@ jobs:
           ref: 66133a22edca925e6386c4d178c251fa5f11c82e
           path: tooling
           persist-credentials: false
-      - name: Checkout merged e7-test a314681b (the 0027 migration bytes only)
+      - name: Checkout the C119 S4 tooling bbf12aa2 (the 0027 + 0028 migration bytes only; sha-checked by the tests)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: veloguide-joel/maravilla-smoobu-proxy
-          ref: a314681b08f402c2f2b140dfe334ac1729c2dabb
-          path: schema27
+          ref: bbf12aa22446807df7b63a55e38a464f4be88763
+          path: schema28
           persist-credentials: false
       - name: Set up Node 22.22.0
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
@@ -74,7 +74,7 @@ jobs:
         working-directory: wrapper
         env:
           E7_TOOLING_DIR: ${{ github.workspace }}/tooling
-          E7_SCHEMA27_DIR: ${{ github.workspace }}/schema27
+          E7_SCHEMA28_DIR: ${{ github.workspace }}/schema28
           E7_HST_DB_TESTS: "1"
           PG_BIN: /usr/lib/postgresql/${{ matrix.pg }}/bin
         run: node --test test/e7-hosted-status.test.mjs

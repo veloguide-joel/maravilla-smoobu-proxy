@@ -13,7 +13,7 @@
 // RELEASE BINDING (C111 circular pinning): the transport is NOT loosened to "any main". The ONLY expectedMainSha it receives is this run's own
 // `github.sha` (E7_WORKFLOW_SHA == the wrapper checkout HEAD), passed at CONSTRUCTION as a reviewed release binding (never call / guest input),
 // and only AFTER this runner proved — before any secret — that the SAME checkout's pipeline runnerFiles frame to the reviewed ENABLE source
-// digest 880db5b3…fe1b (C116; was f09bcbbd…0999) and that the pipeline's pinned closure is f7d7cad6…7273. GET refs/heads/main must then equal that sha (main has not moved),
+// digest 5294b6b4…c3f5 (C119 S4; C116 880db5b3; was f09bcbbd…0999) and that the pipeline's pinned closure is f7d7cad6…7273. GET refs/heads/main must then equal that sha (main has not moved),
 // otherwise the transport returns notSent and 0 POST happens. Wrong / closed / stale pipeline source or a foreign HEAD → 0 credential read, 0 POST.
 //
 // SUPERVISION (the C91 pattern, re-implemented here; the pipeline runner is not edited): ONE seal (wall deadline / run abort / a local connect or
@@ -42,7 +42,8 @@
 //   scripts/e7-test-arm.mjs; the caller-supplied value is never the authority). Detect-flow verify not armed → CLOSED_NOOP (open=false: the gated
 //   jobs are skipped); any other mode not armed → HKO_ARM_CLOSED — before any tooling import, secret value, DB, token or HTTP. The scheduled source
 //   pin now comes from the arm job's recomputed kickoff frame (vars.E7_KICKOFF_EXPECTED_SOURCE is retired). Manual preflight is unchanged.
-//   The arm does NOT gate the pipeline runner (its bytes are untouched): a directly dispatched / already queued pipeline run is not refused by it.
+//   C119 S4: the pipeline is now arm-gated too (P0 arm job, P4 labelled arm gate) and REQUEST-BOUND (P5: only this claim's exact frozen inputs run);
+//   every gated job (kickoff detect / execute included) re-checks the LIVE main ref after any queue / approval delay (P3) — revocation = a CLOSE commit.
 //   PROVEN: refusal whenever the value it RECEIVES (from the GitHub vars context) differs; UNVERIFIED: when GitHub refreshes that context for an already
 //   queued / approval-held job (no live configuration fetch here). Clearing the variable must NOT be relied on to revoke queued / pending-approval /
 //   already-running work (a pre-activation blocker).
@@ -59,7 +60,7 @@ const deepFreeze = (o) => { if (o && typeof o === "object") { for (const v of Ob
 
 export const CATALOG_PINS = deepFreeze({                         // derived from the reviewed 0024 on PG16.15 AND PG17.11 (identical); exact match required. C116: the claim src is 0026's (fb103173 on PG16 + PG17; was ede022a8 at 0024 — a schema-25 claim is CATALOG_DRIFT:0)
   functions: [
-    { sig: "booking.claim_pipeline_kickoff(uuid,text,text,jsonb)", src: "fb103173762c5dc6565338d2a15dd067", secdef: true, vol: "v", cfg: "search_path=pg_catalog, booking", acl: "mv_booking_app:EXECUTE" },
+    { sig: "booking.claim_pipeline_kickoff(uuid,text,text,jsonb)", src: "98ffe6c804377b46b0d3d8907ac7d284", secdef: true, vol: "v", cfg: "search_path=pg_catalog, booking", acl: "mv_booking_app:EXECUTE" },
     { sig: "booking.refuse_pipeline_kickoff(uuid,text)", src: "fe1b6c137b618527bd5d03b7944e212a", secdef: true, vol: "v", cfg: "search_path=pg_catalog, booking", acl: "mv_booking_app:EXECUTE" },
     { sig: "booking.settle_pipeline_kickoff(uuid,text,text,text)", src: "35ec51fa266e024de510073414d6e307", secdef: true, vol: "v", cfg: "search_path=pg_catalog, booking", acl: "mv_booking_app:EXECUTE" },
     { sig: "booking.pipeline_kickoff_record()", src: "f2df109c551f28799a5d107547c90ebc", secdef: true, vol: "v", cfg: "search_path=pg_catalog, booking", acl: "" },
@@ -72,16 +73,16 @@ export const CATALOG_PINS = deepFreeze({                         // derived from
 export const CONSTANTS = deepFreeze({
   executeEnabled: false,                                           // SHIPPED CLOSED: verify / execute refuse HKO_EXECUTE_CLOSED from key names only
   dispatchEnabled: false,                                          // SHIPPED CLOSED: the core refuses HKO_DISPATCH_CLOSED before any DB acquisition
-  toolingCommit: "66133a22edca925e6386c4d178c251fa5f11c82e",       // C116: e7-test #180 merge commit (tree ade3e084 == reviewed head 5ba7f793; 0026 + PINNED_REVISION 880db5b3). Was 4e79f266 (#153)
+  toolingCommit: "bbf12aa22446807df7b63a55e38a464f4be88763",       // C119 S4: e7-test #194 MERGE commit (tree 3057af31 == reviewed head 71750f58; 0028 + PINNED_REVISION 5294b6b4). C116: 66133a22 (#180 merge)
   toolingStatus: "MERGED",                                         // verify / execute refuse HKO_CLOSURE_MISMATCH unless MERGED
   closure: ["lib/booking-db/codec.js", "lib/booking-db/config.js", "lib/booking-db/pipeline-dispatch-transport.js", "lib/booking-db/pipeline-kickoff.js",
     "lib/booking-db/pool.js", "lib/booking-db/repo.js", "lib/checkout/intent-state.js", "lib/checkout/pipeline-kickoff-plan.js",
     "package-lock.json", "package.json", "scripts/e7-connected/probe-env-preflight.mjs"],
-  closureDigest: "e180398f5b9b68d708ac3f8ba0fba138a0a6cf7e7fed0f608384de81ee1ed215",   // C116: framed SHA-256 of `closure` at 66133a22 (== 5ba7f793 bytes; only lib/checkout/pipeline-kickoff-plan.js differs: PINNED_REVISION 880db5b3); was 07fedfca at 4e79f266 (== e11650ec bytes; only the transport differs from 8af49e87) (the test recomputes it from the pinned tree + an independent import scan)
+  closureDigest: "573dae82aad8b7e9fc208fbc1b0887b5a582348cacdd24cdded73f0ac5badc17",   // C119 S4: framed SHA-256 of `closure` at bbf12aa2 (== the 71750f58 tree) (only lib/checkout/pipeline-kickoff-plan.js + lib/booking-db/pipeline-dispatch-transport.js differ from 66133a22 e180398f); the test recomputes it
   pipeline: {                                                       // the reviewed C102 ENABLE revision the dispatch targets (9455bc9e)
     runnerFiles: ["scripts/e7-hosted-pipeline.mjs", "test/e7-hosted-pipeline.test.mjs", "test/e7-hosted-pipeline-workflow.test.mjs", ".github/workflows/e7-hosted-pipeline.yml"],
     sourcePrefix: "e7-hosted-pipeline-v1\n",
-    sourceDigest: "880db5b33024edbf0879fbaf5a3826e3622db12fd1808e8c2047238da507fe1b",   // C116 ENABLE frame (was f09bcbbd at 9455bc9e)
+    sourceDigest: "5294b6b467839e1dd825e56063abc1ad1267eafdfb2973f2c2129e9b1f29c3f5",   // C116 ENABLE frame (was f09bcbbd at 9455bc9e)
     closureDigest: "f7d7cad646eaed2fb37a63e031157732ee6e2a44824f9d935d6b9104e08f7273",
     toolingCommit: "71c3dcf83c6b78a2cb0c6a7e829b5ecb23d37af5"
   },
@@ -96,7 +97,7 @@ export const CONSTANTS = deepFreeze({
   detect: { budgets: { runMs: 60000, teardownMs: 5000, connectMs: 8000, statementMs: 6000, dbQueries: 24, gets: 0, posts: 0, poolMax: 1 } }   // C113 detect job
 });
 /** the reviewed ENABLE source the imported tooling plan must pin (NOT a seam: compared against the imported PINNED_REVISION) */
-export const REVIEWED_PIPELINE_SOURCE = "880db5b33024edbf0879fbaf5a3826e3622db12fd1808e8c2047238da507fe1b";   // C116 (was f09bcbbd)
+export const REVIEWED_PIPELINE_SOURCE = "5294b6b467839e1dd825e56063abc1ad1267eafdfb2973f2c2129e9b1f29c3f5";   // C116 (was f09bcbbd)
 export const OFFICIAL_CA_SHA256 = "700723581420dd1ac98fd7e9ac529f0ef210eadcaf87fc868a3ad7d114c2f3b7";
 export const SOURCE_PREFIX = "e7-hosted-kickoff-v1\n";
 export const CLOSURE_PREFIX = "e7-hosted-kickoff-closure-v1\n";
