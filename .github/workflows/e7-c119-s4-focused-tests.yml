@@ -1,0 +1,81 @@
+# C119 S4 tooling (DRAFT, CLOSED) — FOCUSED TEST EVIDENCE ONLY: migration 0028 (literal-only rebind of booking.claim_pipeline_kickoff to the S4
+# ENABLE frame 5294b6b4…), the honest PINNED_REVISION (closed source commit + C102 delta) with the EXECUTABLE K2 parity made REQUIRED here (the
+# pinned closed source commit is checked out read-only next to this tree), the transport's named historic default pin, and the kickoff
+# consumer / claim suites on DISPOSABLE localhost PostgreSQL 16 and 17. Synthetic fixtures and fake exchanges only: no secrets, no environment,
+# no provider credentials, no shared database, no deploy. Outside every runtime source frame. contents: read only.
+name: e7-c119-s4-focused-tests
+on:
+  pull_request:
+    paths:
+      - "db/migrations/0028_*"
+      - "lib/checkout/pipeline-kickoff-plan.js"
+      - "lib/booking-db/pipeline-dispatch-transport.js"
+      - "test/e7-c107-kickoff-plan.test.mjs"
+      - "test/e7-c109-dispatch-transport.test.mjs"
+      - "test/db/e7-c116-0026-*"
+      - "test/db/e7-c119-s4-*"
+      - "test/db/migrations.test.mjs"
+      - "test/db/e7-0024-sqleditor-apply-wrapper.test.mjs"
+      - "test/db/e7-0025-0026-sqleditor-apply-wrapper.test.mjs"
+      - "test/db/e7-0027-sqleditor-apply-wrapper.test.mjs"
+      - "test/db/e7-c107-kickoff-requests.test.mjs"
+      - "test/db/e7-c118-*"
+      - ".github/workflows/e7-c119-s4-focused-tests.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: e7-c119-s4-focused-tests-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  focused:
+    name: c119-s4-tooling (PG ${{ matrix.pg }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["16", "17"]
+    steps:
+      - name: Checkout (exact event SHA, FULL history — the spent apply-packet suites diff against their accepted base commits)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Checkout the pinned CLOSED pipeline source commit (PINNED_REVISION.closedSourceCommit; read-only, for the REQUIRED K2 parity)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: 8c8c2d58bf431071ab6fa99c338984380a5b40cc
+          path: k2wrapper
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+      - name: Install PostgreSQL ${{ matrix.pg }} binaries (no service is started; tests run their own throwaway cluster)
+        run: |
+          set -euo pipefail
+          if [ ! -x "/usr/lib/postgresql/${{ matrix.pg }}/bin/initdb" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq postgresql-common
+            sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+            sudo apt-get install -y -qq "postgresql-${{ matrix.pg }}"
+          fi
+          sudo systemctl stop postgresql || true
+          "/usr/lib/postgresql/${{ matrix.pg }}/bin/postgres" --version
+      - name: Install dependencies (lockfile, no scripts)
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Unit — plan copy (K1 + REQUIRED executable K2 parity), dispatch transport, kickoff consumer
+        env:
+          E7_K2_WRAPPER_DIR: ${{ github.workspace }}/k2wrapper
+          E7_K2_REQUIRED: "1"
+        run: node --test test/e7-c107-kickoff-plan.test.mjs test/e7-c109-dispatch-transport.test.mjs test/import-closure.test.mjs test/packaging-closure.test.mjs
+      - name: DB — 0028 / 0026 rebind + the kickoff request / claim suites (disposable localhost PostgreSQL ${{ matrix.pg }})
+        env:
+          PG_BIN: /usr/lib/postgresql/${{ matrix.pg }}/bin
+        run: >-
+          node --test --test-concurrency=2
+          test/db/e7-c119-s4-0028-pipeline-kickoff-source-rebind.test.mjs test/db/e7-c116-0026-pipeline-kickoff-source-rebind.test.mjs
+          test/db/e7-c107-kickoff-requests.test.mjs test/db/e7-c118-external-cancellation.test.mjs test/db/migrations.test.mjs
+          test/db/e7-0024-sqleditor-apply-wrapper.test.mjs test/db/e7-0025-0026-sqleditor-apply-wrapper.test.mjs test/db/e7-0027-sqleditor-apply-wrapper.test.mjs
+          test/db/e7-c118-c116-record.test.mjs

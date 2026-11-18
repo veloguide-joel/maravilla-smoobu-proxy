@@ -38,10 +38,12 @@ https.Agent = class { constructor() { netAttempts += 1; throw new Error("https.A
 syncBuiltinESMExports();
 
 let db;
-before(async () => { db = await startMigratedDatabase(); });
+// C119 S4: this SPENT packet targets EXACTLY schema 27 (its function refuses any other history: E7_C116_HISTORY_NOT_1_TO_27) — the literal-only 0028 is
+// rolled back on the disposable cluster before use (no record exists yet, so the down is allowed)
+before(async () => { db = await startMigratedDatabase(); assert.deepEqual(await migrateDown(db.owner, { env: "test", to: 27 }), [28]); });
 after(async () => { globalThis.fetch = realFetch; await db.close(); });
 
-const TOP = loadMigrations().at(-1).version;
+const TOP = 27; assert.equal(loadMigrations().find((m) => m.version === 28).name, "pipeline_kickoff_source_rebind_s4");   // C119 S4: the packet's schema (0028 exists, rolled back above)
 const range = (from, to) => (from <= to ? Array.from({ length: to - from + 1 }, (_, i) => from + i) : Array.from({ length: from - to + 1 }, (_, i) => from - i));
 
 // ---------------------------------------------------------------------------------------------

@@ -12,7 +12,7 @@ import { kickoffDispatch, PINNED_REVISION, WORKFLOW_INPUT_KEYS } from "../lib/ch
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const OPEN = Object.freeze({ ...T.GITHUB_DISPATCH_CONSTANTS, enabled: true });
 const TOKEN = ["synthetic", "token", "for", "tests", "only", "0000"].join("_");           // shape-valid, not a credential
-const PIN = PINNED_REVISION.wrapperCommit;
+const PIN = T.TRANSPORT_DEFAULT_MAIN_PIN;                                                    // C119 S4: the named historic default (was PINNED_REVISION.wrapperCommit)
 const CLOSED_MAIN = "a726d8ca80ec55c4334ba1bc88e4cd7cac8aa4fb";                             // the current CLOSED main (must never match)
 const bound = (o = {}) => ({ intentId: "2b7c5a10-0f3e-4d1a-9c2b-7e5f4a3b2c1d", ref: "MV-ABCD1234", authorizedVersion: 4, paymentIntentId: "pi_3TestKickoff0001",
   amountMinor: 14000, currency: "USD", listingId: 606998, notBefore: "2026-11-16T00:00:01.234Z", ...o });

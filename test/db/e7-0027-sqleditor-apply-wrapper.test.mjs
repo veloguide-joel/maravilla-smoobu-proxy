@@ -144,7 +144,15 @@ test("P0 deterministic assembly: pins == a fresh PRE derivation (schema 26) and 
   const out = execFileSync("python3", [join(ROOT, "claude/gen-0027-wrapper.py"), ROOT], { encoding: "utf8" });
   assert.ok(out.includes(`sqleditor-apply-v1.sql sha256: ${sha(WRAPPER)}`) && out.includes(`readback-v1.sql sha256: ${sha(READBACK)}`), out);
   let haveGit = true; try { execFileSync("git", ["-C", ROOT, "cat-file", "-e", `${BASE}^{commit}`]); } catch { haveGit = false; }
-  if (haveGit) for (const p of SPENT) assert.equal(execFileSync("git", ["-C", ROOT, "diff", "--quiet", BASE, "--", p], { encoding: "utf8" }), "", `untouched vs ${BASE.slice(0, 8)}: ${p}`);
+  // C119 S4: lib/ is untouched vs the accepted base EXCEPT exactly the two kickoff-only files the S4 rebind changes (PINNED_REVISION 5294b6b4 and the
+  // transport's named default pin) — neither is read by this packet, its pins or its readback; anything else changed in lib/ still fails here
+  const S4_LIB = ["lib/booking-db/pipeline-dispatch-transport.js", "lib/checkout/pipeline-kickoff-plan.js"];
+  if (haveGit) for (const p of SPENT) {
+    const ex = p === "lib" ? S4_LIB.map((f) => `:(exclude)${f}`) : [];
+    assert.equal(execFileSync("git", ["-C", ROOT, "diff", "--quiet", BASE, "--", p, ...ex], { encoding: "utf8" }), "", `untouched vs ${BASE.slice(0, 8)}: ${p}`);
+  }
+  if (haveGit) assert.deepEqual(execFileSync("git", ["-C", ROOT, "diff", "--name-only", BASE, "--", "lib"], { encoding: "utf8" }).trim().split("\n").filter(Boolean).sort(), S4_LIB, "C119 S4: exactly the two kickoff-only lib files differ");
+  if (haveGit) for (const f of S4_LIB) assert.doesNotMatch(rd("claude/gen-0027-wrapper.py") + rd("claude/derive-0027-pins.mjs"), new RegExp(f.replace(/[./]/g, "\\$&")), `${f} is not an input of this packet`);
   const doc = rd("claude/e7-0027-apply-operator-sequence.md");
   const manifest = [...doc.matchAll(/^\| `([^`]+)` \| `([0-9a-f]{64})` \|$/gm)].map((x) => [x[1], x[2]]);
   assert.equal(manifest.length, 9, "operator manifest lists every packet + migration file");
@@ -182,7 +190,7 @@ test("P1 one atomic apply over schema-26 data: E7_27_APPLIED, status 27 + ONE ex
       assert.notEqual(nc.catalog, N.CONSTANTS.catalogPin26.catalog, "→ that runner's catalogPin26 check REFUSES schema 27 (fail-closed; no repin here)");
     }
   } finally { await appc.end(); }
-  const st = await migrationStatus(db.c, { env: "test" }); assert.deepEqual([st.applied.length, st.pending], [27, []]);
+  const st = await migrationStatus(db.c, { env: "test" }); assert.deepEqual([st.applied.length, st.pending], [27, [28]]);   // C119 S4: mechanical pin, only the later 0028 is pending
   const r2 = await runWrapper(db.c); assert.deepEqual(r2.notices, ["E7_27_ALREADY_EXACT_NOOP"]); assert.deepEqual(await readback(db.c), post, "second apply wrote nothing");
   const B = await startDbAt(27);
   try { assert.deepEqual(identity(await inventory(B.c)), identity(PINS.post), "migrator-built 27 == the wrapper POST"); assert.deepEqual((await runWrapper(B.c)).notices, ["E7_27_ALREADY_EXACT_NOOP"]); }

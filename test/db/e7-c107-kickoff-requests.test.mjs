@@ -245,7 +245,7 @@ test("P12 C108-F2 the SQL claim binds the reviewed source / closure digests as l
   const goodFor = async (k) => { const i = await loadIntent(db.app, k.id);
     const nb = (await q1(`SELECT to_char(date_trunc('milliseconds', created_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS nb FROM booking.intents WHERE id = $1`, [k.id]))[0].nb;
     return kickoffDispatch({ intentId: k.id, ref: i.ref, authorizedVersion: i.version, paymentIntentId: k.piId, amountMinor: i.price.finalTotalMinor, currency: "USD", listingId: 606998, notBefore: nb }); };
-  for (const [label, drift] of [["source", { expected_source_digest: "a".repeat(64) }], ["closure", { expected_closure_digest: "b".repeat(64) }],
+  for (const [label, drift] of [["source", { expected_source_digest: "a".repeat(64) }], ["C116 source (pre-S4 frame)", { expected_source_digest: "880db5b33024edbf0879fbaf5a3826e3622db12fd1808e8c2047238da507fe1b" }], ["closure", { expected_closure_digest: "b".repeat(64) }],
     ["both", { expected_source_digest: "a".repeat(64), expected_closure_digest: "b".repeat(64) }], ["extra key", { extra: "x" }]]) {
     const k = await authorizedFresh(); const g = await goodFor(k);
     const bad = { ...g.inputs, ...drift };
@@ -254,7 +254,7 @@ test("P12 C108-F2 the SQL claim binds the reviewed source / closure digests as l
   }
   const k = await authorizedFresh(); const g = await goodFor(k);
   assert.deepEqual(Object.keys(g.inputs), [...WORKFLOW_INPUT_KEYS]);
-  assert.equal(g.inputs.expected_source_digest, "880db5b33024edbf0879fbaf5a3826e3622db12fd1808e8c2047238da507fe1b");
+  assert.equal(g.inputs.expected_source_digest, "5294b6b467839e1dd825e56063abc1ad1267eafdfb2973f2c2129e9b1f29c3f5");   // C119 S4 (0028; C116 880db5b3)
   assert.equal(g.inputs.expected_closure_digest, "f7d7cad646eaed2fb37a63e031157732ee6e2a44824f9d935d6b9104e08f7273");
   assert.equal((await q1("SELECT booking.claim_pipeline_kickoff($1, 'root-pins', $2, $3) AS r", [k.id, g.planHash, g.inputs]))[0].r, "CLAIMED");
 });
