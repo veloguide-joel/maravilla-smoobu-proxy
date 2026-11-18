@@ -1,0 +1,70 @@
+# e7-test-auto-hostaway-listing-check — DIAGNOSTIC ONLY (C120). Proves whether ONE secret, the e7-test-auto environment's E7_HOSTAWAY_TOKEN,
+# can make the FIRST read the pricer makes (lib/checkout/server-pricer.js: GET /listings/{id}) for the TEST listing 606998. Nothing else.
+#   * manual dispatch only, main only, NO inputs, NO schedule; environment e7-test-auto (its existing required reviewer gates the job)
+#   * permissions contents: read; no checkout, no dependency install, no repository module; no other secret
+#   * ONE request, fixed: GET https://api.hostaway.com/v1/listings/606998 with the same three headers as the accepted Hostaway transport
+#     (Accept / Authorization Bearer / Cache-control no-cache). No body, no query, no other path or method. One fresh non-keep-alive socket,
+#     8 s timeout (the pricer's), NO retry, NO redirect follow (a 3xx is a FAIL, the Location is never read), NO token creation or refresh.
+#   * the reply body is read up to 1 MiB in memory only to check result.id === 606998 (the pricer's exact match); it is never printed
+#   * output: PASS or FAIL + a fixed code + the HTTP status number ONLY — never the token, headers, body, error text or any listing field
+# OUTSIDE every runner frame and the TEST arm release (no component lists this file); it enables nothing and changes no flag.
+name: e7-test-auto-hostaway-listing-check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e7-test-auto-hostaway-listing-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: e7-test-auto
+    timeout-minutes: 3
+    permissions:
+      contents: read
+    steps:
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: ONE read-only Hostaway listing read (this step only receives the Hostaway secret; output PASS / FAIL + code + HTTP status only)
+        env:
+          E7_HOSTAWAY_TOKEN: ${{ secrets.E7_HOSTAWAY_TOKEN }}
+        run: |
+          node -e '
+          const https = require("node:https");
+          const NAME = "e7-test-auto-hostaway-listing-check"; const LISTING = 606998; const MAX = 1024 * 1024;
+          let done = false;
+          const out = (ok, code, status) => { if (done) return; done = true;
+            process.stdout.write(`${NAME} ${ok ? "PASS" : "FAIL"} code=${code} http=${Number.isInteger(status) ? status : "none"}\n`); process.exit(ok ? 0 : 3); };
+          let token = process.env.E7_HOSTAWAY_TOKEN ?? ""; delete process.env.E7_HOSTAWAY_TOKEN;
+          if (token.length === 0) out(false, "TOKEN_MISSING");
+          if (!/^[\x21-\x7e]+$/.test(token)) out(false, "TOKEN_SHAPE");
+          const agent = new https.Agent({ keepAlive: false, maxSockets: 1 });
+          const req = https.request({ method: "GET", host: "api.hostaway.com", port: 443, path: `/v1/listings/${LISTING}`, agent,
+            headers: { Accept: "application/json", Authorization: `Bearer ${token}`, "Cache-control": "no-cache" }, timeout: 8000 }, (res) => {
+            const s = res.statusCode;
+            if (s >= 300 && s <= 399) { res.destroy(); out(false, "REDIRECT_REFUSED", s); }
+            if (s < 200 || s > 299) { res.destroy(); out(false, `HTTP_${s >= 500 ? "5XX" : s >= 400 ? "4XX" : "OTHER"}`, s); }
+            const chunks = []; let n = 0;
+            res.on("data", (c) => { n += c.length; if (n > MAX) { res.destroy(); out(false, "BODY_TOO_LARGE", s); } else chunks.push(c); });
+            res.on("error", () => out(false, "READ_ERROR", s));
+            res.on("end", () => {
+              let j; try { j = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { out(false, "JSON_INVALID", s); }
+              const r = j !== null && typeof j === "object" && !Array.isArray(j) ? j.result : null;
+              const ok = r !== null && typeof r === "object" && !Array.isArray(r) && Number(r.id) === LISTING;
+              out(ok, ok ? "LISTING_MATCH" : "LISTING_MISMATCH", s);
+            });
+          });
+          token = null;
+          req.on("timeout", () => { req.destroy(); out(false, "TIMEOUT"); });
+          req.on("error", (e) => out(false, (e && typeof e.code === "string" && /^E[A-Z_]{2,24}$/.test(e.code)) ? `REQUEST_${e.code}` : "REQUEST_ERROR"));
+          req.end();
+          ' 2>/dev/null || { rc=$?; [ "$rc" = 3 ] || echo "e7-test-auto-hostaway-listing-check FAIL code=SCRIPT_ERROR http=none"; exit 3; }
