@@ -37,7 +37,8 @@ const IID = "3f1c2b4a-5d6e-4f70-8a91-b2c3d4e5f607"; const OID = "7a8b9c0d-1e2f-4
 const PII = /@|SENTINEL|Synthia|Zanabria|re_[A-Za-z0-9]|Bearer|FAKEPW|maraVilla booking|reservaci|Payment received|Pago recibido|Hello/;
 const KEY = "re_SENTINELkey0123456789";
 const PROC = { versions: { node: "22.22.0" }, platform: "linux", execArgv: [], getuid: () => 1000 };
-const OPEN = Object.freeze({ ...C, executeEnabled: true });           // the TEST-LOCAL seam only; the shipped constant stays false
+const OPEN = Object.freeze({ ...C, executeEnabled: true });           // the TEST-LOCAL seam (C120 ACTIVATION ENABLE ships true; the CLOSE companion restores false)
+const SHUT = Object.freeze({ ...C, executeEnabled: false });          // C120 ACTIVATION ENABLE: the CLOSED behaviour is proven through this closed-constants seam
 /** the C116 schema-26 identity (literal; the CLOSED main runner's previous pin) and the #189 packet's POST-27 notification catalog (literal) */
 const PIN26 = Object.freeze({"catalog":"47b1d904a25cde0f4f9f85b8554b93cd914364d70ef1091cb273ce68043379da","readPath":"31f23b641bb57d5cbdec1aa4896447a574190dd057e4b92e6c5fdf8326220baf","readPathCount":6,"sections":{"con":"550534b1daca47fc1df90a557d5dd28a7f6e1f1df11c581cdbd7a671eb95c188","col":"9d645f671980c7a2e0e679aa07d9a3c30a937e488236f132b589a0a162237fbe","fn":"501f34f7f4db9a5a5fb98c00046013a7904745faea78cd731bbafa23ddf8fb7c","pol":"7c69ad5c06cae91f06e96c8ac9d86d97dbc09e94d95a8afb399b141162ee83ee","rel":"359796c40820562166a4f10dce97ae433fe7ae53c5fd2b3385fc41f179437e89","trg":"13e79df7b90097f365a7f3f15337e58c7b7d5277378608fd482c77e2051982f5"}});
 const POST27_CATALOG = "bcc116319adfa7c2e0c2f42d32d48b67fdc53ab35cd4058e777e5de5376c6d16";
@@ -45,14 +46,14 @@ const POST27_CATALOG = "bcc116319adfa7c2e0c2f42d32d48b67fdc53ab35cd4058e777e5de5
 const PIN27 = Object.freeze({"catalog":"bcc116319adfa7c2e0c2f42d32d48b67fdc53ab35cd4058e777e5de5376c6d16","readPath":"b881c9e076b2d113508399dfc0d16322ea5e759fe9fcc6c6ec1eed25324a930a","readPathCount":7,"sections":{"con":"4c9a9148388a8b3846c9ffdb563454b129ea033bf8ee10ec8578db673671b589","col":"4707a34d900203ce83b3a201876fb64897c45c9c10a587f49bb32e753732435f","fn":"6003d12e6fe64492e52bd6e60727cbedaaa047001853b0185413298a5e1d0b49","pol":"f33e232460e9c4d9e4e29945f6e38526fef3551b122efa7a9f8793b182d40b64","rel":"845368cfa6b65e98bbe47af3e8140057be46bcefd1f6ded3034bd1dd06a66d54","trg":"6887ee0464f01e23a8987b963944e856a2065c8e3f0c2e7d6d0d82808018dd42"}});
 
 // ---------------------------------------------------------------------------------------------------------------------------------
-test("H1 SHIPPED CLOSED: executeEnabled false; verify AND execute refuse NBC_EXECUTE_CLOSED before ANY tooling import, env VALUE read (secrets present), DB, spawn or provider — proven with throwing deps and a recording env proxy", async () => {
-  assert.equal(C.executeEnabled, false); assert.ok(Object.isFrozen(C) && Object.isFrozen(C.sender) && Object.isFrozen(C.budgets));
+test("H1 C120 ACTIVATION ENABLE ships executeEnabled TRUE; with CLOSED constants (seam) verify AND execute refuse NBC_EXECUTE_CLOSED before ANY tooling import, env VALUE read (secrets present), DB, spawn or provider — proven with throwing deps and a recording env proxy", async () => {
+  assert.equal(C.executeEnabled, true); assert.equal(SHUT.executeEnabled, false); assert.ok(Object.isFrozen(C) && Object.isFrozen(C.sender) && Object.isFrozen(C.budgets));
   for (const mode of ["verify", "detect", "execute"]) {
     const reads = []; const base = { E7_DEV_BOOKING_DATABASE_URL: "postgresql://x", E7_RESEND_TEST_KEY: KEY, E7_APPROVAL_REF: "label", E7_INTENT_ID: IID, E7_OP_ID: OID,
       E7_EXPECTED_VERSION: "9", E7_LOCALE: "en", E7_TOOLING_DIR: TOOLING, GITHUB_REF: "refs/heads/main" };
     const env = new Proxy(base, { get(t, k) { reads.push(String(k)); return t[k]; } });
     const never = () => { throw new Error("must not be called"); };
-    const r = await R.runHosted({ mode, env, proc: PROC, wrapperDir: ROOT, deps: { importEnv: never, importTooling: never, runCore: never, spawnChild: never, readPgVersion: never, readCa: never } });
+    const r = await R.runHosted({ mode, env, proc: PROC, wrapperDir: ROOT, deps: { constants: SHUT, importEnv: never, importTooling: never, runCore: never, spawnChild: never, readPgVersion: never, readCa: never } });
     assert.deepEqual([r.exitCode, r.result.code, r.result.executeEnabled, r.result.core, r.result.closureDigest, r.result.planHash], [1, "NBC_EXECUTE_CLOSED", false, null, null, null], mode);
     assert.deepEqual(reads, [], `${mode}: not one env value was read (key names only)`);
     assert.equal(base.E7_RESEND_TEST_KEY, KEY, "nothing deleted / touched");
@@ -152,7 +153,7 @@ test("H4 plan: deterministic; binds intent / op / version / locale / the fixed a
     assert.notEqual(R.buildPlan(C, { ...base, [k]: v }).planHash, h0, k);
   for (const over of [{ sender: { fromAddress: "other@sender.mv-test.invalid", fromName: "maraVilla Test" } }, { sender: { fromAddress: "bookings@sender.mv-test.invalid", fromName: "maraVilla Test" } },
     { sender: { fromAddress: "bookings@mail.maravillanayarit.com", fromName: "maraVilla" } }, { toolingCommit: "d322d2192b377d18b6a9280ae06c17eddfe3e73e" }, { excludedIntentIds: [] }, { protectedReservationIds: [] }, { closureDigest: "c".repeat(64) },
-    { catalogPin28: {} }, { budgets: { ...C.budgets, sends: 2 } }, { executeEnabled: true }])
+    { catalogPin28: {} }, { budgets: { ...C.budgets, sends: 2 } }, { executeEnabled: false } /* C120 ACTIVATION ENABLE: the flag flip is still a plan change */])
     assert.notEqual(R.buildPlan({ ...C, ...over }, base).planHash, h0, Object.keys(over)[0]);
   assert.deepEqual(C.sender, { fromAddress: "bookings@mail.micasadirect.com", fromName: "MiCasaDirect" }, "C55: the fixed approved sender (sender only; not a domain-verification claim)");
   assert.deepEqual([...C.excludedIntentIds], ["abede8b1-8ef6-44f2-876e-6a02fc056a96", "c83c1842-d342-4e27-9ab7-dc3d50b7a309"]);
