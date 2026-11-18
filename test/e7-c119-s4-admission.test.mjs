@@ -64,13 +64,14 @@ test("F1 static: the P3 fresh-admission step is BYTE-IDENTICAL in the five moved
     assert.match(b.job.split("\n    runs-on:")[0], /needs\.arm\.outputs\.armed == 'true'/, `${b.w}.${b.j}: arm-gated (skipped while unarmed → no environment is auto-created)`);
   }
   let probe = 0; let auto = 0;
-  const DIAG = "e7-test-auto-db-connection-check.yml";   // C120 diagnostic: manual-only, main-only, reviewer-gated, DB secret only, no arm, no runtime module
+  // C120 diagnostics: manual-only, main-only, reviewer-gated, ONE secret each, no arm, no runtime module
+  const DIAG = { "e7-test-auto-db-connection-check.yml": "secrets.E7_DEV_BOOKING_DATABASE_URL", "e7-test-auto-hostaway-listing-check.yml": "secrets.E7_HOSTAWAY_TOKEN" };
   for (const f of readdirSync(join(ROOT, ".github/workflows"))) {
     const t = readFileSync(join(ROOT, ".github/workflows", f), "utf8");
-    if (f === DIAG) {
+    if (Object.hasOwn(DIAG, f)) {
       assert.match(t, /\non:\n  workflow_dispatch:\n\npermissions:\n  contents: read\n/, "diagnostic: manual dispatch only, no inputs, read-only token");
       assert.deepEqual((t.match(/environment: e7-test-auto/g) || []).length, 1); assert.match(t, /\n    if: github\.ref == 'refs\/heads\/main'\n/);
-      assert.deepEqual(t.match(/secrets\.[A-Z0-9_]+/g), ["secrets.E7_DEV_BOOKING_DATABASE_URL"], "diagnostic: the DB secret only");
+      assert.deepEqual(t.match(/secrets\.[A-Z0-9_]+/g), [DIAG[f]], `diagnostic ${f}: its one secret only`);
       assert.doesNotMatch(t, /schedule:|vars\.|github\.token|actions: write|wrapper\/scripts|import\(/, "diagnostic: no schedule / arm / token / runtime module");
       continue;
     }
