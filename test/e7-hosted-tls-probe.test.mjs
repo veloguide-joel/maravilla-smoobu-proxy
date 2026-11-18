@@ -75,7 +75,7 @@ test("P1 contract: EXACTLY five samples; the client-hop identity / tooling / clo
   assert.match(P.QUERIES.probe, /pg_stat_ssl s WHERE s\.pid = pg_backend_pid\(\)/); assert.match(P.QUERIES.probe, /transaction_read_only/);
   assert.equal(C.budgets.dbQueries, 15); assert.deepEqual([...P.RUNNER_FILES].at(-1), "scripts/e7-hosted-kickoff.mjs");
   assert.deepEqual([...P.SECRET_KEYS], ["E7_DEV_BOOKING_DATABASE_URL"]); assert.ok(!P.ALLOWED_E7_KEYS.some((k) => /TOKEN|STRIPE|HOSTAWAY|RESEND|SQL|HOST|SSL|TLS/.test(k)));
-  for (const f of ["executeEnabled", "dispatchEnabled"]) assert.equal(K.CONSTANTS[f], false, `booking kickoff ${f} stays CLOSED`);
+  for (const f of ["executeEnabled", "dispatchEnabled"]) assert.equal(K.CONSTANTS[f], true, `C120 ACTIVATION ENABLE: booking kickoff ${f} open (the CLOSE companion restores false); the probe itself never dispatches`);
 });
 
 test("P2 PASS needs all five: each sample a FRESH verified socket checked BEFORE its first statement, BEGIN READ ONLY → SELECT → ROLLBACK, then destroyed; counts 5/5; the backend pid is counted, never output", async () => {
