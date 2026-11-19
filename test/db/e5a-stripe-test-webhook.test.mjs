@@ -480,3 +480,78 @@ test("E6 regression: concurrent startTestCheckout calls for one intent -> exactl
   assert.deepEqual([again.ok, again.sessionId], [true, ok[0].sessionId]);
   assert.equal(w.creates.length, 1);
 });
+
+// ---------------------------------------------------------------------------------------------------------------------
+// C131: the authorization path re-checks, INSIDE the applyEvent transaction right after the intent lock and before any write,
+// that the database marker, the locked intent and the event row are TEST; and only a livemode = false event row is ever
+// marked processed. Every refusal rolls back: the event stays unresolved (503, reason recorded) and a TEST redelivery applies once.
+function rewritingPoolC131(base, rewrite) {
+  return { query: (...a) => base.query(...a), connect: async () => {
+    const c = await base.connect();
+    return new Proxy(c, { get(t, k) {
+      if (k === "query") return async (sql, p) => { const r = await t.query(sql, p); return rewrite(String(sql), r) || r; };
+      const v = t[k]; return typeof v === "function" ? v.bind(t) : v;
+    } });
+  } };
+}
+const authSnapshot = async (id) => ({
+  state: await F.state(db.app, id), version: (await loadIntent(db.app, id)).version, authTransitions: await authTransitions(id),
+  accepted: await ledger(id, "authorization_accepted"),
+  applied: await q1("SELECT event_id, event_type FROM booking.intent_applied_events WHERE intent_id = $1 ORDER BY applied_version", [id]),
+  nonRead: (await q1("SELECT op_type, state FROM booking.external_operations WHERE intent_id = $1 AND op_type NOT LIKE 'stripe.retrieve_%' ORDER BY created_at, id", [id]))
+});
+test("C131 authorization webhook — DB TEST boundary: live / missing marker, non-TEST intent environment, non-TEST event row -> refused before any write; redelivery applies once", async () => {
+  const markerIs = async () => (await db.owner.query("SELECT environment FROM booking.instance")).rows.map((x) => x.environment).join();
+  const cases = [
+    ["database marker live", "DATABASE_NOT_TEST", { beforeApply: () => db.owner.query("UPDATE booking.instance SET environment = 'live'") },
+      () => db.owner.query("UPDATE booking.instance SET environment = 'test'")],
+    ["database marker missing", "DATABASE_NOT_TEST", { beforeApply: () => db.owner.query("DELETE FROM booking.instance") },
+      () => db.owner.query("INSERT INTO booking.instance (environment) VALUES ('test')")],
+    ["locked intent environment not test", "INTENT_ENVIRONMENT_NOT_TEST", null, null,
+      (sql, r) => (sql === "SELECT environment FROM booking.intents WHERE id = $1" ? { ...r, rows: r.rows.map((x) => ({ ...x, environment: "live" })) } : null)],
+    ["event row not livemode=false", "WEBHOOK_EVENT_NOT_TEST", null, null,
+      (sql, r) => (sql === "SELECT livemode FROM booking.stripe_webhook_events WHERE event_id = $1" ? { ...r, rows: r.rows.map((x) => ({ ...x, livemode: true })) } : null)]
+  ];
+  let n = 130;
+  for (const [name, code, hooks, restore, rewrite] of cases) {
+    const w = world();
+    const { id, sessionId } = await checkoutReady(w, n++);
+    w.pay(sessionId);
+    const ev = w.event("checkout.session.completed", sessionId);
+    const snap0 = await authSnapshot(id);
+    let r;
+    try {
+      r = await processVerifiedStripeEvent(rewrite ? rewritingPoolC131(db.app, rewrite) : db.app, ev,
+        { stripe: w.stripe, now: F.at(5), accountId: ACCT, accountCache: {}, hooks: hooks || undefined });
+    } finally { if (restore) await restore(); }
+    assert.equal(await markerIs(), "test", `${name}: marker restored`);
+    assert.deepEqual(r, { http: 503, code }, name);
+    assert.deepEqual(await authSnapshot(id), snap0, `${name}: nothing applied`);
+    assert.deepEqual([(await evRow(ev.id)).status, (await evRow(ev.id)).error_code], ["failed_retryable", code], name);
+    // the same event redelivered against the intact TEST database applies exactly once
+    assert.deepEqual(await deliver(w, ev, F.at(6)), { http: 200, code: "APPLIED", state: "payment_authorized" }, `${name}: redelivery`);
+    assert.deepEqual(await deliver(w, ev, F.at(7)), { http: 200, code: "ALREADY_PROCESSED" });
+    assert.equal(await authTransitions(id), 1);
+    assert.equal((await evRow(ev.id)).status, "processed");
+    await noHostawayOrMoneyMove(id);
+  }
+});
+
+test("C131 markStripeEventProcessedInTx marks only a livemode = false row (a non-TEST row is refused and left unchanged)", async () => {
+  const { markStripeEventProcessedInTx } = await import("../../lib/booking-db/webhooks.js");
+  const t = new Date(F.at(5));
+  await db.owner.query(`INSERT INTO booking.stripe_webhook_events (event_id, event_type, livemode, stripe_created_at, received_at, status)
+    VALUES ('evt_C131LIVE', 'checkout.session.completed', true, $1, $1, 'received'), ('evt_C131TEST', 'checkout.session.completed', false, $1, $1, 'received')`, [t]);
+  for (const [eventId, expect] of [["evt_C131LIVE", "WEBHOOK_EVENT_NOT_TEST"], ["evt_C131TEST", null], ["evt_C131TEST", "WEBHOOK_EVENT_NOT_OPEN"]]) {
+    const c = await db.app.connect();
+    try {
+      await c.query("BEGIN");
+      let got = null;
+      try { await markStripeEventProcessedInTx(c, eventId, { intentId: null, now: F.at(6) }); } catch (e) { got = e.code; }
+      await c.query(got ? "ROLLBACK" : "COMMIT");
+      assert.equal(got, expect, eventId);
+    } finally { c.release(); }
+  }
+  assert.equal((await evRow("evt_C131LIVE")).status, "received");
+  assert.equal((await evRow("evt_C131TEST")).status, "processed");
+});
