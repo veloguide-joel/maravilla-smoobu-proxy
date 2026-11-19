@@ -801,3 +801,66 @@ test("R2 RED→GREEN: a stop inside read post-processing (after*Read hooks) neve
     assert.deepEqual([await piEvidenceCount(c.id), s.stop.code], [0, "SIGNAL"]);
     assert.ok(s.actions.includes("STOP:SIGNAL:pi_read") && !s.actions.includes("WAIT:PI_READ_UNUSABLE"), JSON.stringify(s.actions)); }
 });
+
+// ---------------------------------------------------------------------------------------------------------------------
+// C138: TEST-cleanup Hostaway CANCEL TEST-identity fence (DB marker exactly one 'test' row, TEST intent environment, payment livemode false):
+// (1) in the cancel leg for the pending never-sent row, before any provider read or claim -> WAIT, zero provider calls, no write; (2) right after
+// the cancel claim, before preSendCommon -> the existing SEND_ABORTED path (never sent, no resend). The ordinary TEST cleanup then runs once.
+function poolRewritingC138(base, rewrite) {
+  const wrapQ = (q) => async (sql, p) => { const r = await q(sql, p); return rewrite(String(sql), r) || r; };
+  return { query: wrapQ((s, p) => base.query(s, p)), connect: async () => {
+    const c = await base.connect();
+    return new Proxy(c, { get(t, k) { if (k === "query") return wrapQ((s, p) => t.query(s, p)); const v = t[k]; return typeof v === "function" ? v.bind(t) : v; } });
+  } };
+}
+const C138_INST = "SELECT environment FROM booking.instance";
+const C138_FENCE = "SELECT environment, payment_livemode FROM booking.intents WHERE id = $1";
+const cleanupFacts = async (id) => ({ ...(await db.app.query("SELECT state, version FROM booking.intents WHERE id = $1", [id])).rows[0], legs: await legs(id),
+  ops: (await db.app.query("SELECT op_type, state, attempts, dispatched_at FROM booking.external_operations WHERE intent_id = $1 ORDER BY created_at, id", [id])).rows,
+  evidence: (await db.app.query("SELECT count(*)::int AS n FROM booking.provider_evidence WHERE intent_id = $1", [id])).rows[0].n, held: await held(id), cases: await cases(id) });
+
+test("C138 cleanup cancel fence before the cancel leg's reads: live / missing marker, non-TEST intent environment, non-TEST payment -> WAIT, zero provider calls, zero writes; then the ordinary cleanup ONCE", async () => {
+  const skipFirst = (f) => { let i = 0; return (sql, r) => (sql === C138_INST && ++i >= 2 ? f(r) : null); };   // 1st read = the step's assertEnvironment
+  const variants = [
+    ["marker live", "CANCEL_FENCE_DATABASE_NOT_TEST", () => skipFirst((r) => ({ ...r, rows: r.rows.map(() => ({ environment: "live" })) }))],
+    ["marker missing", "CANCEL_FENCE_DATABASE_NOT_TEST", () => skipFirst((r) => ({ ...r, rows: [] }))],
+    ["intent environment live", "CANCEL_FENCE_INTENT_ENVIRONMENT_NOT_TEST", () => (sql, r) => (sql === C138_FENCE ? { ...r, rows: r.rows.map((x) => ({ ...x, environment: "live" })) } : null)],
+    ["payment livemode true", "CANCEL_FENCE_INTENT_NOT_TEST_MODE", () => (sql, r) => (sql === C138_FENCE ? { ...r, rows: r.rows.map((x) => ({ ...x, payment_livemode: true })) } : null)],
+    ["payment livemode absent", "CANCEL_FENCE_INTENT_NOT_TEST_MODE", () => (sql, r) => (sql === C138_FENCE ? { ...r, rows: r.rows.map((x) => ({ ...x, payment_livemode: null })) } : null)]
+  ];
+  for (const [name, code, mk] of variants) {
+    const w = world(); const c = await cleanupPending(w); const h = harness(w, c.id);
+    const f0 = await cleanupFacts(c.id);
+    const calls0 = w.calls.length;
+    const r = await runTestCleanupStep(poolRewritingC138(db.app, mk()), h.opts());
+    await settleLate(r);
+    assert.ok(r.actions.includes(`WAIT:${code}`), `${name}: ${JSON.stringify(r.actions)}`);
+    assert.deepEqual([r.sends, w.cancels.length, w.posts.length, w.calls.length - calls0], [0, 0, 0, 0], `${name}: zero provider calls`);
+    assert.deepEqual(await cleanupFacts(c.id), f0, `${name}: nothing written (no claim, no read row, no evidence, no event, no case)`);
+    assert.equal(await state(c.id), "test_cleanup_pending");
+    // intact TEST facts: the ordinary cleanup (one PUT, one POST), then idle
+    await h.until((st) => st === "cancelled", { max: 6 });
+    assert.deepEqual([w.cancels.length, w.posts.length, w.forbidden()], [1, 1, 0], name);
+    h.clk.t += MIN;
+    const again = await h.step(); await settleLate(again);
+    assert.deepEqual([again.status, w.cancels.length, w.posts.length], ["idle", 1, 1], `${name}: idempotent`);
+  }
+});
+
+test("C138 cleanup cancel fence after the claim: marker turns live in afterClaim (real owner change) -> SEND_ABORTED, ZERO PUT and ZERO POST; later sessions never resend", async () => {
+  const w = world(); const c = await cleanupPending(w); const h = harness(w, c.id);
+  let r;
+  try {
+    r = await h.step({ hooks: { afterClaim: async (op) => { if ((op.opType || op.op_type) === OPS.CANCEL) await db.owner.query("UPDATE booking.instance SET environment = 'live'"); } } });
+    await settleLate(r);
+  } finally { await db.owner.query("UPDATE booking.instance SET environment = 'test'"); }
+  assert.equal((await db.owner.query(C138_INST)).rows.map((x) => x.environment).join(), "test", "marker restored");
+  assert.ok(r.actions.includes("SEND_ABORTED:CANCEL_FENCE_DATABASE_NOT_TEST"), JSON.stringify(r.actions));
+  assert.deepEqual([r.sends, w.cancels.length, w.posts.length], [0, 0, 0], "never sent");
+  assert.deepEqual((await opsOf(c.id, OPS.CANCEL)).map((o) => [o.state, o.error_code]), [["outcome_unknown", "SEND_ABORTED_CANCEL_FENCE_DATABASE_NOT_TEST"]]);
+  // unknown -> reads only; the reservation is still active -> owner case by E3: never a second cancel, never a refund
+  for (let k = 0; k < 8; k++) { h.clk.t += 3 * MIN; await settleLate(await h.step()); }
+  assert.deepEqual([w.cancels.length, w.posts.length, w.forbidden()], [0, 0, 0], "no resend, no refund");
+  assert.equal(await state(c.id), "reconciliation_required");
+  assert.equal(await held(c.id), true, "claim held");
+});
