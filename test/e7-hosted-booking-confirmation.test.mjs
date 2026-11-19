@@ -37,7 +37,8 @@ const IID = "3f1c2b4a-5d6e-4f70-8a91-b2c3d4e5f607"; const OID = "7a8b9c0d-1e2f-4
 const PII = /@|SENTINEL|Synthia|Zanabria|re_[A-Za-z0-9]|Bearer|FAKEPW|maraVilla booking|reservaci|Payment received|Pago recibido|Hello/;
 const KEY = "re_SENTINELkey0123456789";
 const PROC = { versions: { node: "22.22.0" }, platform: "linux", execArgv: [], getuid: () => 1000 };
-const OPEN = Object.freeze({ ...C, executeEnabled: true });           // the TEST-LOCAL seam only; the shipped constant stays false
+const OPEN = Object.freeze({ ...C, executeEnabled: true });           // the TEST-LOCAL seam (C120 ACTIVATION ENABLE ships true; the CLOSE companion restores false)
+const SHUT = Object.freeze({ ...C, executeEnabled: false });          // C120 ACTIVATION ENABLE: the CLOSED behaviour is proven through this closed-constants seam
 /** the C116 schema-26 identity (literal; the CLOSED main runner's previous pin) and the #189 packet's POST-27 notification catalog (literal) */
 const PIN26 = Object.freeze({"catalog":"47b1d904a25cde0f4f9f85b8554b93cd914364d70ef1091cb273ce68043379da","readPath":"31f23b641bb57d5cbdec1aa4896447a574190dd057e4b92e6c5fdf8326220baf","readPathCount":6,"sections":{"con":"550534b1daca47fc1df90a557d5dd28a7f6e1f1df11c581cdbd7a671eb95c188","col":"9d645f671980c7a2e0e679aa07d9a3c30a937e488236f132b589a0a162237fbe","fn":"501f34f7f4db9a5a5fb98c00046013a7904745faea78cd731bbafa23ddf8fb7c","pol":"7c69ad5c06cae91f06e96c8ac9d86d97dbc09e94d95a8afb399b141162ee83ee","rel":"359796c40820562166a4f10dce97ae433fe7ae53c5fd2b3385fc41f179437e89","trg":"13e79df7b90097f365a7f3f15337e58c7b7d5277378608fd482c77e2051982f5"}});
 const POST27_CATALOG = "bcc116319adfa7c2e0c2f42d32d48b67fdc53ab35cd4058e777e5de5376c6d16";
@@ -45,14 +46,14 @@ const POST27_CATALOG = "bcc116319adfa7c2e0c2f42d32d48b67fdc53ab35cd4058e777e5de5
 const PIN27 = Object.freeze({"catalog":"bcc116319adfa7c2e0c2f42d32d48b67fdc53ab35cd4058e777e5de5376c6d16","readPath":"b881c9e076b2d113508399dfc0d16322ea5e759fe9fcc6c6ec1eed25324a930a","readPathCount":7,"sections":{"con":"4c9a9148388a8b3846c9ffdb563454b129ea033bf8ee10ec8578db673671b589","col":"4707a34d900203ce83b3a201876fb64897c45c9c10a587f49bb32e753732435f","fn":"6003d12e6fe64492e52bd6e60727cbedaaa047001853b0185413298a5e1d0b49","pol":"f33e232460e9c4d9e4e29945f6e38526fef3551b122efa7a9f8793b182d40b64","rel":"845368cfa6b65e98bbe47af3e8140057be46bcefd1f6ded3034bd1dd06a66d54","trg":"6887ee0464f01e23a8987b963944e856a2065c8e3f0c2e7d6d0d82808018dd42"}});
 
 // ---------------------------------------------------------------------------------------------------------------------------------
-test("H1 SHIPPED CLOSED: executeEnabled false; verify AND execute refuse NBC_EXECUTE_CLOSED before ANY tooling import, env VALUE read (secrets present), DB, spawn or provider — proven with throwing deps and a recording env proxy", async () => {
-  assert.equal(C.executeEnabled, false); assert.ok(Object.isFrozen(C) && Object.isFrozen(C.sender) && Object.isFrozen(C.budgets));
+test("H1 C120 ACTIVATION ENABLE ships executeEnabled TRUE; with CLOSED constants (seam) verify AND execute refuse NBC_EXECUTE_CLOSED before ANY tooling import, env VALUE read (secrets present), DB, spawn or provider — proven with throwing deps and a recording env proxy", async () => {
+  assert.equal(C.executeEnabled, true); assert.equal(SHUT.executeEnabled, false); assert.ok(Object.isFrozen(C) && Object.isFrozen(C.sender) && Object.isFrozen(C.budgets));
   for (const mode of ["verify", "detect", "execute"]) {
     const reads = []; const base = { E7_DEV_BOOKING_DATABASE_URL: "postgresql://x", E7_RESEND_TEST_KEY: KEY, E7_APPROVAL_REF: "label", E7_INTENT_ID: IID, E7_OP_ID: OID,
       E7_EXPECTED_VERSION: "9", E7_LOCALE: "en", E7_TOOLING_DIR: TOOLING, GITHUB_REF: "refs/heads/main" };
     const env = new Proxy(base, { get(t, k) { reads.push(String(k)); return t[k]; } });
     const never = () => { throw new Error("must not be called"); };
-    const r = await R.runHosted({ mode, env, proc: PROC, wrapperDir: ROOT, deps: { importEnv: never, importTooling: never, runCore: never, spawnChild: never, readPgVersion: never, readCa: never } });
+    const r = await R.runHosted({ mode, env, proc: PROC, wrapperDir: ROOT, deps: { constants: SHUT, importEnv: never, importTooling: never, runCore: never, spawnChild: never, readPgVersion: never, readCa: never } });
     assert.deepEqual([r.exitCode, r.result.code, r.result.executeEnabled, r.result.core, r.result.closureDigest, r.result.planHash], [1, "NBC_EXECUTE_CLOSED", false, null, null, null], mode);
     assert.deepEqual(reads, [], `${mode}: not one env value was read (key names only)`);
     assert.equal(base.E7_RESEND_TEST_KEY, KEY, "nothing deleted / touched");
@@ -152,7 +153,7 @@ test("H4 plan: deterministic; binds intent / op / version / locale / the fixed a
     assert.notEqual(R.buildPlan(C, { ...base, [k]: v }).planHash, h0, k);
   for (const over of [{ sender: { fromAddress: "other@sender.mv-test.invalid", fromName: "maraVilla Test" } }, { sender: { fromAddress: "bookings@sender.mv-test.invalid", fromName: "maraVilla Test" } },
     { sender: { fromAddress: "bookings@mail.maravillanayarit.com", fromName: "maraVilla" } }, { toolingCommit: "d322d2192b377d18b6a9280ae06c17eddfe3e73e" }, { excludedIntentIds: [] }, { protectedReservationIds: [] }, { closureDigest: "c".repeat(64) },
-    { catalogPin28: {} }, { budgets: { ...C.budgets, sends: 2 } }, { executeEnabled: true }])
+    { catalogPin28: {} }, { budgets: { ...C.budgets, sends: 2 } }, { executeEnabled: false } /* C120 ACTIVATION ENABLE: the flag flip is still a plan change */])
     assert.notEqual(R.buildPlan({ ...C, ...over }, base).planHash, h0, Object.keys(over)[0]);
   assert.deepEqual(C.sender, { fromAddress: "bookings@mail.micasadirect.com", fromName: "MiCasaDirect" }, "C55: the fixed approved sender (sender only; not a domain-verification claim)");
   assert.deepEqual([...C.excludedIntentIds], ["abede8b1-8ef6-44f2-876e-6a02fc056a96", "c83c1842-d342-4e27-9ab7-dc3d50b7a309"]);
@@ -259,7 +260,7 @@ function world(over = {}) {
   return { role: { ro: "on", iso: "repeatable read", su: false, app: true, adm: false, rep: false, own: false }, catalog: C.catalogPin28, instance: { n: 1, env: "test" },
     intent: [{ id: IID, state: "confirmed", version: VER, listing_id: 606998, currency: "USD", protected_reservation: false, email: "SENTINEL@example.test" }],
     ops: [{ id: OID, state: "pending", attempts: 0, dispatched: false, leased: false, completed: false, has_result: false, template: "booking_confirmed", payload_keys: ["template"], protected_payload: false }],
-    pages: [[{ op_id: OID, intent_id: IID, class: "ELIGIBLE" }]], artefacts: { renders: 0, latches: 0, receipts: 0, work_leased: 0 }, throwAt: null, ...over };
+    pages: [[{ op_id: OID, intent_id: IID, class: "ELIGIBLE", in_scope: true }]], artefacts: { renders: 0, latches: 0, receipts: 0, work_leased: 0 }, throwAt: null, ...over };
 }
 function fakeClient(w, log) {
   let page = 0;
@@ -308,7 +309,7 @@ test("H7 admission (fake): every refusal is a code, zero worker invocations, zer
     [{ ops: [] }, "OP_COUNT"], [{ ops: [...o1({}), { ...o1({})[0], id: "7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0e" }] }, "OP_COUNT"], [{ ops: o1({ id: "7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0e" }) }, "OP_NOT_BOUND"],
     [{ ops: o1({ attempts: 1 }) }, "OP_NOT_PRISTINE"], [{ ops: o1({ state: "outcome_unknown" }) }, "OP_NOT_PRISTINE"], [{ ops: o1({ leased: true }) }, "OP_NOT_PRISTINE"], [{ ops: o1({ dispatched: true }) }, "OP_NOT_PRISTINE"],
     [{ ops: o1({ payload_keys: ["recipient", "template"] }) }, "OP_PAYLOAD_SHAPE"], [{ ops: o1({ template: "not_completed_not_charged" }) }, "TEMPLATE_NOT_V2"], [{ ops: o1({ protected_payload: true }) }, "PROTECTED"],
-    [{ pages: [[{ op_id: OID, intent_id: IID, class: "OUT_OF_V1_SCOPE" }]] }, "CLASS_NOT_ELIGIBLE"], [{ pages: [[]] }, "CLASS_NOT_ELIGIBLE"],
+    [{ pages: [[{ op_id: OID, intent_id: IID, class: "OUT_OF_V1_SCOPE", in_scope: true }]] }, "CLASS_NOT_ELIGIBLE"], [{ pages: [[]] }, "CLASS_NOT_ELIGIBLE"],
     [{ artefacts: { renders: 1, latches: 0, receipts: 0, work_leased: 0 } }, "RENDER_PRESENT"], [{ artefacts: { renders: 0, latches: 1, receipts: 0, work_leased: 0 } }, "LATCH_PRESENT"],
     [{ artefacts: { renders: 0, latches: 0, receipts: 1, work_leased: 0 } }, "RECEIPT_PRESENT"], [{ artefacts: { renders: 0, latches: 0, receipts: 0, work_leased: 1 } }, "WORK_LEASED"]];
   for (const [over, code] of cases) {
@@ -442,7 +443,7 @@ test("H10 C119 detect (fake): NONE / ONE / conservative STOP; the fingerprint is
     const r = await detectWith({ snapshot }); assert.deepEqual([r.res.outcome, r.res.code, r.res.fingerprint], ["STOP", code, null], JSON.stringify(snapshot));
   }
   const thrown = await detectWith({ throwAt: "dsnap" }); assert.deepEqual([thrown.res.outcome, thrown.res.code], ["STOP", "DETECT_DB_FAILED"]);
-  assert.ok(one.log.includes("dpage:[null,100,\"2026-11-15T22:58:01.000Z\"]"), "listing page, no cursor, the reviewed page limit + cutoff");
+  assert.ok(one.log.includes("dpage:[null,100,\"2026-11-19T00:00:00.000Z\"]"), "listing page, no cursor, the reviewed page limit + cutoff");
   assert.deepEqual([one.log.filter((k) => k === "begin").length, one.log.filter((k) => k === "rollback").length], [2, 2], "two read-only snapshots (selection + admission), each BEGIN … ROLLBACK");
   assert.ok(!one.log.includes("UNLISTED"));
   for (const r of [one]) { const t = JSON.stringify(r.res); assert.ok(!t.includes(IID) && !t.includes(OID) && !t.includes("1".repeat(64)) && !t.includes("2".repeat(64)) && !t.includes(FB), "no intent / op id / facts hash in the detect result"); assert.doesNotMatch(t, PII); }
@@ -461,7 +462,7 @@ test("H10 C119 detect (fake): NONE / ONE / conservative STOP; the fingerprint is
   assert.deepEqual([two.res.outcome, two.res.code, two.res.fingerprint, two.res.admission], ["STOP", "DETECT_MORE_THAN_ONE", null, null], "CAPACITY LIMITATION: never picks one of several");
   const full = Array.from({ length: 100 }, (_, n) => row({ op_id: `7a8b9c0d-1e2f-4a3b-8c4d-${String(n).padStart(12, "0")}`, class: "SUCCEEDED" }));
   const paged = await detectWith({ dpages: [full, [row()]] });
-  assert.deepEqual([paged.res.outcome, paged.res.counts.pages], ["ONE", 2]); assert.ok(paged.log.includes(`dpage:["${full[99].op_id}",100,"2026-11-15T22:58:01.000Z"]`), "cursor = the last op id of the previous page");
+  assert.deepEqual([paged.res.outcome, paged.res.counts.pages], ["ONE", 2]); assert.ok(paged.log.includes(`dpage:["${full[99].op_id}",100,"2026-11-19T00:00:00.000Z"]`), "cursor = the last op id of the previous page");
   const budget = await detectWith({ dpages: Array.from({ length: 21 }, () => full) });
   assert.deepEqual([budget.res.outcome, budget.res.code, budget.res.counts.pages], ["STOP", "DETECT_BUDGET", 20], "bounded: never an unbounded scan, never a partial NONE");
   for (const bad of [[[{ ...row(), op_id: "x" }]], [[{ ...row(), in_scope: "t" }]], [[{ ...row(), class: null }]], [[{ ...row(), template: 3 }]], [[{ ...row(), intent_id: null }]], [Array.from({ length: 101 }, () => row())]]) {
@@ -474,7 +475,7 @@ test("H10 C119 detect (fake): NONE / ONE / conservative STOP; the fingerprint is
   // the ONE candidate must pass the UNCHANGED admission: cancellation / unreadable projection / version / state / pristine / artefacts / lease
   for (const [over, adm] of [[{ cancellation: [{ x: { cancelled: true, refundStatus: "pending" } }] }, "EXTERNALLY_CANCELLED"], [{ throwAt: "cancellation" }, "CANCELLATION_UNREADABLE"],
     [{ cancellation: [{ x: 1 }] }, "CANCELLATION_UNREADABLE"], [{ intent: [{ ...world().intent[0], state: "payment_captured" }] }, "STATE_NOT_CONFIRMED"],
-    [{ ops: [{ ...world().ops[0], attempts: 1 }] }, "OP_NOT_PRISTINE"], [{ pages: [[{ op_id: OID, intent_id: IID, class: "WAITING" }]] }, "CLASS_NOT_ELIGIBLE"],
+    [{ ops: [{ ...world().ops[0], attempts: 1 }] }, "OP_NOT_PRISTINE"], [{ pages: [[{ op_id: OID, intent_id: IID, class: "WAITING", in_scope: true }]] }, "CLASS_NOT_ELIGIBLE"],
     [{ artefacts: { renders: 0, latches: 0, receipts: 0, work_leased: 1 } }, "WORK_LEASED"], [{ intent: [{ ...world().intent[0], listing_id: 603566 }] }, "LISTING_MISMATCH"]]) {
     const r = await detectWith(over); assert.deepEqual([r.res.outcome, r.res.code, r.res.admission, r.res.fingerprint], ["STOP", "DETECT_NOT_ADMISSIBLE", adm, null], adm);
   }
@@ -921,3 +922,31 @@ if (process.env.E7_HBC_DB_TESTS === "1") {
     noIds(r, bk);
   });
 }
+
+test("H13 C121 standing PROSPECTIVE cutoff: historic ops (created before 2026-11-19T00:00:00Z — e.g. the two older pending confirmations and the C120 outcome_unknown op) are counted but never selected by detect, and refused BEFORE_STANDING_CUTOFF by admission in BOTH flows with ZERO worker invocations and ZERO sends; the cutoff reaches the admission page query as $4", async () => {
+  assert.equal(C.detect.cutoff, "2026-11-19T00:00:00.000Z");
+  assert.ok(Date.parse(C.detect.cutoff) > Date.parse("2026-11-18T23:59:59Z"), "after every C120-era op");
+  assert.match(Q.page, /\(l\.created_at >= \$4::timestamptz\) AS in_scope/);
+  // detect: two historic ELIGIBLE (older pending) + one historic UNKNOWN (C120) → NONE, never a STOP, never selected
+  const hist = await detectWith({ dpages: [[row({ in_scope: false }), row({ op_id: OID2, intent_id: IID2, in_scope: false }), row({ op_id: "9a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0f", intent_id: "4f1c2b4a-5d6e-4f70-8a91-b2c3d4e5f609", in_scope: false, class: "UNKNOWN" })]] });
+  assert.deepEqual([hist.res.outcome, hist.res.code, hist.res.counts.historic, hist.res.counts.historicUnresolved, hist.res.fingerprint], ["NONE", "DETECT_NONE", 3, 3, null]);
+  // a fresh in-scope candidate next to the historic rows is still the ONE candidate
+  const mixed = await detectWith({ dpages: [[row({ op_id: OID2, intent_id: IID2, in_scope: false }), row()]] });
+  assert.deepEqual([mixed.res.outcome, mixed.res.code, mixed.res.fingerprint], ["ONE", "DETECT_ONE", FP]);
+  // manual flow: a historic op bound by hand is refused at admission — no claim, no render, no send
+  let sends = 0; const ex = async () => { sends += 1; return { status: 200 }; };
+  const manual = await core(world({ pages: [[{ op_id: OID, intent_id: IID, class: "ELIGIBLE", in_scope: false }]] }), () => ({ ok: true }), OPEN, PLAN, ex);
+  assert.deepEqual([manual.res.code, manual.res.admission, manual.st.invocations, manual.st.executors, sends], ["NBC_ADMISSION_REFUSED", "BEFORE_STANDING_CUTOFF", 0, 0, 0]);
+  // detect flow: the re-selection sees only historic rows → NBC_CANDIDATE_CHANGED, zero invocations / sends
+  const log = []; const t = fakeTooling(() => ({ ok: true }));
+  const dflow = await R.runBookingConfirmationCore({ pool: fakePool(world({ dpages: [[row({ in_scope: false })]] }), log), plan: null, c: OPEN, tooling: t.tooling, exchange: ex, credential: () => KEY, runId: "123456789-1", detected: { expectedFingerprint: FP, sourceDigest: "a".repeat(64) } });
+  assert.deepEqual([dflow.code, t.st.invocations, sends], ["NBC_CANDIDATE_CHANGED", 0, 0]);
+  // a non-boolean in_scope is never read as "in scope"
+  const shape = await core(world({ pages: [[{ op_id: OID, intent_id: IID, class: "ELIGIBLE" }]] }), () => ({ ok: true }), OPEN, PLAN, ex);
+  assert.deepEqual([shape.res.admission, shape.st.invocations, sends], ["REPLY_SHAPE", 0, 0]);
+  // the cutoff is passed to the admission page query
+  const seen = []; const w = world(); const base = fakeClient(w, []);
+  const spy = { query: async (txt, p) => { if (txt === Q.page) seen.push(p[3]); return base.query(txt, p); }, release: () => {} };
+  const ok = await R.admit({ client: spy, plan: PLAN, c: OPEN });
+  assert.deepEqual([ok.ok, seen], [true, ["2026-11-19T00:00:00.000Z"]]);
+});
