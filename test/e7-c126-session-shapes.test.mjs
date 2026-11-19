@@ -64,6 +64,17 @@ test("C4 reply validation per mode; a reply of the other mode is refused (mismat
   assert.equal(validateCreatedSession(reply("test", bl), op(), bl, { mode: "live" }), "REPLY_NOT_A_LIVE_SESSION");
   assert.equal(validateCreatedSession(reply("live", bl, { livemode: false }), op(), bl, { mode: "live" }), "REPLY_NOT_LIVEMODE");
   assert.equal(validateCreatedSession(reply("live", bl, { livemode: undefined }), op(), bl, { mode: "live" }), "REPLY_NOT_LIVEMODE");
+  // LIVE only: mv_stage must be the LIVE stage the builder set
+  const md = bl.params.metadata;
+  assert.equal(validateCreatedSession(reply("live", bl, { metadata: { ...md, mv_stage: "e5a-test" } }), op(), bl, { mode: "live" }), "REPLY_STAGE");
+  assert.equal(validateCreatedSession(reply("live", bl, { metadata: { ...md, mv_stage: "c126-LIVE" } }), op(), bl, { mode: "live" }), "REPLY_STAGE");
+  const { mv_stage: _drop, ...noStage } = md;
+  assert.equal(validateCreatedSession(reply("live", bl, { metadata: noStage }), op(), bl, { mode: "live" }), "REPLY_STAGE");
+  // TEST adds no stage requirement: a TEST reply with missing or other mv_stage still passes, as before C126
+  const tmd = bt.params.metadata;
+  const { mv_stage: _t, ...tNoStage } = tmd;
+  assert.equal(validateCreatedSession(reply("test", bt, { metadata: tNoStage }), op(), bt), null);
+  assert.equal(validateCreatedSession(reply("test", bt, { metadata: { ...tmd, mv_stage: "other" } }), op(), bt), null);
   // the remaining checks still apply in LIVE
   assert.equal(validateCreatedSession(reply("live", bl, { amount_total: 13999 }), op(), bl, { mode: "live" }), "REPLY_AMOUNT");
   assert.equal(validateCreatedSession(reply("live", bl, { url: "https://evil.example/x" }), op(), bl, { mode: "live" }), "REPLY_URL");
