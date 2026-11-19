@@ -1,6 +1,6 @@
 // public/checkout-test.js — maraVilla direct-booking TEST checkout page (Stripe TEST mode only). The page itself never creates a
-// reservation, captures or records anything: the server-side TEST pipeline is run separately by the test operator (not automatically from
-// here). C98: the page shows "TEST booking confirmed" ONLY when the server's additive bookingProgress projection says "complete"
+// reservation, captures or records anything: the server-side TEST pipeline runs separately on the server (scheduled TEST processing; never from
+// this page). C98: the page shows "TEST booking confirmed" ONLY when the server's additive bookingProgress projection says "complete"
 // together with status "confirmed"; a missing / malformed projection (e.g. an older server) fails closed to "not yet confirmed".
 // Plain ES module, no dependency, no third-party resource. Talks ONLY to the same-origin intent API:
 //   POST /api/checkout/intents            create (server prices the stay; returns a one-time bearer token)
@@ -57,7 +57,7 @@ export function describe(status, { releaseRequested = false, progress = null } =
     // "processing" is a COARSE public status (payment_authorized, reservation_pending, capture_unknown, ... all map to it): no positive
     // authorization / uncaptured claim can be made from it
     case "processing": return { kind: "authorized", title: "Processing — not a booking",
-      text: "Still processing: this TEST booking is not confirmed yet. Keep this tab open and follow the test operator’s instructions. Do not make another TEST payment. A TEST card authorization may be held; this status cannot show whether it has been captured or released. This page does not create a reservation or confirm a booking." };
+      text: "Still processing: this TEST booking is not confirmed yet. Keep this tab open. The remaining steps run on the server on a schedule, not from this page; use Refresh status to check again. Do not make another TEST payment. A TEST card authorization may be held; this status cannot show whether it has been captured or released. This page does not create a reservation or confirm a booking." };
     case "release_requested": return { kind: "releaseQueued", title: "Release requested — not released yet",
       text: "Your release request is queued, not finished. Next: wait for the test operator to run cleanup. Refresh status checks the result; it does not release the hold. The TEST hold stays until cleanup verifies the release." };
     case "unavailable_not_charged": return releaseRequested
@@ -75,9 +75,9 @@ export function describe(status, { releaseRequested = false, progress = null } =
       if (pg && pg.stage === "complete") return { kind: "complete", title: "TEST booking confirmed",
         text: `The server reports this TEST booking complete: the reservation is recorded and the TEST payment is received. Booking reference: ${pg.bookingRef}. This is a TEST booking; nothing more is needed from this page.` };
       if (pg && pg.stage === "payment_received_finalizing") return { kind: "finalizing", title: "TEST payment received — finalizing",
-        text: "The server reports the TEST payment received, but the booking is not complete yet. Do not make another TEST payment. The remaining step is run by the test operator, not by this page; use Refresh status to check again." };
+        text: "The server reports the TEST payment received, but the booking is not complete yet. Do not make another TEST payment. The remaining step runs on the server on a schedule, not from this page; use Refresh status to check again." };
       return { kind: "confirming", title: "Not yet confirmed — still processing",
-        text: "The server has not reported this TEST booking as complete. Do not make another TEST payment. Use Refresh status later and follow the test operator’s instructions." };
+        text: "The server has not reported this TEST booking as complete. Do not make another TEST payment. The remaining steps run on the server on a schedule, not from this page; use Refresh status later to check again." };
     }
     // C118: the host cancelled this booking (manually, in the property system). The refund is a SEPARATE label the host records; the page never
     // says money was returned unless the host recorded a refund, and never says when money arrives.
@@ -249,9 +249,9 @@ export function createController({ api, store, ui, timers, nav, config, now = ()
       : screen === "unreadable" ? "Status not confirmed" : screen === "payWait" ? "Waiting for the TEST payment result" : screen === "notChecked" ? "Status not checked"
       : d ? d.title : st ? "Checking status…" : "Start a TEST booking";
     const text = screen === "createUncertain" ? "A create request may or may not have reached the server. This tab has no way to look it up. Acknowledge before starting another TEST booking (a second TEST intent may then exist)."
-      : screen === "lost" ? "The server no longer accepts this tab's access to the TEST booking, so this page cannot check it, pay or request a release. Nothing more is sent from this tab. This says nothing about whether a TEST hold exists; follow the test operator's instructions."
+      : screen === "lost" ? "This tab has lost access to the TEST booking's status: the server no longer accepts this tab's access, so this page cannot check the booking, pay or request a release, and it cannot determine the outcome. Nothing more is sent from this tab. This says nothing about whether a TEST hold or payment exists; the owner must review this TEST booking."
       : screen === "unreadable" ? "The server's last reply did not contain a recognised status, so this page claims nothing about the current state. Nothing is sent automatically; use Refresh status."
-      : screen === "payWait" ? "You returned from Stripe. The server has not reported a result yet, so nothing is known about the payment from this page. Payment is not offered again here. Use Refresh status to check; if this does not change, follow the test operator's instructions."
+      : screen === "payWait" ? "You returned from Stripe. Returning from Stripe proves neither a payment nor a booking, and the server has not reported a result yet, so nothing is known about the payment from this page. Payment is not offered again here. The server's scheduled checks may be delayed. Refresh status only reads the current status; if this does not change, contact the owner."
       : screen === "notChecked" ? "The status check did not succeed (for example too many requests or a server error). This page claims nothing about the current state. Wait, then use Refresh status."
       : d ? d.text : "";
     ui.render({ screen, title, text, price, notice, busy, polling: pollTimer !== null, pollStopped: lost ? null : stopped,   // lost: no "use Refresh" hint (Refresh is not offered)
