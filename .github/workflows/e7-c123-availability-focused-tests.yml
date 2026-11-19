@@ -1,0 +1,32 @@
+# C123 — FOCUSED TEST EVIDENCE ONLY for the read-only TEST availability check (scripts/e7-test-auto-availability-check.mjs + its workflow).
+# Fakes only: no secret, no environment, no variable, no database, no provider, no network beyond the checkout. Outside every runtime frame and the arm release.
+name: e7-c123-availability-focused-tests
+on:
+  pull_request:
+    paths:
+      - "scripts/e7-test-auto-availability-check.mjs"
+      - "test/e7-test-auto-availability-check.test.mjs"
+      - ".github/workflows/e7-test-auto-availability-check.yml"
+      - ".github/workflows/e7-c123-availability-focused-tests.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: e7-c123-availability-focused-tests-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  focused:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout (exact event SHA)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Unit — availability check script + workflow contract (fakes only)
+        run: node --test test/e7-test-auto-availability-check.test.mjs

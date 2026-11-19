@@ -97,6 +97,16 @@ test("F1 static: the P3 fresh-admission step is BYTE-IDENTICAL in the five moved
       assert.doesNotMatch(t, /github\.token|actions: write|E7_TEST_ARM:|e7-test-arm|E7_RESEND|E7_STRIPE|E7_HOSTAWAY|E7_DISPATCH_TOKEN/, "status: no token / write / arm digest / provider");
       continue;
     }
+    // C123: the READ-ONLY TEST availability check (NOT a runtime / arm component): manual dispatch only (two date inputs), main-only, ONE environment,
+    // exactly the two existing secret NAMES (each in its own step), no schedule / arm / token / variable / write; its own W1 / S1 tests cover the rest
+    if (f === "e7-test-auto-availability-check.yml") {
+      assert.match(t, /\non:\n  workflow_dispatch:\n    inputs:\n/, "availability check: manual dispatch only"); assert.match(t, /\npermissions:\n  contents: read\n/);
+      assert.deepEqual(t.match(/environment: [a-z0-9-]+/g), ["environment: e7-test-auto"], "availability check: ONE environment, the isolated TEST one");
+      assert.match(t, /\n  check:\n    if: github\.ref == 'refs\/heads\/main'\n    runs-on: ubuntu-24\.04\n    environment: e7-test-auto\n/);
+      assert.deepEqual(t.match(/secrets\.[A-Z0-9_]+/g), ["secrets.E7_HOSTAWAY_TOKEN", "secrets.E7_DEV_BOOKING_DATABASE_URL"], "availability check: its two existing secrets only");
+      assert.doesNotMatch(t, /schedule:|vars\.|github\.token|actions: write|E7_TEST_ARM:|e7-test-arm|E7_RESEND|E7_STRIPE|E7_DISPATCH_TOKEN/, "availability check: no schedule / arm / token / write");
+      continue;
+    }
     probe += (t.match(/\n    environment: e7-readonly-probe\n/g) || []).length; auto += (t.match(/environment: e7-test-auto/g) || []).length;
   }
   assert.deepEqual([probe, auto], [15, 5], "the 5 moved jobs only (+ the C120 sink-probe send job and the C122 status job, checked above); every other e7-readonly-probe reference untouched");
