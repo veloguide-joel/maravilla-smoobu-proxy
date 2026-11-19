@@ -154,7 +154,10 @@ test("F4 main-side parity: the REAL ENABLE pipeline bytes of THIS checkout (C102
   assert.equal(sha(readFileSync(join(ROOT, PR.enableDeltaPath))), PR.enableDeltaSha256, "the delta bytes of this checkout == the pinned delta");
   const text = Object.fromEntries(PR.runnerFiles.map((f) => [f, readFileSync(join(ROOT, f), "utf8")]));
   const frame = (t) => { const h = createHash("sha256"); h.update(PR.sourcePrefix); for (const f of PR.runnerFiles) { const b = Buffer.from(t[f], "utf8"); h.update(f); h.update(Buffer.from([0])); h.update(String(b.length)); h.update(Buffer.from([0])); h.update(b); h.update(Buffer.from([0])); } return h.digest("hex"); };
-  assert.equal(frame(text), PR.closedSourceDigest, "this checkout's CLOSED pipeline bytes == the pinned closed frame");
+  const here = frame(text);   // C120: this checkout carries the CLOSED (shipped) or the reviewed ENABLE (activation window) pipeline bytes
+  assert.ok([PR.closedSourceDigest, PR.sourceDigest].includes(here), "this checkout's pipeline bytes == the pinned closed or ENABLE frame");
+  if (here === PR.sourceDigest) for (const o of D.ops) { assert.equal(text[o.file].split(o.enable).length, 2); text[o.file] = text[o.file].replace(o.enable, () => o.closed); }
+  assert.equal(frame(text), PR.closedSourceDigest, "the CLOSED pipeline bytes == the pinned closed frame");
   for (const o of D.ops) { assert.equal(text[o.file].split(o.closed).length, 2); text[o.file] = text[o.file].replace(o.closed, () => o.enable); }
   assert.equal(frame(text), PR.sourceDigest); assert.equal(sha(Buffer.from(text[PR.runnerPath], "utf8")), PR.runnerSha256); assert.equal(sha(Buffer.from(text[PR.workflowPath], "utf8")), PR.workflowSha256);
   const d = mkdtempSync(join(tmpdir(), "e7-s4-en-")); writeFileSync(join(d, "r.mjs"), text[PR.runnerPath]);

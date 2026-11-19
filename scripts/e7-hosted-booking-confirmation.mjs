@@ -3,7 +3,12 @@
 // lib/checkout/booking-confirmation-request.js (gn-v2 builder), lib/notify/resend-notification-executor.js (branded executor) and
 // scripts/e7-resend/resend-exchange.mjs (the reviewed single-use HTTPS exchange), with the schema-23 typed receipts (0023) on the reviewed schema 27 (C119 S1; was 26). Nothing here re-implements the worker.
 //
-// HONEST LABEL: SHIPPED CLOSED. executeEnabled is FALSE: `verify` and `execute` refuse NBC_EXECUTE_CLOSED right after the mode / unexpected-input checks,
+// HONEST LABEL: C121 STANDING TEST (DRAFT) — OPENED for bounded TEST sink notifications: ONE worker invocation / ONE send per dispatch, serial capacity
+// (>1 eligible → STOP DETECT_MORE_THAN_ONE), PROSPECTIVE ONLY: an op created before CONSTANTS.detect.cutoff (the C121 rollout, 2026-11-19T00:00:00Z) is
+// never selected by detect AND never admitted by execute (manual or detect flow: BEFORE_STANDING_CUTOFF), so historic rows (incl. the two older pending
+// confirmations and the C120 outcome_unknown op) stay untouched. The arm variable (release digest) is the switch. NOT production concurrency readiness.
+// (History: C120 opened this runner for ONE run with a CLOSE companion.) With closed constants (the shipped
+// state outside this window) `verify` and `execute` refuse NBC_EXECUTE_CLOSED right after the mode / unexpected-input checks,
 // BEFORE any tooling import, credential read, database or provider access. The execute BODY exists so that it can be reviewed and exercised through the
 // test-local constants / deps seam on disposable PostgreSQL (schema 26) with FAKE exchanges only. Enabling it is a separate reviewed change (no enable diff
 // here). Even then: the sender is the FIXED approved identity bookings@mail.micasadirect.com / MiCasaDirect (C54/C55; equal to the pinned tooling's
@@ -90,7 +95,7 @@ const CATALOG_PIN_28 = {"catalog":"96d74ab10cdf7bdd99e125eb6825284e9b57cacec3347
 export const CONSTANTS = deepFreeze({
   toolingCommit: "66133a22edca925e6386c4d178c251fa5f11c82e",          // C116: e7-test #180 merge commit (tree ade3e084 == reviewed head 5ba7f793; 0026). #178 merge 9b7a96bf: tree 40dbe13f == reviewed head d7e39ae3; sink recipient scope + 0025). C55 pin was 46b3eaf8
   toolingStatus: "MERGED",
-  executeEnabled: false,                                                // SHIPPED CLOSED: verify / execute refuse NBC_EXECUTE_CLOSED before any import / secret / DB / provider
+  executeEnabled: true,                                                 // C121 STANDING TEST (bounded per dispatch; prospective cutoff below; arm = switch); closed constants refuse NBC_EXECUTE_CLOSED
   // the INDEPENDENTLY scanned transitive relative imports of the five runtime roots at 66133a22 (+ package files); bare imports: node:* and pg only
   closure: ["lib/booking-db/notification-worker.js", "lib/booking-db/pool.js", "lib/checkout/booking-confirmation-copy.js", "lib/checkout/booking-confirmation-request.js",
     "lib/checkout/guest-notification.js", "lib/notify/resend-notification-executor.js", "lib/notify/sender-identity.js", "package-lock.json", "package.json", "scripts/e7-connected/probe-env-preflight.mjs",
@@ -108,9 +113,10 @@ export const CONSTANTS = deepFreeze({
   sender: { fromAddress: "bookings@mail.micasadirect.com", fromName: "MiCasaDirect" },
   workerEnv: { VERCEL_ENV: "preview", MV_E7_NOTIFICATION_WORKER: "enabled" },   // the accepted worker's own gate marker, passed ONLY inside the (closed) execute body
   catalogPin28: CATALOG_PIN_28,
-  // C119 S1 detect scope: the reviewed kickoff cutoff (2026-11-15T22:58:01Z; older rows are historic: counted, never selected, never a STOP) and the
+  // C121 standing scope: the PROSPECTIVE rollout cutoff 2026-11-19T00:00:00Z (was the C119 S1 kickoff cutoff 2026-11-15T22:58:01Z). Older rows are historic:
+  // detect counts them, never selects them, never STOPs on them; admission (both flows) refuses them BEFORE_STANDING_CUTOFF. And the
   // runner's exclusions + the C103 continuation intent (== the reviewed kickoff scope's exclusions). Fixed label + locale for the server-derived plan.
-  detect: { cutoff: "2026-11-15T22:58:01.000Z", template: "booking_confirmed", locale: "en", approvalRef: "E7-HBC-DETECT-v1", pages: 20, pageLimit: 100,
+  detect: { cutoff: "2026-11-19T00:00:00.000Z", template: "booking_confirmed", locale: "en", approvalRef: "E7-HBC-DETECT-v1", pages: 20, pageLimit: 100,
     excludedIntentIds: ["abede8b1-8ef6-44f2-876e-6a02fc056a96", "c83c1842-d342-4e27-9ab7-dc3d50b7a309", "1d6e770f-ba3d-40f7-92c1-ee01be7da532"] },
   // timing scope: every connect ≤ connectMs (this wrapper; the frozen pool has no connect timeout), every statement ≤ the pool's statement_timeout
   // (statementMs, server-side), ≤ statements in total, ONE provider exchange ≤ the reviewed exchange's own 10 s deadline, pool.end ≤ endMs. Not a single
@@ -138,7 +144,7 @@ export const CORE_CODES = freeze(["PROVIDER_ACCEPTED", "PROVIDER_ACCEPTED_REPLAY
   "NBC_WORKER_REFUSED", "NBC_WORKER_ERROR", "NBC_EXECUTOR_INVALID", "NBC_DB_FAILED", "NBC_DB_TIMEOUT", "NBC_BUDGET", "NBC_CANDIDATE_CHANGED", "NBC_BOUND_FACTS_MISMATCH"]);
 export const ADMISSION_CODES = freeze(["NOT_READ_ONLY", "ROLE_REFUSED", "CATALOG_NOT_28", "NOT_TEST", "INTENT_NOT_FOUND", "INTENT_EXCLUDED", "LISTING_MISMATCH",
   "VERSION_MISMATCH", "CURRENCY_NOT_USD", "STATE_NOT_CONFIRMED", "PROTECTED", "EXTERNALLY_CANCELLED", "CANCELLATION_UNREADABLE", "OP_COUNT", "OP_NOT_BOUND", "OP_NOT_PRISTINE", "OP_PAYLOAD_SHAPE", "TEMPLATE_NOT_V2",
-  "CLASS_NOT_ELIGIBLE", "RENDER_PRESENT", "LATCH_PRESENT", "RECEIPT_PRESENT", "WORK_LEASED", "REPLY_SHAPE"]);
+  "CLASS_NOT_ELIGIBLE", "BEFORE_STANDING_CUTOFF", "RENDER_PRESENT", "LATCH_PRESENT", "RECEIPT_PRESENT", "WORK_LEASED", "REPLY_SHAPE"]);
 export const HOSTED_CODES = freeze(["NBC_USAGE", "NBC_INPUT_UNEXPECTED", "NBC_EXECUTE_CLOSED", "NBC_SECRET_SCOPE_VIOLATION", "NBC_INPUT_INVALID", "NBC_INPUT_INCOMPLETE",
   "NBC_INTENT_EXCLUDED", "NBC_REF_NOT_MAIN", "NBC_LAYOUT_INVALID", "NBC_SOURCE_UNREADABLE", "NBC_SOURCE_MISMATCH", "NBC_CLOSURE_MISMATCH", "NBC_PLAN_HASH_MISMATCH",
   "NBC_IMPORT_FAILED", "NBC_ENV_REFUSED", "NBC_CHILD_FAILED", "NBC_TESTS_FAILED", "NBC_CREDENTIALS_MISSING", "NBC_DEPENDENCY_MISMATCH", "NBC_DB_TARGET_INVALID",
@@ -316,7 +322,7 @@ export const ADMISSION_QUERIES = deepFreeze({
     o.payload ->> 'template' AS template, (SELECT coalesce(array_agg(k ORDER BY k), '{}'::text[]) FROM jsonb_object_keys(o.payload) k) AS payload_keys,
     coalesce((o.payload ->> 'reservationId') = ANY ($2::text[]), false) AS protected_payload
     FROM booking.external_operations o WHERE o.intent_id = $1::uuid AND o.op_type = 'guest.notify' ORDER BY o.id`,
-  page: "SELECT l.op_id::text AS op_id, l.intent_id::text AS intent_id, l.class AS class FROM booking.list_guest_notifications($1::int[], $2::uuid, $3::int) l",
+  page: "SELECT l.op_id::text AS op_id, l.intent_id::text AS intent_id, l.class AS class, (l.created_at >= $4::timestamptz) AS in_scope FROM booking.list_guest_notifications($1::int[], $2::uuid, $3::int) l",
   artefacts: `SELECT (SELECT count(*)::int FROM booking.notification_renders r WHERE r.operation_id = $1::uuid) AS renders,
     (SELECT count(*)::int FROM booking.notification_latches l WHERE l.operation_id = $1::uuid) AS latches,
     (SELECT count(*)::int FROM booking.notification_provider_receipts p WHERE p.operation_id = $1::uuid) AS receipts,
@@ -394,15 +400,16 @@ export async function admit({ client, plan, c = CONSTANTS }) {
     if (!Array.isArray(o.payload_keys) || o.payload_keys.length !== 1 || o.payload_keys[0] !== "template") no("OP_PAYLOAD_SHAPE");
     if (o.template !== "booking_confirmed") no("TEMPLATE_NOT_V2");
     if (o.state !== "pending" || o.attempts !== 0 || o.dispatched !== false || o.leased !== false || o.completed !== false || o.has_result !== false) no("OP_NOT_PRISTINE");
-    let cls = null; let cursor = null;
+    let cls = null; let inScope = null; let cursor = null;
     for (let pages = 1; cls === null; pages += 1) {
       if (pages > c.budgets.pages) refuse("NBC_BUDGET");
-      const pg = await q("page", [[c.listingId], cursor, c.budgets.pageLimit]);
+      const pg = await q("page", [[c.listingId], cursor, c.budgets.pageLimit, c.detect.cutoff]);
       if (!pg || !Array.isArray(pg.rows) || pg.rows.length > c.budgets.pageLimit) no("REPLY_SHAPE");
-      for (const x of pg.rows) { if (typeof x.op_id !== "string" || !UUID_RE.test(x.op_id)) no("REPLY_SHAPE"); if (x.op_id === plan.opId) { if (x.intent_id !== plan.intentId) no("REPLY_SHAPE"); cls = String(x.class); break; } }
+      for (const x of pg.rows) { if (typeof x.op_id !== "string" || !UUID_RE.test(x.op_id)) no("REPLY_SHAPE"); if (x.op_id === plan.opId) { if (x.intent_id !== plan.intentId || typeof x.in_scope !== "boolean") no("REPLY_SHAPE"); cls = String(x.class); inScope = x.in_scope; break; } }
       if (cls !== null || pg.rows.length < c.budgets.pageLimit) break;
       cursor = pg.rows[pg.rows.length - 1].op_id;
     }
+    if (cls !== null && inScope !== true) no("BEFORE_STANDING_CUTOFF");                    // C121: historic ops are outside standing scope (manual AND detect flow)
     if (cls !== "ELIGIBLE") no("CLASS_NOT_ELIGIBLE");
     const a = one(await q("artefacts", [plan.opId, plan.intentId]));
     if (a.renders !== 0) no("RENDER_PRESENT"); if (a.latches !== 0) no("LATCH_PRESENT"); if (a.receipts !== 0) no("RECEIPT_PRESENT"); if (a.work_leased !== 0) no("WORK_LEASED");
