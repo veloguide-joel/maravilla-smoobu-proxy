@@ -619,3 +619,67 @@ test("C132 finishDuplicateAuthorizationEvent (direct): refuses a non-TEST row an
   assert.deepEqual(await finishDuplicateAuthorizationEvent(db.app, "evt_C132MISSING", { intentId: id, now: F.at(8) }), { ok: false, code: "WEBHOOK_EVENT_NOT_TEST" });
   assert.deepEqual(await finishDuplicateAuthorizationEvent(db.app, "evt_C132TEST", { intentId: "00000000-0000-4000-8000-000000000000", now: F.at(8) }), { ok: false, code: "INTENT_NOT_FOUND" });
 });
+
+// ---------------------------------------------------------------------------------------------------------------------
+// C133: the verified expiry path re-checks the TEST boundary (one 'test' instance row, TEST intent, livemode = false event
+// row) inside EACH writing transaction (E3 CHECKOUT_EXPIRED, then the attempt / claim release) and the processed finish.
+// A refusal rolls back that transaction: 503, the row stays retryable; a TEST redelivery completes idempotently.
+const expirySnapshot = async (id) => ({
+  state: await F.state(db.app, id), version: (await loadIntent(db.app, id)).version,
+  expired: await F.count(db.app, "SELECT count(*) AS n FROM booking.intent_transitions WHERE intent_id = $1 AND event_type = 'CHECKOUT_EXPIRED'", [id]),
+  attempts: (await q1("SELECT status FROM booking.payment_attempts WHERE intent_id = $1 ORDER BY attempt", [id])).map((a) => a.status),
+  claims: (await q1("SELECT released_at IS NULL AS held FROM booking.inventory_claims WHERE intent_id = $1", [id])).map((c) => c.held),
+  nonRead: (await q1("SELECT op_type, state FROM booking.external_operations WHERE intent_id = $1 AND op_type NOT LIKE 'stripe.retrieve_%' ORDER BY created_at, id", [id]))
+});
+test("C133 expiry webhook — DB TEST boundary in every writing transaction: live / missing marker, non-TEST intent / event -> 503 retryable, nothing changes; TEST redelivery idempotent", async () => {
+  const INST = "SELECT environment FROM booking.instance";
+  const live = (r) => ({ ...r, rows: r.rows.map((x) => ({ ...x, environment: "live" })) });
+  const nth = (k, f) => { let i = 0; return (sql, r) => (sql === INST && ++i >= k ? f(r) : null); };
+  const cases = [
+    ["marker live", "DATABASE_NOT_TEST", () => nth(1, live)],
+    ["marker missing", "DATABASE_NOT_TEST", () => nth(1, (r) => ({ ...r, rows: [] }))],
+    ["intent environment not test", "INTENT_ENVIRONMENT_NOT_TEST",
+      () => (sql, r) => (sql === "SELECT environment FROM booking.intents WHERE id = $1" ? live(r) : null)],
+    ["event row not livemode=false", "WEBHOOK_EVENT_NOT_TEST",
+      () => (sql, r) => (sql === "SELECT livemode FROM booking.stripe_webhook_events WHERE event_id = $1" ? { ...r, rows: r.rows.map((x) => ({ ...x, livemode: true })) } : null)]
+  ];
+  let n = 160;
+  for (const [name, code, mk] of cases) {
+    const w = world();
+    const { id, sessionId } = await checkoutReady(w, n++);
+    w.expire(sessionId);
+    const ev = w.event("checkout.session.expired", sessionId);
+    const snap0 = await expirySnapshot(id);
+    const r = await processVerifiedStripeEvent(rewritingPoolC131(db.app, mk()), ev, { stripe: w.stripe, now: F.at(41), accountId: ACCT, accountCache: {} });
+    assert.deepEqual(r, { http: 503, code }, name);
+    assert.deepEqual(await expirySnapshot(id), snap0, `${name}: nothing changed`);
+    assert.deepEqual([(await evRow(ev.id)).status, (await evRow(ev.id)).error_code], ["failed_retryable", code], name);
+    assert.deepEqual(await deliver(w, ev, F.at(42)), { http: 200, code: "EXPIRY_APPLIED", state: "payment_expired" }, `${name}: redelivery`);
+    assert.deepEqual(await deliver(w, ev, F.at(43)), { http: 200, code: "ALREADY_PROCESSED" });
+    const s = await expirySnapshot(id);
+    assert.deepEqual([s.state, s.expired, s.attempts], ["payment_expired", 1, ["expired"]], name);
+    await noHostawayOrMoneyMove(id);
+  }
+});
+
+test("C133 expiry webhook — marker turns live AFTER CHECKOUT_EXPIRED committed: the second transaction refuses (finish never reached); redelivery finishes the row, nothing applied twice", async () => {
+  const w = world();
+  const { id, sessionId } = await checkoutReady(w, 170);
+  w.expire(sessionId);
+  const ev = w.event("checkout.session.expired", sessionId);
+  // 1st instance read = applyEvent afterLock (TEST); every later read in this delivery answers live
+  let i = 0;
+  const rw = (sql, r) => (sql === "SELECT environment FROM booking.instance" && ++i >= 2 ? { ...r, rows: r.rows.map((x) => ({ ...x, environment: "live" })) } : null);
+  const r = await processVerifiedStripeEvent(rewritingPoolC131(db.app, rw), ev, { stripe: w.stripe, now: F.at(41), accountId: ACCT, accountCache: {} });
+  assert.deepEqual(r, { http: 503, code: "DATABASE_NOT_TEST" });
+  const mid = await expirySnapshot(id);
+  // the E3 CHECKOUT_EXPIRED transaction (its side records already mark the attempt expired) committed; the second transaction
+  // was refused and rolled back; the finish was never reached
+  assert.deepEqual([mid.state, mid.expired, mid.attempts], ["payment_expired", 1, ["expired"]]);
+  assert.equal((await evRow(ev.id)).status, "failed_retryable");
+  assert.deepEqual(await deliver(w, ev, F.at(42)), { http: 200, code: "EXPIRY_APPLIED", state: "payment_expired" });
+  const done = await expirySnapshot(id);
+  assert.deepEqual(done, mid, "the redelivery adds nothing: CHECKOUT_EXPIRED applied once, same attempt / claim / operations");
+  assert.equal((await evRow(ev.id)).status, "processed");
+  await noHostawayOrMoneyMove(id);
+});
