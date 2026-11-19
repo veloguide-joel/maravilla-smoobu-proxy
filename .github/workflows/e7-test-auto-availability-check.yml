@@ -1,0 +1,97 @@
+# e7-test-auto-availability-check — C123 READ-ONLY availability check for the FIXED TEST listing 606998 (scripts/e7-test-auto-availability-check.mjs).
+# Answers: which nights of a half-open stay [check_in, check_out) (≤ 31 nights) are CLEAR = Hostaway available AND no unreleased internal claim.
+#   * manual dispatch only, main only, NO schedule / push / pull_request / API trigger; environment e7-test-auto (existing; no new environment)
+#   * permissions contents: read; the listing is a fixed literal in the script, never an input; inputs reach the script via env only
+#   * Hostaway step: ONLY the existing secret E7_HOSTAWAY_TOKEN; ONE GET /v1/listings/606998/calendar?startDate=&endDate=, no retry, no redirect,
+#     no token mint / refresh, no other endpoint or method
+#   * DB step: ONLY the existing secret E7_DEV_BOOKING_DATABASE_URL (runtime role); pinned pooler shape + pinned CA; BEGIN READ ONLY; TEST-instance
+#     check; ONE SELECT of lower / upper(stay) of unreleased 606998 claims; ROLLBACK. No write.
+#   * combine step: no secret; prints only dates, available / blocked / unknown, claim true / false, verdicts and fixed codes
+#   * no booking, reservation, payment, cancellation, calendar change, workflow dispatch, token, variable or setting change
+# OUTSIDE every runner frame and the TEST arm release (no component lists this file); it enables nothing and changes no flag.
+name: e7-test-auto-availability-check
+
+on:
+  workflow_dispatch:
+    inputs:
+      check_in:
+        description: "check-in date YYYY-MM-DD (first night)"
+        type: string
+        required: true
+      check_out:
+        description: "check-out date YYYY-MM-DD (exclusive; at most 31 nights after check-in)"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e7-test-auto-availability-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: e7-test-auto
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout wrapper (this repository, exact dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          path: wrapper
+          persist-credentials: false
+      - name: Checkout the pinned tooling (bbf12aa2) for its verified pg lockfile only
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: veloguide-joel/maravilla-smoobu-proxy
+          ref: bbf12aa22446807df7b63a55e38a464f4be88763
+          path: tooling
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Verify the wrapper and tooling pins, then install the pinned dependency from the verified lockfile (no lifecycle scripts)
+        env:
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+          E7_TOOLING_PIN: bbf12aa22446807df7b63a55e38a464f4be88763
+        run: |
+          set -eu
+          [ "$(git -C wrapper rev-parse HEAD)" = "$E7_WORKFLOW_SHA" ] || { echo "FAIL code=WRAPPER_PIN"; exit 3; }
+          [ "$(git -C tooling rev-parse HEAD)" = "$E7_TOOLING_PIN" ] || { echo "FAIL code=TOOLING_PIN"; exit 3; }
+          cd tooling && npm ci --ignore-scripts --omit=dev --no-audit --no-fund >/dev/null 2>&1 || { echo "FAIL code=NPM_CI"; exit 3; }
+      - name: Fetch the public Supabase CA (the script checks its pinned SHA-256)
+        run: |
+          set -eu
+          curl --fail --silent --show-error --proto '=https' --max-time 20 -o "$RUNNER_TEMP/prod-ca-2021.crt" https://supabase-downloads.s3-ap-southeast-1.amazonaws.com/prod/ssl/prod-ca-2021.crt || { echo "FAIL code=CA_FETCH"; exit 3; }
+      - name: ONE read-only Hostaway calendar GET (this step only receives the Hostaway secret)
+        continue-on-error: true
+        env:
+          E7_CHECK_IN: ${{ inputs.check_in }}
+          E7_CHECK_OUT: ${{ inputs.check_out }}
+          E7_OUT_FILE: ${{ runner.temp }}/hostaway.json
+          E7_HOSTAWAY_TOKEN: ${{ secrets.E7_HOSTAWAY_TOKEN }}
+        run: node wrapper/scripts/e7-test-auto-availability-check.mjs hostaway 2>/dev/null
+      - name: ONE read-only internal-claim snapshot (this step only receives the DB secret)
+        continue-on-error: true
+        env:
+          E7_CHECK_IN: ${{ inputs.check_in }}
+          E7_CHECK_OUT: ${{ inputs.check_out }}
+          E7_OUT_FILE: ${{ runner.temp }}/claims.json
+          E7_TOOLING_DIR: ${{ github.workspace }}/tooling
+          E7_CA_FILE: ${{ runner.temp }}/prod-ca-2021.crt
+          E7_DEV_BOOKING_DATABASE_URL: ${{ secrets.E7_DEV_BOOKING_DATABASE_URL }}
+        run: node wrapper/scripts/e7-test-auto-availability-check.mjs claims 2>/dev/null
+      - name: Combine (no secret; per-night verdict; any unknown or failed read fails the run)
+        env:
+          E7_CHECK_IN: ${{ inputs.check_in }}
+          E7_CHECK_OUT: ${{ inputs.check_out }}
+          E7_HOSTAWAY_RESULT: ${{ runner.temp }}/hostaway.json
+          E7_CLAIMS_RESULT: ${{ runner.temp }}/claims.json
+        run: node wrapper/scripts/e7-test-auto-availability-check.mjs combine 2>/dev/null
