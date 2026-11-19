@@ -12,7 +12,7 @@
 //   * one non-keep-alive socket, 8 s timeout, NO retry, NO redirect follow (3xx = FAIL), NO token mint / refresh, reply ≤ 1 MiB in memory
 //   * no other request: no checkout API, no database, no Stripe, no reservation, calendar, listing-fee or any mutation endpoint
 // Output: an ALLOWLIST only — totalPrice, and per component type / name / title / value / total / isIncludedInTotalPrice / isMandatory
-// (safe strings, finite numbers), plus a sum check. Never the token, headers, raw body, ids, coupons, extraComponents / selectedComponents.
+// (safe strings; every amount required and exact as safe-integer cents, else FAIL), plus a sum check. Never the token, headers, raw body, ids, coupons, extraComponents / selectedComponents.
 // The reply carries no currency field (Stage D); the currency line says so instead of guessing.
 // OUTSIDE every runner frame and the TEST arm release; it enables nothing and changes no flag, setting, schedule or secret.
 
@@ -79,33 +79,57 @@ export function priceRequestOptions(v, token) {
 const isObj = (x) => x !== null && typeof x === "object" && !Array.isArray(x);
 const SAFE_TEXT = /^[A-Za-z0-9 _.,:()/&%+'-]{1,60}$/;
 const safeText = (v) => (typeof v === "string" && SAFE_TEXT.test(v) ? v : null);
-const finite = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
 const bit = (v) => (v === 0 || v === 1 || v === true || v === false ? (v === 1 || v === true ? 1 : 0) : null);
-const cents = (x) => Math.round(x * 100);
 
 /**
- * reply → { ok:true, totalPrice, components:[allowlisted], sumIncluded, sumMatches } | { ok:false, code }
+ * an amount → integer cents, or a stable failure: "MISSING" (absent / not a number / NaN / ±Infinity) or "UNSAFE" (finite but not
+ * exactly representable as safe-integer cents). Negative amounts are kept (discounts); the caller decides where a sign is invalid.
+ */
+export function toCents(v) {
+  if (typeof v !== "number" || !Number.isFinite(v)) return { ok: false, why: "MISSING" };
+  const scaled = v * 100;
+  if (!Number.isFinite(scaled) || Math.abs(scaled) > Number.MAX_SAFE_INTEGER) return { ok: false, why: "UNSAFE" };
+  const c = Math.round(scaled);
+  if (!Number.isSafeInteger(c)) return { ok: false, why: "UNSAFE" };
+  return { ok: true, cents: c === 0 ? 0 : c }; // normalise -0
+}
+
+/**
+ * reply → { ok:true, totalCents, components:[allowlisted, amounts in integer cents], sumIncludedCents, sumMatches } | { ok:false, code }
  * Fails closed on anything not exactly the documented price-details object; nothing outside the allowlist is ever copied.
+ * Every amount (totalPrice, each component value AND total) is required and must convert to safe-integer cents; the included-cents
+ * accumulation must stay a safe integer. Codes: TOTAL_INVALID (missing / non-numeric / negative total), COMPONENT_MALFORMED (a required
+ * field missing or of the wrong type, incl. value / total), AMOUNT_UNSAFE (a finite amount or the running sum outside safe-integer cents).
  */
 export function sanitizePriceDetails(json) {
   if (!isObj(json)) return { ok: false, code: "SHAPE_NOT_OBJECT" };
   if (json.status !== "success") return { ok: false, code: json.status === "fail" ? "HOSTAWAY_FAIL" : "SHAPE_STATUS_NOT_SUCCESS" };
   const r = json.result;
   if (!isObj(r)) return { ok: false, code: "SHAPE_NO_RESULT_OBJECT" };
-  const total = finite(r.totalPrice);
-  if (total === null || total < 0) return { ok: false, code: "TOTAL_INVALID" };
+  const total = toCents(r.totalPrice);
+  if (!total.ok) return { ok: false, code: total.why === "UNSAFE" ? "AMOUNT_UNSAFE" : "TOTAL_INVALID" };
+  if (total.cents < 0) return { ok: false, code: "TOTAL_INVALID" };
   if (!Array.isArray(r.components) || r.components.length === 0) return { ok: false, code: "COMPONENTS_MISSING" };
   if (r.components.length > CONSTANTS.maxComponents) return { ok: false, code: "COMPONENTS_TOO_MANY" };
   const components = [];
   for (const c of r.components) {
     if (!isObj(c)) return { ok: false, code: "COMPONENT_MALFORMED" };
-    const out = { type: safeText(c.type), name: safeText(c.name), title: safeText(c.title), value: finite(c.value), total: finite(c.total),
+    const value = toCents(c.value); const tot = toCents(c.total);
+    if (!value.ok && value.why === "MISSING") return { ok: false, code: "COMPONENT_MALFORMED" };
+    if (!tot.ok && tot.why === "MISSING") return { ok: false, code: "COMPONENT_MALFORMED" };
+    if (!value.ok || !tot.ok) return { ok: false, code: "AMOUNT_UNSAFE" };
+    const out = { type: safeText(c.type), name: safeText(c.name), title: safeText(c.title), valueCents: value.cents, totalCents: tot.cents,
       isIncludedInTotalPrice: bit(c.isIncludedInTotalPrice), isMandatory: bit(c.isMandatory) };
-    if (out.type === null || out.name === null || out.total === null || out.isIncludedInTotalPrice === null) return { ok: false, code: "COMPONENT_MALFORMED" };
+    if (out.type === null || out.name === null || out.isIncludedInTotalPrice === null) return { ok: false, code: "COMPONENT_MALFORMED" };
     components.push(out);
   }
-  const sumIncluded = components.filter((c) => c.isIncludedInTotalPrice === 1).reduce((s, c) => s + cents(c.total), 0) / 100;
-  return { ok: true, totalPrice: total, components, sumIncluded, sumMatches: cents(sumIncluded) === cents(total) };
+  let sumIncludedCents = 0;
+  for (const c of components) {
+    if (c.isIncludedInTotalPrice !== 1) continue;
+    sumIncludedCents += c.totalCents;
+    if (!Number.isSafeInteger(sumIncludedCents)) return { ok: false, code: "AMOUNT_UNSAFE" };
+  }
+  return { ok: true, totalCents: total.cents, components, sumIncludedCents, sumMatches: sumIncludedCents === total.cents };
 }
 
 /** ONE POST, no retry, no redirect. Resolves { ok, code, http, price? } — never rejects, never carries token / body / headers. */
@@ -139,7 +163,11 @@ export function readPriceDetails({ token, inputs, request = null }) {
   });
 }
 
-const money = (x) => (x === null ? "null" : (cents(x) / 100).toFixed(2));
+/** integer cents → "123.45" / "-10.00" (exact string arithmetic; no float division) */
+export function money(c) {
+  const neg = c < 0; const a = String(Math.abs(c)).padStart(3, "0");
+  return `${neg ? "-" : ""}${a.slice(0, -2)}.${a.slice(-2)}`;
+}
 
 /** the printed report: allowlisted fields only */
 export function report(inputs, r) {
@@ -147,10 +175,10 @@ export function report(inputs, r) {
   if (!r.ok) return [head, `RESULT FAIL code=${r.code} http=${r.http ?? "none"}`];
   const lines = [head];
   for (const c of r.price.components) {
-    lines.push(`component type=${c.type} name=${c.name} title=${c.title ?? "null"} value=${money(c.value)} total=${money(c.total)}`
+    lines.push(`component type=${c.type} name=${c.name} title=${c.title ?? "null"} value=${money(c.valueCents)} total=${money(c.totalCents)}`
       + ` included=${c.isIncludedInTotalPrice} mandatory=${c.isMandatory ?? "null"}`);
   }
-  lines.push(`totalPrice=${money(r.price.totalPrice)} sumIncluded=${money(r.price.sumIncluded)} sumMatches=${r.price.sumMatches}`);
+  lines.push(`totalPrice=${money(r.price.totalCents)} sumIncluded=${money(r.price.sumIncludedCents)} sumMatches=${r.price.sumMatches}`);
   lines.push("currency=NOT_IN_RESPONSE (the price-details reply has no currency field; the listing's own currency is not read by this check)");
   lines.push(`RESULT ${r.price.sumMatches ? "PASS" : "FAIL"} code=${r.price.sumMatches ? "PRICE_CALCULATED" : "SUM_MISMATCH"} http=${r.http}`);
   return lines;

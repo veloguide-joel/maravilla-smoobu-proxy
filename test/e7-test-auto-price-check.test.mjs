@@ -86,8 +86,8 @@ test("R2 fail closed on transport: 3xx (never followed), 4xx, 5xx, timeout, sock
 
 test("P1 sanitized allowlist: only type / name / title / value / total / included / mandatory + totalPrice + sum check; ids, coupons, extras and guest data dropped", () => {
   const p = M.sanitizePriceDetails(GOOD);
-  assert.equal(p.ok, true); assert.equal(p.totalPrice, 150); assert.equal(p.sumIncluded, 150); assert.equal(p.sumMatches, true);
-  for (const c of p.components) assert.deepEqual(Object.keys(c), ["type", "name", "title", "value", "total", "isIncludedInTotalPrice", "isMandatory"]);
+  assert.equal(p.ok, true); assert.equal(p.totalCents, 15000); assert.equal(p.sumIncludedCents, 15000); assert.equal(p.sumMatches, true);
+  for (const c of p.components) assert.deepEqual(Object.keys(c), ["type", "name", "title", "valueCents", "totalCents", "isIncludedInTotalPrice", "isMandatory"]);
   const lines = M.report(inputs(), { ok: true, http: 200, price: p }).join("\n");
   assert.match(lines, /component type=accommodation name=baseRate title=Base rate value=100\.00 total=100\.00 included=1 mandatory=1/);
   assert.match(lines, /component type=fee name=cleaningFee title=Cleaning fee value=50\.00 total=50\.00 included=1 mandatory=1/);
@@ -109,6 +109,7 @@ test("P2 malformed replies fail closed: fail envelope, wrong status, no result, 
   assert.deepEqual(bad((j) => { j.result.components = []; }), { ok: false, code: "COMPONENTS_MISSING" });
   assert.deepEqual(bad((j) => { j.result.components[1].total = null; }), { ok: false, code: "COMPONENT_MALFORMED" });
   assert.deepEqual(bad((j) => { j.result.components[1].isIncludedInTotalPrice = "1"; }), { ok: false, code: "COMPONENT_MALFORMED" });
+  assert.deepEqual(bad((j) => { delete j.result.totalPrice; }), { ok: false, code: "TOTAL_INVALID" });
   assert.deepEqual(bad((j) => { j.result.components = Array(51).fill(GOOD.result.components[0]); }), { ok: false, code: "COMPONENTS_TOO_MANY" });
   const mism = bad((j) => { j.result.totalPrice = 140; });
   assert.equal(mism.sumMatches, false);
@@ -148,4 +149,42 @@ test("W1 workflow contract: workflow_dispatch only (dates + guests), main only, 
   assert.match(withSecret[0], /E7_HOSTAWAY_TOKEN: \$\{\{ secrets\.E7_HOSTAWAY_TOKEN \}\}\n        run: node wrapper\/scripts\/e7-test-auto-price-check\.mjs 2>\/dev\/null(\n|$)/);
   for (const x of steps) { const run = x.split("\n        run:")[1] ?? ""; assert.doesNotMatch(run, /\$\{\{/, "no expression inside a run script"); }
   assert.equal((t.match(/persist-credentials: false/g) || []).length, 1);
+});
+
+test("A1 amounts: value AND total required, finite, numeric; every amount exact safe-integer cents (AMOUNT_UNSAFE); discounts may be negative; the included sum stays safe", () => {
+  const bad = (f) => { const j = structuredClone(GOOD); f(j); return M.sanitizePriceDetails(j); };
+  const MALFORMED = { ok: false, code: "COMPONENT_MALFORMED" }; const UNSAFE = { ok: false, code: "AMOUNT_UNSAFE" };
+  // missing / non-numeric / non-finite value or total → malformed (never emitted as null)
+  for (const v of [undefined, null, "100", "", true, [], {}, NaN]) {
+    assert.deepEqual(bad((j) => { if (v === undefined) delete j.result.components[0].value; else j.result.components[0].value = v; }), MALFORMED, `value ${String(v)}`);
+    assert.deepEqual(bad((j) => { if (v === undefined) delete j.result.components[0].total; else j.result.components[0].total = v; }), MALFORMED, `total ${String(v)}`);
+  }
+  // JSON cannot carry Infinity, but the sanitizer must still refuse it if handed one
+  assert.deepEqual(bad((j) => { j.result.components[0].value = Infinity; }), MALFORMED);
+  assert.deepEqual(bad((j) => { j.result.components[0].total = -Infinity; }), MALFORMED);
+  // huge finite amounts: not representable as safe-integer cents → AMOUNT_UNSAFE (value, total and totalPrice), incl. JSON-parsed 1e308
+  for (const huge of [1e15, -1e15, 9.1e13, -9.1e13, 1e308, Number.MAX_VALUE]) {
+    assert.deepEqual(bad((j) => { j.result.components[2].value = huge; }), UNSAFE, `value ${huge}`);
+    assert.deepEqual(bad((j) => { j.result.components[2].total = huge; }), UNSAFE, `total ${huge}`);
+  }
+  assert.deepEqual(bad((j) => { j.result.totalPrice = 1e308; }), UNSAFE);
+  assert.deepEqual(M.sanitizePriceDetails(JSON.parse('{"status":"success","result":{"totalPrice":1e308,"components":[{"type":"fee","name":"x","value":1,"total":1,"isIncludedInTotalPrice":1}]}}')), UNSAFE);
+  // the largest safe amount is accepted; the running included sum overflowing safe-integer cents is refused
+  const edge = 90071992547409.91; // 9007199254740991 cents = Number.MAX_SAFE_INTEGER
+  assert.equal(M.toCents(edge).cents, Number.MAX_SAFE_INTEGER);
+  assert.deepEqual(M.toCents(90071992547410), { ok: false, why: "UNSAFE" });
+  const two = { status: "success", result: { totalPrice: 1, components: [
+    { type: "fee", name: "a", value: edge, total: edge, isIncludedInTotalPrice: 1 }, { type: "fee", name: "b", value: edge, total: edge, isIncludedInTotalPrice: 1 }] } };
+  assert.deepEqual(M.sanitizePriceDetails(two), UNSAFE, "included-cents accumulation overflow");
+  // legitimate negative discount totals are kept and summed exactly (0.1 + 0.2 style float noise does not leak)
+  const disc = M.sanitizePriceDetails({ status: "success", result: { totalPrice: 135.3, components: [
+    { type: "accommodation", name: "baseRate", title: "Base rate", value: 100.1, total: 100.1, isIncludedInTotalPrice: 1, isMandatory: 1 },
+    { type: "fee", name: "cleaningFee", title: "Cleaning fee", value: 50.2, total: 50.2, isIncludedInTotalPrice: 1, isMandatory: 1 },
+    { type: "discount", name: "weeklyDiscount", title: "Weekly discount", value: -15, total: -15, isIncludedInTotalPrice: 1, isMandatory: 0 }] } });
+  assert.equal(disc.ok, true); assert.equal(disc.sumIncludedCents, 13530); assert.equal(disc.sumMatches, true);
+  const out = M.report(inputs(), { ok: true, http: 200, price: disc }).join("\n");
+  assert.match(out, /name=weeklyDiscount title=Weekly discount value=-15\.00 total=-15\.00 included=1/);
+  assert.match(out, /totalPrice=135\.30 sumIncluded=135\.30 sumMatches=true/);
+  assert.deepEqual(bad((j) => { j.result.totalPrice = -5; }), { ok: false, code: "TOTAL_INVALID" }, "a negative TOTAL is still refused");
+  assert.deepEqual([M.money(0), M.money(5), M.money(-5), M.money(12345), M.money(-1000)], ["0.00", "0.05", "-0.05", "123.45", "-10.00"]);
 });
