@@ -117,6 +117,29 @@ test("H3 per-night classification (lib/bookability nightIsOpen rule): available 
   assert.deepEqual(r.nights, { "2026-12-01": "available", "2026-12-02": "blocked", "2026-12-03": "blocked", "2026-12-04": "unknown",
     "2026-12-05": "unknown", "2026-12-06": "unknown", "2026-12-07": "unknown" });
   assert.equal(M.classifyDay(day("2026-12-01", "available", true)), "available");
+});
+
+test("H4 response forms = the pinned lib/hostaway-calendar.js contract: top-level array OR {result:[…]} (status, if present, must be success); empty / malformed fail closed", async () => {
+  const nights = ["2026-12-01", "2026-12-02"];
+  const days = [day("2026-12-01"), day("2026-12-02", "reserved", 0)];
+  const want = { ok: true, nights: { "2026-12-01": "available", "2026-12-02": "blocked" } };
+  assert.deepEqual(M.classifyCalendar(days, nights), want, "top-level array");
+  assert.deepEqual(M.classifyCalendar({ result: days }, nights), want, "wrapper without status");
+  assert.deepEqual(M.classifyCalendar({ status: "success", result: days }, nights), want, "wrapper with status success");
+  const req = fakeRequest({ status: 200, body: JSON.stringify(days) });
+  assert.deepEqual(await M.readHostawayCalendar({ token: TOKEN, range: range("2026-12-01", "2026-12-03"), request: req }),
+    { ok: true, code: "CALENDAR_READ", http: 200, nights: { "2026-12-01": "available", "2026-12-02": "blocked" } }, "top-level array end to end");
+  const fails = [
+    [[], "SHAPE_EMPTY"], [{ result: [] }, "SHAPE_EMPTY"], [{ status: "success", result: [] }, "SHAPE_EMPTY"],
+    [{ status: "fail", result: days }, "SHAPE_STATUS_NOT_SUCCESS"], [{ status: null, result: days }, "SHAPE_STATUS_NOT_SUCCESS"],
+    [{ status: "success" }, "SHAPE_NO_RESULT_ARRAY"], [{ status: "success", result: { "2026-12-01": days[0] } }, "SHAPE_NO_RESULT_ARRAY"], [{}, "SHAPE_NO_RESULT_ARRAY"],
+    [null, "SHAPE_UNEXPECTED"], ["days", "SHAPE_UNEXPECTED"], [42, "SHAPE_UNEXPECTED"],
+  ];
+  for (const [j, code] of fails) assert.deepEqual(M.classifyCalendar(j, nights), { ok: false, code }, JSON.stringify(j));
+  // malformed entries inside an accepted form never make a night available: they are ignored, so the night is unknown
+  assert.deepEqual(M.classifyCalendar([null, "x", 7, { date: "2026-12-1", status: "available", isAvailable: 1 }, { date: "2026-12-01T00:00:00Z", status: "available", isAvailable: 1 }], nights),
+    { ok: true, nights: { "2026-12-01": "unknown", "2026-12-02": "unknown" } });
+  assert.deepEqual(M.classifyCalendar([day("2026-12-01"), day("2026-12-01")], nights).nights["2026-12-01"], "unknown", "duplicate date in a top-level array");
   assert.equal(M.classifyDay(day("2026-12-01", "available", "1")), "unknown", "string flags are not trusted");
 });
 

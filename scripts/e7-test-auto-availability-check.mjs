@@ -100,13 +100,22 @@ export function classifyDay(d) {
   return unflag(d.isAvailable) ? "blocked" : "unknown"; // a non-available status with isAvailable 1 (or missing) is contradictory → unknown
 }
 
-/** parsed reply → { ok:true, nights:{date:status} } | { ok:false, code } ; a missing / duplicated night is unknown */
+/**
+ * parsed reply → { ok:true, nights:{date:status} } | { ok:false, code }
+ * Accepts exactly the two forms the pinned lib/hostaway-calendar.js accepts: a top-level array, or an object whose `result` is an array
+ * (an object's `status`, when present, must be "success"). An empty array fails (that helper's EMPTY). A missing / duplicated night is unknown.
+ */
 export function classifyCalendar(json, nights) {
-  if (!isObj(json)) return { ok: false, code: "SHAPE_NOT_OBJECT" };
-  if (Object.hasOwn(json, "status") && json.status !== "success") return { ok: false, code: "SHAPE_STATUS_NOT_SUCCESS" };
-  if (!Array.isArray(json.result)) return { ok: false, code: "SHAPE_NO_RESULT_ARRAY" };
+  let raw;
+  if (Array.isArray(json)) raw = json;
+  else if (isObj(json)) {
+    if (Object.hasOwn(json, "status") && json.status !== "success") return { ok: false, code: "SHAPE_STATUS_NOT_SUCCESS" };
+    if (!Array.isArray(json.result)) return { ok: false, code: "SHAPE_NO_RESULT_ARRAY" };
+    raw = json.result;
+  } else return { ok: false, code: "SHAPE_UNEXPECTED" };
+  if (raw.length === 0) return { ok: false, code: "SHAPE_EMPTY" };
   const seen = new Map();
-  for (const d of json.result) {
+  for (const d of raw) {
     const date = isObj(d) ? parseIsoDate(d.date) : null;
     if (!date) continue;
     seen.set(date, seen.has(date) ? "DUPLICATE" : d);
