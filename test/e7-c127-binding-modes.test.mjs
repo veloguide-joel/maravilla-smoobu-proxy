@@ -56,9 +56,18 @@ test("B1 TEST behaviour of bindAuthorization / bindCanceledDuplicate / isTestSes
 });
 
 test("B2 invalid mode is refused first", () => {
+  // omitted and explicit "test" both still bind a valid TEST canceled duplicate (no new refusal)
+  const tc = (top) => authFixture(canceled({ charge: { currency: "mxn" }, top }));
+  const omitted = bindCanceledDuplicate(tc({}));
+  assert.equal(omitted.ok, true);
+  assert.deepEqual(bindCanceledDuplicate(tc({ mode: "test" })), omitted);
+  assert.deepEqual(bindCanceledDuplicate(tc({ mode: undefined })), omitted);
   for (const mode of ["", "LIVE", "prod", null, 1]) {
     assert.deepEqual(bindAuthorization(authFixture({ top: { mode } })), { ok: false, code: "MODE_INVALID" }, String(mode));
-    assert.deepEqual(bindCanceledDuplicate(authFixture({ top: { mode } })), { ok: false, code: "NOT_A_CANCELED_AUTHORIZATION" }, String(mode));
+    assert.deepEqual(bindCanceledDuplicate(authFixture({ top: { mode } })), { ok: false, code: "MODE_INVALID" }, String(mode));
+    // refused first even on an otherwise valid canceled-duplicate read (TEST and LIVE shaped)
+    assert.deepEqual(bindCanceledDuplicate(authFixture(canceled({ top: { mode } }))), { ok: false, code: "MODE_INVALID" }, `canceled ${mode}`);
+    assert.deepEqual(bindCanceledDuplicate(live(canceled({ top: { mode } }))), { ok: false, code: "MODE_INVALID" }, `live canceled ${mode}`);
     assert.equal(isSessionIdForMode("cs_test_a1", mode), false);
   }
 });
