@@ -1038,3 +1038,86 @@ test("LF8 crash AFTER a consistent succeeded create (echo case) but BEFORE RESER
   assert.equal(String((await loadIntent(db.app, a.id)).reservation.reservationId), String(rid));
   assert.equal(w.count("CREATE"), 0, "the worker never sends a create for an already dispatched intent");
 });
+
+// ---------------------------------------------------------------------------------------------
+// C136: Hostaway CREATE TEST-identity fence (DB marker exactly one 'test' row, TEST intent environment, payment livemode false)
+// at the three create decision points. Before the claim: STOP with no write and no provider call. After the claim: the existing
+// SEND_ABORTED path (never sent, settled unknown). The same intent then proceeds normally on intact TEST facts: exactly ONE create.
+function poolRewriting(base, rewrite) {
+  const wrapQ = (q) => async (sql, p) => { const r = await q(sql, p); return rewrite(String(sql), r) || r; };
+  return { query: wrapQ((s, p) => base.query(s, p)), connect: async () => {
+    const c = await base.connect();
+    return new Proxy(c, { get(t, k) { if (k === "query") return wrapQ((s, p) => t.query(s, p)); const v = t[k]; return typeof v === "function" ? v.bind(t) : v; } });
+  } };
+}
+const INST_SQL = "SELECT environment FROM booking.instance";
+const FENCE_SQL = "SELECT environment, payment_livemode FROM booking.intents WHERE id = $1";
+const intentFacts = async (id) => ({ ...(await db.app.query("SELECT state, version, lease_worker_id IS NOT NULL AS leased FROM booking.intents WHERE id = $1", [id])).rows[0],
+  creates: (await opsOf(id, "hostaway.create_reservation")).map((o) => o.state),
+  attempts: await F.count(db.app, "SELECT count(*) AS n FROM booking.hostaway_reservation_attempts WHERE intent_id = $1", [id]) });
+
+test("C136 create fence before RESERVATION_STARTED: live / missing marker, non-TEST intent environment, non-TEST payment -> STOP, zero writes, zero provider calls; then ONE create", async () => {
+  const skipFirst = (f) => { let i = 0; return (sql, r) => (sql === INST_SQL && ++i >= 2 ? f(r) : null); };   // 1st read = the step's assertEnvironment
+  const cases = [
+    ["marker live", "CREATE_FENCE_DATABASE_NOT_TEST", () => skipFirst((r) => ({ ...r, rows: r.rows.map(() => ({ environment: "live" })) }))],
+    ["marker missing", "CREATE_FENCE_DATABASE_NOT_TEST", () => skipFirst((r) => ({ ...r, rows: [] }))],
+    ["intent environment live", "CREATE_FENCE_INTENT_ENVIRONMENT_NOT_TEST", () => (sql, r) => (sql === FENCE_SQL ? { ...r, rows: r.rows.map((x) => ({ ...x, environment: "live" })) } : null)],
+    ["payment livemode true", "CREATE_FENCE_INTENT_NOT_TEST_MODE", () => (sql, r) => (sql === FENCE_SQL ? { ...r, rows: r.rows.map((x) => ({ ...x, payment_livemode: true })) } : null)],
+    ["payment livemode absent", "CREATE_FENCE_INTENT_NOT_TEST_MODE", () => (sql, r) => (sql === FENCE_SQL ? { ...r, rows: r.rows.map((x) => ({ ...x, payment_livemode: null })) } : null)]
+  ];
+  let n = 136;
+  for (const [name, code, mk] of cases) {
+    const w = world(); const id = L(n++);
+    const a = await authorizedIntent(w, id);
+    const h = harness(w, [id]);
+    const f0 = await intentFacts(a.id);
+    const r = await runOrchestratorStep(poolRewriting(db.app, mk()), h.opts({ intentId: a.id }));
+    assert.equal(r.status, "worked", name);
+    assert.ok(r.actions.includes(`STOP:${code}`), `${name}: ${JSON.stringify(r.actions)}`);
+    assert.equal(r.sends, 0);
+    assert.deepEqual(w.calls, [], `${name}: no pricing / lookup / create call`);
+    assert.deepEqual(await intentFacts(a.id), f0, `${name}: nothing written`);
+    assert.equal((await loadIntent(db.app, a.id)).status, "payment_authorized");
+    // intact TEST facts: the normal path, exactly one create
+    await h.until(a.id, (s) => s === "reservation_confirmed", { max: 6 });
+    assert.equal(w.count("CREATE"), 1, name);
+    await noWriteExecuted(a.id);
+  }
+});
+
+test("C136 create fence before RESERVATION_DISPATCHED: non-TEST payment after the start -> STOP before write-before-send (no create row); then ONE create", async () => {
+  const w = world(); const id = L(150);
+  const a = await authorizedIntent(w, id);
+  const h = harness(w, [id]);
+  const s1 = await h.step({ intentId: a.id });
+  assert.ok(s1.actions.includes("RESERVATION_STARTED->reservation_pending"));
+  const f1 = await intentFacts(a.id);
+  const rw = (sql, r) => (sql === FENCE_SQL ? { ...r, rows: r.rows.map((x) => ({ ...x, payment_livemode: true })) } : null);
+  const s2 = await runOrchestratorStep(poolRewriting(db.app, rw), h.opts({ intentId: a.id }));
+  assert.ok(s2.actions.includes("STOP:CREATE_FENCE_INTENT_NOT_TEST_MODE"), JSON.stringify(s2.actions));
+  assert.ok(!s2.actions.includes("RESERVATION_DISPATCHED"));
+  assert.equal(s2.sends, 0);
+  assert.equal(w.count("CREATE"), 0);
+  const f2 = await intentFacts(a.id);
+  assert.deepEqual([f2.state, f2.version, f2.creates, f2.attempts], [f1.state, f1.version, [], 0], "no dispatch, no create row, no attempts row");
+  await h.until(a.id, (s) => s === "reservation_confirmed", { max: 6 });
+  assert.equal(w.count("CREATE"), 1);
+  await noWriteExecuted(a.id);
+});
+
+test("C136 create fence in the pre-send check: marker turns live AFTER the claim (real owner change) -> SEND_ABORTED, never sent, settled unknown", async () => {
+  const w = world(); const id = L(151);
+  const a = await authorizedIntent(w, id);
+  const h = harness(w, [id]);
+  await h.step({ intentId: a.id });
+  let r;
+  try {
+    r = await h.step({ intentId: a.id, hooks: { afterClaim: async () => { await db.owner.query("UPDATE booking.instance SET environment = 'live'"); } } });
+  } finally { await db.owner.query("UPDATE booking.instance SET environment = 'test'"); }
+  assert.equal((await db.owner.query(INST_SQL)).rows.map((x) => x.environment).join(), "test", "marker restored");
+  assert.ok(r.actions.includes("SEND_ABORTED:CREATE_FENCE_DATABASE_NOT_TEST"), JSON.stringify(r.actions));
+  assert.equal(r.sends, 0);
+  assert.equal(w.count("CREATE"), 0, "the create was never sent");
+  assert.deepEqual((await opsOf(a.id, "hostaway.create_reservation")).map((o) => [o.state, o.error_code]), [["outcome_unknown", "SEND_ABORTED_CREATE_FENCE_DATABASE_NOT_TEST"]]);
+  await noWriteExecuted(a.id);
+});

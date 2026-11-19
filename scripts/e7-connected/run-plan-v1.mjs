@@ -29,7 +29,9 @@ export const PROTECTED_RESERVATION_IDS_COPY = Object.freeze(["70636076", "710453
 export const CONSTANT_ORIGINS = Object.freeze({
   // origin pin 91724d9d... -> 2638df7d... (root review of r02 candidate 49e7fe4e, F1/F2; exact, no loosening)
   "lib/booking-db/test-abort.js": "2638df7d3cceab9b0720c2ea1c7fa53d439900ef7392d944ef3663c331ebcc86",
-  "lib/booking-db/reservation-worker.js": "601f48f67052f5dac40b83354b9cf10d5f81950ff9fe9cbd587288d19ed05e88"
+  // C136 (2026-11-19): reservation-worker origin pin 601f48f6... -> ef76c13f... = additive Hostaway CREATE TEST-identity fence only;
+  // the copied PROTECTED_HOSTAWAY_RESERVATION_IDS / DEFAULT_TIMEOUTS are byte-identical (parity tests unchanged)
+  "lib/booking-db/reservation-worker.js": "ef76c13fac9cfff6e51f0afd29f68f24a642d62c05480c5a11481c0fa50f6330"
 });
 /** exact historical identifiers from the accepted ledger; null = the identifier did NOT exist (explicit, never guessed) */
 export const HISTORICAL_EXCLUSIONS = Object.freeze({
