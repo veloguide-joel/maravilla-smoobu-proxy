@@ -434,3 +434,48 @@ test("late canceled duplicate — same event id delivered concurrently: exactly 
   assert.deepEqual(await webhookRow(ev.id), { status: "processed", error_code: "CANCELED_DUPLICATE", intent_id: b.id, attempts: 2 });
   assert.equal((await loadIntent(db.app, b.id)).status, "authorization_released");
 });
+
+// ---------------------------------------------------------------------------------------------------------------------
+// C130: the acknowledgement re-checks, INSIDE its transaction and after the row locks, that the database marker and the locked
+// intent are TEST, and only marks a livemode = false event row. Every refusal rolls back: nothing changes, the event stays
+// unresolved (503 AUTHORIZATION_CANCELED, reason recorded), and a later TEST delivery still acknowledges normally.
+/** a pool whose transaction client rewrites selected results (simulates rows the schema would not let the app role create) */
+function rewritingPool(base, rewrite) {
+  return { query: (...a) => base.query(...a), connect: async () => {
+    const c = await base.connect();
+    return new Proxy(c, { get(t, k) {
+      if (k === "query") return async (sql, p) => { const r = await t.query(sql, p); return rewrite(String(sql), r) || r; };
+      const v = t[k]; return typeof v === "function" ? v.bind(t) : v;
+    } });
+  } };
+}
+test("C130 late canceled duplicate — DB TEST boundary: live / missing instance marker, non-TEST intent environment, non-TEST event row -> refused, nothing changes", async () => {
+  const cases = [
+    ["database marker flips to live after the locks", "DATABASE_NOT_TEST", (b) => ({ hooks: { canceledAck: { afterLocks: () => db.owner.query("UPDATE booking.instance SET environment = 'live'") } } }),
+      () => db.owner.query("UPDATE booking.instance SET environment = 'test'")],
+    ["database marker missing", "DATABASE_NOT_TEST", (b) => ({ hooks: { canceledAck: { afterLocks: () => db.owner.query("DELETE FROM booking.instance") } } }),
+      () => db.owner.query("INSERT INTO booking.instance (environment) VALUES ('test')")],
+    ["locked intent environment not test", "INTENT_ENVIRONMENT_NOT_TEST", null, null,
+      (sql, r) => (/FROM booking\.intents WHERE id = \$1 FOR SHARE/.test(sql) ? { ...r, rows: r.rows.map((x) => ({ ...x, environment: "live" })) } : null)],
+    ["event row not livemode=false", "WEBHOOK_EVENT_NOT_TEST", null, null,
+      (sql, r) => (/error_code = 'CANCELED_DUPLICATE'/.test(sql) ? { ...r, rowCount: 0, rows: [] }
+        : /SELECT status, livemode FROM booking\.stripe_webhook_events/.test(sql) ? { ...r, rows: r.rows.map((x) => ({ ...x, livemode: true })) } : null)]
+  ];
+  for (const [name, detail, depsOf, restore, rewrite] of cases) {
+    const b = await released();
+    const snap0 = await snapshot(b.id);
+    const { ev, run } = lateOf(b, depsOf ? depsOf(b) : {});
+    let r;
+    try { r = await run(rewrite ? rewritingPool(db.app, rewrite) : db.app); } finally { if (restore) await restore(); }
+    assert.equal((await db.owner.query("SELECT environment FROM booking.instance")).rows.map((x) => x.environment).join(), "test", `${name}: marker restored`);
+    assert.deepEqual([r.http, r.code], [503, "AUTHORIZATION_CANCELED"], name);
+    assert.deepEqual(await snapshot(b.id), snap0, `${name}: nothing changed`);
+    const row = await webhookRow(ev.id);
+    assert.deepEqual([row.status, row.error_code], ["failed_retryable", detail], name);
+    // the same event, redelivered against the intact TEST database, is acknowledged exactly once as before
+    const again = await processVerifiedStripeEvent(db.app, ev, { stripe: b.w.stripe, now: NOW0 + 10 * MIN, accountId: ACCT, accountCache: {} });
+    assert.deepEqual(again, { http: 200, code: "DUPLICATE_CANCELED", state: "authorization_released" }, `${name}: redelivery`);
+    assert.deepEqual([(await webhookRow(ev.id)).status, (await webhookRow(ev.id)).error_code], ["processed", "CANCELED_DUPLICATE"]);
+    assert.equal(b.w.writes.hostaway, 0);
+  }
+});
