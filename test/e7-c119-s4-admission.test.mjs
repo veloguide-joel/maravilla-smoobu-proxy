@@ -107,6 +107,16 @@ test("F1 static: the P3 fresh-admission step is BYTE-IDENTICAL in the five moved
       assert.doesNotMatch(t, /schedule:|vars\.|github\.token|actions: write|E7_TEST_ARM:|e7-test-arm|E7_RESEND|E7_STRIPE|E7_DISPATCH_TOKEN/, "availability check: no schedule / arm / token / write");
       continue;
     }
+    // C124: the Hostaway PRICE CALCULATION check (NOT a runtime / arm component): manual dispatch only (dates + guests), main-only, ONE environment,
+    // exactly ONE existing secret NAME in ONE step, no schedule / arm / token / variable / DB; its own W1 / S1 / R1 tests cover the rest
+    if (f === "e7-test-auto-price-check.yml") {
+      assert.match(t, /\non:\n  workflow_dispatch:\n    inputs:\n/, "price check: manual dispatch only"); assert.match(t, /\npermissions:\n  contents: read\n/);
+      assert.deepEqual(t.match(/environment: [a-z0-9-]+/g), ["environment: e7-test-auto"], "price check: ONE environment, the isolated TEST one");
+      assert.match(t, /\n  check:\n    if: github\.ref == 'refs\/heads\/main'\n    runs-on: ubuntu-24\.04\n    environment: e7-test-auto\n/);
+      assert.deepEqual(t.match(/secrets\.[A-Z0-9_]+/g), ["secrets.E7_HOSTAWAY_TOKEN"], "price check: its one existing secret only");
+      assert.doesNotMatch(t, /schedule:|vars\.|github\.token|actions: write|E7_TEST_ARM:|e7-test-arm|E7_DEV_BOOKING|E7_RESEND|E7_STRIPE|E7_DISPATCH_TOKEN/, "price check: no schedule / arm / token / DB / write");
+      continue;
+    }
     probe += (t.match(/\n    environment: e7-readonly-probe\n/g) || []).length; auto += (t.match(/environment: e7-test-auto/g) || []).length;
   }
   assert.deepEqual([probe, auto], [15, 5], "the 5 moved jobs only (+ the C120 sink-probe send job and the C122 status job, checked above); every other e7-readonly-probe reference untouched");

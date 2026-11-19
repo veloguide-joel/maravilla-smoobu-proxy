@@ -1,0 +1,68 @@
+# e7-test-auto-price-check — C124 Hostaway PRICE CALCULATION check for the FIXED TEST listing 606998 (scripts/e7-test-auto-price-check.mjs).
+# ONE POST /v1/listings/606998/calendar/priceDetails with exactly {startingDate, endingDate, numberOfGuests, version:2} — a calculation
+# (Hostaway "Calculate reservation price"; Stage D verified live that it creates nothing). No markup / coupon / components are ever sent.
+#   * manual dispatch only, main only, NO schedule / push / pull_request / API trigger; environment e7-test-auto (existing; no new environment)
+#   * permissions contents: read; the listing is a fixed literal in the script; inputs (dates + guests) reach the script via env only
+#   * ONE step receives ONE existing secret (E7_HOSTAWAY_TOKEN); no retry, no redirect, no token mint / refresh, no other endpoint
+#   * no checkout API, database, Stripe, reservation, calendar change, workflow dispatch, token, variable or setting change
+#   * output: allowlisted price components + totalPrice + sum check + fixed codes only
+# OUTSIDE every runner frame and the TEST arm release (no component lists this file); it enables nothing and changes no flag.
+name: e7-test-auto-price-check
+
+on:
+  workflow_dispatch:
+    inputs:
+      check_in:
+        description: "check-in date YYYY-MM-DD (first night)"
+        type: string
+        required: true
+      check_out:
+        description: "check-out date YYYY-MM-DD (exclusive; at most 31 nights after check-in)"
+        type: string
+        required: true
+      guests:
+        description: "number of guests (1-10)"
+        type: string
+        required: true
+        default: "1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e7-test-auto-price-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: e7-test-auto
+    timeout-minutes: 3
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout wrapper (this repository, exact dispatched commit)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          path: wrapper
+          persist-credentials: false
+      - name: Set up Node 22.22.0
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22.22.0"
+          package-manager-cache: false
+      - name: Verify the wrapper pin (no secret)
+        env:
+          E7_WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          [ "$(git -C wrapper rev-parse HEAD)" = "$E7_WORKFLOW_SHA" ] || { echo "FAIL code=WRAPPER_PIN"; exit 3; }
+      - name: ONE Hostaway price calculation POST (this step only receives the Hostaway secret)
+        env:
+          E7_CHECK_IN: ${{ inputs.check_in }}
+          E7_CHECK_OUT: ${{ inputs.check_out }}
+          E7_GUESTS: ${{ inputs.guests }}
+          E7_HOSTAWAY_TOKEN: ${{ secrets.E7_HOSTAWAY_TOKEN }}
+        run: node wrapper/scripts/e7-test-auto-price-check.mjs 2>/dev/null
