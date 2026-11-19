@@ -186,3 +186,62 @@ test("claims are never released for in-progress money states even if their revie
   assert.deepEqual(blockers, ["STATE_NOT_RELEASABLE:payment_authorized"]);
   assert.equal(await active(L(10)), 1);
 });
+
+// ---------------------------------------------------------------------------------------------------------------------
+// C134: the pay step re-checks, INSIDE its transaction after the intent row lock and before any write, that the database
+// marker is exactly one 'test' row and the locked intent is TEST. A refusal writes nothing (no claim, attempt or
+// Checkout-create operation); the same call against the intact TEST database then claims exactly once.
+function rewritingPoolC134(base, rewrite) {
+  return { query: (...a) => base.query(...a), connect: async () => {
+    const c = await base.connect();
+    return new Proxy(c, { get(t, k) {
+      if (k === "query") return async (sql, p) => { const r = await t.query(sql, p); return rewrite(String(sql), r) || r; };
+      const v = t[k]; return typeof v === "function" ? v.bind(t) : v;
+    } });
+  } };
+}
+const payFacts = async (id) => ({
+  claims: await F.count(db.app, "SELECT count(*) AS n FROM booking.inventory_claims WHERE intent_id = $1", [id]),
+  attempts: await F.count(db.app, "SELECT count(*) AS n FROM booking.payment_attempts WHERE intent_id = $1", [id]),
+  ops: await F.count(db.app, "SELECT count(*) AS n FROM booking.external_operations WHERE intent_id = $1", [id]),
+  state: (await db.app.query("SELECT state, version FROM booking.intents WHERE id = $1", [id])).rows[0]
+});
+test("C134 pay step — DB TEST boundary in the transaction: live / missing marker, non-TEST intent, invalid environment -> refused, nothing written; TEST claims once", async () => {
+  const INST = "SELECT environment FROM booking.instance";
+  const live = (r) => ({ ...r, rows: r.rows.map((x) => ({ ...x, environment: "live" })) });
+  const cases = [
+    ["marker live (real owner change)", "DATABASE_NOT_TEST", { before: () => db.owner.query("UPDATE booking.instance SET environment = 'live'"),
+      restore: () => db.owner.query("UPDATE booking.instance SET environment = 'test'") }],
+    ["marker missing (real owner change)", "DATABASE_NOT_TEST", { before: () => db.owner.query("DELETE FROM booking.instance"),
+      restore: () => db.owner.query("INSERT INTO booking.instance (environment) VALUES ('test')") }],
+    ["marker reads live inside the transaction", "DATABASE_NOT_TEST", { rewrite: (sql, r) => (sql === INST ? live(r) : null) }],
+    ["locked intent environment not test", "INTENT_ENVIRONMENT_NOT_TEST",
+      { rewrite: (sql, r) => (/FROM booking\.intents WHERE id = \$1 FOR UPDATE$/.test(sql) ? live(r) : null) }],
+    ["invalid expected environment", "ENVIRONMENT_INVALID", { opts: { environment: "staging" } }]
+  ];
+  let n = 134;
+  for (const [name, code, c] of cases) {
+    const stay = { listingId: L(n++), from: "2027-10-01", to: "2027-10-03" };
+    const id = await F.withDetails(db.app, stay);
+    const before0 = await payFacts(id);
+    let r;
+    try {
+      if (c.before) await c.before();
+      r = await beginPayStep(c.rewrite ? rewritingPoolC134(db.app, c.rewrite) : db.app, id, { now: F.at(2), ...(c.opts || {}) });
+    } finally { if (c.restore) await c.restore(); }
+    assert.equal((await db.owner.query("SELECT environment FROM booking.instance")).rows.map((x) => x.environment).join(), "test", `${name}: marker restored`);
+    assert.deepEqual(r, { ok: false, error: code }, name);
+    assert.deepEqual(await payFacts(id), before0, `${name}: nothing written`);
+    assert.equal(await active(stay.listingId), 0, `${name}: no claim`);
+    const ok = F.ok(await beginPayStep(db.app, id, { now: F.at(3) }), `${name}: TEST retry`);
+    assert.equal(ok.reused, false);
+    const after1 = await payFacts(id);
+    assert.deepEqual([after1.claims, after1.attempts, after1.ops], [1, 1, 1], name);
+    // a repeat reuses the same attempt: still exactly one of each
+    assert.equal(F.ok(await beginPayStep(db.app, id, { now: F.at(4) })).reused, true);
+    assert.deepEqual(await payFacts(id), after1);
+  }
+  // explicit "test" behaves exactly like the default
+  const id2 = await F.withDetails(db.app, { listingId: L(140), from: "2027-10-05", to: "2027-10-06" });
+  assert.equal(F.ok(await beginPayStep(db.app, id2, { now: F.at(2), environment: "test" })).reused, false);
+});
