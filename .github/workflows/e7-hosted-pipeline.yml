@@ -1,8 +1,8 @@
 # E7 C90: HOSTED TEST PIPELINE runner (scripts/e7-hosted-pipeline.mjs): ONE bounded invocation of the ACCEPTED test-pipeline coordinator
 # (lib/booking-db/test-pipeline-coordinator.js, immutable tooling 71c3dcf8) for ONE fresh accepted TEST checkout on listing 606998 — reservation →
 # capture → recording through the ACCEPTED workers / executor adapters / transports, replacing the manual S1 / S2 / S4 dispatch sequence.
-# C102 ENABLE: the runner's executeEnabled is TRUE for ONE gated TEST run (the reverse CLOSE patch restores false; closed, `verify` refuses
-# HPL_EXECUTE_CLOSED before any value, import, credential, database or provider access, so the secret step is never reached). HONEST LABEL: MANUAL hosted TEST
+# SHIPPED CLOSED: the runner's executeEnabled is FALSE — `verify` (and therefore the execute job) refuses HPL_EXECUTE_CLOSED before any value,
+# import, credential, database or provider access; the secret step below is never reached while it is closed. HONEST LABEL: MANUAL hosted TEST
 # runner (workflow_dispatch; C119 S4: arm + live-main + request-bound, environment `e7-test-auto`); NOT a cron / webhook / API / UI path.
 # <= 2 coordinator invocations per dispatch (C100: the second ONLY after ONE bounded wait <= 150 s of the proven healthy PENDING NOT_DUE branch,
 # with a fresh re-admission), cumulative <= 1 create / 1 capture / 1 offline-charge record; no poll / re-dispatch. Any other PENDING (or a second
@@ -27,7 +27,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "preflight (default: no environment, no secrets, no database) or execute (C102 OPENED for ONE gated TEST run; main only; needs a successful preflight of this dispatch + the exact bindings)"
+        description: "preflight (default: no environment, no secrets, no database) or execute (SHIPPED CLOSED: refuses at verify; main only; needs a successful preflight of this dispatch)"
         type: choice
         options: [preflight, execute]
         default: preflight
@@ -52,7 +52,7 @@ on:
         required: false
         default: ""
       not_before:
-        description: "ISO-8601 UTC instant >= 2026-11-15T21:18:31Z; an intent created before it is refused as HISTORIC."
+        description: "ISO-8601 UTC instant >= 2026-11-15T18:25:04Z; an intent created before it is refused as HISTORIC."
         type: string
         required: false
         default: ""
@@ -235,7 +235,7 @@ jobs:
           live="$(printf '%s' "$body" | node -e 'let s="";process.stdin.on("data",(d)=>{s+=d;if(s.length>8192)process.exit(3);}).on("end",()=>{let j;try{j=JSON.parse(s);}catch{process.exit(3);}const o=j&&j.object;if(!j||j.ref!=="refs/heads/main"||!o||o.type!=="commit"||typeof o.sha!=="string"||!/^[0-9a-f]{40}$/.test(o.sha))process.exit(3);process.stdout.write(o.sha);});')" || { echo "REFUSED: MAIN_UNREADABLE (shape)"; exit 3; }
           [ "$live" = "$FRESH_SHA" ] || { echo "REFUSED: MAIN_MOVED (live main != this run's commit; a CLOSE commit revokes not-yet-admitted work)"; exit 3; }
           echo "fresh admission ok: live main == this run's commit (point-in-time; a later move of main is not seen by this run)"
-      - name: Verify (runner; closed → HPL_EXECUTE_CLOSED here; opened → closure / source / plan / approval / main bindings; no secret, no database)
+      - name: Verify (runner; SHIPPED CLOSED → HPL_EXECUTE_CLOSED here; else closure / source / plan / approval bindings; no secret, no database)
         env:
           E7_TOOLING_DIR: ${{ github.workspace }}/tooling
           E7_TEST_ARM: ${{ vars.E7_TEST_AUTO_ARMED }}
