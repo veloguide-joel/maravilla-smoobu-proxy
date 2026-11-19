@@ -184,9 +184,9 @@ test("W3 stop reasons: plain text per code; neutral fallback for an unknown code
 
 test("W5 shorter Processing text keeps every caution; the release-zone lead carries server authority", () => {
   const t = describe("processing").text;
-  for (const re of [/Keep this tab open/, /test operator/, /Do not make another TEST payment/, /may be held/, /cannot show whether it has been captured or released/,
+  for (const re of [/Keep this tab open/, /run on the server on a schedule, not from this page/, /use Refresh status/, /Do not make another TEST payment/, /may be held/, /cannot show whether it has been captured or released/,
     /does not create a reservation or confirm a booking/]) assert.match(t, re);
-  assert.doesNotMatch(t, /Request release|^Next:/);
+  assert.doesNotMatch(t, /Request release|^Next:|test operator/);
   assert.equal(describe("processing").title, "Processing — not a booking");
   assert.match(/<div id="mv-release-trigger">\s*<p class="muted">([^<]*)</.exec(HTML)[1], /^Only if you want to end this test early\. The server decides whether a release is still allowed\.$/);
 });
