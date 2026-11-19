@@ -784,3 +784,75 @@ test("race: another actor settles the authorization leg (same state, new version
   assert.deepEqual(await legs(a.id), [false, true], "the other actor's settlement stands; nothing escalated");
   assert.equal(await events(a.id, "ESCALATE"), 0);
 });
+
+// ---------------------------------------------------------------------------------------------------------------------
+// C137: Hostaway CANCEL TEST-identity fence (DB marker exactly one 'test' row, TEST intent environment, payment livemode false):
+// (1) first in the cancel leg, before any read / claim -> WAIT, no write, no provider call; (2) right after the claim, before the
+// pre-send re-reads -> the existing SEND_ABORTED path (never sent). The void leg is unchanged; an ordinary TEST cancel stays single.
+function poolRewritingC137(base, rewrite) {
+  const wrapQ = (q) => async (sql, p) => { const r = await q(sql, p); return rewrite(String(sql), r) || r; };
+  return { query: wrapQ((s, p) => base.query(s, p)), connect: async () => {
+    const c = await base.connect();
+    return new Proxy(c, { get(t, k) { if (k === "query") return wrapQ((s, p) => t.query(s, p)); const v = t[k]; return typeof v === "function" ? v.bind(t) : v; } });
+  } };
+}
+const C137_INST = "SELECT environment FROM booking.instance";
+const C137_FENCE = "SELECT environment, payment_livemode FROM booking.intents WHERE id = $1";
+const cancelFacts = async (id) => ({ ...(await db.app.query("SELECT state, version FROM booking.intents WHERE id = $1", [id])).rows[0],
+  legs: await legs(id), cancel: (await opsOf(id, OPS.CANCEL)).map((o) => [o.state, o.attempts, o.dispatched_at]),
+  reads: await F.count(db.app, "SELECT count(*) AS n FROM booking.external_operations WHERE intent_id = $1 AND op_type LIKE '%retrieve%'", [id]) });
+
+test("C137 cancel fence before the cancel leg's reads: live / missing marker, non-TEST intent environment, non-TEST payment -> WAIT, zero writes, zero cancel; then ONE cancel", async () => {
+  const skipFirst = (f) => { let i = 0; return (sql, r) => (sql === C137_INST && ++i >= 2 ? f(r) : null); };   // 1st read = the step's assertEnvironment
+  const cases = [
+    ["marker live", "CANCEL_FENCE_DATABASE_NOT_TEST", () => skipFirst((r) => ({ ...r, rows: r.rows.map(() => ({ environment: "live" })) }))],
+    ["marker missing", "CANCEL_FENCE_DATABASE_NOT_TEST", () => skipFirst((r) => ({ ...r, rows: [] }))],
+    ["intent environment live", "CANCEL_FENCE_INTENT_ENVIRONMENT_NOT_TEST", () => (sql, r) => (sql === C137_FENCE ? { ...r, rows: r.rows.map((x) => ({ ...x, environment: "live" })) } : null)],
+    ["payment livemode true", "CANCEL_FENCE_INTENT_NOT_TEST_MODE", () => (sql, r) => (sql === C137_FENCE ? { ...r, rows: r.rows.map((x) => ({ ...x, payment_livemode: true })) } : null)],
+    ["payment livemode absent", "CANCEL_FENCE_INTENT_NOT_TEST_MODE", () => (sql, r) => (sql === C137_FENCE ? { ...r, rows: r.rows.map((x) => ({ ...x, payment_livemode: null })) } : null)]
+  ];
+  let n = 137;
+  for (const [name, code, mk] of cases) {
+    const w = world();
+    const a = await captureFailed(w, n, "P");
+    const h = harness(w, [n]); n += 1;
+    await h.step({ intentId: a.id });                                              // void leg (unchanged)
+    assert.deepEqual(await legs(a.id), [false, true], `${name}: authorization leg settled first`);
+    const f0 = await cancelFacts(a.id);
+    const calls0 = w.cancels.length;
+    const r = await runCleanupStep(poolRewritingC137(db.app, mk()), h.opts({ intentId: a.id }));
+    await settleLate(r);
+    assert.ok(r.actions.includes(`WAIT:${code}`), `${name}: ${JSON.stringify(r.actions)}`);
+    assert.equal(r.sends, 0, name);
+    assert.equal(w.cancels.length, calls0, `${name}: no cancel sent`);
+    assert.deepEqual(await cancelFacts(a.id), f0, `${name}: nothing written (no claim, no read row, no event)`);
+    assert.equal(await state(a.id), "capture_failed");
+    // intact TEST facts: exactly one cancel, then idempotent
+    await h.until(a.id, (s) => s === "cancelled", { max: 6 });
+    assert.equal(w.cancels.length, 1, name);
+    for (let k = 0; k < 3; k++) { h.clk.t += MIN; await settleLate(await h.step({ intentId: a.id })); }
+    assert.equal(w.cancels.length, 1, `${name}: repeated steps never resend`);
+    assert.equal((await opsOf(a.id, OPS.CANCEL))[0].state, "succeeded");
+  }
+});
+
+test("C137 cancel fence after the claim: marker turns live in afterClaim (real owner change) -> SEND_ABORTED, never sent; later steps never resend", async () => {
+  const w = world();
+  const a = await captureFailed(w, 160, "P");
+  const h = harness(w, [160]);
+  await h.step({ intentId: a.id });                                                // void leg
+  let r;
+  try {
+    r = await h.step({ intentId: a.id, hooks: { afterClaim: async (op) => { if (op.opType === OPS.CANCEL || op.op_type === OPS.CANCEL) await db.owner.query("UPDATE booking.instance SET environment = 'live'"); } } });
+    await settleLate(r);
+  } finally { await db.owner.query("UPDATE booking.instance SET environment = 'test'"); }
+  assert.equal((await db.owner.query(C137_INST)).rows.map((x) => x.environment).join(), "test", "marker restored");
+  assert.ok(r.actions.includes("SEND_ABORTED:CANCEL_FENCE_DATABASE_NOT_TEST"), JSON.stringify(r.actions));
+  assert.equal(r.sends, 0);
+  assert.equal(w.cancels.length, 0, "the cancel was never sent");
+  assert.deepEqual((await opsOf(a.id, OPS.CANCEL)).map((o) => [o.state, o.error_code]), [["outcome_unknown", "SEND_ABORTED_CANCEL_FENCE_DATABASE_NOT_TEST"]]);
+  // unknown -> reads only; the still-active reservation is a fenced owner case: never a resend
+  for (let k = 0; k < 6; k++) { h.clk.t += 3 * MIN; await settleLate(await h.step({ intentId: a.id })); }
+  assert.equal(w.cancels.length, 0, "no resend, ever");
+  assert.equal(await state(a.id), "reconciliation_required");
+});
