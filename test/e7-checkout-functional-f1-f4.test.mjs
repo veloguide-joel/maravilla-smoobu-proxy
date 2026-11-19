@@ -86,7 +86,10 @@ test("F2-1 401 is a persistent 'lost' state: honest title, no Refresh, no pay / 
   const f = fakeApi({ status: [reply(401, { code: "UNAUTHORIZED" })] }); const r = rig({ api: f, search: "?checkout=complete" }); await r.c.init();
   const chk = (label) => { const v = r.last(); assert.deepEqual([v.screen, v.title, v.canRefresh, v.canPay, v.canRequestRelease, v.retry], ["lost", "This tab can no longer check this TEST booking", false, false, false, null], label); assert.equal(v.pollStopped, null, `${label}: no Refresh hint`); };
   chk("after 401");
-  assert.doesNotMatch(r.last().text, NO_CLAIM); assert.match(r.last().text, /says nothing about whether a TEST hold exists/);
+  assert.doesNotMatch(r.last().text, NO_CLAIM);
+  assert.match(r.last().text, /says nothing about whether a TEST hold or payment exists/);
+  assert.match(r.last().text, /cannot determine the outcome/);
+  assert.match(r.last().text, /the owner must review this TEST booking/);
   const before = f.calls.length;
   await r.c.refresh(); chk("refresh"); await r.c.pay(); chk("pay");
   r.c.armRelease(); await r.c.confirmRelease(); chk("release");
