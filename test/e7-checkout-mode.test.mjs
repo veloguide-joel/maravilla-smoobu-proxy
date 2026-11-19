@@ -1,5 +1,6 @@
 // C125 — explicit TEST / LIVE checkout mode gate (lib/checkout/stripe-test-mode.js checkoutModeGate) and its placement as the FIRST check of
-// stripeTestGate(), which the intent API and both webhook entry points call before anything else. Pure: no SDK, pool or network.
+// stripeTestGate(), which the intent API gate and the webhook HTTP wrapper call first (the internal processor keeps its own
+// livemode === false guard). Pure: no SDK, pool or network.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { checkoutModeGate, parseCheckoutMode, parseLiveListings, returnUrlOnOrigin, validateLiveContract, NEVER_LIVE_LISTING_IDS, stripeTestGate } from "../lib/checkout/stripe-test-mode.js";
@@ -56,7 +57,7 @@ test("T2 TEST fails closed when LIVE credentials / LIVE listings are visible; a 
 test("L1 a fully valid LIVE contract is still REFUSED (LIVE_NOT_ACTIVATED) at every checkout entry gate; nothing returns a LIVE config", () => {
   assert.deepEqual(validateLiveContract(LIVE).ok, true);
   assert.deepEqual(checkoutModeGate(LIVE), { ok: false, code: "LIVE_NOT_ACTIVATED" });
-  assert.deepEqual(stripeTestGate(LIVE), { ok: false, code: "LIVE_NOT_ACTIVATED" }, "intent API + both webhook entry points call this first");
+  assert.deepEqual(stripeTestGate(LIVE), { ok: false, code: "LIVE_NOT_ACTIVATED" }, "intent API gate + webhook HTTP wrapper call this first");
   assert.deepEqual(intentApiGate({ ...LIVE, MV_RATE_LIMIT_SALT: "s".repeat(40) }), { ok: false, code: "LIVE_NOT_ACTIVATED" });
   noSecret(stripeTestGate(LIVE));
 });
