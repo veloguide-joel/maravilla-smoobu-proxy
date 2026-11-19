@@ -1,15 +1,20 @@
 # E7 C119 S3: HOSTED READ-ONLY TEST STATUS / RECONCILIATION runner (scripts/e7-hosted-status.mjs) — it REPORTS counts / codes, it never repairs.
-# SHIPPED CLOSED: the runner's readEnabled is FALSE — `verify` (and therefore the status job) refuses STS_READ_CLOSED before any import, credential,
-# database or network; the secret step below is never reached while it is closed. HONEST LABEL: MANUAL workflow_dispatch ONLY (no schedule, no arm,
-# no activation wiring — that is future, separately reviewed work); OUTSIDE the C119 S2 arm release. Default mode `preflight` = no environment, no
-# secret, no database (digests only). The ONLY secret (existing NAME E7_DEV_BOOKING_DATABASE_URL = the runtime role, environment `e7-readonly-probe`)
-# appears in the ONE last status step only; ONE read-only snapshot; no provider credential; no write. No new secret, environment, permission or setting.
+# C122 L3 DRAFT: the runner's readEnabled is TRUE (read-only). HONEST LABEL: manual workflow_dispatch AND a bounded TEST schedule (:07 / :37, nominal;
+# GitHub may delay or drop scheduled runs — NOT a delivery SLA). The scheduled status job runs ONLY while the repository variable E7_TEST_AUTO_ARMED is
+# present (a PRESENCE gate: this workflow is OUTSIDE the C119 S2 arm release and never checks the release digest), so no environment job is queued
+# while the standing TEST release is unarmed. The status job moved from `e7-readonly-probe` to the isolated `e7-test-auto` (the SAME existing secret
+# NAME E7_DEV_BOOKING_DATABASE_URL = the runtime role; main-only; ATTENTION / UNKNOWN → exit 1 → GitHub's own failed-run notice; nothing is sent).
+# Scheduled runs bind the expected source digest to the preflight job's computation of the SAME commit (a consistency check, not an independent review
+# binding) and the closure digest to the pinned literal. Default mode `preflight` = no environment, no secret, no database (digests only). The ONLY
+# secret appears in the ONE last status step only; ONE read-only snapshot; no provider credential; no write. No new secret, environment, permission or setting.
 # Source digest = SHA-256 over: prefix "e7-hosted-status-v1\n", then for each file IN THIS ORDER
 #   1. scripts/e7-hosted-status.mjs  2. test/e7-hosted-status.test.mjs  3. test/e7-hosted-status-workflow.test.mjs  4. .github/workflows/e7-hosted-status.yml
 # the frame  <relative path> NUL <decimal byte length> NUL <file bytes> NUL  (the framedDigest convention of the reviewed runners).
 name: e7-hosted-status
 
 on:
+  schedule:
+    - cron: '7,37 * * * *'
   workflow_dispatch:
     inputs:
       mode:
@@ -39,6 +44,8 @@ jobs:
   preflight:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    outputs:
+      source: ${{ steps.pf.outputs.source }}
     steps:
       - name: Checkout wrapper (this repository, exact dispatched commit)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -59,16 +66,22 @@ jobs:
           node-version: "22.22.0"
           package-manager-cache: false
       - name: Preflight (runner; digests + layout; no environment, no secret, no database, no dependency install)
+        id: pf
         env:
           E7_TOOLING_DIR: ${{ github.workspace }}/tooling
           E7_WORKFLOW_SHA: ${{ github.sha }}
-        run: node wrapper/scripts/e7-hosted-status.mjs preflight
+        run: |
+          set -eu
+          node wrapper/scripts/e7-hosted-status.mjs preflight > "$RUNNER_TEMP/pf.json"
+          cat "$RUNNER_TEMP/pf.json"
+          src="$(node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));if(j.code!=="PREFLIGHT_OK"||!/^[0-9a-f]{64}$/.test(j.sourceDigest))process.exit(3);process.stdout.write(j.sourceDigest)' "$RUNNER_TEMP/pf.json")"
+          echo "source=$src" >> "$GITHUB_OUTPUT"
 
   status:
     needs: preflight
-    if: inputs.mode == 'status' && github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && ((github.event_name == 'workflow_dispatch' && inputs.mode == 'status') || (github.event_name == 'schedule' && vars.E7_TEST_AUTO_ARMED != ''))
     runs-on: ubuntu-24.04
-    environment: e7-readonly-probe
+    environment: e7-test-auto
     timeout-minutes: 10
     steps:
       - name: Checkout wrapper (this repository, exact dispatched commit)
@@ -93,8 +106,8 @@ jobs:
         env:
           E7_WORKFLOW_SHA: ${{ github.sha }}
           E7_TOOLING_PIN: 66133a22edca925e6386c4d178c251fa5f11c82e
-          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
-          E7_EXPECTED_CLOSURE_DIGEST: ${{ inputs.expected_closure_digest }}
+          E7_EXPECTED_SOURCE_DIGEST: ${{ github.event_name == 'schedule' && needs.preflight.outputs.source || inputs.expected_source_digest }}
+          E7_EXPECTED_CLOSURE_DIGEST: ${{ github.event_name == 'schedule' && '20e8a125a7981f6d442bfd61749e22cfd0ee2fefe4272201a413577cf598ef54' || inputs.expected_closure_digest }}
         run: |
           set -eu
           head="$(git -C wrapper rev-parse HEAD)"
@@ -108,8 +121,8 @@ jobs:
       - name: Verify (runner; SHIPPED CLOSED → STS_READ_CLOSED here; no secret, no database)
         env:
           E7_TOOLING_DIR: ${{ github.workspace }}/tooling
-          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
-          E7_EXPECTED_CLOSURE_DIGEST: ${{ inputs.expected_closure_digest }}
+          E7_EXPECTED_SOURCE_DIGEST: ${{ github.event_name == 'schedule' && needs.preflight.outputs.source || inputs.expected_source_digest }}
+          E7_EXPECTED_CLOSURE_DIGEST: ${{ github.event_name == 'schedule' && '20e8a125a7981f6d442bfd61749e22cfd0ee2fefe4272201a413577cf598ef54' || inputs.expected_closure_digest }}
           E7_WORKFLOW_SHA: ${{ github.sha }}
           E7_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
         run: node wrapper/scripts/e7-hosted-status.mjs verify
@@ -121,8 +134,8 @@ jobs:
       - name: ONE read-only status snapshot (the DB secret only, this step only; counts / codes only; no write, no provider)
         env:
           E7_TOOLING_DIR: ${{ github.workspace }}/tooling
-          E7_EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
-          E7_EXPECTED_CLOSURE_DIGEST: ${{ inputs.expected_closure_digest }}
+          E7_EXPECTED_SOURCE_DIGEST: ${{ github.event_name == 'schedule' && needs.preflight.outputs.source || inputs.expected_source_digest }}
+          E7_EXPECTED_CLOSURE_DIGEST: ${{ github.event_name == 'schedule' && '20e8a125a7981f6d442bfd61749e22cfd0ee2fefe4272201a413577cf598ef54' || inputs.expected_closure_digest }}
           E7_WORKFLOW_SHA: ${{ github.sha }}
           E7_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
           E7_CA_FILE: ${{ runner.temp }}/prod-ca-2021.crt

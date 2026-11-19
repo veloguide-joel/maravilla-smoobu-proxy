@@ -34,16 +34,18 @@ function runBlock(stepName) {
   const m = yml.slice(i).match(/\n        run: \|\n((?:          .*\n)+)/); assert.ok(m); return m[1].split("\n").map((l) => l.replace(/^ {10}/, "")).join("\n");
 }
 
-test("W1 static: MANUAL workflow_dispatch ONLY (no schedule / push / pull_request / workflow_run / repository_dispatch / workflow_call — no activation wiring); inputs exactly mode (choice [preflight, status], default preflight) + two expected digests — no identifier / SQL / scope / threshold input; contents: read; serialised", () => {
-  assert.match(yml, /^on:\n  workflow_dispatch:\n    inputs:\n      mode:\n/m);
-  assert.doesNotMatch(code, /\n  (schedule|push|pull_request|pull_request_target|workflow_call|repository_dispatch|workflow_run):|cron:/);
+test("W1 static (C122): workflow_dispatch + ONE bounded TEST schedule (:07 / :37) ONLY (no push / pull_request / workflow_run / repository_dispatch / workflow_call); inputs exactly mode (choice [preflight, status], default preflight) + two expected digests — no identifier / SQL / scope / threshold input; contents: read; serialised; the ONLY variable read is the arm PRESENCE in the status job's if (no digest check, no arm script, no E7_TEST_ARM)", () => {
+  assert.match(yml, /^on:\n  schedule:\n    - cron: '7,37 \* \* \* \*'\n  workflow_dispatch:\n    inputs:\n      mode:\n/m);
+  assert.equal(count(/cron:/g), 1);
+  assert.doesNotMatch(code, /\n  (push|pull_request|pull_request_target|workflow_call|repository_dispatch|workflow_run):/);
   assert.match(yml, /      mode:\n(?:        .*\n)*?        type: choice\n        options: \[preflight, status\]\n        default: preflight\n/);
   assert.deepEqual([...yml.matchAll(/^      ([a-z_]+):\n        description/gm)].map((m) => m[1]), ["mode", "expected_source_digest", "expected_closure_digest"]);
   assert.match(yml, /\npermissions:\n  contents: read\n\n/); assert.equal(count(/permissions:/g), 1); assert.doesNotMatch(code, /: write|id-token:/);
   assert.match(yml, /\nconcurrency:\n  group: e7-hosted-status\n  cancel-in-progress: false\n/);
   assert.deepEqual([...yml.matchAll(/^  ([a-z-]+):\n    (?:needs|runs-on|if)/gm)].map((m) => m[1]), ["preflight", "status"]);
   assert.deepEqual([...S.CONSTANTS.runnerFiles], FILES);
-  assert.doesNotMatch(code, /vars\.|E7_TEST_ARM|e7-test-arm/, "no arm wiring (future, separately reviewed)");
+  assert.deepEqual(code.match(/vars\.[A-Za-z0-9_]+[^)\n]*/g), ["vars.E7_TEST_AUTO_ARMED != ''"], "ONE variable read: the arm PRESENCE gate");
+  assert.doesNotMatch(code, /E7_TEST_ARM:|e7-test-arm/, "no arm digest check (the runner stays outside the release)");
 });
 
 test("W2 static: exact-SHA wrapper + the tooling pin 66133a22 checkouts (persist-credentials false), the reviewed action pins (== the C50 workflow), Node 22.22.0; the preflight job has no environment / secret / npm / curl", () => {
@@ -56,8 +58,12 @@ test("W2 static: exact-SHA wrapper + the tooling pin 66133a22 checkouts (persist
   assert.equal(S.CONSTANTS.toolingCommit, PIN);
 });
 
-test("W3 static: status job needs preflight AND mode == 'status' && main AND the EXISTING environment e7-readonly-probe; order: checkouts → node → pre-secret re-check → runner verify (SHIPPED CLOSED refuses HERE) → npm ci → CA → the ONE status step LAST; the ONLY secret (existing NAME E7_DEV_BOOKING_DATABASE_URL) once, in that last step; no provider secret / token; no expression inside any run; every E7_* key admitted", () => {
-  assert.match(jobs.status, /^\n  status:\n    needs: preflight\n    if: inputs\.mode == 'status' && github\.ref == 'refs\/heads\/main'\n    runs-on: ubuntu-24\.04\n    environment: e7-readonly-probe\n    timeout-minutes: 10\n/);
+test("W3 static (C122): status job needs preflight AND main AND (manual mode == 'status' OR a schedule while the arm is PRESENT) AND the isolated EXISTING environment e7-test-auto (moved from e7-readonly-probe; the SAME existing secret NAME); order: checkouts → node → pre-secret re-check → runner verify (SHIPPED CLOSED refuses HERE) → npm ci → CA → the ONE status step LAST; the ONLY secret (existing NAME E7_DEV_BOOKING_DATABASE_URL) once, in that last step; no provider secret / token; no expression inside any run; every E7_* key admitted", () => {
+  assert.match(jobs.status, /^\n  status:\n    needs: preflight\n    if: github\.ref == 'refs\/heads\/main' && \(\(github\.event_name == 'workflow_dispatch' && inputs\.mode == 'status'\) \|\| \(github\.event_name == 'schedule' && vars\.E7_TEST_AUTO_ARMED != ''\)\)\n    runs-on: ubuntu-24\.04\n    environment: e7-test-auto\n    timeout-minutes: 10\n/);
+  // scheduled runs: the source digest = the preflight job's computation of the SAME commit (consistency, not an independent review binding); closure = the pinned literal
+  assert.equal(count(/E7_EXPECTED_SOURCE_DIGEST: \$\{\{ github\.event_name == 'schedule' && needs\.preflight\.outputs\.source \|\| inputs\.expected_source_digest \}\}/g), 3);
+  assert.equal(count(new RegExp(`E7_EXPECTED_CLOSURE_DIGEST: \\$\\{\\{ github\\.event_name == 'schedule' && '${S.CONSTANTS.closureDigest}' \\|\\| inputs\\.expected_closure_digest \\}\\}`, "g")), 3);
+  assert.match(jobs.preflight, /\n    outputs:\n      source: \$\{\{ steps\.pf\.outputs\.source \}\}\n/);
   assert.equal(count(/environment: /g), 1);
   assert.deepEqual(steps(jobs.status).map((s) => s.split(" (")[0]), ["Checkout wrapper", "Checkout merged E7 tooling", "Set up Node 22.22.0", "Re-check bindings BEFORE the secret", "Verify",
     "Install the pinned dependency from the verified lockfile", "Fetch the public Supabase CA", "ONE read-only status snapshot"]);
@@ -68,8 +74,8 @@ test("W3 static: status job needs preflight AND mode == 'status' && main AND the
   assert.doesNotMatch(yml, /E7_RESEND|E7_STRIPE|E7_HOSTAWAY|E7_DISPATCH_TOKEN|github\.token|api\.stripe\.com|api\.hostaway\.com/);
   for (const blk of yml.split(/\n      - name: /).slice(1)) { const r = blk.match(/\n        run: \|\n((?:          .*\n)+)|\n        run: (.*)\n/); if (r) assert.doesNotMatch(r[1] ?? r[2], /\$\{\{/); }
   for (const k of [...yml.matchAll(/^          (E7_[A-Z0-9_]+):/gm)].map((m) => m[1])) if (k !== "E7_TOOLING_PIN") assert.ok(S.ALLOWED_E7_KEYS.includes(k), k);
-  assert.equal(count(/e7-hosted-status\.mjs (preflight|verify|status)\n/g), 3);
-  assert.equal(S.CONSTANTS.readEnabled, false, "SHIPPED CLOSED: the verify step refuses STS_READ_CLOSED, so the secret step never runs");
+  assert.equal(count(/e7-hosted-status\.mjs (verify|status)\n/g), 2); assert.equal(count(/e7-hosted-status\.mjs preflight > "\$RUNNER_TEMP\/pf\.json"\n/g), 1);
+  assert.equal(S.CONSTANTS.readEnabled, true, "C122: opened (read-only); a CLOSED constant would refuse at verify before the secret step");
 });
 
 const headSha = execFileSync("git", ["-C", ROOT, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
@@ -103,4 +109,19 @@ test("W5 the status runner is OUTSIDE the TEST arm release: the release recomput
   for (const f of ["e7-hosted-kickoff.mjs", "e7-hosted-booking-confirmation.mjs", "e7-hosted-pipeline.mjs", "e7-hosted-notify-inspect.mjs", "e7-hosted-tls-probe.mjs"]) {
     const X = await import(`../scripts/${f}`); const rf = X.CONSTANTS?.runnerFiles ?? X.RUNNER_FILES; assert.ok(!rf.some((g) => FILES.includes(g)), f);
   }
+});
+
+test("W6 C122 the preflight output block executed locally: it runs the runner's preflight (no secret / DB) and publishes ONLY a 64-hex source digest EQUAL to the runner's framedDigest; a refused / malformed preflight publishes nothing and fails", async () => {
+  const want = await S.framedDigest(ROOT, FILES, S.SOURCE_DIGEST_PREFIX);
+  const blk = runBlock("Preflight (runner; digests + layout; no environment, no secret, no database, no dependency install)");
+  assert.doesNotMatch(blk, /E7_DEV_BOOKING_DATABASE_URL|secrets\.|\.mjs (verify|status)/);
+  const d = sandbox(); try {
+    const rt = mkdtempSync(join(tmpdir(), "e7-s3-rt-")); const out = join(rt, "out");
+    const r = sh(blk, { E7_TOOLING_DIR: join(d, "tooling"), E7_WORKFLOW_SHA: headSha, RUNNER_TEMP: rt, GITHUB_OUTPUT: out }, d);
+    assert.equal(r.status, 0, r.out); assert.equal(readFileSync(out, "utf8"), `source=${want}\n`);
+    const out2 = join(rt, "out2");
+    const bad = sh(blk, { E7_TOOLING_DIR: join(d, "nope"), E7_WORKFLOW_SHA: headSha, RUNNER_TEMP: rt, GITHUB_OUTPUT: out2 }, d);
+    assert.notEqual(bad.status, 0); assert.throws(() => readFileSync(out2, "utf8"), "nothing published");
+    rmSync(rt, { recursive: true, force: true });
+  } finally { rmSync(d, { recursive: true, force: true }); }
 });

@@ -27,19 +27,20 @@ const TOOLING = realpathSync(process.env.E7_TOOLING_DIR || join(ROOT, "..", "too
 const S = await import("../scripts/e7-hosted-status.mjs");
 const C = S.CONSTANTS; const Q = S.STATUS_QUERIES;
 const sha = (b) => createHash("sha256").update(b).digest("hex");
-const OPEN = Object.freeze({ ...C, readEnabled: true });                 // the TEST-LOCAL seam only; the shipped constant stays false
+const OPEN = Object.freeze({ ...C, readEnabled: true });                 // C122: equal to the shipped constants (opened); kept as the explicit seam
 const PROC = { versions: { node: "22.22.0" }, platform: "linux", execArgv: [], getuid: () => 1000 };
 const IID = "3f1c2b4a-5d6e-4f70-8a91-b2c3d4e5f607"; const OID = "7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d";
 const PII = /@|SENTINEL|MV-[A-Z0-9]{5,}|\bpi_[A-Za-z0-9]|\bre_[A-Za-z0-9]|Bearer|FAKEPW|3f1c2b4a|7a8b9c0d/;
 const DBURL = "postgresql://mv_booking_app_dev.mxotevtiscernhqilyiu:FAKEPW@aws-0-us-east-1.pooler.supabase.com:6543/postgres";
 const never = (n) => async () => { throw new Error(`must not be called: ${n}`); };
 
-test("T1 SHIPPED CLOSED: readEnabled false; verify AND status refuse STS_READ_CLOSED from KEY NAMES only (zero env value reads, imports, DB, CA) even with the secret present; no schedule / arm / activation wiring", async () => {
-  assert.equal(C.readEnabled, false); assert.ok(Object.isFrozen(C) && Object.isFrozen(C.thresholds) && Object.isFrozen(C.scope));
+test("T1 C122 OPENED: readEnabled true (read-only); with CLOSED constants (seam) verify AND status refuse STS_READ_CLOSED from KEY NAMES only (zero env value reads, imports, DB, CA) even with the secret present; the runner itself reads no arm / provider / token", async () => {
+  assert.equal(C.readEnabled, true); assert.ok(Object.isFrozen(C) && Object.isFrozen(C.thresholds) && Object.isFrozen(C.scope));
+  const CLOSED = Object.freeze({ ...C, readEnabled: false });
   for (const mode of ["verify", "status"]) {
     const reads = []; const base = { E7_DEV_BOOKING_DATABASE_URL: DBURL, E7_TOOLING_DIR: TOOLING, E7_EXPECTED_SOURCE_DIGEST: "a".repeat(64), E7_EXPECTED_CLOSURE_DIGEST: C.closureDigest, GITHUB_REF: "refs/heads/main" };
     const env = new Proxy(base, { get(t, k) { reads.push(String(k)); return t[k]; } });
-    const r = await S.runHosted({ mode, env, proc: PROC, wrapperDir: ROOT, deps: { importPool: never("pool"), runCore: never("core"), readPgVersion: never("pg"), readCa: never("ca") } });
+    const r = await S.runHosted({ mode, env, proc: PROC, wrapperDir: ROOT, deps: { constants: CLOSED, importPool: never("pool"), runCore: never("core"), readPgVersion: never("pg"), readCa: never("ca") } });
     assert.deepEqual([r.exitCode, r.result.code, r.result.status, r.result.closureDigest], [1, "STS_READ_CLOSED", null, null], mode);
     assert.deepEqual(reads, [], `${mode}: not one env value was read`);
   }
@@ -124,14 +125,23 @@ const AGG = {
 };
 function world(over = {}) {
   return { role: { ro: "on", iso: "repeatable read", su: false, app: true, adm: false, rep: false, own: false }, catalog: C.catalogPin28, instance: { n: 1, env: "test" }, clock: { ok: true, synthetic: false },
-    scope: { n: 1 }, agg: AGG, notifyPages: [[{ op_id: OID, intent_id: IID, template: "booking_confirmed", class: "SUCCEEDED", code: null, in_scope: true, age_min: 30 }]],
+    scope: { n: 1 }, agg: AGG, notifyPages: [[{ op_id: OID, intent_id: IID, template: "booking_confirmed", class: "SUCCEEDED", code: null, in_scope: true, in_hist: false, age_min: 30 }]],
     refunds: [{ x: { cancelled: true, refundStatus: "pending" } }], throwAt: null, ...over };
 }
+const HIST_RANGE = `[${C.scope.cutoff},${C.scope.standingCutoff})`; const STANDING_RANGE = `[${C.scope.standingCutoff},)`;
 function fakePool(w, log) {
   let page = 0;
   return { connect: async () => ({ query: async (t, p) => {
     const k = Object.keys(Q).find((x) => Q[x] === t) ?? "UNLISTED"; log.push(k); if (k === "UNLISTED") throw new Error("unlisted");
     if (w.throwAt === k) throw new Error("SENTINEL db FAKEPW");
+    if (w.params) w.params.push([k, p ? p[1] : undefined, k === "notifyPage" ? [p[3], p[5]] : undefined]);
+    // C122: the historic window (its tstzrange in $2) may carry its own fixture (w.hist = { agg, raw, scope, refunds })
+    if (w.hist && Array.isArray(p) && p[1] === HIST_RANGE && k !== "notifyPage") {
+      const h = w.hist;
+      if (k === "scope") return { rows: [h.scope ?? { n: 0 }] };
+      if (k === "refunds") return { rows: h.refunds ?? [] };
+      if (["kickoff", "pipeline", "operations", "cases", "work", "notifyMissing"].includes(k)) return h.raw?.[k] ?? { rows: [{ ...(h.agg ?? AGG)[k] }] };
+    }
     switch (k) {
       case "role": return { rows: [w.role] };
       case "catalog": return { rows: [{ id: { sections: w.catalog.sections, readPath: w.catalog.readPath, readPathCount: w.catalog.readPathCount } }] };
@@ -178,8 +188,8 @@ test("T6 core (fake): missing / unreadable / malformed data is UNKNOWN — never
     assert.equal(res.metrics[metric].status, "UNKNOWN", k); assert.equal(res.metrics[metric].counts, null); assert.equal(res.overall, "UNKNOWN");
     if (k === "pipeline") assert.equal(res.metrics.authorization.status, "UNKNOWN");
   }
-  for (const pages of [[[{ op_id: OID, intent_id: IID, template: "booking_confirmed", class: "NEW_CLASS", code: null, in_scope: true, age_min: 1 }]], [[{ op_id: 1 }]],
-    [[{ op_id: OID, intent_id: IID, template: "booking_confirmed", class: "LATCHED", code: "lower", in_scope: true, age_min: 1 }]], Array.from({ length: 21 }, () => Array.from({ length: 100 }, () => ({ op_id: OID, intent_id: IID, template: "x", class: "SUCCEEDED", code: null, in_scope: true, age_min: 1 })))]) {
+  for (const pages of [[[{ op_id: OID, intent_id: IID, template: "booking_confirmed", class: "NEW_CLASS", code: null, in_scope: true, in_hist: false, age_min: 1 }]], [[{ op_id: 1 }]],
+    [[{ op_id: OID, intent_id: IID, template: "booking_confirmed", class: "LATCHED", code: "lower", in_scope: true, in_hist: false, age_min: 1 }]], Array.from({ length: 21 }, () => Array.from({ length: 100 }, () => ({ op_id: OID, intent_id: IID, template: "x", class: "SUCCEEDED", code: null, in_scope: true, in_hist: false, age_min: 1 })))]) {
     const { res } = await core(world({ notifyPages: pages })); assert.deepEqual([res.metrics.notifications.status, res.overall], ["UNKNOWN", "UNKNOWN"]);
   }
   for (const refunds of [[{ y: 1 }], [{ x: { cancelled: false } }], [{ x: { cancelled: true, refundStatus: 3 } }], [{ x: [] }], [{ x: "pending" }], Array.from({ length: 501 }, () => ({ x: null }))]) {
@@ -188,9 +198,9 @@ test("T6 core (fake): missing / unreadable / malformed data is UNKNOWN — never
   const budget = await core(world(), { ...OPEN, budgets: { ...OPEN.budgets, statements: 5 } }); assert.deepEqual([budget.res.overall, budget.res.code], ["UNKNOWN", "STS_BUDGET"]);
   const badClock = await core(world(), OPEN, "not-a-time"); assert.deepEqual([badClock.res.overall, badClock.res.code], ["UNKNOWN", "STS_CLOCK_INVALID"]);
   const conn = await S.runStatusCore({ pool: { connect: async () => { throw new Error("SENTINEL"); } }, c: OPEN }); assert.deepEqual([conn.overall, conn.code], ["UNKNOWN", "STS_DB_FAILED"]);
-  const excluded = await core(world({ notifyPages: [[{ op_id: OID, intent_id: "abede8b1-8ef6-44f2-876e-6a02fc056a96", template: "booking_confirmed", class: "UNKNOWN", code: null, in_scope: true, age_min: 1 }]] }));
+  const excluded = await core(world({ notifyPages: [[{ op_id: OID, intent_id: "abede8b1-8ef6-44f2-876e-6a02fc056a96", template: "booking_confirmed", class: "UNKNOWN", code: null, in_scope: true, in_hist: false, age_min: 1 }]] }));
   assert.equal(excluded.res.metrics.notifications.status, "OK", "an excluded historical intent is out of scope");
-  const historic = await core(world({ notifyPages: [[{ op_id: OID, intent_id: IID, template: "booking_confirmed", class: "UNKNOWN", code: null, in_scope: false, age_min: 99999 }]] }));
+  const historic = await core(world({ notifyPages: [[{ op_id: OID, intent_id: IID, template: "booking_confirmed", class: "UNKNOWN", code: null, in_scope: false, in_hist: false, age_min: 99999 }]] }));
   assert.equal(historic.res.metrics.notifications.status, "OK", "before the cutoff = out of scope");
 });
 
@@ -272,6 +282,54 @@ test("T7 hosted gates (seam): status needs ONLY the DB secret, both 64-hex diges
 });
 
 // ---------------------------------------------------------------------------------------------------------------------------------
+test("T8 C122 L3 (fake): a STALLED future PENDING booking pages (pipeline stalled + overdue work → ATTENTION, exit 1 via the runHosted mapping), a confirmed future booking with NO notification pages; the known HISTORIC incidents (a C120-like outcome_unknown op + open case, two stale pending confirmations, an UNKNOWN notify class) stay VISIBLE as INFO with their would-be status and NEVER page; historic unreadable / malformed is UNKNOWN, never suppressed; both windows go to SQL as tstzranges and every notify row lands in exactly one window", async () => {
+  assert.deepEqual([C.scope.cutoff, C.scope.standingCutoff], ["2026-11-15T22:58:01.000Z", "2026-11-19T00:00:00.000Z"]);
+  // a stalled future PENDING: e.g. the pipeline returned PENDING (exit 0, silent) and nothing continued it → updated_at older than 30 min + overdue next_action_at
+  const stalled = await core(world({ agg: { ...AGG, pipeline: { ...AGG.pipeline, total: 2, in_pipeline: 1, stalled: 1, oldest_in_pipeline_min: 31, authorized_uncaptured: 1 },
+    work: { ...AGG.work, due_overdue: 1 } } }));
+  assert.deepEqual([stalled.res.overall, stalled.res.metrics.pipeline.status, stalled.res.metrics.pipeline.counts.stalled, stalled.res.metrics.work.status], ["ATTENTION", "ACTION", 1, "ACTION"]);
+  const unsent = await core(world({ agg: { ...AGG, notifyMissing: { n: 1 } } }));
+  assert.deepEqual([unsent.res.overall, unsent.res.metrics.notifications.status, unsent.res.metrics.notifications.counts.confirmedWithoutNotify], ["ATTENTION", "ACTION", 1]);
+  // the known historic incidents: visible, INFO, never paged — nothing cleared / settled / resent
+  const HAGG = { ...AGG, operations: { ...AGG.operations, outcome_unknown: 1 }, cases: { open: 1, oldest_open_min: 2000 }, pipeline: { ...AGG.pipeline, total: 3, confirmed: 3 } };
+  const histPages = [[{ op_id: OID, intent_id: IID, template: "booking_confirmed", class: "UNKNOWN", code: null, in_scope: false, in_hist: true, age_min: 5000 },
+    { op_id: "7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c01", intent_id: "3f1c2b4a-5d6e-4f70-8a91-b2c3d4e5f601", template: "booking_confirmed", class: "ELIGIBLE", code: null, in_scope: false, in_hist: true, age_min: 4000 },
+    { op_id: "7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c02", intent_id: "3f1c2b4a-5d6e-4f70-8a91-b2c3d4e5f602", template: "booking_confirmed", class: "ELIGIBLE", code: null, in_scope: false, in_hist: true, age_min: 3000 }]];
+  const params = [];
+  const hist = await core(world({ params, notifyPages: histPages, refunds: [], agg: { ...AGG, pipeline: { ...AGG.pipeline, total: 0, confirmed: 0 } },
+    hist: { agg: HAGG, scope: { n: 3 }, refunds: [{ x: null }, { x: null }, { x: null }] } }));
+  assert.deepEqual([hist.res.overall, hist.res.code], ["OK", "STATUS_OK"], "historic incidents never page");
+  for (const m of Object.values(hist.res.metrics)) assert.equal(m.status, "OK");
+  const H = hist.res.historic.metrics;
+  assert.deepEqual([H.operations.status, H.operations.rawStatus, H.operations.counts.outcome_unknown, H.cases.status, H.cases.rawStatus, H.cases.counts.open],
+    ["INFO", "ACTION", 1, "INFO", "ACTION", 1], "the C120-like unknown op and its open case stay visible");
+  assert.deepEqual([H.notifications.status, H.notifications.rawStatus, H.notifications.counts.eligibleStale, H.notifications.counts.attentionClass], ["INFO", "ACTION", 2, 1], "the two older pending + the unknown stay visible");
+  assert.match(H.notifications.note, /never paged, never cleared \/ settled \/ resent/); assert.match(hist.res.historic.scope, /HISTORIC created in \[2026-11-15T22:58:01\.000Z, 2026-11-19T00:00:00\.000Z\)/);
+  assert.deepEqual([hist.res.scope.intents, hist.res.scope.historicIntents], [1, 3]);
+  assert.match(S.summaryMarkdown({ mode: "status", code: "STATUS_DONE", readEnabled: true, status: hist.res }), /historic: .*operations=INFO\(ACTION\)/);
+  // the SAME rows in the standing window would page
+  const asStanding = await core(world({ notifyPages: [histPages[0].map((x) => ({ ...x, in_scope: true, in_hist: false }))], agg: { ...HAGG, pipeline: { ...AGG.pipeline, total: 3, confirmed: 3 } },
+    refunds: [{ x: null }, { x: null }, { x: null }] }));
+  assert.equal(asStanding.res.overall, "ATTENTION");
+  // both windows reach SQL as tstzranges; the notify page carries both; every non-page statement of the historic pass uses the historic range
+  assert.ok(params.some(([k, r]) => k === "kickoff" && r === STANDING_RANGE) && params.some(([k, r]) => k === "kickoff" && r === HIST_RANGE));
+  assert.deepEqual(params.filter(([k]) => k === "notifyPage").map((x) => x[2]), [[STANDING_RANGE, HIST_RANGE]], "ONE page walk, both windows");
+  assert.match(Q.notifyPage, /\(l\.created_at <@ \$4::tstzrange\) AS in_scope/); assert.match(Q.notifyPage, /\(l\.created_at <@ \$6::tstzrange\) AS in_hist/);
+  for (const k of ["scope", "kickoff", "pipeline", "operations", "cases", "work", "notifyMissing", "refunds"]) assert.match(Q[k], /<@ \$2::tstzrange/, k);
+  // historic unreadable / malformed → UNKNOWN overall (never suppressed); a row claiming BOTH windows → notifications UNKNOWN
+  for (const raw of [{ operations: { rows: [] } }, { cases: { rows: [{ open: "1", oldest_open_min: null }] } }, { notifyMissing: { rows: [{ n: null }] } }]) {
+    const r = await core(world({ hist: { raw, scope: { n: 1 }, refunds: [{ x: null }] } }));
+    assert.equal(r.res.overall, "UNKNOWN", JSON.stringify(raw)); assert.ok(Object.values(r.res.historic.metrics).some((m) => m.status === "UNKNOWN"));
+  }
+  const both = await core(world({ notifyPages: [[{ op_id: OID, intent_id: IID, template: "booking_confirmed", class: "SUCCEEDED", code: null, in_scope: true, in_hist: true, age_min: 1 }]] }));
+  assert.deepEqual([both.res.metrics.notifications.status, both.res.overall], ["UNKNOWN", "UNKNOWN"]);
+  const noHist = await core(world({ notifyPages: [[{ op_id: OID, intent_id: IID, template: "booking_confirmed", class: "SUCCEEDED", code: null, in_scope: true, age_min: 1 }]] }));
+  assert.equal(noHist.res.overall, "UNKNOWN", "a missing in_hist is never read as 'not historic'");
+  const tooBig = await core(world({ hist: { scope: { n: 501 } } })); assert.deepEqual([tooBig.res.overall, tooBig.res.code], ["UNKNOWN", "STS_SCOPE_TOO_LARGE"]);
+  const inverted = await core(world(), { ...OPEN, scope: { ...OPEN.scope, standingCutoff: "2026-11-01T00:00:00.000Z" } }); assert.deepEqual([inverted.res.overall, inverted.res.code], ["UNKNOWN", "STS_SCOPE_INVALID"]);
+  assert.doesNotMatch(JSON.stringify(hist.res), PII);
+});
+
 // OPT-IN REAL DISPOSABLE POSTGRESQL at schema 28 (C119 S4) — the REAL core, synthetic fixtures (pinned tooling) and a synthetic clock
 if (process.env.E7_HST_DB_TESTS === "1") {
   const tool = (p) => import(pathToFileURL(join(TOOLING, p)).href);
@@ -307,7 +365,8 @@ if (process.env.E7_HST_DB_TESTS === "1") {
   const reportPool = new pg.Pool({ connectionString: db.reportUrl(), max: 2 });
   after(async () => { await reportPool.end(); await db.close(); rmSync(MDIR, { recursive: true, force: true }); rmSync(tdir, { recursive: true, force: true }); });
   const L = 606998;
-  const C0 = Object.freeze({ ...OPEN, scope: Object.freeze({ ...OPEN.scope, cutoff: "2026-01-01T00:00:00.000Z" }) });   // TEST-LOCAL: the fixtures' clock predates the reviewed cutoff
+  // TEST-LOCAL: the fixtures' clock predates the reviewed cutoffs; C122: historic window [2026-01-01, 2026-01-02) (empty), standing ≥ 2026-01-02
+  const C0 = Object.freeze({ ...OPEN, scope: Object.freeze({ ...OPEN.scope, cutoff: "2026-01-01T00:00:00.000Z", standingCutoff: "2026-01-02T00:00:00.000Z" }) });
   let day = 0; const stay = (listingId = L, extra = {}) => { day += 3; const d = (n) => new Date(Date.UTC(2027, 0, 1) + n * 86400000).toISOString().slice(0, 10); return { listingId, from: d(day), to: d(day + 2), ...extra }; };
   const cOf = (listingId) => Object.freeze({ ...C0, listingId });   // TEST-LOCAL: one synthetic listing per scenario keeps the scenarios independent
   const one = async (sql, p = []) => (await db.owner.query(sql, p)).rows[0];
@@ -318,6 +377,21 @@ if (process.env.E7_HST_DB_TESTS === "1") {
       LATERAL (SELECT (xpath('/row/v/text()', query_to_xml(format('SELECT count(*) || '':'' || md5(coalesce(string_agg(to_jsonb(x)::text, E''\\n'' ORDER BY to_jsonb(x)::text), '''')) AS v FROM booking.%I x', t.relname), false, true, '')))[1]::text AS v) x
       WHERE s.nspname = 'booking' AND t.relkind = 'r'`)).rows[0].f;
   const notifyOf = async (id) => one("SELECT id, created_at FROM booking.external_operations WHERE intent_id = $1 AND op_type = 'guest.notify'", [id]);
+
+  test("D6 C122 HISTORIC visibility on REAL rows: the SAME stalled authorized intent and a stale ELIGIBLE confirmation that page in the standing window (D1 / D2) are reported, once they fall before the standing cutoff, as HISTORIC INFO with their would-be ACTION — overall OK (never paged), nothing written", async () => {
+    const LL = 700006; const a = await F.authorized(db.app, stay(LL)); const e = await Hm.confirmedBooking({ listingId: LL }); const op = await notifyOf(e.id);
+    const i = await one("SELECT updated_at FROM booking.intents WHERE id = $1", [a.id]);
+    const asOf = iso(new Date(Math.max(new Date(i.updated_at).getTime(), new Date(op.created_at).getTime())).toISOString(), 120);
+    const standing = await runL(LL, asOf);
+    assert.deepEqual([standing.overall, standing.metrics.pipeline.status, standing.metrics.notifications.status], ["ATTENTION", "ACTION", "ACTION"], "in the standing window they page");
+    const HC = Object.freeze({ ...cOf(LL), scope: Object.freeze({ ...C0.scope, standingCutoff: "2099-01-01T00:00:00.000Z" }) });   // TEST-LOCAL: every fixture is now historic
+    const f0 = await tableFingerprint(); const h = await run(asOf, HC);
+    assert.deepEqual([h.overall, h.scope.intents, h.scope.historicIntents], ["OK", 0, 2], JSON.stringify(h.scope));
+    for (const m of Object.values(h.metrics)) assert.equal(m.status, "OK");
+    assert.deepEqual([h.historic.metrics.pipeline.status, h.historic.metrics.pipeline.rawStatus, h.historic.metrics.pipeline.counts.stalled], ["INFO", "ACTION", 1]);
+    assert.deepEqual([h.historic.metrics.notifications.status, h.historic.metrics.notifications.rawStatus, h.historic.metrics.notifications.counts.eligibleStale], ["INFO", "ACTION", 1]);
+    assert.deepEqual(await tableFingerprint(), f0, "zero writes");
+  });
 
   test("D0 empty TEST scope on schema 28 (the real runtime role): overall OK, every metric OK with zero counts — and ONE read-only snapshot writes NOTHING", async () => {
     const f0 = await tableFingerprint(); const r = await run(null);
