@@ -548,7 +548,8 @@ const CLOSURE_PATH_ONLY_PINS = Object.freeze({
   "scripts/e4-write-runner/happy-preflight.mjs": "30b9ec467c2d5b6d025f0636519f1291ae6f68dbefc050c41551a8366bf3ce99",
   "scripts/e7-connected/run-binding-r1.mjs": "d724625c1109c6e82486dee471bc93928e7095e9aea15517257078894696c62c",
   "scripts/e7-connected/run-plan-cli-main.mjs": "9f5931b88d4b1f57c1f46e0f890beab79213800177967759e0928f83458c6724",
-  "scripts/e7-connected/run-plan-v1.mjs": "585a90120bbea9692e8bf0d1b4b9d31309b189ecb53b99601ab42b9632b85edf"
+  // C136: run-plan-v1 pin 585a9012 -> b4b6144a: only its reservation-worker ORIGIN pin changed (comment + digest); closure-path data unchanged
+  "scripts/e7-connected/run-plan-v1.mjs": "b4b6144a43da03ee95de3ac053d1cc56abd346f400cb01d1e9714083d3ff5a70"
 });
 function assertClosurePathOnly(source, label) {
   assert.ok(Object.hasOwn(CLOSURE_PATH_ONLY_PINS, label), `${label}: must be individually reviewed`);
