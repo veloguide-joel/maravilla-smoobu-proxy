@@ -44,6 +44,16 @@ test("C2 LIVE builder: same contract, LIVE product label and stage only; all oth
   assert.deepEqual(buildCheckoutSessionParams(op({ amountMinor: -1 }), { nowMs: NOW, returnUrl: RETURN_URL, mode: "live" }), { ok: false, code: "AMOUNT_INVALID" });
 });
 
+test("C2b LIVE builder is USD-only; TEST currency behaviour unchanged", () => {
+  assert.equal(buildCheckoutSessionParams(op({ currency: "USD" }), { nowMs: NOW, returnUrl: RETURN_URL, mode: "live" }).ok, true);
+  for (const c of ["MXN", "CAD"]) {
+    assert.deepEqual(buildCheckoutSessionParams(op({ currency: c }), { nowMs: NOW, returnUrl: RETURN_URL, mode: "live" }), { ok: false, code: "LIVE_CURRENCY_NOT_ALLOWED" }, c);
+    assert.equal(buildCheckoutSessionParams(op({ currency: c }), { nowMs: NOW, returnUrl: RETURN_URL }).ok, true, `TEST ${c}`);
+  }
+  // the generic syntax check still runs first in both modes
+  for (const m of ["test", "live"]) assert.deepEqual(buildCheckoutSessionParams(op({ currency: "usd" }), { nowMs: NOW, returnUrl: RETURN_URL, mode: m }), { ok: false, code: "CURRENCY_INVALID" }, m);
+});
+
 test("C3 invalid mode is refused first, by builder and validator", () => {
   for (const m of ["", "LIVE", "Test", "prod", null, 1]) {
     assert.deepEqual(buildCheckoutSessionParams(op(), { nowMs: NOW, returnUrl: RETURN_URL, mode: m }), { ok: false, code: "MODE_INVALID" }, String(m));
