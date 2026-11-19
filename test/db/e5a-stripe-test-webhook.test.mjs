@@ -555,3 +555,67 @@ test("C131 markStripeEventProcessedInTx marks only a livemode = false row (a non
   assert.equal((await evRow("evt_C131LIVE")).status, "received");
   assert.equal((await evRow("evt_C131TEST")).status, "processed");
 });
+
+// ---------------------------------------------------------------------------------------------------------------------
+// C132: a DUPLICATE authorization event (a second event id for an already-accepted PaymentIntent) is marked processed only
+// inside a TEST-boundary transaction: TEST marker, TEST intent, livemode = false row. A refusal leaves the row retryable
+// (503, reason recorded); nothing is applied twice; a TEST redelivery answers the ordinary 200 DUPLICATE and finishes the row.
+test("C132 duplicate authorization finish — DB TEST boundary: live / missing marker, non-TEST intent environment, non-TEST event row -> retryable; TEST redelivery DUPLICATE", async () => {
+  const markerIs = async () => (await db.owner.query("SELECT environment FROM booking.instance")).rows.map((x) => x.environment).join();
+  const cases = [
+    ["database marker live", "DATABASE_NOT_TEST", { beforeDuplicateFinish: () => db.owner.query("UPDATE booking.instance SET environment = 'live'") },
+      () => db.owner.query("UPDATE booking.instance SET environment = 'test'")],
+    ["database marker missing", "DATABASE_NOT_TEST", { beforeDuplicateFinish: () => db.owner.query("DELETE FROM booking.instance") },
+      () => db.owner.query("INSERT INTO booking.instance (environment) VALUES ('test')")],
+    ["intent environment not test", "INTENT_ENVIRONMENT_NOT_TEST", null, null,
+      (sql, r) => (sql === "SELECT environment FROM booking.intents WHERE id = $1" ? { ...r, rows: r.rows.map((x) => ({ ...x, environment: "live" })) } : null)],
+    ["event row not livemode=false", "WEBHOOK_EVENT_NOT_TEST", null, null,
+      (sql, r) => (sql === "SELECT livemode FROM booking.stripe_webhook_events WHERE event_id = $1" ? { ...r, rows: r.rows.map((x) => ({ ...x, livemode: true })) } : null)]
+  ];
+  let n = 140;
+  for (const [name, code, hooks, restore, rewrite] of cases) {
+    const w = world();
+    const { id, sessionId } = await checkoutReady(w, n++);
+    w.pay(sessionId);
+    const first = w.event("checkout.session.completed", sessionId);
+    assert.deepEqual(await deliver(w, first), { http: 200, code: "APPLIED", state: "payment_authorized" });
+    const dup = w.event("checkout.session.completed", sessionId);
+    const snap0 = await authSnapshot(id);
+    let r;
+    try {
+      // the rewritten reads only matter inside the duplicate finish: the authorization was applied before (applyEvent answers duplicate)
+      r = await processVerifiedStripeEvent(rewrite ? rewritingPoolC131(db.app, rewrite) : db.app, dup,
+        { stripe: w.stripe, now: F.at(6), accountId: ACCT, accountCache: {}, hooks: hooks || undefined });
+    } finally { if (restore) await restore(); }
+    assert.equal(await markerIs(), "test", `${name}: marker restored`);
+    assert.deepEqual(r, { http: 503, code }, name);
+    assert.deepEqual(await authSnapshot(id), snap0, `${name}: nothing applied or queued`);
+    assert.deepEqual([(await evRow(dup.id)).status, (await evRow(dup.id)).error_code], ["failed_retryable", code], name);
+    assert.equal((await evRow(first.id)).status, "processed");
+    // ordinary TEST duplicate redelivery: 200 DUPLICATE, row finished, still exactly one transition
+    assert.deepEqual(await deliver(w, dup, F.at(7)), { http: 200, code: "DUPLICATE", state: "payment_authorized" }, `${name}: redelivery`);
+    assert.deepEqual([(await evRow(dup.id)).status, (await evRow(dup.id)).error_code], ["processed", null]);
+    assert.deepEqual(await deliver(w, dup, F.at(8)), { http: 200, code: "ALREADY_PROCESSED" });
+    assert.equal(await authTransitions(id), 1);
+    assert.equal(await ledger(id, "authorization_accepted"), 1);
+    await noHostawayOrMoneyMove(id);
+  }
+});
+
+test("C132 finishDuplicateAuthorizationEvent (direct): refuses a non-TEST row and leaves it open; an already-finished TEST row -> updated:false, unchanged", async () => {
+  const { finishDuplicateAuthorizationEvent } = await import("../../lib/booking-db/webhooks.js");
+  const w = world();
+  const { id, sessionId } = await checkoutReady(w, 150);
+  w.pay(sessionId);
+  assert.equal((await deliver(w, w.event("checkout.session.completed", sessionId))).code, "APPLIED");
+  const t = new Date(F.at(6));
+  await db.owner.query(`INSERT INTO booking.stripe_webhook_events (event_id, event_type, livemode, stripe_created_at, received_at, status)
+    VALUES ('evt_C132LIVE', 'checkout.session.completed', true, $1, $1, 'received'), ('evt_C132TEST', 'checkout.session.completed', false, $1, $1, 'received')`, [t]);
+  assert.deepEqual(await finishDuplicateAuthorizationEvent(db.app, "evt_C132LIVE", { intentId: id, now: F.at(7) }), { ok: false, code: "WEBHOOK_EVENT_NOT_TEST" });
+  assert.equal((await evRow("evt_C132LIVE")).status, "received");
+  assert.deepEqual(await finishDuplicateAuthorizationEvent(db.app, "evt_C132TEST", { intentId: id, now: F.at(7) }), { ok: true, updated: true });
+  assert.deepEqual(await finishDuplicateAuthorizationEvent(db.app, "evt_C132TEST", { intentId: id, now: F.at(8) }), { ok: true, updated: false });
+  assert.deepEqual(await evRow("evt_C132TEST"), { status: "processed", error_code: null, attempts: 1, intent_id: id });
+  assert.deepEqual(await finishDuplicateAuthorizationEvent(db.app, "evt_C132MISSING", { intentId: id, now: F.at(8) }), { ok: false, code: "WEBHOOK_EVENT_NOT_TEST" });
+  assert.deepEqual(await finishDuplicateAuthorizationEvent(db.app, "evt_C132TEST", { intentId: "00000000-0000-4000-8000-000000000000", now: F.at(8) }), { ok: false, code: "INTENT_NOT_FOUND" });
+});
