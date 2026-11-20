@@ -37,7 +37,7 @@ const addDays = (d, n) => new Date(Date.parse(`${d}T00:00:00Z`) + n * DAY).toISO
 const httpError = (statusCode) => Object.assign(new Error(`provider ${statusCode} (mock)`), { statusCode });
 
 let block = 6100000;
-function world({ nightly = 250, echoRef = true } = {}) {
+function world({ nightly = 250, echoRef = true, live = false } = {}) {
   block += 1000;
   const w = { calls: [], writes: Object.fromEntries(WRITE_KEYS.map((k) => [k, 0])), res: new Map(), pis: new Map(), charges: [],
     nextRes: block, nextCharge: block * 10, mode: { capture: "ok", record: "ok" } };
@@ -47,11 +47,11 @@ function world({ nightly = 250, echoRef = true } = {}) {
   const ridOf = (path) => Number(/\/reservations\/(\d+)/.exec(path)[1]);
   w.piObj = (p) => {
     const cap = p.status === "succeeded";
-    return { object: "payment_intent", id: p.id, livemode: false, status: p.status, capture_method: "manual", amount: p.amount,
+    return { object: "payment_intent", id: p.id, livemode: live, status: p.status, capture_method: "manual", amount: p.amount,
       amount_received: cap ? p.received : 0, amount_capturable: p.status === "requires_capture" ? p.amount : 0, currency: "usd",
       metadata: { mv_intent_id: p.intentId, mv_payment_attempt_id: p.attemptId },
       latest_charge: { object: "charge", id: p.chargeId, payment_intent: p.id, status: "succeeded", paid: true, captured: cap, amount: p.amount,
-        amount_captured: cap ? p.received : 0, amount_refunded: 0, currency: "usd", livemode: false, payment_method_details: { card: { capture_before: p.captureBeforeSec } } } };
+        amount_captured: cap ? p.received : 0, amount_refunded: 0, currency: "usd", livemode: live, payment_method_details: { card: { capture_before: p.captureBeforeSec } } } };
   };
   w.pricing = {
     get: async (path, opts = {}) => {
@@ -123,7 +123,7 @@ function world({ nightly = 250, echoRef = true } = {}) {
 }
 
 let lane = 0;
-async function authorizedBooking(w, { listingId = L_ID } = {}) {
+async function authorizedBooking(w, { listingId = L_ID, live = false } = {}) {
   lane += 1;
   const stay = { from: addDays("2027-02-01", 6 * lane), to: addDays("2027-02-01", 6 * lane + 3), guests: 2 };
   const base = Date.now() - 20 * MIN;
@@ -131,18 +131,18 @@ async function authorizedBooking(w, { listingId = L_ID } = {}) {
     today: todayInTimeZone(undefined, new Date(base)), now: base });
   assert.ok(priced.ok, priced.error);
   w.calls.length = 0;
-  const intent = await createIntentRecord(db.app, { ref: F.nextRef(), accessTokenHash: F.tokenHash(), environment: "test", now: base, listingId, ...stay });
+  const intent = await createIntentRecord(db.app, { ref: F.nextRef(), accessTokenHash: F.tokenHash(), environment: live ? "live" : "test", now: base, listingId, ...stay });
   F.ok(await applyEvent(db.app, intent.id, { type: "PRICE_CONFIRMED", price: priced.price }, { now: base, actor: "guest" }));
   F.ok(await collectGuestDetails(db.app, intent.id, F.GUEST, { now: base + SEC, termsVersion: "terms-2026-10" }));
-  const b = F.ok(await beginPayStep(db.app, intent.id, { now: base + 2 * SEC }));
+  const b = F.ok(await beginPayStep(db.app, intent.id, { now: base + 2 * SEC, ...(live ? { environment: "live" } : {}) }));
   const op = await claimNextOperation(db.app, { workerId: "w-pay", now: base + 2 * SEC, intentId: intent.id, opTypes: ["stripe.create_checkout_session"] });
-  const sessionId = `cs_test_co${lane}`;
+  const sessionId = `${live ? "cs_live" : "cs_test"}_co${lane}`;
   F.ok(await completeOperation(db.app, op.id, { workerId: "w-pay", now: base + 2 * SEC, outcome: { status: "succeeded", resultRef: sessionId } }));
   F.ok(await recordCheckoutSession(db.app, intent.id, b.attempt.id, { sessionId, expiresAt: base + 30 * MIN, now: base + 2 * SEC }));
   const piId = `pi_test_co${lane}`;
   const captureBefore = Math.floor((base + 7 * DAY) / 1000) * 1000;
   F.ok(await applyEvent(db.app, intent.id, { type: "PAYMENT_AUTHORIZED", id: `evt_auth_${piId}`, paymentIntentId: piId, sessionId, amountMinor: priced.price.finalTotalMinor,
-    currency: "usd", livemode: false, authorizationCreatedAt: base + 3 * SEC, captureBefore }, { now: base + 4 * SEC, actor: "webhook" }));
+    currency: "usd", livemode: live, authorizationCreatedAt: base + 3 * SEC, captureBefore }, { now: base + 4 * SEC, actor: "webhook", ...(live ? { config: { expectedLivemode: true } } : {}) }));
   const pa = (await db.app.query("SELECT id FROM booking.payment_attempts WHERE intent_id = $1 AND status = 'completed'", [intent.id])).rows[0].id;
   w.pis.set(piId, { id: piId, intentId: intent.id, attemptId: pa, status: "requires_capture", amount: priced.price.finalTotalMinor, received: 0,
     chargeId: `ch_test_co${lane}`, captureBeforeSec: captureBefore / 1000 });
@@ -150,6 +150,7 @@ async function authorizedBooking(w, { listingId = L_ID } = {}) {
 }
 
 function coord(w, bk, extra = {}) {
+  const L_ID = extra.listingId ?? TEST_LISTING_ID;                              // P2c-1: LIVE runs name their ONE approved listing
   const clk = { t: bk.base + 10 * SEC };
   const adapterConfig = validateAdapterConfig({ allowedListingIds: [L_ID], refFieldId: REF_FIELD, channelId: 2000, currency: "USD" });
   const recCfg = { accountRef: LABEL.accountRef, channelId: 2000, currency: "USD", listingId: L_ID, paymentMethod: "credit_card", refFieldId: REF_FIELD };
@@ -516,4 +517,44 @@ test("C139b persisted scope: live / missing / duplicated marker, intent environm
   const n0 = w.calls.length;
   const again = await c.run();
   assert.deepEqual([again.outcome, again.steps.length, again.writes, w.calls.length], ["CONFIRMED", 0, { create: 0, capture: 0, record: 0 }, n0]);
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// P2c-1: run mode + scope. Omitted mode = TEST (everything above, unchanged). mode "live": ONE explicit approved listing (never 606998), USD,
+// on a database whose marker is 'live', for an intent whose environment is 'live' and whose payment is livemode true.
+const LIVE_LISTING = 700123;
+test("P2c-1a scope refusals (no query, no provider call): junk modes; LIVE without / with a bad / with the TEST listing; TEST with an explicit listing; LIVE on a TEST database; a TEST intent offered to LIVE", async () => {
+  const w = world(); const bk = await authorizedBooking(w);
+  const c = coord(w, bk); const calls0 = w.calls.length;
+  for (const m of ["", "LIVE", "prod", null, 1]) assert.equal((await c.run({ mode: m })).code, "MODE_INVALID", String(m));
+  for (const id of [undefined, null, "700123", 0, -1, 1.5, 606998]) assert.equal((await c.run({ mode: "live", listingId: id })).code, "LISTING_NOT_LIVE_SCOPED", String(id));
+  assert.equal((await c.run({ listingId: 606998 })).code, "LISTING_NOT_TEST_FIXED");                       // TEST never takes a listing option
+  assert.equal((await c.run({ mode: "test", listingId: LIVE_LISTING })).code, "LISTING_NOT_TEST_FIXED");
+  // a LIVE-scoped call with LIVE-shaped configs, on the TEST database: refused at the marker
+  const cl = coord(w, bk, { listingId: LIVE_LISTING });
+  assert.deepEqual([(await cl.run({ mode: "live" })).outcome, (await cl.run({ mode: "live" })).code], ["REFUSED", "DATABASE_NOT_TEST"]);
+  assert.equal(w.calls.length, calls0, "zero provider calls");
+  assert.deepEqual((await c.run()).writes, { create: 1, capture: 1, record: 1 });                           // the TEST booking still completes once
+});
+
+test("P2c-1b LIVE happy path on a 'live' database: authorized -> confirmed through the same workers; exactly 1 create / 1 capture / 1 record; a TEST-mode call on it is refused; idempotent", async () => {
+  await db.owner.query("UPDATE booking.instance SET environment = 'live'");
+  try {
+    const w = world({ live: true }); const bk = await authorizedBooking(w, { listingId: LIVE_LISTING, live: true });
+    const row = await one("SELECT environment, payment_livemode FROM booking.intents WHERE id = $1", [bk.id]);
+    assert.deepEqual([row.environment, row.payment_livemode], ["live", true]);
+    const c = coord(w, bk, { listingId: LIVE_LISTING });
+    assert.deepEqual([(await c.run()).outcome, (await c.run()).code], ["REFUSED", "LISTING_NOT_TEST_FIXED"], "omitted mode = TEST: LIVE configs refused");
+    assert.equal((await coord(w, bk).run()).code, "DATABASE_NOT_TEST", "a TEST coordinator never runs on a LIVE database");
+    assert.equal(w.calls.length, 0);
+    const r = await c.run({ mode: "live" });
+    assert.equal(r.outcome, "CONFIRMED", JSON.stringify(r));
+    assert.deepEqual(r.writes, { create: 1, capture: 1, record: 1 });
+    assert.deepEqual(r.steps.map((s) => [s.phase, s.stateAfter]).at(-1), ["recording", "confirmed"]);
+    assert.deepEqual([w.writes.createReservation, w.writes.capturePaymentIntent, w.writes.createOfflineCharge], [1, 1, 1]);
+    const again = await c.run({ mode: "live" });
+    assert.deepEqual([again.outcome, again.writes], ["CONFIRMED", { create: 0, capture: 0, record: 0 }]);
+    assert.deepEqual([w.writes.createReservation, w.writes.capturePaymentIntent, w.writes.createOfflineCharge], [1, 1, 1], "never a second provider write");
+  } finally { await db.owner.query("UPDATE booking.instance SET environment = 'test'"); }
+  assert.equal((await db.owner.query("SELECT environment FROM booking.instance")).rows.map((x) => x.environment).join(), "test", "marker restored");
 });
