@@ -1,0 +1,52 @@
+# mv-db-setup: bring the PRODUCTION booking database to the current schema and give the runtime its login
+# (scripts/mv-db-setup.mjs; PRODUCTION.md, "P3-1"). Manual dispatch only, no schedule. The code that runs is the commit given in `ref`.
+# Environment mv-live-admin holds the two passwords (entered by the owner); they are never printed. The script refuses the TEST project.
+name: mv-db-setup
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "status (read applied versions) or setup (migrate + runtime login)"
+        required: true
+        type: choice
+        options: [status, setup]
+      ref:
+        description: "full 40-hex commit of e7-test to run"
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: mv-db-setup
+  cancel-in-progress: false
+jobs:
+  run:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: mv-live-admin
+    steps:
+      - name: The ref must be a full commit id
+        env:
+          MV_REF: ${{ inputs.ref }}
+        run: |
+          [[ "$MV_REF" =~ ^[0-9a-f]{40}$ ]] || { echo "ref must be 40 lowercase hex"; exit 1; }
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.0
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Database CA (pinned by SHA-256 in the script)
+        run: curl --fail --silent --show-error --proto '=https' --max-time 20 -o "$RUNNER_TEMP/prod-ca-2021.crt" https://supabase-downloads.s3-ap-southeast-1.amazonaws.com/prod/ssl/prod-ca-2021.crt
+      - name: Run
+        env:
+          MV_DB_ACTION: ${{ inputs.action }}
+          MV_DB_HOST: ${{ vars.MV_LIVE_DB_HOST }}
+          MV_DB_PROJECT_REF: ${{ vars.MV_LIVE_DB_PROJECT_REF }}
+          MV_DB_CA_FILE: ${{ runner.temp }}/prod-ca-2021.crt
+          MV_DB_OWNER_PASSWORD: ${{ secrets.MV_LIVE_DB_OWNER_PASSWORD }}
+          MV_DB_APP_PASSWORD: ${{ secrets.MV_LIVE_DB_APP_PASSWORD }}
+        run: node scripts/mv-db-setup.mjs

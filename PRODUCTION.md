@@ -146,3 +146,20 @@ Owner go-ahead for B and C: given 2026-11-20 ("Go").
 
 Remaining for Monday: step F only.
 
+## P3-1: production database
+
+Supabase project **MiCasaDirect Production**, ref `ewfkrzuwdkbkjeeztzsv` (created by the owner 2026-11-20). TEST stays
+`mxotevtiscernhqilyiu`; `scripts/mv-db-setup.mjs` refuses that ref.
+
+`scripts/mv-db-setup.mjs` + `.github/workflows/mv-db-setup.yml` (manual dispatch, environment `mv-live-admin`), one run as the schema
+owner over the session pooler with the pinned CA:
+1. every migration with environment `live` (`db/lib/migrate.js`; repeatable, forward only);
+2. runtime login `mv_booking_app_live` (member of `mv_booking_app` only, no elevated attribute, role timeouts 5s / 10s);
+3. its password is set by sending the SCRAM-SHA-256 verifier computed in the job (checked in tests against PostgreSQL's own hashing);
+4. a login as that role proves identity, marker `live`, the timeout, and that the migration table is denied.
+
+Owner inputs (pasted by the owner into GitHub, never seen by Claude): secrets `MV_LIVE_DB_OWNER_PASSWORD` (the database password
+from project creation) and `MV_LIVE_DB_APP_PASSWORD` (a new one, 32 letters and digits). Variables: `MV_LIVE_DB_HOST`,
+`MV_LIVE_DB_PROJECT_REF`. The runtime URL for Vercel production and for `mv-pipeline` live is
+`postgresql://mv_booking_app_live.<ref>:<app password>@<host>:6543/postgres` (P3-2).
+
