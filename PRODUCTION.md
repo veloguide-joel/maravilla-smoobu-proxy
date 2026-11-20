@@ -127,5 +127,16 @@ does nothing.
 schema 30: it would need the 0030 and 0029 down migrations (TEST only, and 0029 down fails once a taxed price row exists). In practice the
 fallback is fixing the new runner; the workers, proofs and fences under it are the ones proven on 2026-11-20.
 
-Owner go-ahead needed for B and C (they change the working test setup). A, D and E follow from them.
+Owner go-ahead for B and C: given 2026-11-20 ("Go").
+
+**Done 2026-11-20:**
+- B: repository variable `E7_TEST_AUTO_ARMED` deleted (owner confirmed GitHub access with his passkey), between 21:57Z and 22:26Z.
+  Value before deletion: b1d6bb6395205f59f4c6dc7a0629edc6b3c6aaada7a0415a155745a3b84822b6 (equal to the recorded digest).
+- C: 0029 + 0030 applied 22:28Z in one transaction through the SQL editor (script sha256 00c9833c...7485, checked in the page before
+  running; precheck marker `test` and versions exactly 1..28). Readback: versions 1..30, rows 29 `price_tax` (up c7bf74acd99c...) and
+  30 `gn_live_recipient_scope` (up 6ed5c3325f63...), environment `test`; 20 intents, 0 taxed; `gn_recipient_in_scope` is STABLE, refuses a
+  real address and admits the sink; column `tax_minor` exists.
+- A: PR #249 merged to `main` (cc210027): only `.github/workflows/mv-pipeline.yml`, inputs `mode` and `ref`.
+- D: `MV_CHECKOUT_TAX_POLICY=mx-iva16-ish5-v1` created (Preview, branch `e7-test`, project `maravilla-smoobu-proxy`).
+- `MV_TEST_PIPELINE_NOT_BEFORE` = 2026-11-20T22:30:00.000Z.
 
