@@ -52,16 +52,17 @@ test("E3 the CLI prints ONE JSON line of codes only and exits 1 on any refusal (
   assert.match(OFFICIAL_CA_SHA256, /^[0-9a-f]{64}$/);
 });
 
-test("E4 wiring guards (before anything is built): the Stripe key kind must match the mode; LIVE wiring is refused until the Stripe transport is mode-aware", () => {
+test("E4 wiring guards (before anything is built): the Stripe key kind must match the mode; a LIVE restricted key validates only in LIVE mode (P2c-4)", () => {
   assert.equal(validateWiringOptions(W), true);
   assert.equal(code(() => validateWiringOptions({ ...W, stripeKey: K("rk_live_") })), "KEY_MODE_MISMATCH");           // a LIVE key in TEST mode
   assert.equal(code(() => validateWiringOptions({ ...W, mode: "live" })), "KEY_MODE_MISMATCH");                         // a TEST key in LIVE mode
-  assert.equal(code(() => validateWiringOptions({ ...W, mode: "live", stripeKey: K("rk_live_") })), "STRIPE_LIVE_TRANSPORT_NOT_READY");
+  assert.equal(validateWiringOptions({ ...W, mode: "live", stripeKey: K("rk_live_") }), true);                          // P2c-4: the LIVE transport exists
   for (const [over, c] of [[{ stripeKey: K("sk_live_") }, "CREDENTIAL_INVALID"], [{ stripeKey: "x" }, "CREDENTIAL_INVALID"], [{ hostawayToken: "" }, "CREDENTIAL_INVALID"],
     [{ stripeAccountId: "x" }, "ACCOUNT_ID_INVALID"], [{ refFieldId: 0 }, "REF_FIELD_INVALID"], [{ timeZone: "Mexico" }, "TIME_ZONE_INVALID"], [{ runId: "" }, "LABEL_INVALID"],
     [{ pool: null }, "POOL_REQUIRED"], [{ mode: "prod" }, "MODE_INVALID"]]) assert.equal(code(() => validateWiringOptions({ ...W, ...over })), c, c);
   const never = async () => { throw new Error("no provider call is expected"); };
   assert.equal(typeof createWiring({ ...W, exchanges: { stripe: never, hostaway: never } }).buildPhases, "function");
+  assert.equal(typeof createWiring({ ...W, mode: "live", stripeKey: K("rk_live_"), exchanges: { stripe: never, hostaway: never } }).buildPhases, "function");
 });
 
 test("E5 the workflow file: manual dispatch only (no schedule), read-only token, environment by mode, secrets and variables by NAME, not in any arm manifest", () => {

@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createE7HostawaySend, createE7StripeTestSend, E7TransportError, ERROR_CODES, CHARGE_LIST_LIMIT, HOSTAWAY_MAX_BYTES, STRIPE_MAX_BYTES }
+import { createE7HostawaySend, createE7StripeTestSend, createE7StripeLiveSend, E7TransportError, ERROR_CODES, CHARGE_LIST_LIMIT, HOSTAWAY_MAX_BYTES, STRIPE_MAX_BYTES }
   from "../scripts/e7-connected/http-transports.mjs";
 import { createPhaseExecutors, ExecutorTransportFailure } from "../scripts/e7-connected/executor-adapters.mjs";
 import { offlineChargeTitle, exactAmount, formatScheduledDate, LIST_LIMIT } from "../lib/checkout/offline-charge-proof.js";
@@ -448,4 +448,38 @@ process.stdout.write(JSON.stringify({ code, u }));`;
   const r = spawnSync(process.execPath, ["--input-type=module", "-e", script], { encoding: "utf8", timeout: 10_000 });
   assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(JSON.parse(r.stdout), { code: "CREDENTIAL_INVALID", u: 0 }, "child process: zero unhandled rejections");
+});
+
+// P2c-4: the LIVE Stripe send = the same operations and wire mapping; it admits a restricted live key only and requires livemode true.
+test("T14 (P2c-4). Stripe LIVE send: rk_live_ only (sk_live_ / every TEST key / junk -> CREDENTIAL_INVALID, zero exchanges); PaymentIntent replies must be livemode true; same wire as TEST; the TEST send still refuses a live key", async () => {
+  const LKEY = `rk_live_${"A".repeat(24)}`;
+  const live = (reply, key = LKEY) => { const f = fakeExchange(reply); let calls = 0; const r = createE7StripeLiveSend({ exchange: f.exchange, credential: () => { calls += 1; return key; }, accountId: ACCT, apiVersion: VERSION });
+    assert.equal(r.ok, true); return { send: r.transport.send, log: f.log, creds: () => calls }; };
+  const call = { op: "paymentIntents.retrieve", id: PI, params: { expand: ["latest_charge"] } };
+  // accepted: live key + livemode true
+  const t = live((req) => (req.url.endsWith("/v1/account") ? ok(ACCOUNT) : ok(PIOBJ({ livemode: true }))));
+  assert.equal((await t.send(call, { signal: sig() })).livemode, true);
+  assert.equal((await t.send({ op: "accounts.retrieve" }, { signal: sig() })).id, ACCT);
+  const cap = { op: "paymentIntents.capture", id: PI, params: { amount_to_capture: 50000, expand: ["latest_charge"] }, idempotencyKey: `cap:${INTENT}:${PI}` };
+  await t.send(cap, { signal: sig() });
+  const rec = t.log.at(-1);
+  assert.deepEqual([rec.method, rec.url, rec.body, rec.auth, rec.headers["Stripe-Version"], rec.headers["Idempotency-Key"]],
+    ["POST", `https://api.stripe.com/v1/payment_intents/${PI}/capture`, "amount_to_capture=50000&expand%5B%5D=latest_charge", `Bearer ${LKEY}`, VERSION, `cap:${INTENT}:${PI}`]);
+  // refused replies: a TEST-mode or unmarked PaymentIntent
+  for (const reply of [ok(PIOBJ()), ok((({ livemode, ...x }) => x)(PIOBJ()))]) { const u = live(() => reply); assert.deepEqual([await codeOf(u.send(call, { signal: sig() })), u.log.length], ["LIVEMODE_REFUSED", 1]); }
+  // refused keys: zero exchanges (the shared error-code list is unchanged: a wrong key kind is CREDENTIAL_INVALID here)
+  for (const key of [SKEY, `rk_test_${"A".repeat(24)}`, `sk_live_${"A".repeat(24)}`, `pk_live_${"A".repeat(24)}`, "rk_live_short", "junk"]) {
+    const u = live(() => ok(PIOBJ({ livemode: true })), key);
+    assert.deepEqual([await codeOf(u.send(call, { signal: sig() })), u.log.length], ["CREDENTIAL_INVALID", 0], key.slice(0, 8));
+  }
+  // not-allowlisted operations stay refused before the credential
+  const z = live(() => ok(PIOBJ({ livemode: true })));
+  for (const bad of [{ op: "refunds.create" }, { op: "paymentIntents.retrieve", id: PI, params: {} }, { ...cap, params: { ...cap.params, final_capture: true } }]) assert.equal(await codeOf(z.send(bad, { signal: sig() })), "REQUEST_NOT_ALLOWED");
+  assert.deepEqual([z.log.length, z.creds()], [0, 0]);
+  // the TEST send is unchanged: a live key is refused there, and a live reply too
+  const tt = stripe(() => ok(PIOBJ({ livemode: true })));
+  assert.equal(await codeOf(tt.send(call, { signal: sig() })), "LIVEMODE_REFUSED");
+  const f = fakeExchange(() => ok(PIOBJ())); const wrong = createE7StripeTestSend({ exchange: f.exchange, credential: () => LKEY, accountId: ACCT, apiVersion: VERSION });
+  assert.deepEqual([await codeOf(wrong.transport.send(call, { signal: sig() })), f.log.length], ["KEY_NOT_TEST", 0]);
+  assert.ok(ERROR_CODES.includes("KEY_NOT_TEST") && !ERROR_CODES.includes("KEY_NOT_LIVE"));
 });

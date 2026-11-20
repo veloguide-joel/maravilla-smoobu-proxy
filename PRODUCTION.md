@@ -25,8 +25,8 @@ gets its own database (marker `live`), its own GitHub environment and arm variab
 | P2c-1 | Pipeline coordinator: `mode` + one explicit live listing (`coordinatorScope`). A full LIVE happy path passes on the throwaway cluster | merged (#242) |
 | P2c-2 | `scripts/mv-pipeline.mjs` core `runPipelineOnce` (config check, marker check, advisory lock, selection by mode / allowlist / state / `notBefore`, per-booking coordinator call) | merged (#243) |
 | P2c-3 | `scripts/mv-pipeline-wiring.mjs`, CLI env parsing (`MV_PIPELINE_*`), session-mode database only, `.github/workflows/mv-pipeline.yml` (manual dispatch only; takes effect only once on `main`). TEST wiring complete; not yet run against real providers | merged (#244) |
-| P2c-4 | LIVE Stripe transport: `createE7StripeTestSend` admits `sk_test_` only; make it mode-aware (restricted live key) so LIVE wiring stops refusing `STRIPE_LIVE_TRANSPORT_NOT_READY` | todo |
-| P2d-1 | Recipient scope by environment: migration 0030 (`booking.gn_recipient_in_scope` admits a real address only when the marker is exactly `live`; TEST scope unchanged), `isRecipientInScopeFor`, `buildLiveBookingConfirmationRequest`, Resend executor and notification worker take `mode` | this PR |
+| P2c-4 | `createE7StripeLiveSend` (restricted live key only, `livemode` true on replies; TEST send unchanged) and LIVE provider wiring in `mv-pipeline-wiring`. No live key exists anywhere and nothing passes mode `live` | this PR |
+| P2d-1 | Recipient scope by environment: migration 0030 (`booking.gn_recipient_in_scope` admits a real address only when the marker is exactly `live`; TEST scope unchanged), `isRecipientInScopeFor`, `buildLiveBookingConfirmationRequest`, Resend executor and notification worker take `mode` | merged (#245) |
 | P2d-2 | Confirmation step in `mv-pipeline` (bookings in `confirmed` with a queued, never-attempted `guest.notify`) and its Resend wiring | todo |
 | P2d-3 | Email text: tax line and the owner's cancellation policy (check 0022 for pinned template hashes first) | todo |
 | P3 | Production database (schema at marker `live`, backups), production Vercel env, GitHub environment `mv-live` + secrets | todo |

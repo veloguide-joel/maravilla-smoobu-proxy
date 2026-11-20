@@ -350,7 +350,17 @@ const expandOnly = (p) => p && typeof p === "object" && keysExactly(p, ["expand"
  * createE7StripeTestSend({ exchange, credential, accountId, apiVersion, maxBytes? }) → frozen { ok:true, transport:{ send } } | { ok:false, code }
  * send(call, { signal }) → native Promise<frozen Stripe object> | rejects E7TransportError(code)
  */
-export function createE7StripeTestSend(input) {
+export function createE7StripeTestSend(input) { return stripeSendFor(input, STRIPE_TEST_KIND); }
+/**
+ * P2c-4: createE7StripeLiveSend — the SAME three allowlisted operations for a LIVE deployment. It admits ONLY a restricted live key
+ * (rk_live_; a full sk_live_ key and every TEST key are refused with CREDENTIAL_INVALID, zero exchanges; the shared error-code list is unchanged) and requires livemode === true on every
+ * PaymentIntent reply. Nothing else differs from the TEST send.
+ */
+export function createE7StripeLiveSend(input) { return stripeSendFor(input, STRIPE_LIVE_KIND); }
+const LIVE_KEY_RE = /^rk_live_[A-Za-z0-9]{8,200}$/;
+const STRIPE_TEST_KIND = freeze({ keyRe: TEST_KEY_RE, wrongKeyCode: "KEY_NOT_TEST", livemode: false });
+const STRIPE_LIVE_KIND = freeze({ keyRe: LIVE_KEY_RE, wrongKeyCode: "CREDENTIAL_INVALID", livemode: true });
+function stripeSendFor(input, keyKind) {
   const o = topData(input, ["accountId", "apiVersion", "credential", "exchange"], ["maxBytes"]);
   if (!o || !isFn(o.exchange) || !isSyncFn(o.credential) || typeof o.accountId !== "string" || !ACCT_RE.test(o.accountId)
       || typeof o.apiVersion !== "string" || !VERSION_RE.test(o.apiVersion)) return freeze({ ok: false, code: "OPTIONS_INVALID" });
@@ -382,7 +392,7 @@ export function createE7StripeTestSend(input) {
     } else fail("REQUEST_NOT_ALLOWED");
     let key = callCredential(credential);
     if (key.length === 0) fail("CREDENTIAL_INVALID");
-    if (!TEST_KEY_RE.test(key)) fail("KEY_NOT_TEST");                 // sk_live_ / rk_live_ / rk_test_ / anything else: zero exchanges
+    if (!keyKind.keyRe.test(key)) fail(keyKind.wrongKeyCode);                 // sk_live_ / rk_live_ / rk_test_ / anything else: zero exchanges
     const headers = { Authorization: `Bearer ${key}`, "Stripe-Version": apiVersion };
     key = null;
     if (method === "POST") { headers["Content-Type"] = "application/x-www-form-urlencoded"; headers["Idempotency-Key"] = idem; }
@@ -398,7 +408,7 @@ export function createE7StripeTestSend(input) {
       if (obj.object !== "account" || obj.id !== accountId) fail("ACCOUNT_MISMATCH");
     } else {
       if (obj.object !== "payment_intent" || obj.id !== c.id) fail("REPLY_INVALID");
-      if (obj.livemode !== false) fail("LIVEMODE_REFUSED");
+      if (obj.livemode !== keyKind.livemode) fail("LIVEMODE_REFUSED");
     }
     return obj;
     });
