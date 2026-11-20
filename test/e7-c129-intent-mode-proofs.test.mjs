@@ -77,12 +77,13 @@ const capOp = () => ({ id: "op-cap-1", opType: "stripe.capture_payment_intent", 
   payload: { paymentIntentId: PI, amountMinor: 90000, attempt: 1, providerIdempotencyKey: captureKey("int-1", PI, 1) } });
 const capEv = () => piEv(rawPI());
 const markLive = (i, v = true) => ({ ...i, payment: { ...i.payment, livemode: v } });
-const NOT_TEST = [true, undefined, null, "false", 0];
+// P2b-2: the intent's own marker must be a recorded BOOLEAN; which mode may act is decided by the worker fences (configured run mode).
+const NOT_TEST = [null, "false", 0, "true", 1];
 
 // a counting fake provider: a request is "sent" only if the pure builder returned one
 function fakeSender() { let sent = 0; return { send: (built) => { if (built && built.ok === true) sent += 1; return built; }, get sent() { return sent; } }; }
 
-test("P1 capture: a TEST intent still proves and builds exactly as before; a non-TEST intent marker refuses at every layer, nothing sent", () => {
+test("P1 capture: a TEST intent still proves and builds exactly as before; an unrecorded / non-boolean intent marker refuses at every layer, nothing sent", () => {
   const i = confirmed();
   assert.equal(i.payment.livemode, false);
   const e = initialCaptureSendEligibility({ evidence: capEv(), intent: i, paymentAttemptId: ATT, captureOp: capOp(), captureHistory: [capOp()] });
@@ -106,7 +107,7 @@ test("P1 capture: a TEST intent still proves and builds exactly as before; a non
   assert.equal(stillAuthorizedV3Refusal(piEv(rawPI({ livemode: true })), i, ATT), "PAYMENT_INTENT_IDENTITY");
 });
 
-test("P2 void: TEST unchanged; a non-TEST intent marker refuses eligibility, build and validation; nothing sent", () => {
+test("P2 void: TEST unchanged; an unrecorded / non-boolean intent marker refuses eligibility, build and validation; nothing sent", () => {
   const base = voidIn();
   const e = C.voidSendEligibility(base);
   assert.equal(e.ok, true);
@@ -123,7 +124,7 @@ test("P2 void: TEST unchanged; a non-TEST intent marker refuses eligibility, bui
   assert.equal(s.sent, 0);
 });
 
-test("P3 canceled proof + Hostaway cancel: TEST unchanged; a non-TEST intent marker refuses proof, eligibility, build and validation", () => {
+test("P3 canceled proof + Hostaway cancel: TEST unchanged; an unrecorded / non-boolean intent marker refuses proof, eligibility, build and validation", () => {
   const base = cancelIn();
   const e = C.cancelSendEligibility(base);
   assert.equal(e.ok, true);
@@ -146,14 +147,40 @@ test("P3 canceled proof + Hostaway cancel: TEST unchanged; a non-TEST intent mar
   assert.equal(s.sent, 0);
 });
 
-test("P4 consistency: capture, void, cancel and the existing mirror proof all name the same refusal for a non-TEST intent", () => {
-  assert.equal(stillAuthorizedV3Refusal(capEv(), markLive(confirmed()), ATT), "INTENT_NOT_TEST_MODE");
-  assert.equal(C.piCanceledProofV3(piEv(canceledRaw()), markLive(reservationFailed()), ATT, { now: NOW, notBefore: NOT_BEFORE }), "INTENT_NOT_TEST_MODE");
+test("P4 consistency: capture, void and cancel name the same refusal for an unrecorded marker; the TEST-only mirror proof still refuses a LIVE intent", () => {
+  assert.equal(stillAuthorizedV3Refusal(capEv(), markLive(confirmed(), null), ATT), "INTENT_NOT_TEST_MODE");
+  assert.equal(C.piCanceledProofV3(piEv(canceledRaw()), markLive(reservationFailed(), null), ATT, { now: NOW, notBefore: NOT_BEFORE }), "INTENT_NOT_TEST_MODE");
   // mirror already enforced this before C129 (shown with a minimal mirror-ready shape)
   const mi = { id: "11111111-2222-4333-8444-555555555555", version: 3, status: "test_cleanup_pending", price: { finalTotalMinor: 90000, currency: "USD" },
     payment: { capturedMinor: 90000, livemode: true }, settlement: { reservationCancelled: true, authorizationSettled: true, recordingMirrored: false },
     reservation: { reservationId: "7001" }, offlineChargeId: "88001" };
   assert.equal(mirrorIntentRefusal(mi), "INTENT_NOT_TEST_MODE");
+});
+
+test("P6 (P2b-2) evidence must be of the INTENT'S recorded mode: a mode mismatch never proves in either direction; a consistent LIVE world proves", () => {
+  const live = (raw) => ({ ...raw, livemode: true, latest_charge: { ...raw.latest_charge, livemode: true } });
+  const i = confirmed(); const li = markLive(i);
+  const elig = (intent, ev) => initialCaptureSendEligibility({ evidence: ev, intent, paymentAttemptId: ATT, captureOp: capOp(), captureHistory: [capOp()] });
+  // capture
+  assert.equal(elig(i, capEv()).ok, true);                                   // TEST intent + TEST evidence
+  assert.equal(elig(li, piEv(live(rawPI()))).ok, true);                       // LIVE intent + LIVE evidence
+  assert.deepEqual(elig(li, capEv()), { ok: false, code: "PAYMENT_INTENT_IDENTITY" });                 // LIVE intent, TEST evidence
+  assert.deepEqual(elig(i, piEv(live(rawPI()))), { ok: false, code: "PAYMENT_INTENT_IDENTITY" });      // TEST intent, LIVE evidence
+  assert.equal(stillAuthorizedV3Refusal(piEv({ ...rawPI(), livemode: true }), li, ATT), "CHARGE_NOT_TEST_MODE");   // LIVE PaymentIntent with a TEST charge
+  // void
+  const vb = voidIn();
+  assert.equal(C.voidSendEligibility({ ...vb, intent: markLive(vb.intent), evidence: piEv(live(rawPI())) }).ok, true);
+  assert.equal(C.voidSendEligibility({ ...vb, intent: markLive(vb.intent) }).ok, false);
+  assert.equal(C.voidSendEligibility({ ...vb, evidence: piEv(live(rawPI())) }).ok, false);
+  // canceled proof
+  const opts = { now: NOW, notBefore: NOT_BEFORE };
+  assert.equal(C.piCanceledProofV3(piEv(live(canceledRaw())), markLive(reservationFailed()), ATT, opts), null);
+  assert.notEqual(C.piCanceledProofV3(piEv(canceledRaw()), markLive(reservationFailed()), ATT, opts), null);
+  assert.notEqual(C.piCanceledProofV3(piEv(live(canceledRaw())), reservationFailed(), ATT, opts), null);
+  // Hostaway cancel
+  const cb = cancelIn();
+  assert.equal(C.cancelSendEligibility({ ...cb, intent: markLive(cb.intent), piEvidence: piEv(live(rawPI())) }).ok, true);
+  assert.equal(C.cancelSendEligibility({ ...cb, intent: markLive(cb.intent) }).ok, false);
 });
 
 test("P5 LIVE stays closed: the runtime mode gate still refuses LIVE first", () => {
