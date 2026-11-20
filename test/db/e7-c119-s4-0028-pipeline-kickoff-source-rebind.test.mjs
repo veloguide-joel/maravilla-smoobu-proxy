@@ -38,7 +38,7 @@ const others = () => q1(`SELECT md5(string_agg(x, E'\\n' ORDER BY x)) AS h FROM 
 
 test("C119-S4-D1 0028 on base schema 27: claim_pipeline_kickoff replaced IN PLACE with ONLY the expected_source_digest literal changed (880db5b3 → 5294b6b4 == PINNED_REVISION.sourceDigest); OID / owner / ACL / volatility / definer / search_path / signature / return / language unchanged; no privilege change; every other booking object identical (0027 untouched); exact down restores the 0026 body; re-up identical", async () => {
   assert.equal(PINNED_REVISION.sourceDigest, NEW, "SQL literal == tooling PINNED_REVISION.sourceDigest");
-  const M = loadMigrations(); const m28 = M.find((m) => m.version === 28); assert.equal(m28.name, "pipeline_kickoff_source_rebind_s4"); assert.equal(M.length, 29);   // P1: + 0029 (mechanical)
+  const M = loadMigrations(); const m28 = M.find((m) => m.version === 28); assert.equal(m28.name, "pipeline_kickoff_source_rebind_s4"); assert.equal(M.length, 30);   // P1: + 0029 (mechanical)
   assert.deepEqual(await migrateUp(c, { env: "test", to: 27 }), Array.from({ length: 27 }, (_, i) => i + 1));
   const a27 = await attrs(); const p27 = await privs(); const o27 = await others();
   assert.deepEqual([a27.srcmd5, a27.secdef, a27.vol, a27.config, a27.lang], ["fb103173762c5dc6565338d2a15dd067", true, "v", "{\"search_path=pg_catalog, booking\"}", "plpgsql"], "base = the reviewed 0026 claim (the kickoff CATALOG_PINS src at schema 26 / 27)");

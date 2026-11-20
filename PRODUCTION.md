@@ -24,9 +24,11 @@ gets its own database (marker `live`), its own GitHub environment and arm variab
 | P2b-2 | Proofs (`capture-proof`, `compensation-proof`, `recovery-plan`) bind evidence to the intent's own recorded `payment.livemode` (a boolean) instead of the literal `false`; the workers' fences decide which mode may act. Cleanup and mirror stay TEST-only | merged (#240) |
 | P2c-1 | Pipeline coordinator: `mode` + one explicit live listing (`coordinatorScope`). A full LIVE happy path passes on the throwaway cluster | merged (#242) |
 | P2c-2 | `scripts/mv-pipeline.mjs` core `runPipelineOnce` (config check, marker check, advisory lock, selection by mode / allowlist / state / `notBefore`, per-booking coordinator call) | merged (#243) |
-| P2c-3 | `scripts/mv-pipeline-wiring.mjs` (accepted adapters, late-bound per booking), CLI env parsing (`MV_PIPELINE_*`), session-mode database only, `.github/workflows/mv-pipeline.yml` (manual dispatch only; takes effect only once on `main`, which is P5). TEST wiring complete; not yet run against real providers | this PR |
+| P2c-3 | `scripts/mv-pipeline-wiring.mjs`, CLI env parsing (`MV_PIPELINE_*`), session-mode database only, `.github/workflows/mv-pipeline.yml` (manual dispatch only; takes effect only once on `main`). TEST wiring complete; not yet run against real providers | merged (#244) |
 | P2c-4 | LIVE Stripe transport: `createE7StripeTestSend` admits `sk_test_` only; make it mode-aware (restricted live key) so LIVE wiring stops refusing `STRIPE_LIVE_TRANSPORT_NOT_READY` | todo |
-| P2d | Confirmation to real guests: migration so `booking.gn_recipient_in_scope` admits real addresses on a `live` database; notification worker / runner gates; policy text and tax breakdown in the email | todo |
+| P2d-1 | Recipient scope by environment: migration 0030 (`booking.gn_recipient_in_scope` admits a real address only when the marker is exactly `live`; TEST scope unchanged), `isRecipientInScopeFor`, `buildLiveBookingConfirmationRequest`, Resend executor and notification worker take `mode` | this PR |
+| P2d-2 | Confirmation step in `mv-pipeline` (bookings in `confirmed` with a queued, never-attempted `guest.notify`) and its Resend wiring | todo |
+| P2d-3 | Email text: tax line and the owner's cancellation policy (check 0022 for pinned template hashes first) | todo |
 | P3 | Production database (schema at marker `live`, backups), production Vercel env, GitHub environment `mv-live` + secrets | todo |
 | P4 | Production checkout page (today only `public/checkout-test.html`), guest-site "Book now", micasadirect.com DNS to Vercel | todo |
 | P5 | TEST proof of the new runner with taxes on ($169.40), retire the old armed chain, then one owner-approved live booking | todo |
