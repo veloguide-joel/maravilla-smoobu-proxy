@@ -856,3 +856,82 @@ test("C137 cancel fence after the claim: marker turns live in afterClaim (real o
   assert.equal(w.cancels.length, 0, "no resend, ever");
   assert.equal(await state(a.id), "reconciliation_required");
 });
+
+// ---------------------------------------------------------------------------------------------------------------------
+// C142: Stripe VOID TEST-identity fence on the authorization leg (DB marker exactly one 'test' row, TEST intent environment, payment
+// livemode false): (1) before the capture-history / PaymentIntent reads and the claim -> WAIT, zero provider calls, no write; (2) right after
+// the void claim, before preSendCommon -> the existing SEND_ABORTED path (never sent, never resent). The ordinary void then happens ONCE.
+async function ownerForceC142(sql, params) {        // the intents guard forbids these changes: throwaway DB only, triggers bypassed for ONE statement
+  const c = await db.owner.connect();
+  try { await c.query("BEGIN"); await c.query("SET LOCAL session_replication_role = replica"); await c.query(sql, params); await c.query("COMMIT"); }
+  catch (e) { await c.query("ROLLBACK").catch(() => {}); throw e; }
+  finally { c.release(); }
+}
+const C142_INST = "SELECT environment FROM booking.instance";
+const C142_FENCE = "SELECT environment, payment_livemode FROM booking.intents WHERE id = $1";
+const voidFacts = async (id) => ({ ...(await db.app.query("SELECT state, version FROM booking.intents WHERE id = $1", [id])).rows[0], legs: await legs(id),
+  ops: (await db.app.query("SELECT op_type, state, attempts, dispatched_at, idempotency_key FROM booking.external_operations WHERE intent_id = $1 ORDER BY created_at, id", [id])).rows,
+  evidence: (await db.app.query("SELECT count(*)::int AS n FROM booking.provider_evidence WHERE intent_id = $1", [id])).rows[0].n,
+  cases: (await db.app.query("SELECT count(*)::int AS n FROM booking.reconciliation_cases WHERE intent_id = $1", [id])).rows[0].n });
+
+test("C142 void fence before any read / claim: live / missing / duplicated marker, non-TEST intent environment, non-TEST payment -> WAIT, zero Stripe calls, zero writes; then ONE void", async () => {
+  const skipFirst = (f) => { let i = 0; return (sql, r) => (sql === C142_INST && ++i >= 2 ? f(r) : null); };   // 1st read = the step's assertEnvironment
+  const cases = [
+    ["marker live", "VOID_FENCE_DATABASE_NOT_TEST", () => skipFirst((r) => ({ ...r, rows: r.rows.map(() => ({ environment: "live" })) }))],
+    ["marker missing", "VOID_FENCE_DATABASE_NOT_TEST", () => skipFirst((r) => ({ ...r, rows: [] }))],
+    ["marker duplicated", "VOID_FENCE_DATABASE_NOT_TEST", () => skipFirst((r) => ({ ...r, rows: [...r.rows, ...r.rows] }))],
+    ["intent environment live", "VOID_FENCE_INTENT_ENVIRONMENT_NOT_TEST", () => (sql, r) => (sql === C142_FENCE ? { ...r, rows: r.rows.map((x) => ({ ...x, environment: "live" })) } : null)],
+    ["payment livemode true", "VOID_FENCE_INTENT_NOT_TEST_MODE", () => (sql, r) => (sql === C142_FENCE ? { ...r, rows: r.rows.map((x) => ({ ...x, payment_livemode: true })) } : null)],
+    ["payment livemode absent", "VOID_FENCE_INTENT_NOT_TEST_MODE", () => (sql, r) => (sql === C142_FENCE ? { ...r, rows: r.rows.map((x) => ({ ...x, payment_livemode: null })) } : null)]
+  ];
+  let n = 142;
+  for (const [name, code, mk] of cases) {
+    const w = world(); const a = await reservationFailed(w, n); const h = harness(w, [n]); n += 1;
+    const f0 = await voidFacts(a.id);
+    const r = await runCleanupStep(poolRewritingC137(db.app, mk()), h.opts({ intentId: a.id }));
+    await settleLate(r);
+    assert.ok(r.actions.includes(`WAIT:${code}`), `${name}: ${JSON.stringify(r.actions)}`);
+    assert.deepEqual([r.sends, w.calls.length, w.voids.length, w.cancels.length], [0, 0, 0, 0], `${name}: zero provider calls`);
+    assert.deepEqual(await voidFacts(a.id), f0, `${name}: nothing written (no claim, read row, evidence, event or case)`);
+    assert.equal(await state(a.id), "reservation_failed");
+    // intact TEST facts: exactly ONE void -> authorization_released; then idle
+    await h.until(a.id, (s) => s === "authorization_released", { max: 4 });
+    assert.equal(w.voids.length, 1, name);
+    assert.equal((await h.step({ intentId: a.id })).status, "idle", `${name}: idempotent`);
+    assert.equal(w.voids.length, 1);
+  }
+});
+
+test("C142 void fence after the claim: REAL marker live / intent environment live / payment_livemode true / NULL in afterClaim -> SEND_ABORTED before Stripe; zero voids through recovery; one row / key", async () => {
+  const cases = [
+    ["marker live", "VOID_FENCE_DATABASE_NOT_TEST",
+      () => db.owner.query("UPDATE booking.instance SET environment = 'live'"), () => db.owner.query("UPDATE booking.instance SET environment = 'test'")],
+    ["intent environment live", "VOID_FENCE_INTENT_ENVIRONMENT_NOT_TEST",
+      (id) => ownerForceC142("UPDATE booking.intents SET environment = 'live' WHERE id = $1", [id]), (id) => ownerForceC142("UPDATE booking.intents SET environment = 'test' WHERE id = $1", [id])],
+    ["payment_livemode true", "VOID_FENCE_INTENT_NOT_TEST_MODE",
+      (id) => ownerForceC142("UPDATE booking.intents SET payment_livemode = true WHERE id = $1", [id]), (id) => ownerForceC142("UPDATE booking.intents SET payment_livemode = false WHERE id = $1", [id])],
+    ["payment_livemode null", "VOID_FENCE_INTENT_NOT_TEST_MODE",
+      (id) => ownerForceC142("UPDATE booking.intents SET payment_livemode = NULL WHERE id = $1", [id]), (id) => ownerForceC142("UPDATE booking.intents SET payment_livemode = false WHERE id = $1", [id])]
+  ];
+  let n = 170;
+  for (const [name, code, mutate, restore] of cases) {
+    const w = world(); const a = await reservationFailed(w, n); const h = harness(w, [n]); n += 1;
+    const key0 = (await opsOf(a.id, OPS.VOID))[0].payload.providerIdempotencyKey;
+    let r;
+    try {
+      r = await h.step({ intentId: a.id, hooks: { afterClaim: async (op) => { if ((op.opType || op.op_type) === OPS.VOID) await mutate(a.id); } } });
+      await settleLate(r);
+    } finally { await restore(a.id); }
+    const fx = (await db.owner.query("SELECT i.environment, i.payment_livemode, (SELECT string_agg(environment, ',') FROM booking.instance) AS marker FROM booking.intents i WHERE i.id = $1", [a.id])).rows[0];
+    assert.deepEqual([fx.environment, fx.payment_livemode, fx.marker], ["test", false, "test"], `${name}: fixture restored`);
+    assert.ok(r.actions.includes(`SEND_ABORTED:${code}`), `${name}: ${JSON.stringify(r.actions)}`);
+    assert.deepEqual([r.sends, w.voids.length], [0, 0], `${name}: refused before Stripe`);
+    assert.deepEqual((await opsOf(a.id, OPS.VOID)).map((o) => [o.state, o.error_code]), [["outcome_unknown", `SEND_ABORTED_${code}`]], name);
+    // unknown -> reads only; the PaymentIntent is still authorized -> intercepted owner case: never a void, never a second row / key
+    for (let k = 0; k < 6; k++) { h.clk.t += 3 * MIN; await settleLate(await h.step({ intentId: a.id })); }
+    assert.equal(w.voids.length, 0, `${name}: zero voids through recovery`);
+    assert.equal(await state(a.id), "reconciliation_required", name);
+    const rows = await opsOf(a.id, OPS.VOID);
+    assert.deepEqual([rows.length, rows[0].payload.providerIdempotencyKey], [1, key0], `${name}: one void row, same key`);
+  }
+});
