@@ -447,3 +447,73 @@ test("C88c unit: TWO simultaneous guarded capture calls with an async veto → t
   assert.deepEqual([calls, counter.capturePaymentIntent, rs.filter((x) => x.status === "fulfilled").length], [1, 1, 1]);
   assert.ok(rs.some((x) => x.status === "rejected" && x.reason instanceof CoordinatorBudgetError));
 });
+
+// ---------------------------------------------------------------------------------------------
+// C139: coordinator-level scope fence — every phase config fixed to 606998 / USD (incl. the adapter allowlists and the recording config's
+// listing) and the persisted scope (exactly one 'test' marker row, intent environment 'test', price currency USD) checked BEFORE any worker
+// step. Each mismatch is REFUSED with zero provider calls and every intent row byte-identical; the supported TEST path is unchanged.
+function poolRewritingC139(base, rewrite) {
+  const wrapQ = (q) => async (sql, p) => { const r = await q(sql, p); return rewrite(String(sql), r) || r; };
+  return { query: wrapQ((s, p) => base.query(s, p)), connect: async () => {
+    const c = await base.connect();
+    return new Proxy(c, { get(t, k) { if (k === "query") return wrapQ((s, p) => t.query(s, p)); const v = t[k]; return typeof v === "function" ? v.bind(t) : v; } });
+  } };
+}
+
+test("C139a config scope: listing currency / recording listing / adapter allowlist or currency not 606998 / USD -> REFUSED, zero provider calls, rows unchanged", async () => {
+  const w = world(); const bk = await authorizedBooking(w); const c = coord(w, bk);
+  const fp0 = await fingerprint(bk.id);
+  const o = c.opts();
+  const withPhase = (p, patch) => ({ ...o, phases: { ...o.phases, [p]: { ...o.phases[p], ...patch } } });
+  const mxn = (p) => new Map([[L_ID, { ...o.phases[p].listings.get(L_ID), currency: "MXN" }]]);
+  const ac = o.phases.reservation.adapterConfig;
+  for (const [label, opts, code] of [
+    ["reservation listing MXN", withPhase("reservation", { listings: mxn("reservation") }), "CURRENCY_NOT_TEST_FIXED"],
+    ["capture listing MXN", withPhase("capture", { listings: mxn("capture") }), "CURRENCY_NOT_TEST_FIXED"],
+    ["recording listing MXN", withPhase("recording", { listings: mxn("recording") }), "CURRENCY_NOT_TEST_FIXED"],
+    ["recording config listingId other", withPhase("recording", { listings: new Map([[L_ID, { ...o.phases.recording.listings.get(L_ID), listingId: 603566 }]]) }), "LISTING_NOT_TEST_FIXED"],
+    ["reservation adapter wider allowlist", withPhase("reservation", { adapterConfig: { ...ac, allowedListingIds: [L_ID, 603566] } }), "ADAPTER_CONFIG_NOT_TEST_FIXED"],
+    ["capture adapter other listing", withPhase("capture", { adapterConfig: { ...ac, allowedListingIds: [603566] } }), "ADAPTER_CONFIG_NOT_TEST_FIXED"],
+    ["capture adapter MXN", withPhase("capture", { adapterConfig: { ...ac, currency: "MXN" } }), "ADAPTER_CONFIG_NOT_TEST_FIXED"],
+    ["reservation adapter missing", withPhase("reservation", { adapterConfig: undefined }), "ADAPTER_CONFIG_NOT_TEST_FIXED"]
+  ]) {
+    const r = await runTestPipelineCoordinator(db.app, opts);
+    assert.deepEqual([r.outcome, r.code], ["REFUSED", code], label);
+  }
+  assert.equal(w.calls.length, 0, "no provider call on any refusal");
+  assert.deepEqual(await fingerprint(bk.id), fp0, "every intent row byte-identical");
+  assert.equal((await loadIntent(db.app, bk.id)).status, "payment_authorized");
+});
+
+test("C139b persisted scope: live / missing / duplicated marker, intent environment live, intent currency MXN -> REFUSED before any worker step; then the ordinary TEST run once, idempotent", async () => {
+  const w = world(); const bk = await authorizedBooking(w); const c = coord(w, bk);
+  const fp0 = await fingerprint(bk.id);
+  const INST = "SELECT environment FROM booking.instance";
+  const live = (r) => ({ ...r, rows: r.rows.map((x) => ({ ...x, environment: "live" })) });
+  for (const [label, rw, code] of [
+    ["marker live", (sql, r) => (sql === INST ? live(r) : null), "DATABASE_NOT_TEST"],
+    ["marker missing", (sql, r) => (sql === INST ? { ...r, rows: [] } : null), "DATABASE_NOT_TEST"],
+    ["marker duplicated", (sql, r) => (sql === INST ? { ...r, rows: [...r.rows, ...r.rows] } : null), "DATABASE_NOT_TEST"],
+    ["intent environment live", (sql, r) => (sql === "SELECT environment FROM booking.intents WHERE id = $1" ? live(r) : null), "INTENT_ENVIRONMENT_NOT_TEST"],
+    ["intent currency MXN", (sql, r) => (/^SELECT \*, from_date::text AS from_date_s/.test(sql) ? { ...r, rows: r.rows.map((x) => ({ ...x, price_snapshot: { ...x.price_snapshot, currency: "MXN" } })) } : null), "CURRENCY_NOT_TEST_FIXED"]
+  ]) {
+    const r = await c.run({}, poolRewritingC139(db.app, rw));
+    assert.deepEqual([r.outcome, r.code, r.steps?.length ?? 0], ["REFUSED", code, 0], label);
+    assert.deepEqual(r.writes, { create: 0, capture: 0, record: 0 }, label);
+  }
+  // a REAL marker change (owner), restored
+  try {
+    await db.owner.query("UPDATE booking.instance SET environment = 'live'");
+    assert.equal((await c.run()).code, "DATABASE_NOT_TEST");
+  } finally { await db.owner.query("UPDATE booking.instance SET environment = 'test'"); }
+  assert.equal((await db.owner.query(INST)).rows.map((x) => x.environment).join(), "test", "marker restored");
+  assert.equal(w.calls.length, 0, "no provider call on any refusal");
+  assert.deepEqual(await fingerprint(bk.id), fp0, "every intent row byte-identical");
+  // the supported 606998 / USD TEST path: unchanged, exactly 1 / 1 / 1, then idempotent
+  const ok = await c.run();
+  assert.equal(ok.outcome, "CONFIRMED", JSON.stringify(ok));
+  assert.deepEqual([ok.writes, w.writes], [{ create: 1, capture: 1, record: 1 }, { createReservation: 1, capturePaymentIntent: 1, createOfflineCharge: 1 }]);
+  const n0 = w.calls.length;
+  const again = await c.run();
+  assert.deepEqual([again.outcome, again.steps.length, again.writes, w.calls.length], ["CONFIRMED", 0, { create: 0, capture: 0, record: 0 }, n0]);
+});
