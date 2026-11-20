@@ -18,7 +18,7 @@ const INTENT_ROUTES = ["api/checkout/intents.js", "api/checkout/intent-step.js"]
 const INTENT_CLOSURE_STATIC = ["lib/checkout/intent-api-http.js", "lib/checkout/stripe-test-mode.js", "lib/checkout/stripe-webhook-http.js"];
 const INTENT_CLOSURE_DYNAMIC = ["lib/bookability.js", "lib/booking-db/codec.js", "lib/booking-db/config.js", "lib/booking-db/intent-access.js",
   "lib/booking-db/operations.js", "lib/booking-db/pool.js", "lib/booking-db/repo.js", "lib/booking-db/webhooks.js", "lib/checkout/final-price.js",
-  "lib/checkout/intent-api-core.js", "lib/checkout/intent-state.js", "lib/checkout/server-pricer.js", "lib/checkout/stripe-test-webhook.js",
+  "lib/checkout/intent-api-core.js", "lib/checkout/intent-state.js", "lib/checkout/server-pricer.js", "lib/checkout/tax-policy.js", "lib/checkout/stripe-test-webhook.js",
   "lib/direct-policy.js", "lib/direct-pricing.js", "lib/hostaway-calendar.js", "lib/hostaway.js", "lib/public-api.js", "lib/quote-public.js"];
 
 const WEBHOOK_CLOSURE = Object.freeze([

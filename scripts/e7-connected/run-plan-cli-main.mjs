@@ -26,7 +26,7 @@ export const NATIVE_EXEC_SOURCES = Object.freeze([
   "lib/booking-db/config.js", "lib/booking-db/operations.js", "lib/booking-db/pool.js", "lib/booking-db/recording-worker.js",
   "lib/booking-db/recovery.js", "lib/booking-db/repo.js", "lib/booking-db/reservation-worker.js", "lib/booking-db/test-abort.js",
   "lib/checkout/capture-proof.js", "lib/checkout/compensation-proof.js", "lib/checkout/final-price.js", "lib/checkout/intent-state.js",
-  "lib/checkout/offline-charge-proof.js", "lib/checkout/recovery-plan.js", "lib/checkout/server-pricer.js", "lib/direct-policy.js",
+  "lib/checkout/offline-charge-proof.js", "lib/checkout/recovery-plan.js", "lib/checkout/server-pricer.js", "lib/checkout/tax-policy.js", "lib/direct-policy.js",
   "lib/direct-pricing.js", "lib/hostaway-calendar.js", "lib/hostaway-reservations.js", "lib/hostaway.js", "lib/public-api.js", "lib/quote-public.js",
   "package-lock.json", "package.json", "scripts/e7-connected/db-credential-file.mjs", "scripts/e7-connected/executor-adapters.mjs",
   "scripts/e7-connected/http-transports.mjs", "scripts/e7-connected/probe-cli-main.mjs", "scripts/e7-connected/probe-command.mjs",

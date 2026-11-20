@@ -32,7 +32,7 @@ export const COPIED_ORIGINS = Object.freeze({
   "scripts/e7-connected/run-core.mjs": "ad1dcbb29e7cb1ce0aac71ac178d903076d4e5cc293dd17f972c04b4beaa5afe",          // SAME_DB SQL, checkSameDatabase
   "scripts/e7-connected/run-core-abort-v2.mjs": "2b686e1e3bcbe2a5f837412d4a0a6a2c9864ebf232e2bd58bef67c8f36087771",  // P0 / phase budgets, WRITE_TYPES, P0 eligibility
   "scripts/e7-connected/run-test-abort.mjs": "57d97e1806fbaad83f76cf0b794cb45893a95d36456ad09b5acb7fd8b2f62b21",     // BRIDGE_LIMITS
-  "lib/booking-db/reservation-worker.js": "ef76c13fac9cfff6e51f0afd29f68f24a642d62c05480c5a11481c0fa50f6330",       // DEFAULT_TIMEOUTS (C136 pin 601f48f6 -> ef76c13f: CREATE TEST fence only; DEFAULT_TIMEOUTS unchanged)
+  "lib/booking-db/reservation-worker.js": "4e76a33962b5d06e60c7daa36141c51c96325d9f73c3070aecca35f879bb4f4d",       // DEFAULT_TIMEOUTS (C136 pin 601f48f6 -> ef76c13f: CREATE TEST fence only; DEFAULT_TIMEOUTS unchanged)
   "lib/booking-db/recovery.js": "17aa5a665d32cbe959e7daa4c2baffd01a00645e454eb69218938696dfa8dfc7"                  // completed payment-attempt SELECT
 });
 export const SQL_SAME_DB = `SELECT i.environment, i.created_at::text AS created_at, current_database() AS db, pg_postmaster_start_time()::text AS started,
