@@ -288,6 +288,75 @@ test("P9 stale / unsafe facts refuse BEFORE any dispatch (durably): open case, s
     assert.equal(r.code, "REFUSED:STATE_NOT_PAYMENT_AUTHORIZED"); assert.equal(d.calls.length, 0); }
 });
 
+// ---------------------------------------------------------------------------------------------------------------------
+// C147 (placed BEFORE P10: P10's 0024-down probe rolls this DB back to 24 and must stay last): kickoff TEST-identity fence (DB marker exactly one 'test' row, TEST intent environment, payment livemode false): (1) right after
+// the fresh read, BEFORE admission / refuse / claim → FENCE:<code>, no write, no dispatch; (2) after the claim COMMIT, immediately BEFORE the
+// ONE dispatch → FENCE_AFTER_CLAIM:<code>, no dispatch, no settle; the row stays claimed (human-owned, never re-claimed / re-dispatched).
+const C147_INST = "SELECT environment FROM booking.instance";
+const C147_INTENT = "SELECT environment, payment_livemode FROM booking.intents WHERE id = $1";
+/** a POOL whose clients rewrite chosen read results (the database itself is untouched) */
+const rewritingPool = (rw) => ({ connect: async () => { const cl = await db.app.connect();
+  return { query: async (sql, p) => { const out = await cl.query(sql, p); const alt = rw(String(sql), out); return alt ?? out; }, release: (x) => cl.release(x) }; } });
+async function ownerForceC147(sql, params) {        // the intents guard forbids these changes: throwaway DB only, triggers bypassed for ONE statement
+  const c = await db.owner.connect();
+  try { await c.query("BEGIN"); await c.query("SET LOCAL session_replication_role = replica"); await c.query(sql, params); await c.query("COMMIT"); }
+  catch (e) { await c.query("ROLLBACK").catch(() => {}); throw e; }
+  finally { c.release(); }
+}
+
+test("C147 kickoff fence BEFORE admission / claim: live / missing / duplicated marker, non-TEST intent environment, payment livemode true / NULL → FENCE:<code>, zero writes, zero dispatch; then ONE normal dispatch", async () => {
+  const cases = [
+    ["marker live", "KICKOFF_FENCE_DATABASE_NOT_TEST", (sql, r) => (sql === C147_INST ? { ...r, rows: r.rows.map(() => ({ environment: "live" })) } : null)],
+    ["marker missing", "KICKOFF_FENCE_DATABASE_NOT_TEST", (sql, r) => (sql === C147_INST ? { ...r, rows: [] } : null)],
+    ["marker duplicated", "KICKOFF_FENCE_DATABASE_NOT_TEST", (sql, r) => (sql === C147_INST ? { ...r, rows: [...r.rows, ...r.rows] } : null)],
+    ["intent environment live", "KICKOFF_FENCE_INTENT_ENVIRONMENT_NOT_TEST", (sql, r) => (sql === C147_INTENT ? { ...r, rows: r.rows.map((x) => ({ ...x, environment: "live" })) } : null)],
+    ["payment livemode true", "KICKOFF_FENCE_INTENT_NOT_TEST_MODE", (sql, r) => (sql === C147_INTENT ? { ...r, rows: r.rows.map((x) => ({ ...x, payment_livemode: true })) } : null)],
+    ["payment livemode null", "KICKOFF_FENCE_INTENT_NOT_TEST_MODE", (sql, r) => (sql === C147_INTENT ? { ...r, rows: r.rows.map((x) => ({ ...x, payment_livemode: null })) } : null)]
+  ];
+  for (const [name, code, rw] of cases) {
+    const k = await authorizedFresh(); const d = fakeDispatch();
+    const req0 = (await req(k.id))[0]; const i0 = await loadIntent(db.app, k.id);
+    const r = await runPipelineKickoffOnce(rewritingPool(rw), { workerId: "kw-f0", dispatch: d, constants: OPEN, intentId: k.id });
+    assert.deepEqual([r.code, r.claimed, r.dispatchAttempted, d.calls.length], [`FENCE:${code}`, false, false, 0], name);
+    assert.deepEqual((await req(k.id))[0], req0, `${name}: request row untouched (no refuse, no claim)`);
+    assert.equal(req0.state, "requested");
+    const i1 = await loadIntent(db.app, k.id);
+    assert.deepEqual([i1.status, i1.version], [i0.status, i0.version], `${name}: intent untouched`);
+    // intact TEST facts: exactly ONE claim + ONE dispatch; then never again
+    const ok = await runPipelineKickoffOnce(db.app, { workerId: "kw-f0b", dispatch: d, constants: OPEN, intentId: k.id });
+    assert.deepEqual([ok.code, d.calls.length], ["HANDOFF_ACCEPTED", 1], name);
+    const again = await runPipelineKickoffOnce(db.app, { workerId: "kw-f0c", dispatch: d, constants: OPEN, intentId: k.id });
+    assert.deepEqual([again.code, d.calls.length], ["SKIPPED:NOT_REQUESTED:DISPATCH_ACCEPTED", 1], `${name}: idempotent`);
+  }
+});
+
+test("C147 kickoff fence AFTER the claim COMMIT, before the ONE dispatch: REAL marker live / intent environment live / payment_livemode true / NULL → FENCE_AFTER_CLAIM, zero dispatch, no settle; never re-claimed or re-dispatched", async () => {
+  const cases = [
+    ["marker live", "KICKOFF_FENCE_DATABASE_NOT_TEST",
+      () => db.owner.query("UPDATE booking.instance SET environment = 'live'"), () => db.owner.query("UPDATE booking.instance SET environment = 'test'")],
+    ["intent environment live", "KICKOFF_FENCE_INTENT_ENVIRONMENT_NOT_TEST",
+      (id) => ownerForceC147("UPDATE booking.intents SET environment = 'live' WHERE id = $1", [id]), (id) => ownerForceC147("UPDATE booking.intents SET environment = 'test' WHERE id = $1", [id])],
+    ["payment_livemode true", "KICKOFF_FENCE_INTENT_NOT_TEST_MODE",
+      (id) => ownerForceC147("UPDATE booking.intents SET payment_livemode = true WHERE id = $1", [id]), (id) => ownerForceC147("UPDATE booking.intents SET payment_livemode = false WHERE id = $1", [id])],
+    ["payment_livemode null", "KICKOFF_FENCE_INTENT_NOT_TEST_MODE",
+      (id) => ownerForceC147("UPDATE booking.intents SET payment_livemode = NULL WHERE id = $1", [id]), (id) => ownerForceC147("UPDATE booking.intents SET payment_livemode = false WHERE id = $1", [id])]
+  ];
+  for (const [name, code, mutate, restore] of cases) {
+    const k = await authorizedFresh(); const d = fakeDispatch();
+    let r;
+    try { r = await runPipelineKickoffOnce(db.app, { workerId: "kw-f1", dispatch: d, constants: OPEN, intentId: k.id, hooks: { afterClaim: async () => { await mutate(k.id); } } }); }
+    finally { await restore(k.id); }
+    const fx = (await db.owner.query("SELECT i.environment, i.payment_livemode, (SELECT string_agg(environment, ',') FROM booking.instance) AS marker FROM booking.intents i WHERE i.id = $1", [k.id])).rows[0];
+    assert.deepEqual([fx.environment, fx.payment_livemode, fx.marker], ["test", false, "test"], `${name}: fixture restored`);
+    assert.deepEqual([r.code, r.claimed, r.dispatchAttempted, r.settled, d.calls.length], [`FENCE_AFTER_CLAIM:${code}`, true, false, false, 0], name);
+    assert.equal((await req(k.id))[0].state, "claimed", `${name}: claimed, NOT settled (human-owned)`);
+    // recovery: a later clean consumer never re-claims nor re-dispatches the human-owned row
+    const later = await runPipelineKickoffOnce(db.app, { workerId: "kw-f1b", dispatch: d, constants: OPEN, intentId: k.id });
+    assert.deepEqual([later.code, later.claimed, d.calls.length], ["SKIPPED:NOT_REQUESTED:CLAIMED", false, 0], name);
+    assert.equal((await req(k.id))[0].state, "claimed");
+  }
+});
+
 test("P10 the fence: app has no write path except the three functions; inputs that differ from the server binding are refused; only the claiming worker settles; the 0024 down refuses while dispatch evidence exists", async () => {
   const k = await authorizedFresh();
   await assert.rejects(db.app.query("UPDATE booking.pipeline_kickoff_requests SET state = 'claimed' WHERE intent_id = $1", [k.id]), /permission denied/);
