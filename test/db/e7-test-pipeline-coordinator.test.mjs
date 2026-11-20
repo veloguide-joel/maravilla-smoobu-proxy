@@ -16,6 +16,7 @@ import { validateAdapterConfig } from "../../lib/hostaway-reservations.js";
 import { runTestPipelineCoordinator, TEST_LISTING_ID, CoordinatorBudgetError, refundObservationRefusal, _internal as CI } from "../../lib/booking-db/test-pipeline-coordinator.js";
 import { adminRecordEvidence } from "../../db/lib/admin.js";
 import { runPipelineOnce, validatePipelineConfig, exitCodeFor, LOCK_NAME } from "../../scripts/mv-pipeline.mjs";
+import { createWiring } from "../../scripts/mv-pipeline-wiring.mjs";
 
 let netAttempts = 0;
 const realFetch = globalThis.fetch;
@@ -635,4 +636,32 @@ test("P2c-2c LIVE mode on a 'live' database: two approved listings, two bookings
     assert.equal(exitCodeFor(r), 1);
   } finally { await db.owner.query("UPDATE booking.instance SET environment = 'test'"); }
   assert.equal((await db.owner.query("SELECT environment FROM booking.instance")).rows.map((x) => x.environment).join(), "test", "marker restored");
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// P2c-3: the REAL provider wiring (accepted adapters) built for one booking from persisted facts. The injected exchanges count requests and
+// refuse: this test proves the BINDING (what is built, for which booking, and what is still unbound), not a provider conversation. The
+// end-to-end proof of the real adapters is the P5 TEST booking.
+test("P2c-3 wiring: phases are built for exactly this booking from the database; reservation is bound, capture / recording stay UNBOUND until a reservation is verified; mismatches refuse; no request leaves", async () => {
+  const w = world(); const bk = await authorizedBooking(w);
+  let requests = 0; const refuseAll = async () => { requests += 1; throw new Error("no provider call is expected"); };
+  const mk = (over = {}) => createWiring({ mode: "test", pool: db.app, stripeKey: `sk_test_${"A".repeat(24)}`, hostawayToken: "token-placeholder", stripeAccountId: ACCT,
+    refFieldId: REF_FIELD, timeZone: "America/Mexico_City", accountRef: LABEL.accountRef, runId: "run-1", exchanges: { stripe: refuseAll, hostaway: refuseAll }, ...over });
+  const cfg = { listings: usd([606998]) };
+  const built = await mk().buildPhases({ id: bk.id, ref: bk.ref, listingId: 606998 }, cfg);
+  assert.deepEqual(Object.keys(built.phases).sort(), ["capture", "recording", "reservation"]);
+  assert.deepEqual([[...built.phases.reservation.listings.keys()], built.phases.reservation.adapterConfig.allowedListingIds, built.phases.capture.stripeAccountId], [[606998], [606998], ACCT]);
+  assert.deepEqual({ ...built.phases.recording.executors.label }, { accountRef: LABEL.accountRef, clientSnapshotId: "run-1" });
+  assert.equal(built.env.DIRECT_DISCOUNT_BPS, "1000");
+  assert.equal(typeof built.hooks.afterStep, "function");
+  // capture / recording are not bound before a verified reservation exists: they throw BEFORE any request
+  await assert.rejects(built.phases.capture.executors.capturePaymentIntent({}), (e) => e.code === "EXECUTOR_UNBOUND");
+  await assert.rejects(built.phases.recording.executors.createOfflineCharge({}), (e) => e.code === "EXECUTOR_UNBOUND");
+  assert.equal(requests, 0);
+  // a booking reference / listing that does not match the persisted intent, or a listing outside the config, is refused
+  await assert.rejects(mk().buildPhases({ id: bk.id, ref: "MV-WRONGREF", listingId: 606998 }, cfg), (e) => e.code === "INTENT_NOT_BOUND");
+  await assert.rejects(mk().buildPhases({ id: bk.id, ref: bk.ref, listingId: 700123 }, { listings: usd([700123]) }), (e) => e.code === "INTENT_NOT_BOUND");
+  await assert.rejects(mk().buildPhases({ id: bk.id, ref: bk.ref, listingId: 606998 }, { listings: usd([700123]) }), (e) => e.code === "LISTING_NOT_CONFIGURED");
+  assert.equal(requests, 0);
+  assert.equal((await loadIntent(db.app, bk.id)).status, "payment_authorized", "nothing was claimed or written");
 });
