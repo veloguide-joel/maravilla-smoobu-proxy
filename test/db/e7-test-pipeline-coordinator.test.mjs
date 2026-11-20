@@ -15,6 +15,7 @@ import { todayInTimeZone } from "../../lib/public-api.js";
 import { validateAdapterConfig } from "../../lib/hostaway-reservations.js";
 import { runTestPipelineCoordinator, TEST_LISTING_ID, CoordinatorBudgetError, refundObservationRefusal, _internal as CI } from "../../lib/booking-db/test-pipeline-coordinator.js";
 import { adminRecordEvidence } from "../../db/lib/admin.js";
+import { runPipelineOnce, validatePipelineConfig, exitCodeFor, LOCK_NAME } from "../../scripts/mv-pipeline.mjs";
 
 let netAttempts = 0;
 const realFetch = globalThis.fetch;
@@ -555,6 +556,83 @@ test("P2c-1b LIVE happy path on a 'live' database: authorized -> confirmed throu
     const again = await c.run({ mode: "live" });
     assert.deepEqual([again.outcome, again.writes], ["CONFIRMED", { create: 0, capture: 0, record: 0 }]);
     assert.deepEqual([w.writes.createReservation, w.writes.capturePaymentIntent, w.writes.createOfflineCharge], [1, 1, 1], "never a second provider write");
+  } finally { await db.owner.query("UPDATE booking.instance SET environment = 'test'"); }
+  assert.equal((await db.owner.query("SELECT environment FROM booking.instance")).rows.map((x) => x.environment).join(), "test", "marker restored");
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// P2c-2: scripts/mv-pipeline.mjs — the mode-aware runner around the coordinator. Fake providers; the wiring dep returns each booking's phases.
+const cutoffNow = () => new Date(Date.now() - 20 * MIN - 5).toISOString();        // bookings below are created at (now - 20 min): selects only them
+function wiring(pairs, listingOf = () => undefined) {                             // pairs: [[world, booking]]
+  const by = new Map(pairs.map(([w, bk]) => [bk.id, coord(w, bk, listingOf(bk) ? { listingId: listingOf(bk) } : {}).opts()]));
+  return { buildPhases: async (intent) => { const o = by.get(intent.id); if (!o) { const e = new Error("no wiring"); e.code = "NO_WIRING"; throw e; }
+    return { phases: o.phases, env: o.env, clock: o.clock, recordingClock: o.recordingClock }; } };
+}
+const usd = (ids) => new Map(ids.map((id) => [id, { currency: "USD" }]));
+const provWrites = (w) => [w.writes.createReservation, w.writes.capturePaymentIntent, w.writes.createOfflineCharge];
+
+test("P2c-2a config (no I/O): mode, worker id, listings (USD, 1..60, TEST = exactly 606998, LIVE never 606998), notBefore, maxIntents", () => {
+  const ok = { mode: "test", workerId: "mv-t", listings: usd([606998]), notBefore: "2026-11-20T00:00:00.000Z" };
+  assert.equal(validatePipelineConfig(ok).ok, true);
+  assert.deepEqual(validatePipelineConfig({ ...ok, mode: "live", listings: usd([700123, 700124]) }).cfg.listingIds, [700123, 700124]);
+  for (const [over, code] of [[{ mode: "prod" }, "MODE_INVALID"], [{ workerId: "" }, "WORKER_ID_INVALID"], [{ listings: new Map() }, "LISTINGS_INVALID"],
+    [{ listings: usd([700123]) }, "LISTING_NOT_TEST_FIXED"], [{ listings: usd([606998, 700123]) }, "LISTING_NOT_TEST_FIXED"],
+    [{ mode: "live", listings: usd([606998]) }, "LISTING_NOT_LIVE_SCOPED"], [{ mode: "live", listings: usd([700123, 606998]) }, "LISTING_NOT_LIVE_SCOPED"],
+    [{ listings: new Map([[606998, { currency: "MXN" }]]) }, "CURRENCY_NOT_SUPPORTED"], [{ listings: new Map([["606998", { currency: "USD" }]]) }, "LISTINGS_INVALID"],
+    [{ mode: "live", listings: usd(Array.from({ length: 61 }, (_, i) => 700000 + i)) }, "LISTINGS_INVALID"],
+    [{ notBefore: "2026-11-20" }, "NOT_BEFORE_INVALID"], [{ notBefore: undefined }, "NOT_BEFORE_INVALID"], [{ maxIntents: 0 }, "MAX_INTENTS_INVALID"], [{ maxIntents: 11 }, "MAX_INTENTS_INVALID"]]) {
+    assert.deepEqual(validatePipelineConfig({ ...ok, ...over }), { ok: false, code }, code);
+  }
+  assert.deepEqual([exitCodeFor({ outcome: "OK" }), exitCodeFor({ outcome: "BUSY" }), exitCodeFor({ outcome: "ATTENTION" }), exitCodeFor({ outcome: "REFUSED" }), exitCodeFor(null)], [0, 0, 1, 1, 1]);
+});
+
+test("P2c-2b TEST mode: two paid TEST bookings are both confirmed in ONE run (1 / 1 / 1 each); older bookings are never selected; a second run writes nothing; lock held -> BUSY; wrong marker -> REFUSED", async () => {
+  const notBefore = cutoffNow();
+  const w1 = world(); const b1 = await authorizedBooking(w1); const w2 = world(); const b2 = await authorizedBooking(w2);
+  const cfg = { mode: "test", workerId: "mv-t", listings: usd([606998]), notBefore, maxIntents: 10 };
+  const deps = wiring([[w1, b1], [w2, b2]]);
+  // another session holds the runner lock: BUSY, nothing selected, zero provider calls
+  const other = await db.app.connect();
+  try {
+    await other.query("SELECT pg_advisory_lock(hashtext($1), 0)", [LOCK_NAME]);
+    const busy = await runPipelineOnce(db.app, cfg, deps);
+    assert.deepEqual([busy.outcome, busy.code, busy.counts.candidates, w1.calls.length + w2.calls.length], ["BUSY", "LOCK_HELD", 0, 0]);
+  } finally { await other.query("SELECT pg_advisory_unlock(hashtext($1), 0)", [LOCK_NAME]); other.release(); }
+  // a LIVE-configured runner on this TEST database: refused before the lock
+  assert.deepEqual([(await runPipelineOnce(db.app, { ...cfg, mode: "live", listings: usd([700123]) }, deps)).code], ["DATABASE_NOT_CONFIGURED_MODE"]);
+  assert.equal((await runPipelineOnce(db.app, cfg, {})).code, "PROVIDER_WIRING_REQUIRED");
+  const r = await runPipelineOnce(db.app, cfg, deps);
+  assert.deepEqual([r.outcome, r.code, { ...r.counts }], ["OK", "DONE", { candidates: 2, confirmed: 2, pending: 0, stopped: 0, attention: 0 }], JSON.stringify(r));
+  assert.deepEqual(r.intents.map((i) => [i.intentId, i.outcome, i.writes]), [[b1.id, "CONFIRMED", { create: 1, capture: 1, record: 1 }], [b2.id, "CONFIRMED", { create: 1, capture: 1, record: 1 }]]);
+  assert.deepEqual([provWrites(w1), provWrites(w2)], [[1, 1, 1], [1, 1, 1]]);
+  assert.equal(JSON.stringify(r).includes(b1.ref), false, "no booking reference / guest data in the result");
+  const again = await runPipelineOnce(db.app, cfg, deps);
+  assert.deepEqual([again.outcome, again.code, again.counts.candidates], ["OK", "NOTHING_TO_DO", 0]);
+  assert.deepEqual([provWrites(w1), provWrites(w2)], [[1, 1, 1], [1, 1, 1]], "never a second provider write");
+  assert.equal((await db.app.query("SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory'")).rows[0].n, 0, "lock released");
+});
+
+test("P2c-2c LIVE mode on a 'live' database: two approved listings, two bookings -> both confirmed; a listing outside the allowlist is never selected; an open case is reported, not advanced; a wiring fault stops only that booking", async () => {
+  await db.owner.query("UPDATE booking.instance SET environment = 'live'");
+  try {
+    const notBefore = cutoffNow();
+    const A = 700201; const B = 700202; const OUT = 700299;
+    const wa = world({ live: true }); const ba = await authorizedBooking(wa, { listingId: A, live: true });
+    const wb = world({ live: true }); const bb = await authorizedBooking(wb, { listingId: B, live: true });
+    const wo = world({ live: true }); const bo = await authorizedBooking(wo, { listingId: OUT, live: true });          // not approved
+    const wc = world({ live: true }); const bc = await authorizedBooking(wc, { listingId: A, live: true });            // open case
+    const wf = world({ live: true }); const bf = await authorizedBooking(wf, { listingId: B, live: true });            // no wiring (fault)
+    await db.owner.query(`INSERT INTO booking.reconciliation_cases (id, intent_id, kind, status, opened_at, opened_by) VALUES (gen_random_uuid(), $1, 'MV_PIPELINE_TEST_CASE', 'open', now(), 'p2c2-test')`, [bc.id]);
+    const cfg = { mode: "live", workerId: "mv-l", listings: usd([A, B]), notBefore, maxIntents: 10 };
+    assert.equal((await runPipelineOnce(db.app, { ...cfg, mode: "test", listings: usd([606998]) }, {})).code, "PROVIDER_WIRING_REQUIRED");
+    assert.equal((await runPipelineOnce(db.app, { ...cfg, mode: "test", listings: usd([606998]) }, wiring([]))).code, "DATABASE_NOT_CONFIGURED_MODE");
+    const r = await runPipelineOnce(db.app, cfg, wiring([[wa, ba], [wb, bb], [wc, bc]], (bk) => bk.listingId));
+    assert.deepEqual([r.mode, r.outcome, r.code, { ...r.counts }], ["live", "ATTENTION", "NEEDS_REVIEW", { candidates: 4, confirmed: 2, pending: 0, stopped: 1, attention: 1 }], JSON.stringify(r));
+    const by = new Map(r.intents.map((i) => [i.intentId, i]));
+    assert.deepEqual([by.get(ba.id).outcome, by.get(bb.id).outcome, by.get(bc.id).code, by.get(bf.id).code, by.has(bo.id)], ["CONFIRMED", "CONFIRMED", "OPEN_CASE", "RUNNER_THREW_NO_WIRING", false]);
+    assert.deepEqual([provWrites(wa), provWrites(wb), provWrites(wo), provWrites(wc), provWrites(wf)], [[1, 1, 1], [1, 1, 1], [0, 0, 0], [0, 0, 0], [0, 0, 0]]);
+    assert.equal((await loadIntent(db.app, bo.id)).status, "payment_authorized", "the unapproved listing's booking is untouched");
+    assert.equal(exitCodeFor(r), 1);
   } finally { await db.owner.query("UPDATE booking.instance SET environment = 'test'"); }
   assert.equal((await db.owner.query("SELECT environment FROM booking.instance")).rows.map((x) => x.environment).join(), "test", "marker restored");
 });
