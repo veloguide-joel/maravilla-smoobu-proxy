@@ -635,3 +635,86 @@ test("R-C2 (REAL disposable PG): mixed history — a fresh uncited exhausted ide
   assert.equal(await snap(), before, "no read / evidence / assessment / hold / case row created or changed by selection");
   assert.equal(await num("SELECT count(*) AS n FROM booking.recording_assessments WHERE identity_read_op = $1", [esc]), 0, "the exhausted row stays uncited");
 });
+
+// ---------------------------------------------------------------------------------------------------------------------
+// C141: Hostaway OFFLINE-CHARGE RECORD TEST-identity fence (DB marker exactly one 'test' row, TEST intent environment, payment livemode
+// false): (1) on the pending initial path before any escalation / provider read / claim -> WAIT, zero provider calls, no write; (2) right
+// after the claim, before finalCheck -> the existing SEND_ABORTED path (never sent, settled unknown, never resent). The ordinary recording
+// then writes exactly once (606998 / USD end-to-end: e7-test-pipeline-coordinator C1 / C139b).
+function poolRewritingC141(base, rewrite) {
+  const wrapQ = (q) => async (sql, p) => { const r = await q(sql, p); return rewrite(String(sql), r) || r; };
+  return { query: wrapQ((s, p) => base.query(s, p)), connect: async () => {
+    const c = await base.connect();
+    return new Proxy(c, { get(t, k) { if (k === "query") return wrapQ((s, p) => t.query(s, p)); const v = t[k]; return typeof v === "function" ? v.bind(t) : v; } });
+  } };
+}
+async function ownerForceC141(sql, params) {        // the intents guard forbids these changes: throwaway DB only, triggers bypassed for ONE statement
+  const c = await db.owner.connect();
+  try { await c.query("BEGIN"); await c.query("SET LOCAL session_replication_role = replica"); await c.query(sql, params); await c.query("COMMIT"); }
+  catch (e) { await c.query("ROLLBACK").catch(() => {}); throw e; }
+  finally { c.release(); }
+}
+const C141_INST = "SELECT environment FROM booking.instance";
+const C141_FENCE = "SELECT environment, payment_livemode FROM booking.intents WHERE id = $1";
+const recordFacts = async (b) => ({ intent: await intentRow(b.id),
+  ops: await all("SELECT op_type, state, attempts, dispatched_at, idempotency_key FROM booking.external_operations WHERE intent_id = $1 ORDER BY created_at, id", [b.id]),
+  assessments: await num("SELECT count(*) AS n FROM booking.recording_assessments WHERE intent_id = $1", [b.id]),
+  holds: await num("SELECT count(*) AS n FROM booking.recording_holds WHERE intent_id = $1", [b.id]),
+  cases: await num("SELECT count(*) AS n FROM booking.reconciliation_cases WHERE intent_id = $1", [b.id]),
+  evidence: await num("SELECT count(*) AS n FROM booking.provider_evidence WHERE intent_id = $1", [b.id]) });
+
+test("C141 record fence before any read / claim: live / missing / duplicated marker, non-TEST intent environment, non-TEST payment -> WAIT, zero provider calls, zero writes; then ONE record", async () => {
+  const skipFirst = (f) => { let i = 0; return (sql, r) => (sql === C141_INST && ++i >= 2 ? f(r) : null); };   // 1st read = the step-start marker check
+  const cases = [
+    ["marker live", "RECORD_FENCE_DATABASE_NOT_TEST", () => skipFirst((r) => ({ ...r, rows: r.rows.map(() => ({ environment: "live" })) }))],
+    ["marker missing", "RECORD_FENCE_DATABASE_NOT_TEST", () => skipFirst((r) => ({ ...r, rows: [] }))],
+    ["marker duplicated", "RECORD_FENCE_DATABASE_NOT_TEST", () => skipFirst((r) => ({ ...r, rows: [...r.rows, ...r.rows] }))],
+    ["intent environment live", "RECORD_FENCE_INTENT_ENVIRONMENT_NOT_TEST", () => (sql, r) => (sql === C141_FENCE ? { ...r, rows: r.rows.map((x) => ({ ...x, environment: "live" })) } : null)],
+    ["payment livemode true", "RECORD_FENCE_INTENT_NOT_TEST_MODE", () => (sql, r) => (sql === C141_FENCE ? { ...r, rows: r.rows.map((x) => ({ ...x, payment_livemode: true })) } : null)],
+    ["payment livemode absent", "RECORD_FENCE_INTENT_NOT_TEST_MODE", () => (sql, r) => (sql === C141_FENCE ? { ...r, rows: r.rows.map((x) => ({ ...x, payment_livemode: null })) } : null)]
+  ];
+  for (const [name, code, mk] of cases) {
+    const b = await booking(); const w = world(b);
+    const f0 = await recordFacts(b);
+    const r = await step(b, w, { pool: poolRewritingC141(db.app, mk()) });
+    assert.ok(r.actions.includes(`WAIT:${code}`), `${name}: ${JSON.stringify(r.actions)}`);
+    assert.deepEqual([r.writes, w.calls.retrieveReservation, w.calls.listOfflineCharges, w.calls.createOfflineCharge], [0, 0, 0, 0], `${name}: zero provider calls`);
+    assert.deepEqual(await recordFacts(b), f0, `${name}: nothing written (no read row, assessment, hold, case, evidence or claim)`);
+    assert.equal((await intentRow(b.id)).state, "payment_captured");
+    // intact TEST facts: exactly ONE record write -> confirmed; later steps idle, no second write
+    await steps(b, w, 1);
+    assert.equal((await intentRow(b.id)).state, "confirmed", name);
+    assert.equal(w.calls.createOfflineCharge, 1, name);
+    const later = await steps(b, w, 2);
+    assert.ok(later.every((x) => x.writes === 0), `${name}: idempotent`);
+    assert.equal(w.calls.createOfflineCharge, 1);
+  }
+});
+
+test("C141 record fence after the claim: REAL marker live / intent environment live / payment_livemode true / NULL in afterClaim -> SEND_ABORTED before the POST; zero writes through recovery; one row / key", async () => {
+  const cases = [
+    ["marker live", "RECORD_FENCE_DATABASE_NOT_TEST",
+      () => db.owner.query("UPDATE booking.instance SET environment = 'live'"), () => db.owner.query("UPDATE booking.instance SET environment = 'test'")],
+    ["intent environment live", "RECORD_FENCE_INTENT_ENVIRONMENT_NOT_TEST",
+      (id) => ownerForceC141("UPDATE booking.intents SET environment = 'live' WHERE id = $1", [id]), (id) => ownerForceC141("UPDATE booking.intents SET environment = 'test' WHERE id = $1", [id])],
+    ["payment_livemode true", "RECORD_FENCE_INTENT_NOT_TEST_MODE",
+      (id) => ownerForceC141("UPDATE booking.intents SET payment_livemode = true WHERE id = $1", [id]), (id) => ownerForceC141("UPDATE booking.intents SET payment_livemode = false WHERE id = $1", [id])],
+    ["payment_livemode null", "RECORD_FENCE_INTENT_NOT_TEST_MODE",
+      (id) => ownerForceC141("UPDATE booking.intents SET payment_livemode = NULL WHERE id = $1", [id]), (id) => ownerForceC141("UPDATE booking.intents SET payment_livemode = false WHERE id = $1", [id])]
+  ];
+  for (const [name, code, mutate, restore] of cases) {
+    const b = await booking(); const w = world(b);
+    const key0 = (await recording(b.id)).idempotency_key;
+    let r;
+    try { r = await step(b, w, { hooks: { afterClaim: async () => { await mutate(b.id); } } }); }
+    finally { await restore(b.id); }
+    const fx = await one("SELECT i.environment, i.payment_livemode, (SELECT string_agg(environment, ',') FROM booking.instance) AS marker FROM booking.intents i WHERE i.id = $1", [b.id]);
+    assert.deepEqual([fx.environment, fx.payment_livemode, fx.marker], ["test", false, "test"], `${name}: fixture restored`);
+    assert.ok(r.actions.includes(`SEND_ABORTED:${code}`) && r.actions.includes(`UNKNOWN:SEND_ABORTED_${code}`), `${name}: ${JSON.stringify(r.actions)}`);
+    assert.deepEqual([r.writes, w.calls.createOfflineCharge, (await recording(b.id)).state, await unknownCase(b.id)], [0, 0, "outcome_unknown", 1], `${name}: refused before the POST`);
+    await steps(b, w, 3);
+    assert.equal(w.calls.createOfflineCharge, 0, `${name}: never written through recovery`);
+    const rows = await all("SELECT idempotency_key FROM booking.external_operations WHERE intent_id = $1 AND op_type = 'hostaway.record_offline_charge'", [b.id]);
+    assert.deepEqual(rows.map((x) => x.idempotency_key), [key0], `${name}: one record row, same key`);
+  }
+});
