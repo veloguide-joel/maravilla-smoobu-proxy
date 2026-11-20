@@ -605,7 +605,10 @@ test("containment: the adapter is pure and unreachable — no imports, network, 
     "scripts/e7-connected/reconcile-core-r1.mjs",
     // E7 N2 reconcile LOCAL CLI (R-B Step B, ROOT-authorized 2026-11-12, DRAFT): names the adapter's PATH only, in its reconcile execution
     // closure list, to hash it into the reconcile closure digest. It does not import it; offline scripts/ (not deployable).
-    "scripts/e7-connected/reconcile-cli-main.mjs"].sort(),
+    "scripts/e7-connected/reconcile-cli-main.mjs",
+    // P2c-3 (2026-11-20): the mode-aware pipeline runner's provider wiring imports validateAdapterConfig to build each booking's adapter
+    // config. A GitHub Actions script under scripts/ (not deployable to Vercel); no route imports it.
+    "scripts/mv-pipeline-wiring.mjs"].sort(),
     "nothing deployable references the adapter");
   for (const pathOnly of ["scripts/e4-write-runner/happy-preflight.mjs", "scripts/e7-connected/run-binding-r1.mjs", "scripts/e7-connected/run-plan-cli-main.mjs",
     "scripts/e7-connected/run-plan-v1.mjs"]) {

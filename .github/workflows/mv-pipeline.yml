@@ -1,0 +1,53 @@
+# mv-pipeline: the mode-aware booking pipeline runner (scripts/mv-pipeline.mjs). Design: PRODUCTION.md, "P2c design".
+#
+# NOT IN USE YET. Manual dispatch only, no schedule. A workflow file takes effect only on the default branch (main); this file is on
+# e7-test until the P5 promotion. It is not part of any arm manifest and does not replace the armed TEST runners.
+#
+# One run: every paid booking on an approved listing is taken through reserve -> capture -> record by the existing workers
+# (their claims, proofs, fences and 1 / 1 / 1 write budgets are the authority). Output: ONE JSON line of codes and counts.
+# Exit 1 means a person must look (GitHub emails the owner).
+name: mv-pipeline
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "test (TEST database, Stripe TEST) or live"
+        required: true
+        type: choice
+        options: [test, live]
+permissions:
+  contents: read
+concurrency:
+  group: mv-pipeline-${{ inputs.mode }}
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: ${{ inputs.mode == 'live' && 'mv-live' || 'e7-test-auto' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.0
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Database CA (pinned by SHA-256 in the runner)
+        run: curl --fail --silent --show-error --proto '=https' --max-time 20 -o "$RUNNER_TEMP/prod-ca-2021.crt" https://supabase-downloads.s3-ap-southeast-1.amazonaws.com/prod/ssl/prod-ca-2021.crt
+      - name: Run the pipeline once
+        env:
+          MV_PIPELINE_MODE: ${{ inputs.mode }}
+          MV_PIPELINE_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          MV_PIPELINE_DATABASE_CA_FILE: ${{ runner.temp }}/prod-ca-2021.crt
+          MV_PIPELINE_LISTINGS: ${{ inputs.mode == 'live' && vars.MV_LIVE_PIPELINE_LISTINGS || vars.MV_TEST_PIPELINE_LISTINGS }}
+          MV_PIPELINE_NOT_BEFORE: ${{ inputs.mode == 'live' && vars.MV_LIVE_PIPELINE_NOT_BEFORE || vars.MV_TEST_PIPELINE_NOT_BEFORE }}
+          MV_PIPELINE_STRIPE_ACCOUNT: ${{ inputs.mode == 'live' && vars.MV_LIVE_PIPELINE_STRIPE_ACCOUNT || vars.MV_TEST_PIPELINE_STRIPE_ACCOUNT }}
+          MV_PIPELINE_REF_FIELD_ID: ${{ inputs.mode == 'live' && vars.MV_LIVE_PIPELINE_REF_FIELD_ID || vars.MV_TEST_PIPELINE_REF_FIELD_ID }}
+          MV_PIPELINE_TIME_ZONE: ${{ inputs.mode == 'live' && vars.MV_LIVE_PIPELINE_TIME_ZONE || vars.MV_TEST_PIPELINE_TIME_ZONE }}
+          MV_PIPELINE_ACCOUNT_REF: ${{ inputs.mode == 'live' && vars.MV_LIVE_PIPELINE_ACCOUNT_REF || vars.MV_TEST_PIPELINE_ACCOUNT_REF }}
+          MV_PIPELINE_STRIPE_KEY: ${{ inputs.mode == 'live' && secrets.MV_LIVE_STRIPE_KEY || secrets.E7_STRIPE_TEST_KEY }}
+          MV_PIPELINE_HOSTAWAY_TOKEN: ${{ inputs.mode == 'live' && secrets.MV_LIVE_HOSTAWAY_TOKEN || secrets.E7_HOSTAWAY_TOKEN }}
+          MV_PIPELINE_DATABASE_URL: ${{ inputs.mode == 'live' && secrets.MV_LIVE_BOOKING_DATABASE_URL || secrets.E7_DEV_BOOKING_DATABASE_URL }}
+        run: node scripts/mv-pipeline.mjs

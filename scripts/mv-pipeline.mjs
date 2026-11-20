@@ -13,7 +13,7 @@
 //        notBefore: only bookings CREATED at or after it are ever selected (older rows, e.g. the fenced historic TEST rows, are never touched).
 //        test: listings must be exactly the TEST listing; live: 1..60 listings, never the TEST listing. USD only.
 //   deps { buildPhases(intent, cfg) -> { phases, env, clock, recordingClock? } }   the provider wiring for ONE booking (bound executors).
-//        Production wiring is P2c-3; tests inject a fake provider world. No result or log carries guest data: ids, codes and counts only.
+//        Real wiring: scripts/mv-pipeline-wiring.mjs (P2c-3); tests inject a fake provider world. No result or log carries guest data: ids, codes and counts only.
 import { runTestPipelineCoordinator, TEST_LISTING_ID } from "../lib/booking-db/test-pipeline-coordinator.js";
 
 export const MV_PIPELINE_VERSION = "mv-pipeline-v1";
@@ -88,6 +88,7 @@ export async function runPipelineOnce(pool, cfgIn, deps = {}) {
         const built = await deps.buildPhases(freeze({ id: row.id, ref: row.ref, listingId: Number(row.listing_id) }), cfg);
         r = await runTestPipelineCoordinator(pool, { workerId: `${cfg.workerId}:${row.id.slice(0, 8)}`, env: built.env, binding: { intentId: row.id, ref: row.ref },
           phases: built.phases, clock: built.clock, ...(built.recordingClock ? { recordingClock: built.recordingClock } : {}),
+          ...(built.hooks ? { hooks: built.hooks } : {}),
           ...(cfg.mode === "live" ? { mode: "live", listingId: Number(row.listing_id) } : {}) });
       } catch (e) {
         // wiring / transport fault for THIS booking: reported, never retried here; the next run decides on fresh persisted facts
@@ -107,8 +108,79 @@ export async function runPipelineOnce(pool, cfgIn, deps = {}) {
 
 export const exitCodeFor = (result) => (result && (result.outcome === "OK" || result.outcome === "BUSY") ? 0 : 1);
 
-// CLI: the production provider wiring (bound Stripe / Hostaway executors per booking) lands in P2c-3. Until then the CLI refuses.
+// ---------------------------------------------------------------------------------------------------------------------
+// CLI (P2c-3). Configuration by NAME from the job's environment; values are never printed.
+export const ENV_NAMES = Object.freeze({ mode: "MV_PIPELINE_MODE", listings: "MV_PIPELINE_LISTINGS", notBefore: "MV_PIPELINE_NOT_BEFORE",
+  stripeAccount: "MV_PIPELINE_STRIPE_ACCOUNT", refFieldId: "MV_PIPELINE_REF_FIELD_ID", timeZone: "MV_PIPELINE_TIME_ZONE", accountRef: "MV_PIPELINE_ACCOUNT_REF",
+  stripeKey: "MV_PIPELINE_STRIPE_KEY", hostawayToken: "MV_PIPELINE_HOSTAWAY_TOKEN", databaseUrl: "MV_PIPELINE_DATABASE_URL", databaseCaFile: "MV_PIPELINE_DATABASE_CA_FILE",
+  runId: "MV_PIPELINE_RUN_ID" });
+/**
+ * Transaction-pooler ports: a session advisory lock does not survive there. The runner never connects to them. A Supabase pooler URL on
+ * such a port is moved to that host's SESSION port (5432), exactly as the proven runner does for its lock connection; any other pooled
+ * target is refused.
+ */
+export const POOLED_PORTS = Object.freeze(["6543", "6432"]);
+export const SESSION_PORT = "5432";
+/** the Supabase root CA the proven runners pin (prod-ca-2021.crt) */
+export const OFFICIAL_CA_SHA256 = "700723581420dd1ac98fd7e9ac529f0ef210eadcaf87fc868a3ad7d114c2f3b7";
+/** -> a session-mode connection string, or null (pooled and not convertible / not a postgres URL) */
+export function sessionDatabaseUrl(raw) {
+  let u; try { u = new URL(raw); } catch { return null; }
+  if (!/^postgres(ql)?:$/.test(u.protocol) || u.search !== "" || u.hash !== "") return null;
+  if (!POOLED_PORTS.includes(u.port)) return u.href;
+  if (!/^[a-z0-9-]+\.pooler\.supabase\.com$/.test(u.hostname)) return null;
+  u.port = SESSION_PORT;
+  return u.href;
+}
+
+/** Parse "id:USD,id:USD" -> Map | null (strict; USD only; no duplicates). */
+export function parseListings(raw) {
+  if (typeof raw !== "string" || !raw || raw.length > 1200) return null;
+  const m = new Map();
+  for (const part of raw.split(",")) {
+    const x = /^([1-9]\d{0,9}):USD$/.exec(part.trim());
+    if (!x || m.has(Number(x[1]))) return null;
+    m.set(Number(x[1]), freeze({ currency: "USD" }));
+  }
+  return m.size >= 1 && m.size <= MAX_LISTINGS ? m : null;
+}
+
+/** -> { ok:true, cfg, wiring:{...}, db:{ connectionString, caPem } } | { ok:false, code } ; never returns or logs a value on refusal */
+export function parsePipelineEnv(env) {
+  const e = isObj(env) ? env : {};
+  const get = (k) => (typeof e[ENV_NAMES[k]] === "string" && e[ENV_NAMES[k]] !== "" ? e[ENV_NAMES[k]] : null);
+  for (const k of Object.keys(ENV_NAMES)) if (get(k) === null) return { ok: false, code: "CONFIG_INCOMPLETE" };
+  const listings = parseListings(get("listings"));
+  if (!listings) return { ok: false, code: "LISTINGS_INVALID" };
+  const v = validatePipelineConfig({ mode: get("mode"), workerId: "mv-pipeline", listings, notBefore: get("notBefore") });
+  if (!v.ok) return v;
+  if (!/^[1-9]\d{0,9}$/.test(get("refFieldId"))) return { ok: false, code: "REF_FIELD_INVALID" };
+  const sessionUrl = sessionDatabaseUrl(get("databaseUrl"));
+  if (sessionUrl === null) return { ok: false, code: "DATABASE_TARGET_REFUSED" };
+  return { ok: true, cfg: { mode: get("mode"), workerId: "mv-pipeline", listings, notBefore: get("notBefore") },
+    wiring: { mode: get("mode"), stripeKey: get("stripeKey"), hostawayToken: get("hostawayToken"), stripeAccountId: get("stripeAccount"), refFieldId: Number(get("refFieldId")),
+      timeZone: get("timeZone"), accountRef: get("accountRef"), runId: get("runId") },
+    db: { connectionString: sessionUrl, caFile: get("databaseCaFile") } };
+}
+
+export async function main(env = process.env, out = (line) => process.stdout.write(`${line}\n`)) {
+  const p = parsePipelineEnv(env);
+  const say = (r) => { out(JSON.stringify(r)); return exitCodeFor(r); };
+  if (!p.ok) return say({ version: MV_PIPELINE_VERSION, outcome: "REFUSED", code: p.code });
+  let pool = null;
+  try {
+    const [{ createBookingPool }, { createWiring }, { readFile }, { createHash }] = await Promise.all([import("../lib/booking-db/pool.js"), import("./mv-pipeline-wiring.mjs"),
+      import("node:fs/promises"), import("node:crypto")]);
+    let ca; try { ca = await readFile(p.db.caFile); } catch { return say({ version: MV_PIPELINE_VERSION, outcome: "REFUSED", code: "CA_UNREADABLE" }); }
+    if (ca.length > 16384 || createHash("sha256").update(ca).digest("hex") !== OFFICIAL_CA_SHA256) return say({ version: MV_PIPELINE_VERSION, outcome: "REFUSED", code: "CA_INVALID" });
+    pool = createBookingPool({ connectionString: p.db.connectionString, caPem: ca.toString("utf8"), max: 3 });
+    const wiring = createWiring({ ...p.wiring, pool });
+    return say(await runPipelineOnce(pool, p.cfg, wiring));
+  } catch (e) {
+    return say({ version: MV_PIPELINE_VERSION, outcome: "REFUSED", code: safe(e && e.code, "RUNNER_FAILED") });
+  } finally { if (pool) await pool.end().catch(() => {}); }
+}
+
 if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
-  process.stdout.write(`${JSON.stringify({ version: MV_PIPELINE_VERSION, outcome: "REFUSED", code: "NOT_WIRED" })}\n`);
-  process.exit(1);
+  main().then((code) => { process.exitCode = code; }, () => { process.exitCode = 1; });
 }
