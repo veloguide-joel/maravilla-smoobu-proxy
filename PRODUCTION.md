@@ -27,7 +27,7 @@ gets its own database (marker `live`), its own GitHub environment and arm variab
 | P2c-3 | `scripts/mv-pipeline-wiring.mjs`, CLI env parsing (`MV_PIPELINE_*`), session-mode database only, `.github/workflows/mv-pipeline.yml` (manual dispatch only; takes effect only once on `main`). TEST wiring complete; not yet run against real providers | merged (#244) |
 | P2c-4 | `createE7StripeLiveSend` (restricted live key only, `livemode` true on replies) and LIVE provider wiring. No live key exists anywhere | merged (#246) |
 | P2d-1 | Recipient scope by environment: migration 0030 (`booking.gn_recipient_in_scope` admits a real address only when the marker is exactly `live`; TEST scope unchanged), `isRecipientInScopeFor`, `buildLiveBookingConfirmationRequest`, Resend executor and notification worker take `mode` | merged (#245) |
-| P2d-2 | Confirmation step in `mv-pipeline` (confirmed bookings with one queued, never-attempted `guest.notify`; at most 3 per run; one worker invocation each) and `createConfirmationWiring` (accepted Resend executor / exchange, sender bookings@mail.micasadirect.com). Optional `MV_PIPELINE_RESEND_KEY` | this PR |
+| P2d-2 | Confirmation step in `mv-pipeline` (confirmed bookings with one queued, never-attempted `guest.notify`; at most 3 per run; one worker invocation each) and `createConfirmationWiring` (accepted Resend executor / exchange, sender bookings@mail.micasadirect.com). Optional `MV_PIPELINE_RESEND_KEY` | merged (#247) |
 | P2d-3 | Email text: tax line and the owner's cancellation policy (check 0022 for pinned template hashes first) | todo |
 | P3 | Production database (schema at marker `live`, backups), production Vercel env, GitHub environment `mv-live` + secrets | todo |
 | P4 | Production checkout page (today only `public/checkout-test.html`), guest-site "Book now", micasadirect.com DNS to Vercel | todo |
@@ -79,3 +79,53 @@ for secrets and are otherwise small to medium. P5 is one TEST payment by the own
 - The CI job `c119-s4-tooling` has been red since the C136 worker fences (a frozen-`lib` assertion in a one-off 0027 packet test).
 - Fenced, never touched: the C120 `outcome_unknown` notification op, the historic notification rows, and reservations
   70636076 / 71045356 / 71072615 / 71081885.
+
+## P5 plan: TEST booking with taxes through the new runner (Mon 2026-11-23, 10:00 Mexico City = 16:00Z)
+
+Read-only checks, 2026-11-20 21:40Z:
+- Shared TEST database (Supabase `maraVilla Booking DEV`, ref `mxotevtiscernhqilyiu`): marker `test`, applied versions exactly 1..28.
+- Open claims on 606998 from today on: Nov 21, 23, 28, 30; Dec 1, 8, 15, 21, 22 (`reserved`); Dec 17 (`authorized`, the fenced C120 row,
+  older than any `notBefore` we set, so never selected). Free in the database: Dec 2-7, Dec 9-14. Proposed night: **Dec 10** (re-check
+  Hostaway on the morning; the dashboard calendar did not render in the pane today).
+- Vercel: the e7-test preview is served by project `maravilla-smoobu-proxy` (it holds every `MV_*` variable, all scoped Preview / `e7-test`).
+  `-fia6` and `-eww2` are duplicates of the same repository. `MV_CHECKOUT_TAX_POLICY` is not set anywhere.
+- `main` 0244e61c: the old kickoff runs on schedule (`13,43 * * * *`), last four runs green. `main` and `e7-test` are far apart
+  (520 commits one way, 44 the other), so a merge is not a small step.
+
+**A. Making the workflow dispatchable.** A `workflow_dispatch` workflow must be on the default branch. Chosen: one small PR to `main` that
+adds only `.github/workflows/mv-pipeline.yml`, with an extra required input `ref` (40-hex commit of `e7-test`) used by the checkout step.
+Nothing else on `main` changes. The arm digest covers only the files in `scripts/e7-test-arm/manifest.json` (arm gate, kickoff, pipeline,
+confirmation: script + tests + workflow each); none of them is touched. Not chosen: merging `e7-test` into `main` (too large for this step;
+it happens when the old chain is retired).
+
+**B. One processor per booking.** The old chain picks up every new TEST / 606998 booking, and it re-prices without tax, so a taxed
+booking would be refused by it. Before the test the old chain is disarmed: delete repository variable `E7_TEST_AUTO_ARMED` (GitHub web UI).
+Its scheduled runs then end `CLOSED_NOOP` (0 SQL, 0 HTTP). Re-arm = re-create the variable with the release digest
+(b1d6bb63...22b6 on record; re-read it from the latest armed run log before deleting).
+
+**C. Schema.** Apply 0029 (tax) and 0030 (recipient scope by environment) to the shared TEST database through the SQL editor as the
+owner, one transaction, mirroring `db/lib/migrate.js` `migrateUp`: refuse unless marker `test` and versions exactly 1..28;
+`set_config('booking.migration_environment','test',true)`; the migration bytes; one `booking_migrations.applied` row each (version,
+name, up / down sha256, environment); then a readback (versions 1..30). Both are additive: untaxed prices stay valid, TEST recipient
+scope is unchanged. The old runners pin the schema-28 catalog and will refuse on schema 30 (fail-closed), which is consistent with B.
+Order: B first, then C, so the old chain does not raise alarms.
+
+**D. Vercel** (after C): `MV_CHECKOUT_TAX_POLICY=mx-iva16-ish5-v1`, Preview, branch `e7-test`, project `maravilla-smoobu-proxy`; redeploy.
+Check: the checkout quote for one night on 606998 shows $140.00 + $29.40 tax = **$169.40**.
+
+**E. GitHub repository variables** (not secrets): `MV_TEST_PIPELINE_LISTINGS=606998:USD`, `_NOT_BEFORE=<instant of B>`,
+`_STRIPE_ACCOUNT=acct_1TyHE42B9LTneQgw`, `_REF_FIELD_ID=105433`, `_TIME_ZONE=America/Mexico_City`, `_ACCOUNT_REF=hostaway-e7-test`.
+Secrets already exist in environment `e7-test-auto`. Then one empty dispatch (no bookings): expected `OK`, all counts 0. That is the
+runner's first contact with the real database.
+
+**F. Monday.** Owner: open the TEST checkout, night Dec 10, confirm the page shows $169.40, pay with the Stripe TEST card, guest
+email the sink address. Claude: check the stored booking and the Stripe authorization are $169.40, dispatch `mv-pipeline` (mode test),
+then verify one Hostaway reservation, one capture of $169.40, one recording, one confirmation to the sink, and a second dispatch that
+does nothing.
+
+**G. Going back.** Remove the Vercel variable and redeploy (prices return to untaxed). The old chain cannot simply be re-armed at
+schema 30: it would need the 0030 and 0029 down migrations (TEST only, and 0029 down fails once a taxed price row exists). In practice the
+fallback is fixing the new runner; the workers, proofs and fences under it are the ones proven on 2026-11-20.
+
+Owner go-ahead needed for B and C (they change the working test setup). A, D and E follow from them.
+
