@@ -95,13 +95,13 @@ test("L3 LIVE origin / return URL: one exact https origin; the return URL must b
   assert.equal(returnUrlOnOrigin("https://book.example.invalid/a/b", "https://book.example.invalid"), true);
 });
 
-test("L4 LIVE listings: 1..10 owner-approved id:USD entries; the TEST listing 606998, other currencies, duplicates and junk are refused", () => {
+test("L4 LIVE listings: 1..60 (P2a: the whole catalog) owner-approved id:USD entries; the TEST listing 606998, other currencies, duplicates and junk are refused", () => {
   assert.equal(parseLiveListings("111111:USD").ok, true);
   assert.deepEqual(NEVER_LIVE_LISTING_IDS, [606998]);
   for (const [raw, code] of [[undefined, "LIVE_LISTINGS_REQUIRED"], ["", "LIVE_LISTINGS_REQUIRED"], ["606998:USD", "LIVE_LISTING_NOT_APPROVED"],
     ["111111:USD,606998:USD", "LIVE_LISTING_NOT_APPROVED"], ["111111:MXN", "LIVE_LISTINGS_INVALID"], ["111111", "LIVE_LISTINGS_INVALID"],
     ["111111:USD,111111:USD", "LIVE_LISTINGS_INVALID"], ["0:USD", "LIVE_LISTINGS_INVALID"],
-    [Array.from({ length: 11 }, (_, i) => `${100000 + i}:USD`).join(","), "LIVE_LISTINGS_INVALID"]]) {
+    [Array.from({ length: 61 }, (_, i) => `${100000 + i}:USD`).join(","), "LIVE_LISTINGS_INVALID"]]) {
     assert.deepEqual(checkoutModeGate({ ...LIVE, MV_CHECKOUT_LIVE_LISTINGS: raw }), { ok: false, code }, String(raw));
   }
 });

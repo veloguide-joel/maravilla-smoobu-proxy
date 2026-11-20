@@ -83,12 +83,12 @@ test("E4 runtime boundary: existing refusals and their order are unchanged; cons
   }
 });
 
-test("E5 LIVE stays closed: no mode reaches the runtime boundary; the mode gate still refuses LIVE", () => {
+test("E5 (P2a) the event boundary checks the CONFIGURED mode; TEST is the default and LIVE stays refused without activation", () => {
   assert.equal(checkoutModeGate({ MV_CHECKOUT_MODE: "live" }).ok, false);
   assert.equal(stripeTestGate({ MV_CHECKOUT_MODE: "live" }).ok, false);
   const wh = readFileSync(new URL("../lib/checkout/stripe-test-webhook.js", import.meta.url), "utf8");
   const calls = wh.match(/checkEventMode\([^)]*\)/g) || [];
-  assert.deepEqual(calls, ["checkEventMode(event)"]);
-  assert.match(wh, /if \(event\.livemode !== false\) return reply\(400, "LIVEMODE_REFUSED"\);/);
-  assert.match(wh, /recordStripeEvent\(pool, \{ eventId: event\.id, type: event\.type, livemode: false,/);
+  assert.deepEqual(calls, ["checkEventMode(event, { mode })"]);
+  assert.match(wh, /if \(event\.livemode !== \(mode === "live"\)\) return reply\(400, "LIVEMODE_REFUSED"\);/);
+  assert.match(wh, /recordStripeEvent\(pool, \{ eventId: event\.id, type: event\.type, livemode: mode === "live",/);
 });

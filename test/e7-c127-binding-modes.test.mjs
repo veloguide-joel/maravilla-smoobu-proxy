@@ -120,14 +120,14 @@ test("B5 LIVE canceled-duplicate binding: same rules as TEST plus LIVE identity,
   ]) assert.deepEqual(bindCanceledDuplicate(live(canceled(o))), { ok: false, code }, code);
 });
 
-test("B6 the runtime LIVE gate is still closed and the runtime callers pass no mode (TEST)", () => {
+test("B6 (P2a) the runtime callers take the mode ONLY from the gate; without the full contract + activation LIVE stays refused", () => {
   assert.equal(checkoutModeGate({ MV_CHECKOUT_MODE: "live" }).ok, false);
   assert.equal(stripeTestGate({ MV_CHECKOUT_MODE: "live" }).ok, false);
   const wh = readFileSync(new URL("../lib/checkout/stripe-test-webhook.js", import.meta.url), "utf8");
   const calls = wh.match(/bind(Authorization|CanceledDuplicate)\(\{[^}]*\}\)/g) || [];
   assert.equal(calls.length, 2);
-  for (const c of calls) assert.doesNotMatch(c, /mode/);
-  assert.doesNotMatch(wh, /isSessionIdForMode/);
-  const core = readFileSync(new URL("../lib/checkout/intent-api-core.js", import.meta.url), "utf8");
-  assert.doesNotMatch(core, /isSessionIdForMode/);
+  for (const c of calls) assert.match(c, /, mode \}\)$/);
+  assert.match(wh, /const mode = gate\.config\.mode === "live" \? "live" : "test";/);      // pay step: from the gate
+  assert.match(wh, /const mode = deps\.mode === undefined \? "test" : deps\.mode;/);        // webhook processor: from the HTTP wrapper's gate
+  assert.doesNotMatch(wh, /process\.env|MV_CHECKOUT_MODE/);                                 // never read from the environment here
 });

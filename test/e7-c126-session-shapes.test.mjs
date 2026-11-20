@@ -90,7 +90,7 @@ test("C4 reply validation per mode; a reply of the other mode is refused (mismat
   assert.equal(validateCreatedSession(reply("live", bl, { url: "https://evil.example/x" }), op(), bl, { mode: "live" }), "REPLY_URL");
 });
 
-test("C5 executor: TEST sends once as before; LIVE and invalid modes never touch the client", async () => {
+test("C5 executor: TEST sends once as before; LIVE sends once with the LIVE shape (P2a); invalid modes never touch the client", async () => {
   const calls = [];
   const bt = buildCheckoutSessionParams(op(), { nowMs: NOW, returnUrl: RETURN_URL });
   const stripe = { checkout: { sessions: { create: async (params, opts) => { calls.push({ params, opts }); return reply("test", bt); } } } };
@@ -99,21 +99,27 @@ test("C5 executor: TEST sends once as before; LIVE and invalid modes never touch
   assert.equal(calls.length, 1);
   assert.equal(JSON.stringify(calls[0].params), JSON.stringify(JSON.parse(GOLDEN_TEST).params));
   const never = { checkout: { sessions: { create: async () => { throw new Error("must not be called"); } } } };
-  assert.deepEqual(await createCheckoutSessionExecutor({ stripe: never, nowMs: NOW, returnUrl: RETURN_URL, mode: "live" })(op()),
-    { status: "failed_definite", errorCode: "NOT_SENT_LIVE_NOT_ACTIVATED" });
+  // P2a: LIVE sends ONCE with the LIVE shape (the mode reaches the executor only from the activated gate); a TEST-shaped reply is never accepted
+  const live = []; const bl = buildCheckoutSessionParams(op(), { nowMs: NOW, returnUrl: RETURN_URL, mode: "live" });
+  const stripeLive = { checkout: { sessions: { create: async (params, opts) => { live.push({ params, opts }); return reply("live", bl); } } } };
+  const okLive = await createCheckoutSessionExecutor({ stripe: stripeLive, nowMs: NOW, returnUrl: RETURN_URL, mode: "live" })(op());
+  assert.deepEqual([okLive.status, live.length, /^cs_live_/.test(okLive.resultRef)], ["succeeded", 1, true]);
+  assert.equal(JSON.stringify(live[0].params), JSON.stringify(bl.params));
+  const wrong = { checkout: { sessions: { create: async () => reply("test", bt) } } };
+  assert.equal((await createCheckoutSessionExecutor({ stripe: wrong, nowMs: NOW, returnUrl: RETURN_URL, mode: "live" })(op())).status, "outcome_unknown");
   for (const m of ["", "LIVE", "prod"]) {
     assert.deepEqual(await createCheckoutSessionExecutor({ stripe: never, nowMs: NOW, returnUrl: RETURN_URL, mode: m })(op()),
       { status: "failed_definite", errorCode: "NOT_SENT_MODE_INVALID" });
   }
 });
 
-test("C6 the runtime LIVE gate is still closed, and the only executor caller passes no mode (TEST)", () => {
+test("C6 (P2a) LIVE needs the explicit activation; the only executor caller passes the gate's mode", () => {
   assert.equal(checkoutModeGate({ MV_CHECKOUT_MODE: "live" }).ok, false);
   assert.equal(stripeTestGate({ MV_CHECKOUT_MODE: "live" }).ok, false);
   const src = readFileSync(new URL("../lib/checkout/stripe-test-mode.js", import.meta.url), "utf8");
-  assert.match(src, /refuse\("LIVE_NOT_ACTIVATED"\)/);
+  assert.match(src, /if \(e\[LIVE_ACTIVATION_ENV\] !== LIVE_ACTIVATION_VALUE\) return refuse\("LIVE_NOT_ACTIVATED"\);/);
   const wh = readFileSync(new URL("../lib/checkout/stripe-test-webhook.js", import.meta.url), "utf8");
   const callers = wh.match(/createCheckoutSessionExecutor\(\{[^}]*\}\)/g) || [];
   assert.equal(callers.length, 1);
-  assert.doesNotMatch(callers[0], /mode/);
+  assert.match(callers[0], /returnUrl: gate\.config\.returnUrl, mode \}\)$/);
 });
