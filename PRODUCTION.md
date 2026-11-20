@@ -22,7 +22,7 @@ gets its own database (marker `live`), its own GitHub environment and arm variab
 | P2a | Checkout API + webhook take the mode from the gate; LIVE needs the full contract AND `MV_CHECKOUT_LIVE_ACTIVATION=live-payments-approved` | merged (#238) |
 | P2b-1 | Reservation, capture, recording and compensation workers: `mode` option ("test" default); database marker, intent environment and payment livemode fences compare against it | merged (#239) |
 | P2b-2 | Proofs (`capture-proof`, `compensation-proof`, `recovery-plan`) bind evidence to the intent's own recorded `payment.livemode` (a boolean) instead of the literal `false`; the workers' fences decide which mode may act. Cleanup and mirror stay TEST-only | merged (#240) |
-| P2c-1 | Pipeline coordinator takes the run mode and a listing config instead of the fixed 606998 / USD / 'test' | todo |
+| P2c-1 | Pipeline coordinator: `mode` + one explicit live listing (`coordinatorScope`). A full LIVE happy path (live database marker, live intent, livemode true: reserve, capture, record once each) passes on the throwaway cluster | this PR |
 | P2c-2 | `scripts/mv-pipeline.mjs` + workflow: ONE scheduled runner for both modes (see design) | todo |
 | P2d | Confirmation to real guests: migration so `booking.gn_recipient_in_scope` admits real addresses on a `live` database; notification worker / runner gates; policy text and tax breakdown in the email | todo |
 | P3 | Production database (schema at marker `live`, backups), production Vercel env, GitHub environment `mv-live` + secrets | todo |
