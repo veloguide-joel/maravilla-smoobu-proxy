@@ -864,3 +864,90 @@ test("C138 cleanup cancel fence after the claim: marker turns live in afterClaim
   assert.equal(await state(c.id), "reconciliation_required");
   assert.equal(await held(c.id), true, "claim held");
 });
+
+// ---------------------------------------------------------------------------------------------------------------------
+// C143: TEST-cleanup Stripe REFUND TEST-identity fence (DB marker exactly one 'test' row, TEST intent environment, payment livemode false):
+// (1) in the refund leg for the pending never-sent row, before the PaymentIntent read or the claim -> WAIT, zero Stripe calls, no write; (2) right
+// after the refund claim, before preSendCommon -> the existing SEND_ABORTED path (never POSTed; reads-only reconciliation; never resent).
+async function ownerForceC143(sql, params) {        // the intents guard forbids these changes: throwaway DB only, triggers bypassed for ONE statement
+  const c = await db.owner.connect();
+  try { await c.query("BEGIN"); await c.query("SET LOCAL session_replication_role = replica"); await c.query(sql, params); await c.query("COMMIT"); }
+  catch (e) { await c.query("ROLLBACK").catch(() => {}); throw e; }
+  finally { c.release(); }
+}
+/** run the ordinary (fenced, C138) cancel leg until the reservation leg is proven and ONLY the refund leg is open; no refund POST yet */
+async function atRefundLeg(w, h, c) {
+  for (let k = 0; k < 8; k++) {
+    const [rc, ra] = await legs(c.id);
+    if (rc === true && ra === false) break;
+    await settleLate(await h.step()); h.clk.t += MIN;
+  }
+  assert.deepEqual([await legs(c.id), w.cancels.length, w.posts.length, await state(c.id)], [[true, false], 1, 0, "test_cleanup_pending"], "refund leg open, not sent");
+  assert.deepEqual((await opsOf(c.id, OPS.REFUND)).map((o) => [o.state, o.attempts, o.dispatched_at]), [["pending", 0, null]]);
+}
+const refundRows = async (id) => (await db.app.query("SELECT id, state, attempts, idempotency_key, payload ->> 'providerIdempotencyKey' AS pkey FROM booking.external_operations WHERE intent_id = $1 AND op_type = $2 ORDER BY created_at, id", [id, OPS.REFUND])).rows;
+
+test("C143 refund fence before the refund leg's reads: live / missing / duplicated marker, non-TEST intent environment, non-TEST payment -> WAIT, zero Stripe calls, zero writes; then ONE exact refund", async () => {
+  const skipFirst = (f) => { let i = 0; return (sql, r) => (sql === C138_INST && ++i >= 2 ? f(r) : null); };   // 1st read = the step's assertEnvironment
+  const variants = [
+    ["marker live", "REFUND_FENCE_DATABASE_NOT_TEST", () => skipFirst((r) => ({ ...r, rows: r.rows.map(() => ({ environment: "live" })) }))],
+    ["marker missing", "REFUND_FENCE_DATABASE_NOT_TEST", () => skipFirst((r) => ({ ...r, rows: [] }))],
+    ["marker duplicated", "REFUND_FENCE_DATABASE_NOT_TEST", () => skipFirst((r) => ({ ...r, rows: [...r.rows, ...r.rows] }))],
+    ["intent environment live", "REFUND_FENCE_INTENT_ENVIRONMENT_NOT_TEST", () => (sql, r) => (sql === C138_FENCE ? { ...r, rows: r.rows.map((x) => ({ ...x, environment: "live" })) } : null)],
+    ["payment livemode true", "REFUND_FENCE_INTENT_NOT_TEST_MODE", () => (sql, r) => (sql === C138_FENCE ? { ...r, rows: r.rows.map((x) => ({ ...x, payment_livemode: true })) } : null)],
+    ["payment livemode absent", "REFUND_FENCE_INTENT_NOT_TEST_MODE", () => (sql, r) => (sql === C138_FENCE ? { ...r, rows: r.rows.map((x) => ({ ...x, payment_livemode: null })) } : null)]
+  ];
+  for (const [name, code, mk] of variants) {
+    const w = world(); const c = await cleanupPending(w); const h = harness(w, c.id);
+    await atRefundLeg(w, h, c);
+    const f0 = await cleanupFacts(c.id);
+    const calls0 = w.calls.length;
+    const r = await runTestCleanupStep(poolRewritingC138(db.app, mk()), h.opts());
+    await settleLate(r);
+    assert.ok(r.actions.includes(`WAIT:${code}`), `${name}: ${JSON.stringify(r.actions)}`);
+    assert.deepEqual([r.sends, r.refundSends, w.posts.length, w.calls.length - calls0], [0, 0, 0, 0], `${name}: zero Stripe calls`);
+    assert.deepEqual(await cleanupFacts(c.id), f0, `${name}: nothing written (no claim, no read row, no evidence, no event, no case)`);
+    // intact TEST facts: ONE exact refund POST -> cancelled; then idle
+    h.clk.t += MIN;
+    await h.until((st) => st === "cancelled", { max: 6 });
+    assertExactRefundPost(w, c, (await refundRows(c.id))[0].id);
+    assert.deepEqual([w.cancels.length, w.forbidden(), (await refundRows(c.id)).length], [1, 0, 1], name);
+    h.clk.t += MIN;
+    const again = await h.step(); await settleLate(again);
+    assert.deepEqual([again.status, w.cancels.length, w.posts.length], ["idle", 1, 1], `${name}: idempotent`);
+  }
+});
+
+test("C143 refund fence after the claim: REAL marker live / intent environment live / payment_livemode true / NULL in afterClaim -> SEND_ABORTED, ZERO refund POST through recovery; one refund row / key", async () => {
+  const variants = [
+    ["marker live", "REFUND_FENCE_DATABASE_NOT_TEST",
+      () => db.owner.query("UPDATE booking.instance SET environment = 'live'"), () => db.owner.query("UPDATE booking.instance SET environment = 'test'")],
+    ["intent environment live", "REFUND_FENCE_INTENT_ENVIRONMENT_NOT_TEST",
+      (id) => ownerForceC143("UPDATE booking.intents SET environment = 'live' WHERE id = $1", [id]), (id) => ownerForceC143("UPDATE booking.intents SET environment = 'test' WHERE id = $1", [id])],
+    ["payment_livemode true", "REFUND_FENCE_INTENT_NOT_TEST_MODE",
+      (id) => ownerForceC143("UPDATE booking.intents SET payment_livemode = true WHERE id = $1", [id]), (id) => ownerForceC143("UPDATE booking.intents SET payment_livemode = false WHERE id = $1", [id])],
+    ["payment_livemode null", "REFUND_FENCE_INTENT_NOT_TEST_MODE",
+      (id) => ownerForceC143("UPDATE booking.intents SET payment_livemode = NULL WHERE id = $1", [id]), (id) => ownerForceC143("UPDATE booking.intents SET payment_livemode = false WHERE id = $1", [id])]
+  ];
+  for (const [name, code, mutate, restore] of variants) {
+    const w = world(); const c = await cleanupPending(w); const h = harness(w, c.id);
+    await atRefundLeg(w, h, c);
+    const rows0 = await refundRows(c.id);
+    let r;
+    try {
+      r = await h.step({ hooks: { afterClaim: async (op) => { if ((op.opType || op.op_type) === OPS.REFUND) await mutate(c.id); } } });
+      await settleLate(r);
+    } finally { await restore(c.id); }
+    const fx = (await db.owner.query("SELECT i.environment, i.payment_livemode, (SELECT string_agg(environment, ',') FROM booking.instance) AS marker FROM booking.intents i WHERE i.id = $1", [c.id])).rows[0];
+    assert.deepEqual([fx.environment, fx.payment_livemode, fx.marker], ["test", false, "test"], `${name}: fixture restored`);
+    assert.ok(r.actions.includes(`SEND_ABORTED:${code}`), `${name}: ${JSON.stringify(r.actions)}`);
+    assert.deepEqual([r.sends, r.refundSends, w.posts.length], [0, 0, 0], `${name}: refused before Stripe`);
+    assert.deepEqual((await opsOf(c.id, OPS.REFUND)).map((o) => [o.state, o.error_code]), [["outcome_unknown", `SEND_ABORTED_${code}`]], name);
+    // unknown -> reads / discovery only (zero bound refunds) -> REFUND_FAILED owner case: never a POST, never a second row / key
+    for (let k = 0; k < 8; k++) { h.clk.t += 3 * MIN; await settleLate(await h.step()); }
+    assert.deepEqual([w.posts.length, w.cancels.length, w.forbidden()], [0, 1, 0], `${name}: zero refunds through recovery`);
+    assert.equal(await state(c.id), "reconciliation_required", name);
+    const rows = await refundRows(c.id);
+    assert.deepEqual([rows.length, rows[0].id, rows[0].idempotency_key, rows[0].pkey], [1, rows0[0].id, rows0[0].idempotency_key, rows0[0].pkey], `${name}: one refund row, same key`);
+  }
+});
