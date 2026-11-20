@@ -20,8 +20,8 @@ gets its own database (marker `live`), its own GitHub environment and arm variab
 |---|---|---|
 | P1 | Taxes (`lib/checkout/tax-policy.js`, migration 0029). Off until `MV_CHECKOUT_TAX_POLICY=mx-iva16-ish5-v1` and 0029 are applied | merged (#237) |
 | P2a | Checkout API + webhook take the mode from the gate; LIVE needs the full contract AND `MV_CHECKOUT_LIVE_ACTIVATION=live-payments-approved` | merged (#238) |
-| P2b-1 | Reservation, capture, recording and compensation workers: `mode` option ("test" default); database marker, intent environment and payment livemode fences compare against it | this PR |
-| P2b-2 | Proof modules (`capture-proof`, `compensation-proof`, `recovery-plan`: `livemode !== false`) and the state machine's `expectedLivemode` in worker `applyEvent` calls take the mode. Cleanup and mirror workers stay TEST-only | todo |
+| P2b-1 | Reservation, capture, recording and compensation workers: `mode` option ("test" default); database marker, intent environment and payment livemode fences compare against it | merged (#239) |
+| P2b-2 | Proofs (`capture-proof`, `compensation-proof`, `recovery-plan`) bind evidence to the intent's own recorded `payment.livemode` (a boolean) instead of the literal `false`; the workers' fences decide which mode may act. Cleanup and mirror stay TEST-only | this PR |
 | P2c | Kickoff / pipeline / confirmation runners: listing allowlist instead of 606998; migration for the 0024 kickoff trigger (TEST / 606998 / USD only today) | todo |
 | P2d | Confirmation email to real guests (today: sink address only), with policy text and the tax breakdown | todo |
 | P3 | Production database (schema 1..N at marker `live`, backups), production Vercel env, production GitHub environment + arm, release pins | todo |
