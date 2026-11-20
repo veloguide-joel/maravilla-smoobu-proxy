@@ -40,7 +40,7 @@ syncBuiltinESMExports();
 let db;
 // C119 S4: this SPENT packet targets EXACTLY schema 27 (its function refuses any other history: E7_C116_HISTORY_NOT_1_TO_27) — the literal-only 0028 is
 // rolled back on the disposable cluster before use (no record exists yet, so the down is allowed)
-before(async () => { db = await startMigratedDatabase(); assert.deepEqual(await migrateDown(db.owner, { env: "test", to: 27 }), [29, 28]); });   // P1: + 0029 (mechanical)
+before(async () => { db = await startMigratedDatabase(); assert.deepEqual(await migrateDown(db.owner, { env: "test", to: 27 }), [30, 29, 28]); });   // P1: + 0029 (mechanical)
 after(async () => { globalThis.fetch = realFetch; await db.close(); });
 
 const TOP = 27; assert.equal(loadMigrations().find((m) => m.version === 28).name, "pipeline_kickoff_source_rebind_s4");   // C119 S4: the packet's schema (0028 exists, rolled back above)

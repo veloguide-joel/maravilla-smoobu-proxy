@@ -60,7 +60,7 @@ test("R1 contract constants: gn-v2 request version over bcc-v1 copy; exact key s
   assert.deepEqual([...REQUEST_KEYS_V2].filter((k) => !["copyContractVersion", "locale"].includes(k)), [...gn.REQUEST_KEYS].sort());
   for (const o of [INPUT_KEYS, GUEST_KEYS, SENDER_KEYS, REQUEST_KEYS_V2]) assert.ok(Object.isFrozen(o));
   assert.deepEqual(Object.keys(mod).sort(), ["CONTENT_HASH_PREFIX", "COPY_CONTRACT_VERSION", "GUEST_KEYS", "INPUT_KEYS", "LOCALES", "MESSAGE_REF_PREFIX", "REQUEST_KEYS_V2",
-    "REQUEST_VERSION", "SENDER_KEYS", "TEMPLATES", "buildBookingConfirmationRequest", "contentHashV2"]);
+    "REQUEST_VERSION", "SENDER_KEYS", "TEMPLATES", "buildBookingConfirmationRequest", "buildLiveBookingConfirmationRequest", "contentHashV2"]);   // P2d: + the LIVE entry point
 });
 
 test("R2 English: exact 11-field request, deep-frozen; independently derived and pinned content hash; recipient hash = unchanged gn-v1 helper", () => {
