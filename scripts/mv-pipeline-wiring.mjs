@@ -8,14 +8,13 @@
 // Executors are late-bound exactly like the proven runner does: reservation first; capture and recording only once the reservation id is
 // durable (re-bound from fresh persisted facts after every coordinator step). An unbound executor throws; it never reaches a provider.
 //
-// Scope today: TEST. The accepted Stripe transport admits a TEST secret key only (createE7StripeTestSend), so LIVE wiring refuses with
-// STRIPE_LIVE_TRANSPORT_NOT_READY until that transport is made mode-aware in its own reviewed slice. No value of any credential is ever
-// logged, returned or stored here.
+// The Stripe transport is chosen by mode: TEST admits a TEST secret key only; LIVE admits a restricted live key only and requires
+// livemode === true on every PaymentIntent reply. No value of any credential is ever logged, returned or stored here.
 import { loadIntent } from "../lib/booking-db/repo.js";
 import { validateAdapterConfig } from "../lib/hostaway-reservations.js";
 import { captureKey } from "../lib/checkout/intent-state.js";
 import { createPhaseExecutors } from "./e7-connected/executor-adapters.mjs";
-import { createE7HostawaySend, createE7StripeTestSend } from "./e7-connected/http-transports.mjs";
+import { createE7HostawaySend, createE7StripeTestSend, createE7StripeLiveSend } from "./e7-connected/http-transports.mjs";
 import { createE7RealExchange } from "./e7-connected/real-exchange.mjs";
 
 export const WIRING_VERSION = "mv-pipeline-wiring-v1";
@@ -46,7 +45,6 @@ export function validateWiringOptions(o) {
   if (typeof o.timeZone !== "string" || !/^[A-Za-z_]+\/[A-Za-z_]+$/.test(o.timeZone)) refuse("TIME_ZONE_INVALID");
   if (typeof o.accountRef !== "string" || !LABEL_RE.test(o.accountRef) || typeof o.runId !== "string" || !LABEL_RE.test(o.runId)) refuse("LABEL_INVALID");
   if (!o.pool || typeof o.pool.query !== "function") refuse("POOL_REQUIRED");
-  if (o.mode === "live") refuse("STRIPE_LIVE_TRANSPORT_NOT_READY");
   return true;
 }
 
@@ -65,7 +63,7 @@ export function createWiring(o) {
   const xh = o.exchanges ? { ok: true, exchange: o.exchanges.hostaway } : createE7RealExchange({ provider: "hostaway" });
   if (!xs || xs.ok !== true || !xh || xh.ok !== true) refuse("EXCHANGE_INVALID");
   const sk = o.stripeKey; const ht = o.hostawayToken;
-  const ts = createE7StripeTestSend({ exchange: xs.exchange, credential: () => sk, accountId: stripeAccountId, apiVersion: STRIPE_API_VERSION });
+  const ts = (o.mode === "live" ? createE7StripeLiveSend : createE7StripeTestSend)({ exchange: xs.exchange, credential: () => sk, accountId: stripeAccountId, apiVersion: STRIPE_API_VERSION });
   const th = createE7HostawaySend({ exchange: xh.exchange, credential: () => ht });
   if (!ts || ts.ok !== true || !th || th.ok !== true) refuse("TRANSPORT_INVALID");
   const hostawaySend = (req, opts) => th.transport.send(req, opts);
