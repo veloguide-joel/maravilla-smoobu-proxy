@@ -31,7 +31,7 @@ export const CONSTANT_ORIGINS = Object.freeze({
   "lib/booking-db/test-abort.js": "2638df7d3cceab9b0720c2ea1c7fa53d439900ef7392d944ef3663c331ebcc86",
   // C136 (2026-11-19): reservation-worker origin pin 601f48f6... -> ef76c13f... = additive Hostaway CREATE TEST-identity fence only;
   // the copied PROTECTED_HOSTAWAY_RESERVATION_IDS / DEFAULT_TIMEOUTS are byte-identical (parity tests unchanged)
-  "lib/booking-db/reservation-worker.js": "4e76a33962b5d06e60c7daa36141c51c96325d9f73c3070aecca35f879bb4f4d"
+  "lib/booking-db/reservation-worker.js": "b513b431c4b03a6c51f05c938505b4c1626840f00d2e6dbc70c1662e9c8b223b"
 });
 /** exact historical identifiers from the accepted ledger; null = the identifier did NOT exist (explicit, never guessed) */
 export const HISTORICAL_EXCLUSIONS = Object.freeze({
