@@ -29,7 +29,7 @@ gets its own database (marker `live`), its own GitHub environment and arm variab
 | P2d-1 | Recipient scope by environment: migration 0030 (`booking.gn_recipient_in_scope` admits a real address only when the marker is exactly `live`; TEST scope unchanged), `isRecipientInScopeFor`, `buildLiveBookingConfirmationRequest`, Resend executor and notification worker take `mode` | merged (#245) |
 | P2d-2 | Confirmation step in `mv-pipeline` (confirmed bookings with one queued, never-attempted `guest.notify`; at most 3 per run; one worker invocation each) and `createConfirmationWiring` (accepted Resend executor / exchange, sender bookings@mail.micasadirect.com). Optional `MV_PIPELINE_RESEND_KEY` | merged (#247) |
 | P2d-3 | Email text: tax line and the owner's cancellation policy (check 0022 for pinned template hashes first) | todo |
-| P3 | Production database (schema at marker `live`, backups), production Vercel env, GitHub environment `mv-live` + secrets | todo |
+| P3 | Production database (schema at marker `live`, backups), production Vercel env, GitHub environment `mv-live` + secrets | P3-1 database done (#253); P3-2 todo |
 | P4 | Production checkout page (today only `public/checkout-test.html`), guest-site "Book now", micasadirect.com DNS to Vercel | todo |
 | P5 | TEST proof of the new runner with taxes on ($169.40), retire the old armed chain, then one owner-approved live booking | todo |
 
@@ -162,4 +162,9 @@ Owner inputs (pasted by the owner into GitHub, never seen by Claude): secrets `M
 from project creation) and `MV_LIVE_DB_APP_PASSWORD` (a new one, 32 letters and digits). Variables: `MV_LIVE_DB_HOST`,
 `MV_LIVE_DB_PROJECT_REF`. The runtime URL for Vercel production and for `mv-pipeline` live is
 `postgresql://mv_booking_app_live.<ref>:<app password>@<host>:6543/postgres` (P3-2).
+
+**Done 2026-11-20 23:0xZ:** run 44833976104 (`mv-db-setup`, action setup, ref 0cc6774d, main dea22865), host
+`aws-0-us-east-2.pooler.supabase.com`: `{"outcome":"OK","code":"READY","migrationsRun":30,"applied":30,"roleCreated":true,
+"checks":{"identity":true,"marker":true,"statementTimeout":true,"migrationTableDenied":true}}`. Environment `mv-live-admin` holds the
+two secrets (entered by the owner).
 
