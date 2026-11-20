@@ -917,3 +917,66 @@ test("(4) pre-send uses CURRENT rows: a stale/cached plan (changed proof snapsho
   assert.equal((await loadIntent(db.app, a.id)).status, "payment_captured");
   assert.equal(w.count("CAPTURE"), 1);
 });
+
+// ---------------------------------------------------------------------------------------------------------------------
+// C140: Stripe CAPTURE TEST-identity fence (DB marker exactly one 'test' row, TEST intent environment, payment livemode false):
+// (1) before any provider read / claim -> WAIT, zero provider calls, no write; (2) right after the claim, before preSendCapture -> the
+// existing SEND_ABORTED path (never sent, never resent). The ordinary capture then happens exactly once (606998 / USD end-to-end:
+// e7-test-pipeline-coordinator C1 / C139b).
+function poolRewritingC140(base, rewrite) {
+  const wrapQ = (q) => async (sql, p) => { const r = await q(sql, p); return rewrite(String(sql), r) || r; };
+  return { query: wrapQ((s, p) => base.query(s, p)), connect: async () => {
+    const c = await base.connect();
+    return new Proxy(c, { get(t, k) { if (k === "query") return wrapQ((s, p) => t.query(s, p)); const v = t[k]; return typeof v === "function" ? v.bind(t) : v; } });
+  } };
+}
+const C140_INST = "SELECT environment FROM booking.instance";
+const C140_FENCE = "SELECT environment, payment_livemode FROM booking.intents WHERE id = $1";
+const captureFacts = async (id) => ({ ...(await db.app.query("SELECT state, version FROM booking.intents WHERE id = $1", [id])).rows[0],
+  ops: (await db.app.query("SELECT op_type, state, attempts, dispatched_at FROM booking.external_operations WHERE intent_id = $1 ORDER BY created_at, id", [id])).rows,
+  evidence: (await db.app.query("SELECT count(*)::int AS n FROM booking.provider_evidence WHERE intent_id = $1", [id])).rows[0].n });
+
+test("C140 capture fence before any read / claim: live / missing / duplicated marker, non-TEST intent environment, non-TEST payment -> WAIT, zero provider calls, zero writes; then ONE capture", async () => {
+  const skipFirst = (f) => { let i = 0; return (sql, r) => (sql === C140_INST && ++i >= 2 ? f(r) : null); };   // 1st read = the step's assertEnvironment
+  const cases = [
+    ["marker live", "CAPTURE_FENCE_DATABASE_NOT_TEST", () => skipFirst((r) => ({ ...r, rows: r.rows.map(() => ({ environment: "live" })) }))],
+    ["marker missing", "CAPTURE_FENCE_DATABASE_NOT_TEST", () => skipFirst((r) => ({ ...r, rows: [] }))],
+    ["marker duplicated", "CAPTURE_FENCE_DATABASE_NOT_TEST", () => skipFirst((r) => ({ ...r, rows: [...r.rows, ...r.rows] }))],
+    ["intent environment live", "CAPTURE_FENCE_INTENT_ENVIRONMENT_NOT_TEST", () => (sql, r) => (sql === C140_FENCE ? { ...r, rows: r.rows.map((x) => ({ ...x, environment: "live" })) } : null)],
+    ["payment livemode true", "CAPTURE_FENCE_INTENT_NOT_TEST_MODE", () => (sql, r) => (sql === C140_FENCE ? { ...r, rows: r.rows.map((x) => ({ ...x, payment_livemode: true })) } : null)],
+    ["payment livemode absent", "CAPTURE_FENCE_INTENT_NOT_TEST_MODE", () => (sql, r) => (sql === C140_FENCE ? { ...r, rows: r.rows.map((x) => ({ ...x, payment_livemode: null })) } : null)]
+  ];
+  let n = 140;
+  for (const [name, code, mk] of cases) {
+    const w = world(); const a = await capIntent(w, n); const h = harness(w, [n]); n += 1;
+    const f0 = await captureFacts(a.id);
+    const r = await runCaptureStep(poolRewritingC140(db.app, mk()), h.opts({ intentId: a.id }));
+    await settleLate(r);
+    assert.ok(r.actions.includes(`WAIT:${code}`), `${name}: ${JSON.stringify(r.actions)}`);
+    assert.deepEqual([r.sends, w.calls.length, w.captures.length], [0, 0, 0], `${name}: zero provider calls`);
+    assert.deepEqual(await captureFacts(a.id), f0, `${name}: nothing written (no claim, no read row, no evidence, no event)`);
+    assert.equal((await loadIntent(db.app, a.id)).status, "reservation_confirmed");
+    // intact TEST facts: exactly ONE capture, then idle
+    await h.until(a.id, (st) => st === "payment_captured", { max: 4 });
+    assert.equal(w.count("CAPTURE"), 1, name);
+    const again = await h.step({ intentId: a.id }); await settleLate(again);
+    assert.deepEqual([again.status, w.count("CAPTURE")], ["idle", 1], `${name}: idempotent`);
+  }
+});
+
+test("C140 capture fence after the claim: marker turns live in afterClaim (real owner change) -> SEND_ABORTED, ZERO captures; recovery never captures", async () => {
+  const w = world(); const a = await capIntent(w, 160); const h = harness(w, [160]);
+  let r;
+  try {
+    r = await h.step({ intentId: a.id, hooks: { afterClaim: async () => { await db.owner.query("UPDATE booking.instance SET environment = 'live'"); } } });
+    await settleLate(r);
+  } finally { await db.owner.query("UPDATE booking.instance SET environment = 'test'"); }
+  assert.equal((await db.owner.query(C140_INST)).rows.map((x) => x.environment).join(), "test", "marker restored");
+  assert.ok(r.actions.includes("SEND_ABORTED:CAPTURE_FENCE_DATABASE_NOT_TEST"), JSON.stringify(r.actions));
+  assert.deepEqual([r.sends, w.captures.length], [0, 0], "never sent");
+  assert.deepEqual((await opsOf(a.id, OPS.CAPTURE)).map((o) => [o.state, o.error_code]), [["outcome_unknown", "SEND_ABORTED_CAPTURE_FENCE_DATABASE_NOT_TEST"]]);
+  // capture_unknown -> reads only; still authorized -> intercepted owner case: never a capture, never a new row / key
+  await h.until(a.id, (st) => st === "reconciliation_required", { max: 12, advanceMs: 3 * MIN });
+  assert.equal(w.captures.length, 0, "no capture ever");
+  assert.equal((await opsOf(a.id, OPS.CAPTURE)).length, 1, "no second capture row");
+});
