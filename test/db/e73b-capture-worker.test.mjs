@@ -980,3 +980,40 @@ test("C140 capture fence after the claim: marker turns live in afterClaim (real 
   assert.equal(w.captures.length, 0, "no capture ever");
   assert.equal((await opsOf(a.id, OPS.CAPTURE)).length, 1, "no second capture row");
 });
+
+// C140 (ROOT review follow-up): REAL post-claim mutations of the intent row itself. The intents guard forbids changing environment /
+// payment_livemode, so the owner forces them on the THROWAWAY database inside ONE transaction with session_replication_role = replica
+// (triggers bypassed for that statement only), and restores the original value the same way in finally.
+async function ownerForce(sql, params) {
+  const c = await db.owner.connect();
+  try { await c.query("BEGIN"); await c.query("SET LOCAL session_replication_role = replica"); await c.query(sql, params); await c.query("COMMIT"); }
+  catch (e) { await c.query("ROLLBACK").catch(() => {}); throw e; }
+  finally { c.release(); }
+}
+test("C140 capture fence after the claim: REAL intent environment 'live' / payment_livemode true / payment_livemode NULL set in afterClaim -> SEND_ABORTED, ZERO captures through recovery, one row / key", async () => {
+  const cases = [
+    ["intent environment live", "CAPTURE_FENCE_INTENT_ENVIRONMENT_NOT_TEST", "environment", "live", "test"],
+    ["payment_livemode true", "CAPTURE_FENCE_INTENT_NOT_TEST_MODE", "payment_livemode", true, false],
+    ["payment_livemode null", "CAPTURE_FENCE_INTENT_NOT_TEST_MODE", "payment_livemode", null, false]
+  ];
+  let n = 170;
+  for (const [name, code, col, bad, good] of cases) {
+    const w = world(); const a = await capIntent(w, n); const h = harness(w, [n]); n += 1;
+    const key0 = (await opsOf(a.id, OPS.CAPTURE))[0].payload.providerIdempotencyKey;
+    let r;
+    try {
+      r = await h.step({ intentId: a.id, hooks: { afterClaim: async () => { await ownerForce(`UPDATE booking.intents SET ${col} = $2 WHERE id = $1`, [a.id, bad]); } } });
+      await settleLate(r);
+    } finally { await ownerForce(`UPDATE booking.intents SET ${col} = $2 WHERE id = $1`, [a.id, good]); }
+    const row = (await db.owner.query(`SELECT ${col} AS v FROM booking.intents WHERE id = $1`, [a.id])).rows[0];
+    assert.equal(row.v, good, `${name}: fixture restored`);
+    assert.ok(r.actions.includes(`SEND_ABORTED:${code}`), `${name}: ${JSON.stringify(r.actions)}`);
+    assert.deepEqual([r.sends, w.captures.length, w.count("CAPTURE")], [0, 0, 0], `${name}: refused before Stripe`);
+    assert.deepEqual((await opsOf(a.id, OPS.CAPTURE)).map((o) => [o.state, o.error_code]), [["outcome_unknown", `SEND_ABORTED_${code}`]], name);
+    // capture_unknown -> reads only -> intercepted still-authorized owner case: never a capture, never a second row / key
+    await h.until(a.id, (st) => st === "reconciliation_required", { max: 12, advanceMs: 3 * MIN });
+    assert.deepEqual([w.captures.length, w.count("CAPTURE")], [0, 0], `${name}: zero captures through recovery`);
+    const caps = await opsOf(a.id, OPS.CAPTURE);
+    assert.deepEqual([caps.length, caps[0].payload.providerIdempotencyKey], [1, key0], `${name}: one capture row, same key`);
+  }
+});
