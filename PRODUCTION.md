@@ -138,5 +138,11 @@ Owner go-ahead for B and C: given 2026-11-20 ("Go").
   real address and admits the sink; column `tax_minor` exists.
 - A: PR #249 merged to `main` (cc210027): only `.github/workflows/mv-pipeline.yml`, inputs `mode` and `ref`.
 - D: `MV_CHECKOUT_TAX_POLICY=mx-iva16-ish5-v1` created (Preview, branch `e7-test`, project `maravilla-smoobu-proxy`).
-- `MV_TEST_PIPELINE_NOT_BEFORE` = 2026-11-20T22:30:00.000Z.
+- E: the six `MV_TEST_PIPELINE_*` repository variables created (`_NOT_BEFORE` = 2026-11-20T22:30:00.000Z).
+- First run of `mv-pipeline` against the real TEST database: run 44829950271 (main cc210027, ref bf254e92), success,
+  `{"mode":"test","outcome":"OK","code":"NOTHING_TO_DO"}`, all counts 0.
+- Quote check on the redeployed e7-test preview (Dec 12-13, 1 guest, unpaid intent that expires on its own): Accommodation $100.00,
+  Cleaning $50.00, discount -$10.00, Taxes $29.40, total **$169.40**.
+
+Remaining for Monday: step F only.
 
