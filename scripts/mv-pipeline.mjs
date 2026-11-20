@@ -20,6 +20,8 @@ export const MV_PIPELINE_VERSION = "mv-pipeline-v1";
 export const LOCK_NAME = "mv-pipeline-runner";                 // one runner at a time per database (session advisory lock)
 export const MAX_LISTINGS = 60;
 export const DEFAULT_MAX_INTENTS = 3;
+/** booking confirmations sent per run (one worker invocation each; never retried within a run) */
+export const MAX_CONFIRMATIONS = 3;
 export const MAX_INTENTS_LIMIT = 10;
 /** the states the coordinator can advance (its PHASE_OF) */
 export const PIPELINE_STATES = Object.freeze(["payment_authorized", "reservation_pending", "reservation_confirmed", "payment_captured"]);
@@ -60,12 +62,26 @@ const SELECT_SQL = `SELECT i.id::text AS id, i.ref, i.listing_id, i.state,
    ORDER BY i.created_at, i.id
    LIMIT $4`;
 
+/** confirmed bookings whose ONE confirmation is still queued and was never attempted (the notification worker re-checks every fact itself) */
+const CONFIRM_SQL = `SELECT i.id::text AS id, i.ref, i.listing_id
+    FROM booking.intents i
+   WHERE i.environment = $1 AND i.listing_id = ANY($2::int[]) AND i.state = 'confirmed' AND i.created_at >= $4::timestamptz
+     AND (SELECT count(*) FROM booking.external_operations o WHERE o.intent_id = i.id AND o.op_type = 'guest.notify') = 1
+     AND EXISTS (SELECT 1 FROM booking.external_operations o WHERE o.intent_id = i.id AND o.op_type = 'guest.notify'
+                    AND o.state = 'pending' AND o.attempts = 0 AND o.dispatched_at IS NULL)
+   ORDER BY i.created_at, i.id
+   LIMIT $3`;
+/** worker outcomes that mean "a person must look" (a send may have happened and its result is not known) */
+const CONFIRM_ATTENTION = Object.freeze(["unknown", "lease_lost"]);
+
 export async function runPipelineOnce(pool, cfgIn, deps = {}) {
   const v = validatePipelineConfig(cfgIn);
   const counts = { candidates: 0, confirmed: 0, pending: 0, stopped: 0, attention: 0 };
   const intents = [];
+  // P2d-2: booking confirmations (separate from the pipeline counts). code: null | CONFIRMATION_NOT_WIRED | DONE | NEEDS_REVIEW
+  const confirmations = { code: null, candidates: 0, sent: 0, skipped: 0, attention: 0 };
   const out = (outcome, code) => freeze({ version: MV_PIPELINE_VERSION, mode: v.ok ? v.cfg.mode : null, outcome, code,
-    counts: freeze({ ...counts }), intents: freeze(intents.map(freeze)) });
+    counts: freeze({ ...counts }), intents: freeze(intents.map(freeze)), confirmations: freeze({ ...confirmations }) });
   if (!v.ok) return out("REFUSED", v.code);
   if (typeof deps.buildPhases !== "function") return out("REFUSED", "PROVIDER_WIRING_REQUIRED");
   const cfg = v.cfg;
@@ -99,7 +115,22 @@ export async function runPipelineOnce(pool, cfgIn, deps = {}) {
       else if (r.outcome === "PENDING") counts.pending += 1;
       else counts.stopped += 1;                                   // STOP | REFUSED
     }
-    return out(counts.stopped + counts.attention > 0 ? "ATTENTION" : "OK", counts.candidates === 0 ? "NOTHING_TO_DO" : counts.stopped + counts.attention > 0 ? "NEEDS_REVIEW" : "DONE");
+    // ---- confirmations: at most MAX_CONFIRMATIONS, ONE notification-worker invocation each, never retried in this run ----
+    if (typeof deps.sendConfirmation !== "function") confirmations.code = "CONFIRMATION_NOT_WIRED";
+    else {
+      const due = (await client.query(CONFIRM_SQL, [cfg.mode, cfg.listingIds, MAX_CONFIRMATIONS, cfg.notBefore])).rows;
+      confirmations.candidates = due.length;
+      for (const row of due) {
+        let w = null;
+        try { w = await deps.sendConfirmation(freeze({ id: row.id, ref: row.ref, listingId: Number(row.listing_id) }), cfg); } catch { w = null; }
+        if (w && w.ok === true && w.outcome === "accepted") confirmations.sent += 1;
+        else if (!w || w.ok !== true || CONFIRM_ATTENTION.includes(w.outcome) || (Number.isSafeInteger(w.sends) && w.sends > 0)) confirmations.attention += 1;
+        else confirmations.skipped += 1;                          // idle / waiting / latched / not_claimable / protected: nothing was sent
+      }
+      confirmations.code = confirmations.attention > 0 ? "NEEDS_REVIEW" : "DONE";
+    }
+    const bad = counts.stopped + counts.attention + confirmations.attention;
+    return out(bad > 0 ? "ATTENTION" : "OK", bad > 0 ? "NEEDS_REVIEW" : counts.candidates + confirmations.candidates === 0 ? "NOTHING_TO_DO" : "DONE");
   } finally {
     if (locked) await client.query("SELECT pg_advisory_unlock(hashtext($1), 0)", [LOCK_NAME]).catch(() => {});
     client.release();
@@ -132,6 +163,9 @@ export function sessionDatabaseUrl(raw) {
   u.port = SESSION_PORT;
   return u.href;
 }
+
+/** optional secret: the Resend sending key. Absent = the run does the pipeline only (confirmations: CONFIRMATION_NOT_WIRED). */
+export const RESEND_KEY_ENV = "MV_PIPELINE_RESEND_KEY";
 
 /** Parse "id:USD,id:USD" -> Map | null (strict; USD only; no duplicates). */
 export function parseListings(raw) {
@@ -169,13 +203,15 @@ export async function main(env = process.env, out = (line) => process.stdout.wri
   if (!p.ok) return say({ version: MV_PIPELINE_VERSION, outcome: "REFUSED", code: p.code });
   let pool = null;
   try {
-    const [{ createBookingPool }, { createWiring }, { readFile }, { createHash }] = await Promise.all([import("../lib/booking-db/pool.js"), import("./mv-pipeline-wiring.mjs"),
+    const [{ createBookingPool }, { createWiring, createConfirmationWiring }, { readFile }, { createHash }] = await Promise.all([import("../lib/booking-db/pool.js"), import("./mv-pipeline-wiring.mjs"),
       import("node:fs/promises"), import("node:crypto")]);
     let ca; try { ca = await readFile(p.db.caFile); } catch { return say({ version: MV_PIPELINE_VERSION, outcome: "REFUSED", code: "CA_UNREADABLE" }); }
     if (ca.length > 16384 || createHash("sha256").update(ca).digest("hex") !== OFFICIAL_CA_SHA256) return say({ version: MV_PIPELINE_VERSION, outcome: "REFUSED", code: "CA_INVALID" });
     pool = createBookingPool({ connectionString: p.db.connectionString, caPem: ca.toString("utf8"), max: 3 });
     const wiring = createWiring({ ...p.wiring, pool });
-    return say(await runPipelineOnce(pool, p.cfg, wiring));
+    const resendKey = typeof env[RESEND_KEY_ENV] === "string" && env[RESEND_KEY_ENV] !== "" ? env[RESEND_KEY_ENV] : null;   // optional: absent = confirmations not wired
+    const conf = resendKey === null ? {} : createConfirmationWiring({ mode: p.wiring.mode, pool, resendKey, runId: p.wiring.runId });
+    return say(await runPipelineOnce(pool, p.cfg, { ...wiring, ...conf }));
   } catch (e) {
     return say({ version: MV_PIPELINE_VERSION, outcome: "REFUSED", code: safe(e && e.code, "RUNNER_FAILED") });
   } finally { if (pool) await pool.end().catch(() => {}); }

@@ -16,7 +16,7 @@ import { validateAdapterConfig } from "../../lib/hostaway-reservations.js";
 import { runTestPipelineCoordinator, TEST_LISTING_ID, CoordinatorBudgetError, refundObservationRefusal, _internal as CI } from "../../lib/booking-db/test-pipeline-coordinator.js";
 import { adminRecordEvidence } from "../../db/lib/admin.js";
 import { runPipelineOnce, validatePipelineConfig, exitCodeFor, LOCK_NAME } from "../../scripts/mv-pipeline.mjs";
-import { createWiring } from "../../scripts/mv-pipeline-wiring.mjs";
+import { createWiring, createConfirmationWiring, CONFIRMATION_SENDER } from "../../scripts/mv-pipeline-wiring.mjs";
 
 let netAttempts = 0;
 const realFetch = globalThis.fetch;
@@ -125,7 +125,7 @@ function world({ nightly = 250, echoRef = true, live = false } = {}) {
 }
 
 let lane = 0;
-async function authorizedBooking(w, { listingId = L_ID, live = false } = {}) {
+async function authorizedBooking(w, { listingId = L_ID, live = false, guest = F.GUEST } = {}) {
   lane += 1;
   const stay = { from: addDays("2027-02-01", 6 * lane), to: addDays("2027-02-01", 6 * lane + 3), guests: 2 };
   const base = Date.now() - 20 * MIN;
@@ -135,7 +135,7 @@ async function authorizedBooking(w, { listingId = L_ID, live = false } = {}) {
   w.calls.length = 0;
   const intent = await createIntentRecord(db.app, { ref: F.nextRef(), accessTokenHash: F.tokenHash(), environment: live ? "live" : "test", now: base, listingId, ...stay });
   F.ok(await applyEvent(db.app, intent.id, { type: "PRICE_CONFIRMED", price: priced.price }, { now: base, actor: "guest" }));
-  F.ok(await collectGuestDetails(db.app, intent.id, F.GUEST, { now: base + SEC, termsVersion: "terms-2026-10" }));
+  F.ok(await collectGuestDetails(db.app, intent.id, guest, { now: base + SEC, termsVersion: "terms-2026-10" }));
   const b = F.ok(await beginPayStep(db.app, intent.id, { now: base + 2 * SEC, ...(live ? { environment: "live" } : {}) }));
   const op = await claimNextOperation(db.app, { workerId: "w-pay", now: base + 2 * SEC, intentId: intent.id, opTypes: ["stripe.create_checkout_session"] });
   const sessionId = `${live ? "cs_live" : "cs_test"}_co${lane}`;
@@ -664,4 +664,60 @@ test("P2c-3 wiring: phases are built for exactly this booking from the database;
   await assert.rejects(mk().buildPhases({ id: bk.id, ref: bk.ref, listingId: 606998 }, { listings: usd([700123]) }), (e) => e.code === "LISTING_NOT_CONFIGURED");
   assert.equal(requests, 0);
   assert.equal((await loadIntent(db.app, bk.id)).status, "payment_authorized", "nothing was claimed or written");
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// P2d-2: the confirmation step of the runner, through the REAL notification worker and Resend executor with a FAKE exchange
+// (nothing leaves this process). The recipient scope is the database's: TEST = `.invalid` / the sink; LIVE = a real address (0030).
+const RKEY = "re_SENTINELkey0123456789";
+let resendSeq = 0;                                                             // provider message ids are unique across the whole file (receipts are unique)
+function fakeResend() {
+  const s = { calls: 0, reqs: [] };
+  s.exchange = async (req) => { s.calls += 1; s.reqs.push(req); resendSeq += 1; const n = resendSeq;
+    return { status: 200, headers: { contentType: "application/json", contentEncoding: null, idempotentReplayed: null }, body: Buffer.from(`{"id":"6f0c1a2b-3c4d-4e5f-8a6b-${String(n).padStart(12, "0")}"}`) }; };
+  return s;
+}
+const recipientOf = (req) => JSON.parse(Buffer.from(req.body).toString("utf8")).to;
+const notifyOf = (id) => one("SELECT state, attempts, (dispatched_at IS NOT NULL) AS dispatched FROM booking.external_operations WHERE intent_id = $1 AND op_type = 'guest.notify'", [id]);
+
+test("P2d-2a TEST: after the pipeline confirms a booking, the SAME run sends ONE confirmation to the in-scope TEST address from the MiCasaDirect sender; a second run sends none; without the wiring nothing is sent", async () => {
+  const notBefore = cutoffNow();
+  const w1 = world(); const b1 = await authorizedBooking(w1, { guest: { ...F.GUEST, email: "delivered@resend.dev" } });
+  const w2 = world(); const b2 = await authorizedBooking(w2);                                   // fixture guest: NOT in the TEST scope (never sent)
+  const cfg = { mode: "test", workerId: "mv-t", listings: usd([606998]), notBefore, maxIntents: 10 };
+  const fx = fakeResend();
+  const deps = { ...wiring([[w1, b1], [w2, b2]]), ...createConfirmationWiring({ mode: "test", pool: db.app, resendKey: RKEY, runId: "run-c1", exchange: fx.exchange }) };
+  const r = await runPipelineOnce(db.app, cfg, deps);
+  assert.deepEqual([r.outcome, r.counts.confirmed, { ...r.confirmations }], ["OK", 2, { code: "DONE", candidates: 2, sent: 1, skipped: 1, attention: 0 }], JSON.stringify(r));
+  assert.equal(fx.calls, 1);
+  const sent = JSON.parse(Buffer.from(fx.reqs[0].body).toString("utf8"));
+  assert.equal(String(sent.from).includes(CONFIRMATION_SENDER.fromAddress), true);
+  assert.ok(JSON.stringify(recipientOf(fx.reqs[0])).includes("delivered@resend.dev"));
+  assert.equal(JSON.stringify(r).includes("delivered@resend.dev"), false, "the result carries no recipient");
+  assert.equal((await notifyOf(b1.id)).state, "succeeded");
+  const again = await runPipelineOnce(db.app, cfg, deps);
+  assert.deepEqual([again.outcome, again.confirmations.sent, fx.calls], ["OK", 0, 1], "never a second send");
+  // without the confirmation wiring: the pipeline part is unaffected and nothing is sent
+  const w3 = world(); const b3 = await authorizedBooking(w3, { guest: { ...F.GUEST, email: "delivered@resend.dev" } });
+  const none = await runPipelineOnce(db.app, { ...cfg, notBefore: new Date(b3.base - 5).toISOString() }, wiring([[w3, b3]]));
+  assert.deepEqual([none.outcome, none.counts.confirmed, none.confirmations.code, fx.calls], ["OK", 1, "CONFIRMATION_NOT_WIRED", 1]);
+  assert.deepEqual({ ...(await notifyOf(b3.id)) }, { state: "pending", attempts: 0, dispatched: false });
+});
+
+test("P2d-2b LIVE-marked database: the confirmation goes to the guest's real-looking address (fake exchange); a TEST-mode sender on that database sends nothing", async () => {
+  await db.owner.query("UPDATE booking.instance SET environment = 'live'");
+  try {
+    const notBefore = cutoffNow(); const A = 700301;
+    const w = world({ live: true }); const bk = await authorizedBooking(w, { listingId: A, live: true, guest: { ...F.GUEST, email: "guest@example.com" } });
+    const cfg = { mode: "live", workerId: "mv-l", listings: usd([A]), notBefore, maxIntents: 10 };
+    const fx = fakeResend(); const pipe = wiring([[w, bk]], (b) => b.listingId);
+    // a TEST-mode confirmation wiring on a LIVE database: the worker refuses at the marker; counted for review, nothing sent
+    const wrong = await runPipelineOnce(db.app, cfg, { ...pipe, ...createConfirmationWiring({ mode: "test", pool: db.app, resendKey: RKEY, runId: "run-c2", exchange: fx.exchange }) });
+    assert.deepEqual([wrong.counts.confirmed, wrong.confirmations.sent, wrong.confirmations.attention, fx.calls], [1, 0, 1, 0], JSON.stringify(wrong));
+    const r = await runPipelineOnce(db.app, cfg, { ...pipe, ...createConfirmationWiring({ mode: "live", pool: db.app, resendKey: RKEY, runId: "run-c3", exchange: fx.exchange }) });
+    assert.deepEqual([r.outcome, { ...r.confirmations }, fx.calls], ["OK", { code: "DONE", candidates: 1, sent: 1, skipped: 0, attention: 0 }, 1], JSON.stringify(r));
+    assert.ok(JSON.stringify(recipientOf(fx.reqs[0])).includes("guest@example.com"));
+    assert.equal(JSON.stringify(r).includes("guest@example.com"), false);
+  } finally { await db.owner.query("UPDATE booking.instance SET environment = 'test'"); }
+  assert.equal((await db.owner.query("SELECT environment FROM booking.instance")).rows.map((x) => x.environment).join(), "test", "marker restored");
 });

@@ -49,5 +49,6 @@ jobs:
           MV_PIPELINE_ACCOUNT_REF: ${{ inputs.mode == 'live' && vars.MV_LIVE_PIPELINE_ACCOUNT_REF || vars.MV_TEST_PIPELINE_ACCOUNT_REF }}
           MV_PIPELINE_STRIPE_KEY: ${{ inputs.mode == 'live' && secrets.MV_LIVE_STRIPE_KEY || secrets.E7_STRIPE_TEST_KEY }}
           MV_PIPELINE_HOSTAWAY_TOKEN: ${{ inputs.mode == 'live' && secrets.MV_LIVE_HOSTAWAY_TOKEN || secrets.E7_HOSTAWAY_TOKEN }}
+          MV_PIPELINE_RESEND_KEY: ${{ inputs.mode == 'live' && secrets.MV_LIVE_RESEND_KEY || secrets.E7_RESEND_TEST_KEY }}
           MV_PIPELINE_DATABASE_URL: ${{ inputs.mode == 'live' && secrets.MV_LIVE_BOOKING_DATABASE_URL || secrets.E7_DEV_BOOKING_DATABASE_URL }}
         run: node scripts/mv-pipeline.mjs

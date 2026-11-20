@@ -16,6 +16,9 @@ import { captureKey } from "../lib/checkout/intent-state.js";
 import { createPhaseExecutors } from "./e7-connected/executor-adapters.mjs";
 import { createE7HostawaySend, createE7StripeTestSend, createE7StripeLiveSend } from "./e7-connected/http-transports.mjs";
 import { createE7RealExchange } from "./e7-connected/real-exchange.mjs";
+import { runNotificationStep, NOTIFICATION_V2_OPTION_KEY, NOTIFICATION_PROVIDER_OPTION_KEY } from "../lib/booking-db/notification-worker.js";
+import { createResendNotificationExecutor } from "../lib/notify/resend-notification-executor.js";
+import { createResendExchange } from "./e7-resend/resend-exchange.mjs";
 
 export const WIRING_VERSION = "mv-pipeline-wiring-v1";
 export const STRIPE_API_VERSION = "2026-01-28.clover";            // the version the proven runner pins
@@ -133,4 +136,36 @@ export function createWiring(o) {
         recording: { listings: new Map([[listingId, recCfg]]), executors: proxies.recording } } };
   }
   return freeze({ buildPhases });
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// P2d-2: booking confirmation wiring (deps.sendConfirmation). ONE accepted notification-worker invocation for ONE booking, through the
+// accepted Resend executor and exchange. The worker owns every fence: eligibility class, recipient scope by database marker (0030), claim,
+// lease, latch, render and receipt. The sender is the verified MiCasaDirect address; the recipient comes only from the database.
+export const CONFIRMATION_SENDER = freeze({ fromAddress: "bookings@mail.micasadirect.com", fromName: "MiCasaDirect" });
+export const CONFIRMATION_LOCALE = "en";
+const RESEND_KEY_RE = /^re_[A-Za-z0-9_]{8,200}$/;
+
+/**
+ * createConfirmationWiring({ mode, pool, resendKey, runId, exchange? }) -> { sendConfirmation(intentRef, cfg) -> worker result }
+ * exchange is injectable for tests (a fake Resend); by default a fresh accepted single-use Resend exchange per send.
+ */
+export function createConfirmationWiring(o) {
+  if (!isObj(o) || (o.mode !== "test" && o.mode !== "live")) refuse("MODE_INVALID");
+  if (typeof o.resendKey !== "string" || !RESEND_KEY_RE.test(o.resendKey)) refuse("CREDENTIAL_INVALID");
+  if (!o.pool || typeof o.pool.query !== "function") refuse("POOL_REQUIRED");
+  if (typeof o.runId !== "string" || !LABEL_RE.test(o.runId)) refuse("LABEL_INVALID");
+  const { mode, pool, runId } = o; const key = o.resendKey;
+  const live = mode === "live" ? { mode: "live" } : {};
+  async function sendConfirmation(intentRef) {
+    const xr = typeof o.exchange === "function" ? { ok: true, exchange: o.exchange } : createResendExchange();     // single-use: a fresh one per send
+    if (!xr || xr.ok !== true || typeof xr.exchange !== "function") refuse("EXCHANGE_INVALID");
+    const ex = createResendNotificationExecutor({ exchange: xr.exchange, credential: () => key,
+      sender: { ...CONFIRMATION_SENDER }, ...live });
+    if (!ex || ex.ok !== true) refuse("EXECUTOR_INVALID");
+    return runNotificationStep(pool, { env: { VERCEL_ENV: "preview", MV_E7_NOTIFICATION_WORKER: "enabled" }, workerId: `mvp-${runId}`.slice(0, 60), listingIds: [intentRef.listingId],
+      intentId: intentRef.id, sender: { ...CONFIRMATION_SENDER }, clock: Date.now, [NOTIFICATION_V2_OPTION_KEY]: CONFIRMATION_LOCALE,
+      [NOTIFICATION_PROVIDER_OPTION_KEY]: ex.executor, ...live });
+  }
+  return freeze({ sendConfirmation });
 }
