@@ -69,7 +69,7 @@ test("N1 NATIVE EXECUTION CLOSURE: literal list = independent scan of CLI + laun
   assert.equal(entries.length, ind.files); assert.equal(await CLI.nativeClosureDigest(entries), ind.digest);
   console.log(`# N1 native closure: ${CLI.NATIVE_EXEC_SOURCES.length} sources + ${ind.files - CLI.NATIVE_EXEC_SOURCES.length} dependency files (${ind.pkgs.length} packages) → ${ind.digest}`);
   for (const f of CLI.NATIVE_EXEC_SOURCES) assert.ok(!readFileSync(join(ROOT, f), "utf8").includes(ind.digest), `${f} embeds no digest`);
-  assert.ok(R.R1_EXECUTOR_CLOSURE.length === 30 && CLI.NATIVE_EXEC_SOURCES.length > R.R1_EXECUTOR_CLOSURE.length);
+  assert.ok(R.R1_EXECUTOR_CLOSURE.length === 31 && CLI.NATIVE_EXEC_SOURCES.length > R.R1_EXECUTOR_CLOSURE.length);
   for (const f of ["scripts/e7-connected/run-r1-launcher.mjs", "scripts/e7-connected/run-core-abort-v2.mjs", "scripts/e7-connected/run-journal-file-v2.mjs", "scripts/e7-connected/db-credential-file.mjs",
     "scripts/e7-connected/http-transports.mjs", "scripts/e7-connected/real-exchange.mjs", "lib/booking-db/pool.js", "lib/booking-db/reservation-worker.js", "lib/booking-db/compensation-worker.js"])
     assert.ok(CLI.NATIVE_EXEC_SOURCES.includes(f) && !R.R1_EXECUTOR_CLOSURE.includes(f), `${f}: in the native closure, not in the G1-only closure`);

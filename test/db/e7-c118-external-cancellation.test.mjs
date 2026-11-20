@@ -310,7 +310,7 @@ test("after-stay release and retention: compatible in both orders; purge keeps w
 });
 
 test("migration: 0027 (C119 S4: only the literal-rebind 0028 follows); down refused once records exist; on a fresh cluster down restores 0021's claim_release_blockers exactly", async () => {
-  const M = loadMigrations(); assert.equal(M.find((m) => m.version === 27).name, "external_cancellation_disposition"); assert.deepEqual(M.filter((m) => m.version > 27).map((m) => m.name), ["pipeline_kickoff_source_rebind_s4"]);
+  const M = loadMigrations(); assert.equal(M.find((m) => m.version === 27).name, "external_cancellation_disposition"); assert.deepEqual(M.filter((m) => m.version > 27).map((m) => m.name), ["pipeline_kickoff_source_rebind_s4", "price_tax"]);   // P1: + 0029 (mechanical)
   const e = await errOf((async () => { const cl = new pg.Client({ connectionString: db.adminUrl }); await cl.connect();
     try { await migrateDown(cl, { to: 26, env: "test" }); } finally { await cl.end(); } })());
   assert.match(e?.message ?? "", /DOWN_REFUSED/);

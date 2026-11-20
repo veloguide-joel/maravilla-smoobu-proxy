@@ -116,7 +116,7 @@ test("P0 deterministic assembly: pins == a fresh PRE derivation (schema 27) and 
   assert.deepEqual(IDENTITY_KEYS.filter((k) => JSON.stringify(PINS.pre[k]) !== JSON.stringify(PINS.post[k])), ["functions"]); assert.deepEqual(PINS.identityKeysChanged, ["functions"]);
   assert.deepEqual([PINS.files.up28, PINS.files.down28, PINS.files.name28], [m28.upChecksum, m28.downChecksum, m28.name]);
   assert.deepEqual([m28.upChecksum, m28.downChecksum], ["a72d2ce911cac924b728525f1af43b547c7e908a96bdecbf84f41ca3ebfa3642", "c247b17883b23ecdba1eb0ec2a94e5e0e9caa558724ee29c4b0500fb7b77806f"]);
-  assert.equal(M.at(-1).version, 28);
+  assert.equal(M.at(-1).version, 29);   // P1: 0029 (price tax) follows; this packet is still about 28
   assert.equal(/\$e7_0028_up\$([\s\S]*?)\$e7_0028_up\$/.exec(WRAPPER)[1], m28.up); assert.equal(WRAPPER.split("$e7_0028_up$").length, 3);
   for (const m of M) { if (m.version < 28) assert.ok(!WRAPPER.includes(m.up), `up ${m.version} absent`); assert.ok(!WRAPPER.includes(m.down), `down ${m.version} absent`); }
   assert.equal((WRAPPER.match(/INSERT INTO booking_migrations\.applied/g) || []).length, 1); assert.ok(!/VALUES \((?!28,)\d+,/.test(WRAPPER), "only the 28 tracking row");
@@ -187,7 +187,7 @@ test("P1 one atomic apply over REALISTIC schema-27 data (incl. a REAL recorded C
     }
   } finally { await appc.end(); }
   // the REAL claim function now binds the S4 frame literal (the kickoff tooling's own dispatch inputs) — exercised on a FRESH disposable cluster
-  const st = await migrationStatus(db.c, { env: "test" }); assert.deepEqual([st.applied.length, st.pending], [28, []]);
+  const st = await migrationStatus(db.c, { env: "test" }); assert.deepEqual([st.applied.length, st.pending], [28, [29]]);   // P1: + 0029 (mechanical)
   const r2 = await runWrapper(db.c); assert.deepEqual(r2.notices, ["E7_28_ALREADY_EXACT_NOOP"]); assert.deepEqual(await readback(db.c), post, "second apply wrote nothing");
   const B = await startDbAt(28);
   try { assert.deepEqual(identity(await inventory(B.c)), identity(PINS.post), "migrator-built 28 == the wrapper POST"); assert.deepEqual((await runWrapper(B.c)).notices, ["E7_28_ALREADY_EXACT_NOOP"]); }

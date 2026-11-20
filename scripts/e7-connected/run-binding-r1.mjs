@@ -21,7 +21,7 @@ export const ACCEPTED_REF_RE = /^MV-[A-Z0-9]{6,10}$/;          // = run-manifest
 export const R1_EXECUTOR_CLOSURE = Object.freeze([
   "lib/bookability.js", "lib/booking-db/codec.js", "lib/booking-db/config.js", "lib/booking-db/repo.js", "lib/checkout/capture-proof.js",
   "lib/checkout/compensation-proof.js", "lib/checkout/final-price.js", "lib/checkout/intent-state.js", "lib/checkout/offline-charge-proof.js",
-  "lib/checkout/recovery-plan.js", "lib/checkout/server-pricer.js", "lib/direct-policy.js", "lib/direct-pricing.js", "lib/hostaway-calendar.js", "lib/hostaway-reservations.js", "lib/hostaway.js",
+  "lib/checkout/recovery-plan.js", "lib/checkout/server-pricer.js", "lib/checkout/tax-policy.js", "lib/direct-policy.js", "lib/direct-pricing.js", "lib/hostaway-calendar.js", "lib/hostaway-reservations.js", "lib/hostaway.js",
   "lib/public-api.js", "lib/quote-public.js", "package-lock.json", "package.json", "scripts/e7-connected/executor-adapters.mjs",
   "scripts/e7-connected/probe-env-preflight.mjs", "scripts/e7-connected/probe-source-digest.mjs", "scripts/e7-connected/run-binding-r1.mjs",
   "scripts/e7-connected/run-facts.mjs", "scripts/e7-connected/run-guard.mjs", "scripts/e7-connected/run-manifest-v2.mjs", "scripts/e7-connected/run-manifest.mjs",

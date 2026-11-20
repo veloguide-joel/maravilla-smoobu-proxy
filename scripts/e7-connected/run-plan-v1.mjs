@@ -31,7 +31,7 @@ export const CONSTANT_ORIGINS = Object.freeze({
   "lib/booking-db/test-abort.js": "2638df7d3cceab9b0720c2ea1c7fa53d439900ef7392d944ef3663c331ebcc86",
   // C136 (2026-11-19): reservation-worker origin pin 601f48f6... -> ef76c13f... = additive Hostaway CREATE TEST-identity fence only;
   // the copied PROTECTED_HOSTAWAY_RESERVATION_IDS / DEFAULT_TIMEOUTS are byte-identical (parity tests unchanged)
-  "lib/booking-db/reservation-worker.js": "ef76c13fac9cfff6e51f0afd29f68f24a642d62c05480c5a11481c0fa50f6330"
+  "lib/booking-db/reservation-worker.js": "4e76a33962b5d06e60c7daa36141c51c96325d9f73c3070aecca35f879bb4f4d"
 });
 /** exact historical identifiers from the accepted ledger; null = the identifier did NOT exist (explicit, never guessed) */
 export const HISTORICAL_EXCLUSIONS = Object.freeze({
@@ -56,7 +56,7 @@ export const RUN_PLAN_CLOSURE = Object.freeze([
   "lib/booking-db/operations.js", "lib/booking-db/pool.js", "lib/booking-db/recording-worker.js", "lib/booking-db/recovery.js", "lib/booking-db/repo.js",
   "lib/booking-db/reservation-worker.js", "lib/booking-db/test-abort.js", "lib/checkout/capture-proof.js", "lib/checkout/compensation-proof.js",
   "lib/checkout/final-price.js", "lib/checkout/intent-state.js", "lib/checkout/offline-charge-proof.js", "lib/checkout/recovery-plan.js",
-  "lib/checkout/server-pricer.js", "lib/direct-policy.js", "lib/direct-pricing.js", "lib/hostaway-calendar.js", "lib/hostaway-reservations.js", "lib/hostaway.js",
+  "lib/checkout/server-pricer.js", "lib/checkout/tax-policy.js", "lib/direct-policy.js", "lib/direct-pricing.js", "lib/hostaway-calendar.js", "lib/hostaway-reservations.js", "lib/hostaway.js",
   "lib/public-api.js", "lib/quote-public.js", "package-lock.json", "package.json", "scripts/e7-connected/executor-adapters.mjs", "scripts/e7-connected/http-transports.mjs",
   "scripts/e7-connected/probe-credential-file.mjs", "scripts/e7-connected/probe-env-preflight.mjs", "scripts/e7-connected/probe-source-digest.mjs",
   "scripts/e7-connected/real-exchange.mjs", "scripts/e7-connected/run-binding-r1.mjs", "scripts/e7-connected/run-core-abort-v2.mjs", "scripts/e7-connected/run-core.mjs", "scripts/e7-connected/run-facts.mjs",
