@@ -33,8 +33,8 @@ gets its own database (marker `live`), its own GitHub environment and arm variab
 | P4-1 | Guest checkout page `public/checkout.html` + `checkout.js` + `checkout.css` (stay from the link `?listing=&from=&to=&guests=[&name=]`, guest wording, Taxes line, the cancellation policy before payment, identical to the email; logic imported from `checkout-test.js`) and `GET /api/checkout/config` (`mode`, `termsVersion`; same gate as the checkout API) | merged (#258); "Book this new stay" for a returning guest (this PR) |
 | P4-2 | Guest site (`maravilla-booking-ui`): "Book now" in the booking panel for a server-confirmed stay, linking to the checkout page; only on hosts in `CHECKOUT_ENVIRONMENTS` (today the `mcd-catalog` preview alias) | merged to `mcd-catalog` and `DEV` (booking-ui #7, #8, #9) |
 | P4-3 | Go-live plan (section "Go-live runbook"); approach approved by the owner 2026-11-20 (branch `production`, `book.micasadirect.com`); owner states the Hostaway calendar is current for all listings | merged (#260) |
-| P4-4 | `MV_PUBLIC_CATALOG=launch`: the 28 USD listings in any environment, never the two MXN pilots or 606998 | this PR |
-| P4-5 | Guest site: MiCasaDirect branding, money format, production hosts in the API / checkout maps; proxy CORS allowlist for the production guest origin | todo |
+| P4-4 | `MV_PUBLIC_CATALOG=launch`: the 28 USD listings in any environment, never the two MXN pilots or 606998 | merged (#261) |
+| P4-5 | Guest site: MiCasaDirect title, US dollar format (`$1,012.50`), `micasadirect.com` / `www` -> `https://book.micasadirect.com` for API and checkout. The proxy CORS allowlist takes the production guest origins from `BOOKING_UI_ORIGINS` (no code change) | merged to `mcd-catalog` and `DEV` (booking-ui #10, #11); browser suites not run (no Chromium here) |
 | P5 | TEST proof of the new runner with taxes on ($169.40), retire the old armed chain, then one owner-approved live booking | TEST proof done 2026-11-21 (below); live booking todo |
 
 ## P2c design: the unattended chain for production
