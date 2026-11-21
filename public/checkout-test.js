@@ -172,7 +172,8 @@ export function createApi(fetchFn, { timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
     if (token) headers.Authorization = `Bearer ${token}`;
     let res;
     try {
-      res = await fetchFn(path, { method: "POST", headers, body: JSON.stringify(body), credentials: "omit", cache: "no-store", referrerPolicy: "no-referrer",
+      res = await fetchFn(path, { method: "POST", headers, body: JSON.stringify(body), credentials: "omit", cache: "no-store", referrerPolicy: "same-origin",   // NOT "no-referrer": Safari / Firefox then send `Origin: null` on a same-origin POST and the API refuses it (ORIGIN_NOT_ALLOWED)
+       
         redirect: "error", mode: "same-origin", signal: AbortSignal.timeout(timeoutMs) });
     } catch { return { kind: "unknown" }; }
     let json = null;

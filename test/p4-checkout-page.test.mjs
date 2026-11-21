@@ -84,3 +84,10 @@ test("P4-1b new stay: offered only with a valid stay link AND a finished booking
   for (const s of ["create", "details", "pay", "payWait", "authorized", "confirming", "finalizing", "review", "lost", "unreadable", "createUncertain", "loading"]) assert.equal(offerNewStay(s, stay), false, s);
 });
 
+test("Origin header: the checkout API calls never use referrerPolicy no-referrer (browsers that follow the Fetch standard send `Origin: null` with it, which the API refuses); navigations keep no-referrer", () => {
+  const api = read("checkout-test.js");
+  assert.match(api, /method: "POST"[^\n]*referrerPolicy: "same-origin"/);
+  assert.doesNotMatch(api, /method: "POST"[^\n]*referrerPolicy: "no-referrer"/);
+  for (const page of ["checkout.html", "checkout-test.html"]) assert.match(read(page), /<meta name="referrer" content="no-referrer">/, page);
+});
+
