@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { parseStayQuery, guestCopy, guestNotice, readCheckoutConfig, CANCELLATION_POLICY, CANCELLATION_CONTACT, BRAND, RETURN_HINTS, CONFIG_PATH } from "../public/checkout.js";
+import { offerNewStay, FINISHED_SCREENS, parseStayQuery, guestCopy, guestNotice, readCheckoutConfig, CANCELLATION_POLICY, CANCELLATION_CONTACT, BRAND, RETURN_HINTS, CONFIG_PATH } from "../public/checkout.js";
 import { renderBookingConfirmationV2, BRAND_V2, CANCELLATION_CONTACT as EMAIL_CONTACT } from "../lib/checkout/booking-confirmation-copy.js";
 import { createCheckoutConfigHandler } from "../lib/checkout/checkout-config-http.js";
 import { ENV_OK } from "./e5a-fixtures.mjs";
@@ -76,3 +76,11 @@ test("P4-1 config: GET /api/checkout/config returns only mode and terms version,
   for (const [s, b] of [[404, { code: "NOT_FOUND" }], [200, { mode: "prod", termsVersion: "x" }], [200, { mode: "test", termsVersion: "<b>" }], [200, null]]) assert.equal(await readCheckoutConfig(fake(s, b)), null);
   assert.equal(await readCheckoutConfig(async () => { throw new Error("network"); }), null);
 });
+
+test("P4-1b new stay: offered only with a valid stay link AND a finished booking in the tab; never over a booking in progress", () => {
+  const stay = parseStayQuery("?listing=5&from=2026-12-12&to=2026-12-13&guests=1").stay;
+  assert.deepEqual([...FINISHED_SCREENS], ["complete", "terminal"]);
+  for (const s of FINISHED_SCREENS) { assert.equal(offerNewStay(s, stay), true, s); assert.equal(offerNewStay(s, null), false, s); }
+  for (const s of ["create", "details", "pay", "payWait", "authorized", "confirming", "finalizing", "review", "lost", "unreadable", "createUncertain", "loading"]) assert.equal(offerNewStay(s, stay), false, s);
+});
+
