@@ -31,7 +31,7 @@ gets its own database (marker `live`), its own GitHub environment and arm variab
 | P2d-3 | Confirmation copy contract `bcc-v2` (MiCasaDirect, "taxes included", cancellation policy, contact info@micasadirect.com; en + es), migration 0031 (`claim_guest_notification_v3`, render CHECK admits `bcc-v1` / `bcc-v2`), worker option `copyContract`, runner sends `bcc-v2` | merged (#255); 0031 applied to both databases |
 | P3 | Production database (schema at marker `live`, backups), production Vercel env, GitHub environment `mv-live` + secrets | P3-1 database done (#253); P3-2 todo |
 | P4 | Production checkout page (today only `public/checkout-test.html`), guest-site "Book now", micasadirect.com DNS to Vercel | todo |
-| P5 | TEST proof of the new runner with taxes on ($169.40), retire the old armed chain, then one owner-approved live booking | todo |
+| P5 | TEST proof of the new runner with taxes on ($169.40), retire the old armed chain, then one owner-approved live booking | TEST proof done 2026-11-21 (below); live booking todo |
 
 ## P2c design: the unattended chain for production
 
@@ -180,4 +180,16 @@ The wording lives in `lib/checkout/booking-confirmation-copy.js` (`bcc-v2`). The
 readback 31 versions, `claim_guest_notification_v3` present, CHECK names `bcc-v2`); production by `mv-db-setup` run 44841403485
 (ref b84763f2: `migrationsRun` 1, `applied` 31, login checks all true). Monday's TEST booking must run `mv-pipeline` at a ref at or
 after b84763f2 (the runner sends `bcc-v2`).
+
+## P5 TEST proof (2026-11-21 UTC; done on Friday evening instead of Monday)
+
+Booking MV-TK3NP7NN, 606998, Dec 10-11, intent a7b7d5a6. Owner paid on Stripe TEST at 00:40Z; stored price 16940 (tax 2940),
+authorized 16940. `mv-pipeline` (main cc210027+, ref f3373f46, mode test), manual dispatches:
+- 44845486783: `create` 1, PENDING / NOT_DUE (reservation created; the next step is scheduled about two minutes later);
+- 44845660658: PENDING / NOT_DUE, no write (dispatched a few seconds early);
+- 44845853741: CONFIRMED, `capture` 1, `record` 1, confirmations sent 1;
+- 44846176643: NOTHING_TO_DO.
+Readback: state `confirmed`, Hostaway reservation 72081660, captured 16940, offline charge recorded, every operation `succeeded`
+with attempts 1 (one create, one capture, one record, one `guest.notify`), render `gn-v2` / `bcc-v2` / `en`.
+Consequence for scheduling: a booking needs two runs a few minutes apart, so a 5-minute schedule confirms within about 10 minutes.
 
