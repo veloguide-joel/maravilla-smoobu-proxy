@@ -70,6 +70,11 @@ export function guestCopy(v) {
     default: return { title: "Status not confirmed", text: "Please use Refresh status." };
   }
 }
+/** P4-1b: the guest followed a Book now link while this tab still shows an earlier, FINISHED booking (confirmed or closed). Only then
+ *  is "Book this new stay" offered; a booking that is still in progress is never replaced from here. */
+export const FINISHED_SCREENS = Object.freeze(["complete", "terminal"]);
+export const offerNewStay = (screen, stay) => !!stay && FINISHED_SCREENS.includes(screen);
+
 /** rare technical notices come from the shared controller: drop its test wording, keep the meaning */
 export const guestNotice = (text) => (typeof text === "string" ? text.replace(/\bStripe TEST Checkout\b/g, "the payment page").replace(/\bTEST intent\b/g, "booking request").replace(/\bTEST /g, "") : "");
 
@@ -101,14 +106,17 @@ export async function startApp(doc, win) {
   const pol = $("mv-policy-list"); pol.replaceChildren();
   for (const line of CANCELLATION_POLICY) { const li = doc.createElement("li"); li.textContent = line; pol.append(li); }
   const stayLine = stay ? `${stay.name || `Property ${stay.listingId}`} · ${longDate(stay.from)} to ${longDate(stay.to)} · ${stay.nights} night${stay.nights === 1 ? "" : "s"} · ${stay.guests} guest${stay.guests === 1 ? "" : "s"}` : "";
-  let announced = null; let autoStarted = false; let ctl = null;
+  let announced = null; let autoStarted = false; let ctl = null; let lastScreen = null;
   const ui = {
     render(v) {
       const c = guestCopy(v);
       const noStay = v.screen === "create" && !stay;
       $("mv-title").textContent = noStay ? "Choose your stay first" : c.title;
       $("mv-text").textContent = noStay ? (parsed && !parsed.ok ? "This booking link is not complete. Please go back to the property page and choose your dates again." : "Please choose a property and dates on our site, then use Book now.") : c.text;
-      $("mv-stay").textContent = stayLine; show("mv-stay", !!stay && ["create", "details", "pay", "loading"].includes(v.screen));
+      lastScreen = v.screen;
+      const newStay = offerNewStay(v.screen, stay);
+      $("mv-stay").textContent = stayLine; show("mv-stay", !!stay && (newStay || ["create", "details", "pay", "loading"].includes(v.screen)));
+      show("mv-new", newStay);
       const n = $("mv-notice");
       n.textContent = v.notice ? guestNotice(v.notice.text) : ""; n.dataset.level = v.notice ? v.notice.level : ""; n.hidden = !v.notice;
       const codes = [...new Set([v.notice && v.notice.code, v.pollStopped].filter((x) => x != null).map(supportCode))];
@@ -155,6 +163,8 @@ export async function startApp(doc, win) {
   $("mv-retry-btn").addEventListener("click", () => { if (c.state.retry === "details" && typeof $("mv-details").reportValidity === "function" && !$("mv-details").reportValidity()) return; c.retryUncertain(details()); });
   $("mv-ack-create-btn").addEventListener("click", () => { if (win.confirm("An earlier request may exist. Start a new booking request anyway?")) c.acknowledgeUncertainCreate(); });
   $("mv-refresh").addEventListener("click", () => c.refresh());
+  // P4-1b: clear the finished booking from this tab (nothing is sent), then ask for the new stay's price
+  $("mv-new-btn").addEventListener("click", () => { if (!stay || !offerNewStay(lastScreen, stay)) return; autoStarted = true; c.startOver(); c.create({ from: stay.from, to: stay.to, guests: stay.guests }); });
   $("mv-restart").addEventListener("click", () => { if (win.confirm("Clear this booking from this page? This does not cancel a booking or a payment.")) { autoStarted = true; c.startOver(); } });
   c.init();
   return c;
