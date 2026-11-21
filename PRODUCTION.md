@@ -28,7 +28,7 @@ gets its own database (marker `live`), its own GitHub environment and arm variab
 | P2c-4 | `createE7StripeLiveSend` (restricted live key only, `livemode` true on replies) and LIVE provider wiring. No live key exists anywhere | merged (#246) |
 | P2d-1 | Recipient scope by environment: migration 0030 (`booking.gn_recipient_in_scope` admits a real address only when the marker is exactly `live`; TEST scope unchanged), `isRecipientInScopeFor`, `buildLiveBookingConfirmationRequest`, Resend executor and notification worker take `mode` | merged (#245) |
 | P2d-2 | Confirmation step in `mv-pipeline` (confirmed bookings with one queued, never-attempted `guest.notify`; at most 3 per run; one worker invocation each) and `createConfirmationWiring` (accepted Resend executor / exchange, sender bookings@mail.micasadirect.com). Optional `MV_PIPELINE_RESEND_KEY` | merged (#247) |
-| P2d-3 | Confirmation copy contract `bcc-v2` (MiCasaDirect, "taxes included", cancellation policy, contact info@micasadirect.com; en + es), migration 0031 (`claim_guest_notification_v3`, render CHECK admits `bcc-v1` / `bcc-v2`), worker option `copyContract`, runner sends `bcc-v2` | this PR |
+| P2d-3 | Confirmation copy contract `bcc-v2` (MiCasaDirect, "taxes included", cancellation policy, contact info@micasadirect.com; en + es), migration 0031 (`claim_guest_notification_v3`, render CHECK admits `bcc-v1` / `bcc-v2`), worker option `copyContract`, runner sends `bcc-v2` | merged (#255); 0031 applied to both databases |
 | P3 | Production database (schema at marker `live`, backups), production Vercel env, GitHub environment `mv-live` + secrets | P3-1 database done (#253); P3-2 todo |
 | P4 | Production checkout page (today only `public/checkout-test.html`), guest-site "Book now", micasadirect.com DNS to Vercel | todo |
 | P5 | TEST proof of the new runner with taxes on ($169.40), retire the old armed chain, then one owner-approved live booking | todo |
@@ -175,4 +175,9 @@ two secrets (entered by the owner).
 - 89 days or fewer: no refund; the amount paid less the same fee is a credit toward a stay at the same property that begins within one
   year of the original arrival date; not usable at another property.
 The wording lives in `lib/checkout/booking-confirmation-copy.js` (`bcc-v2`). The production checkout page (P4) must show the same text.
+
+**0031 applied 2026-11-21 (UTC):** TEST through the SQL editor (script sha256 e85aefdd...88aa, precheck versions exactly 1..30;
+readback 31 versions, `claim_guest_notification_v3` present, CHECK names `bcc-v2`); production by `mv-db-setup` run 44841403485
+(ref b84763f2: `migrationsRun` 1, `applied` 31, login checks all true). Monday's TEST booking must run `mv-pipeline` at a ref at or
+after b84763f2 (the runner sends `bcc-v2`).
 
