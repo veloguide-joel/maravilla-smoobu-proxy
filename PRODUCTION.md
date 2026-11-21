@@ -28,7 +28,7 @@ gets its own database (marker `live`), its own GitHub environment and arm variab
 | P2c-4 | `createE7StripeLiveSend` (restricted live key only, `livemode` true on replies) and LIVE provider wiring. No live key exists anywhere | merged (#246) |
 | P2d-1 | Recipient scope by environment: migration 0030 (`booking.gn_recipient_in_scope` admits a real address only when the marker is exactly `live`; TEST scope unchanged), `isRecipientInScopeFor`, `buildLiveBookingConfirmationRequest`, Resend executor and notification worker take `mode` | merged (#245) |
 | P2d-2 | Confirmation step in `mv-pipeline` (confirmed bookings with one queued, never-attempted `guest.notify`; at most 3 per run; one worker invocation each) and `createConfirmationWiring` (accepted Resend executor / exchange, sender bookings@mail.micasadirect.com). Optional `MV_PIPELINE_RESEND_KEY` | merged (#247) |
-| P2d-3 | Email text: tax line and the owner's cancellation policy (check 0022 for pinned template hashes first) | todo |
+| P2d-3 | Confirmation copy contract `bcc-v2` (MiCasaDirect, "taxes included", cancellation policy, contact info@micasadirect.com; en + es), migration 0031 (`claim_guest_notification_v3`, render CHECK admits `bcc-v1` / `bcc-v2`), worker option `copyContract`, runner sends `bcc-v2` | this PR |
 | P3 | Production database (schema at marker `live`, backups), production Vercel env, GitHub environment `mv-live` + secrets | P3-1 database done (#253); P3-2 todo |
 | P4 | Production checkout page (today only `public/checkout-test.html`), guest-site "Book now", micasadirect.com DNS to Vercel | todo |
 | P5 | TEST proof of the new runner with taxes on ($169.40), retire the old armed chain, then one owner-approved live booking | todo |
@@ -167,4 +167,12 @@ from project creation) and `MV_LIVE_DB_APP_PASSWORD` (a new one, 32 letters and 
 `aws-0-us-east-2.pooler.supabase.com`: `{"outcome":"OK","code":"READY","migrationsRun":30,"applied":30,"roleCreated":true,
 "checks":{"identity":true,"marker":true,"statementTimeout":true,"migrationTableDenied":true}}`. Environment `mv-live-admin` holds the
 two secrets (entered by the owner).
+
+## Cancellation policy (owner, approved 2026-11-20)
+
+- Cancel by email to info@micasadirect.com (the owner sets up this inbox before launch).
+- 90 days or more before arrival: refund of the amount paid including taxes, less a fee of US$250 + 16% IVA (US$290).
+- 89 days or fewer: no refund; the amount paid less the same fee is a credit toward a stay at the same property that begins within one
+  year of the original arrival date; not usable at another property.
+The wording lives in `lib/checkout/booking-confirmation-copy.js` (`bcc-v2`). The production checkout page (P4) must show the same text.
 

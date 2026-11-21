@@ -166,7 +166,7 @@ test("P1 one atomic apply over schema-24 data: notice E7_2526_APPLIED, status 26
       assert.deepEqual(await notificationCatalog(appc, N), NOTIFICATION_CATALOG_PIN_26, "the notification runner's own CATALOG_SQL, as the runtime app role, admits this database");
     }
   } finally { await appc.end(); }
-  const st = await migrationStatus(db.c, { env: "test" }); assert.deepEqual([st.applied.length, st.pending], [26, [27, 28, 29, 30]]);   // P1: + 0029 (mechanical)   // C119 S4: + 0028 (mechanical)   // C118 draft: mechanical pin, only the later 0027 is pending
+  const st = await migrationStatus(db.c, { env: "test" }); assert.deepEqual([st.applied.length, st.pending], [26, [27, 28, 29, 30, 31]]);   // P1: + 0029 (mechanical)   // C119 S4: + 0028 (mechanical)   // C118 draft: mechanical pin, only the later 0027 is pending
   const r2 = await runWrapper(db.c); assert.deepEqual(r2.notices, ["E7_2526_ALREADY_EXACT_NOOP"]); assert.deepEqual(await readback(db.c), post, "second apply wrote nothing");
   const B = await startDbAt(26);
   try { assert.deepEqual(identity(await inventory(B.c)), identity(PINS.post), "migrator-built 26 == the wrapper POST"); assert.deepEqual((await runWrapper(B.c)).notices, ["E7_2526_ALREADY_EXACT_NOOP"]); }

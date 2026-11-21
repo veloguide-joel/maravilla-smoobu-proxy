@@ -59,8 +59,9 @@ test("R1 contract constants: gn-v2 request version over bcc-v1 copy; exact key s
   assert.deepEqual([...REQUEST_KEYS_V2], ["channel", "copyContractVersion", "from", "fromName", "locale", "messageRef", "subject", "template", "templateVersion", "text", "to"]);
   assert.deepEqual([...REQUEST_KEYS_V2].filter((k) => !["copyContractVersion", "locale"].includes(k)), [...gn.REQUEST_KEYS].sort());
   for (const o of [INPUT_KEYS, GUEST_KEYS, SENDER_KEYS, REQUEST_KEYS_V2]) assert.ok(Object.isFrozen(o));
-  assert.deepEqual(Object.keys(mod).sort(), ["CONTENT_HASH_PREFIX", "COPY_CONTRACT_VERSION", "GUEST_KEYS", "INPUT_KEYS", "LOCALES", "MESSAGE_REF_PREFIX", "REQUEST_KEYS_V2",
-    "REQUEST_VERSION", "SENDER_KEYS", "TEMPLATES", "buildBookingConfirmationRequest", "buildLiveBookingConfirmationRequest", "contentHashV2"]);   // P2d: + the LIVE entry point
+  assert.deepEqual(Object.keys(mod).sort(), ["CONTENT_HASH_PREFIX", "COPY_CONTRACTS", "COPY_CONTRACT_VERSION", "GUEST_KEYS", "INPUT_KEYS", "LOCALES", "MESSAGE_REF_PREFIX", "REQUEST_KEYS_V2",
+    "REQUEST_VERSION", "SENDER_KEYS", "TEMPLATES", "buildBookingConfirmationRequest", "buildBookingConfirmationRequestBcc2", "buildLiveBookingConfirmationRequest",
+    "buildLiveBookingConfirmationRequestBcc2", "contentHashV2"]);   // P2d: + the LIVE entry point; P2d-3: + the bcc-v2 copy entry points
 });
 
 test("R2 English: exact 11-field request, deep-frozen; independently derived and pinned content hash; recipient hash = unchanged gn-v1 helper", () => {
@@ -313,7 +314,8 @@ test("R18 integration boundary (C41 / C45): ONLY the notification worker imports
   }
   const naming = readdirSync(new URL("../db/migrations/", import.meta.url)).filter((f) => readFileSync(new URL(`../db/migrations/${f}`, import.meta.url), "utf8").includes("gn-v2"));
   assert.deepEqual(naming.sort(), ["0022_gn_v2_booking_confirmation.down.sql", "0022_gn_v2_booking_confirmation.up.sql",
-    "0023_gn_v2_resend_receipts.up.sql"], "only 0022 (gn-v2 render support) and the 0023 up (gn-v2 Resend receipt binding, C45) name gn-v2");
+    "0023_gn_v2_resend_receipts.up.sql", "0031_gn_copy_contract_v2.down.sql", "0031_gn_copy_contract_v2.up.sql"],
+    "only 0022 (gn-v2 render support), the 0023 up (gn-v2 Resend receipt binding, C45) and 0031 (P2d-3: the bcc-v2 copy contract for gn-v2) name gn-v2");
   const fence = readFileSync(new URL("../db/migrations/0016_guest_notification_fence.up.sql", import.meta.url), "utf8");
   assert.ok(fence.includes("CHECK (template_version = 'gn-v1')") && fence.includes("p_template_version IS DISTINCT FROM 'gn-v1'"), "0016 text unchanged: its six-argument claim refuses any other version");
   assert.equal(gn.TEMPLATE_VERSION, "gn-v1");

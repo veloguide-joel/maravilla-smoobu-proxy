@@ -16,7 +16,7 @@ import { captureKey } from "../lib/checkout/intent-state.js";
 import { createPhaseExecutors } from "./e7-connected/executor-adapters.mjs";
 import { createE7HostawaySend, createE7StripeTestSend, createE7StripeLiveSend } from "./e7-connected/http-transports.mjs";
 import { createE7RealExchange } from "./e7-connected/real-exchange.mjs";
-import { runNotificationStep, NOTIFICATION_V2_OPTION_KEY, NOTIFICATION_PROVIDER_OPTION_KEY } from "../lib/booking-db/notification-worker.js";
+import { runNotificationStep, NOTIFICATION_V2_OPTION_KEY, NOTIFICATION_PROVIDER_OPTION_KEY, NOTIFICATION_COPY_OPTION_KEY } from "../lib/booking-db/notification-worker.js";
 import { createResendNotificationExecutor } from "../lib/notify/resend-notification-executor.js";
 import { createResendExchange } from "./e7-resend/resend-exchange.mjs";
 
@@ -144,6 +144,8 @@ export function createWiring(o) {
 // lease, latch, render and receipt. The sender is the verified MiCasaDirect address; the recipient comes only from the database.
 export const CONFIRMATION_SENDER = freeze({ fromAddress: "bookings@mail.micasadirect.com", fromName: "MiCasaDirect" });
 export const CONFIRMATION_LOCALE = "en";
+/** P2d-3: the copy the runner sends (MiCasaDirect, taxes included, cancellation policy). Needs migration 0031. */
+export const CONFIRMATION_COPY_CONTRACT = "bcc-v2";
 const RESEND_KEY_RE = /^re_[A-Za-z0-9_]{8,200}$/;
 
 /**
@@ -165,7 +167,7 @@ export function createConfirmationWiring(o) {
     if (!ex || ex.ok !== true) refuse("EXECUTOR_INVALID");
     return runNotificationStep(pool, { env: { VERCEL_ENV: "preview", MV_E7_NOTIFICATION_WORKER: "enabled" }, workerId: `mvp-${runId}`.slice(0, 60), listingIds: [intentRef.listingId],
       intentId: intentRef.id, sender: { ...CONFIRMATION_SENDER }, clock: Date.now, [NOTIFICATION_V2_OPTION_KEY]: CONFIRMATION_LOCALE,
-      [NOTIFICATION_PROVIDER_OPTION_KEY]: ex.executor, ...live });
+      [NOTIFICATION_PROVIDER_OPTION_KEY]: ex.executor, [NOTIFICATION_COPY_OPTION_KEY]: CONFIRMATION_COPY_CONTRACT, ...live });
   }
   return freeze({ sendConfirmation });
 }

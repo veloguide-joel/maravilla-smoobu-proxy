@@ -540,7 +540,7 @@ test("A10 SQL fences: old six-argument claim refuses gn-v2; v2 claim refuses bad
   const BC = "booking_confirmed";
   for (const [kind, args] of [["v2 + gn1 prefix", ["gn-v2", "gn1-", BC, "en", "bcc-v1"]], ["v1 + gn2 prefix", ["gn-v1", "gn2-", BC, null, null]],
     ["v2 + failure template", ["gn-v2", "gn2-", "not_completed_not_charged", "en", "bcc-v1"]], ["v2 + unknown locale", ["gn-v2", "gn2-", BC, "fr", "bcc-v1"]],
-    ["v2 + no locale", ["gn-v2", "gn2-", BC, null, "bcc-v1"]], ["v2 + other copy", ["gn-v2", "gn2-", BC, "es", "bcc-v2"]], ["v2 + no copy", ["gn-v2", "gn2-", BC, "es", null]],
+    ["v2 + no locale", ["gn-v2", "gn2-", BC, null, "bcc-v1"]], ["v2 + other copy", ["gn-v2", "gn2-", BC, "es", "bcc-v3"]], ["v2 + no copy", ["gn-v2", "gn2-", BC, "es", null]],
     ["v1 + locale", ["gn-v1", "gn1-", BC, "en", null]], ["v1 + copy", ["gn-v1", "gn1-", BC, null, "bcc-v1"]], ["unknown version", ["gn-v3", "gn2-", BC, "en", "bcc-v1"]]]) {
     const e = await pgErr(() => owner(...args));
     assert.deepEqual([e.code, e.constraint], ["23514", "notification_renders_version_binding"], kind);

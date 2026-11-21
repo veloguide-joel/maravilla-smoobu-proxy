@@ -190,7 +190,7 @@ test("P1 one atomic apply over schema-26 data: E7_27_APPLIED, status 27 + ONE ex
       assert.notEqual(nc.catalog, N.CONSTANTS.catalogPin26.catalog, "→ that runner's catalogPin26 check REFUSES schema 27 (fail-closed; no repin here)");
     }
   } finally { await appc.end(); }
-  const st = await migrationStatus(db.c, { env: "test" }); assert.deepEqual([st.applied.length, st.pending], [27, [28, 29, 30]]);   // P1: + 0029 (mechanical)   // C119 S4: mechanical pin, only the later 0028 is pending
+  const st = await migrationStatus(db.c, { env: "test" }); assert.deepEqual([st.applied.length, st.pending], [27, [28, 29, 30, 31]]);   // P1: + 0029 (mechanical)   // C119 S4: mechanical pin, only the later 0028 is pending
   const r2 = await runWrapper(db.c); assert.deepEqual(r2.notices, ["E7_27_ALREADY_EXACT_NOOP"]); assert.deepEqual(await readback(db.c), post, "second apply wrote nothing");
   const B = await startDbAt(27);
   try { assert.deepEqual(identity(await inventory(B.c)), identity(PINS.post), "migrator-built 27 == the wrapper POST"); assert.deepEqual((await runWrapper(B.c)).notices, ["E7_27_ALREADY_EXACT_NOOP"]); }

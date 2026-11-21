@@ -43,7 +43,8 @@ test("B1 contract constants: independent version bcc-v1, brand, explicit locales
   assert.deepEqual([...FACT_KEYS], ["checkIn", "checkOut", "currency", "guests", "nights", "ref", "totalMinor"]);
   assert.deepEqual([...COPY_KEYS], ["contractVersion", "locale", "subject", "template", "text"]);
   for (const o of [LOCALES, TEMPLATES, INPUT_KEYS, FACT_KEYS, COPY_KEYS, LIMITS]) assert.ok(Object.isFrozen(o));
-  assert.deepEqual(Object.keys(mod).sort(), ["BRAND", "COPY_CONTRACT_VERSION", "COPY_KEYS", "FACT_KEYS", "INPUT_KEYS", "LIMITS", "LOCALES", "TEMPLATES", "calendarDayMs", "renderBookingConfirmation"]);
+  assert.deepEqual(Object.keys(mod).sort(), ["BRAND", "BRAND_V2", "CANCELLATION_CONTACT", "COPY_CONTRACT_VERSION", "COPY_CONTRACT_VERSION_V2", "COPY_KEYS", "FACT_KEYS", "INPUT_KEYS", "LIMITS", "LOCALES", "TEMPLATES", "calendarDayMs",
+    "renderBookingConfirmation", "renderBookingConfirmationV2"]);   // P2d-3: + the bcc-v2 copy
 });
 
 test("B2 English: exact subject and plain-text body for synthetic facts; frozen; only the five copy keys", () => {
@@ -277,7 +278,8 @@ test("B14 module source: single pure import (formatUsd from guest-notification.j
   const src = readFileSync(new URL("../lib/checkout/booking-confirmation-copy.js", import.meta.url), "utf8");
   const imports = [...src.matchAll(/^import\s.*?from\s+"([^"]+)";?$/gm)].map((m) => m[1]);
   assert.deepEqual(imports, ["./guest-notification.js"]);
-  const code = src.replace(/^\s*\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+  // P2d-3: the bcc-v2 policy line names how to cancel ("To cancel, email <the one contact constant>"); that one phrase is the only allowed use of the word
+  const code = src.replace(/^\s*\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "").replace("To cancel, email ${CANCELLATION_CONTACT}", "");
   assert.ok(!/node:|require\(|process\.|Date\.now|new Date\(\)|fetch|https?\.|pg|sql|SELECT|INSERT|sendMessage|fromAddress|to:|email|firstName|setTimeout/i.test(code), "no I/O / clock / env / contact surface in code");
   assert.ok(/Reflect\.ownKeys/.test(code) && /getOwnPropertyDescriptor/.test(code) && !/Object\.keys\((input|facts|obj)\)/.test(code), "descriptor-based exact-shape extraction");
 });
