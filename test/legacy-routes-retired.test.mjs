@@ -65,6 +65,7 @@ const EXPECTED_API_FILES = Object.freeze([
   "api/booking/calendar.js",
   "api/booking/listings.js",
   "api/booking/quote.js",
+  "api/checkout/config.js",
   "api/checkout/intent-step.js",
   "api/checkout/intents.js",
   "api/checkout/stripe-webhook.js",
