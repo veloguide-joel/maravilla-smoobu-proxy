@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<title>MiCasaDirect — Secure checkout</title>
+<link rel="stylesheet" href="checkout.css">
+<script type="module" src="checkout.js"></script>
+</head>
+<body>
+<header class="brand"><span class="brand-name">MiCasaDirect</span><span class="brand-note">Secure checkout</span></header>
+<p id="mv-test-banner" class="banner" role="note" hidden><strong>Test environment.</strong> No real booking is made and no real card is charged.</p>
+<main id="mv-app">
+  <h1 id="mv-title" tabindex="-1">One moment…</h1>
+  <p id="mv-text"></p>
+  <p id="mv-stay" class="stay" hidden></p>
+  <p id="mv-notice" class="notice" hidden></p>
+  <p id="mv-diag" class="diag" hidden></p>
+  <p id="mv-announce" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
+  <ul id="mv-price" class="price"></ul>
+
+  <form id="mv-create" hidden>
+    <button type="submit" id="mv-create-submit">See the total price</button>
+  </form>
+
+  <section id="mv-policy" class="policy" aria-labelledby="mv-policy-title" hidden>
+    <h2 id="mv-policy-title">Cancellation policy</h2>
+    <ul id="mv-policy-list"></ul>
+  </section>
+
+  <form id="mv-details" hidden>
+    <label>First name <input name="firstName" autocomplete="given-name" required></label>
+    <label>Last name <input name="lastName" autocomplete="family-name" required></label>
+    <label>Email <input type="email" name="email" autocomplete="email" required></label>
+    <label>Phone (optional) <input type="tel" name="phone" autocomplete="tel"></label>
+    <label class="check"><input type="checkbox" id="mv-terms"> <span id="mv-terms-label"></span></label>
+    <button type="submit" id="mv-details-submit">Continue</button>
+  </form>
+
+  <div id="mv-pay" hidden>
+    <button type="button" id="mv-pay-btn">Continue to secure payment</button>
+    <p class="muted">Payment is taken by card on Stripe's secure page. We never see your card number.</p>
+  </div>
+
+  <div id="mv-ack-create" hidden>
+    <button type="button" id="mv-ack-create-btn">Start a new booking request</button>
+  </div>
+  <p><button type="button" id="mv-retry-btn" class="secondary" hidden></button></p>
+
+  <p id="mv-polling" class="muted"></p>
+  <p class="actions"><button type="button" id="mv-refresh" hidden>Refresh status</button></p>
+
+  <section id="mv-reset" class="reset-zone" aria-label="Clear this page" hidden>
+    <p id="mv-reset-warn" class="muted"></p>
+    <button type="button" id="mv-restart" class="secondary" aria-describedby="mv-reset-warn">Leave this booking on this device…</button>
+  </section>
+</main>
+</body>
+</html>

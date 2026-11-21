@@ -30,7 +30,9 @@ gets its own database (marker `live`), its own GitHub environment and arm variab
 | P2d-2 | Confirmation step in `mv-pipeline` (confirmed bookings with one queued, never-attempted `guest.notify`; at most 3 per run; one worker invocation each) and `createConfirmationWiring` (accepted Resend executor / exchange, sender bookings@mail.micasadirect.com). Optional `MV_PIPELINE_RESEND_KEY` | merged (#247) |
 | P2d-3 | Confirmation copy contract `bcc-v2` (MiCasaDirect, "taxes included", cancellation policy, contact info@micasadirect.com; en + es), migration 0031 (`claim_guest_notification_v3`, render CHECK admits `bcc-v1` / `bcc-v2`), worker option `copyContract`, runner sends `bcc-v2` | merged (#255); 0031 applied to both databases |
 | P3 | Production database (schema at marker `live`, backups), production Vercel env, GitHub environment `mv-live` + secrets | P3-1 database done (#253); P3-2 todo |
-| P4 | Production checkout page (today only `public/checkout-test.html`), guest-site "Book now", micasadirect.com DNS to Vercel | todo |
+| P4-1 | Guest checkout page `public/checkout.html` + `checkout.js` + `checkout.css` (stay from the link `?listing=&from=&to=&guests=[&name=]`, guest wording, Taxes line, the cancellation policy before payment, identical to the email; logic imported from `checkout-test.js`) and `GET /api/checkout/config` (`mode`, `termsVersion`; same gate as the checkout API) | this PR |
+| P4-2 | Guest site (`maravilla-booking-ui`, branch `DEV`): "Book now" in the booking panel linking to the checkout page | todo |
+| P4-3 | Go-live plan: production branch, production settings, public catalog in production (today only the two pilots), domains, schedule | todo |
 | P5 | TEST proof of the new runner with taxes on ($169.40), retire the old armed chain, then one owner-approved live booking | TEST proof done 2026-11-21 (below); live booking todo |
 
 ## P2c design: the unattended chain for production

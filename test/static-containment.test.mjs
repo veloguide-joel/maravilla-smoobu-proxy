@@ -14,7 +14,7 @@ test("vercel.json serves static files only from public/", () => {
 });
 
 test("public/ holds exactly the robots.txt that disallows crawling and the three TEST checkout page assets", () => {
-  assert.deepEqual(readdirSync(join(ROOT, "public")).sort(), ["checkout-test.css", "checkout-test.html", "checkout-test.js", "robots.txt"]);
+  assert.deepEqual(readdirSync(join(ROOT, "public")).sort(), ["checkout-test.css", "checkout-test.html", "checkout-test.js", "checkout.css", "checkout.html", "checkout.js", "robots.txt"]   /* P4-1: + the guest checkout page */);
   assert.match(readFileSync(join(ROOT, "public", "robots.txt"), "utf8"), /^User-agent: \*\nDisallow: \/\n$/);
 });
 

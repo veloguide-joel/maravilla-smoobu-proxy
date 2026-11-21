@@ -14,6 +14,7 @@ const MOVED = ["codec", "config", "operations", "pool", "repo", "webhooks"];
 const BOOKING_DB_FILES = [...MOVED, "intent-access", "recovery", "reservation-worker", "capture-worker", "compensation-worker", "recording-worker", "recording-inbox", "notification-worker", "test-abort", "test-cleanup", "cleanup-worker", "test-cleanup-recorded", "mirror-worker", "mirror-transport", "test-pipeline-coordinator", "pipeline-kickoff", "pipeline-dispatch-transport"].sort(); // + C109 CLOSED, UNWIRED GitHub workflow_dispatch transport (not imported anywhere; fake-HTTP tests only); + C107 CLOSED pipeline kickoff consumer (fake-dispatch only; not route-reachable); + C83 TEST-only pipeline coordinator over the accepted workers (not route-reachable); + E7 recorded cleanup MIRROR worker + isolated transport (not route-reachable); + 0021 recorded TEST cleanup request (not route-reachable); + E6 bearer-token lookup and shared rate limits; + E7.1 recovery; + E7.2/E7.3b/E7.4a/E7.4b/E7 guest-notification offline workers; + E7 TEST abort/cleanup transactions + the TEST cleanup worker (not route-reachable)
 const WEBHOOK = "api/checkout/stripe-webhook.js";
 const INTENT_ROUTES = ["api/checkout/intents.js", "api/checkout/intent-step.js"];
+const CONFIG_ROUTE = "api/checkout/config.js";   // P4-1: GET { mode, termsVersion }; shares the intent API gate, adds nothing else
 // E6 intent API closure (identical for both routes apart from the entry file); everything after the HTTP layer is lazy.
 const INTENT_CLOSURE_STATIC = ["lib/checkout/intent-api-http.js", "lib/checkout/stripe-test-mode.js", "lib/checkout/stripe-webhook-http.js"];
 const INTENT_CLOSURE_DYNAMIC = ["lib/bookability.js", "lib/booking-db/codec.js", "lib/booking-db/config.js", "lib/booking-db/intent-access.js",
@@ -72,6 +73,16 @@ test("E6 intent routes: exact closure (static HTTP layer; DB, core, pricer, Host
   }
 });
 
+test("P4-1 config route: its closure is the intent route's closure plus its own two files; nothing new is reachable", () => {
+  const c = importClosure(ROOT, CONFIG_ROUTE); const base = importClosure(ROOT, INTENT_ROUTES[0]);
+  const own = [CONFIG_ROUTE, "lib/checkout/checkout-config-http.js"];
+  for (const f of own) assert.equal(c.files.get(f), "static", f);
+  for (const f of c.files.keys()) if (!own.includes(f)) assert.ok(base.files.has(f), `${f} is not in the intent route closure`);
+  for (const pkg of c.packages) assert.ok(base.packages.has(pkg), pkg);
+  assert.deepEqual(c.nonLiteralDynamic, []);
+  for (const f of c.files.keys()) for (const re of EXCLUDED) assert.doesNotMatch(f, re, f);
+});
+
 test("no runtime module in the closure reads files or migrations", () => {
   for (const f of WEBHOOK_CLOSURE) {
     const src = readFileSync(join(ROOT, f), "utf8");
@@ -81,7 +92,7 @@ test("no runtime module in the closure reads files or migrations", () => {
 });
 
 test("every other api/ file keeps its exact base closure: no DB, payment or Stripe reachability gained", () => {
-  const apiFiles = walk("api").filter((f) => f.endsWith(".js") && f !== WEBHOOK && !INTENT_ROUTES.includes(f)).sort();
+  const apiFiles = walk("api").filter((f) => f.endsWith(".js") && f !== WEBHOOK && !INTENT_ROUTES.includes(f) && f !== CONFIG_ROUTE).sort();
   assert.deepEqual(apiFiles, Object.keys(OTHER_API).sort(), "api/ file set");
   for (const f of apiFiles) {
     const c = importClosure(ROOT, f);
@@ -124,7 +135,7 @@ test("only the E5a/E6 checkout modules import the booking DB layer; nothing in l
 test(".vercelignore and public/ containment are unchanged", () => {
   assert.equal(readFileSync(join(ROOT, ".vercelignore"), "utf8"),
     "# C8: never upload internal-only trees to Vercel (defence in depth; outputDirectory \"public\" already keeps\n# everything else out of static serving). NEVER list api/ or lib/: API functions bundle their lib/ imports.\n/db\n/test\n/scripts\n");
-  assert.deepEqual(readdirSync(join(ROOT, "public")).sort(), ["checkout-test.css", "checkout-test.html", "checkout-test.js", "robots.txt"]);   // exact allowlist (E7 TEST page)
+  assert.deepEqual(readdirSync(join(ROOT, "public")).sort(), ["checkout-test.css", "checkout-test.html", "checkout-test.js", "checkout.css", "checkout.html", "checkout.js", "robots.txt"]);   // exact allowlist (E7 TEST page)
   assert.deepEqual(JSON.parse(readFileSync(join(ROOT, "vercel.json"), "utf8")), { outputDirectory: "public" });
 });
 
