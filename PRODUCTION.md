@@ -256,3 +256,15 @@ permission is added to the key. Checked with a Stripe test delivery before activ
 **Going back at any time:** remove `MV_CHECKOUT_LIVE_ACTIVATION` (checkout refuses at once) and disable the schedule. Paid bookings
 already in the pipeline can still be finished by manual runs.
 
+**Runbook step 3, done 2026-11-21 02:1xZ (owner approved the approach 2026-11-20):**
+- Branch `production` created at e7-test 18737728; Vercel Production Branch of `maravilla-smoobu-proxy` set to `production` (was `main`).
+- Production had no variables. Added (plain, Production only): `STRIPE_LIVE_ACCOUNT_ID`, `MV_CHECKOUT_ALLOWED_ORIGIN`,
+  `MV_CHECKOUT_RETURN_URL`, `MV_CHECKOUT_LIVE_LISTINGS` (28 ids), `MV_CHECKOUT_TERMS_VERSION` = `terms-2026-12`,
+  `MV_CHECKOUT_TAX_POLICY`, `MV_PUBLIC_CATALOG` = `launch`, `BOOKING_UI_ORIGINS`, `BOOKING_DATABASE_CA_PEM` (copied from the preview
+  variable; sha256 equals the official CA 7007...f3b7, checked in the page before posting).
+- `HOSTAWAY_ACCOUNT_ID` and `HOSTAWAY_CLIENT_SECRET`: the existing variables were extended to Production (values not shown or read).
+- No TEST-named variable exists on Production. `MV_CHECKOUT_LIVE_ACTIVATION` is NOT set. No secret was entered.
+- Domain `book.micasadirect.com` added to the Vercel project. DNS record still to add at Squarespace (needs the owner's passkey):
+  CNAME `book` -> `7e85b09589a25110.vercel-dns-017.com`.
+- Note: `micasadirect.com` already has Google Workspace MX records, so `info@micasadirect.com` can be a Google Workspace address.
+
