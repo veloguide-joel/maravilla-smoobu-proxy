@@ -693,6 +693,11 @@ test("P2d-2a TEST: after the pipeline confirms a booking, the SAME run sends ONE
   const sent = JSON.parse(Buffer.from(fx.reqs[0].body).toString("utf8"));
   assert.equal(String(sent.from).includes(CONFIRMATION_SENDER.fromAddress), true);
   assert.ok(JSON.stringify(recipientOf(fx.reqs[0])).includes("delivered@resend.dev"));
+  // P2d-3: the runner sends the bcc-v2 copy (MiCasaDirect, taxes included, cancellation policy) and the render row records that contract
+  assert.match(sent.subject, /^Your MiCasaDirect booking MV-[A-Z0-9]+ is confirmed$/);
+  for (const part of ["(taxes included)", "Cancellation policy", "To cancel, email info@micasadirect.com with your booking reference.", "US$290 in total", "within one year of your original arrival date"]) assert.ok(sent.text.includes(part), part);
+  assert.equal(sent.text.includes("maraVilla"), false);
+  assert.deepEqual(await one("SELECT template_version, copy_contract_version, locale FROM booking.notification_renders WHERE intent_id = $1", [b1.id]), { template_version: "gn-v2", copy_contract_version: "bcc-v2", locale: "en" });
   assert.equal(JSON.stringify(r).includes("delivered@resend.dev"), false, "the result carries no recipient");
   assert.equal((await notifyOf(b1.id)).state, "succeeded");
   const again = await runPipelineOnce(db.app, cfg, deps);
@@ -721,3 +726,20 @@ test("P2d-2b LIVE-marked database: the confirmation goes to the guest's real-loo
   } finally { await db.owner.query("UPDATE booking.instance SET environment = 'test'"); }
   assert.equal((await db.owner.query("SELECT environment FROM booking.instance")).rows.map((x) => x.environment).join(), "test", "marker restored");
 });
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// P2d-3: migration 0031 -- the copy contract a gn-v2 render may name
+test("P2d-3 SQL: the v3 claim refuses an unknown copy contract before anything else; the render CHECK admits bcc-v1 / bcc-v2 only; v2 claim text is unchanged", async () => {
+  const op = "00000000-0000-4000-8000-000000000031"; const h = "a".repeat(64);
+  await assert.rejects(db.app.query("SELECT booking.claim_guest_notification_v3($1, 'mv-t', 'en', $2, $2, NULL, 'bcc-v3')", [op, h]), /MV_GN_COPY_CONTRACT_INVALID/);
+  await assert.rejects(db.app.query("SELECT booking.claim_guest_notification_v3($1, 'mv-t', 'en', $2, $2, NULL, NULL)", [op, h]), /MV_GN_COPY_CONTRACT_INVALID/);
+  const def = (await db.owner.query("SELECT pg_get_constraintdef(oid) AS d FROM pg_constraint WHERE conname = 'notification_renders_version_binding'")).rows[0].d;
+  assert.ok(def.includes("bcc-v1") && def.includes("bcc-v2") && !def.includes("bcc-v3"));
+  const src = async (sig) => (await db.owner.query("SELECT prosrc FROM pg_proc WHERE oid = $1::regprocedure", [sig])).rows[0].prosrc;
+  const v2 = await src("booking.claim_guest_notification_v2(uuid,text,text,text,text,text)"); const v3 = await src("booking.claim_guest_notification_v3(uuid,text,text,text,text,text,text)");
+  assert.ok(v2.includes("p_locale, 'bcc-v1');"), "v2 still stores the literal bcc-v1");
+  const expected = v2.replace("  PERFORM booking.gn_check_worker(p_worker);\n", "  PERFORM booking.gn_check_worker(p_worker);\n  IF p_copy_contract IS NULL OR p_copy_contract NOT IN ('bcc-v1', 'bcc-v2') THEN RAISE EXCEPTION 'MV_GN_COPY_CONTRACT_INVALID' USING ERRCODE = '22023'; END IF;\n")
+    .replace("p_locale, 'bcc-v1');", "p_locale, p_copy_contract);");
+  assert.equal(v3, expected, "v3 = v2 with exactly the guard and the stored contract");
+});
+

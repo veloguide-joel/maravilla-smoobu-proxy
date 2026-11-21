@@ -52,10 +52,10 @@ test("S4 0030 replaces the function in place (same oid, owner, ACL, security, se
   const own = await db.owner.connect();
   let a29;
   try {
-    assert.deepEqual(await migrateDown(own, { env: "test", to: 29 }), [30]);
+    assert.deepEqual(await migrateDown(own, { env: "test", to: 29 }), [31, 30]);
     a29 = await attrs();
     assert.equal(await sql(db.owner, SINK_RECIPIENT), true);
-    assert.deepEqual(await migrateUp(own, { env: "test" }), [30]);
+    assert.deepEqual(await migrateUp(own, { env: "test" }), [30, 31]);
   } finally { own.release(); }
   const again = await attrs();
   assert.deepEqual([a29.vol, a29.oid, a29.owner, a29.acl, a29.cfg, a29.secdef], ["i", a30.oid, a30.owner, a30.acl, a30.cfg, false]);
