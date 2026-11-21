@@ -32,7 +32,9 @@ gets its own database (marker `live`), its own GitHub environment and arm variab
 | P3 | Production database (schema at marker `live`, backups), production Vercel env, GitHub environment `mv-live` + secrets | P3-1 database done (#253); P3-2 todo |
 | P4-1 | Guest checkout page `public/checkout.html` + `checkout.js` + `checkout.css` (stay from the link `?listing=&from=&to=&guests=[&name=]`, guest wording, Taxes line, the cancellation policy before payment, identical to the email; logic imported from `checkout-test.js`) and `GET /api/checkout/config` (`mode`, `termsVersion`; same gate as the checkout API) | merged (#258); "Book this new stay" for a returning guest (this PR) |
 | P4-2 | Guest site (`maravilla-booking-ui`): "Book now" in the booking panel for a server-confirmed stay, linking to the checkout page; only on hosts in `CHECKOUT_ENVIRONMENTS` (today the `mcd-catalog` preview alias) | merged to `mcd-catalog` and `DEV` (booking-ui #7, #8, #9) |
-| P4-3 | Go-live plan: production branch, production settings, public catalog in production (today only the two pilots), domains, schedule | todo |
+| P4-3 | Go-live plan (section "Go-live runbook") | this PR |
+| P4-4 | Public catalog mode for production: the 28 USD listings, never the two MXN pilots or 606998 | todo |
+| P4-5 | Guest site: MiCasaDirect branding, money format, production hosts in the API / checkout maps; proxy CORS allowlist for the production guest origin | todo |
 | P5 | TEST proof of the new runner with taxes on ($169.40), retire the old armed chain, then one owner-approved live booking | TEST proof done 2026-11-21 (below); live booking todo |
 
 ## P2c design: the unattended chain for production
@@ -194,4 +196,63 @@ authorized 16940. `mv-pipeline` (main cc210027+, ref f3373f46, mode test), manua
 Readback: state `confirmed`, Hostaway reservation 72081660, captured 16940, offline charge recorded, every operation `succeeded`
 with attempts 1 (one create, one capture, one record, one `guest.notify`), render `gn-v2` / `bcc-v2` / `en`.
 Consequence for scheduling: a booking needs two runs a few minutes apart, so a 5-minute schedule confirms within about 10 minutes.
+
+## Go-live runbook (P4-3, written 2026-11-21 from the code; target: soft launch Wed 2026-12-02)
+
+**Shape of production**
+- Guest site = repo `maravilla-booking-ui` (Vercel project `maravilla-booking-ui`); production branch `main`, which today holds only
+  retired pages. `DEV` (search, property pages, Book now) is promoted to `main` at launch. Domain: `micasadirect.com` + `www`.
+- Booking system = this repo (Vercel project `maravilla-smoobu-proxy`). `main` has only `api/health.js` and the dispatch workflows, so
+  production serves nothing today. Proposal: a branch **`production`**, created from a tested `e7-test` commit and set as the Vercel
+  Production Branch; releases are fast-forwards of `production`. `main` stays the home of the workflows (they run a given commit).
+  Domain: `book.micasadirect.com` (checkout page + APIs; the checkout API accepts only its own origin).
+- LIVE needs `VERCEL_ENV=production`, the full contract below and, last, `MV_CHECKOUT_LIVE_ACTIVATION=live-payments-approved`.
+
+**Production settings, Vercel project `maravilla-smoobu-proxy`, target Production** (`validateLiveContract`, `intentApiGate`)
+| Name | Value | Who |
+|---|---|---|
+| `STRIPE_LIVE_SECRET_KEY` | the restricted key `rk_live_...` ("MiCasaDirect booking") | owner pastes |
+| `STRIPE_LIVE_WEBHOOK_SECRET` | `whsec_...` of the live webhook endpoint | owner pastes |
+| `STRIPE_LIVE_ACCOUNT_ID` | `acct_1TyHE42B9LTneQgw` | Claude |
+| `BOOKING_DATABASE_URL` | `postgresql://mv_booking_app_live.ewfkrzuwdkbkjeeztzsv:<app password>@aws-0-us-east-2.pooler.supabase.com:6543/postgres` | owner pastes (Claude gives the line with one placeholder) |
+| `BOOKING_DATABASE_CA_PEM` | the public Supabase CA certificate (sha256 7007...f3b7) | Claude |
+| `MV_CHECKOUT_ALLOWED_ORIGIN` / `MV_CHECKOUT_RETURN_URL` | `https://book.micasadirect.com` / `https://book.micasadirect.com/checkout.html` | Claude |
+| `MV_CHECKOUT_LIVE_LISTINGS` | the 28 ids as `id:USD` (628346; 628372-628380; 628382-628386; 628388-628400), max 60 | Claude |
+| `MV_CHECKOUT_TERMS_VERSION` | `terms-2026-12` (must not contain "test") | Claude |
+| `MV_CHECKOUT_TAX_POLICY` | `mx-iva16-ish5-v1` | Claude |
+| `MV_RATE_LIMIT_SALT` | 32+ random characters | owner pastes (password manager) |
+| `HOSTAWAY_ACCOUNT_ID`, `HOSTAWAY_CLIENT_SECRET` | exist for Preview only; extend the existing variables to Production if Vercel allows it without showing the value, else owner pastes | Claude / owner |
+| `MV_PUBLIC_CATALOG`, `BOOKING_UI_ORIGINS` | production catalog mode (P4-4); `https://micasadirect.com,https://www.micasadirect.com` | Claude |
+| `MV_CHECKOUT_LIVE_ACTIVATION` | `live-payments-approved`; **added last, on the owner's word** | Claude |
+No TEST name may exist on Production (`MV_CHECKOUT_TEST_*`, `MV_STRIPE_TEST_WEBHOOK`, `STRIPE_TEST_*`): the contract refuses mixed settings.
+
+**GitHub environment `mv-live`** (runner): has `MV_LIVE_STRIPE_KEY`. Still needed: `MV_LIVE_BOOKING_DATABASE_URL` (same line as above),
+`MV_LIVE_HOSTAWAY_TOKEN` (Hostaway has one account for test and real listings; the owner pastes the access token he already created
+for the test runner, or creates a new one in Hostaway), `MV_LIVE_RESEND_KEY` (owner pastes a sending key). Variables (Claude):
+`MV_LIVE_PIPELINE_LISTINGS` (as above), `_NOT_BEFORE` (activation instant), `_STRIPE_ACCOUNT`, `_REF_FIELD_ID` 105433 (confirm it is
+the same custom field for real listings), `_TIME_ZONE` America/Mexico_City, `_ACCOUNT_REF`. A `schedule` (every 5 minutes, live mode)
+is added to `mv-pipeline.yml` on `main` at activation; a booking needs two runs, so about 10 minutes from payment to confirmation.
+
+**Stripe (live)**: webhook endpoint `https://book.micasadirect.com/api/checkout/stripe-webhook`, events `checkout.session.completed`,
+`checkout.session.expired`, `payment_intent.payment_failed`, `checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed`.
+Open check: the webhook reads `GET /v1/account` with the restricted key (`verifyAccount`); if Stripe refuses it, one more read
+permission is added to the key. Checked with a Stripe test delivery before activation.
+
+**Runbook**
+| # | Step | Who | When |
+|---|---|---|---|
+| 1 | P4-4 production catalog mode; P4-5 guest-site branding, money format, production hosts | Claude | Sat 21 - Sun 22 Nov |
+| 2 | Owner approves this approach (branch `production`, `book.micasadirect.com`) | Joel | by Mon 23 Nov |
+| 3 | Create `production` from tested `e7-test`; set it as Vercel Production Branch; add the non-secret settings; domain `book.micasadirect.com` (one DNS record at Squarespace) | Claude | Mon 23 Nov |
+| 4 | One sitting of pastes (about 20 minutes): Stripe key, database line and salt into Vercel; database line, Hostaway token and email key into GitHub; create the Stripe webhook and paste its secret | Joel, forms opened by Claude | Mon 23 - Tue 24 Nov |
+| 5 | Production checks with activation OFF: catalog shows the 28 listings, quotes, checkout page answers "not available", webhook test delivery, runner `status` run in live mode refuses nothing unexpected | Claude | Tue 24 Nov |
+| 6 | **Availability gate:** Hostaway must hold every existing reservation (Tokeet import / Airbnb connection) before any real guest can book; otherwise the site could sell taken nights | Joel (and Jillian) | before step 8 |
+| 7 | Inbox `info@micasadirect.com` exists and is read | Joel | before step 8 |
+| 8 | Activation on the owner's word; schedule on; **one real booking by the owner** (cheapest available night), verified end to end, then cancelled and refunded by hand | Joel + Claude | Wed 25 - Fri 27 Nov |
+| 9 | Fixes from step 8; guest site `DEV` -> `main`; `micasadirect.com` DNS to the guest site | Claude, DNS on the owner's word | Mon 30 Nov - Tue 1 Dec |
+| 10 | Soft launch | - | Wed 2 Dec |
+| 11 | After launch: 50% deposit / balance 60 days before arrival; retire the old test runners on `main`; remove the duplicate Vercel projects | Claude | December |
+
+**Going back at any time:** remove `MV_CHECKOUT_LIVE_ACTIVATION` (checkout refuses at once) and disable the schedule. Paid bookings
+already in the pipeline can still be finished by manual runs.
 
