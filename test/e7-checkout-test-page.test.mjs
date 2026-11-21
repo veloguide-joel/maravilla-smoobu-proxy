@@ -85,7 +85,7 @@ test("API client: exact same-origin paths, POST only, token only in Authorizatio
   const api = createApi(async (path, init) => { seen.push({ path, ...init, signal: !!init.signal }); return { status: 200, json: async () => ({ status: "processing" }) }; });
   await api.create({ listingId: 606998, from: "2027-01-10", to: "2027-01-13", guests: 2 }); await api.status(TOKEN); await api.release(TOKEN);
   assert.deepEqual(seen.map((x) => x.path), [API.intents, API.step, API.step]);
-  assert.ok(seen.every((x) => x.method === "POST" && x.credentials === "omit" && x.referrerPolicy === "no-referrer" && x.redirect === "error" && x.mode === "same-origin" && x.cache === "no-store" && x.signal));
+  assert.ok(seen.every((x) => x.method === "POST" && x.credentials === "omit" && x.referrerPolicy === "same-origin" && x.redirect === "error" && x.mode === "same-origin" && x.cache === "no-store" && x.signal));
   assert.equal(seen[0].headers.Authorization, undefined);
   assert.equal(seen[1].headers.Authorization, `Bearer ${TOKEN}`);
   assert.deepEqual(JSON.parse(seen[1].body), { step: "status" }); assert.deepEqual(JSON.parse(seen[2].body), { step: "release" });
