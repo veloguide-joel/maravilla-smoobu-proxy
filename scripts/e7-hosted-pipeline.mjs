@@ -4,10 +4,9 @@
 // recording). The coordinator drives the three ACCEPTED workers (runOrchestratorStep / runCaptureStep / runRecordingStep) over the ACCEPTED
 // executor adapters + HTTP transports; this file re-implements none of them and edits no existing runner.
 //
-// HONEST LABEL: OPENED (C102 ENABLE, separately reviewed) for ONE gated TEST run. CONSTANTS.executeEnabled is TRUE, so `verify` / `execute` proceed to
-// the exact closure / source / plan / approval / main-ref bindings (closed constants still refuse HPL_EXECUTE_CLOSED right after the key-name / mode
-// checks — BEFORE any input value, tooling import, credential, database or provider access; asserted through the closed-constants test seam). The
-// exact reverse CLOSE patch is in the ENABLE PR body and restores executeEnabled false at END or STOP.
+// HONEST LABEL: SHIPPED CLOSED. CONSTANTS.executeEnabled is FALSE: `verify` and `execute` refuse HPL_EXECUTE_CLOSED right after the key-name /
+// mode checks — BEFORE any input value, tooling import, credential, database or provider access. The execute body exists so it can be reviewed
+// and exercised through test seams on disposable PostgreSQL with FAKE provider exchanges only. Opening it is a separate reviewed change.
 // MANUAL hosted TEST runner (workflow_dispatch; C119 S4: arm + live-main + request-bound, env `e7-test-auto`). NOT automatic checkout, NOT a cron / webhook /
 // API / UI path. ≤ 2 coordinator invocations per dispatch (the second only after the ONE bounded wait of the proven healthy PENDING NOT_DUE
 // branch, C100); no poll or re-dispatch loop; never self-retries an uncertain write.
@@ -79,7 +78,7 @@ const MIGRATED = [628346, 628372, 628373, 628374, 628375, 628376, 628377, 628378
 export const CONSTANTS = deepFreeze({
   toolingCommit: "71c3dcf83c6b78a2cb0c6a7e829b5ecb23d37af5",        // e7-test: merge #129 (C87) on top of #128 (coordinator C83/C86/C88, merge 07011a79); immutable
   toolingStatus: "MERGED",
-  executeEnabled: true,                                               // C102 ENABLE (ONE gated TEST run; reverse CLOSE patch restores false); closed constants refuse HPL_EXECUTE_CLOSED
+  executeEnabled: false,                                              // SHIPPED CLOSED: verify / execute refuse HPL_EXECUTE_CLOSED before any value / import / secret / DB / provider
   // the INDEPENDENTLY scanned transitive relative imports of the twelve tooling roots at 71c3dcf8 (+ package files); bare imports: node:* and pg only
   closure: ["lib/bookability.js", "lib/booking-db/capture-worker.js", "lib/booking-db/codec.js", "lib/booking-db/config.js", "lib/booking-db/operations.js",
     "lib/booking-db/pool.js", "lib/booking-db/recording-worker.js", "lib/booking-db/recovery.js", "lib/booking-db/repo.js", "lib/booking-db/reservation-worker.js",
@@ -1129,7 +1128,7 @@ export async function runPipelineCore(input) {
 }
 
 // =================================================================================================================================
-// hosted wrapper (GitHub Actions): preflight (no secrets) / verify / execute (C102: OPENED; closed constants refuse)
+// hosted wrapper (GitHub Actions): preflight (no secrets) / verify / execute (SHIPPED CLOSED)
 export const CLOSURE_DIGEST_PREFIX = "e7-hosted-pipeline-closure-v1\n";
 export const SOURCE_DIGEST_PREFIX = "e7-hosted-pipeline-v1\n";
 const TEST_FILES = freeze(["test/e7-hosted-pipeline.test.mjs", "test/e7-hosted-pipeline-workflow.test.mjs"]);
@@ -1211,7 +1210,7 @@ export async function runHosted({ mode = "preflight", env, proc, wrapperDir, dep
     r.mode = mode;
     const keys = Object.keys(env);                                         // key NAMES only — no value is read before the next two gates
     if (keys.some((k) => k.startsWith("E7_") && !ALLOWED_E7_KEYS.includes(k))) refuse("HPL_INPUT_UNEXPECTED");
-    if (mode !== "preflight" && c.executeEnabled !== true) refuse("HPL_EXECUTE_CLOSED");   // CLOSED constants refuse HERE — before any value / import / credential / DB / provider
+    if (mode !== "preflight" && c.executeEnabled !== true) refuse("HPL_EXECUTE_CLOSED");   // SHIPPED: refuses HERE — before any value / import / credential / DB / provider
     // C119 S4 (P4): the TEST arm, RECOMPUTED from THIS checkout (the supplied value is a claim, never the authority) — after the key-name / CLOSED
     // gates, BEFORE any input value / tooling import / credential / DB / provider. No manual bypass: verify and execute both require it.
     if (mode !== "preflight") {
