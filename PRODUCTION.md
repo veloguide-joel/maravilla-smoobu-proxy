@@ -290,3 +290,29 @@ any other listing is NOT processed by the runner: no Hostaway reservation is cre
 **Confirmed on a real iPhone (owner, 2026-11-26).** The checkout reaches the API (no `ORIGIN_NOT_ALLOWED`), a TEST payment completes and
 returns from Stripe.
 
+
+## 2026-11-26 (later): safety items from the owner's review of 2026-11-21
+
+**Live runner locked to an approved commit (main PR #270).** In live mode `mv-pipeline` stops before checkout unless it was dispatched from
+`main` and `inputs.ref` equals repo variable `MV_LIVE_APPROVED_REF` (40 hex). The variable is NOT set: every live run refuses. Environment
+`mv-live` now admits the `main` branch only (GitHub setting). The guard has not been fired yet (first live attempt should be a wrong ref).
+
+**Read-only status (PR #271; main PR #272).** `scripts/mv-status.mjs`: one READ ONLY transaction, no lock, no provider call, database URL
+only. `mv-pipeline` input `action: status`. Proven on TEST, run 45871169735: `ATTENTION / PAID_ON_UNLISTED_LISTING`, `unlistedPaid: 2`
+(the owner's two TEST payments of 2026-11-26 on launch listings, which the TEST runner may not process). Expected, left as is.
+
+**Watchdog (main PR #273).** `mv-watchdog.yml`, manual dispatch for now: job `status` (the script above) and job `freshness` (last
+successful `mv-pipeline` run younger than N minutes). Proven on TEST, run 45871746182: both jobs failed as they should (`unlistedPaid 2`;
+`RUNNER_STALE`). A failed job emails the owner through GitHub. To do at activation: add the schedules (runner every 5 minutes, watchdog
+every 15 with `max_runner_age_minutes` 15). Not built: the daily three-way reconciliation (database / Stripe / Hostaway); alerts by
+text message. Both run on GitHub, so a GitHub outage silences runner and watchdog together.
+
+**Operator test page off the production hosts (PR #271).** `vercel.json` redirects `/checkout-test.html` to `/checkout.html` on
+`book.micasadirect.com` and `maravilla-smoobu-proxy.vercel.app`. On e7-test only: the `production` branch has NOT been updated since
+2026-11-21, so production still serves the old page and lacks today's checkout wording. Promotion needs the owner's go.
+
+**Production read-only sweep (2026-11-26, current production deployment).** All 28 launch listings answer the quote API in USD; 26 priced
+in one of two sample weeks, the other two (628376, 628388) priced in a third week (their sample weeks were booked). Pilot listing 404;
+`/api/checkout/config` 404 (activation off). `https://book.micasadirect.com/checkout.html` loads over HTTPS and quotes.
+
+**Guest site.** booking-ui `mcd-catalog` merged to `DEV` (search fix).
