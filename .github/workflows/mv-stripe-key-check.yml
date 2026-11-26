@@ -1,0 +1,34 @@
+# mv-stripe-key-check: READ-ONLY. Asks Stripe which account the live runner key belongs to, two ways, and prints only HTTP status,
+# Stripe's error code/type and whether the returned account id equals the configured one. No key, body or id is printed.
+name: mv-stripe-key-check
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: mv-live
+    steps:
+      - name: Two read-only account reads
+        env:
+          MV_KEY: ${{ secrets.MV_LIVE_STRIPE_KEY }}
+          MV_ACCT: ${{ vars.MV_LIVE_PIPELINE_STRIPE_ACCOUNT }}
+        run: |
+          [[ "$MV_KEY" == rk_live_* ]] || { echo "KEY_KIND_NOT_RESTRICTED_LIVE"; exit 1; }
+          [[ "$MV_ACCT" =~ ^acct_[A-Za-z0-9]{8,40}$ ]] || { echo "ACCOUNT_VAR_INVALID"; exit 1; }
+          probe() {
+            local name="$1" url="$2" out status
+            out=$(mktemp)
+            status=$(curl --silent --show-error --max-time 20 --proto '=https' -o "$out" -w '%{http_code}' -u "$MV_KEY:" "$url" || echo "000")
+            node -e '
+              const fs=require("fs"); let j={}; try{ j=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); }catch{}
+              const safe=(v)=>typeof v==="string"&&/^[a-z0-9_.]{1,60}$/i.test(v)?v:null;
+              console.log(JSON.stringify({ probe:process.argv[2], http:Number(process.argv[3]), object:safe(j.object), idMatches:j.id===process.argv[4],
+                errorType:safe(j.error&&j.error.type), errorCode:safe(j.error&&j.error.code) }));
+            ' "$out" "$name" "$status" "$MV_ACCT"
+            rm -f "$out"
+          }
+          probe own_account "https://api.stripe.com/v1/account"
+          probe account_by_id "https://api.stripe.com/v1/accounts/$MV_ACCT"
