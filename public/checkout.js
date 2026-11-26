@@ -84,6 +84,12 @@ export const GUEST_REFUSALS = Object.freeze({
   "The server refused to start payment (a definite refusal).": `We couldn't open the payment page. Nothing was charged. Please try again in a moment. ${HELP}`,
   "The server refused the release request (a definite refusal).": `We couldn't release this booking request. ${HELP}`
 });
+// P4-7: refusals that trying again cannot fix (the listing or these dates cannot be booked online). The price button is hidden for them.
+export const UNBOOKABLE_CODES = Object.freeze(["LISTING_NOT_AVAILABLE", "LISTING_NOT_CONFIGURED", "NOT_AVAILABLE"]);
+export const UNBOOKABLE_TEXT = "This stay can't be booked online right now. Please go back and choose different dates or another property, or email info@micasadirect.com.";
+export const isUnbookable = (notice) => !!notice && UNBOOKABLE_CODES.includes(notice.code);
+/** The guest's wording for a controller notice ({ text, code }). */
+export const guestNoticeFor = (notice) => (!notice ? "" : isUnbookable(notice) ? UNBOOKABLE_TEXT : guestNotice(notice.text));
 export const guestNotice = (text) => (typeof text !== "string" ? "" : Object.prototype.hasOwnProperty.call(GUEST_REFUSALS, text) ? GUEST_REFUSALS[text] : text.replace(/\bStripe TEST Checkout\b/g, "the payment page").replace(/\bTEST intent\b/g, "booking request").replace(/\bTEST /g, ""));
 
 function formatMoney(minor, currency) {
@@ -126,7 +132,7 @@ export async function startApp(doc, win) {
       $("mv-stay").textContent = stayLine; show("mv-stay", !!stay && (newStay || ["create", "details", "pay", "loading"].includes(v.screen)));
       show("mv-new", newStay);
       const n = $("mv-notice");
-      n.textContent = v.notice ? guestNotice(v.notice.text) : ""; n.dataset.level = v.notice ? v.notice.level : ""; n.hidden = !v.notice;
+      n.textContent = guestNoticeFor(v.notice); n.dataset.level = v.notice ? v.notice.level : ""; n.hidden = !v.notice;
       const codes = [...new Set([v.notice && v.notice.code, v.pollStopped].filter((x) => x != null).map(supportCode))];
       $("mv-diag").textContent = codes.length ? `Support code: ${codes.join(", ")}` : ""; $("mv-diag").hidden = !codes.length;
       const p = $("mv-price"); p.replaceChildren();
@@ -134,7 +140,7 @@ export async function startApp(doc, win) {
         for (const l of v.price.lines) { const li = doc.createElement("li"); li.textContent = `${l.label}: ${formatMoney(l.amountMinor, v.price.currency)}`; p.append(li); }
         const t = doc.createElement("li"); t.className = "total"; t.textContent = `Total: ${formatMoney(v.price.totalMinor, v.price.currency)}`; p.append(t);
       }
-      show("mv-create", v.screen === "create" && !!stay); show("mv-details", v.screen === "details"); show("mv-pay", v.screen === "pay" || (v.retry === "details" && v.canPay));
+      show("mv-create", v.screen === "create" && !!stay && !isUnbookable(v.notice)); show("mv-details", v.screen === "details"); show("mv-pay", v.screen === "pay" || (v.retry === "details" && v.canPay));
       show("mv-policy", ["create", "details", "pay"].includes(v.screen) && !noStay);
       show("mv-ack-create", v.screen === "createUncertain");
       show("mv-reset", !["create", "loading", "redirecting", "createUncertain"].includes(v.screen));
@@ -150,7 +156,7 @@ export async function startApp(doc, win) {
       $("mv-polling").textContent = v.polling ? "Checking automatically…" : v.pollStopped && !(v.notice && v.notice.level !== "info") ? stopLine(v.pollStopped, refreshOffered) : "";
       $("mv-restart").textContent = v.reset === "startNew" ? "Start a new booking…" : "Leave this booking on this device…";
       $("mv-reset-warn").textContent = v.reset === "startNew" ? "This clears this page only." : "This only clears this page. It does not cancel a booking or a payment, and this page will no longer be able to show its status.";
-      const a = announcementFor({ ...v, title: c.title, notice: v.notice ? { ...v.notice, text: guestNotice(v.notice.text) } : null }, announced);
+      const a = announcementFor({ ...v, title: c.title, notice: v.notice ? { ...v.notice, text: guestNoticeFor(v.notice) } : null }, announced);
       if (a) { announced = a.key; if (a.key !== null || $("mv-announce").textContent !== "") $("mv-announce").textContent = a.text; }
       // the guest already chose the stay on the property page: ask the server for the price once, without another click
       if (v.screen === "create" && stay && !autoStarted && !v.busy && ctl) { autoStarted = true; win.setTimeout(() => ctl.create({ from: stay.from, to: stay.to, guests: stay.guests }), 0); }
