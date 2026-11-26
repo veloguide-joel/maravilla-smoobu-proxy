@@ -253,7 +253,7 @@ permission is added to the key. Checked with a Stripe test delivery before activ
 | 10 | Soft launch | - | Wed 2 Dec |
 | 11 | After launch: 50% deposit / balance 60 days before arrival; retire the old test runners on `main`; remove the duplicate Vercel projects | Claude | December |
 
-**Going back at any time:** remove `MV_CHECKOUT_LIVE_ACTIVATION` (checkout refuses at once) and disable the schedule. Paid bookings
+**Going back at any time:** remove `MV_CHECKOUT_LIVE_ACTIVATION` **and redeploy production** (a removed Vercel variable takes effect only in a new deployment; until the redeploy finishes checkout still accepts payments), and disable the schedule. This procedure has not been rehearsed yet. Paid bookings
 already in the pipeline can still be finished by manual runs.
 
 **Runbook step 3, done 2026-11-21 02:1xZ (owner approved the approach 2026-11-20):**
@@ -267,4 +267,26 @@ already in the pipeline can still be finished by manual runs.
 - Domain `book.micasadirect.com` added to the Vercel project. DNS record still to add at Squarespace (needs the owner's passkey):
   CNAME `book` -> `7e85b09589a25110.vercel-dns-017.com`.
 - Note: `micasadirect.com` already has Google Workspace MX records, so `info@micasadirect.com` can be a Google Workspace address.
+
+## 2026-11-26 changes (work resumed after a pause, 2026-11-21 to 2026-11-25)
+
+**DNS for micasadirect.com (Squarespace), added 2026-11-20 and 2026-11-26.** `book` CNAME to Vercel; TXT `@` SPF `v=spf1 include:_spf.google.com ~all`;
+TXT `google._domainkey` (Google Workspace DKIM, 2048-bit); TXT `_dmarc` `v=DMARC1; p=none; rua=mailto:info@micasadirect.com`. The three Resend
+records (`rsend.mail`, `send.mail`, `resend._domainkey.mail`) are untouched. A message from info@micasadirect.com showed SPF pass and DKIM pass
+(header read 2026-11-26) but landed in spam; DMARC was added after that and has not been re-tested.
+
+**Guest site (booking-ui PR #12, `mcd-catalog`).** Search quotes four listings at a time, cards change together, one short count line.
+Owner confirmed it on the preview. Not yet merged to `DEV`.
+
+**Checkout (PRs #265, #266, #267).** Guest wording for refusals; own wording and no price button when a listing or dates cannot be booked
+(`LISTING_NOT_AVAILABLE`, `LISTING_NOT_CONFIGURED`, `NOT_AVAILABLE`); TEST listing ceiling 10 -> 60.
+
+**TEST preview settings (Vercel, branch e7-test), changed 2026-11-26 on the owner's instruction.** `MV_CHECKOUT_TEST_LISTINGS` = 606998 plus
+the 28 launch listings (all USD); `MV_PUBLIC_CATALOG` = `launch`; `MV_CHECKOUT_RETURN_URL` = `.../checkout.html` (was `checkout-test.html`,
+which sent the owner to the operator page after a TEST payment). `MV_TEST_PIPELINE_LISTINGS` is still `606998:USD`, so a TEST payment on
+any other listing is NOT processed by the runner: no Hostaway reservation is created. One such unprocessed TEST authorization exists
+(owner, 2026-11-26, total $1,225.13); left as is.
+
+**Confirmed on a real iPhone (owner, 2026-11-26).** The checkout reaches the API (no `ORIGIN_NOT_ALLOWED`), a TEST payment completes and
+returns from Stripe.
 
