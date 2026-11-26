@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { offerNewStay, FINISHED_SCREENS, parseStayQuery, guestCopy, guestNotice, readCheckoutConfig, CANCELLATION_POLICY, CANCELLATION_CONTACT, BRAND, RETURN_HINTS, CONFIG_PATH } from "../public/checkout.js";
+import { GUEST_REFUSALS, offerNewStay, FINISHED_SCREENS, parseStayQuery, guestCopy, guestNotice, readCheckoutConfig, CANCELLATION_POLICY, CANCELLATION_CONTACT, BRAND, RETURN_HINTS, CONFIG_PATH } from "../public/checkout.js";
 import { renderBookingConfirmationV2, BRAND_V2, CANCELLATION_CONTACT as EMAIL_CONTACT } from "../lib/checkout/booking-confirmation-copy.js";
 import { createCheckoutConfigHandler } from "../lib/checkout/checkout-config-http.js";
 import { ENV_OK } from "./e5a-fixtures.mjs";
@@ -91,3 +91,12 @@ test("Origin header: the checkout API calls never use referrerPolicy no-referrer
   for (const page of ["checkout.html", "checkout-test.html"]) assert.match(read(page), /<meta name="referrer" content="no-referrer">/, page);
 });
 
+
+test("P4-6: every 'definite refusal' notice the controller can raise has guest wording (no operator phrasing reaches the guest)", () => {
+  const src = readFileSync(new URL("../public/checkout-test.js", import.meta.url), "utf8");
+  const raised = [...src.matchAll(/text: "([^"]*\(a definite refusal\)\.)"/g)].map((m) => m[1]);
+  assert.equal(raised.length, 4);
+  assert.deepEqual([...new Set(raised)].sort(), Object.keys(GUEST_REFUSALS).sort());
+  for (const r of raised) { const g = guestNotice(r); assert.ok(!/refus|server|definite|TEST/i.test(g), g); assert.match(g, /info@micasadirect\.com/); }
+  assert.match(guestNotice("The server refused to start payment (a definite refusal)."), /Nothing was charged/);
+});

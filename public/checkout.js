@@ -76,7 +76,15 @@ export const FINISHED_SCREENS = Object.freeze(["complete", "terminal"]);
 export const offerNewStay = (screen, stay) => !!stay && FINISHED_SCREENS.includes(screen);
 
 /** rare technical notices come from the shared controller: drop its test wording, keep the meaning */
-export const guestNotice = (text) => (typeof text === "string" ? text.replace(/\bStripe TEST Checkout\b/g, "the payment page").replace(/\bTEST intent\b/g, "booking request").replace(/\bTEST /g, "") : "");
+// P4-6: the controller's refusal notices are written for an operator; the guest reads these instead (the support code line is unchanged).
+const HELP = "If it keeps happening, email info@micasadirect.com with the support code below.";
+export const GUEST_REFUSALS = Object.freeze({
+  "The server refused the request (a definite refusal).": `We couldn't continue with this booking. Please try again in a moment. ${HELP}`,
+  "The server refused the details (a definite refusal).": `We couldn't save your details. Please check them and try again. ${HELP}`,
+  "The server refused to start payment (a definite refusal).": `We couldn't open the payment page. Nothing was charged. Please try again in a moment. ${HELP}`,
+  "The server refused the release request (a definite refusal).": `We couldn't release this booking request. ${HELP}`
+});
+export const guestNotice = (text) => (typeof text !== "string" ? "" : Object.prototype.hasOwnProperty.call(GUEST_REFUSALS, text) ? GUEST_REFUSALS[text] : text.replace(/\bStripe TEST Checkout\b/g, "the payment page").replace(/\bTEST intent\b/g, "booking request").replace(/\bTEST /g, ""));
 
 function formatMoney(minor, currency) {
   try { return new Intl.NumberFormat("en-US", { style: "currency", currency }).format(minor / 100); } catch { return `${(minor / 100).toFixed(2)} ${currency}`; }
