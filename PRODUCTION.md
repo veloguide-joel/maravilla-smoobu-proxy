@@ -345,3 +345,8 @@ the TEST runner; one Hostaway account), `MV_LIVE_RESEND_KEY` (sending access, do
 **Open before activation:** production redeploy so the four settings load; webhook delivery and `GET /v1/account` with the website key
 (both only answer once activation is on); `_REF_FIELD_ID` 105433 confirmed for real listings; stop procedure rehearsed; schedules.
 For the first booking: `MV_CHECKOUT_LIVE_LISTINGS` and `MV_LIVE_PIPELINE_LISTINGS` reduced to ONE listing.
+
+**Correction to the settings table (2026-11-26, found at activation):** Production also needs `MV_CHECKOUT_MODE` = `live`. Without it the
+mode defaults to `test`, which refuses any deployment that can see LIVE settings, so `/api/checkout/config` stayed 404 after
+`MV_CHECKOUT_LIVE_ACTIVATION` was added. Added on the owner's "go live" of 2026-11-26 together with the activation value;
+`MV_CHECKOUT_LIVE_LISTINGS` narrowed to `628392:USD` for the owner's first booking.
