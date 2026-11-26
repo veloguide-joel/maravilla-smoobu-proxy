@@ -22,3 +22,12 @@ button.secondary { background: transparent; color: var(--fg); border-color: var(
 .diag { margin: 4px 0 0; font-size: .8rem; color: var(--muted); }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 .banner { margin: 0; background: #ffe36e; color: #1b1b1b; padding: 10px 16px; border-bottom: 2px solid #c9a300; }
+/* P7-1 / P7-2: the "confirming" picture: a small plane flying to Bucerías while the page checks by itself */
+.wait { margin: 14px 0 4px; max-width: 320px; }
+.wait-art { display: block; width: 100%; height: auto; overflow: visible; }
+.wait-route { stroke: var(--line); stroke-width: 2; stroke-dasharray: 2 7; stroke-linecap: round; }
+.wait-from { fill: var(--muted); } .wait-pin { fill: var(--brand); }
+.wait-plane { fill: var(--brand); offset-path: path("M24 70 Q160 -6 290 62"); offset-rotate: auto; animation: mv-fly 5s ease-in-out infinite; }
+.wait-labels { display: flex; justify-content: space-between; margin: 2px 0 0; font-size: .8rem; color: var(--muted); }
+@keyframes mv-fly { 0% { offset-distance: 0%; opacity: 0; } 8% { opacity: 1; } 88% { opacity: 1; } 100% { offset-distance: 100%; opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .wait-plane { animation: none; offset-distance: 55%; } }

@@ -57,10 +57,10 @@ export function guestCopy(v) {
     case "details": return { title: "Your details", text: "Review the total, then enter your details. Nothing is charged at this step." };
     case "pay": return { title: "Ready for payment", text: "Continue to our secure payment page (Stripe) to pay by card. If you have already paid, use Refresh status instead of paying again." };
     case "redirecting": return { title: "Opening the secure payment page…", text: "" };
-    case "payWait": return { title: "Checking your payment", text: "You are back from the payment page. We are confirming the result with our system. Please do not pay again; use Refresh status in a moment." };
+    case "payWait": return { title: "Checking your payment", text: "You are back from the payment page. We are confirming the result with our system. Please do not pay again. This page updates by itself." };
     case "authorized": case "confirming": return { title: "We are confirming your booking",
-      text: "Your payment details were received and we are now confirming the reservation. This usually takes a few minutes. Please do not pay again. You can keep this page open and use Refresh status; we also email you when the booking is confirmed." };
-    case "finalizing": return { title: "Payment received — finishing your booking", text: "Your payment was received and the booking is being completed. Please do not pay again. Use Refresh status in a moment." };
+      text: "Your payment details were received and we are now confirming the reservation. This usually takes a few minutes. Please do not pay again. This page updates by itself; we also email you when the booking is confirmed." };
+    case "finalizing": return { title: "Payment received — finishing your booking", text: "Your payment was received and the booking is being completed. Please do not pay again. This page updates by itself." };
     case "complete": return { title: "Your booking is confirmed", text: `Thank you. Your reservation is confirmed and your payment was received.${ref ? ` Booking reference: ${ref}.` : ""} A confirmation email is on its way.` };
     case "terminal": return { title: "This booking was not completed", text: "This booking request is closed. If a payment was not completed, you were not charged. You can start again from the property page." };
     case "review": return { title: "We need to check this booking", text: `We could not confirm this booking automatically. Please do not pay again. Our team will review it; you can write to ${CANCELLATION_CONTACT} with the support code shown below.` };
@@ -103,6 +103,28 @@ function formatMoney(minor, currency) {
 }
 const longDate = (iso) => { try { return new Intl.DateTimeFormat("en-US", { weekday: "short", year: "numeric", month: "short", day: "numeric", timeZone: "UTC" }).format(new Date(`${iso}T00:00:00Z`)); } catch { return iso; } };
 
+// P7-1: while a paid booking is being confirmed the page checks by itself; the guest never has to press Refresh status.
+// The server allows 40 status reads per booking per 10 minutes; one read every 30 s stays well inside that, next to the controller's own reads.
+export const AUTO_CHECK = Object.freeze({ intervalMs: 30 * 1000, totalMs: 25 * 60 * 1000 });
+export const WAITING_SCREENS = Object.freeze(["payWait", "authorized", "confirming", "finalizing"]);
+/** screens where a read did not succeed; while waiting, the page simply tries again at the next interval */
+export const RETRY_SCREENS = Object.freeze(["notChecked", "unreadable"]);
+/** screens where "Refresh status" has nothing left to do */
+export const SETTLED_SCREENS = Object.freeze(["complete", "terminal"]);
+/**
+ * What the waiting area shows. waiting = a waiting screen was seen and nothing has settled since; startedAt = when waiting began.
+ * -> { mode: "off" | "auto" | "paused", again: boolean }   auto: animation + automatic reads; paused: the time budget is used up
+ */
+export function autoCheckPlan({ screen, waiting, startedAt, now }) {
+  if (!waiting || !(WAITING_SCREENS.includes(screen) || RETRY_SCREENS.includes(screen))) return Object.freeze({ mode: "off", again: false });
+  if (!Number.isFinite(startedAt) || !Number.isFinite(now) || now - startedAt >= AUTO_CHECK.totalMs) return Object.freeze({ mode: "paused", again: false });
+  return Object.freeze({ mode: "auto", again: true });
+}
+export const WAIT_TEXT = Object.freeze({
+  auto: "We are checking automatically. You can keep this page open or close it: we will email your confirmation either way.",
+  paused: "This is taking longer than usual. Your booking is still being processed and we will email you. You can also check again below."
+});
+
 /** GET /api/checkout/config -> { mode, termsVersion } | null (unavailable / unexpected). Same origin; nothing is sent. */
 export async function readCheckoutConfig(fetchFn) {
   try {
@@ -127,6 +149,7 @@ export async function startApp(doc, win) {
   for (const line of CANCELLATION_POLICY) { const li = doc.createElement("li"); li.textContent = line; pol.append(li); }
   const stayLine = stay ? `${stay.name || `Property ${stay.listingId}`} · ${longDate(stay.from)} to ${longDate(stay.to)} · ${stay.nights} night${stay.nights === 1 ? "" : "s"} · ${stay.guests} guest${stay.guests === 1 ? "" : "s"}` : "";
   let announced = null; let autoStarted = false; let ctl = null; let lastScreen = null;
+  let waiting = false; let waitStartedAt = null; let autoTimer = null;   // P7-1 automatic checking
   const ui = {
     render(v) {
       const c = guestCopy(v);
@@ -139,7 +162,7 @@ export async function startApp(doc, win) {
       show("mv-new", newStay);
       const n = $("mv-notice");
       n.textContent = guestNoticeFor(v.notice); n.dataset.level = v.notice ? v.notice.level : ""; n.hidden = !guestNoticeFor(v.notice);
-      const codes = [...new Set([showsSupportCode(v.notice) ? v.notice.code : null, v.pollStopped].filter((x) => x != null).map(supportCode))];
+      const codes = [...new Set([showsSupportCode(v.notice) ? v.notice.code : null, waiting && v.pollStopped === "BUDGET" ? null : v.pollStopped].filter((x) => x != null).map(supportCode))];
       $("mv-diag").textContent = codes.length ? `Support code: ${codes.join(", ")}` : ""; $("mv-diag").hidden = !codes.length;
       const p = $("mv-price"); p.replaceChildren();
       if (v.price) {
@@ -157,9 +180,19 @@ export async function startApp(doc, win) {
       for (const b of doc.querySelectorAll("button")) {
         b.disabled = v.busy || (b.id === "mv-details-submit" && !v.termsVersion) || (latched[b.id] !== undefined && v.latch === latched[b.id]) || (b.id === "mv-pay-btn" && !v.canPay);
       }
-      $("mv-refresh").hidden = !v.canRefresh && !v.busy;
-      const refreshOffered = v.canRefresh || v.busy;
-      $("mv-polling").textContent = v.polling ? "Checking automatically…" : v.pollStopped && !(v.notice && v.notice.level !== "info") ? stopLine(v.pollStopped, refreshOffered) : "";
+      // P7-1: automatic checking while the booking is being confirmed
+      if (WAITING_SCREENS.includes(v.screen)) { if (!waiting) { waiting = true; waitStartedAt = Date.now(); } }
+      else if (!RETRY_SCREENS.includes(v.screen) && v.screen !== "loading") { waiting = false; waitStartedAt = null; }
+      const plan = autoCheckPlan({ screen: v.screen, waiting, startedAt: waitStartedAt, now: Date.now() });
+      if (plan.mode !== "auto" && autoTimer !== null) { win.clearTimeout(autoTimer); autoTimer = null; }
+      if (plan.again && autoTimer === null && !v.busy && !v.polling && ctl) {
+        autoTimer = win.setTimeout(() => { autoTimer = null; if (ctl && !ctl.state.busy) ctl.refresh(); }, AUTO_CHECK.intervalMs);
+      }
+      show("mv-wait", plan.mode === "auto");
+      $("mv-refresh").hidden = (!v.canRefresh && !v.busy) || plan.mode === "auto" || SETTLED_SCREENS.includes(v.screen);
+      const refreshOffered = !$("mv-refresh").hidden;
+      $("mv-polling").textContent = plan.mode === "auto" ? WAIT_TEXT.auto : plan.mode === "paused" ? WAIT_TEXT.paused
+        : v.polling ? "Checking automatically…" : v.pollStopped && !(v.notice && v.notice.level !== "info") ? stopLine(v.pollStopped, refreshOffered) : "";
       $("mv-restart").textContent = v.reset === "startNew" ? "Start a new booking…" : "Leave this booking on this device…";
       $("mv-reset-warn").textContent = v.reset === "startNew" ? "This clears this page only." : "This only clears this page. It does not cancel a booking or a payment, and this page will no longer be able to show its status.";
       const a = announcementFor({ ...v, title: c.title, notice: v.notice ? { ...v.notice, text: guestNoticeFor(v.notice) } : null }, announced);
