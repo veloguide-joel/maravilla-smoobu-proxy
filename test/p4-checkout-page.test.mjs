@@ -150,7 +150,8 @@ test("P7-1: while a paid booking is being confirmed the page checks by itself (i
   assert.ok((600_000 / AUTO_CHECK.intervalMs) <= 20);
   assert.match(WAIT_TEXT.auto, /email/); assert.match(WAIT_TEXT.paused, /check again/);
   const js = readFileSync(new URL("../public/checkout.js", import.meta.url), "utf8");
-  assert.ok(js.includes('plan.mode === "auto" || SETTLED_SCREENS.includes(v.screen)'), "no Refresh button while checking or once settled");
+  assert.ok(js.includes('plan.mode === "auto" || SETTLED_SCREENS.includes(v.screen) || NO_REFRESH_SCREENS.includes(v.screen);'), "no Refresh button while checking, once settled, or before any payment");
+  assert.ok(js.includes('NO_REFRESH_SCREENS = Object.freeze(["create", "details", "loading", "redirecting"])'));
   assert.ok(js.includes("if (ctl && !ctl.state.busy) ctl.refresh();"));
   assert.ok(js.includes("win.clearTimeout(autoTimer)"));
 });
