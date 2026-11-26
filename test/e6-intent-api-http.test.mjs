@@ -24,11 +24,12 @@ test("gate: E5a TEST gate first (production refused), then every intent-API sett
   assert.deepEqual([...g.config.listings].map(([id, c]) => [id, c.currency]), [[603566, "MXN"], [606998, "USD"]]);
 });
 
-test("test listing configuration: explicit id:currency pairs (MXN|USD), distinct, 1..10", () => {
+test("test listing configuration: explicit id:currency pairs (MXN|USD), distinct, 1..60", () => {
   assert.equal(parseTestListings("603566:MXN").get(603566).currency, "MXN");
-  for (const bad of [undefined, "", "603566", "603566:EUR", "603566:mxn", "0:MXN", "603566:MXN,603566:USD", "a:MXN", Array.from({ length: 11 }, (_, i) => `${i + 1}:USD`).join(",")]) {
+  for (const bad of [undefined, "", "603566", "603566:EUR", "603566:mxn", "0:MXN", "603566:MXN,603566:USD", "a:MXN", Array.from({ length: 61 }, (_, i) => `${i + 1}:USD`).join(",")]) {
     assert.equal(parseTestListings(bad), null, String(bad));
   }
+  assert.equal(parseTestListings(Array.from({ length: 29 }, (_, i) => `${628346 + i}:USD`).join(",")).size, 29); // P4-7: the test listing plus the 28 launch listings
 });
 
 test("bearer tokens: only canonical 43-char base64url (256-bit) values in the Authorization header; hashed with SHA-256", () => {
