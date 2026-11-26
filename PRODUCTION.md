@@ -350,3 +350,26 @@ For the first booking: `MV_CHECKOUT_LIVE_LISTINGS` and `MV_LIVE_PIPELINE_LISTING
 mode defaults to `test`, which refuses any deployment that can see LIVE settings, so `/api/checkout/config` stayed 404 after
 `MV_CHECKOUT_LIVE_ACTIVATION` was added. Added on the owner's "go live" of 2026-11-26 together with the activation value;
 `MV_CHECKOUT_LIVE_LISTINGS` narrowed to `628392:USD` for the owner's first booking.
+
+## 2026-11-26: first LIVE booking by the owner (runbook step 8), and the stop rehearsal
+
+**Activation (owner: "go live", 14:xx Mexico City).** Production `MV_CHECKOUT_LIVE_LISTINGS` = `628392:USD`, `MV_CHECKOUT_MODE` = `live`,
+`MV_CHECKOUT_LIVE_ACTIVATION` set; production redeployed; `/api/checkout/config` -> `{ mode: live, termsVersion: terms-2026-12 }`.
+
+**First attempt stopped before payment (nothing charged).** Pay step answered 503; intent stayed `details_collected`, no case.
+Cause, proven with the read-only workflow `mv-stripe-key-check` (main PRs #277-#279; runs 45889151218, 45889748549): a restricted
+key gets 403 `more_permissions_required` on `GET /v1/account` unless it has `connected_account_read` = the row **Accounts: Read**
+(group Connect) in Stripe's key form. The owner added it to both keys ("MiCasaDirect website", "MiCasaDirect booking"); run
+45892402219 then returned 200 and the configured account id for the runner key. Required key permissions are therefore:
+website key = Payment Intents write, Checkout Sessions write, Accounts read; runner key = those plus Charges and Refunds read.
+
+**Second attempt, end to end.** Listing 628392, 2027-05-18 to 2027-05-20, 2 guests, total USD 163.35 (150.00 - 15.00 + 28.35 tax).
+Intent 93090208-931e-4dd8-9d6f-f30512d5cb2f.
+- status run 45893297907: `payment_authorized` 1 minute after payment (live webhook delivered and verified; website key works).
+- run 45893595173: `PENDING / NOT_DUE`, writes create 1 (Hostaway reservation created; the Hostaway token works).
+- run 45894399723: `CONFIRMED`, writes capture 1, record 1; confirmations sent 1 (runner key captures; Resend key sends).
+Still to do by hand: owner confirms the email arrived and the reservation in Hostaway; cancel the reservation in Hostaway; refund in
+Stripe (owner clicks); three-way reconciliation; record the external cancellation.
+
+**Stop rehearsal.** `MV_CHECKOUT_LIVE_ACTIVATION` deleted from Production at 2026-11-26T20:56:25Z. As documented, the running deployment
+kept answering until the redeploy; see the times below.
