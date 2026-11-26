@@ -1,3 +1,27 @@
 {
-  "outputDirectory": "public"
+  "outputDirectory": "public",
+  "redirects": [
+    {
+      "source": "/checkout-test.html",
+      "has": [
+        {
+          "type": "host",
+          "value": "book.micasadirect.com"
+        }
+      ],
+      "destination": "/checkout.html",
+      "permanent": false
+    },
+    {
+      "source": "/checkout-test.html",
+      "has": [
+        {
+          "type": "host",
+          "value": "maravilla-smoobu-proxy.vercel.app"
+        }
+      ],
+      "destination": "/checkout.html",
+      "permanent": false
+    }
+  ]
 }

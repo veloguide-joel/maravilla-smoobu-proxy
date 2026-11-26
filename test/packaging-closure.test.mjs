@@ -136,7 +136,9 @@ test(".vercelignore and public/ containment are unchanged", () => {
   assert.equal(readFileSync(join(ROOT, ".vercelignore"), "utf8"),
     "# C8: never upload internal-only trees to Vercel (defence in depth; outputDirectory \"public\" already keeps\n# everything else out of static serving). NEVER list api/ or lib/: API functions bundle their lib/ imports.\n/db\n/test\n/scripts\n");
   assert.deepEqual(readdirSync(join(ROOT, "public")).sort(), ["checkout-test.css", "checkout-test.html", "checkout-test.js", "checkout.css", "checkout.html", "checkout.js", "robots.txt"]);   // exact allowlist (E7 TEST page)
-  assert.deepEqual(JSON.parse(readFileSync(join(ROOT, "vercel.json"), "utf8")), { outputDirectory: "public" });
+  // P6-2: the operator test page is not served on the production hosts (it redirects to the guest checkout); previews keep it
+  assert.deepEqual(JSON.parse(readFileSync(join(ROOT, "vercel.json"), "utf8")), { outputDirectory: "public", redirects: ["book.micasadirect.com", "maravilla-smoobu-proxy.vercel.app"]
+    .map((value) => ({ source: "/checkout-test.html", has: [{ type: "host", value }], destination: "/checkout.html", permanent: false })) });
 });
 
 test("E7.1/E7.2: no api/ route's import closure reaches the recovery modules, the reservation worker or the Hostaway adapter", () => {
