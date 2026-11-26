@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { RETURN_NOTICES, showsSupportCode, UNBOOKABLE_CODES, UNBOOKABLE_TEXT, isUnbookable, guestNoticeFor, GUEST_REFUSALS, offerNewStay, FINISHED_SCREENS, parseStayQuery, guestCopy, guestNotice, readCheckoutConfig, CANCELLATION_POLICY, CANCELLATION_CONTACT, BRAND, RETURN_HINTS, CONFIG_PATH } from "../public/checkout.js";
+import { AUTO_CHECK, WAITING_SCREENS, RETRY_SCREENS, SETTLED_SCREENS, WAIT_TEXT, autoCheckPlan, RETURN_NOTICES, showsSupportCode, UNBOOKABLE_CODES, UNBOOKABLE_TEXT, isUnbookable, guestNoticeFor, GUEST_REFUSALS, offerNewStay, FINISHED_SCREENS, parseStayQuery, guestCopy, guestNotice, readCheckoutConfig, CANCELLATION_POLICY, CANCELLATION_CONTACT, BRAND, RETURN_HINTS, CONFIG_PATH } from "../public/checkout.js";
 import { renderBookingConfirmationV2, BRAND_V2, CANCELLATION_CONTACT as EMAIL_CONTACT } from "../lib/checkout/booking-confirmation-copy.js";
 import { createCheckoutConfigHandler } from "../lib/checkout/checkout-config-http.js";
 import { ENV_OK } from "./e5a-fixtures.mjs";
@@ -131,4 +131,38 @@ test("P4-8: returning from the payment page shows no operator hint and no suppor
   assert.equal(showsSupportCode(left), false);
   assert.equal(showsSupportCode({ level: "warn", code: "RATE_LIMITED", text: "x" }), true);
   assert.equal(showsSupportCode(null), false);
+});
+
+test("P7-1: while a paid booking is being confirmed the page checks by itself (inside the server's read limit) and never asks for Refresh status", () => {
+  const t0 = 1_000_000;
+  for (const screen of WAITING_SCREENS) {
+    assert.deepEqual(autoCheckPlan({ screen, waiting: true, startedAt: t0, now: t0 + 1 }), { mode: "auto", again: true });
+    assert.ok(!/Refresh status/.test(guestCopy({ screen }).text), screen);
+  }
+  for (const screen of RETRY_SCREENS) assert.equal(autoCheckPlan({ screen, waiting: true, startedAt: t0, now: t0 + 1 }).mode, "auto", "a failed read is simply tried again");
+  assert.equal(autoCheckPlan({ screen: "notChecked", waiting: false, startedAt: null, now: t0 }).mode, "off", "never started for a page that was not waiting");
+  for (const screen of [...SETTLED_SCREENS, "review", "lost", "create", "details", "pay"]) assert.equal(autoCheckPlan({ screen, waiting: true, startedAt: t0, now: t0 + 1 }).mode, "off", screen);
+  assert.deepEqual(autoCheckPlan({ screen: "confirming", waiting: true, startedAt: t0, now: t0 + AUTO_CHECK.totalMs }), { mode: "paused", again: false });
+  assert.equal(autoCheckPlan({ screen: "confirming", waiting: true, startedAt: null, now: t0 }).mode, "paused", "no start time: never an endless loop");
+  // 40 reads per booking per 10 minutes on the server (DEFAULT_LIMITS.perToken); the controller may add 24 of its own in a 10-minute window
+  const api = readFileSync(new URL("../lib/checkout/intent-api-http.js", import.meta.url), "utf8");
+  assert.match(api, /perToken: Object\.freeze\(\[600, 40\]\)/);
+  assert.ok((600_000 / AUTO_CHECK.intervalMs) <= 20);
+  assert.match(WAIT_TEXT.auto, /email/); assert.match(WAIT_TEXT.paused, /check again/);
+  const js = readFileSync(new URL("../public/checkout.js", import.meta.url), "utf8");
+  assert.ok(js.includes('plan.mode === "auto" || SETTLED_SCREENS.includes(v.screen)'), "no Refresh button while checking or once settled");
+  assert.ok(js.includes("if (ctl && !ctl.state.busy) ctl.refresh();"));
+  assert.ok(js.includes("win.clearTimeout(autoTimer)"));
+});
+
+test("P7-2: the waiting picture is decorative, same-origin and still when the guest prefers reduced motion", () => {
+  const html = readFileSync(new URL("../public/checkout.html", import.meta.url), "utf8");
+  const css = readFileSync(new URL("../public/checkout.css", import.meta.url), "utf8");
+  assert.match(html, /<div id="mv-wait" class="wait" aria-hidden="true" hidden>/);
+  assert.match(html, /<span>Bucerías<\/span>/);
+  const wait = html.slice(html.indexOf('id="mv-wait"'), html.indexOf('id="mv-polling"'));
+  assert.doesNotMatch(wait, /style=|href=|<script|<image|url\(/i, "no inline style, link, script or external image (the page's CSP allows none)");
+  assert.match(html, /style-src 'self'/);
+  assert.match(css, /@media \(prefers-reduced-motion: reduce\) \{ \.wait-plane \{ animation: none;/);
+  assert.match(css, /\.wait-plane \{[^}]*offset-path: path\("M24 70 Q160 -6 290 62"\)/);
 });
