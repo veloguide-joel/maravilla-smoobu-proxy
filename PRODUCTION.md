@@ -394,3 +394,26 @@ a versioned contract (`bcc-v2`: DB CHECK, claim function v3, worker, executor), 
 
 **Known wait.** On a 5-minute schedule a booking needs two runner passes: about 10 minutes from payment to confirmation (the first
 pass creates the Hostaway reservation and sets a due time a few minutes ahead; the second verifies, captures, records and sends).
+
+## 2026-11-26 (evening): promoted, schedules on, guest-site hygiene (owner: "you can do your next steps")
+
+**Production** = e7-test f492f0a (P7 waiting page + P7-1b). `MV_CHECKOUT_LIVE_LISTINGS` restored to the 28 launch listings.
+`MV_CHECKOUT_LIVE_ACTIVATION` is ABSENT: payments are off (`/api/checkout/config` 404, webhook 404; quotes answer).
+
+**Schedules (main PR #284).** `mv-pipeline` every 5 minutes and `mv-watchdog` at :07/:22/:37/:52, both LIVE with
+ref = `MV_LIVE_APPROVED_REF` (66f3f120; the runner code has not changed since). Scheduled jobs run only while repo variable
+`MV_LIVE_SCHEDULE` = `on`; it was set at 23:21Z. First scheduled runs: runner 45910861848 `OK / NOTHING_TO_DO`; watchdog 45911036193
+status `OK / NOTHING_IN_FLIGHT`, freshness `OK` (1 minute). To stop the schedule: delete or change `MV_LIVE_SCHEDULE` (no commit).
+Left on overnight on purpose, with payments off, to measure how late GitHub starts scheduled runs (the watchdog's limit is 30 minutes).
+`MV_LIVE_PIPELINE_LISTINGS` holds the 28 listings (an attempt to narrow it to one did not save; harmless).
+
+**Guest site (booking-ui PRs #14, #15; `mcd-catalog` and `DEV`).** `.vercelignore`: only the guest page is deployed. The old admin page
+(its `/api/holds/*` endpoints no longer exist), old drafts, reference pages, `tools/` and `tests/` stay in the repository but answer 404.
+Checked on the preview: 28 cards, `/` and `/property/:id` 200, the excluded paths 404.
+
+**Still running on main:** the old `e7-hosted-*` scheduled workflows (kickoff, status, booking-confirmation). They are disarmed
+(`E7_TEST_AUTO_ARMED` deleted) and report success without doing anything; to retire after launch.
+
+**Launch steps left (each on the owner's word):** booking-ui `DEV` -> `main`; micasadirect.com added to the booking-ui Vercel project
+and pointed in Squarespace DNS; decide indexing (the guest page has no noindex and robots.txt allows all); add
+`MV_CHECKOUT_LIVE_ACTIVATION` and redeploy. Before that: the owner cancels reservation MV-Z6KV455M in Hostaway and refunds USD 163.35.
