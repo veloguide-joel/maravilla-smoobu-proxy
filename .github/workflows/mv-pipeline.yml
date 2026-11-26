@@ -1,7 +1,12 @@
 # mv-pipeline: the mode-aware booking pipeline runner (scripts/mv-pipeline.mjs). Design: PRODUCTION.md, "P2c design".
 #
-# Manual dispatch only, no schedule. This copy on main only makes the workflow dispatchable (PRODUCTION.md on e7-test, "P5 plan", step A):
-# the code that runs is the commit given in `ref` (the e7-test head), not main. It is not part of any arm manifest and touches none
+# Manual dispatch, plus a schedule for LIVE. This copy on main only makes the workflow runnable (PRODUCTION.md on e7-test, "P5 plan",
+# step A): the code that runs is the commit given in `ref` (the e7-test head), not main.
+#
+# Schedule: every 5 minutes, LIVE, action run, ref = the owner-approved commit (repo variable MV_LIVE_APPROVED_REF). The scheduled job
+# does NOTHING unless repo variable MV_LIVE_SCHEDULE is exactly "on": deleting or changing that variable stops the schedule at once,
+# without a commit. GitHub may start scheduled runs late. A scheduled run has no inputs, so every `inputs.x || default` below resolves
+# to the live defaults; a manual dispatch is unchanged. It is not part of any arm manifest and touches none
 # of the old TEST runner files.
 #
 # One run: every paid booking on an approved listing is taken through reserve -> capture -> record by the existing workers
@@ -9,6 +14,8 @@
 # Exit 1 means a person must look (GitHub emails the owner).
 name: mv-pipeline
 on:
+  schedule:
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -29,26 +36,27 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: mv-pipeline-${{ inputs.mode }}
+  group: mv-pipeline-${{ inputs.mode || 'live' }}
   cancel-in-progress: false
 jobs:
   run:
+    if: github.event_name != 'schedule' || vars.MV_LIVE_SCHEDULE == 'on'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    environment: ${{ inputs.mode == 'live' && 'mv-live' || 'e7-test-auto' }}
+    environment: ${{ (inputs.mode || 'live') == 'live' && 'mv-live' || 'e7-test-auto' }}
     steps:
       - name: The ref must be a full commit id
         env:
-          MV_REF: ${{ inputs.ref }}
+          MV_REF: ${{ inputs.ref || vars.MV_LIVE_APPROVED_REF }}
         run: |
           [[ "$MV_REF" =~ ^[0-9a-f]{40}$ ]] || { echo "ref must be 40 lowercase hex"; exit 1; }
       # Live runs only the one commit the owner approved (repo variable MV_LIVE_APPROVED_REF), and only when dispatched from main.
       # Fail closed: an empty or malformed variable, another commit, or another branch stops the job before any code is checked out
       # and before any secret is read (secrets appear only in the last step).
       - name: Live runs only the approved commit, from main
-        if: inputs.mode == 'live'
+        if: (inputs.mode || 'live') == 'live'
         env:
-          MV_REF: ${{ inputs.ref }}
+          MV_REF: ${{ inputs.ref || vars.MV_LIVE_APPROVED_REF }}
           MV_APPROVED: ${{ vars.MV_LIVE_APPROVED_REF }}
           MV_DISPATCH_REF: ${{ github.ref }}
         run: |
@@ -57,7 +65,7 @@ jobs:
           [[ "$MV_REF" == "$MV_APPROVED" ]] || { echo "LIVE_REFUSED: ref is not the approved commit"; exit 1; }
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.ref || vars.MV_LIVE_APPROVED_REF }}
           persist-credentials: false
       - uses: actions/setup-node@v4
         with:
@@ -69,26 +77,26 @@ jobs:
       - name: Status (read-only)
         if: inputs.action == 'status'
         env:
-          MV_PIPELINE_MODE: ${{ inputs.mode }}
+          MV_PIPELINE_MODE: ${{ inputs.mode || 'live' }}
           MV_PIPELINE_DATABASE_CA_FILE: ${{ runner.temp }}/prod-ca-2021.crt
-          MV_PIPELINE_LISTINGS: ${{ inputs.mode == 'live' && vars.MV_LIVE_PIPELINE_LISTINGS || vars.MV_TEST_PIPELINE_LISTINGS }}
-          MV_PIPELINE_NOT_BEFORE: ${{ inputs.mode == 'live' && vars.MV_LIVE_PIPELINE_NOT_BEFORE || vars.MV_TEST_PIPELINE_NOT_BEFORE }}
-          MV_PIPELINE_DATABASE_URL: ${{ inputs.mode == 'live' && secrets.MV_LIVE_BOOKING_DATABASE_URL || secrets.E7_DEV_BOOKING_DATABASE_URL }}
+          MV_PIPELINE_LISTINGS: ${{ (inputs.mode || 'live') == 'live' && vars.MV_LIVE_PIPELINE_LISTINGS || vars.MV_TEST_PIPELINE_LISTINGS }}
+          MV_PIPELINE_NOT_BEFORE: ${{ (inputs.mode || 'live') == 'live' && vars.MV_LIVE_PIPELINE_NOT_BEFORE || vars.MV_TEST_PIPELINE_NOT_BEFORE }}
+          MV_PIPELINE_DATABASE_URL: ${{ (inputs.mode || 'live') == 'live' && secrets.MV_LIVE_BOOKING_DATABASE_URL || secrets.E7_DEV_BOOKING_DATABASE_URL }}
         run: node scripts/mv-status.mjs
       - name: Run the pipeline once
         if: inputs.action != 'status'
         env:
-          MV_PIPELINE_MODE: ${{ inputs.mode }}
+          MV_PIPELINE_MODE: ${{ inputs.mode || 'live' }}
           MV_PIPELINE_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
           MV_PIPELINE_DATABASE_CA_FILE: ${{ runner.temp }}/prod-ca-2021.crt
-          MV_PIPELINE_LISTINGS: ${{ inputs.mode == 'live' && vars.MV_LIVE_PIPELINE_LISTINGS || vars.MV_TEST_PIPELINE_LISTINGS }}
-          MV_PIPELINE_NOT_BEFORE: ${{ inputs.mode == 'live' && vars.MV_LIVE_PIPELINE_NOT_BEFORE || vars.MV_TEST_PIPELINE_NOT_BEFORE }}
-          MV_PIPELINE_STRIPE_ACCOUNT: ${{ inputs.mode == 'live' && vars.MV_LIVE_PIPELINE_STRIPE_ACCOUNT || vars.MV_TEST_PIPELINE_STRIPE_ACCOUNT }}
-          MV_PIPELINE_REF_FIELD_ID: ${{ inputs.mode == 'live' && vars.MV_LIVE_PIPELINE_REF_FIELD_ID || vars.MV_TEST_PIPELINE_REF_FIELD_ID }}
-          MV_PIPELINE_TIME_ZONE: ${{ inputs.mode == 'live' && vars.MV_LIVE_PIPELINE_TIME_ZONE || vars.MV_TEST_PIPELINE_TIME_ZONE }}
-          MV_PIPELINE_ACCOUNT_REF: ${{ inputs.mode == 'live' && vars.MV_LIVE_PIPELINE_ACCOUNT_REF || vars.MV_TEST_PIPELINE_ACCOUNT_REF }}
-          MV_PIPELINE_STRIPE_KEY: ${{ inputs.mode == 'live' && secrets.MV_LIVE_STRIPE_KEY || secrets.E7_STRIPE_TEST_KEY }}
-          MV_PIPELINE_HOSTAWAY_TOKEN: ${{ inputs.mode == 'live' && secrets.MV_LIVE_HOSTAWAY_TOKEN || secrets.E7_HOSTAWAY_TOKEN }}
-          MV_PIPELINE_RESEND_KEY: ${{ inputs.mode == 'live' && secrets.MV_LIVE_RESEND_KEY || secrets.E7_RESEND_TEST_KEY }}
-          MV_PIPELINE_DATABASE_URL: ${{ inputs.mode == 'live' && secrets.MV_LIVE_BOOKING_DATABASE_URL || secrets.E7_DEV_BOOKING_DATABASE_URL }}
+          MV_PIPELINE_LISTINGS: ${{ (inputs.mode || 'live') == 'live' && vars.MV_LIVE_PIPELINE_LISTINGS || vars.MV_TEST_PIPELINE_LISTINGS }}
+          MV_PIPELINE_NOT_BEFORE: ${{ (inputs.mode || 'live') == 'live' && vars.MV_LIVE_PIPELINE_NOT_BEFORE || vars.MV_TEST_PIPELINE_NOT_BEFORE }}
+          MV_PIPELINE_STRIPE_ACCOUNT: ${{ (inputs.mode || 'live') == 'live' && vars.MV_LIVE_PIPELINE_STRIPE_ACCOUNT || vars.MV_TEST_PIPELINE_STRIPE_ACCOUNT }}
+          MV_PIPELINE_REF_FIELD_ID: ${{ (inputs.mode || 'live') == 'live' && vars.MV_LIVE_PIPELINE_REF_FIELD_ID || vars.MV_TEST_PIPELINE_REF_FIELD_ID }}
+          MV_PIPELINE_TIME_ZONE: ${{ (inputs.mode || 'live') == 'live' && vars.MV_LIVE_PIPELINE_TIME_ZONE || vars.MV_TEST_PIPELINE_TIME_ZONE }}
+          MV_PIPELINE_ACCOUNT_REF: ${{ (inputs.mode || 'live') == 'live' && vars.MV_LIVE_PIPELINE_ACCOUNT_REF || vars.MV_TEST_PIPELINE_ACCOUNT_REF }}
+          MV_PIPELINE_STRIPE_KEY: ${{ (inputs.mode || 'live') == 'live' && secrets.MV_LIVE_STRIPE_KEY || secrets.E7_STRIPE_TEST_KEY }}
+          MV_PIPELINE_HOSTAWAY_TOKEN: ${{ (inputs.mode || 'live') == 'live' && secrets.MV_LIVE_HOSTAWAY_TOKEN || secrets.E7_HOSTAWAY_TOKEN }}
+          MV_PIPELINE_RESEND_KEY: ${{ (inputs.mode || 'live') == 'live' && secrets.MV_LIVE_RESEND_KEY || secrets.E7_RESEND_TEST_KEY }}
+          MV_PIPELINE_DATABASE_URL: ${{ (inputs.mode || 'live') == 'live' && secrets.MV_LIVE_BOOKING_DATABASE_URL || secrets.E7_DEV_BOOKING_DATABASE_URL }}
         run: node scripts/mv-pipeline.mjs
