@@ -111,6 +111,8 @@ export const WAITING_SCREENS = Object.freeze(["payWait", "authorized", "confirmi
 export const RETRY_SCREENS = Object.freeze(["notChecked", "unreadable"]);
 /** screens where "Refresh status" has nothing left to do */
 export const SETTLED_SCREENS = Object.freeze(["complete", "terminal"]);
+/** screens before any payment: there is no status to refresh yet (P7-1b) */
+export const NO_REFRESH_SCREENS = Object.freeze(["create", "details", "loading", "redirecting"]);
 /**
  * What the waiting area shows. waiting = a waiting screen was seen and nothing has settled since; startedAt = when waiting began.
  * -> { mode: "off" | "auto" | "paused", again: boolean }   auto: animation + automatic reads; paused: the time budget is used up
@@ -189,7 +191,7 @@ export async function startApp(doc, win) {
         autoTimer = win.setTimeout(() => { autoTimer = null; if (ctl && !ctl.state.busy) ctl.refresh(); }, AUTO_CHECK.intervalMs);
       }
       show("mv-wait", plan.mode === "auto");
-      $("mv-refresh").hidden = (!v.canRefresh && !v.busy) || plan.mode === "auto" || SETTLED_SCREENS.includes(v.screen);
+      $("mv-refresh").hidden = (!v.canRefresh && !v.busy) || plan.mode === "auto" || SETTLED_SCREENS.includes(v.screen) || NO_REFRESH_SCREENS.includes(v.screen);
       const refreshOffered = !$("mv-refresh").hidden;
       $("mv-polling").textContent = plan.mode === "auto" ? WAIT_TEXT.auto : plan.mode === "paused" ? WAIT_TEXT.paused
         : v.polling ? "Checking automatically…" : v.pollStopped && !(v.notice && v.notice.level !== "info") ? stopLine(v.pollStopped, refreshOffered) : "";
