@@ -1,0 +1,87 @@
+# mv-watchdog: an independent look at the booking pipeline (owner review 2026-11-21). It never processes a booking.
+#
+# Two checks, each a separate job so one cannot hide the other:
+#   status     scripts/mv-status.mjs -- one READ ONLY database transaction; fails when a booking needs a person, a paid booking has
+#              waited longer than 20 minutes, or a paid booking is on a listing the runner may not process.
+#   freshness  the last SUCCESSFUL mv-pipeline run must be younger than `max_runner_age_minutes` (0 = skip; use it once a schedule runs).
+# A failed job makes GitHub email the owner. Manual dispatch only for now; the schedule is added when live bookings are switched on.
+name: mv-watchdog
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "test or live"
+        required: true
+        type: choice
+        options: [test, live]
+      ref:
+        description: "full 40-hex commit of e7-test to run"
+        required: true
+        type: string
+      max_runner_age_minutes:
+        description: "fail when the last successful mv-pipeline run is older than this (0 = skip)"
+        required: false
+        default: "0"
+        type: string
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: mv-watchdog-${{ inputs.mode }}
+  cancel-in-progress: false
+jobs:
+  status:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: ${{ inputs.mode == 'live' && 'mv-live' || 'e7-test-auto' }}
+    steps:
+      - name: The ref must be a full commit id
+        env:
+          MV_REF: ${{ inputs.ref }}
+        run: |
+          [[ "$MV_REF" =~ ^[0-9a-f]{40}$ ]] || { echo "ref must be 40 lowercase hex"; exit 1; }
+      - name: Live runs only the approved commit, from main
+        if: inputs.mode == 'live'
+        env:
+          MV_REF: ${{ inputs.ref }}
+          MV_APPROVED: ${{ vars.MV_LIVE_APPROVED_REF }}
+          MV_DISPATCH_REF: ${{ github.ref }}
+        run: |
+          [[ "$MV_DISPATCH_REF" == "refs/heads/main" ]] || { echo "LIVE_REFUSED: dispatch from main only"; exit 1; }
+          [[ "$MV_APPROVED" =~ ^[0-9a-f]{40}$ ]] || { echo "LIVE_REFUSED: MV_LIVE_APPROVED_REF is not set to a full commit id"; exit 1; }
+          [[ "$MV_REF" == "$MV_APPROVED" ]] || { echo "LIVE_REFUSED: ref is not the approved commit"; exit 1; }
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.0
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Database CA (pinned by SHA-256 in the script)
+        run: curl --fail --silent --show-error --proto '=https' --max-time 20 -o "$RUNNER_TEMP/prod-ca-2021.crt" https://supabase-downloads.s3-ap-southeast-1.amazonaws.com/prod/ssl/prod-ca-2021.crt
+      - name: Status (read-only)
+        env:
+          MV_PIPELINE_MODE: ${{ inputs.mode }}
+          MV_PIPELINE_DATABASE_CA_FILE: ${{ runner.temp }}/prod-ca-2021.crt
+          MV_PIPELINE_LISTINGS: ${{ inputs.mode == 'live' && vars.MV_LIVE_PIPELINE_LISTINGS || vars.MV_TEST_PIPELINE_LISTINGS }}
+          MV_PIPELINE_NOT_BEFORE: ${{ inputs.mode == 'live' && vars.MV_LIVE_PIPELINE_NOT_BEFORE || vars.MV_TEST_PIPELINE_NOT_BEFORE }}
+          MV_PIPELINE_DATABASE_URL: ${{ inputs.mode == 'live' && secrets.MV_LIVE_BOOKING_DATABASE_URL || secrets.E7_DEV_BOOKING_DATABASE_URL }}
+        run: node scripts/mv-status.mjs
+  freshness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: The last successful mv-pipeline run must be recent
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MV_MAX_AGE: ${{ inputs.max_runner_age_minutes }}
+          MV_REPO: ${{ github.repository }}
+        run: |
+          [[ "$MV_MAX_AGE" =~ ^[0-9]{1,4}$ ]] || { echo "max_runner_age_minutes must be a number"; exit 1; }
+          if [[ "$MV_MAX_AGE" == "0" ]]; then echo '{"check":"freshness","outcome":"SKIPPED"}'; exit 0; fi
+          last=$(gh api "repos/$MV_REPO/actions/workflows/mv-pipeline.yml/runs?status=success&per_page=1" --jq '.workflow_runs[0].updated_at // empty')
+          [[ -n "$last" ]] || { echo '{"check":"freshness","outcome":"ATTENTION","code":"NO_SUCCESSFUL_RUN"}'; exit 1; }
+          age=$(( ( $(date -u +%s) - $(date -u -d "$last" +%s) ) / 60 ))
+          if (( age > MV_MAX_AGE )); then echo "{\"check\":\"freshness\",\"outcome\":\"ATTENTION\",\"code\":\"RUNNER_STALE\",\"ageMinutes\":$age}"; exit 1; fi
+          echo "{\"check\":\"freshness\",\"outcome\":\"OK\",\"ageMinutes\":$age}"
