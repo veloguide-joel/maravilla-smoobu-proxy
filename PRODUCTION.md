@@ -373,3 +373,24 @@ Stripe (owner clicks); three-way reconciliation; record the external cancellatio
 
 **Stop rehearsal.** `MV_CHECKOUT_LIVE_ACTIVATION` deleted from Production at 2026-11-26T20:56:25Z. As documented, the running deployment
 kept answering until the redeploy; see the times below.
+
+**Stop rehearsal, result (2026-11-26).** Activation deleted 20:56:25Z; `/api/checkout/config` still 200 at 20:56:44Z (old deployment);
+`production` fast-forwarded 20:58:12Z, deployment ready 20:58:24Z; at 21:00:03Z config 404 and the webhook path 404, quotes still
+answer. So stopping takes one redeploy, about 2 to 4 minutes end to end. Production is now: `MV_CHECKOUT_MODE` = `live`,
+`MV_CHECKOUT_LIVE_LISTINGS` = `628392:USD` (ONE listing; restore the 28 before launch), activation ABSENT. Payments are off.
+Owner confirmed: reservation visible and confirmed in Hostaway; confirmation email arrived in the inbox (not spam) at 14:55 local.
+Open: the owner cancels the Hostaway reservation and refunds USD 163.35 in Stripe; then reconcile and record the external cancellation.
+The first attempt's intent (2027-05-11 to 05-13) is still `details_collected`; it expires by itself.
+
+**P7 (PR #281, e7-test only; NOT promoted).** Owner feedback after the live booking. The guest checkout page now reads the status by
+itself every 30 s for up to 25 minutes while a paid booking is being confirmed (server limit 40 reads per booking per 10 minutes);
+"Refresh status" is hidden while it checks and once the booking is settled. Waiting picture: a plane flying to a pin labelled Bucerias
+(inline SVG, CSS motion path, still under reduced motion). Seen animating on the e7-test preview (element forced visible); the automatic
+reads have not been watched through a real waiting state yet.
+
+**Not started: confirmation email content (owner feedback).** No property name, ISO dates, no arrival details, plain text. The copy is
+a versioned contract (`bcc-v2`: DB CHECK, claim function v3, worker, executor), so adding the property name and long dates means a new
+`bcc-v3`, migration 0032 on both databases and a trusted source for the listing name. Planned as its own slice.
+
+**Known wait.** On a 5-minute schedule a booking needs two runner passes: about 10 minutes from payment to confirmation (the first
+pass creates the Hostaway reservation and sets a due time a few minutes ahead; the second verifies, captures, records and sends).
