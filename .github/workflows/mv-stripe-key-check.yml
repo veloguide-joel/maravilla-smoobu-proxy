@@ -27,7 +27,7 @@ jobs:
               const safe=(v)=>typeof v==="string"&&/^[a-z0-9_.]{1,60}$/i.test(v)?v:null;
               console.log(JSON.stringify({ probe:process.argv[2], http:Number(process.argv[3]), object:safe(j.object), idMatches:j.id===process.argv[4],
                 errorType:safe(j.error&&j.error.type), errorCode:safe(j.error&&j.error.code),
-                neededPermissions:[...new Set(String(j.error&&j.error.message||"").match(/\brak_[a-z0-9_]{3,60}\b/g)||[])].slice(0,6) }));
+                neededPermissions:[...new Set(String(j.error&&j.error.message||"").match(/\b[a-z]{2,20}(?:_[a-z0-9]{1,20}){1,6}\b/g)||[])].filter((w)=>!/^(rk|sk|pk|acct)_/.test(w)).slice(0,8) }));
             ' "$out" "$name" "$status" "$MV_ACCT"
             rm -f "$out"
           }
