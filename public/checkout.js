@@ -88,8 +88,14 @@ export const GUEST_REFUSALS = Object.freeze({
 export const UNBOOKABLE_CODES = Object.freeze(["LISTING_NOT_AVAILABLE", "LISTING_NOT_CONFIGURED", "NOT_AVAILABLE"]);
 export const UNBOOKABLE_TEXT = "This stay can't be booked online right now. Please go back and choose different dates or another property, or email info@micasadirect.com.";
 export const isUnbookable = (notice) => !!notice && UNBOOKABLE_CODES.includes(notice.code);
-/** The guest's wording for a controller notice ({ text, code }). */
-export const guestNoticeFor = (notice) => (!notice ? "" : isUnbookable(notice) ? UNBOOKABLE_TEXT : guestNotice(notice.text));
+// P4-8: coming back from the payment page. The screen title already says what is happening, so "complete" shows no extra notice
+// and no support code; "cancelled" gets one plain line.
+export const RETURN_NOTICES = Object.freeze({ RETURNED_COMPLETE: "", RETURNED_CANCELLED: "You left the payment page before paying. You can continue below when you are ready." });
+const isReturn = (notice) => !!notice && Object.prototype.hasOwnProperty.call(RETURN_NOTICES, notice.code);
+/** The guest's wording for a controller notice ({ text, code }); "" means show no notice. */
+export const guestNoticeFor = (notice) => (!notice ? "" : isReturn(notice) ? RETURN_NOTICES[notice.code] : isUnbookable(notice) ? UNBOOKABLE_TEXT : guestNotice(notice.text));
+/** Support codes are for refusals and problems, not for the ordinary return from the payment page. */
+export const showsSupportCode = (notice) => !!notice && !isReturn(notice);
 export const guestNotice = (text) => (typeof text !== "string" ? "" : Object.prototype.hasOwnProperty.call(GUEST_REFUSALS, text) ? GUEST_REFUSALS[text] : text.replace(/\bStripe TEST Checkout\b/g, "the payment page").replace(/\bTEST intent\b/g, "booking request").replace(/\bTEST /g, ""));
 
 function formatMoney(minor, currency) {
@@ -132,8 +138,8 @@ export async function startApp(doc, win) {
       $("mv-stay").textContent = stayLine; show("mv-stay", !!stay && (newStay || ["create", "details", "pay", "loading"].includes(v.screen)));
       show("mv-new", newStay);
       const n = $("mv-notice");
-      n.textContent = guestNoticeFor(v.notice); n.dataset.level = v.notice ? v.notice.level : ""; n.hidden = !v.notice;
-      const codes = [...new Set([v.notice && v.notice.code, v.pollStopped].filter((x) => x != null).map(supportCode))];
+      n.textContent = guestNoticeFor(v.notice); n.dataset.level = v.notice ? v.notice.level : ""; n.hidden = !guestNoticeFor(v.notice);
+      const codes = [...new Set([showsSupportCode(v.notice) ? v.notice.code : null, v.pollStopped].filter((x) => x != null).map(supportCode))];
       $("mv-diag").textContent = codes.length ? `Support code: ${codes.join(", ")}` : ""; $("mv-diag").hidden = !codes.length;
       const p = $("mv-price"); p.replaceChildren();
       if (v.price) {

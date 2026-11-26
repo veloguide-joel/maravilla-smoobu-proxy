@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { UNBOOKABLE_CODES, UNBOOKABLE_TEXT, isUnbookable, guestNoticeFor, GUEST_REFUSALS, offerNewStay, FINISHED_SCREENS, parseStayQuery, guestCopy, guestNotice, readCheckoutConfig, CANCELLATION_POLICY, CANCELLATION_CONTACT, BRAND, RETURN_HINTS, CONFIG_PATH } from "../public/checkout.js";
+import { RETURN_NOTICES, showsSupportCode, UNBOOKABLE_CODES, UNBOOKABLE_TEXT, isUnbookable, guestNoticeFor, GUEST_REFUSALS, offerNewStay, FINISHED_SCREENS, parseStayQuery, guestCopy, guestNotice, readCheckoutConfig, CANCELLATION_POLICY, CANCELLATION_CONTACT, BRAND, RETURN_HINTS, CONFIG_PATH } from "../public/checkout.js";
 import { renderBookingConfirmationV2, BRAND_V2, CANCELLATION_CONTACT as EMAIL_CONTACT } from "../lib/checkout/booking-confirmation-copy.js";
 import { createCheckoutConfigHandler } from "../lib/checkout/checkout-config-http.js";
 import { ENV_OK } from "./e5a-fixtures.mjs";
@@ -116,4 +116,19 @@ test("P4-7: a listing or dates that cannot be booked get their own wording (neve
   assert.equal(guestNoticeFor(null), "");
   const page = readFileSync(new URL("../public/checkout.js", import.meta.url), "utf8");
   assert.ok(page.includes('show("mv-create", v.screen === "create" && !!stay && !isUnbookable(v.notice));'));
+});
+
+test("P4-8: returning from the payment page shows no operator hint and no support code", () => {
+  const src = readFileSync(new URL("../public/checkout-test.js", import.meta.url), "utf8");
+  for (const c of Object.keys(RETURN_NOTICES)) assert.ok(src.includes(`"${c}"`), c);
+  const done = { level: "info", code: "RETURNED_COMPLETE", text: "You returned from Stripe. This is only a hint: the page now asks the server what actually happened." };
+  assert.equal(guestNoticeFor(done), "");
+  assert.equal(showsSupportCode(done), false);
+  const left = { ...done, code: "RETURNED_CANCELLED" };
+  assert.match(guestNoticeFor(left), /before paying/);
+  assert.ok(readFileSync(new URL("../public/checkout.js", import.meta.url), "utf8").includes("showsSupportCode(v.notice) ? v.notice.code : null"));
+  assert.ok(!/Stripe|hint|server/i.test(guestNoticeFor(left)));
+  assert.equal(showsSupportCode(left), false);
+  assert.equal(showsSupportCode({ level: "warn", code: "RATE_LIMITED", text: "x" }), true);
+  assert.equal(showsSupportCode(null), false);
 });
