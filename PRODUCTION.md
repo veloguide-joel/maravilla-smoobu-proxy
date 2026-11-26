@@ -316,3 +316,32 @@ in one of two sample weeks, the other two (628376, 628388) priced in a third wee
 `/api/checkout/config` 404 (activation off). `https://book.micasadirect.com/checkout.html` loads over HTTPS and quotes.
 
 **Guest site.** booking-ui `mcd-catalog` merged to `DEV` (search fix).
+
+## 2026-11-26 (afternoon): promotion and runbook step 4 (the owner's paste sitting), done
+
+**Promotion (owner: "promote").** `production` fast-forwarded fde99ab -> 66f3f120. Checked on `book.micasadirect.com`: `/checkout-test.html`
+lands on `/checkout.html`; new checkout wording served; `/api/checkout/config` 404; five sample listings quote in USD; pilot 404.
+
+**Vercel Production, pasted by the owner (all type sensitive, Production only):** `MV_RATE_LIMIT_SALT`, `BOOKING_DATABASE_URL`,
+`STRIPE_LIVE_SECRET_KEY` (a second restricted key "MiCasaDirect website": Payment Intents write, Checkout Sessions write; the first key
+stays the runner's), `STRIPE_LIVE_WEBHOOK_SECRET`. No TEST-named variable on Production. `MV_CHECKOUT_LIVE_ACTIVATION` is NOT set.
+These four take effect at the next production deployment (none has happened since they were added).
+
+**Stripe live webhook** `micasadirect-live-checkout` -> `https://book.micasadirect.com/api/checkout/stripe-webhook`, five events
+(the four `checkout.session.*` and `payment_intent.payment_failed`), snapshot payload, API version 2026-06-24.dahlia. Not yet delivered to.
+
+**GitHub environment `mv-live`, pasted by the owner:** `MV_LIVE_BOOKING_DATABASE_URL`, `MV_LIVE_HOSTAWAY_TOKEN` (the access token used for
+the TEST runner; one Hostaway account), `MV_LIVE_RESEND_KEY` (sending access, domain `mail.micasadirect.com`). Repo variables (Claude):
+`MV_LIVE_PIPELINE_LISTINGS` (28), `_NOT_BEFORE` 2026-11-26T19:00:00.000Z, `_STRIPE_ACCOUNT`, `_REF_FIELD_ID` 105433, `_TIME_ZONE`,
+`_ACCOUNT_REF` hostaway-live, and `MV_LIVE_APPROVED_REF` = 66f3f1204a8a315a94694b214ed6e177d5329170 (the promoted commit).
+
+**Proofs (live mode, nothing to process):**
+- run 45882726763, wrong ref: stopped at the guard, `LIVE_REFUSED: ref is not the approved commit`, nothing checked out.
+- run 45882909910, `action: status`: `OK / NOTHING_IN_FLIGHT` (the live database line and CA are right).
+- run 45886371510, `action: run`: `OK / NOTHING_TO_DO`, confirmations `DONE` (wired). Configuration complete, live key kind accepted,
+  lock taken and released. No provider was called (no candidates), so the Hostaway token, the Stripe key's permissions and the Resend
+  key are NOT yet proven; they are proven by the owner's first real booking.
+
+**Open before activation:** production redeploy so the four settings load; webhook delivery and `GET /v1/account` with the website key
+(both only answer once activation is on); `_REF_FIELD_ID` 105433 confirmed for real listings; stop procedure rehearsed; schedules.
+For the first booking: `MV_CHECKOUT_LIVE_LISTINGS` and `MV_LIVE_PIPELINE_LISTINGS` reduced to ONE listing.
