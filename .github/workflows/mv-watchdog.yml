@@ -4,9 +4,12 @@
 #   status     scripts/mv-status.mjs -- one READ ONLY database transaction; fails when a booking needs a person, a paid booking has
 #              waited longer than 20 minutes, or a paid booking is on a listing the runner may not process.
 #   freshness  the last SUCCESSFUL mv-pipeline run must be younger than `max_runner_age_minutes` (0 = skip; use it once a schedule runs).
-# A failed job makes GitHub email the owner. Manual dispatch only for now; the schedule is added when live bookings are switched on.
+# A failed job makes GitHub email the owner. Schedule: every 15 minutes, LIVE, runner age limit 30 minutes (GitHub starts scheduled
+# runs late, so 30 rather than 15). Like the runner, the scheduled jobs do nothing unless repo variable MV_LIVE_SCHEDULE is "on".
 name: mv-watchdog
 on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -27,23 +30,24 @@ permissions:
   contents: read
   actions: read
 concurrency:
-  group: mv-watchdog-${{ inputs.mode }}
+  group: mv-watchdog-${{ inputs.mode || 'live' }}
   cancel-in-progress: false
 jobs:
   status:
+    if: github.event_name != 'schedule' || vars.MV_LIVE_SCHEDULE == 'on'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    environment: ${{ inputs.mode == 'live' && 'mv-live' || 'e7-test-auto' }}
+    environment: ${{ (inputs.mode || 'live') == 'live' && 'mv-live' || 'e7-test-auto' }}
     steps:
       - name: The ref must be a full commit id
         env:
-          MV_REF: ${{ inputs.ref }}
+          MV_REF: ${{ inputs.ref || vars.MV_LIVE_APPROVED_REF }}
         run: |
           [[ "$MV_REF" =~ ^[0-9a-f]{40}$ ]] || { echo "ref must be 40 lowercase hex"; exit 1; }
       - name: Live runs only the approved commit, from main
-        if: inputs.mode == 'live'
+        if: (inputs.mode || 'live') == 'live'
         env:
-          MV_REF: ${{ inputs.ref }}
+          MV_REF: ${{ inputs.ref || vars.MV_LIVE_APPROVED_REF }}
           MV_APPROVED: ${{ vars.MV_LIVE_APPROVED_REF }}
           MV_DISPATCH_REF: ${{ github.ref }}
         run: |
@@ -52,7 +56,7 @@ jobs:
           [[ "$MV_REF" == "$MV_APPROVED" ]] || { echo "LIVE_REFUSED: ref is not the approved commit"; exit 1; }
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.ref || vars.MV_LIVE_APPROVED_REF }}
           persist-credentials: false
       - uses: actions/setup-node@v4
         with:
@@ -62,20 +66,21 @@ jobs:
         run: curl --fail --silent --show-error --proto '=https' --max-time 20 -o "$RUNNER_TEMP/prod-ca-2021.crt" https://supabase-downloads.s3-ap-southeast-1.amazonaws.com/prod/ssl/prod-ca-2021.crt
       - name: Status (read-only)
         env:
-          MV_PIPELINE_MODE: ${{ inputs.mode }}
+          MV_PIPELINE_MODE: ${{ inputs.mode || 'live' }}
           MV_PIPELINE_DATABASE_CA_FILE: ${{ runner.temp }}/prod-ca-2021.crt
-          MV_PIPELINE_LISTINGS: ${{ inputs.mode == 'live' && vars.MV_LIVE_PIPELINE_LISTINGS || vars.MV_TEST_PIPELINE_LISTINGS }}
-          MV_PIPELINE_NOT_BEFORE: ${{ inputs.mode == 'live' && vars.MV_LIVE_PIPELINE_NOT_BEFORE || vars.MV_TEST_PIPELINE_NOT_BEFORE }}
-          MV_PIPELINE_DATABASE_URL: ${{ inputs.mode == 'live' && secrets.MV_LIVE_BOOKING_DATABASE_URL || secrets.E7_DEV_BOOKING_DATABASE_URL }}
+          MV_PIPELINE_LISTINGS: ${{ (inputs.mode || 'live') == 'live' && vars.MV_LIVE_PIPELINE_LISTINGS || vars.MV_TEST_PIPELINE_LISTINGS }}
+          MV_PIPELINE_NOT_BEFORE: ${{ (inputs.mode || 'live') == 'live' && vars.MV_LIVE_PIPELINE_NOT_BEFORE || vars.MV_TEST_PIPELINE_NOT_BEFORE }}
+          MV_PIPELINE_DATABASE_URL: ${{ (inputs.mode || 'live') == 'live' && secrets.MV_LIVE_BOOKING_DATABASE_URL || secrets.E7_DEV_BOOKING_DATABASE_URL }}
         run: node scripts/mv-status.mjs
   freshness:
+    if: github.event_name != 'schedule' || vars.MV_LIVE_SCHEDULE == 'on'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: The last successful mv-pipeline run must be recent
         env:
           GH_TOKEN: ${{ github.token }}
-          MV_MAX_AGE: ${{ inputs.max_runner_age_minutes }}
+          MV_MAX_AGE: ${{ inputs.max_runner_age_minutes || '30' }}
           MV_REPO: ${{ github.repository }}
         run: |
           [[ "$MV_MAX_AGE" =~ ^[0-9]{1,4}$ ]] || { echo "max_runner_age_minutes must be a number"; exit 1; }
