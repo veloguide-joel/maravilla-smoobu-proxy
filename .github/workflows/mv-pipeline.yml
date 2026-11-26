@@ -20,6 +20,12 @@ on:
         description: "full 40-hex commit of e7-test to run"
         required: true
         type: string
+      action:
+        description: "run (process bookings) or status (read-only look; writes nothing, calls no provider)"
+        required: false
+        default: run
+        type: choice
+        options: [run, status]
 permissions:
   contents: read
 concurrency:
@@ -59,7 +65,18 @@ jobs:
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Database CA (pinned by SHA-256 in the runner)
         run: curl --fail --silent --show-error --proto '=https' --max-time 20 -o "$RUNNER_TEMP/prod-ca-2021.crt" https://supabase-downloads.s3-ap-southeast-1.amazonaws.com/prod/ssl/prod-ca-2021.crt
+      # Read-only status: only the database URL is passed; no provider secret is read by this step.
+      - name: Status (read-only)
+        if: inputs.action == 'status'
+        env:
+          MV_PIPELINE_MODE: ${{ inputs.mode }}
+          MV_PIPELINE_DATABASE_CA_FILE: ${{ runner.temp }}/prod-ca-2021.crt
+          MV_PIPELINE_LISTINGS: ${{ inputs.mode == 'live' && vars.MV_LIVE_PIPELINE_LISTINGS || vars.MV_TEST_PIPELINE_LISTINGS }}
+          MV_PIPELINE_NOT_BEFORE: ${{ inputs.mode == 'live' && vars.MV_LIVE_PIPELINE_NOT_BEFORE || vars.MV_TEST_PIPELINE_NOT_BEFORE }}
+          MV_PIPELINE_DATABASE_URL: ${{ inputs.mode == 'live' && secrets.MV_LIVE_BOOKING_DATABASE_URL || secrets.E7_DEV_BOOKING_DATABASE_URL }}
+        run: node scripts/mv-status.mjs
       - name: Run the pipeline once
+        if: inputs.action != 'status'
         env:
           MV_PIPELINE_MODE: ${{ inputs.mode }}
           MV_PIPELINE_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
