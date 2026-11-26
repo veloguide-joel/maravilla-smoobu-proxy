@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { GUEST_REFUSALS, offerNewStay, FINISHED_SCREENS, parseStayQuery, guestCopy, guestNotice, readCheckoutConfig, CANCELLATION_POLICY, CANCELLATION_CONTACT, BRAND, RETURN_HINTS, CONFIG_PATH } from "../public/checkout.js";
+import { UNBOOKABLE_CODES, UNBOOKABLE_TEXT, isUnbookable, guestNoticeFor, GUEST_REFUSALS, offerNewStay, FINISHED_SCREENS, parseStayQuery, guestCopy, guestNotice, readCheckoutConfig, CANCELLATION_POLICY, CANCELLATION_CONTACT, BRAND, RETURN_HINTS, CONFIG_PATH } from "../public/checkout.js";
 import { renderBookingConfirmationV2, BRAND_V2, CANCELLATION_CONTACT as EMAIL_CONTACT } from "../lib/checkout/booking-confirmation-copy.js";
 import { createCheckoutConfigHandler } from "../lib/checkout/checkout-config-http.js";
 import { ENV_OK } from "./e5a-fixtures.mjs";
@@ -99,4 +99,21 @@ test("P4-6: every 'definite refusal' notice the controller can raise has guest w
   assert.deepEqual([...new Set(raised)].sort(), Object.keys(GUEST_REFUSALS).sort());
   for (const r of raised) { const g = guestNotice(r); assert.ok(!/refus|server|definite|TEST/i.test(g), g); assert.match(g, /info@micasadirect\.com/); }
   assert.match(guestNotice("The server refused to start payment (a definite refusal)."), /Nothing was charged/);
+});
+
+test("P4-7: a listing or dates that cannot be booked get their own wording (never 'try again'), and the price button is hidden", () => {
+  const core = readFileSync(new URL("../lib/checkout/intent-api-core.js", import.meta.url), "utf8");
+  for (const c of UNBOOKABLE_CODES) {
+    assert.ok(core.includes(`code: "${c}"`), c);
+    const n = { level: "warn", code: c, text: "The server refused the request (a definite refusal)." };
+    assert.equal(isUnbookable(n), true);
+    assert.equal(guestNoticeFor(n), UNBOOKABLE_TEXT);
+  }
+  assert.ok(!/try again/i.test(UNBOOKABLE_TEXT));
+  const other = { level: "warn", code: "RATE_LIMITED", text: "The server refused the request (a definite refusal)." };
+  assert.equal(isUnbookable(other), false);
+  assert.match(guestNoticeFor(other), /try again in a moment/);
+  assert.equal(guestNoticeFor(null), "");
+  const page = readFileSync(new URL("../public/checkout.js", import.meta.url), "utf8");
+  assert.ok(page.includes('show("mv-create", v.screen === "create" && !!stay && !isUnbookable(v.notice));'));
 });
