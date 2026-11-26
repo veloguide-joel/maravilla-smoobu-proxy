@@ -36,6 +36,19 @@ jobs:
           MV_REF: ${{ inputs.ref }}
         run: |
           [[ "$MV_REF" =~ ^[0-9a-f]{40}$ ]] || { echo "ref must be 40 lowercase hex"; exit 1; }
+      # Live runs only the one commit the owner approved (repo variable MV_LIVE_APPROVED_REF), and only when dispatched from main.
+      # Fail closed: an empty or malformed variable, another commit, or another branch stops the job before any code is checked out
+      # and before any secret is read (secrets appear only in the last step).
+      - name: Live runs only the approved commit, from main
+        if: inputs.mode == 'live'
+        env:
+          MV_REF: ${{ inputs.ref }}
+          MV_APPROVED: ${{ vars.MV_LIVE_APPROVED_REF }}
+          MV_DISPATCH_REF: ${{ github.ref }}
+        run: |
+          [[ "$MV_DISPATCH_REF" == "refs/heads/main" ]] || { echo "LIVE_REFUSED: dispatch from main only"; exit 1; }
+          [[ "$MV_APPROVED" =~ ^[0-9a-f]{40}$ ]] || { echo "LIVE_REFUSED: MV_LIVE_APPROVED_REF is not set to a full commit id"; exit 1; }
+          [[ "$MV_REF" == "$MV_APPROVED" ]] || { echo "LIVE_REFUSED: ref is not the approved commit"; exit 1; }
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
