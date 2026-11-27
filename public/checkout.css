@@ -1,10 +1,14 @@
-:root { color-scheme: light dark; --bg: #fff; --fg: #1b1b1b; --muted: #5c5c5c; --warn: #8a5a00; --err: #a1121b; --info: #0b4f8a; --line: #d6d6d6; --brand: #0d5c63; }
+:root { color-scheme: light dark; --bg: #fff; --fg: #1b1b1b; --muted: #5c5c5c; --warn: #8a5a00; --err: #a1121b; --info: #0b4f8a; --line: #d6d6d6; --brand: #1F4D3E; --accent: #A9552F; --wave: #4E8571; }
 [hidden] { display: none !important; }
-@media (prefers-color-scheme: dark) { :root { --bg: #151515; --fg: #ececec; --muted: #a8a8a8; --warn: #f0b44c; --err: #ff7b82; --info: #7dbbf5; --line: #3a3a3a; --brand: #6fc3ca; } }
+@media (prefers-color-scheme: dark) { :root { --bg: #151515; --fg: #ececec; --muted: #a8a8a8; --warn: #f0b44c; --err: #ff7b82; --info: #7dbbf5; --line: #3a3a3a; --brand: #9CCDB8; --accent: #E0946C; --wave: #6FA892; } }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
-.brand { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--line); }
-.brand-name { font-weight: 700; font-size: 1.2rem; color: var(--brand); } .brand-note { color: var(--muted); font-size: .9rem; }
+.brand { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--line); }
+/* B2 (owner's brand, 2026-11-27): Coastal Green name and mark, Terracotta "Direct" and buttons. The page's CSP allows no fonts, so the name
+   uses the reader's own serif face. */
+.brand-id { display: flex; align-items: center; gap: 9px; } .brand-mark { width: 44px; height: 26px; flex: none; }
+.brand-roof { fill: none; stroke: var(--brand); stroke-width: 11; stroke-miterlimit: 6; } .brand-wave { fill: var(--wave); }
+.brand-name { font-family: Georgia, "Times New Roman", serif; font-weight: 700; font-size: 1.3rem; color: var(--brand); } .brand-name span { color: var(--accent); } .brand-note { color: var(--muted); font-size: .9rem; }
 main { max-width: 640px; margin: 0 auto; padding: 16px; }
 h1 { font-size: 1.4rem; margin: 8px 0; } h2 { font-size: 1.05rem; margin: 0 0 6px; }
 .muted { color: var(--muted); font-size: .9rem; }
@@ -15,7 +19,7 @@ h1 { font-size: 1.4rem; margin: 8px 0; } h2 { font-size: 1.05rem; margin: 0 0 6p
 .policy { margin: 16px 0; padding: 12px; border: 1px solid var(--line); border-radius: 8px; font-size: .92rem; } .policy ul { margin: 0; padding-left: 18px; } .policy li { margin: 4px 0; }
 form { display: grid; gap: 10px; margin: 12px 0; } label { display: grid; gap: 4px; } label.check { display: flex; gap: 8px; align-items: flex-start; }
 input { font: inherit; padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: inherit; }
-button { font: inherit; padding: 11px 16px; border-radius: 6px; border: 1px solid var(--brand); background: var(--brand); color: var(--bg); cursor: pointer; font-weight: 600; }
+button { font: inherit; padding: 11px 16px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: var(--bg); cursor: pointer; font-weight: 600; }
 button.secondary { background: transparent; color: var(--fg); border-color: var(--fg); font-weight: 400; } button:disabled { opacity: .5; cursor: not-allowed; }
 .actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .reset-zone { margin-top: 28px; padding-top: 12px; border-top: 1px dashed var(--line); }
