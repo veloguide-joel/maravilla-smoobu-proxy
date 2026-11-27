@@ -28,10 +28,10 @@ test("disabled without HOSTAWAY_DIAG_KEY; 401 without or with a wrong key; no up
   assert.equal(calls, 0);
 });
 
-test("with the key, the audit view shows the candidate and that it is not published", async () => {
+test("with the key, the audit view shows the candidate and that it is published (owner decision 2026-11-27)", async () => {
   process.env.HOSTAWAY_DIAG_KEY = "test-only-diag-key";
   const r = await run({ "x-admin-key": "test-only-diag-key" });
   assert.equal(r.statusCode, 200);
   const pc = JSON.stringify(r.body).match(/"publicCandidate":(\{.*?\})(,"|\})/)?.[1];
-  assert.ok(pc && pc.includes("Clean candidate text for the audit.") && pc.includes('"publishedNow":false'), pc);
+  assert.ok(pc && pc.includes("Clean candidate text for the audit.") && pc.includes('"publishedNow":true'), pc);
 });
