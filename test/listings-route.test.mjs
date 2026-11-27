@@ -114,13 +114,15 @@ test("no private or internal data leaks (keys or values)", async () => {
   for (const f of FORBIDDEN) assert.equal(text.includes(f), false, `leaked: ${f}`);
 });
 
-test("description stays null for every source text (owner decision: not published until human-approved)", async () => {
-  assert.equal(PUBLISH_DESCRIPTION, false);
+test("description is published only when the private-content scan is clean (owner decision 2026-11-27), as bounded plain text", async () => {
+  assert.equal(PUBLISH_DESCRIPTION, true);
   for (const d of [PRIVATE_DESCRIPTION, CLEAN_DESCRIPTION, "<img src=x onerror=alert(1)>", "x".repeat(10000), "", null, 42]) {
     descriptionFixture = d;
     const { res } = await call();
     for (const l of res.body.listings) {
-      assert.equal(l.description, null, `description published for fixture ${String(d).slice(0, 30)}`);
+      if (d === PRIVATE_DESCRIPTION) assert.equal(l.description, null, "a description with private content is withheld whole");
+      if (d === CLEAN_DESCRIPTION) assert.equal(l.description, "Bright studio two blocks from the beach.\nFast Wi-Fi and a shared rooftop.");
+      assert.ok(l.description === null || (typeof l.description === "string" && l.description.length <= 2001 && !/[<>]/.test(l.description)), `unbounded or marked-up description for fixture ${String(d).slice(0, 30)}`);
       assert.ok(l.summary === null || (typeof l.summary === "string" && l.summary.length <= 201), "summary stays the bounded F1 excerpt");
     }
   }

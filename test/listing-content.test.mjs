@@ -93,8 +93,8 @@ test("public listing contract: new keys present, description gated by PUBLISH_DE
   const r = toPublicListing(raw, 603566); assert.equal(r.ok, true); const l = r.listing;
   assert.deepEqual(Object.keys(l).sort(), [...PUBLIC_LISTING_KEYS].sort());
   assert.deepEqual([l.amenities, l.beds, l.checkInFrom, l.checkOutBy], [["Wireless", "Kitchen"], 1, "15:00", null]);
-  assert.equal(PUBLISH_DESCRIPTION, false, "description stays unpublished until the human audit (flip deliberately)");
-  assert.equal(l.description, null);
+  assert.equal(PUBLISH_DESCRIPTION, true, "owner decision 2026-11-27: published, behind the private-content scan");
+  assert.equal(l.description, "Welcome to the East Side Studio. Fast Wi-Fi and a rooftop.");
   assert.equal(l.summary, "Welcome to the East Side Studio. Fast Wi-Fi and a rooftop."); // existing F1 summary unchanged
   const json = JSON.stringify(l);
   for (const bad of ["9999", "secret", "Calle X", "20.1", "105.1", "houseRules", "no parties", "flexible", "cancellation", "door", "wifiPassword"]) assert.equal(json.includes(bad), false, bad);
