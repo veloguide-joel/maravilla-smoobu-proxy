@@ -1,0 +1,36 @@
+# mv-hostaway-reviews-check: READ-ONLY. Two GET requests to Hostaway to learn what review and host data the account exposes.
+# Prints field NAMES, counts, numeric ratings and channel ids only. No review text, no guest name, no token.
+name: mv-hostaway-reviews-check
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: mv-live
+    steps:
+      - name: Two read-only reads
+        env:
+          MV_TOKEN: ${{ secrets.MV_LIVE_HOSTAWAY_TOKEN }}
+        run: |
+          get() { curl --silent --show-error --max-time 25 --proto '=https' -o "$2" -w '%{http_code}' -H "Authorization: Bearer $MV_TOKEN" -H 'Cache-Control: no-cache' "$1" || echo 000; }
+          s1=$(get "https://api.hostaway.com/v1/reviews?limit=100" /tmp/r.json)
+          s2=$(get "https://api.hostaway.com/v1/listings/628392" /tmp/l.json)
+          node -e '
+            const fs=require("fs"); const rd=(f)=>{try{return JSON.parse(fs.readFileSync(f,"utf8"))}catch{return {}}};
+            const r=rd("/tmp/r.json"), l=rd("/tmp/l.json"); const rows=Array.isArray(r.result)?r.result:[];
+            const tally=(k)=>{const o={}; for(const x of rows){const v=String(x[k]); o[v]=(o[v]||0)+1} return o};
+            const num=(v)=>typeof v==="number"&&Number.isFinite(v)?v:null;
+            const L=l.result&&typeof l.result==="object"?l.result:{};
+            const hostish=Object.keys(L).filter((k)=>/host|contact|review|rating|star|airbnb|channel|license|manager/i.test(k));
+            console.log(JSON.stringify({ probe:"reviews", http:Number(process.argv[1]), count:r.count??null, returned:rows.length,
+              keys:rows[0]?Object.keys(rows[0]).sort():[], byType:tally("type"), byStatus:tally("status"), byChannel:tally("channelId"),
+              withRating:rows.filter((x)=>num(x.rating)!==null).length, withPublicText:rows.filter((x)=>typeof x.publicReview==="string"&&x.publicReview.length>0).length,
+              listings:new Set(rows.map((x)=>x.listingMapId)).size,
+              categoryNames:[...new Set(rows.flatMap((x)=>Array.isArray(x.reviewCategory)?x.reviewCategory.map((c)=>String(c.category)):[]))].slice(0,12) }));
+            console.log(JSON.stringify({ probe:"listing", http:Number(process.argv[2]), fieldCount:Object.keys(L).length,
+              relevantKeys:hostish.sort(), values:Object.fromEntries(hostish.filter((k)=>num(L[k])!==null).map((k)=>[k,L[k]])) }));
+          ' "$s1" "$s2"
+          rm -f /tmp/r.json /tmp/l.json
