@@ -35,3 +35,9 @@ button.secondary { background: transparent; color: var(--fg); border-color: var(
 .wait-labels { display: flex; justify-content: space-between; margin: 2px 0 0; font-size: .8rem; color: var(--muted); }
 @keyframes mv-fly { 0% { offset-distance: 0%; opacity: 0; } 8% { opacity: 1; } 88% { opacity: 1; } 100% { offset-distance: 100%; opacity: 0; } }
 @media (prefers-reduced-motion: reduce) { .wait-plane { animation: none; offset-distance: 55%; } }
+/* M1 manage-my-booking page */
+.mg-status { font-size: 1.15rem; font-weight: 700; color: var(--brand); margin: 6px 0 12px; } .mg-status[data-cancelled="true"] { color: var(--err); }
+.mg-facts { margin: 0 0 14px; border: 1px solid var(--line); border-radius: 8px; } .mg-facts div { display: flex; justify-content: space-between; gap: 16px; padding: 9px 12px; border-top: 1px solid var(--line); }
+.mg-facts div:first-child { border-top: 0; } .mg-facts dt { color: var(--muted); } .mg-facts dd { margin: 0; text-align: right; font-weight: 600; }
+a.button { display: inline-block; padding: 11px 16px; border-radius: 6px; border: 1px solid var(--fg); color: var(--fg); text-decoration: none; }
+#mg-ref { text-transform: uppercase; }
