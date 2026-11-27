@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<title>MiCasaDirect — Manage my booking</title>
+<link rel="stylesheet" href="checkout.css">
+<script type="module" src="manage.js"></script>
+</head>
+<body>
+<header class="brand"><span class="brand-id"><svg class="brand-mark" viewBox="0 0 120 70" aria-hidden="true" focusable="false"><defs><clipPath id="mv-roof"><rect x="0" y="0" width="120" height="52"/></clipPath></defs><polyline class="brand-roof" clip-path="url(#mv-roof)" points="-6,66 40,10 60,34 80,10 126,66"/><path class="brand-wave" d="M22 58 C 38 43, 56 43, 71 50 C 85 57, 98 56, 111 49 C 100 64, 83 68, 67 60 C 52 52, 38 50, 22 58 Z"/></svg><span class="brand-name">MiCasa<span>Direct</span></span></span><span class="brand-note">Manage my booking</span></header>
+<p id="mv-test-banner" class="banner" role="note" hidden><strong>Test environment.</strong> No real booking is made and no real card is charged.</p>
+<main id="mv-manage">
+  <h1 id="mg-title" tabindex="-1">Find my booking</h1>
+  <p id="mg-intro">Enter the booking reference from your confirmation email and the email address you booked with.</p>
+  <form id="mg-form" novalidate>
+    <label>Booking reference <input id="mg-ref" name="ref" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="MV-XXXXXXXX" maxlength="16" required></label>
+    <label>Email <input id="mg-email" type="email" name="email" autocomplete="email" maxlength="254" required></label>
+    <button type="submit" id="mg-submit">Find my booking</button>
+  </form>
+  <p id="mg-notice" class="notice" role="status" aria-live="polite" hidden></p>
+
+  <section id="mg-booking" aria-labelledby="mg-status" hidden>
+    <p id="mg-status" class="mg-status"></p>
+    <dl class="mg-facts">
+      <div><dt>Booking reference</dt><dd id="mg-f-ref"></dd></div>
+      <div><dt>Home</dt><dd id="mg-f-home"></dd></div>
+      <div><dt>Check-in</dt><dd id="mg-f-in"></dd></div>
+      <div><dt>Check-out</dt><dd id="mg-f-out"></dd></div>
+      <div><dt>Nights</dt><dd id="mg-f-nights"></dd></div>
+      <div><dt>Guests</dt><dd id="mg-f-guests"></dd></div>
+    </dl>
+    <h2>Price</h2>
+    <ul id="mg-price" class="price"></ul>
+    <p id="mg-refund" class="muted" hidden></p>
+    <div id="mg-actions">
+      <h2>Need to change or cancel?</h2>
+      <p class="muted">Send us a request and we will reply by email. The cancellation policy in your confirmation email applies.</p>
+      <p class="actions"><a id="mg-change" class="button secondary">Request a change</a><a id="mg-cancel" class="button secondary">Request cancellation</a></p>
+    </div>
+    <p class="muted">Questions? <a id="mg-contact" href="mailto:info@micasadirect.com">info@micasadirect.com</a></p>
+    <p><button type="button" id="mg-again" class="secondary">Look up another booking</button></p>
+  </section>
+</main>
+</body>
+</html>
